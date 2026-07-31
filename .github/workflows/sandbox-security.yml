@@ -16,8 +16,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install Bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install and authorize Bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor-profiles bubblewrap
+          sudo install -m 0644 \
+            /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          /usr/bin/bwrap \
+            --unshare-all \
+            --unshare-user \
+            --disable-userns \
+            --assert-userns-disabled \
+            --cap-drop ALL \
+            --ro-bind / / \
+            --proc /proc \
+            --dev /dev \
+            -- /usr/bin/true
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets -- --test-threads=1
