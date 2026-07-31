@@ -2478,6 +2478,8 @@ fn build_search_argv(
             let context_lines = parse_acp_search_context_lines_arg(tool_args.get("context_lines"))?;
             let case_insensitive =
                 parse_acp_bool_arg_for_search(tool_args, "case_insensitive", false)?;
+            let file_type = optional_acp_search_string_arg_opt(tool_args, "type")?;
+            let glob = optional_acp_search_string_arg_opt(tool_args, "glob")?;
             let program =
                 resolve_program("rg").ok_or_else(|| "Could not locate `rg` on PATH".to_string())?;
 
@@ -2489,7 +2491,7 @@ fn build_search_argv(
                 argv.push("--context".to_string());
                 argv.push(context_lines.to_string());
             }
-            if let Some(ft) = optional_acp_search_string_arg_opt(tool_args, "type")? {
+            if let Some(ft) = file_type {
                 // The type name itself is an argv entry, but disallow values
                 // that look like flags to keep the contract obvious.
                 if ft.starts_with('-') {
@@ -2498,7 +2500,7 @@ fn build_search_argv(
                 argv.push("--type".to_string());
                 argv.push(ft);
             }
-            if let Some(g) = optional_acp_search_string_arg_opt(tool_args, "glob")? {
+            if let Some(g) = glob {
                 if g.starts_with('-') {
                     return Err(format!("Invalid `glob` value (looks like a flag): {g}"));
                 }
