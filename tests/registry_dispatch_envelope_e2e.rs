@@ -18,8 +18,9 @@ use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-const fn ctx() -> ToolContext<'static> {
+fn ctx() -> ToolContext<'static> {
     ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -237,7 +238,7 @@ fn dispatch_repeated_with_same_args_returns_consistent_envelope_shape() {
     // PINS IDEMPOTENCY: read-only tools (list_files) with the
     // same args produce same envelope shape on every call.
     let mut c = ctx();
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let args: HashMap<String, Value> =
         vec![("path".to_string(), json!(dir.path().to_str().unwrap()))]
             .into_iter()

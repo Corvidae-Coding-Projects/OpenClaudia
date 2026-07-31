@@ -844,8 +844,11 @@ impl SessionManager {
 
         // Persist the session; failure must surface to the caller, not be
         // swallowed via warn!() as it was prior to #356.
-        self.persist_session(&session)
-            .map_err(|source| EndSessionError::PersistFailed { source })?;
+        let persist_result = self.persist_session(&session);
+        crate::tools::cancel_session_sandbox_processes(&session.id);
+        crate::tools::terminate_session_background_jobs(&session.id);
+        crate::tools::security::release_session_context(&session.id);
+        persist_result.map_err(|source| EndSessionError::PersistFailed { source })?;
 
         info!(
             session_id = %session.id,

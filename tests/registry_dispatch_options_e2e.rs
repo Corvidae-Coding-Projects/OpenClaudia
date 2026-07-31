@@ -17,8 +17,9 @@ fn empty_args() -> HashMap<String, serde_json::Value> {
     HashMap::new()
 }
 
-const fn fresh_ctx() -> ToolContext<'static> {
+fn fresh_ctx() -> ToolContext<'static> {
     ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -221,6 +222,7 @@ fn dispatch_works_with_all_none_context_fields() {
     // default for tools that don't need memory_db/app_config/task_mgr.
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -233,6 +235,7 @@ fn dispatch_works_with_all_none_context_fields() {
 fn dispatch_does_not_panic_on_unknown_with_all_none_context() {
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,

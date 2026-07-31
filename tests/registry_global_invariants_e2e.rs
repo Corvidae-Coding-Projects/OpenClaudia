@@ -307,6 +307,7 @@ fn notebook_edit_permission_target_uses_notebook_path_arg_key() {
 fn every_documented_tool_dispatches_to_some_result() {
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,

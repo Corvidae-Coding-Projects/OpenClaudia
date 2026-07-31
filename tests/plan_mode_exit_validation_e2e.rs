@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 fn dispatch_exit_plan_mode(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -30,6 +31,7 @@ fn dispatch_exit_plan_mode(args: &HashMap<String, Value>) -> (String, bool) {
 
 fn dispatch_enter_plan_mode() -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,

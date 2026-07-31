@@ -160,7 +160,7 @@ fn replace_cell_by_id_rewrites_source() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint23-replace");
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
     let nb = make_notebook(&[
         ("c1", "code", "print('one')"),
@@ -202,7 +202,7 @@ fn insert_cell_grows_notebook_by_one() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint23-insert");
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
     let nb = make_notebook(&[("c1", "code", "x = 1")]);
     write_notebook(&path, &nb);
@@ -234,7 +234,7 @@ fn delete_cell_shrinks_notebook_by_one() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint23-delete");
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
     let nb = make_notebook(&[
         ("c1", "code", "x = 1"),
@@ -277,7 +277,7 @@ fn invalid_edit_mode_is_refused() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint23-bad-mode");
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
     write_notebook(&path, &make_notebook(&[("c1", "code", "x = 1")]));
     let path_str = path.to_string_lossy().to_string();
@@ -301,7 +301,7 @@ fn invalid_cell_type_on_insert_is_refused() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint23-bad-celltype");
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
     write_notebook(&path, &make_notebook(&[("c1", "code", "x = 1")]));
     let path_str = path.to_string_lossy().to_string();
@@ -326,7 +326,7 @@ fn unknown_cell_id_on_replace_is_refused() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint23-unknown-id");
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
     write_notebook(&path, &make_notebook(&[("c1", "code", "x = 1")]));
     let path_str = path.to_string_lossy().to_string();
@@ -369,7 +369,7 @@ fn symlink_leaf_notebook_path_is_refused_through_public_dispatch() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint23-symlink-leaf");
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let target = dir.path().join("target.ipynb");
     let nb = make_notebook(&[("guarded", "code", "SAFE")]);
     write_notebook(&target, &nb);
@@ -417,7 +417,7 @@ fn nbformat_top_level_fields_survive_edit() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint23-schema");
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
     let nb = make_notebook(&[("c1", "code", "x = 1")]);
     write_notebook(&path, &nb);

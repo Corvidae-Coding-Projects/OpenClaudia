@@ -34,7 +34,7 @@ use openclaudia::tools::{execute_tool, FunctionCall, SessionIdGuard, ToolCall};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use tempfile::tempdir;
+use tempfile::tempdir_in;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -94,7 +94,7 @@ fn edit_without_prior_read_is_refused() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-edit-no-read");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("target.txt");
     std::fs::write(&path, "v1").expect("plant file");
     let path_str = path.to_string_lossy().to_string();
@@ -114,7 +114,7 @@ fn edit_after_read_in_same_session_succeeds() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-edit-after-read");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("target.txt");
     std::fs::write(&path, "alpha").expect("plant");
     let path_str = path.to_string_lossy().to_string();
@@ -134,7 +134,7 @@ fn second_edit_with_same_old_string_errors_because_already_replaced() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-edit-twice");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("target.txt");
     std::fs::write(&path, "unique").expect("plant");
     let path_str = path.to_string_lossy().to_string();
@@ -161,7 +161,7 @@ fn write_to_existing_file_without_read_is_refused() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-write-no-read");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("existing.txt");
     std::fs::write(&path, "existing content").expect("plant");
     let path_str = path.to_string_lossy().to_string();
@@ -181,7 +181,7 @@ fn write_to_new_file_without_read_succeeds() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-write-new");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("brand-new.txt");
     let path_str = path.to_string_lossy().to_string();
     assert!(!path.exists(), "test precondition: file must not exist yet");
@@ -197,7 +197,7 @@ fn write_to_existing_file_after_read_succeeds() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-write-after-read");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("existing.txt");
     std::fs::write(&path, "before").expect("plant");
     let path_str = path.to_string_lossy().to_string();
@@ -219,7 +219,7 @@ fn no_op_edit_is_refused_without_touching_file() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-noop-edit");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("target.txt");
     std::fs::write(&path, "content").expect("plant");
     let path_str = path.to_string_lossy().to_string();
@@ -251,7 +251,7 @@ fn no_op_edit_is_refused_without_touching_file() {
 fn read_in_one_session_does_not_count_in_another() {
     let _sess = session_lock();
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("isolated.txt");
     std::fs::write(&path, "content").expect("plant");
     let path_str = path.to_string_lossy().to_string();
@@ -288,7 +288,7 @@ fn write_creates_missing_parent_directories() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-write-parents");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let nested = dir.path().join("a/b/c/d/file.txt");
     assert!(!nested.parent().unwrap().exists(), "parent dirs absent");
     let path_str = nested.to_string_lossy().to_string();
@@ -312,7 +312,7 @@ fn write_refuses_when_leaf_is_a_symlink() {
     let _sess = session_lock();
     let _guard = SessionIdGuard::set("sprint21-symlink-leaf");
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempdir_in(".").expect("project-local tempdir");
     let real = dir.path().join("real.txt");
     std::fs::write(&real, "real content").expect("plant real");
     let link = dir.path().join("link.txt");

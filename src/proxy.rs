@@ -2423,8 +2423,60 @@ pub async fn connect_mcp_servers(
     mcp_manager: &Arc<RwLock<McpManager>>,
     plugin_manager: &Arc<PluginManager>,
 ) {
+    let trusted = match mcp_trust_grants_from_startup() {
+        Ok(trusted) => trusted,
+        Err(error) => {
+            warn!(
+                env = "OPENCLAUDIA_TRUST_MCP_SERVERS",
+                %error,
+                "MCP startup is blocked because the host trust grant is invalid"
+            );
+            return;
+        }
+    };
+    connect_mcp_servers_with_trust(mcp_manager, plugin_manager, &trusted).await;
+}
+
+/// Connect only MCP servers covered by an explicit host trust grant.
+///
+/// Entries use `plugin-id/server-name`. This function is public for trusted
+/// host frontends and integration tests; it is not part of agent tool
+/// dispatch.
+#[allow(clippy::too_many_lines)]
+pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
+    mcp_manager: &Arc<RwLock<McpManager>>,
+    plugin_manager: &Arc<PluginManager>,
+    trusted: &std::collections::HashSet<String, S>,
+) {
     let mcp = mcp_manager.write().await;
     for (plugin, server) in plugin_manager.all_mcp_servers() {
+        let trust_id = format!("{}/{}", plugin.id, server.name);
+        if !trusted.contains(&trust_id) {
+            if let Err(error) = mcp.disconnect(&server.name).await {
+                warn!(
+                    server = %server.name,
+                    %error,
+                    "Failed to terminate MCP server while revoking trust"
+                );
+            }
+            warn!(
+                plugin = %plugin.id,
+                server = %server.name,
+                trust_id,
+                env = "OPENCLAUDIA_TRUST_MCP_SERVERS",
+                "MCP server remains disconnected pending an explicit host trust grant"
+            );
+            continue;
+        }
+        info!(
+            plugin = %plugin.id,
+            server = %server.name,
+            trust_id,
+            transport = %server.transport,
+            env_grants = server.env.len(),
+            header_grants = server.headers.len(),
+            "Applying explicit MCP server trust grant"
+        );
         let tool_timeout = server.timeout.map(std::time::Duration::from_millis);
         match server.transport.as_str() {
             "stdio" => {
@@ -2505,6 +2557,32 @@ pub async fn connect_mcp_servers(
     if count > 0 {
         info!(connected = count, "MCP servers initialized");
     }
+}
+
+fn mcp_trust_grants_from_startup() -> Result<std::collections::HashSet<String>, String> {
+    let Some(value) = std::env::var_os("OPENCLAUDIA_TRUST_MCP_SERVERS") else {
+        return Ok(std::collections::HashSet::new());
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| "OPENCLAUDIA_TRUST_MCP_SERVERS contains non-Unicode data".to_string())?;
+    let mut trusted = std::collections::HashSet::new();
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let valid = entry
+            .split_once('/')
+            .is_some_and(|(plugin, server)| !plugin.is_empty() && !server.is_empty());
+        if !valid || entry.contains('*') {
+            return Err(format!(
+                "invalid MCP trust id '{entry}'; expected exact plugin-id/server-name"
+            ));
+        }
+        trusted.insert(entry.to_string());
+    }
+    Ok(trusted)
 }
 
 /// Fire the `SessionStart` hook and return the session ID.

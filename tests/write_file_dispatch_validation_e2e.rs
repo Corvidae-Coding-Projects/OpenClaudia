@@ -16,17 +16,11 @@ use openclaudia::tools::registry::{registry, ToolContext};
 use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-
-fn cwd_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+use std::sync::{Arc, Mutex};
 
 fn dispatch_write(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -38,6 +32,7 @@ fn dispatch_write(args: &HashMap<String, Value>) -> (String, bool) {
 
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -127,26 +122,23 @@ fn path_with_parent_dir_traversal_rejected_pre_write() {
 }
 
 #[test]
-fn relative_path_is_accepted_and_resolved_to_cwd_relative() {
+fn relative_path_is_accepted_and_resolved_to_session_root() {
     // AUTHORING DISCOVERY: relative paths are accepted —
-    // resolve_path joins them to std::env::current_dir().
-    // This is documented behavior (not a security hole).
+    // secure resolution joins them to the immutable session root.
     // The dispatch must NOT reject for relative-ness alone.
-    let _l = cwd_lock();
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    let prev_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(dir.path()).expect("cd");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
+    let path = dir.path().join("new_relative_file_xyz.txt");
 
     let args = args_with(&[
-        ("path", json!("new_relative_file_xyz.txt")),
+        ("path", json!(path.to_string_lossy())),
         ("content", json!("body")),
     ]);
     let (msg, is_err) = dispatch_write(&args);
-    let _ = std::env::set_current_dir(&prev_cwd);
     assert!(
         !is_err,
-        "relative path MUST be accepted (resolved to cwd); got error {msg:?}"
+        "relative path MUST be accepted (resolved to session root); got error {msg:?}"
     );
+    assert_eq!(std::fs::read_to_string(path).expect("read back"), "body");
 }
 
 #[test]
@@ -156,7 +148,7 @@ fn write_file_records_diff_observation_when_session_ledger_is_active() {
     let _ledger_guard =
         openclaudia::ledger::install_active_ledger_for_session("writeledger", Arc::clone(&ledger));
 
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("ledger_write.txt");
     let args = args_with(&[
         ("path", json!(path.to_str().unwrap())),
@@ -193,7 +185,7 @@ fn write_file_records_diff_observation_when_session_ledger_is_active() {
 fn missing_content_arg_on_new_file_errors() {
     // Use a tempdir path so the file path validates successfully
     // and we reach the content check.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("new_unique_file_marker.txt");
     let args = args_with(&[("path", json!(path.to_str().unwrap()))]);
     let (msg, is_err) = dispatch_write(&args);
@@ -206,7 +198,7 @@ fn missing_content_arg_on_new_file_errors() {
 
 #[test]
 fn content_arg_as_number_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("test.txt");
     let args = args_with(&[
         ("path", json!(path.to_str().unwrap())),
@@ -222,7 +214,7 @@ fn content_arg_as_number_returns_validation_error() {
 
 #[test]
 fn content_arg_as_array_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("test.txt");
     let args = args_with(&[
         ("path", json!(path.to_str().unwrap())),
@@ -235,7 +227,7 @@ fn content_arg_as_array_returns_validation_error() {
 
 #[test]
 fn content_arg_as_null_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("test.txt");
     let args = args_with(&[
         ("path", json!(path.to_str().unwrap())),
@@ -294,7 +286,7 @@ fn overwrite_existing_file_without_prior_read_errors() {
     // PINS #968: an existing file that has NOT been read via
     // read_file in this session cannot be overwritten — model
     // would be hallucinating prior content.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("existing_unique_marker.txt");
     // Pre-create file (existing) without going through read_file.
     std::fs::write(&path, "original content").expect("create");
@@ -325,7 +317,7 @@ fn overwrite_existing_file_without_prior_read_errors() {
 #[test]
 fn failed_read_does_not_satisfy_overwrite_gate() {
     let _session_guard = SessionIdGuard::set("failed-read-overwrite-gate");
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("empty.png");
     std::fs::write(&path, "").expect("create empty image");
     let path_str = path.to_str().expect("utf8 path");
@@ -359,7 +351,7 @@ fn failed_read_does_not_satisfy_overwrite_gate() {
 #[test]
 fn empty_string_content_is_accepted_for_new_file() {
     // Empty content string is valid — creates empty file.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("empty_new.txt");
     let args = args_with(&[
         ("path", json!(path.to_str().unwrap())),
@@ -373,7 +365,7 @@ fn empty_string_content_is_accepted_for_new_file() {
 
 #[test]
 fn unicode_content_writes_byte_exact() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("unicode.txt");
     let content = "日本語コンテンツ 🎉";
     let args = args_with(&[

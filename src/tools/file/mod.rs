@@ -4,6 +4,7 @@ mod grep;
 mod list;
 mod notebook;
 mod read;
+mod secure_fs;
 mod write;
 
 pub use edit::execute_edit_file;
@@ -216,90 +217,17 @@ impl ReadFileTracker {
     }
 }
 
-/// Snapshot of the project root, captured the first time [`resolve_path`] runs.
-///
-/// Pinned at startup so that later `cd`s (via the worktree tool, shell
-/// commands, etc.) cannot move the jail underneath us.
-///
-/// crosslink #981: when `current_dir` or `canonicalize` fail (process started
-/// in a deleted directory, FUSE EIO, etc.) the previous fallback was a bare
-/// `PathBuf::from(".")` — a relative path. Every subsequent
-/// `path_is_within(canonical, &PROJECT_ROOT)` would then compare a fully
-/// canonicalized absolute path against `"."` and reject every file silently,
-/// breaking the entire tool subsystem with no visible error. Surface the
-/// failure: a `warn!` records the underlying cause and we fall back to the
-/// absolute filesystem-root `/` so the jail is conservatively wide-open
-/// rather than uniformly closed — operators see broken behaviour and an
-/// explicit warning instead of a silent dead harness. The follow-up cleanup
-/// (panic-on-startup) is tracked separately; this is the smallest fix that
-/// removes the silent-dead-harness mode.
-static PROJECT_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
-    match std::env::current_dir().and_then(|cwd| cwd.canonicalize()) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "PROJECT_ROOT could not be resolved at startup (current_dir/canonicalize failed); \
-                 file-tool jail will fall back to the filesystem root '/'. crosslink #981",
-            );
-            // Use a path that exists and is a real directory so containment
-            // checks at least return *something* deterministic. `/` matches
-            // every absolute path; the operator will see this in logs and
-            // can correct it. Better than `"."`, which silently broke
-            // every path comparison.
-            #[cfg(unix)]
-            {
-                PathBuf::from("/")
-            }
-            #[cfg(not(unix))]
-            {
-                PathBuf::from("\\")
-            }
-        }
-    }
-});
-
-/// Process temp directory, canonicalized.
-static TEMP_ROOT: LazyLock<Option<PathBuf>> =
-    LazyLock::new(|| std::env::temp_dir().canonicalize().ok());
-
-/// Returns `true` when the path jail is in force.
-///
-/// `OPENCLAUDIA_ALLOW_OUT_OF_ROOT=1` opts out of the project-root + temp-dir
-/// containment requirement. crosslink #982: emit a single `tracing::warn!`
-/// the first time we observe the variable in the disabled state so an
-/// operator who set the flag "just for one test" and forgot has a paper
-/// trail in the logs. We deliberately do not warn on every call (the file
-/// tools call `resolve_path` per operation); the once-per-process latch
-/// keeps the log signal-rich without rate-limiting the file subsystem.
-fn strict_mode() -> bool {
-    let on = !matches!(std::env::var("OPENCLAUDIA_ALLOW_OUT_OF_ROOT"), Ok(ref v) if v == "1");
-    if !on {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::SeqCst) {
-            tracing::warn!(
-                env = "OPENCLAUDIA_ALLOW_OUT_OF_ROOT",
-                "file-path jail DISABLED: OPENCLAUDIA_ALLOW_OUT_OF_ROOT=1 is set; \
-                 file tools may read/write outside the project root. crosslink #982",
-            );
-        }
-    }
-    on
-}
-
-fn path_is_within(canonical: &Path, root: &Path) -> bool {
-    canonical == root || canonical.starts_with(root)
+fn project_root() -> Result<PathBuf, String> {
+    crate::tools::security::current_context().map(|context| context.project_root().to_path_buf())
 }
 
 fn resolve_path(path: &str) -> Result<PathBuf, String> {
+    let security = crate::tools::security::current_context()?;
     let p = Path::new(path);
     let absolute = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(|e| format!("Cannot resolve relative path (no working directory): {e}"))?
-            .join(p)
+        security.working_directory().join(p)
     };
     if absolute
         .components()
@@ -330,22 +258,27 @@ fn resolve_path(path: &str) -> Result<PathBuf, String> {
         }
         built
     };
-    if strict_mode() {
-        let in_project = path_is_within(&canonical, &PROJECT_ROOT);
-        let in_temp = TEMP_ROOT
-            .as_ref()
-            .is_some_and(|t| path_is_within(&canonical, t));
-        if !in_project && !in_temp {
-            return Err(format!(
-                "Path '{path}' resolves to '{}' which is outside the project root ('{}') \
-                 and outside the process temp directory. Set \
-                 OPENCLAUDIA_ALLOW_OUT_OF_ROOT=1 to disable this jail (not recommended).",
-                canonical.display(),
-                PROJECT_ROOT.display(),
-            ));
-        }
+    if !security.permits_read(&canonical) {
+        return Err(format!(
+            "Path '{path}' resolves to '{}' which is outside the session's granted roots \
+             (project '{}', private temp '{}').",
+            canonical.display(),
+            security.project_root().display(),
+            security.private_temp_root().display(),
+        ));
     }
     Ok(canonical)
+}
+
+/// Open an agent-supplied path through the same immutable capability and
+/// descriptor-relative traversal used by `read_file`.
+///
+/// Agent-adjacent consumers such as the LSP adapter must use this rather than
+/// reopening a validated path by name.
+pub fn open_capability_regular_read(user_path: &str) -> Result<(PathBuf, std::fs::File), String> {
+    let resolved = resolve_path(user_path)?;
+    let file = secure_fs::open_regular_read(&resolved)?;
+    Ok((resolved, file))
 }
 
 /// Canonicalise a path that may not yet exist by walking the deepest
@@ -388,13 +321,12 @@ pub(super) fn canonicalize_or_walk_up(p: &Path, user_path: &str) -> Result<PathB
 }
 
 pub fn resolve_open_path(user_path: &str) -> Result<PathBuf, String> {
+    let security = crate::tools::security::current_context()?;
     let p = Path::new(user_path);
     let absolute = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(|e| format!("Cannot resolve relative path (no working directory): {e}"))?
-            .join(p)
+        security.working_directory().join(p)
     };
     if absolute
         .components()
@@ -432,20 +364,14 @@ pub fn resolve_open_path(user_path: &str) -> Result<PathBuf, String> {
         built
     };
     let containment_probe = canonical_parent.join(leaf);
-    if strict_mode() {
-        let in_project = path_is_within(&containment_probe, &PROJECT_ROOT);
-        let in_temp = TEMP_ROOT
-            .as_ref()
-            .is_some_and(|t| path_is_within(&containment_probe, t));
-        if !in_project && !in_temp {
-            return Err(format!(
-                "Path '{user_path}' resolves to '{}' which is outside the project root ('{}') \
-                 and outside the process temp directory. Set \
-                 OPENCLAUDIA_ALLOW_OUT_OF_ROOT=1 to disable this jail (not recommended).",
-                containment_probe.display(),
-                PROJECT_ROOT.display(),
-            ));
-        }
+    if !security.permits_write(&containment_probe) {
+        return Err(format!(
+            "Path '{user_path}' resolves to '{}' which is outside the session's writable roots \
+             (project '{}', private temp '{}').",
+            containment_probe.display(),
+            security.project_root().display(),
+            security.private_temp_root().display(),
+        ));
     }
     Ok(canonical_parent.join(leaf))
 }
@@ -568,7 +494,7 @@ pub(super) fn require_fresh_file_observation_if_ledger_active(
 }
 
 fn read_file_bytes_for_ledger(path: &Path) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
+    let file = secure_fs::open_regular_read(path).map_err(std::io::Error::other)?;
     let mut bytes = Vec::new();
     file.take(read::MAX_FILE_SIZE_BYTES)
         .read_to_end(&mut bytes)?;
@@ -668,8 +594,8 @@ mod tests {
         PathBuf,
         PathBuf,
     ) {
-        let a = tempfile::NamedTempFile::new().expect("tempfile a");
-        let b = tempfile::NamedTempFile::new().expect("tempfile b");
+        let a = tempfile::NamedTempFile::new_in(".").expect("tempfile a");
+        let b = tempfile::NamedTempFile::new_in(".").expect("tempfile b");
         let pa = a.path().canonicalize().expect("canonicalize a");
         let pb = b.path().canonicalize().expect("canonicalize b");
         (a, b, pa, pb)
@@ -819,7 +745,7 @@ mod tests {
         READ_TRACKER.clear_all();
         let _g = crate::tools::SessionIdGuard::set("session-363-rel-abs");
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(".").expect("tempdir");
         let canon_dir = dir.path().canonicalize().expect("canonicalize dir");
         let abs_file = canon_dir.join("rel_target.txt");
         std::fs::write(&abs_file, b"hello").expect("write file");
@@ -854,7 +780,7 @@ mod tests {
 
         // Path under a real tempdir but with a leaf that does not exist
         // on disk: canonicalize on the leaf will fail.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(".").expect("tempdir");
         let ghost = dir.path().join("does_not_exist_12345.txt");
         assert!(
             !ghost.exists(),
@@ -896,7 +822,7 @@ mod tests {
         READ_TRACKER.clear_all();
         let _g = crate::tools::SessionIdGuard::set("session-363-concurrent");
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(".").expect("tempdir");
         let canon_dir = dir.path().canonicalize().expect("canonicalize dir");
 
         let mut paths: Vec<PathBuf> = Vec::with_capacity(N);

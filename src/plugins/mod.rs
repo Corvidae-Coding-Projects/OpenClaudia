@@ -403,6 +403,30 @@ pub struct PluginMcpServer {
 }
 
 fn process_env_lookup(name: &str) -> Result<Option<String>, String> {
+    let grants = env::var_os("OPENCLAUDIA_MCP_ENV_GRANTS")
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "OPENCLAUDIA_MCP_ENV_GRANTS contains non-Unicode data".to_string())
+                .and_then(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .try_fold(std::collections::HashSet::new(), |mut grants, entry| {
+                            validate_mcp_env_var_name(entry)?;
+                            grants.insert(entry.to_string());
+                            Ok(grants)
+                        })
+                })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if !grants.contains(name) {
+        // An ungranted variable behaves as absent, allowing `${VAR:-safe}`
+        // defaults without exposing ambient host state.
+        return Ok(None);
+    }
     match env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(env::VarError::NotPresent) => Ok(None),

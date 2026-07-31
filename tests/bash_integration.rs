@@ -349,10 +349,13 @@ fn b2e_kill_shells_for_agent_terminates_only_matching_agent_shells() {
 
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let result = execute_tool(&make_tool_call(
-        "kill_shells_for_agent",
-        &json!({ "agent_id": alpha }),
-    ));
+    let result = {
+        let _guard = SessionIdGuard::set(alpha);
+        execute_tool(&make_tool_call(
+            "kill_shells_for_agent",
+            &json!({ "agent_id": alpha }),
+        ))
+    };
     assert!(
         !result.is_error,
         "B2e: kill_shells_for_agent must succeed; got: {}",
@@ -366,39 +369,52 @@ fn b2e_kill_shells_for_agent_terminates_only_matching_agent_shells() {
         result.content
     );
 
-    let alpha_poll = execute_tool(&make_tool_call(
-        "bash_output",
-        &json!({ "shell_id": alpha_shell }),
-    ));
+    let alpha_poll = {
+        let _guard = SessionIdGuard::set(alpha);
+        execute_tool(&make_tool_call(
+            "bash_output",
+            &json!({ "shell_id": alpha_shell }),
+        ))
+    };
     assert!(
         alpha_poll.is_error,
         "B2e: killed alpha shell must be removed from lookup; got: {}",
         alpha_poll.content
     );
 
-    let beta_poll = execute_tool(&make_tool_call(
-        "bash_output",
-        &json!({ "shell_id": beta_shell }),
-    ));
+    let beta_poll = {
+        let _guard = SessionIdGuard::set(beta);
+        execute_tool(&make_tool_call(
+            "bash_output",
+            &json!({ "shell_id": beta_shell }),
+        ))
+    };
     assert!(
         !beta_poll.is_error,
         "B2e: beta shell must remain available after alpha cleanup; got: {}",
         beta_poll.content
     );
 
-    let _cleanup = execute_tool(&make_tool_call(
-        "kill_shell",
-        &json!({ "shell_id": beta_shell }),
-    ));
+    let _cleanup = {
+        let _guard = SessionIdGuard::set(beta);
+        execute_tool(&make_tool_call(
+            "kill_shell",
+            &json!({ "shell_id": beta_shell }),
+        ))
+    };
 }
 
 /// B2f — agent-scoped cleanup is idempotent when no shells match.
 #[test]
 fn b2f_kill_shells_for_agent_no_matches_succeeds() {
-    let result = execute_tool(&make_tool_call(
-        "kill_shells_for_agent",
-        &json!({ "agent_id": "gap584-agent-without-shells" }),
-    ));
+    let agent = "gap584-agent-without-shells";
+    let result = {
+        let _guard = SessionIdGuard::set(agent);
+        execute_tool(&make_tool_call(
+            "kill_shells_for_agent",
+            &json!({ "agent_id": agent }),
+        ))
+    };
     assert!(
         !result.is_error,
         "B2f: no-match cleanup must be idempotent success; got: {}",
@@ -888,9 +904,12 @@ fn b5l_denylist_blocks_proc_environ_reads() {
 #[test]
 #[cfg(unix)]
 fn b6a_cd_single_quoted_path_reaches_bash() {
-    use tempfile::TempDir;
-    let dir = TempDir::new().expect("B6a: tempdir");
-    let path = dir.path().to_string_lossy().into_owned();
+    let dir = tempfile::Builder::new()
+        .prefix("openclaudia-b6a-")
+        .tempdir_in(".")
+        .expect("B6a: project tempdir");
+    let canonical = dir.path().canonicalize().expect("B6a: canonical tempdir");
+    let path = canonical.to_string_lossy().into_owned();
 
     let result = execute_tool(&make_tool_call(
         "bash",
@@ -903,7 +922,7 @@ fn b6a_cd_single_quoted_path_reaches_bash() {
         result.content
     );
     assert!(
-        result.content.contains(dir.path().to_str().unwrap()),
+        result.content.contains(canonical.to_str().unwrap()),
         "B6a: pwd must show the target dir; got: {}",
         result.content
     );
@@ -946,9 +965,12 @@ fn b6b_cd_nonexistent_path_reaches_bash_not_oc_denylist() {
 #[test]
 #[cfg(unix)]
 fn b6c_cd_double_quoted_path_with_spaces_executes() {
-    use tempfile::TempDir;
-    let dir = TempDir::new().expect("B6c: tempdir");
-    let path = dir.path().to_string_lossy().into_owned();
+    let dir = tempfile::Builder::new()
+        .prefix("openclaudia b6c ")
+        .tempdir_in(".")
+        .expect("B6c: project tempdir");
+    let canonical = dir.path().canonicalize().expect("B6c: canonical tempdir");
+    let path = canonical.to_string_lossy().into_owned();
 
     let result = execute_tool(&make_tool_call(
         "bash",
@@ -961,30 +983,22 @@ fn b6c_cd_double_quoted_path_with_spaces_executes() {
         result.content
     );
     assert!(
-        result.content.contains(dir.path().to_str().unwrap()),
+        result.content.contains(canonical.to_str().unwrap()),
         "B6c: pwd must show the target dir; got: {}",
         result.content
     );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// B7 — Sandbox toggle: document OC's current behavior, mark missing
+// B7 — Sandbox containment
 // Spec: crosslink #526 §B7
-// OC source: src/tools/bash/mod.rs (no sandbox implementation)
-//
-// GAP: OC has NO sandbox. CC wraps execution in seccomp/firejail/macOS
-// sandbox-exec via SandboxManager. OC's only isolation is process_group(0)
-// (for clean SIGTERM delivery) and env scrubbing.
-// Ref crosslink #575 (sandbox missing).
+// OC source: src/tools/bash/sandbox.rs
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// B7a — OC accepts `dangerouslyDisableSandbox` field but ignores it
+/// B7a — model input cannot disable the OS sandbox
 ///
-/// CC: field is parsed and passed to `shouldUseSandbox()` (BashTool.tsx:241).
 /// OC: field is not in the input schema; unknown JSON args are silently ignored.
-/// Passing the field must not cause an error.
-///
-/// GAP: crosslink #575 — sandbox subsystem missing.
+/// Passing the field must not cause an error or alter containment.
 #[test]
 fn b7a_dangerously_disable_sandbox_ignored_no_error() {
     let result = execute_tool(&make_tool_call(
@@ -1026,15 +1040,14 @@ fn b7b_gap_573_powershell_tool_not_registered() {
     );
 }
 
-/// B7c — GAP: commands run unsandboxed (filesystem writes succeed)
+/// B7c — host filesystem writes are contained
 ///
-/// OC: `process_group(0)` is NOT a security sandbox — it exists only for
-/// clean SIGTERM delivery. Ref crosslink #575.
-///
-/// Pin: a command with filesystem side-effects succeeds, proving no sandbox blocks it.
+/// A model can spell the destination through an interpreter, expansion, or a
+/// symlink, so this assertion tests the OS boundary rather than the command
+/// parser.
 #[test]
-#[cfg(unix)]
-fn b7c_gap_575_commands_run_without_sandbox() {
+#[cfg(target_os = "linux")]
+fn b7c_host_filesystem_write_is_blocked() {
     use tempfile::TempDir;
     let dir = TempDir::new().expect("B7c: tempdir");
     let file_path = dir.path().join("sandbox_probe.txt");
@@ -1042,18 +1055,154 @@ fn b7c_gap_575_commands_run_without_sandbox() {
 
     let result = execute_tool(&make_tool_call(
         "bash",
-        &json!({ "command": format!("echo unsandboxed > '{path_str}'") }),
+        &json!({
+            "command": format!(
+                "python3 -c 'from pathlib import Path; Path({path_str:?}).write_text(\"escaped\")'"
+            )
+        }),
     ));
 
-    // If OC were sandboxed, the write would be blocked; it must succeed.
     assert!(
-        !result.is_error,
-        "B7c: unsandboxed write must succeed (gap #575); got: {}",
+        result.is_error,
+        "B7c: writing a host temp path must fail; got: {}",
+        result.content,
+    );
+    assert!(!file_path.exists(), "B7c: host file escaped the sandbox");
+}
+
+/// B7d — symlinks cannot turn an in-project path into host access.
+#[test]
+#[cfg(target_os = "linux")]
+fn b7d_symlink_to_host_file_is_blocked() {
+    use std::os::unix::fs::symlink;
+
+    let host_dir = tempfile::TempDir::new().expect("B7d: host tempdir");
+    let host_secret = host_dir.path().join("secret.txt");
+    std::fs::write(&host_secret, "B7D_HOST_SECRET").expect("B7d: write host secret");
+
+    let project_dir = tempfile::Builder::new()
+        .prefix("openclaudia-b7d-")
+        .tempdir_in(".")
+        .expect("B7d: project tempdir");
+    let link = project_dir.path().join("outside-link");
+    symlink(&host_secret, &link).expect("B7d: create symlink");
+    let link = link.canonicalize().unwrap_or(link);
+    let link_path = project_dir.path().join("outside-link");
+
+    let result = execute_tool(&make_tool_call(
+        "bash",
+        &json!({ "command": format!("cat -- {:?}", link_path.to_string_lossy()) }),
+    ));
+
+    assert!(result.is_error, "B7d: symlink read must fail: {result:?}");
+    assert!(
+        !result.content.contains("B7D_HOST_SECRET"),
+        "B7d: host secret crossed the sandbox: {} (target {})",
+        result.content,
+        link.display(),
+    );
+}
+
+/// B7e — the sandbox has no route to a listening host TCP socket.
+#[test]
+#[cfg(target_os = "linux")]
+fn b7e_host_network_is_unreachable() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("B7e: bind listener");
+    let port = listener.local_addr().expect("B7e: local address").port();
+
+    let result = execute_tool(&make_tool_call(
+        "bash",
+        &json!({
+            "command": format!(
+                "python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", {port}), .2)'"
+            )
+        }),
+    ));
+
+    assert!(
+        result.is_error,
+        "B7e: sandbox connected to a host socket: {}",
         result.content
     );
+    listener
+        .set_nonblocking(true)
+        .expect("B7e: nonblocking listener");
     assert!(
-        file_path.exists(),
-        "B7c: file must be written — no sandbox blocking writes (gap #575)"
+        matches!(
+            listener.accept(),
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "B7e: host listener accepted a sandbox connection"
+    );
+}
+
+/// B7f — project output remains writable, but harness and VCS control state do not.
+#[test]
+#[cfg(target_os = "linux")]
+fn b7f_project_is_writable_but_control_state_is_protected() {
+    let project_dir = tempfile::Builder::new()
+        .prefix("openclaudia-b7f-")
+        .tempdir_in(".")
+        .expect("B7f: project tempdir");
+    let output = project_dir.path().join("output.txt");
+    let output_path = output
+        .canonicalize()
+        .unwrap_or_else(|_| output.clone())
+        .to_string_lossy()
+        .into_owned();
+
+    let write = execute_tool(&make_tool_call(
+        "bash",
+        &json!({ "command": format!("printf sandboxed > {output_path:?}") }),
+    ));
+    assert!(!write.is_error, "B7f: project write failed: {write:?}");
+    assert_eq!(
+        std::fs::read_to_string(&output).expect("B7f: read project output"),
+        "sandboxed"
+    );
+
+    let git_probe = std::path::Path::new(".git/openclaudia-sandbox-probe");
+    assert!(!git_probe.exists(), "B7f: stale git probe");
+    let control_write = execute_tool(&make_tool_call(
+        "bash",
+        &json!({ "command": "touch .git/openclaudia-sandbox-probe" }),
+    ));
+    assert!(
+        control_write.is_error,
+        "B7f: .git write escaped protection: {control_write:?}"
+    );
+    assert!(!git_probe.exists(), "B7f: sandbox mutated .git");
+
+    let git_status = execute_tool(&make_tool_call(
+        "bash",
+        &json!({ "command": "git status --short >/dev/null" }),
+    ));
+    assert!(
+        !git_status.is_error,
+        "B7f: read-only git workflow failed: {git_status:?}"
+    );
+
+    let hidden_state = execute_tool(&make_tool_call(
+        "bash",
+        &json!({ "command": "test ! -e .openclaudia/memory.db && test ! -e .claude/hooks" }),
+    ));
+    assert!(
+        !hidden_state.is_error,
+        "B7f: harness control state is visible: {hidden_state:?}"
+    );
+}
+
+/// B7g — a process in the sandbox cannot create a nested user namespace.
+#[test]
+#[cfg(target_os = "linux")]
+fn b7g_nested_user_namespace_is_blocked() {
+    let result = execute_tool(&make_tool_call(
+        "bash",
+        &json!({ "command": "unshare -Ur --map-root-user true" }),
+    ));
+    assert!(
+        result.is_error,
+        "B7g: nested user namespace unexpectedly succeeded: {result:?}"
     );
 }
 

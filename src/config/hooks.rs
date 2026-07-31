@@ -5,36 +5,37 @@ use std::collections::HashSet;
 
 /// Sandbox isolation level applied when spawning a hook command.
 ///
-/// Defaults to [`SandboxMode::EnvScrub`] when a policy is present and the
-/// field is omitted. The weakest mode still scrubs all credentials from the
-/// child environment.
+/// Defaults to [`SandboxMode::FullSandbox`] when a policy is present and the
+/// field is omitted. Weaker modes require a separate host-startup trust
+/// decision; repository configuration alone cannot opt out of isolation.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
     /// No additional isolation beyond the defaults provided by the OS.
     /// Credentials are still scrubbed (same as `EnvScrub`).
     None,
-    /// Remove every credential-classified env var before spawning (default).
-    #[default]
+    /// Remove every credential-classified env var before spawning.
     EnvScrub,
-    /// Placeholder for future OS-level sandbox (e.g. bubblewrap/nsjail).
-    /// Currently behaves identically to `EnvScrub`; reserved for crosslink #254 Phase 2.
+    /// Run the hook inside the OS subprocess sandbox. Project and hook scripts
+    /// remain readable, while VCS/harness control state is read-only, host
+    /// files and networking are unavailable, and project output is writable.
+    #[default]
     FullSandbox,
 }
 
 /// Per-`HooksConfig` security policy for command hook execution.
 ///
-/// When `None` (the field is absent from the config), hooks run in
-/// **backwards-compatible allow-all mode** — every command is permitted and
-/// `EnvScrub` is applied automatically. A deprecation warning is emitted once
-/// per process so operators know to add an explicit policy.
+/// When `None` (the field is absent from the config), every command name is
+/// permitted but command hooks still run in the full OS sandbox. This keeps
+/// compatibility with existing hook command lists without trusting repository
+/// code with host process access.
 ///
 /// Example config YAML:
 /// ```yaml
 /// hooks:
 ///   policy:
 ///     allowed_commands: ["python", "node", "jq"]
-///     sandbox: env_scrub
+///     sandbox: full_sandbox
 /// ```
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct HookPolicy {
@@ -47,7 +48,7 @@ pub struct HookPolicy {
     #[serde(default)]
     pub allowed_commands: Option<HashSet<String>>,
 
-    /// Isolation mode applied during spawn. Defaults to [`SandboxMode::EnvScrub`].
+    /// Isolation mode applied during spawn. Defaults to [`SandboxMode::FullSandbox`].
     #[serde(default)]
     pub sandbox: SandboxMode,
 }
@@ -56,7 +57,7 @@ pub struct HookPolicy {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct HooksConfig {
     /// Security policy applied to all command hooks in this config.
-    /// Absent → backwards-compatible allow-all mode (deprecation warning logged once).
+    /// Absent → allow every executable name inside the full OS sandbox.
     #[serde(default)]
     pub policy: Option<HookPolicy>,
     #[serde(default)]
@@ -257,7 +258,7 @@ mod tests {
     fn test_hook_policy_default() {
         let policy = HookPolicy::default();
         assert!(policy.allowed_commands.is_none());
-        assert_eq!(policy.sandbox, SandboxMode::EnvScrub);
+        assert_eq!(policy.sandbox, SandboxMode::FullSandbox);
     }
 
     #[test]
@@ -280,6 +281,7 @@ mod tests {
         let policy = config.policy.unwrap();
         let allowed = policy.allowed_commands.unwrap();
         assert!(allowed.contains("jq"));
+        assert_eq!(policy.sandbox, SandboxMode::FullSandbox);
     }
 
     #[test]

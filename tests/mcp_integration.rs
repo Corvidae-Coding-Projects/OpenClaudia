@@ -31,7 +31,7 @@ use openclaudia::mcp::{
     HttpTransport, McpError, McpManager, McpServer, McpServerConfig, StdioTransport,
 };
 use openclaudia::plugins::PluginManager;
-use openclaudia::proxy::connect_mcp_servers;
+use openclaudia::proxy::connect_mcp_servers_with_trust;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -289,7 +289,12 @@ async fn plugin_mcp_stdio_env_reaches_child_process() {
     let plugins = Arc::new(plugins);
     let manager = Arc::new(RwLock::new(McpManager::new()));
 
-    connect_mcp_servers(&manager, &plugins).await;
+    connect_mcp_servers_with_trust(
+        &manager,
+        &plugins,
+        &std::collections::HashSet::from(["env-plugin/env-server".to_string()]),
+    )
+    .await;
 
     let functions = {
         let mcp = manager.read().await;
@@ -301,6 +306,157 @@ async fn plugin_mcp_stdio_env_reaches_child_process() {
     assert!(
         functions.is_empty(),
         "plugin MCP env var must suppress fixture tools; non-empty tools means env was dropped"
+    );
+}
+
+#[tokio::test]
+async fn repository_mcp_server_requires_exact_host_trust_and_revocation_disconnects_it() {
+    let root = TempDir::new().expect("tempdir");
+    let plugin_dir = root.path().join("trust-plugin");
+    std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+    let fixture_json = serde_json::to_string(fixture_path().to_str().expect("fixture path utf-8"))
+        .expect("fixture path json");
+    std::fs::write(
+        plugin_dir.join("plugin.json"),
+        format!(
+            r#"{{
+                "name": "trust-plugin",
+                "mcpServers": {{
+                    "trust-server": {{
+                        "transport": "stdio",
+                        "command": "python3",
+                        "args": [{fixture_json}]
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .expect("manifest");
+    let mut plugins = PluginManager::with_paths(vec![root.path().to_path_buf()]);
+    assert!(plugins.discover().is_empty());
+    let plugins = Arc::new(plugins);
+    let manager = Arc::new(RwLock::new(McpManager::new()));
+
+    connect_mcp_servers_with_trust(&manager, &plugins, &std::collections::HashSet::new()).await;
+    assert!(
+        !manager.read().await.is_connected("trust-server").await,
+        "repository MCP must remain disconnected before explicit trust"
+    );
+
+    connect_mcp_servers_with_trust(
+        &manager,
+        &plugins,
+        &std::collections::HashSet::from(["trust-plugin/trust-server".to_string()]),
+    )
+    .await;
+    assert!(manager.read().await.is_live("trust-server").await);
+
+    connect_mcp_servers_with_trust(&manager, &plugins, &std::collections::HashSet::new()).await;
+    assert!(
+        !manager.read().await.is_connected("trust-server").await,
+        "revocation must terminate and unregister the trusted server"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn stdio_mcp_rejects_an_executable_from_an_agent_writable_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let executable =
+        tempfile::NamedTempFile::new_in(".").expect("project-local executable fixture");
+    std::fs::set_permissions(executable.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("executable mode");
+    let result = StdioTransport::spawn(
+        executable.path().to_str().expect("utf-8 executable path"),
+        &[],
+    );
+    let Err(error) = result else {
+        panic!("project executable must not become an MCP host extension");
+    };
+    assert!(
+        error.to_string().contains("agent-writable"),
+        "unexpected executable trust error: {error}"
+    );
+}
+
+#[test]
+fn stdio_mcp_rejects_sensitive_environment_without_an_exact_host_grant() {
+    let key = "OPENCLAUDIA_TEST_MCP_PRIVATE_TOKEN";
+    let env = HashMap::from([(key.to_string(), "canary-value".to_string())]);
+    let Err(error) = StdioTransport::spawn_with_env("python3", &["-c", "pass"], &env) else {
+        panic!("sensitive MCP env must require an exact host grant");
+    };
+    assert!(
+        error.to_string().contains(key) && error.to_string().contains("host operator"),
+        "unexpected environment-grant error: {error}"
+    );
+}
+
+#[test]
+fn stdio_mcp_rejects_host_dynamic_loader_environment() {
+    let env = HashMap::from([(
+        "LD_PRELOAD".to_string(),
+        "./repository-controlled-library.so".to_string(),
+    )]);
+    let Err(error) = StdioTransport::spawn_with_env("python3", &["-c", "pass"], &env) else {
+        panic!("MCP env must not influence the host sandbox launcher");
+    };
+    assert!(
+        error.to_string().contains("dynamic loader"),
+        "unexpected loader-environment error: {error}"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn stdio_mcp_sandbox_blocks_host_file_and_network_access() {
+    let outside = TempDir::new().expect("outside tempdir");
+    let sentinel = outside.path().join("host-sentinel");
+    std::fs::write(&sentinel, "outside-secret").expect("sentinel");
+    let path_literal =
+        serde_json::to_string(sentinel.to_str().expect("utf-8 sentinel")).expect("json path");
+    let script = format!(
+        r#"
+import json, socket, sys
+blocked_file = False
+blocked_network = False
+try:
+    open({path_literal}, "rb").read()
+except OSError:
+    blocked_file = True
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+except OSError:
+    blocked_network = True
+
+def reply(i, result):
+    print(json.dumps({{"jsonrpc":"2.0","id":i,"result":result}}), flush=True)
+
+request = json.loads(sys.stdin.readline())
+reply(request["id"], {{
+    "protocolVersion":"2024-11-05",
+    "capabilities":{{"tools":{{"listChanged":False}}}},
+    "serverInfo":{{"name":"sandbox-probe","version":"1"}}
+}})
+request = json.loads(sys.stdin.readline())
+reply(request["id"], None)
+request = json.loads(sys.stdin.readline())
+name = "sandbox_blocked" if blocked_file and blocked_network else "sandbox_escaped"
+reply(request["id"], {{"tools":[{{"name":name,"inputSchema":{{"type":"object"}}}}]}})
+"#
+    );
+    let transport =
+        StdioTransport::spawn("python3", &["-u", "-c", &script]).expect("sandboxed MCP");
+    let server = McpServer::new("sandbox-probe", Box::new(transport))
+        .await
+        .expect("probe handshake");
+    assert!(
+        server
+            .tools()
+            .iter()
+            .any(|tool| tool.name == "sandbox_blocked"),
+        "sandboxed MCP reached a host file or network socket"
     );
 }
 

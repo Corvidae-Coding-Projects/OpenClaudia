@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -118,7 +119,7 @@ fn glob_permissive_translator_accepts_most_patterns_no_panic() {
 
 #[test]
 fn glob_finds_matching_file_in_tempdir() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("a.rs"), "").expect("write a");
     std::fs::write(dir.path().join("b.rs"), "").expect("write b");
     std::fs::write(dir.path().join("c.txt"), "").expect("write c");
@@ -141,7 +142,7 @@ fn glob_finds_matching_file_in_tempdir() {
 
 #[test]
 fn glob_no_match_returns_clean_output_not_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("x.txt"), "").expect("write");
 
     let args = args_with(&[
@@ -189,7 +190,7 @@ fn grep_pattern_as_array_returns_validation_error() {
 
 #[test]
 fn grep_invalid_regex_pattern_returns_clean_error_not_panic() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("x.txt"), "body").expect("write");
 
     let args = args_with(&[
@@ -210,7 +211,7 @@ fn grep_invalid_regex_pattern_returns_clean_error_not_panic() {
 
 #[test]
 fn grep_literal_pattern_finds_match_in_file() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(
         dir.path().join("hit.txt"),
         "line one\nUNIQUE_MARKER_xyz\nline three\n",
@@ -228,7 +229,7 @@ fn grep_literal_pattern_finds_match_in_file() {
 
 #[test]
 fn grep_case_insensitive_flag_matches_uppercase_lowercase() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("ci.txt"), "Hello WORLD\nlowercase world\n").expect("write");
 
     let args = args_with(&[
@@ -245,7 +246,7 @@ fn grep_case_insensitive_flag_matches_uppercase_lowercase() {
 
 #[test]
 fn grep_default_case_sensitive_skips_wrong_case() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("cs.txt"), "Hello WORLD\nfoo bar\n").expect("write");
 
     let args = args_with(&[
@@ -291,7 +292,7 @@ fn grep_path_as_array_returns_validation_error() {
 
 #[test]
 fn grep_context_lines_above_u64_max_no_panic() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("ctx.txt"), "match\n").expect("write");
 
     let args = args_with(&[
@@ -305,7 +306,7 @@ fn grep_context_lines_above_u64_max_no_panic() {
 
 #[test]
 fn grep_negative_context_lines_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("ctx2.txt"), "match\n").expect("write");
 
     let args = args_with(&[

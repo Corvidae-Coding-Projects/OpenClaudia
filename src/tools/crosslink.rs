@@ -69,8 +69,9 @@ const LEGACY_CHAINLINK_DIR: &str = ".chainlink";
 /// into the new location so existing project history survives the
 /// chainlink→crosslink migration.
 fn db_path_for_cwd() -> Result<PathBuf, String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("Failed to read current directory: {e}"))?;
+    let cwd = crate::tools::security::current_context()?
+        .working_directory()
+        .to_path_buf();
     let dir = cwd.join(CROSSLINK_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {CROSSLINK_DIR}/: {e}"))?;
     let db = dir.join("issues.db");

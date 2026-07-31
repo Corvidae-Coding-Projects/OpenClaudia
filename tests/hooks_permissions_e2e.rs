@@ -30,7 +30,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::config::{Hook, HookEntry, HooksConfig};
+use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, SandboxMode};
 use openclaudia::hooks::{HookEngine, HookEvent, HookInput};
 use openclaudia::permissions::{
     CheckResult, EscalationState, PermissionDecision, PermissionManager, PermissionRule,
@@ -46,7 +46,7 @@ use tempfile::tempdir;
 /// `default_allow=[]` so we never get an unwanted `Allowed` result that
 /// masks a regression.
 fn fresh_manager() -> (PermissionManager, tempfile::TempDir) {
-    let dir = tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("permissions.json");
     let mgr = PermissionManager::new(path, true, Vec::new());
     (mgr, dir)
@@ -113,6 +113,38 @@ async fn command_hook_runs_and_returns_allowed_by_default() {
             .all(|o| o.decision.as_deref() != Some("deny")),
         "no hook decided deny, but outputs say: {:?}",
         result.outputs
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn full_sandbox_hook_cannot_persist_host_temp_write() {
+    let host_dir = tempdir().expect("full-sandbox host tempdir");
+    let host_file = host_dir.path().join("escape.txt");
+    let host_dir_text = host_dir.path().to_string_lossy();
+    let host_file_text = host_file.to_string_lossy();
+    let command = format!(
+        "test \"$OPENCLAUDIA_SANDBOX\" = 1 && mkdir -p {host_dir_text} && \
+         printf escaped > {host_file_text}"
+    );
+    let mut cfg = config_with_command_hook(HookSlot::SessionStart, None, &command, 10);
+    cfg.policy = Some(HookPolicy {
+        allowed_commands: None,
+        sandbox: SandboxMode::FullSandbox,
+    });
+    let engine = HookEngine::new(cfg);
+    let input = HookInput::new(HookEvent::SessionStart);
+
+    let result = engine.run(HookEvent::SessionStart, &input).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "full sandbox hook should succeed in its private temp: {:?}",
+        result.errors
+    );
+    assert!(
+        !host_file.exists(),
+        "full sandbox hook persisted a write to host temp"
     );
 }
 
@@ -205,6 +237,45 @@ async fn timeout_kills_long_running_hook_within_grace_window() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
+async fn timeout_kills_hook_descendants_before_they_can_escape_lifetime() {
+    let dir = tempfile::tempdir_in(".").expect("project-local marker directory");
+    let marker = dir.path().join("descendant-survived");
+    let command = format!("(sleep 2; touch '{}') & sleep 60", marker.to_string_lossy());
+    let cfg = config_with_command_hook(HookSlot::SessionStart, None, &command, 1);
+    let engine = HookEngine::new(cfg);
+    let input = HookInput::new(HookEvent::SessionStart);
+
+    let _ = engine.run(HookEvent::SessionStart, &input).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    assert!(
+        !marker.exists(),
+        "a daemonized hook descendant survived timeout cleanup"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn hook_output_capture_is_bounded() {
+    let command = r#"python3 -c 'print("x" * (2 * 1024 * 1024))'"#;
+    let cfg = config_with_command_hook(HookSlot::SessionStart, None, command, 10);
+    let engine = HookEngine::new(cfg);
+    let input = HookInput::new(HookEvent::SessionStart);
+
+    let result = engine.run(HookEvent::SessionStart, &input).await;
+    let retained = result
+        .outputs
+        .iter()
+        .filter_map(|output| output.additional_context.as_deref())
+        .map(str::len)
+        .sum::<usize>();
+    assert!(
+        retained < 1_100_000,
+        "hook retained {retained} output bytes"
+    );
+}
+
+#[tokio::test]
 async fn user_prompt_submit_matcher_targets_prompt_not_tool_name() {
     // Crosslink #350 regression test: matchers on UserPromptSubmit
     // must test the prompt text, NOT a tool_name (which is absent
@@ -253,7 +324,7 @@ async fn multiple_hooks_in_same_slot_all_run() {
     // Two entries both match (no matcher = unconditional). Both
     // must run. The first prints "first" to additionalContext, the
     // second to systemMessage. Both must end up in outputs.
-    let dir = tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(".").expect("project-local tempdir");
     let marker_a = dir.path().join("a.txt");
     let marker_b = dir.path().join("b.txt");
 

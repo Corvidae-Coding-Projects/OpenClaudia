@@ -1,43 +1,10 @@
-use super::{canonicalize_or_walk_up, resolve_open_path, resolve_path, READ_TRACKER};
+use super::{resolve_open_path, resolve_path, secure_fs, READ_TRACKER};
 use crate::tools::args::ToolArgs as _;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs;
-use std::io::Write as _;
+use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::Path;
-
-/// Open a file for writing in a way that refuses to follow a symlink at the
-/// leaf. This closes the TOCTOU window in which an attacker swaps the leaf
-/// for a symlink between [`resolve_path`]'s `canonicalize` and the final
-/// `fs::write` (crosslink #417 / dup #428).
-///
-/// `O_NOFOLLOW` applies to the **last** component of the path only — intermediate
-/// path elements still resolve through symlinks. That is exactly what we want:
-/// the jail check has already vetted the *resolved* path, and `O_NOFOLLOW`
-/// ensures the kernel's `open(2)` call fails with `ELOOP` if the leaf became
-/// a symlink in the meantime.
-#[cfg(unix)]
-fn open_for_write_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_for_write_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    // On non-Unix targets we fall back to the standard open. Windows
-    // hardening (FILE_FLAG_OPEN_REPARSE_POINT) is tracked separately.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-}
 
 /// Write content to a file
 pub fn execute_write_file(args: &HashMap<String, Value>) -> (String, bool) {
@@ -60,23 +27,33 @@ pub fn execute_write_file(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (e, true),
     };
 
-    // crosslink #969: single source of truth for "canonicalize the path, or
-    // walk up to the deepest existing ancestor and rejoin." Edit, write, and
-    // (the next refactor) notebook all share this helper instead of carrying
-    // three drifted copies.
-    let canonical = match canonicalize_or_walk_up(&p, user_path) {
-        Ok(c) => c,
-        Err(e) => return (e, true),
-    };
-    let path = canonical.to_string_lossy().to_string();
+    let path = p.to_string_lossy().to_string();
     let path = path.as_str();
+
+    let content = match args.arg_str_strict("content") {
+        Ok(content) => content,
+        Err(e) => return e.into_tool_error(),
+    };
+
+    if let Err(msg) = crate::guardrails::check_file_access(path) {
+        return (msg, true);
+    }
+
+    let (mut file, target_exists) = match secure_fs::open_regular_update_or_create(&open_path) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return (
+                format!("Failed to securely open file '{path}' for writing: {error}"),
+                true,
+            );
+        }
+    };
 
     // crosslink #968: parity with `edit_file` — require the file to have
     // been read at least once before we overwrite it. A model that
     // writes blindly is hallucinating the old contents; the diff is
     // unverifiable. Creating a new file (path does not exist yet) is
     // exempt because there is no prior content to hallucinate.
-    let target_exists = Path::new(path).exists();
     if target_exists && !READ_TRACKER.has_been_read(Path::new(path)) {
         return (
             format!(
@@ -96,39 +73,22 @@ pub fn execute_write_file(args: &HashMap<String, Value>) -> (String, bool) {
         }
     }
 
-    let content = match args.arg_str_strict("content") {
-        Ok(content) => content,
-        Err(e) => return e.into_tool_error(),
+    let old_content = if target_exists {
+        match secure_fs::read_to_string(&mut file, Path::new(path)) {
+            Ok(content) => content,
+            Err(error) => return (error, true),
+        }
+    } else {
+        String::new()
     };
-
-    if let Err(msg) = crate::guardrails::check_file_access(path) {
-        return (msg, true);
-    }
-
-    let old_content = fs::read_to_string(path).unwrap_or_default();
     let old_lines = u32::try_from(old_content.lines().count()).unwrap_or(u32::MAX);
     let new_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
-    if let Some(parent) = Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                return (format!("Failed to create directories: {e}"), true);
-            }
-        }
-    }
-
-    // Open with O_NOFOLLOW against the LEAF-PRESERVING path. See #417.
-    let mut file = match open_for_write_nofollow(&open_path) {
-        Ok(f) => f,
-        Err(e) => {
-            return (
-                format!("Failed to open file '{path}' for writing: {e}"),
-                true,
-            );
-        }
-    };
-
-    match file.write_all(content.as_bytes()) {
+    let write_result = file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| file.set_len(0))
+        .and_then(|()| file.write_all(content.as_bytes()));
+    match write_result {
         Ok(()) => {
             crate::guardrails::record_file_modification(path, new_lines, old_lines);
             super::record_active_diff_observation(path, &old_content, content);
@@ -164,7 +124,7 @@ mod tests {
 
     #[test]
     fn write_creates_parent_directories_recursively() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let deep = dir.path().join("a").join("b").join("c").join("file.txt");
         let args = make_args(&deep.to_string_lossy(), "hello");
         let (msg, is_err) = super::execute_write_file(&args);
@@ -177,7 +137,7 @@ mod tests {
 
     #[test]
     fn write_success_message_contains_byte_count_and_path() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("out.txt");
         let content = "abc";
         let args = make_args(&path.to_string_lossy(), content);
@@ -190,7 +150,7 @@ mod tests {
     #[test]
     fn write_parent_already_exists_is_idempotent() {
         let _lock = tracker_lock();
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("file.txt");
         let args = make_args(&path.to_string_lossy(), "first");
         let (_, is_err) = super::execute_write_file(&args);
@@ -208,7 +168,7 @@ mod tests {
     #[test]
     fn write_overwrites_existing_file() {
         let _lock = tracker_lock();
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("existing.txt");
         std::fs::write(&path, "old content").expect("setup");
         // crosslink #968: overwrite requires a prior read.
@@ -223,7 +183,7 @@ mod tests {
     #[test]
     fn successful_overwrite_invalidates_prior_read_marker() {
         let _lock = tracker_lock();
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("stale_after_write.txt");
         std::fs::write(&path, "old").expect("setup");
         super::READ_TRACKER.mark_read(&path);
@@ -250,7 +210,7 @@ mod tests {
     fn fix968_overwrite_without_read_is_rejected() {
         let _lock = tracker_lock();
         super::READ_TRACKER.clear_all();
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("must_read_first.txt");
         std::fs::write(&path, "old").expect("setup");
         // Deliberately do NOT mark_read. Overwrite must fail.
@@ -275,7 +235,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(crate::ledger::RealityLedger::new()));
         let _ledger_guard =
             crate::ledger::install_active_ledger_for_session("write-ledger-read-required", ledger);
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("ledger_requires_read.txt");
         std::fs::write(&path, "old").expect("setup");
         super::READ_TRACKER.mark_read(&path);
@@ -297,7 +257,7 @@ mod tests {
     /// content, not to gate fresh creation.
     #[test]
     fn fix968_create_new_file_does_not_require_read() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("brand_new_file.txt");
         assert!(!path.exists(), "precondition: target must not exist");
         let args = make_args(&path.to_string_lossy(), "fresh");
@@ -308,7 +268,7 @@ mod tests {
 
     #[test]
     fn write_empty_content_succeeds() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("empty.txt");
         let args = make_args(&path.to_string_lossy(), "");
         let (msg, is_err) = super::execute_write_file(&args);
@@ -319,7 +279,7 @@ mod tests {
 
     #[test]
     fn write_missing_content_arg_returns_error() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("x.txt");
         let mut args = HashMap::new();
         args.insert(
@@ -345,7 +305,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fix417_write_rejects_symlink_at_target() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let target = dir.path().join("attacker_secrets.txt");
         std::fs::write(&target, "DO NOT OVERWRITE").expect("setup target");
         let leaf = dir.path().join("leaf.txt");
@@ -366,7 +326,7 @@ mod tests {
     #[test]
     fn fix417_write_legitimate_regular_file_still_works() {
         let _lock = tracker_lock();
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("real.txt");
         std::fs::write(&path, "old").expect("setup");
         // crosslink #968: overwrite requires a prior read.
@@ -379,7 +339,7 @@ mod tests {
 
     #[test]
     fn fix417_write_create_new_file_works() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("brand_new.txt");
         assert!(!path.exists(), "precondition: file must not exist");
         let args = make_args(&path.to_string_lossy(), "fresh");

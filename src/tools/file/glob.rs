@@ -22,12 +22,11 @@
 //!
 //! [`PROJECT_ROOT`]: super::PROJECT_ROOT
 
-use super::resolve_path;
+use super::{resolve_path, secure_fs};
 use crate::tools::args::ToolArgs as _;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Hard cap on returned filenames (parity with CC `GlobTool`).
@@ -86,9 +85,21 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
     let mut visited: usize = 0;
     let mut truncated = false;
 
+    let directory = match secure_fs::open_directory(&root) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return (
+                format!(
+                    "Failed to securely open glob root '{}': {error}",
+                    root.display()
+                ),
+                true,
+            );
+        }
+    };
     walk(
-        &root,
-        &root,
+        &directory,
+        Path::new(""),
         &regex,
         allow_hidden_root,
         &mut matches,
@@ -116,8 +127,8 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
 }
 
 fn walk(
-    root: &Path,
-    dir: &Path,
+    dir: &secure_fs::SecureDirectory,
+    relative_dir: &Path,
     regex: &Regex,
     allow_hidden_root: bool,
     matches: &mut Vec<String>,
@@ -127,26 +138,19 @@ fn walk(
     if matches.len() >= MAX_RESULTS || *visited >= MAX_WALK_ENTRIES {
         return;
     }
-    let entries = match fs::read_dir(dir) {
+    let entries = match dir.entries() {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
-                dir = %dir.display(),
+                dir = %relative_dir.display(),
                 error = %e,
                 "glob: skipping unreadable directory",
             );
             return;
         }
     };
-    let mut subdirs: Vec<PathBuf> = Vec::new();
+    let mut subdirs: Vec<(secure_fs::SecureDirectory, PathBuf)> = Vec::new();
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e, "glob: skipping unreadable entry");
-                continue;
-            }
-        };
         *visited += 1;
         if *visited >= MAX_WALK_ENTRIES {
             tracing::warn!(
@@ -156,12 +160,9 @@ fn walk(
             *truncated = true;
             return;
         }
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            let name = entry.file_name();
+        let path = relative_dir.join(&entry.name);
+        if entry.kind == secure_fs::SecureFileType::Directory {
+            let name = entry.name;
             let name_str = name.to_string_lossy();
             // Skip hidden / vendor dirs unless caller explicitly chose
             // to descend (root was named such a dir).
@@ -170,12 +171,20 @@ fn walk(
             {
                 continue;
             }
-            subdirs.push(path);
-        } else if file_type.is_file() {
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            let rel_str = rel.to_string_lossy();
+            match dir.open_child_directory(&name) {
+                Ok(child) => subdirs.push((child, path)),
+                Err(error) => {
+                    tracing::warn!(
+                        entry = %path.display(),
+                        %error,
+                        "glob: directory changed before secure open"
+                    );
+                }
+            }
+        } else if entry.kind == secure_fs::SecureFileType::Regular {
+            let rel_str = path.to_string_lossy();
             if regex.is_match(&rel_str) {
-                matches.push(rel.display().to_string());
+                matches.push(path.display().to_string());
                 if matches.len() >= MAX_RESULTS {
                     *truncated = true;
                     return;
@@ -183,9 +192,9 @@ fn walk(
             }
         }
     }
-    for sub in subdirs {
+    for (sub, relative) in subdirs {
         walk(
-            root, &sub, regex, false, // descend with default hidden-skip behaviour
+            &sub, &relative, regex, false, // descend with default hidden-skip behaviour
             matches, visited, truncated,
         );
         if matches.len() >= MAX_RESULTS || *visited >= MAX_WALK_ENTRIES {
@@ -246,6 +255,7 @@ fn glob_to_regex(pattern: &str) -> Option<Regex> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
     use std::fs::File;
     use std::io::Write as _;
     use tempfile::TempDir;
@@ -264,7 +274,7 @@ mod tests {
     /// Subdirs are reached only with `**`.
     #[test]
     fn glob_matches_rust_files_at_root_with_star() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         write_file(dir.path(), "lib.rs", "fn x() {}");
         write_file(dir.path(), "main.rs", "fn main() {}");
         write_file(dir.path(), "src/inner.rs", "fn y() {}");
@@ -287,7 +297,7 @@ mod tests {
     /// Pin: `**` crosses path separators — `**/*.rs` reaches subdirs.
     #[test]
     fn glob_double_star_crosses_directories() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         write_file(dir.path(), "src/deep/a.rs", "fn a() {}");
         write_file(dir.path(), "src/deep/b.txt", "no");
         let mut args = HashMap::new();
@@ -344,7 +354,7 @@ mod tests {
     /// This pins the "no panic on weird input" invariant.
     #[test]
     fn glob_special_characters_are_escaped_not_panicking() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         // Create a file whose name contains the literal characters we
         // are testing: `[` and `]`. The glob dialect treats these as
         // literals (regex specials are escaped before compile).

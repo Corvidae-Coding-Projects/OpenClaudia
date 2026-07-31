@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 fn dispatch_list(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -85,7 +86,7 @@ fn path_with_parent_dir_traversal_rejected() {
 
 #[test]
 fn nonexistent_path_errors_with_documented_message() {
-    let args = args_with(&[("path", json!("/tmp/definitely_nonexistent_xyz_marker_153"))]);
+    let args = args_with(&[("path", json!("definitely_nonexistent_xyz_marker_153"))]);
     let (msg, is_err) = dispatch_list(&args);
     assert!(is_err);
     assert!(
@@ -104,7 +105,7 @@ fn nonexistent_path_errors_with_documented_message() {
 
 #[test]
 fn lists_files_in_tempdir() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("alpha.txt"), "").expect("write a");
     std::fs::write(dir.path().join("beta.rs"), "").expect("write b");
     std::fs::write(dir.path().join("gamma.md"), "").expect("write g");
@@ -119,7 +120,7 @@ fn lists_files_in_tempdir() {
 
 #[test]
 fn lists_empty_dir_returns_empty_output_not_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let args = args_with(&[("path", json!(dir.path().to_str().unwrap()))]);
     let (text, is_err) = dispatch_list(&args);
     assert!(!is_err);
@@ -135,7 +136,7 @@ fn lists_empty_dir_returns_empty_output_not_error() {
 
 #[test]
 fn directories_marked_with_trailing_slash() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::create_dir(dir.path().join("subdir")).expect("mkdir");
     std::fs::write(dir.path().join("file.txt"), "").expect("write");
 
@@ -154,7 +155,7 @@ fn directories_marked_with_trailing_slash() {
 #[test]
 fn dirs_appear_before_files_in_output() {
     // PINS #953: dirs-before-files alphabetical layout.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     // Use names that would mix if simple alphabetical.
     std::fs::write(dir.path().join("a_file.txt"), "").expect("write");
     std::fs::create_dir(dir.path().join("z_dir")).expect("mkdir");
@@ -187,7 +188,7 @@ fn dirs_appear_before_files_in_output() {
 #[test]
 fn nested_dirs_listed_at_only_top_level() {
     // list_files is non-recursive.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::create_dir(dir.path().join("outer")).expect("mkdir outer");
     std::fs::write(dir.path().join("outer/inner.txt"), "").expect("write inner");
 
@@ -207,7 +208,7 @@ fn nested_dirs_listed_at_only_top_level() {
 
 #[test]
 fn unicode_filename_listed_byte_exact() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     std::fs::write(dir.path().join("日本語.txt"), "").expect("write unicode");
     std::fs::create_dir(dir.path().join("フォルダ")).expect("mkdir unicode");
 
@@ -228,7 +229,7 @@ fn list_files_registered_in_registry() {
 
 #[test]
 fn list_files_never_panics_on_arbitrary_extra_args() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let args = args_with(&[
         ("path", json!(dir.path().to_str().unwrap())),
         ("extra", json!({"k": "v"})),
@@ -240,7 +241,7 @@ fn list_files_never_panics_on_arbitrary_extra_args() {
 
 #[test]
 fn list_files_path_to_regular_file_errors_cleanly() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let f = dir.path().join("just_a_file.txt");
     std::fs::write(&f, "body").expect("write");
 

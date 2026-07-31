@@ -222,14 +222,14 @@ impl ScheduleStore {
 /// back to the original relative path rather than panic — surfacing
 /// a `warn!` so the operator can see what happened.
 fn schedules_path() -> PathBuf {
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(SCHEDULES_FILE),
+    match crate::tools::security::current_context() {
+        Ok(context) => context.working_directory().join(SCHEDULES_FILE),
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "schedules_path: current_dir() failed; falling back to relative {SCHEDULES_FILE}"
+                "schedules_path: session context unavailable; using an invalid fail-closed path"
             );
-            PathBuf::from(SCHEDULES_FILE)
+            PathBuf::from("/__openclaudia_unavailable__/schedules.json")
         }
     }
 }

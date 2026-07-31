@@ -6,7 +6,7 @@
 //! covered `HookEntry` + `HookMatcherTarget` serde +
 //! basic `HookPolicy` deserialization; this file pins
 //! the `SandboxMode` 3-variant `snake_case` wire shape,
-//! the `EnvScrub` default, and the `HookPolicy`
+//! the `FullSandbox` default, and the `HookPolicy`
 //! `allowed_commands` None vs Some-empty vs Some-populated
 //! semantics.
 
@@ -21,10 +21,10 @@ use openclaudia::config::{HookPolicy, SandboxMode};
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn sandbox_mode_default_is_env_scrub() {
-    // PINS DOCUMENTED DEFAULT: EnvScrub is the documented
-    // default — credentials scrubbed before spawn.
-    assert_eq!(SandboxMode::default(), SandboxMode::EnvScrub);
+fn sandbox_mode_default_is_full_sandbox() {
+    // Repository hooks must be OS-contained unless the host operator
+    // separately makes an explicit trust decision at process startup.
+    assert_eq!(SandboxMode::default(), SandboxMode::FullSandbox);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -95,16 +95,16 @@ fn hook_policy_default_allowed_commands_is_none() {
 }
 
 #[test]
-fn hook_policy_default_sandbox_is_env_scrub() {
+fn hook_policy_default_sandbox_is_full_sandbox() {
     let policy = HookPolicy::default();
-    assert_eq!(policy.sandbox, SandboxMode::EnvScrub);
+    assert_eq!(policy.sandbox, SandboxMode::FullSandbox);
 }
 
 #[test]
 fn hook_policy_empty_yaml_object_matches_default() {
     let policy: HookPolicy = serde_yaml::from_str("{}").expect("parse empty");
     assert!(policy.allowed_commands.is_none());
-    assert_eq!(policy.sandbox, SandboxMode::EnvScrub);
+    assert_eq!(policy.sandbox, SandboxMode::FullSandbox);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ fn hook_policy_allowed_commands_dedup_via_hashset() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn hook_policy_with_sandbox_none_overrides_env_scrub_default() {
+fn hook_policy_with_sandbox_none_overrides_full_sandbox_default() {
     let yaml = "sandbox: none";
     let policy: HookPolicy = serde_yaml::from_str(yaml).expect("parse");
     assert_eq!(policy.sandbox, SandboxMode::None);
@@ -159,7 +159,7 @@ fn hook_policy_with_sandbox_full_sandbox_overrides_default() {
 }
 
 #[test]
-fn hook_policy_with_explicit_env_scrub_matches_default() {
+fn hook_policy_with_explicit_env_scrub_is_a_weaker_explicit_mode() {
     let yaml = "sandbox: env_scrub";
     let policy: HookPolicy = serde_yaml::from_str(yaml).expect("parse");
     assert_eq!(policy.sandbox, SandboxMode::EnvScrub);

@@ -39,7 +39,7 @@ fn write_read_edit_read_cross_tool_flow() {
     let _lock = READ_TRACKER_LOCK.lock().expect("lock");
     reset_read_tracker();
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let sub = dir.path().join("subdir").join("notes.txt");
 
     // ---- Step 1: write creates missing parent directory (Behavior 6) --------
@@ -148,7 +148,7 @@ fn write_read_edit_read_cross_tool_flow() {
 #[test]
 fn write_creates_deeply_nested_parent_directories() {
     // Behavior 6: create_dir_all handles any depth
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let deep = dir
         .path()
         .join("a")
@@ -176,7 +176,7 @@ fn write_creates_deeply_nested_parent_directories() {
 fn read_offset_beyond_eof_is_non_error() {
     // Behavior 1 edge: OC does NOT error when offset > file line count.
     // CC would emit a warning; OC returns an empty body with a suffix.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("short.txt");
     fs::write(&path, "only one line\n").expect("write");
 
@@ -208,7 +208,7 @@ fn read_large_file_truncated_as_non_error() {
     // Behavior 8: OC silently truncates at 100 000 chars; CC throws an error.
     // Pinned as current OC behavior. CC parity gap: no error flag, no offset
     // guidance in the result.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("large.txt");
     // Each numbered line is ~208 chars; 600 lines ≈ 124 800 chars → triggers truncation
     let line = "y".repeat(200) + "\n";
@@ -237,7 +237,7 @@ fn read_large_file_truncated_as_non_error() {
 fn read_image_extensions_dispatched_as_image() {
     // Behavior 2: .png, .jpg, .jpeg, .gif, .webp must trigger the image path.
     // We write 1 byte (not valid image data, but enough to confirm dispatch).
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     for ext in &["png", "jpg", "jpeg", "gif", "webp"] {
         let path = dir.path().join(format!("img.{ext}"));
         fs::write(&path, b"\x00").expect("write");
@@ -263,7 +263,7 @@ fn read_image_extensions_dispatched_as_image() {
 
 #[test]
 fn glob_tool_finds_matching_files_through_execute_tool() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     fs::write(dir.path().join("alpha.rs"), "fn alpha() {}\n").expect("write alpha");
     fs::write(dir.path().join("beta.rs"), "fn beta() {}\n").expect("write beta");
     fs::write(dir.path().join("notes.txt"), "not rust\n").expect("write notes");
@@ -296,7 +296,7 @@ fn glob_tool_finds_matching_files_through_execute_tool() {
 
 #[test]
 fn grep_tool_finds_matching_lines_through_execute_tool() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     fs::write(
         dir.path().join("src.txt"),
         "first line\nneedle: important result\nlast line\n",
@@ -334,7 +334,7 @@ fn edit_replace_all_multi_occurrence_replaces_every_match() {
     let _lock = READ_TRACKER_LOCK.lock().expect("lock");
     reset_read_tracker();
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("multi.txt");
     fs::write(&path, "foo bar foo baz foo\n").expect("write");
 

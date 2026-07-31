@@ -1,6 +1,7 @@
 mod kill;
 mod output;
 pub mod path_constraints;
+pub mod sandbox;
 // `policy` is exposed so the security E2E test suite
 // (`tests/tools_security_e2e.rs`) can drive `validate_command`,
 // `is_safe_for_auto_allow`, `dangerous_shell_construct`, and
@@ -28,7 +29,7 @@ use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::thread;
@@ -37,6 +38,8 @@ use uuid::Uuid;
 /// Maximum number of background shells allowed before refusing new ones
 const MAX_BACKGROUND_SHELLS: usize = 50;
 const LEDGER_COMMAND_OUTPUT_MAX_BYTES: usize = 100_000;
+const BACKGROUND_OUTPUT_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
+const FOREGROUND_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
 const VERIFICATION_COMMAND_NEEDLES: &[&str] = &[
     "cargo test",
     "cargo check",
@@ -72,10 +75,6 @@ fn bash_bin() -> Result<&'static Path, String> {
     }
 }
 
-fn bash_command() -> Result<Command, String> {
-    Ok(Command::new(bash_bin()?))
-}
-
 fn recover_mutex_lock<'a, T>(
     mutex: &'a Mutex<T>,
     op: &'static str,
@@ -95,9 +94,11 @@ fn recover_mutex_lock<'a, T>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_output_reader<R>(
     stream: R,
     buffer: Arc<Mutex<Vec<String>>>,
+    output_limit: Arc<OutputLimit>,
     ledger_buffer: Arc<Mutex<String>>,
     done: Arc<AtomicBool>,
     op: &'static str,
@@ -110,10 +111,51 @@ fn spawn_output_reader<R>(
         let reader = BufReader::new(stream);
         for line in reader.lines().map_while(Result::ok) {
             append_ledger_output_line(&ledger_buffer, &line, op, "ledger_buffer", &shell_id);
-            recover_mutex_lock(&buffer, op, resource, Some(&shell_id)).push(line);
+            let retained = output_limit.reserve(line.len().saturating_add(1));
+            if retained > 0 {
+                let retained_line = safe_truncate(&line, retained.min(line.len())).to_string();
+                recover_mutex_lock(&buffer, op, resource, Some(&shell_id)).push(retained_line);
+            }
+            if retained < line.len().saturating_add(1)
+                && !output_limit.marker.swap(true, Ordering::SeqCst)
+            {
+                recover_mutex_lock(&buffer, op, resource, Some(&shell_id))
+                    .push("[output truncated at 1 MiB]".to_string());
+            }
         }
         done.store(true, Ordering::SeqCst);
     });
+}
+
+struct OutputLimit {
+    bytes: std::sync::atomic::AtomicUsize,
+    marker: AtomicBool,
+}
+
+impl OutputLimit {
+    const fn new() -> Self {
+        Self {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            marker: AtomicBool::new(false),
+        }
+    }
+
+    fn reserve(&self, requested: usize) -> usize {
+        let mut current = self.bytes.load(Ordering::SeqCst);
+        loop {
+            let remaining = BACKGROUND_OUTPUT_MAX_BYTES_PER_STREAM.saturating_sub(current);
+            let granted = requested.min(remaining);
+            match self.bytes.compare_exchange(
+                current,
+                current.saturating_add(granted),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return granted,
+                Err(actual) => current = actual,
+            }
+        }
+    }
 }
 
 fn append_ledger_output_line(
@@ -210,8 +252,8 @@ impl BackgroundShellManager {
 
         let shell_id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
         let owner = super::todo::current_session_key();
-        // IMPORTANT: Set current_dir to ensure bash runs in the same directory as the process
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let security = crate::tools::security::current_context()?;
+        let cwd = security.working_directory().to_path_buf();
 
         // ── Crosslink #672 fix: atomic check+reserve ──────────────────────────
         //
@@ -260,27 +302,18 @@ impl BackgroundShellManager {
 
         #[cfg(windows)]
         let child = {
-            let mut cmd = match find_git_bash() {
-                Some(git_bash) => Command::new(git_bash),
-                None => bash_command()?,
-            };
-            cmd.args(["-c", command])
-                .current_dir(&cwd)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            apply_env_scrub(&mut cmd);
+            let bash = find_git_bash().unwrap_or(bash_bin()?.to_path_buf());
+            let mut cmd = sandbox::sandboxed_bash_command(&bash, command, &cwd)?;
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             cmd.spawn()
         };
 
         #[cfg(not(windows))]
         let child = {
-            let mut cmd = bash_command()?;
-            cmd.args(["-c", command])
-                .current_dir(&cwd)
-                .stdout(Stdio::piped())
+            let mut cmd = sandbox::sandboxed_bash_command(bash_bin()?, command, &cwd)?;
+            cmd.stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0); // Put child in its own process group for clean kill
-            apply_env_scrub(&mut cmd);
             cmd.spawn()
         };
 
@@ -293,6 +326,8 @@ impl BackgroundShellManager {
         let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
         let stdout_ledger_buffer = Arc::new(Mutex::new(String::new()));
         let stderr_ledger_buffer = Arc::new(Mutex::new(String::new()));
+        let stdout_output_limit = Arc::new(OutputLimit::new());
+        let stderr_output_limit = Arc::new(OutputLimit::new());
         let finished = Arc::new(AtomicBool::new(false));
         let stdout_done = Arc::new(AtomicBool::new(false));
         let stderr_done = Arc::new(AtomicBool::new(false));
@@ -314,6 +349,7 @@ impl BackgroundShellManager {
             spawn_output_reader(
                 stdout,
                 Arc::clone(&stdout_buffer),
+                stdout_output_limit,
                 Arc::clone(&stdout_ledger_buffer),
                 Arc::clone(&stdout_done),
                 "stdout_reader",
@@ -329,6 +365,7 @@ impl BackgroundShellManager {
             spawn_output_reader(
                 stderr,
                 Arc::clone(&stderr_buffer),
+                stderr_output_limit,
                 Arc::clone(&stderr_ledger_buffer),
                 Arc::clone(&stderr_done),
                 "stderr_reader",
@@ -419,6 +456,7 @@ impl BackgroundShellManager {
     /// Get output from a background shell (returns new output since last call)
     #[allow(clippy::significant_drop_tightening)] // shells lock must be held while accessing shell
     pub(crate) fn get_output(&self, shell_id: &str) -> Result<(String, bool, Option<i32>), String> {
+        let caller = super::todo::current_session_key();
         // Crosslink #678: the shells map holds an entry-per-shell HashMap with
         // no cross-field invariant — every recoverable state is fully
         // represented inside an individual BackgroundShell, and HashMap
@@ -431,6 +469,17 @@ impl BackgroundShellManager {
         let shell = shells
             .get(shell_id)
             .ok_or_else(|| format!("Shell '{shell_id}' not found"))?;
+        if shell.owner != caller {
+            tracing::warn!(
+                target: "openclaudia::bash",
+                event = "cross_session_shell_access_denied",
+                caller,
+                shell_id,
+                "Denied background shell output access outside the owning session"
+            );
+            // Deliberately do not reveal whether a guessed identifier exists.
+            return Err(format!("Shell '{shell_id}' not found"));
+        }
 
         let mut output = String::new();
 
@@ -509,6 +558,21 @@ impl BackgroundShellManager {
         // that observed poisoning.
         let mut shells = recover_mutex_lock(&self.shells, "kill", "shells", Some(shell_id));
 
+        let caller = super::todo::current_session_key();
+        if shells
+            .get(shell_id)
+            .is_some_and(|shell| shell.owner != caller)
+        {
+            tracing::warn!(
+                target: "openclaudia::bash",
+                event = "cross_session_shell_kill_denied",
+                caller,
+                shell_id,
+                "Denied background shell termination outside the owning session"
+            );
+            return Err(format!("Shell '{shell_id}' not found"));
+        }
+
         if let Some(shell) = shells.remove(shell_id) {
             if !shell.finished.load(Ordering::SeqCst) {
                 // Terminate the process group (SIGTERM -> wait -> SIGKILL)
@@ -572,10 +636,12 @@ impl BackgroundShellManager {
 
     /// List all background shells
     pub(crate) fn list(&self) -> Vec<(String, String, bool)> {
+        let caller = super::todo::current_session_key();
         // Crosslink #678: see get_output for poison-recovery rationale.
         let shells = recover_mutex_lock(&self.shells, "list", "shells", None);
         shells
             .iter()
+            .filter(|(_, shell)| shell.owner == caller)
             .map(|(id, shell)| {
                 (
                     id.clone(),
@@ -585,6 +651,20 @@ impl BackgroundShellManager {
             })
             .collect()
     }
+}
+
+/// Terminate every background job owned by a session during trusted lifecycle
+/// cleanup. This bypasses the agent-facing identifier argument, but remains
+/// scoped to the exact immutable session id supplied by `SessionManager`.
+pub fn terminate_session_background_jobs(session_id: &str) {
+    let result = BACKGROUND_SHELLS.kill_for_agent(session_id);
+    tracing::info!(
+        target: "openclaudia::bash",
+        event = "session_background_jobs_terminated",
+        session_id,
+        result,
+        "Applied session-end background-process cleanup"
+    );
 }
 
 fn wait_for_output_readers(stdout_done: &AtomicBool, stderr_done: &AtomicBool, shell_id: &str) {
@@ -731,27 +811,27 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
     // Run synchronously (original behavior).
     // On Windows, use Git Bash explicitly (not WSL bash).
     // On Unix, use system bash.
-    // IMPORTANT: Set current_dir to ensure bash runs in the same directory as
-    // the process.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let security = crate::tools::security::current_context().map_err(ToolError::External)?;
+    let cwd = security.working_directory().to_path_buf();
 
     #[cfg(windows)]
     let output = {
-        let mut cmd = match find_git_bash() {
-            Some(git_bash) => Command::new(git_bash),
-            None => bash_command().map_err(ToolError::External)?,
-        };
-        cmd.args(["-c", command]).current_dir(&cwd);
-        apply_env_scrub(&mut cmd);
-        cmd.output()
+        let bash =
+            find_git_bash().unwrap_or(bash_bin().map_err(ToolError::External)?.to_path_buf());
+        let cmd =
+            sandbox::sandboxed_bash_command(&bash, command, &cwd).map_err(ToolError::External)?;
+        super::command::run_prepared_sandboxed_with_timeout(cmd, "bash", FOREGROUND_COMMAND_TIMEOUT)
     };
 
     #[cfg(not(windows))]
     let output = {
-        let mut cmd = bash_command().map_err(ToolError::External)?;
-        cmd.args(["-c", command]).current_dir(&cwd);
-        apply_env_scrub(&mut cmd);
-        cmd.output()
+        let cmd = sandbox::sandboxed_bash_command(
+            bash_bin().map_err(ToolError::External)?,
+            command,
+            &cwd,
+        )
+        .map_err(ToolError::External)?;
+        super::command::run_prepared_sandboxed_with_timeout(cmd, "bash", FOREGROUND_COMMAND_TIMEOUT)
     };
 
     let output =

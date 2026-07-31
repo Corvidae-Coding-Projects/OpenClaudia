@@ -31,6 +31,8 @@ use serde_json::{json, Value};
 /// Bundles the three optional context objects that the old 3-function overload
 /// set threaded independently. Handlers that don't need a field ignore it.
 pub struct ToolContext<'a> {
+    /// Immutable filesystem/process capabilities for this session.
+    pub security: Result<std::sync::Arc<super::security::ToolSecurityContext>, String>,
     /// Optional archival memory database (stateful mode).
     pub memory_db: Option<&'a MemoryDb>,
     /// Optional application configuration (subagent tools).
@@ -127,6 +129,12 @@ impl ToolRegistry {
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> Option<(String, bool)> {
+        if let Err(error) = &ctx.security {
+            return Some((
+                format!("Tool execution is blocked because session capabilities are unavailable: {error}"),
+                true,
+            ));
+        }
         self.handlers.get(tool_name).map(|h| h.execute(args, ctx))
     }
 }

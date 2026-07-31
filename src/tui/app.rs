@@ -3306,7 +3306,7 @@ impl App {
         };
         let area = frame.area();
         let dialog_width = area.width.min(70);
-        let dialog_height = 7u16;
+        let dialog_height = 8u16;
         let x = (area.width.saturating_sub(dialog_width)) / 2;
         let y = area.height.saturating_sub(dialog_height + 4);
         let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
@@ -3326,6 +3326,13 @@ impl App {
             )),
             Line::from(Span::styled(
                 format!("  Args: {args_preview}"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "  Scope: {}",
+                    crate::tools::permission_scope_summary(&perm.tool_name)
+                ),
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(""),
