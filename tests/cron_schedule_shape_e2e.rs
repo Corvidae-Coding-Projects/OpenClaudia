@@ -13,7 +13,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::{execute_cron_create, execute_cron_list};
+use openclaudia::tools::{execute_cron_create, execute_cron_list, SessionIdGuard};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -31,13 +31,20 @@ fn cwd_lock() -> MutexGuard<'static, ()> {
 }
 
 fn run_in_tempdir<R>(f: impl FnOnce() -> R) -> R {
+    struct RestoreCwd(std::path::PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
     let prev = std::env::current_dir().expect("current_dir");
     let tmp = TempDir::new().expect("tempdir");
     std::env::set_current_dir(tmp.path()).expect("set cwd");
+    let _restore = RestoreCwd(prev);
+    let _session = SessionIdGuard::set(format!("cron-shape-{}", tmp.path().display()));
     std::fs::create_dir_all(".openclaudia").expect("mkdir");
-    let outcome = f();
-    std::env::set_current_dir(&prev).expect("restore cwd");
-    outcome
+    f()
 }
 
 fn cron_args(name: &str, schedule: &str, prompt: &str) -> HashMap<String, Value> {

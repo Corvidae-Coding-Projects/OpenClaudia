@@ -354,7 +354,7 @@ fn session_id_guards_are_stack_scoped_and_restore_on_drop() {
     // drops still sees the same file as "not read in this session"
     // because each `SessionIdGuard::set` overwrites the slot.
 
-    let dir = tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(".").expect("tempdir");
     let path = dir.path().join("scoped.txt");
     std::fs::write(&path, "v1").expect("write");
 

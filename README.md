@@ -43,9 +43,17 @@ OpenClaudia is a Rust-based CLI that transforms any LLM into an agentic coding a
 ### Required
 
 - **Rust** — Install via [rustup](https://rustup.rs/)
-- **Git Bash** (Windows only) — Comes with [Git for Windows](https://git-scm.com/download/win)
-  - OpenClaudia uses Git Bash on Windows for Unix command compatibility
+- **bubblewrap** (Linux) — Required for OS containment of agent Bash and
+  project-controlled quality-gate processes (`apt install bubblewrap`,
+  `dnf install bubblewrap`, or your distribution equivalent)
+- **Git Bash** (Windows compatibility mode only) — Comes with [Git for Windows](https://git-scm.com/download/win)
+  - OpenClaudia can use Git Bash when the host explicitly opts out of sandboxing
   - Ensure Git is in your PATH
+
+Agent subprocesses fail closed when a supported OS sandbox is unavailable.
+For emergency compatibility only, a host user can explicitly opt out before
+startup with `OPENCLAUDIA_BASH_SANDBOX=off`; models cannot set this through
+tool arguments, and OpenClaudia logs a warning when the opt-out is active.
 
 ## Installation
 
@@ -106,6 +114,20 @@ openclaudia --mode debug      # Investigation-first debugging
 | `OPENROUTER_API_KEY` | OpenRouter | For OpenRouter |
 | `OPENCODE_API_KEY` | OpenCode Go | For OpenCode Go |
 | `OPENAI_COMPATIBLE_API_KEY` or `API_KEY` | Generic OpenAI-compatible endpoint | For `openai-compatible` |
+
+Sandbox policy is fixed at host startup:
+
+| Variable | Effect |
+|---|---|
+| `OPENCLAUDIA_PROJECT_SECRET_MASKS` | Comma-separated project-relative paths hidden from agent file tools and subprocesses |
+| `OPENCLAUDIA_AGENT_READ_ONLY_ROOTS` | Platform path-list of additional immutable session roots |
+| `OPENCLAUDIA_AGENT_READ_WRITE_ROOTS` | Platform path-list of additional writable session roots |
+| `OPENCLAUDIA_AGENT_ENV_GRANTS` | Comma-separated exact environment names granted to sandboxed agent processes |
+| `OPENCLAUDIA_AGENT_NETWORK` | Must be `denied` (default); unsupported grants fail closed |
+| `OPENCLAUDIA_TRUST_MCP_SERVERS` | Comma-separated exact `plugin/server` names approved from repository MCP config |
+| `OPENCLAUDIA_MCP_ENV_GRANTS` | Comma-separated exact sensitive environment names an approved MCP server may receive |
+| `OPENCLAUDIA_TRUST_UNSANDBOXED_HOOKS` | Set to `true` only to authorize hook `none`/`env_scrub` modes |
+| `OPENCLAUDIA_BASH_SANDBOX` | `on` by default; `off` is an explicit host-wide emergency opt-out |
 
 ### Config File
 
@@ -204,6 +226,24 @@ keybindings:
   tab: toggle_mode
   escape: cancel
 ```
+
+## Sandbox Security
+
+Linux agent subprocesses run inside named Bubblewrap profiles with filesystem
+capabilities, network denial, seccomp, resource/output limits, inherited-FD
+closure, and complete process-tree cancellation. File operations use
+descriptor-relative resolution, and ACP routes filesystem/search operations
+through those same local primitives.
+
+The project root is readable and writable by agent code by default, so secrets
+stored in `.env`, fixtures, or generated files are in scope unless masked.
+`.openclaudia` and `.claude` stay hidden. macOS and Windows agent subprocesses
+currently fail closed; they never silently fall back to host execution.
+
+Run `openclaudia doctor` to inspect the effective redacted policy. See the
+[agent sandbox threat model](docs/sandbox-threat-model.md) and
+[subprocess inventory](docs/subprocess-inventory.md) for platform support,
+trust boundaries, limitations, and incident response.
 
 ## CLI Commands
 

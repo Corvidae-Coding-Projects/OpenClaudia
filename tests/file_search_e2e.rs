@@ -71,7 +71,7 @@ fn touch(path: &Path, content: &str) {
 
 #[test]
 fn list_files_returns_top_level_entries_of_tempdir() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let root = dir.path();
     touch(&root.join("alpha.rs"), "");
     touch(&root.join("bravo.md"), "");
@@ -108,7 +108,7 @@ fn list_files_default_path_is_cwd() {
 
 #[test]
 fn list_files_nonexistent_path_errors() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let nonexistent = dir.path().join("never-existed");
     let (msg, is_err) = list_files(&json!({
         "path": nonexistent.to_string_lossy().to_string(),
@@ -122,7 +122,7 @@ fn list_files_nonexistent_path_errors() {
 
 #[test]
 fn glob_matches_pattern_across_nested_dirs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let root = dir.path();
     touch(&root.join("top.rs"), "");
     touch(&root.join("src/main.rs"), "");
@@ -167,7 +167,7 @@ fn glob_allow_hidden_root_disables_skip_list() {
     // root on Linux is `/tmp/.tmpXXX/...` — so the hidden-root
     // heuristic ALWAYS fires under tempfile. Pinning the
     // alternate behaviour instead is the honest test.)
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let root = dir.path();
     let root_str = root.to_string_lossy().to_string();
     assert!(
@@ -201,7 +201,7 @@ fn glob_allow_hidden_root_disables_skip_list() {
 
 #[test]
 fn glob_no_match_returns_clean_empty_result() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     touch(&dir.path().join("a.rs"), "");
     let (msg, is_err) = glob(&json!({
         "pattern": "**/*.zzz",
@@ -239,7 +239,7 @@ fn glob_non_string_pattern_arg_errors_before_search() {
 
 #[test]
 fn grep_finds_literal_pattern_in_file() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let root = dir.path();
     touch(
         &root.join("src/main.rs"),
@@ -267,7 +267,7 @@ fn grep_finds_literal_pattern_in_file() {
 
 #[test]
 fn grep_case_insensitive_flag_widens_matches() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let root = dir.path();
     touch(&root.join("file.txt"), "Hello WORLD\n");
 
@@ -301,7 +301,7 @@ fn grep_case_insensitive_flag_widens_matches() {
 
 #[test]
 fn grep_invalid_regex_errors_cleanly() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     touch(&dir.path().join("x.txt"), "content");
     // Unmatched open paren — invalid regex.
     let (msg, is_err) = grep(&json!({
@@ -317,7 +317,7 @@ fn grep_invalid_regex_errors_cleanly() {
 
 #[test]
 fn grep_no_match_returns_clean_empty_result() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     touch(&dir.path().join("x.txt"), "content");
     let (msg, is_err) = grep(&json!({
         "pattern": "absolutely-not-present-string-zzz",
@@ -350,7 +350,7 @@ fn grep_non_string_pattern_arg_errors_before_search() {
 
 #[test]
 fn grep_anchored_regex_only_matches_at_line_start() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let root = dir.path();
     touch(&root.join("file.txt"), "alpha\nstarts-with-alpha\nXalpha\n");
     // `^alpha` anchors to line start.
@@ -376,7 +376,7 @@ fn grep_redos_resistant_input_completes_within_deadline() {
     // catastrophic-backtrack in PCRE complete quickly. Pin that
     // contract: a long input + a "nested-quantifier" pattern
     // completes in well under 10 seconds.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = TempDir::new_in(".").expect("tempdir");
     let body = "a".repeat(10_000) + "X";
     touch(&dir.path().join("evil.txt"), &body);
 

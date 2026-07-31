@@ -17,12 +17,13 @@
 //! `file:line-context` lines for the surrounding window. Capped at
 //! `MAX_MATCHES` so a runaway regex does not flood the agent.
 
-use super::resolve_path;
+use super::{resolve_path, secure_fs};
 use crate::tools::args::ToolArgs as _;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::File;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// Hard cap on returned matches before truncation.
@@ -85,65 +86,41 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (format!("Invalid regex '{pattern}': {e}"), true),
     };
 
-    // Collect every regular file under `root`, then grep each.
-    let mut files: Vec<PathBuf> = Vec::new();
+    let directory = match secure_fs::open_directory(&root) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return (
+                format!(
+                    "Failed to securely open grep root '{}': {error}",
+                    root.display()
+                ),
+                true,
+            );
+        }
+    };
     let mut visited: usize = 0;
-    collect_files(&root, &mut files, &mut visited);
-
     let mut output: Vec<String> = Vec::new();
     let mut total_matches: usize = 0;
+    let mut files_scanned: usize = 0;
     let mut truncated = false;
-
-    for file in &files {
-        if total_matches >= MAX_MATCHES {
-            truncated = true;
-            break;
-        }
-        let rel = file
-            .strip_prefix(&root)
-            .unwrap_or(file)
-            .display()
-            .to_string();
-        match grep_one(file, &regex, context) {
-            Ok(hits) => {
-                for hit in hits {
-                    if total_matches >= MAX_MATCHES {
-                        truncated = true;
-                        break;
-                    }
-                    for ctx_line in hit.context_before {
-                        output.push(format!("{rel}-{}-{ctx_line}", hit.line_no - 1));
-                    }
-                    output.push(format!("{rel}:{}:{}", hit.line_no, hit.line));
-                    let mut after_no = hit.line_no;
-                    for ctx_line in hit.context_after {
-                        after_no += 1;
-                        output.push(format!("{rel}-{after_no}-{ctx_line}"));
-                    }
-                    if context > 0 {
-                        output.push("--".to_string());
-                    }
-                    total_matches += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(file = %file.display(), error = %e, "grep: file read failed");
-            }
-        }
-    }
+    grep_directory(
+        &directory,
+        Path::new(""),
+        &regex,
+        context,
+        &mut output,
+        &mut total_matches,
+        &mut files_scanned,
+        &mut visited,
+        &mut truncated,
+    );
 
     let header = if truncated {
         format!(
-            "Found {} matches (truncated at {MAX_MATCHES}) across {} files:",
-            total_matches,
-            files.len()
+            "Found {total_matches} matches (truncated at {MAX_MATCHES}) across {files_scanned} files:"
         )
     } else {
-        format!(
-            "Found {} matches across {} files:",
-            total_matches,
-            files.len()
-        )
+        format!("Found {total_matches} matches across {files_scanned} files:")
     };
     let body = output.join("\n");
     let out = if body.is_empty() {
@@ -171,12 +148,16 @@ struct Hit {
     context_after: Vec<String>,
 }
 
-fn grep_one(path: &Path, regex: &Regex, context: usize) -> std::io::Result<Vec<Hit>> {
-    let meta = fs::metadata(path)?;
+fn grep_one(file: File, regex: &Regex, context: usize) -> std::io::Result<Vec<Hit>> {
+    let meta = file.metadata()?;
     if meta.len() > MAX_FILE_BYTES {
         return Ok(Vec::new());
     }
-    let body = fs::read_to_string(path)?;
+    let mut body = String::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_string(&mut body)?;
+    if body.len() > usize::try_from(MAX_FILE_BYTES).unwrap_or(usize::MAX) {
+        return Ok(Vec::new());
+    }
     let lines: Vec<&str> = body.lines().collect();
     let mut hits = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
@@ -210,40 +191,129 @@ fn grep_one(path: &Path, regex: &Regex, context: usize) -> std::io::Result<Vec<H
     Ok(hits)
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, visited: &mut usize) {
-    if *visited >= MAX_WALK_ENTRIES {
+#[allow(clippy::too_many_arguments)]
+fn grep_directory(
+    dir: &secure_fs::SecureDirectory,
+    relative_dir: &Path,
+    regex: &Regex,
+    context: usize,
+    output: &mut Vec<String>,
+    total_matches: &mut usize,
+    files_scanned: &mut usize,
+    visited: &mut usize,
+    truncated: &mut bool,
+) {
+    if *visited >= MAX_WALK_ENTRIES || *total_matches >= MAX_MATCHES {
+        *truncated = true;
         return;
     }
-    let entries = match fs::read_dir(dir) {
+    let entries = match dir.entries() {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(dir = %dir.display(), error = %e, "grep: skipping unreadable dir");
+            tracing::warn!(
+                dir = %relative_dir.display(),
+                error = %e,
+                "grep: skipping unreadable dir"
+            );
             return;
         }
     };
-    let mut subdirs: Vec<PathBuf> = Vec::new();
+    let mut subdirs: Vec<(secure_fs::SecureDirectory, PathBuf)> = Vec::new();
     for entry in entries {
-        let Ok(entry) = entry else { continue };
         *visited += 1;
         if *visited >= MAX_WALK_ENTRIES {
+            *truncated = true;
             return;
         }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let name = entry.file_name();
+        let name = entry.name;
         let name_str = name.to_string_lossy();
-        if file_type.is_dir() {
+        let relative = relative_dir.join(&name);
+        if entry.kind == secure_fs::SecureFileType::Directory {
             if name_str.starts_with('.') || SKIP_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
-            subdirs.push(entry.path());
-        } else if file_type.is_file() {
-            out.push(entry.path());
+            match dir.open_child_directory(&name) {
+                Ok(child) => subdirs.push((child, relative)),
+                Err(error) => tracing::warn!(
+                    entry = %relative.display(),
+                    %error,
+                    "grep: directory changed before secure open"
+                ),
+            }
+        } else if entry.kind == secure_fs::SecureFileType::Regular {
+            *files_scanned += 1;
+            match dir.open_child_regular(&name) {
+                Ok(file) => match grep_one(file, regex, context) {
+                    Ok(hits) => append_hits(
+                        &relative.display().to_string(),
+                        hits,
+                        context,
+                        output,
+                        total_matches,
+                        truncated,
+                    ),
+                    Err(error) => tracing::warn!(
+                        file = %relative.display(),
+                        %error,
+                        "grep: confined file read failed"
+                    ),
+                },
+                Err(error) => tracing::warn!(
+                    file = %relative.display(),
+                    %error,
+                    "grep: file changed before secure open"
+                ),
+            }
+            if *total_matches >= MAX_MATCHES {
+                *truncated = true;
+                return;
+            }
         }
     }
-    for sub in subdirs {
-        collect_files(&sub, out, visited);
+    for (sub, relative) in subdirs {
+        grep_directory(
+            &sub,
+            &relative,
+            regex,
+            context,
+            output,
+            total_matches,
+            files_scanned,
+            visited,
+            truncated,
+        );
+        if *truncated {
+            return;
+        }
+    }
+}
+
+fn append_hits(
+    relative: &str,
+    hits: Vec<Hit>,
+    context: usize,
+    output: &mut Vec<String>,
+    total_matches: &mut usize,
+    truncated: &mut bool,
+) {
+    for hit in hits {
+        if *total_matches >= MAX_MATCHES {
+            *truncated = true;
+            break;
+        }
+        for ctx_line in hit.context_before {
+            output.push(format!("{relative}-{}-{ctx_line}", hit.line_no - 1));
+        }
+        output.push(format!("{relative}:{}:{}", hit.line_no, hit.line));
+        let mut after_no = hit.line_no;
+        for ctx_line in hit.context_after {
+            after_no += 1;
+            output.push(format!("{relative}-{after_no}-{ctx_line}"));
+        }
+        if context > 0 {
+            output.push("--".to_string());
+        }
+        *total_matches += 1;
     }
 }
 
@@ -251,6 +321,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, visited: &mut usize) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
     use std::fs::File;
     use std::io::Write as _;
     use tempfile::TempDir;
@@ -270,7 +341,7 @@ mod tests {
     /// for every hit, ignoring files that don't contain the pattern.
     #[test]
     fn grep_emits_file_line_match() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         write_file(
             dir.path(),
             "a.rs",
@@ -293,7 +364,7 @@ mod tests {
     /// Pin: `context_lines` = 1 emits the surrounding line on each side.
     #[test]
     fn grep_emits_context_lines() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         write_file(
             dir.path(),
             "ctx.txt",
@@ -317,7 +388,7 @@ mod tests {
     /// Pin: an invalid regex surfaces a clean error instead of panicking.
     #[test]
     fn grep_invalid_regex_errors() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         let mut args = HashMap::new();
         args.insert("pattern".to_string(), json!("[unterminated"));
         args.insert(
@@ -367,7 +438,7 @@ mod tests {
     /// Pin: `case_insensitive=true` matches mixed-case occurrences.
     #[test]
     fn grep_case_insensitive_flag() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         write_file(dir.path(), "x.txt", "HELLO world\n");
         let mut args = HashMap::new();
         args.insert("pattern".to_string(), json!("hello"));
@@ -383,7 +454,7 @@ mod tests {
 
     #[test]
     fn grep_rejects_non_boolean_case_insensitive() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         write_file(dir.path(), "x.txt", "hello\n");
         let mut args = HashMap::new();
         args.insert("pattern".to_string(), json!("hello"));

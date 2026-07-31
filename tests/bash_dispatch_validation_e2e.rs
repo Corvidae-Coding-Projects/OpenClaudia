@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 fn dispatch_bash(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -30,6 +31,7 @@ fn dispatch_bash(args: &HashMap<String, Value>) -> (String, bool) {
 
 fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 fn dispatch_edit(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -32,6 +33,7 @@ fn dispatch_edit(args: &HashMap<String, Value>) -> (String, bool) {
 
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -106,7 +108,7 @@ fn path_with_parent_dir_traversal_rejected_pre_read_gate() {
 #[test]
 fn edit_existing_file_without_prior_read_errors_with_documented_message() {
     // Create a file that has NOT been read via read_file.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("never_read_unique.txt");
     std::fs::write(&path, "original body").expect("create");
     let path_str = path.to_str().unwrap();
@@ -138,7 +140,7 @@ fn edit_existing_file_without_prior_read_errors_with_documented_message() {
 #[test]
 fn failed_read_does_not_satisfy_edit_gate() {
     let _session_guard = SessionIdGuard::set("failed-read-edit-gate");
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("empty.png");
     std::fs::write(&path, "").expect("create empty image");
     let path_str = path.to_str().expect("utf8 path");
@@ -168,7 +170,7 @@ fn failed_read_does_not_satisfy_edit_gate() {
 
 #[test]
 fn edit_after_explicit_read_file_dispatch_passes_must_read_gate() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("read_then_edited_unique.txt");
     std::fs::write(&path, "before").expect("create");
     let path_str = path.to_str().unwrap();
@@ -199,7 +201,7 @@ fn edit_records_diff_and_stales_prior_read_observation() {
     let _ledger_guard =
         openclaudia::ledger::install_active_ledger_for_session("editledger", Arc::clone(&ledger));
 
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("ledger_edit.txt");
     std::fs::write(&path, "before\n").expect("create");
     let path_str = path.to_str().unwrap();
@@ -256,7 +258,7 @@ fn edit_records_diff_and_stales_prior_read_observation() {
 
 #[test]
 fn missing_old_string_after_read_errors() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("missing_old.txt");
     std::fs::write(&path, "body").expect("create");
     let path_str = path.to_str().unwrap();
@@ -275,7 +277,7 @@ fn missing_old_string_after_read_errors() {
 
 #[test]
 fn missing_new_string_after_read_errors() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("missing_new.txt");
     std::fs::write(&path, "body").expect("create");
     let path_str = path.to_str().unwrap();
@@ -293,7 +295,7 @@ fn missing_new_string_after_read_errors() {
 
 #[test]
 fn old_string_arg_as_number_after_read_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("wrong_old.txt");
     std::fs::write(&path, "body").expect("create");
     let path_str = path.to_str().unwrap();
@@ -312,7 +314,7 @@ fn old_string_arg_as_number_after_read_returns_validation_error() {
 
 #[test]
 fn new_string_arg_as_number_after_read_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("wrong_new.txt");
     std::fs::write(&path, "body").expect("create");
     let path_str = path.to_str().unwrap();
@@ -335,7 +337,7 @@ fn new_string_arg_as_number_after_read_returns_validation_error() {
 
 #[test]
 fn no_op_edit_with_identical_old_and_new_strings_refused() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("noop.txt");
     std::fs::write(&path, "body").expect("create");
     let path_str = path.to_str().unwrap();
@@ -358,7 +360,7 @@ fn no_op_edit_with_identical_old_and_new_strings_refused() {
 #[test]
 fn no_op_edit_with_empty_strings_refused() {
     // PINS #970: empty == empty is also a no-op.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("noop_empty.txt");
     std::fs::write(&path, "body").expect("create");
     let path_str = path.to_str().unwrap();
@@ -377,7 +379,7 @@ fn no_op_edit_with_empty_strings_refused() {
 #[test]
 fn no_op_does_not_modify_file_mtime() {
     // PINS #970 DOC: no-op fails BEFORE any I/O.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("noop_mtime.txt");
     std::fs::write(&path, "body").expect("create");
     let path_str = path.to_str().unwrap();
@@ -407,7 +409,7 @@ fn multi_occurrence_without_replace_all_refused() {
     // PINS #687: when replace_all=false (default), multiple
     // occurrences MUST be rejected so callers provide
     // uniquely-matching context.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("multi_occur.txt");
     std::fs::write(&path, "x\nx\nx\n").expect("create");
     let path_str = path.to_str().unwrap();
@@ -429,7 +431,7 @@ fn multi_occurrence_without_replace_all_refused() {
 
 #[test]
 fn multi_occurrence_with_replace_all_true_succeeds() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("multi_replace_all.txt");
     std::fs::write(&path, "x\nx\nx\n").expect("create");
     let path_str = path.to_str().unwrap();
@@ -451,7 +453,7 @@ fn multi_occurrence_with_replace_all_true_succeeds() {
 
 #[test]
 fn replace_all_false_explicit_matches_default_behavior() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("replace_explicit_false.txt");
     std::fs::write(&path, "a\na\n").expect("create");
     let path_str = path.to_str().unwrap();
@@ -477,7 +479,7 @@ fn replace_all_false_explicit_matches_default_behavior() {
 
 #[test]
 fn single_occurrence_edit_replaces_byte_exact() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("single_occur.txt");
     std::fs::write(&path, "before content\nafter\n").expect("create");
     let path_str = path.to_str().unwrap();
@@ -498,7 +500,7 @@ fn single_occurrence_edit_replaces_byte_exact() {
 
 #[test]
 fn unicode_old_and_new_strings_round_trip() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("unicode_edit.txt");
     std::fs::write(&path, "before 日本語 content\n").expect("create");
     let path_str = path.to_str().unwrap();

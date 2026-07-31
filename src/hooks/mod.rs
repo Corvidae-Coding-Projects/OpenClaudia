@@ -21,7 +21,7 @@ pub use claude_compat::{
 };
 pub use merge::merge_hooks_config;
 
-use crate::config::{Hook, HookEntry, HookMatcherTarget, HookPolicy, HooksConfig};
+use crate::config::{Hook, HookEntry, HookMatcherTarget, HookPolicy, HooksConfig, SandboxMode};
 use crate::tools::is_sensitive_env;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
@@ -30,10 +30,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -41,6 +41,25 @@ use tracing::{debug, error, info, warn};
 /// Emitted once per process the first time a hook runs without an explicit
 /// `HookPolicy`. Prevents repeated log noise while still surfacing the gap.
 static ALLOW_ALL_DEPRECATION_WARNED: AtomicBool = AtomicBool::new(false);
+const TRUST_UNSANDBOXED_HOOKS_ENV: &str = "OPENCLAUDIA_TRUST_UNSANDBOXED_HOOKS";
+static TRUST_UNSANDBOXED_HOOKS: LazyLock<Result<bool, String>> = LazyLock::new(|| {
+    std::env::var_os(TRUST_UNSANDBOXED_HOOKS_ENV).map_or(Ok(false), |value| {
+        let value = value.to_str().ok_or_else(|| {
+            format!(
+                "{TRUST_UNSANDBOXED_HOOKS_ENV} contains non-Unicode data; refusing host hook execution"
+            )
+        })?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "off" | "no" => Ok(false),
+            "1" | "true" | "on" | "yes" => Ok(true),
+            _ => Err(format!(
+                "Invalid {TRUST_UNSANDBOXED_HOOKS_ENV} value '{value}'; use 'false' (default) or 'true'"
+            )),
+        }
+    })
+});
+const MAX_HOOK_OUTPUT_BYTES_PER_STREAM: usize = 1024 * 1024;
+const HOOK_OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[hook output truncated at 1 MiB]\n";
 
 /// All hook event types supported by `OpenClaudia`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -235,8 +254,8 @@ impl HookInput {
     pub fn new(event: HookEvent) -> Self {
         Self {
             event,
-            cwd: std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
+            cwd: crate::tools::security::current_context()
+                .map(|context| context.working_directory().to_string_lossy().to_string())
                 .unwrap_or_default(),
             session_id: None,
             tool_name: None,
@@ -875,10 +894,10 @@ impl HookEngine {
             None => {
                 if !ALLOW_ALL_DEPRECATION_WARNED.swap(true, Ordering::Relaxed) {
                     warn!(
-                        "HooksConfig has no `policy` field — running in allow-all \
-                         backwards-compatible mode. Add `policy: {{}}` to silence \
-                         this warning, or `policy: {{allowed_commands: [...]}}` to \
-                         restrict which binaries hooks may execute."
+                        "HooksConfig has no `policy` field — allowing every hook \
+                         executable name inside the full OS sandbox. Add \
+                         `policy: {{allowed_commands: [...]}}` to restrict which \
+                         binaries hooks may execute."
                     );
                 }
             }
@@ -929,6 +948,12 @@ impl HookEngine {
     }
 
     async fn terminate_child_after_stdin_failure(child: &mut Child) {
+        if let Some(pid) = child.id() {
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::tools::terminate_process_tree(pid);
+            })
+            .await;
+        }
         if let Err(e) = child.start_kill() {
             debug!(error = %e, "Failed to kill hook process after stdin failure");
         }
@@ -937,15 +962,91 @@ impl HookEngine {
         }
     }
 
+    async fn read_bounded_hook_stream<R>(mut stream: R) -> Result<Vec<u8>, std::io::Error>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut retained = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut truncated = false;
+        loop {
+            let count = stream.read(&mut chunk).await?;
+            if count == 0 {
+                break;
+            }
+            let remaining = MAX_HOOK_OUTPUT_BYTES_PER_STREAM.saturating_sub(retained.len());
+            let keep = remaining.min(count);
+            retained.extend_from_slice(&chunk[..keep]);
+            truncated |= keep < count;
+        }
+        if truncated {
+            retained.extend_from_slice(HOOK_OUTPUT_TRUNCATED_MARKER);
+        }
+        Ok(retained)
+    }
+
     async fn wait_for_hook_output(
-        child: Child,
+        mut child: Child,
         timeout_secs: u64,
     ) -> Result<std::process::Output, HookError> {
-        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(e)) => Err(HookError::CommandFailed(e.to_string())),
-            Err(_) => Err(HookError::Timeout(timeout_secs)),
-        }
+        let pid = child.id();
+        let stdout = child.stdout.take().ok_or_else(|| {
+            HookError::CommandFailed("hook stdout unavailable after spawn".to_string())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            HookError::CommandFailed("hook stderr unavailable after spawn".to_string())
+        })?;
+        let stdout_reader = tokio::spawn(Self::read_bounded_hook_stream(stdout));
+        let stderr_reader = tokio::spawn(Self::read_bounded_hook_stream(stderr));
+        let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                if let Some(pid) = pid {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::tools::terminate_process_tree(pid);
+                    })
+                    .await;
+                }
+                return Err(HookError::CommandFailed(error.to_string()));
+            }
+            Err(_) => {
+                if let Some(pid) = pid {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::tools::terminate_process_tree(pid);
+                    })
+                    .await;
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = stdout_reader.await;
+                let _ = stderr_reader.await;
+                return Err(HookError::Timeout(timeout_secs));
+            }
+        };
+        let stdout = stdout_reader
+            .await
+            .map_err(|error| HookError::CommandFailed(error.to_string()))?
+            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
+        let stderr = stderr_reader
+            .await
+            .map_err(|error| HookError::CommandFailed(error.to_string()))?
+            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    #[cfg(unix)]
+    fn isolate_hook_process_group(command: &mut Command) {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+
+    #[cfg(not(unix))]
+    fn isolate_hook_process_group(_command: &mut Command) {
+        // The enforced Windows backend uses a Job object when available.
     }
 
     /// Execute a command hook.
@@ -967,8 +1068,9 @@ impl HookEngine {
         debug!(command = %command, shell = use_shell, "Running command hook");
 
         // Resolve cwd eagerly — missing cwd is a hard error, not a silent "".
-        let project_dir = std::env::current_dir()
-            .map_err(|e| HookError::CommandFailed(format!("current_dir() failed: {e}")))?;
+        let security =
+            crate::tools::security::current_context().map_err(HookError::CommandFailed)?;
+        let project_dir = security.working_directory().to_path_buf();
 
         let mut child_cmd = if use_shell {
             warn!(
@@ -985,13 +1087,46 @@ impl HookEngine {
         };
 
         Self::apply_hook_env(&mut child_cmd, &project_dir);
+        let sandbox_mode = policy.map_or(SandboxMode::FullSandbox, |hook_policy| {
+            hook_policy.sandbox.clone()
+        });
+        if sandbox_mode == SandboxMode::FullSandbox {
+            let sandboxed = crate::tools::sandboxed_hook_command(child_cmd.as_std(), &project_dir)
+                .map_err(|error| {
+                    HookError::CommandFailed(format!("failed to create full hook sandbox: {error}"))
+                })?;
+            child_cmd = Command::from(sandboxed);
+        } else {
+            let trusted = TRUST_UNSANDBOXED_HOOKS
+                .as_ref()
+                .map_err(Clone::clone)
+                .map_err(HookError::CommandFailed)?;
+            if !trusted {
+                return Err(HookError::CommandFailed(format!(
+                    "hook sandbox mode '{sandbox_mode:?}' requests host execution, which is blocked. \
+                     A host operator must explicitly start OpenClaudia with \
+                     {TRUST_UNSANDBOXED_HOOKS_ENV}=true to trust unsandboxed hooks"
+                )));
+            }
+            warn!(
+                mode = ?sandbox_mode,
+                env = TRUST_UNSANDBOXED_HOOKS_ENV,
+                "Hook OS sandbox explicitly disabled by the host operator"
+            );
+        }
 
+        Self::isolate_hook_process_group(&mut child_cmd);
         let mut child = child_cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| HookError::CommandFailed(e.to_string()))?;
+        let _process_registration = (sandbox_mode == SandboxMode::FullSandbox).then(|| {
+            child
+                .id()
+                .map(crate::tools::command::ActiveSandboxProcess::register)
+        });
 
         let Some(mut stdin) = child.stdin.take() else {
             Self::terminate_child_after_stdin_failure(&mut child).await;
@@ -1002,15 +1137,7 @@ impl HookEngine {
         let stdin_result = Self::write_hook_stdin(&mut stdin, input_json).await;
         drop(stdin);
         if let Err(e) = stdin_result {
-            let output = Self::wait_for_hook_output(child, timeout_secs).await?;
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.is_empty() {
-                    debug!(stderr = %stderr, "Hook stderr");
-                }
-                return Ok((Self::parse_hook_output(&stdout), 0));
-            }
+            Self::terminate_child_after_stdin_failure(&mut child).await;
             return Err(e);
         }
 
@@ -1021,6 +1148,19 @@ impl HookEngine {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.is_empty() {
                     debug!(stderr = %stderr, "Hook stderr");
+                }
+                if exit_code != 0 && exit_code != 2 {
+                    const MAX_HOOK_ERROR_BYTES: usize = 4096;
+                    let diagnostic =
+                        crate::tools::safe_truncate(stderr.trim(), MAX_HOOK_ERROR_BYTES);
+                    let suffix = if diagnostic.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {diagnostic}")
+                    };
+                    return Err(HookError::CommandFailed(format!(
+                        "hook process exited with status {exit_code}{suffix}"
+                    )));
                 }
                 Ok((Self::parse_hook_output(&stdout), exit_code))
             }
@@ -1903,7 +2043,7 @@ mod tests {
         use std::collections::HashSet;
         let policy = HookPolicy {
             allowed_commands: Some(HashSet::from(["true".to_string()])),
-            sandbox: SandboxMode::EnvScrub,
+            sandbox: SandboxMode::FullSandbox,
         };
         let engine = HookEngine::new(make_command_config("true", false, Some(policy)));
         let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
@@ -1920,7 +2060,7 @@ mod tests {
         use std::collections::HashSet;
         let policy = HookPolicy {
             allowed_commands: Some(HashSet::from(["python3".to_string()])),
-            sandbox: SandboxMode::EnvScrub,
+            sandbox: SandboxMode::FullSandbox,
         };
         // Attempt to run `true` which is NOT in the allowlist.
         let engine = HookEngine::new(make_command_config("true", false, Some(policy)));
@@ -1952,7 +2092,7 @@ mod tests {
         // The string "; rm -rf /tmp/x" is passed as a *literal argument* to echo.
         let policy = HookPolicy {
             allowed_commands: Some(HashSet::from(["echo".to_string()])),
-            sandbox: SandboxMode::EnvScrub,
+            sandbox: SandboxMode::FullSandbox,
         };
         let engine = HookEngine::new(make_command_config(
             "echo '; rm -rf /tmp/x'",
@@ -2024,7 +2164,7 @@ mod tests {
                 "printenv".to_string(),
                 "sh".to_string(),
             ])),
-            sandbox: SandboxMode::EnvScrub,
+            sandbox: SandboxMode::FullSandbox,
         };
         let engine = HookEngine::new(make_command_config(
             "printenv ANTHROPIC_API_KEY",
@@ -2353,7 +2493,7 @@ mod tests {
         // HookError::Denied on every command-hook invocation.
         let policy = HookPolicy {
             allowed_commands: Some(HashSet::new()),
-            sandbox: SandboxMode::EnvScrub,
+            sandbox: SandboxMode::FullSandbox,
         };
         let config = HooksConfig {
             policy: Some(policy),

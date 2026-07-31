@@ -218,6 +218,7 @@ enum Commands {
 // and keeps all futures on one thread, which is required by the `onig`-backed
 // StreamingMarkdownRenderer (holds `*mut` raw pointers that are not Send).
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -259,6 +260,15 @@ async fn main() -> anyhow::Result<()> {
     // logs each and continues.
     let _ =
         openclaudia::migrations::run_all(&openclaudia::migrations::MigrationContext::from_env());
+
+    let agent_capable_surface = cli.print.is_some()
+        || matches!(
+            cli.command.as_ref(),
+            None | Some(Commands::Acp { .. } | Commands::Start { .. } | Commands::Loop { .. })
+        );
+    if agent_capable_surface {
+        openclaudia::tools::sandbox_preflight().map_err(anyhow::Error::msg)?;
+    }
 
     if let Some(prompt) = cli.print.clone() {
         if cli.command.is_some() {

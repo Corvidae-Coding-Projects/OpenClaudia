@@ -16,17 +16,120 @@
 //! backoff matches the schedule worktree.rs already used so trivial
 //! commands still see sub-millisecond exit-detection overhead.
 
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::io::Write as _;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::io::{Read, Write as _};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// Exponential-backoff polling schedule (ms between `try_wait` calls).
 /// Pins on the last entry once exhausted so long-running commands cost
 /// at most one poll per 100 ms (crosslink #956, #836).
 const WAIT_BACKOFF_MS: &[u64] = &[1, 2, 5, 10, 25, 50, 100];
+const MAX_CAPTURE_BYTES_PER_STREAM: usize = 10 * 1024 * 1024;
+const OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[output truncated at 10 MiB]\n";
+
+static ACTIVE_SANDBOX_PROCESSES: LazyLock<Mutex<HashMap<String, HashSet<u32>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CANCELLED_SANDBOX_SESSIONS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+pub struct ActiveSandboxProcess {
+    owner: String,
+    pid: u32,
+}
+
+impl ActiveSandboxProcess {
+    pub(crate) fn register(pid: u32) -> Self {
+        let owner = crate::tools::todo::current_session_key();
+        let mut active = ACTIVE_SANDBOX_PROCESSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.entry(owner.clone()).or_default().insert(pid);
+        tracing::debug!(
+            target: "openclaudia::sandbox",
+            event = "sandbox_process_started",
+            session_id = owner,
+            pid,
+            "Registered cancellable sandbox process"
+        );
+        drop(active);
+        let cancelled = CANCELLED_SANDBOX_SESSIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&owner);
+        if cancelled {
+            crate::tools::bash::terminate_process_tree(pid);
+        }
+        Self { owner, pid }
+    }
+}
+
+impl Drop for ActiveSandboxProcess {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_SANDBOX_PROCESSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(processes) = active.get_mut(&self.owner) {
+            processes.remove(&self.pid);
+            if processes.is_empty() {
+                active.remove(&self.owner);
+            }
+        }
+    }
+}
+
+/// Terminate every synchronous sandbox process currently owned by a session.
+pub fn cancel_session_sandbox_processes(session_id: &str) -> usize {
+    CANCELLED_SANDBOX_SESSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_id.to_string());
+    let pids: Vec<u32> = ACTIVE_SANDBOX_PROCESSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .map(|pids| pids.iter().copied().collect())
+        .unwrap_or_default();
+    for pid in &pids {
+        crate::tools::bash::terminate_process_tree(*pid);
+    }
+    if !pids.is_empty() {
+        tracing::info!(
+            target: "openclaudia::sandbox",
+            event = "sandbox_processes_cancelled",
+            session_id,
+            count = pids.len(),
+            "Terminated session sandbox processes"
+        );
+    }
+    pids.len()
+}
+
+/// Start a new cancellation generation for a session. ACP calls this exactly
+/// once when accepting a fresh prompt, before any of its tool workers spawn.
+pub fn clear_session_process_cancellation(session_id: &str) {
+    CANCELLED_SANDBOX_SESSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id);
+}
+
+/// ACP runs as a dedicated process. On transport EOF, terminate any remaining
+/// synchronous sandbox work before shutting the server down.
+pub fn cancel_all_sandbox_processes() {
+    let owners: Vec<String> = ACTIVE_SANDBOX_PROCESSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .cloned()
+        .collect();
+    for owner in owners {
+        cancel_session_sandbox_processes(&owner);
+    }
+}
 
 /// Run `program` with `args` under `timeout`. Captures stdout and
 /// stderr (both `Stdio::piped`) and returns them in [`Output`] on a
@@ -47,6 +150,7 @@ const WAIT_BACKOFF_MS: &[u64] = &[1, 2, 5, 10, 25, 50, 100];
 /// Wait errors (a rare kernel-side condition: signal handler races,
 /// EINTR after retry exhaustion) surface as
 /// [`CommandError::WaitFailed`].
+#[cfg(test)]
 pub fn run_with_timeout(
     program: &(impl AsRef<OsStr> + ?Sized),
     args: &[impl AsRef<OsStr>],
@@ -65,6 +169,7 @@ pub fn run_with_timeout(
 ///
 /// Returns the same structured [`CommandError`] variants as
 /// [`run_with_timeout`].
+#[cfg(test)]
 pub fn run_with_timeout_with_env(
     program: &(impl AsRef<OsStr> + ?Sized),
     args: &[impl AsRef<OsStr>],
@@ -72,7 +177,7 @@ pub fn run_with_timeout_with_env(
     timeout: Duration,
     env: &HashMap<String, String>,
 ) -> Result<Output, CommandError> {
-    run_with_timeout_inner(program, args, cwd, timeout, env, None)
+    run_test_host_with_timeout_inner(program, args, cwd, timeout, env, None)
 }
 
 /// Run `program` under `timeout`, writing `stdin_input` to the child before
@@ -87,6 +192,7 @@ pub fn run_with_timeout_with_env(
 /// Returns the same structured [`CommandError`] variants as
 /// [`run_with_timeout`]. A stdin write failure is reported as
 /// [`CommandError::WaitFailed`] after killing and reaping the child.
+#[cfg(test)]
 pub fn run_with_timeout_with_input(
     program: &(impl AsRef<OsStr> + ?Sized),
     args: &[impl AsRef<OsStr>],
@@ -94,7 +200,7 @@ pub fn run_with_timeout_with_input(
     timeout: Duration,
     stdin_input: &[u8],
 ) -> Result<Output, CommandError> {
-    run_with_timeout_inner(
+    run_test_host_with_timeout_inner(
         program,
         args,
         cwd,
@@ -104,7 +210,70 @@ pub fn run_with_timeout_with_input(
     )
 }
 
-fn run_with_timeout_inner(
+/// Sandboxed counterpart to [`run_with_timeout_with_input`].
+///
+/// # Errors
+///
+/// Returns the same structured [`CommandError`] variants as
+/// [`run_sandboxed_with_timeout`].
+pub fn run_sandboxed_with_timeout_with_input(
+    program: &(impl AsRef<OsStr> + ?Sized),
+    args: &[impl AsRef<OsStr>],
+    project_root: &Path,
+    timeout: Duration,
+    stdin_input: &[u8],
+) -> Result<Output, CommandError> {
+    run_sandboxed_with_timeout_inner(
+        crate::tools::SandboxProfile::DocumentParser,
+        program,
+        args,
+        project_root,
+        timeout,
+        &HashMap::new(),
+        Some(stdin_input),
+    )
+}
+
+/// Run a process under a named sandbox profile with explicit environment
+/// grants and no stdin payload.
+pub fn run_sandboxed_with_timeout_with_env(
+    profile: crate::tools::SandboxProfile,
+    program: &(impl AsRef<OsStr> + ?Sized),
+    args: &[impl AsRef<OsStr>],
+    project_root: &Path,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+) -> Result<Output, CommandError> {
+    run_sandboxed_with_timeout_inner(profile, program, args, project_root, timeout, env, None)
+}
+
+fn run_sandboxed_with_timeout_inner(
+    profile: crate::tools::SandboxProfile,
+    program: &(impl AsRef<OsStr> + ?Sized),
+    args: &[impl AsRef<OsStr>],
+    project_root: &Path,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    stdin_input: Option<&[u8]>,
+) -> Result<Output, CommandError> {
+    let program_str = program.as_ref().to_string_lossy().into_owned();
+    let sandbox_args: Vec<OsString> = args.iter().map(|arg| arg.as_ref().to_os_string()).collect();
+    let mut cmd = crate::tools::sandboxed_process_command(
+        profile,
+        program.as_ref(),
+        &sandbox_args,
+        project_root,
+    )
+    .map_err(|source| CommandError::SpawnFailed {
+        program: program_str.clone(),
+        source,
+    })?;
+    cmd.envs(env);
+    run_prepared_with_timeout(cmd, program_str, timeout, stdin_input, true)
+}
+
+#[cfg(test)]
+fn run_test_host_with_timeout_inner(
     program: &(impl AsRef<OsStr> + ?Sized),
     args: &[impl AsRef<OsStr>],
     cwd: Option<&Path>,
@@ -113,22 +282,43 @@ fn run_with_timeout_inner(
     stdin_input: Option<&[u8]>,
 ) -> Result<Output, CommandError> {
     let program_str = program.as_ref().to_string_lossy().into_owned();
-    let mut cmd = Command::new(program);
-    cmd.args(args.iter().map(AsRef::as_ref))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = Command::new(program);
+    command.args(args.iter().map(AsRef::as_ref)).envs(env);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    run_prepared_with_timeout(command, program_str, timeout, stdin_input, false)
+}
+
+/// Execute an already sandboxed command with bounded capture and a wall-clock
+/// deadline.
+pub fn run_prepared_sandboxed_with_timeout(
+    command: Command,
+    program_label: &str,
+    timeout: Duration,
+) -> Result<Output, CommandError> {
+    run_prepared_with_timeout(command, program_label.to_string(), timeout, None, true)
+}
+
+fn run_prepared_with_timeout(
+    mut cmd: Command,
+    program_str: String,
+    timeout: Duration,
+    stdin_input: Option<&[u8]>,
+    terminate_tree: bool,
+) -> Result<Output, CommandError> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin_input.is_some() {
         cmd.stdin(Stdio::piped());
     }
-    cmd.envs(env);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-
     let mut child = cmd.spawn().map_err(|e| CommandError::SpawnFailed {
         program: program_str.clone(),
         source: e.to_string(),
     })?;
+    let pid = child.id();
+    let _active_process = terminate_tree.then(|| ActiveSandboxProcess::register(pid));
+    let stdout_reader = child.stdout.take().map(spawn_bounded_reader);
+    let stderr_reader = child.stderr.take().map(spawn_bounded_reader);
 
     if let Some(input) = stdin_input {
         let write_result = child
@@ -147,8 +337,10 @@ fn run_with_timeout_inner(
                     })
             });
         if let Err(err) = write_result {
-            let _ = child.kill();
+            terminate_child(&mut child, pid, terminate_tree);
             let _ = child.wait();
+            let _ = join_bounded_reader(stdout_reader);
+            let _ = join_bounded_reader(stderr_reader);
             return Err(err);
         }
     }
@@ -157,18 +349,31 @@ fn run_with_timeout_inner(
     let mut step = 0usize;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| CommandError::WaitFailed {
-                        program: program_str,
-                        source: e.to_string(),
-                    });
+            Ok(Some(status)) => {
+                let stdout = join_bounded_reader(stdout_reader).map_err(|source| {
+                    CommandError::WaitFailed {
+                        program: program_str.clone(),
+                        source,
+                    }
+                })?;
+                let stderr = join_bounded_reader(stderr_reader).map_err(|source| {
+                    CommandError::WaitFailed {
+                        program: program_str.clone(),
+                        source,
+                    }
+                })?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    terminate_child(&mut child, pid, terminate_tree);
                     let _ = child.wait();
+                    let _ = join_bounded_reader(stdout_reader);
+                    let _ = join_bounded_reader(stderr_reader);
                     return Err(CommandError::TimedOut {
                         program: program_str,
                         timeout,
@@ -179,6 +384,10 @@ fn run_with_timeout_inner(
                 step = step.saturating_add(1);
             }
             Err(e) => {
+                terminate_child(&mut child, pid, terminate_tree);
+                let _ = child.wait();
+                let _ = join_bounded_reader(stdout_reader);
+                let _ = join_bounded_reader(stderr_reader);
                 return Err(CommandError::WaitFailed {
                     program: program_str,
                     source: e.to_string(),
@@ -186,6 +395,52 @@ fn run_with_timeout_inner(
             }
         }
     }
+}
+
+fn terminate_child(child: &mut std::process::Child, pid: u32, terminate_tree: bool) {
+    if terminate_tree {
+        crate::tools::bash::terminate_process_tree(pid);
+    }
+    let _ = child.kill();
+}
+
+fn spawn_bounded_reader<R: Read + Send + 'static>(
+    mut reader: R,
+) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
+    std::thread::spawn(move || {
+        let mut retained = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let mut truncated = false;
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("captured-output read failed: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            let remaining = MAX_CAPTURE_BYTES_PER_STREAM.saturating_sub(retained.len());
+            let keep = count.min(remaining);
+            retained.extend_from_slice(&buffer[..keep]);
+            truncated |= keep < count;
+        }
+        if truncated {
+            retained.extend_from_slice(OUTPUT_TRUNCATED_MARKER);
+        }
+        Ok(retained)
+    })
+}
+
+fn join_bounded_reader(
+    reader: Option<std::thread::JoinHandle<Result<Vec<u8>, String>>>,
+) -> Result<Vec<u8>, String> {
+    reader.map_or_else(
+        || Ok(Vec::new()),
+        |reader| {
+            reader
+                .join()
+                .map_err(|_| "captured-output reader panicked".to_string())?
+        },
+    )
 }
 
 /// Errors returned by [`run_with_timeout`]. The variants are
@@ -305,5 +560,27 @@ mod tests {
         .expect("cat must echo stdin");
         assert!(out.status.success(), "cat exit status must be 0");
         assert_eq!(out.stdout, b"alpha\nbeta\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn captured_output_is_bounded_while_pipe_is_fully_drained() {
+        let out = run_with_timeout(
+            "sh",
+            &["-c", "yes x | head -c 12582912"],
+            None,
+            Duration::from_secs(10),
+        )
+        .expect("output producer must complete without a pipe deadlock");
+        assert!(out.status.success());
+        assert!(
+            out.stdout.len() <= MAX_CAPTURE_BYTES_PER_STREAM + OUTPUT_TRUNCATED_MARKER.len(),
+            "capture exceeded the configured bound: {} bytes",
+            out.stdout.len()
+        );
+        assert!(
+            out.stdout.ends_with(OUTPUT_TRUNCATED_MARKER),
+            "truncated output must carry a bounded diagnostic"
+        );
     }
 }

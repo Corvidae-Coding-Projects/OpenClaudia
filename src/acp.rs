@@ -11,10 +11,9 @@
 //! - `session/set_mode` — change session mode
 //! - `session/set_config_option` — set advertised session config options
 //!
-//! Tool execution is delegated through ACP client methods:
-//! - `fs/read_text_file`, `fs/write_text_file` — file operations
-//! - `terminal/create`, `terminal/output`, `terminal/wait_for_exit`,
-//!   `terminal/kill`, `terminal/release` — shell execution
+//! File, search, and shell execution deliberately stay local so every ACP
+//! caller crosses `OpenClaudia`'s filesystem jail and OS sandbox instead of
+//! trusting the client's filesystem or terminal implementation.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
@@ -24,7 +23,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
@@ -53,12 +52,6 @@ pub(crate) struct JsonRpcMessage {
     /// Present on requests and notifications.
     #[serde(default)]
     params: Option<Value>,
-    /// Present on successful responses.
-    #[serde(default)]
-    result: Option<Value>,
-    /// Present on error responses.
-    #[serde(default)]
-    error: Option<JsonRpcError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,16 +77,6 @@ struct JsonRpcResponse {
 #[derive(Debug, Serialize)]
 struct JsonRpcNotification {
     jsonrpc: &'static str,
-    method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<Value>,
-}
-
-/// Outgoing JSON-RPC request (server → client, e.g. `fs/read_text_file`).
-#[derive(Debug, Serialize)]
-struct JsonRpcRequest {
-    jsonrpc: &'static str,
-    id: u64,
     method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<Value>,
@@ -151,14 +134,9 @@ pub struct AcpServer {
     /// Library-layer permission manager. Every tool call dispatched from
     /// `execute_tool_via_openclaudia` consults this gate — closes
     /// crosslink #505 for the ACP path.
-    permission_mgr: crate::permissions::PermissionManager,
+    permission_mgr: Arc<crate::permissions::PermissionManager>,
     /// Session-scoped enterprise policy enforcer for model/token/tool caps.
     policy_enforcer: Arc<crate::services::policy::PolicyEnforcer>,
-    /// Request ID counter for server→client requests
-    next_request_id: AtomicU64,
-    /// Pending responses for server→client requests
-    #[allow(clippy::type_complexity)]
-    pending_responses: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, JsonRpcError>>>>>,
     /// Cancellation flag for in-flight prompts
     cancel_flag: Arc<AtomicBool>,
     /// Channel for writing to stdout (serialized access)
@@ -774,11 +752,11 @@ impl AcpServer {
         let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
         let hook_engine = HookEngine::new(merged_hooks);
         let rules_engine = RulesEngine::new(".openclaudia/rules");
-        let permission_mgr = crate::permissions::PermissionManager::new(
+        let permission_mgr = Arc::new(crate::permissions::PermissionManager::new(
             std::path::PathBuf::from(".openclaudia/permissions.json"),
             true,
             config.permissions.default_allow.clone(),
-        );
+        ));
         let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             config.policy.clone(),
         ));
@@ -796,8 +774,6 @@ impl AcpServer {
             claude_code_token,
             permission_mgr,
             policy_enforcer,
-            next_request_id: AtomicU64::new(1),
-            pending_responses: Arc::new(Mutex::new(HashMap::new())),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
             config_options: HashMap::new(),
@@ -841,43 +817,6 @@ impl AcpServer {
         };
         if let Ok(line) = serde_json::to_string(&notif) {
             let _ = self.stdout_tx.send(line);
-        }
-    }
-
-    /// Send a JSON-RPC request to the client and await the response.
-    async fn client_request(&self, method: &str, params: Option<Value>) -> Result<Value, String> {
-        let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-
-        // Register pending response
-        {
-            let mut pending = self.pending_responses.lock().await;
-            pending.insert(id, tx);
-        }
-
-        // Send request
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0",
-            id,
-            method: method.to_string(),
-            params,
-        };
-        if let Ok(line) = serde_json::to_string(&req) {
-            let _ = self.stdout_tx.send(line);
-        }
-
-        // Await response with timeout
-        match tokio::time::timeout(std::time::Duration::from_mins(5), rx).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(rpc_err))) => Err(format!("RPC error {}: {}", rpc_err.code, rpc_err.message)),
-            Ok(Err(_)) => Err("Client request channel closed".to_string()),
-            Err(_) => {
-                // Clean up pending
-                let mut pending = self.pending_responses.lock().await;
-                pending.remove(&id);
-                drop(pending);
-                Err("Client request timed out".to_string())
-            }
         }
     }
 
@@ -946,22 +885,8 @@ impl AcpServer {
 
     /// Route an incoming JSON-RPC message.
     async fn handle_message(&mut self, msg: JsonRpcMessage) {
-        // Is this a response to a server→client request?
-        if msg.method.is_none() && (msg.result.is_some() || msg.error.is_some()) {
-            if let Some(id) = msg.id.as_ref().and_then(serde_json::Value::as_u64) {
-                let mut pending = self.pending_responses.lock().await;
-                if let Some(tx) = pending.remove(&id) {
-                    if let Some(err) = msg.error {
-                        let _ = tx.send(Err(err));
-                    } else {
-                        let _ = tx.send(Ok(msg.result.unwrap_or(Value::Null)));
-                    }
-                }
-            }
-            return;
-        }
-
-        // It's a request or notification from the client
+        // This server sends notifications and responses, never requests, so an
+        // incoming message must be a request or notification from the client.
         let method = if let Some(ref m) = msg.method {
             m.clone()
         } else {
@@ -1255,19 +1180,53 @@ impl AcpServer {
     // ========================================================================
 
     fn handle_ide_file_opened(&mut self, params: &Value) {
+        if !self.ide_notification_path_allowed(params) {
+            return;
+        }
         apply_ide_file_opened(&mut self.ide_state, params);
     }
 
     fn handle_ide_file_closed(&mut self, params: &Value) {
+        if !self.ide_notification_path_allowed(params) {
+            return;
+        }
         apply_ide_file_closed(&mut self.ide_state, params);
     }
 
     fn handle_ide_selection_changed(&mut self, params: &Value) {
+        if !self.ide_notification_path_allowed(params) {
+            return;
+        }
         apply_ide_selection_changed(&mut self.ide_state, params);
     }
 
     fn handle_ide_diagnostics(&mut self, params: &Value) {
+        if !self.ide_notification_path_allowed(params) {
+            return;
+        }
         apply_ide_diagnostics(&mut self.ide_state, params);
+    }
+
+    fn ide_notification_path_allowed(&self, params: &Value) -> bool {
+        let Some(path) = params.get("filePath").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(acp_session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            warn!("ACP IDE notification omitted sessionId; dropping unscoped buffer data");
+            return false;
+        };
+        let openclaudia_session_id = self.oc_session_id_for_acp(acp_session_id);
+        let _guard = crate::tools::SessionIdGuard::set(openclaudia_session_id);
+        match crate::tools::security::validate_client_buffer_path(std::path::Path::new(path)) {
+            Ok(_) => true,
+            Err(reason) => {
+                warn!(
+                    event = "acp_ide_buffer_denied",
+                    reason, "Dropped IDE buffer notification outside the session capability"
+                );
+                false
+            }
+        }
     }
 
     // ========================================================================
@@ -1316,6 +1275,7 @@ impl AcpServer {
         // Reset cancel flag
         self.cancel_flag.store(false, Ordering::SeqCst);
         let oc_session_id = self.oc_session_id_for_acp(&acp_session_id);
+        crate::tools::clear_session_process_cancellation(&oc_session_id);
 
         // Add user message
         self.messages.push(json!({
@@ -1415,9 +1375,9 @@ impl AcpServer {
             // paths inherited a different mental model than the model
             // was given. Best-effort: a failed `current_dir` call simply
             // omits the block (matches the proxy-path behaviour).
-            let cwd_string = std::env::current_dir()
+            let cwd_string = crate::tools::security::current_context()
                 .ok()
-                .map(|p| p.to_string_lossy().into_owned());
+                .map(|context| context.working_directory().to_string_lossy().into_owned());
             let system_prompt = crate::prompt::build_system_prompt_with_cwd(
                 None,
                 rules_arg,
@@ -1988,9 +1948,12 @@ impl AcpServer {
             "read_file" => self.acp_read_file(session_id, &args).await,
             "write_file" => self.acp_write_file(session_id, &args).await,
             "edit_file" => self.acp_edit_file(session_id, &args).await,
+            // Shells must run through the local executor: delegating these to
+            // an arbitrary ACP client's terminal/create API bypasses
+            // OpenClaudia's OS sandbox entirely.
             "bash" => self.acp_bash(session_id, &args).await,
-            "bash_output" => self.acp_bash_output(&args).await,
-            "kill_shell" => self.acp_kill_shell(&args).await,
+            "bash_output" => self.acp_bash_output(session_id, &args),
+            "kill_shell" => self.acp_kill_shell(session_id, &args),
             "list_files" => self.acp_list_files(session_id, &args).await,
             "glob" | "grep" => self.acp_search(session_id, &args, tool_name).await,
             // Internal tools run locally — not file/terminal operations
@@ -2036,32 +1999,67 @@ impl AcpServer {
         tool_name: &str,
         arguments_json: &str,
     ) -> AcpToolResult {
-        use crate::tools::{FunctionCall, ToolCall};
+        execute_local_tool_with_permission(
+            &self.permission_mgr,
+            session_id,
+            tool_name,
+            arguments_json,
+        )
+    }
 
-        let tc = ToolCall {
-            id: "local".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: tool_name.to_string(),
-                arguments: arguments_json.to_string(),
-            },
-        };
-
-        let result = crate::services::tool_executor::ToolExecutor::execute(
-            crate::services::tool_executor::ToolExecutorRequest {
-                tool_call: &tc,
-                memory_db: None,
-                app_config: None,
-                task_mgr: None,
-                permission_mgr: Some(&self.permission_mgr),
-                permission_already_checked: false,
-                session_id: Some(session_id),
-                policy_enforcer: None,
-            },
-        );
-        AcpToolResult {
-            content: result.content,
-            is_error: result.is_error,
+    /// Execute a synchronous local tool on Tokio's blocking pool so a
+    /// foreground command or large file operation cannot stall ACP message
+    /// routing. The permission manager is shared read-only here; the outer ACP
+    /// gate already made and recorded the mutable permission decision.
+    async fn execute_local_tool_async(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> AcpToolResult {
+        let permission_mgr = Arc::clone(&self.permission_mgr);
+        let session_id = session_id.to_string();
+        let tool_name = tool_name.to_string();
+        let arguments_json = arguments_json.to_string();
+        let cancellation = Arc::clone(&self.cancel_flag);
+        let cancellation_session = session_id.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            execute_local_tool_with_permission(
+                &permission_mgr,
+                &session_id,
+                &tool_name,
+                &arguments_json,
+            )
+        });
+        loop {
+            tokio::select! {
+                outcome = &mut worker => {
+                    return match outcome {
+                        Ok(result) => result,
+                        Err(error) => AcpToolResult {
+                            content: format!("Local tool worker failed: {error}"),
+                            is_error: true,
+                        },
+                    };
+                }
+                () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    if cancellation.load(Ordering::SeqCst) {
+                        let cancelled_processes =
+                            crate::tools::cancel_session_sandbox_processes(&cancellation_session);
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            &mut worker,
+                        )
+                        .await;
+                        return AcpToolResult {
+                            content: format!(
+                                "Tool execution cancelled; terminated {cancelled_processes} sandbox process tree(s)"
+                            ),
+                            is_error: true,
+                        };
+                    }
+                }
+            }
         }
     }
 
@@ -2102,7 +2100,7 @@ impl AcpServer {
         self.rules_engine.get_combined_rules(&ext_refs)
     }
 
-    // -- File operations via ACP client --
+    // -- Locally confined file operations --
 
     async fn acp_read_file(
         &self,
@@ -2118,49 +2116,31 @@ impl AcpServer {
         // Match the registry read_file contract: offset is a 1-indexed
         // positive line number, limit is a positive max-line count. Validate
         // before asking the ACP client to read the file.
-        let offset = match parse_acp_read_offset_arg(args.get("offset")) {
-            Ok(offset) => offset,
-            Err(result) => return result,
-        };
-        let limit = match parse_acp_read_limit_arg(args.get("limit")) {
-            Ok(limit) => limit,
-            Err(result) => return result,
-        };
-
-        match self
-            .client_request("fs/read_text_file", Some(json!({"path": path})))
-            .await
-        {
-            Ok(result) => {
-                let text = result
-                    .get("text")
-                    .or_else(|| result.get("content"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let lines: Vec<&str> = text.lines().collect();
-                let start = offset.min(lines.len());
-                let end = limit.map_or(lines.len(), |l| (start + l).min(lines.len()));
-
-                let numbered: String = lines[start..end]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                record_acp_file_read_observation(session_id, path, text, start, end, &numbered);
-
-                AcpToolResult {
-                    content: numbered,
-                    is_error: false,
-                }
-            }
-            Err(e) => AcpToolResult {
-                content: format!("Failed to read file: {e}"),
-                is_error: true,
-            },
+        if let Err(result) = parse_acp_read_offset_arg(args.get("offset")) {
+            return result;
         }
+        if let Err(result) = parse_acp_read_limit_arg(args.get("limit")) {
+            return result;
+        }
+
+        let mut local_args = serde_json::Map::new();
+        local_args.insert("path".to_string(), Value::String(path.to_string()));
+        if let Some(offset) = args.get("offset") {
+            local_args.insert("offset".to_string(), offset.clone());
+        }
+        if let Some(limit) = args.get("limit") {
+            local_args.insert("limit".to_string(), limit.clone());
+        }
+        if let Some(pages) = args.get("pages") {
+            local_args.insert("pages".to_string(), pages.clone());
+        }
+
+        self.execute_local_tool_async(
+            session_id,
+            "read_file",
+            &Value::Object(local_args).to_string(),
+        )
+        .await
     }
 
     async fn acp_write_file(
@@ -2173,52 +2153,17 @@ impl AcpServer {
             Ok(path) => path,
             Err(result) => return result,
         };
-
         let content = match parse_acp_required_string_arg(args, "content") {
             Ok(content) => content,
             Err(result) => return result,
         };
 
-        let before = self
-            .client_request("fs/read_text_file", Some(json!({"path": path})))
-            .await
-            .ok()
-            .and_then(|result| {
-                result
-                    .get("text")
-                    .or_else(|| result.get("content"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            });
-        if let Some(before_text) = before.as_deref() {
-            let end = before_text.lines().count();
-            record_acp_file_read_observation(session_id, path, before_text, 0, end, before_text);
-        }
-
-        match self
-            .client_request(
-                "fs/write_text_file",
-                Some(json!({"path": path, "content": content})),
-            )
-            .await
-        {
-            Ok(_) => {
-                record_acp_diff_observation(
-                    session_id,
-                    path,
-                    before.as_deref().unwrap_or_default(),
-                    content,
-                );
-                AcpToolResult {
-                    content: format!("Successfully wrote to {path}"),
-                    is_error: false,
-                }
-            }
-            Err(e) => AcpToolResult {
-                content: format!("Failed to write file: {e}"),
-                is_error: true,
-            },
-        }
+        self.execute_local_tool_async(
+            session_id,
+            "write_file",
+            &json!({"path": path, "content": content}).to_string(),
+        )
+        .await
     }
 
     async fn acp_edit_file(
@@ -2247,83 +2192,21 @@ impl AcpServer {
             Err(result) => return result,
         };
 
-        // Read the file via ACP
-        let file_content = match self
-            .client_request("fs/read_text_file", Some(json!({"path": path})))
-            .await
-        {
-            Ok(result) => result
-                .get("text")
-                .or_else(|| result.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            Err(e) => {
-                return AcpToolResult {
-                    content: format!("Failed to read file for edit: {e}"),
-                    is_error: true,
-                }
-            }
-        };
-        let file_end = file_content.lines().count();
-        record_acp_file_read_observation(
+        self.execute_local_tool_async(
             session_id,
-            path,
-            &file_content,
-            0,
-            file_end,
-            &file_content,
-        );
-
-        let (new_content, count) = if replace_all {
-            let count = file_content.matches(old_string).count();
-            (file_content.replace(old_string, new_string), count)
-        } else if file_content.contains(old_string) {
-            (file_content.replacen(old_string, new_string, 1), 1)
-        } else {
-            return AcpToolResult {
-                content: format!(
-                    "old_string not found in {path}. Read the file first to see exact content."
-                ),
-                is_error: true,
-            };
-        };
-
-        if count == 0 {
-            return AcpToolResult {
-                content: format!("old_string not found in {path}"),
-                is_error: true,
-            };
-        }
-
-        // Write back via ACP
-        match self
-            .client_request(
-                "fs/write_text_file",
-                Some(json!({"path": path, "content": new_content})),
-            )
-            .await
-        {
-            Ok(_) => {
-                record_acp_diff_observation(session_id, path, &file_content, &new_content);
-                AcpToolResult {
-                    content: format!(
-                        "Successfully edited {} ({} replacement{})",
-                        path,
-                        count,
-                        if count == 1 { "" } else { "s" }
-                    ),
-                    is_error: false,
-                }
-            }
-            Err(e) => AcpToolResult {
-                content: format!("Failed to write edited file: {e}"),
-                is_error: true,
-            },
-        }
+            "edit_file",
+            &json!({
+                "path": path,
+                "old_string": old_string,
+                "new_string": new_string,
+                "replace_all": replace_all
+            })
+            .to_string(),
+        )
+        .await
     }
 
-    // -- Terminal operations via ACP client --
+    // -- Sandboxed terminal operations --
 
     async fn acp_bash(&self, session_id: &str, args: &HashMap<String, Value>) -> AcpToolResult {
         let command = match parse_acp_required_string_arg(args, "command") {
@@ -2335,158 +2218,46 @@ impl AcpServer {
             Ok(value) => value,
             Err(result) => return result,
         };
-        let cwd = std::env::current_dir().unwrap_or_default();
-
-        // Create terminal
-        let terminal_id = match self
-            .client_request(
-                "terminal/create",
-                Some(json!({
-                    "command": command,
-                    "cwd": cwd.to_string_lossy().to_string(),
-                })),
-            )
+        let local_args = json!({
+            "command": command,
+            "run_in_background": run_in_background,
+        });
+        self.execute_local_tool_async(session_id, "bash", &local_args.to_string())
             .await
-        {
-            Ok(result) => result
-                .get("terminalId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            Err(e) => {
-                return AcpToolResult {
-                    content: format!("Failed to create terminal: {e}"),
-                    is_error: true,
-                }
-            }
+    }
+
+    fn acp_bash_output(&self, session_id: &str, args: &HashMap<String, Value>) -> AcpToolResult {
+        let shell_id = match parse_acp_required_alias_string_arg(
+            args,
+            "shell_id",
+            "terminal_id",
+            "shell_id",
+        ) {
+            Ok(shell_id) => shell_id,
+            Err(result) => return result,
         };
-
-        if run_in_background {
-            record_acp_background_command_start(session_id, &cwd, command);
-            return AcpToolResult {
-                content: format!(
-                    "Background shell started with terminal ID: {terminal_id}\nUse bash_output with this ID to retrieve output."
-                ),
-                is_error: false,
-            };
-        }
-
-        // Wait for completion
-        let exit_result = match self
-            .client_request(
-                "terminal/wait_for_exit",
-                Some(json!({"terminalId": terminal_id})),
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                return AcpToolResult {
-                    content: format!("Failed waiting for terminal: {e}"),
-                    is_error: true,
-                }
-            }
-        };
-
-        // Get output
-        let output = self
-            .client_request("terminal/output", Some(json!({"terminalId": terminal_id})))
-            .await
-            .map_or_else(
-                |_| String::new(),
-                |result| {
-                    result
-                        .get("output")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                },
-            );
-
-        // Release terminal
-        let _ = self
-            .client_request("terminal/release", Some(json!({"terminalId": terminal_id})))
-            .await;
-
-        let exit_code = exit_result
-            .get("exitCode")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(-1);
-
-        let stdout = output.as_str();
-        let stderr = "";
-        crate::tools::record_command_observation_for_session(
+        self.execute_local_tool(
             session_id,
-            &cwd,
-            command,
-            i32::try_from(exit_code).unwrap_or(-1),
-            stdout,
-            stderr,
-        );
-
-        AcpToolResult {
-            content: if output.is_empty() {
-                format!("(exit code {exit_code})")
-            } else {
-                format!("{output}\n(exit code {exit_code})")
-            },
-            is_error: exit_code != 0,
-        }
+            "bash_output",
+            &json!({"shell_id": shell_id}).to_string(),
+        )
     }
 
-    async fn acp_bash_output(&self, args: &HashMap<String, Value>) -> AcpToolResult {
-        let terminal_id = match parse_acp_required_alias_string_arg(
+    fn acp_kill_shell(&self, session_id: &str, args: &HashMap<String, Value>) -> AcpToolResult {
+        let shell_id = match parse_acp_required_alias_string_arg(
             args,
             "shell_id",
             "terminal_id",
             "shell_id",
         ) {
-            Ok(terminal_id) => terminal_id,
+            Ok(shell_id) => shell_id,
             Err(result) => return result,
         };
-
-        match self
-            .client_request("terminal/output", Some(json!({"terminalId": terminal_id})))
-            .await
-        {
-            Ok(result) => {
-                let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
-                AcpToolResult {
-                    content: output.to_string(),
-                    is_error: false,
-                }
-            }
-            Err(e) => AcpToolResult {
-                content: format!("Failed to get terminal output: {e}"),
-                is_error: true,
-            },
-        }
-    }
-
-    async fn acp_kill_shell(&self, args: &HashMap<String, Value>) -> AcpToolResult {
-        let terminal_id = match parse_acp_required_alias_string_arg(
-            args,
-            "shell_id",
-            "terminal_id",
-            "shell_id",
-        ) {
-            Ok(terminal_id) => terminal_id,
-            Err(result) => return result,
-        };
-
-        match self
-            .client_request("terminal/kill", Some(json!({"terminalId": terminal_id})))
-            .await
-        {
-            Ok(_) => AcpToolResult {
-                content: format!("Terminal {terminal_id} killed"),
-                is_error: false,
-            },
-            Err(e) => AcpToolResult {
-                content: format!("Failed to kill terminal: {e}"),
-                is_error: true,
-            },
-        }
+        self.execute_local_tool(
+            session_id,
+            "kill_shell",
+            &json!({"shell_id": shell_id}).to_string(),
+        )
     }
 
     async fn acp_list_files(
@@ -2498,19 +2269,8 @@ impl AcpServer {
             Ok(path) => path,
             Err(result) => return result,
         };
-        let command = match acp_list_files_command(path) {
-            Ok(command) => command,
-            Err(content) => {
-                return AcpToolResult {
-                    content,
-                    is_error: true,
-                };
-            }
-        };
-        // Delegate as a terminal command
-        let mut ls_args = HashMap::new();
-        ls_args.insert("command".to_string(), Value::String(command));
-        self.acp_bash(session_id, &ls_args).await
+        self.execute_local_tool_async(session_id, "list_files", &json!({"path": path}).to_string())
+            .await
     }
 
     async fn acp_search(
@@ -2519,156 +2279,62 @@ impl AcpServer {
         tool_args: &HashMap<String, Value>,
         tool_name: &str,
     ) -> AcpToolResult {
-        // SECURITY (#688): user-/model-supplied search arguments must NEVER be
-        // interpolated into a shell command. Build an argv vector and execute
-        // the resolved binary directly via `Command`, bypassing the ACP
-        // `terminal/create` shell entirely. Metacharacters become literal
-        // argv entries; `--` blocks flag injection from the pattern/path.
-        let (program, argv) = match build_search_argv(tool_name, tool_args) {
-            Ok(plan) => plan,
+        let arguments_json = match serde_json::to_string(tool_args) {
+            Ok(arguments) => arguments,
             Err(err) => {
                 return AcpToolResult {
-                    content: err,
+                    content: format!("Failed to serialize {tool_name} arguments: {err}"),
                     is_error: true,
-                };
+                }
             }
         };
-
-        run_search_argv(session_id, &program, &argv).await
+        self.execute_local_tool_async(session_id, tool_name, &arguments_json)
+            .await
     }
 }
 
-/// Output cap for search subprocesses (bytes). Replaces the previous
-/// `| head -N` pipeline, which only worked because the command was being
-/// shell-interpreted.
-const SEARCH_OUTPUT_CAP_BYTES: usize = 256 * 1024;
-const ACP_LEDGER_EXCERPT_MAX_BYTES: usize = 100_000;
+fn execute_local_tool_with_permission(
+    permission_mgr: &PermissionManager,
+    session_id: &str,
+    tool_name: &str,
+    arguments_json: &str,
+) -> AcpToolResult {
+    use crate::tools::{FunctionCall, ToolCall};
+
+    let tc = ToolCall {
+        id: "local".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: tool_name.to_string(),
+            arguments: arguments_json.to_string(),
+        },
+    };
+
+    let result = crate::services::tool_executor::ToolExecutor::execute(
+        crate::services::tool_executor::ToolExecutorRequest {
+            tool_call: &tc,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: Some(permission_mgr),
+            // `execute_tool_via_acp` performs the headless permission gate
+            // before dispatch, so this worker must not make a second decision.
+            permission_already_checked: true,
+            session_id: Some(session_id),
+            policy_enforcer: None,
+        },
+    );
+    AcpToolResult {
+        content: result.content,
+        is_error: result.is_error,
+    }
+}
+
+#[cfg(test)]
 const ACP_BACKGROUND_COMMAND_PENDING_STDERR: &str =
     "background command started; completion pending via bash_output";
 
-fn record_acp_file_read_observation(
-    session_id: &str,
-    path: &str,
-    full_text: &str,
-    start: usize,
-    end: usize,
-    excerpt: &str,
-) {
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                path,
-                error = %err,
-                "failed to open session reality ledger for ACP file read"
-            );
-            return;
-        }
-    };
-    let (start_line, end_line) = acp_read_line_range(full_text, start, end);
-    if let Err(err) = ledger.observe_file_read(
-        path.to_string(),
-        full_text,
-        start_line,
-        end_line,
-        crate::tools::safe_truncate(excerpt, ACP_LEDGER_EXCERPT_MAX_BYTES).to_string(),
-    ) {
-        tracing::warn!(
-            session_id,
-            path,
-            error = %err,
-            "failed to append ACP file read observation to reality ledger"
-        );
-    }
-}
-
-fn acp_read_line_range(full_text: &str, start: usize, end: usize) -> (usize, usize) {
-    let total_lines = if full_text.is_empty() {
-        0
-    } else {
-        full_text.lines().count().max(1)
-    };
-    if total_lines == 0 {
-        return (0, 0);
-    }
-    let bounded_start = start.min(total_lines.saturating_sub(1));
-    let bounded_end = end.clamp(bounded_start + 1, total_lines);
-    (bounded_start + 1, bounded_end)
-}
-
-fn record_acp_diff_observation(session_id: &str, path: &str, before: &str, after: &str) {
-    if before == after {
-        return;
-    }
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                path,
-                error = %err,
-                "failed to open session reality ledger for ACP diff"
-            );
-            return;
-        }
-    };
-    let diff_patch = similar::TextDiff::from_lines(before, after)
-        .unified_diff()
-        .header(&format!("a/{path}"), &format!("b/{path}"))
-        .to_string();
-    if let Err(err) = ledger.observe_diff(vec![path.to_string()], diff_patch) {
-        tracing::warn!(
-            session_id,
-            path,
-            error = %err,
-            "failed to append ACP diff observation to reality ledger"
-        );
-    }
-}
-
-fn record_acp_command_argv_observation(
-    session_id: &str,
-    program: &std::path::Path,
-    argv: &[String],
-    exit_code: i32,
-    stdout: &str,
-    stderr: &str,
-) {
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to open session reality ledger for ACP command"
-            );
-            return;
-        }
-    };
-    let cwd = std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let mut ledger_argv = Vec::with_capacity(argv.len() + 1);
-    ledger_argv.push(program.to_string_lossy().to_string());
-    ledger_argv.extend(argv.iter().cloned());
-    if let Err(err) = ledger.observe_command_run(
-        cwd,
-        ledger_argv,
-        exit_code,
-        crate::tools::safe_truncate(stdout, ACP_LEDGER_EXCERPT_MAX_BYTES).to_string(),
-        crate::tools::safe_truncate(stderr, ACP_LEDGER_EXCERPT_MAX_BYTES).to_string(),
-    ) {
-        tracing::warn!(
-            session_id,
-            program = %program.display(),
-            error = %err,
-            "failed to append ACP command observation to reality ledger"
-        );
-    }
-}
-
+#[cfg(test)]
 fn record_acp_background_command_start(session_id: &str, cwd: &std::path::Path, command: &str) {
     let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
         Ok(ledger) => ledger,
@@ -2733,6 +2399,7 @@ fn record_acp_tool_result_observation(
     }
 }
 
+#[cfg(test)]
 fn acp_list_files_command(path: &str) -> Result<String, String> {
     let quoted = shlex::try_quote(path).map_err(|err| format!("Invalid list_files path: {err}"))?;
     Ok(format!("ls -la -- {quoted}"))
@@ -2745,6 +2412,7 @@ fn acp_list_files_command(path: &str) -> Result<String, String> {
 /// absolute path so the caller invokes a known binary instead of relying on
 /// `Command::new`'s implicit lookup (which still works, but is harder to
 /// audit and to exercise in tests).
+#[cfg(test)]
 fn resolve_program(name: &str) -> Option<std::path::PathBuf> {
     // Reject obviously path-like or unsafe names — search tools are bare
     // executable names (`rg`, `find`), not paths.
@@ -2780,6 +2448,7 @@ fn resolve_program(name: &str) -> Option<std::path::PathBuf> {
 /// plus argv. No shell, no interpolation. Returns `Err` with a
 /// human-readable reason when the tool name is unknown or the binary cannot
 /// be located on `PATH`.
+#[cfg(test)]
 fn build_search_argv(
     tool_name: &str,
     tool_args: &HashMap<String, Value>,
@@ -2809,6 +2478,8 @@ fn build_search_argv(
             let context_lines = parse_acp_search_context_lines_arg(tool_args.get("context_lines"))?;
             let case_insensitive =
                 parse_acp_bool_arg_for_search(tool_args, "case_insensitive", false)?;
+            let file_type = optional_acp_search_string_arg_opt(tool_args, "type")?;
+            let glob = optional_acp_search_string_arg_opt(tool_args, "glob")?;
             let program =
                 resolve_program("rg").ok_or_else(|| "Could not locate `rg` on PATH".to_string())?;
 
@@ -2820,7 +2491,7 @@ fn build_search_argv(
                 argv.push("--context".to_string());
                 argv.push(context_lines.to_string());
             }
-            if let Some(ft) = optional_acp_search_string_arg_opt(tool_args, "type")? {
+            if let Some(ft) = file_type {
                 // The type name itself is an argv entry, but disallow values
                 // that look like flags to keep the contract obvious.
                 if ft.starts_with('-') {
@@ -2829,7 +2500,7 @@ fn build_search_argv(
                 argv.push("--type".to_string());
                 argv.push(ft);
             }
-            if let Some(g) = optional_acp_search_string_arg_opt(tool_args, "glob")? {
+            if let Some(g) = glob {
                 if g.starts_with('-') {
                     return Err(format!("Invalid `glob` value (looks like a flag): {g}"));
                 }
@@ -2848,6 +2519,7 @@ fn build_search_argv(
     }
 }
 
+#[cfg(test)]
 fn required_acp_search_string_arg(
     tool_args: &HashMap<String, Value>,
     key: &'static str,
@@ -2858,6 +2530,7 @@ fn required_acp_search_string_arg(
         .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 fn optional_acp_search_string_arg(
     tool_args: &HashMap<String, Value>,
     key: &'static str,
@@ -2867,6 +2540,7 @@ fn optional_acp_search_string_arg(
         .map(|value| value.unwrap_or_else(|| default.to_string()))
 }
 
+#[cfg(test)]
 fn optional_acp_search_string_arg_opt(
     tool_args: &HashMap<String, Value>,
     key: &'static str,
@@ -2879,6 +2553,7 @@ fn optional_acp_search_string_arg_opt(
     })
 }
 
+#[cfg(test)]
 fn parse_acp_bool_arg_for_search(
     args: &HashMap<String, Value>,
     key: &'static str,
@@ -2888,6 +2563,7 @@ fn parse_acp_bool_arg_for_search(
         .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 fn parse_acp_search_context_lines_arg(value: Option<&Value>) -> Result<usize, String> {
     let Some(value) = value else {
         return Ok(0);
@@ -2896,58 +2572,6 @@ fn parse_acp_search_context_lines_arg(value: Option<&Value>) -> Result<usize, St
         return Err("Error: context_lines must be a non-negative integer".to_string());
     };
     Ok(usize::try_from(context).unwrap_or(usize::MAX))
-}
-
-/// Execute the resolved program with the planned argv and return a result
-/// suitable for an ACP tool reply. Output is byte-capped (replacing the
-/// former `| head -N` shell pipeline) and stdout+stderr are merged in the
-/// natural order Tokio gives us.
-async fn run_search_argv(
-    session_id: &str,
-    program: &std::path::Path,
-    argv: &[String],
-) -> AcpToolResult {
-    let output = match tokio::process::Command::new(program)
-        .args(argv)
-        .output()
-        .await
-    {
-        Ok(out) => out,
-        Err(e) => {
-            return AcpToolResult {
-                content: format!("Failed to spawn {}: {e}", program.display()),
-                is_error: true,
-            };
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let mut combined = stdout.clone();
-    if !stderr.is_empty() {
-        // Surface stderr (rg prints "No files were searched" etc. there)
-        // but only when present, so happy paths stay clean.
-        combined.push_str(&stderr);
-    }
-    if combined.len() > SEARCH_OUTPUT_CAP_BYTES {
-        combined.truncate(SEARCH_OUTPUT_CAP_BYTES);
-        combined.push_str("\n[output truncated]");
-    }
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    record_acp_command_argv_observation(session_id, program, argv, exit_code, &stdout, &stderr);
-    let content = if combined.is_empty() {
-        format!("(exit code {exit_code})")
-    } else {
-        format!("{combined}\n(exit code {exit_code})")
-    };
-    AcpToolResult {
-        content,
-        // `rg` exits non-zero when there are no matches — that's not a tool
-        // error, just an empty result. Treat exit codes 0 and 1 from rg as
-        // success; anything else is a real failure.
-        is_error: !(exit_code == 0 || exit_code == 1),
-    }
 }
 
 // ============================================================================
@@ -3119,8 +2743,13 @@ pub async fn run_acp_server(
         }
     });
 
-    // Spawn stdin reader on a blocking thread — stdin.lock() is not Send
+    let mut server = AcpServer::new(config, model, api_key, claude_code_token, stdout_tx);
+
+    // Spawn stdin reader on a blocking thread — stdin.lock() is not Send.
+    // Cancellation is raised here, before the sequential dispatcher receives
+    // the message, so an in-flight prompt/tool cannot starve session/cancel.
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+    let reader_cancel = Arc::clone(&server.cancel_flag);
     std::thread::spawn(move || {
         let stdin = io::stdin();
         let reader = stdin.lock();
@@ -3128,6 +2757,19 @@ pub async fn run_acp_server(
             match line_result {
                 Ok(line) => {
                     let trimmed = line.trim().to_string();
+                    if serde_json::from_str::<Value>(&trimmed)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("method")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .as_deref()
+                        == Some("session/cancel")
+                    {
+                        reader_cancel.store(true, Ordering::SeqCst);
+                    }
                     if !trimmed.is_empty() && stdin_tx.send(trimmed).is_err() {
                         break;
                     }
@@ -3135,9 +2777,9 @@ pub async fn run_acp_server(
                 Err(_) => break,
             }
         }
+        reader_cancel.store(true, Ordering::SeqCst);
+        crate::tools::cancel_all_sandbox_processes();
     });
-
-    let mut server = AcpServer::new(config, model, api_key, claude_code_token, stdout_tx);
 
     info!("ACP server started on stdio");
 
@@ -3663,23 +3305,9 @@ mod search_security_tests {
 #[cfg(test)]
 mod acp_ledger_helper_tests {
     use super::{
-        acp_read_line_range, record_acp_background_command_start,
-        record_acp_tool_result_observation, AcpToolResult, ACP_BACKGROUND_COMMAND_PENDING_STDERR,
-        ACP_LEDGER_EXCERPT_MAX_BYTES,
+        record_acp_background_command_start, record_acp_tool_result_observation, AcpToolResult,
+        ACP_BACKGROUND_COMMAND_PENDING_STDERR,
     };
-
-    #[test]
-    fn acp_read_line_range_maps_slice_offsets_to_one_based_lines() {
-        assert_eq!(acp_read_line_range("a\nb\nc\n", 0, 3), (1, 3));
-        assert_eq!(acp_read_line_range("a\nb\nc\n", 1, 2), (2, 2));
-    }
-
-    #[test]
-    fn acp_read_line_range_never_returns_inverted_ranges() {
-        assert_eq!(acp_read_line_range("", 0, 0), (0, 0));
-        assert_eq!(acp_read_line_range("a\nb\nc\n", 99, 99), (3, 3));
-        assert_eq!(acp_read_line_range("a\nb\nc\n", 1, 1), (2, 2));
-    }
 
     #[test]
     fn acp_tool_result_observer_records_bounded_result_envelope() {
@@ -3689,7 +3317,7 @@ mod acp_ledger_helper_tests {
         let _ = std::fs::remove_file(&path);
 
         let result = AcpToolResult {
-            content: "x".repeat(ACP_LEDGER_EXCERPT_MAX_BYTES + 128),
+            content: "x".repeat(crate::grounded_loop::TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES + 128),
             is_error: true,
         };
         record_acp_tool_result_observation(session_id, "read_file", "call_acp", &result);
@@ -3978,7 +3606,7 @@ mod session_mode_tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Arc;
-    use tokio::sync::{mpsc, Mutex};
+    use tokio::sync::mpsc;
 
     fn test_config() -> AppConfig {
         serde_yaml::from_str(
@@ -4013,12 +3641,10 @@ providers:
             model: "local-model".to_string(),
             api_key: None,
             claude_code_token: None,
-            permission_mgr: PermissionManager::unrestricted(),
+            permission_mgr: Arc::new(PermissionManager::unrestricted()),
             policy_enforcer: Arc::new(crate::services::policy::PolicyEnforcer::new(
                 crate::services::policy::EnterprisePolicy::default(),
             )),
-            next_request_id: AtomicU64::new(1),
-            pending_responses: Arc::new(Mutex::new(HashMap::new())),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
             config_options: HashMap::new(),
@@ -4049,25 +3675,6 @@ providers:
             rx.try_recv().is_err(),
             "{context} must fail before emitting an ACP client request"
         );
-    }
-
-    async fn respond_to_next_client_request(
-        server: &AcpServer,
-        rx: &mut mpsc::UnboundedReceiver<String>,
-        result: Value,
-    ) -> Value {
-        let line = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out waiting for ACP client request")
-            .expect("expected ACP client request");
-        let request: Value = serde_json::from_str(&line).expect("client request must be JSON");
-        let id = request["id"].as_u64().expect("client request id");
-        let tx = {
-            let mut pending = server.pending_responses.lock().await;
-            pending.remove(&id).expect("pending response channel")
-        };
-        tx.send(Ok(result)).expect("send fake client response");
-        request
     }
 
     #[tokio::test]
@@ -4185,29 +3792,152 @@ providers:
             ("limit".to_string(), json!(1)),
         ]);
 
-        let read = server.acp_read_file("acp-window", &args);
-        let respond = async {
-            let request = respond_to_next_client_request(
-                &server,
-                &mut rx,
-                json!({"text": "first\nsecond\nthird"}),
-            )
-            .await;
-            assert_eq!(request["method"], "fs/read_text_file");
-            assert_eq!(request["params"]["path"], "src/lib.rs");
-        };
-        let (result, ()) = tokio::join!(read, respond);
+        let expected = std::fs::read_to_string("src/lib.rs")
+            .expect("read fixture")
+            .lines()
+            .nth(1)
+            .expect("fixture has a second line")
+            .to_string();
+        let result = server.acp_read_file("acp-window", &args).await;
 
         assert!(!result.is_error, "valid window must succeed: {result:?}");
         assert!(
-            result.content.contains("\tsecond"),
-            "offset=2 limit=1 must show line 2; got {}",
+            result.content.contains(&format!("| {expected}")),
+            "offset=2 limit=1 must show the fixture's line 2; got {}",
             result.content
         );
         assert!(
-            !result.content.contains("\tfirst") && !result.content.contains("\tthird"),
-            "offset/limit window must only show one line; got {}",
+            result
+                .content
+                .lines()
+                .filter(|line| line.contains('|'))
+                .count()
+                == 1,
+            "offset/limit window must return exactly one numbered content line; got {}",
             result.content
+        );
+        assert_no_client_request(&mut rx, "local ACP read");
+    }
+
+    #[tokio::test]
+    async fn acp_filesystem_operations_cannot_expand_local_capabilities() {
+        let (server, mut rx, _tmp) = test_server();
+        let outside = tempfile::tempdir().expect("outside capability fixture");
+        let sentinel = outside.path().join("sentinel.txt");
+        std::fs::write(&sentinel, "outside-secret").expect("outside sentinel");
+
+        let read = server
+            .acp_read_file(
+                "acp-capability-jail",
+                &HashMap::from([(
+                    "path".to_string(),
+                    Value::String(sentinel.to_string_lossy().into_owned()),
+                )]),
+            )
+            .await;
+        assert!(read.is_error);
+        assert!(!read.content.contains("outside-secret"));
+
+        let write = server
+            .acp_write_file(
+                "acp-capability-jail",
+                &HashMap::from([
+                    (
+                        "path".to_string(),
+                        Value::String(sentinel.to_string_lossy().into_owned()),
+                    ),
+                    ("content".to_string(), Value::String("changed".to_string())),
+                ]),
+            )
+            .await;
+        assert!(write.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("outside sentinel"),
+            "outside-secret"
+        );
+
+        let traversal = server
+            .acp_read_file(
+                "acp-capability-jail",
+                &HashMap::from([(
+                    "path".to_string(),
+                    Value::String("../outside.txt".to_string()),
+                )]),
+            )
+            .await;
+        assert!(traversal.is_error);
+
+        let search = server
+            .acp_search(
+                "acp-capability-jail",
+                &HashMap::from([
+                    ("pattern".to_string(), Value::String("outside".to_string())),
+                    (
+                        "path".to_string(),
+                        Value::String(outside.path().to_string_lossy().into_owned()),
+                    ),
+                ]),
+                "grep",
+            )
+            .await;
+        assert!(search.is_error);
+        assert!(!search.content.contains("outside-secret"));
+
+        #[cfg(unix)]
+        {
+            let inside = tempfile::tempdir_in(".").expect("project-local fixture");
+            let link = inside.path().join("outside-link");
+            std::os::unix::fs::symlink(&sentinel, &link).expect("outside symlink");
+            let linked = server
+                .acp_read_file(
+                    "acp-capability-jail",
+                    &HashMap::from([(
+                        "path".to_string(),
+                        Value::String(link.to_string_lossy().into_owned()),
+                    )]),
+                )
+                .await;
+            assert!(linked.is_error);
+            assert!(!linked.content.contains("outside-secret"));
+        }
+
+        assert_no_client_request(&mut rx, "locally confined ACP filesystem tools");
+    }
+
+    #[test]
+    fn ide_unsaved_buffers_require_session_scoped_file_capability() {
+        let (mut server, _rx, _tmp) = test_server();
+        server.handle_ide_file_opened(&json!({
+            "sessionId": "ide-capability-session",
+            "filePath": "src/lib.rs",
+            "text": "unsaved editor contents"
+        }));
+        assert_eq!(
+            server.ide_state.active_file.as_deref(),
+            Some("src/lib.rs"),
+            "project-local unsaved buffer should be accepted"
+        );
+
+        let outside = tempfile::NamedTempFile::new().expect("outside IDE fixture");
+        server.handle_ide_file_opened(&json!({
+            "sessionId": "ide-capability-session",
+            "filePath": outside.path(),
+            "text": "outside unsaved secret"
+        }));
+        assert_eq!(
+            server.ide_state.active_file.as_deref(),
+            Some("src/lib.rs"),
+            "outside buffer notification must be dropped"
+        );
+
+        server.handle_ide_file_opened(&json!({
+            "filePath": "src/main.rs",
+            "text": "unscoped"
+        }));
+        assert_eq!(
+            server.ide_state.active_file.as_deref(),
+            Some("src/lib.rs"),
+            "notification without a session id must be dropped"
         );
     }
 
@@ -4319,11 +4049,72 @@ providers:
     }
 
     #[tokio::test]
-    async fn acp_bash_output_rejects_wrong_type_shell_id_before_client_request() {
+    async fn acp_bash_executes_locally_without_terminal_client_delegation() {
+        let (server, mut rx, _tmp) = test_server();
+        let args = HashMap::from([
+            ("command".to_string(), json!("echo acp_sandbox_probe")),
+            ("run_in_background".to_string(), json!(false)),
+        ]);
+
+        let result = server.acp_bash("acp-local-bash", &args).await;
+
+        assert!(!result.is_error, "local ACP bash failed: {result:?}");
+        assert!(result.content.contains("acp_sandbox_probe"));
+        assert_no_client_request(&mut rx, "ACP bash sandbox routing");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn acp_foreground_bash_cancellation_terminates_descendants_promptly() {
+        let (server, _rx, _tmp) = test_server();
+        let fixture = tempfile::tempdir_in(".").expect("project-local cancellation fixture");
+        let escaped_marker = fixture.path().join("descendant-survived");
+        let marker = shlex::try_quote(
+            escaped_marker
+                .to_str()
+                .expect("cancellation marker must be UTF-8"),
+        )
+        .expect("quote cancellation marker");
+        let args = HashMap::from([
+            (
+                "command".to_string(),
+                json!(format!("(sleep 1; echo escaped > {marker}) & sleep 30")),
+            ),
+            ("run_in_background".to_string(), json!(false)),
+        ]);
+        let cancel = Arc::clone(&server.cancel_flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = std::time::Instant::now();
+        let result = server.acp_bash("acp-cancel-tree", &args).await;
+        assert!(
+            result.is_error,
+            "cancelled tool must be reported as an error"
+        );
+        assert!(
+            result.content.contains("cancelled"),
+            "unexpected cancellation result: {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "ACP cancellation did not return promptly"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        assert!(
+            !escaped_marker.exists(),
+            "a daemonized sandbox descendant survived ACP cancellation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn acp_bash_output_rejects_wrong_type_shell_id_before_client_request() {
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("shell_id".to_string(), json!(42))]);
 
-        let result = server.acp_bash_output(&args).await;
+        let result = server.acp_bash_output("acp-bad-output", &args);
 
         assert!(result.is_error, "bad shell_id must error: {result:?}");
         assert!(
@@ -4336,12 +4127,12 @@ providers:
         assert_no_client_request(&mut rx, "bad bash_output shell_id");
     }
 
-    #[tokio::test]
-    async fn acp_kill_shell_rejects_wrong_type_terminal_id_before_client_request() {
+    #[test]
+    fn acp_kill_shell_rejects_wrong_type_terminal_id_before_client_request() {
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("terminal_id".to_string(), json!({"id": "term"}))]);
 
-        let result = server.acp_kill_shell(&args).await;
+        let result = server.acp_kill_shell("acp-bad-kill", &args);
 
         assert!(result.is_error, "bad terminal_id must error: {result:?}");
         assert!(
@@ -4863,7 +4654,7 @@ mod acp_permission_gate_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod pre_tool_gate_tests {
     use super::pre_tool_use_gate;
     use crate::config::{Hook, HookEntry, HookPolicy, HooksConfig};
@@ -4911,7 +4702,7 @@ mod pre_tool_gate_tests {
     /// when the wiring regresses.
     #[tokio::test]
     async fn hook_denial_blocks_tool_dispatch() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempfile::tempdir_in(".").expect("project-local tempdir");
         let script = write_deny_script(tmp.path(), "blocked-by-policy");
 
         let mut cfg = HooksConfig::default();
@@ -4951,7 +4742,7 @@ mod pre_tool_gate_tests {
     /// This guards against an over-eager fix that just blocks everything.
     #[tokio::test]
     async fn allowed_tool_passes_through_gate() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempfile::tempdir_in(".").expect("project-local tempdir");
         let script = write_deny_script(tmp.path(), "denied");
 
         let mut cfg = HooksConfig::default();
@@ -5012,7 +4803,7 @@ mod pre_tool_gate_tests {
     /// is wired correctly through the ACP code path.
     #[tokio::test]
     async fn matcher_match_triggers_deny() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempfile::tempdir_in(".").expect("project-local tempdir");
         let script = write_deny_script(tmp.path(), "bash-not-allowed");
 
         let mut cfg = HooksConfig::default();

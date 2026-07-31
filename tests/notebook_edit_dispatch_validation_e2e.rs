@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 fn dispatch_notebook(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -74,7 +75,7 @@ fn notebook_path_as_null_returns_validation_error() {
 
 #[test]
 fn missing_new_source_arg_returns_documented_error() {
-    let args = args_with(&[("notebook_path", json!("/tmp/x.ipynb"))]);
+    let args = args_with(&[("notebook_path", json!("x.ipynb"))]);
     let (msg, is_err) = dispatch_notebook(&args);
     assert!(is_err);
     assert!(
@@ -86,7 +87,7 @@ fn missing_new_source_arg_returns_documented_error() {
 #[test]
 fn new_source_as_number_returns_validation_error() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/x.ipynb")),
+        ("notebook_path", json!("x.ipynb")),
         ("new_source", json!(42)),
     ]);
     let (msg, is_err) = dispatch_notebook(&args);
@@ -117,7 +118,7 @@ fn missing_both_args_surfaces_notebook_path_error_first() {
 #[test]
 fn invalid_edit_mode_returns_documented_3_choice_error() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/x.ipynb")),
+        ("notebook_path", json!("x.ipynb")),
         ("new_source", json!("body")),
         ("edit_mode", json!("not_a_real_mode")),
     ]);
@@ -137,7 +138,7 @@ fn invalid_edit_mode_returns_documented_3_choice_error() {
 #[test]
 fn edit_mode_as_number_returns_validation_error() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/x.ipynb")),
+        ("notebook_path", json!("x.ipynb")),
         ("new_source", json!("body")),
         ("edit_mode", json!(42)),
     ]);
@@ -151,7 +152,7 @@ fn edit_mode_replace_passes_enum_check() {
     // Valid edit_mode — fails downstream (file doesn't exist) but
     // NOT with the enum error.
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent_nb_xyz.ipynb")),
+        ("notebook_path", json!("nonexistent_nb_xyz.ipynb")),
         ("new_source", json!("body")),
         ("edit_mode", json!("replace")),
     ]);
@@ -166,7 +167,7 @@ fn edit_mode_replace_passes_enum_check() {
 #[test]
 fn edit_mode_insert_passes_enum_check() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("edit_mode", json!("insert")),
     ]);
@@ -178,7 +179,7 @@ fn edit_mode_insert_passes_enum_check() {
 #[test]
 fn edit_mode_delete_passes_enum_check() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("edit_mode", json!("delete")),
     ]);
@@ -191,7 +192,7 @@ fn edit_mode_delete_passes_enum_check() {
 fn missing_edit_mode_defaults_to_replace() {
     // PINS DEFAULT: omitted edit_mode → "replace" (no enum error).
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
     ]);
     let (msg, is_err) = dispatch_notebook(&args);
@@ -211,7 +212,7 @@ fn invalid_cell_type_returns_documented_nbformat_error() {
     // PINS #985: cell_type must be in nbformat allowlist
     // {code, markdown, raw}.
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/x.ipynb")),
+        ("notebook_path", json!("x.ipynb")),
         ("new_source", json!("body")),
         ("cell_type", json!("bogus_type")),
     ]);
@@ -230,7 +231,7 @@ fn invalid_cell_type_returns_documented_nbformat_error() {
 #[test]
 fn cell_type_as_number_returns_validation_error() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/x.ipynb")),
+        ("notebook_path", json!("x.ipynb")),
         ("new_source", json!("body")),
         ("cell_type", json!(42)),
     ]);
@@ -242,7 +243,7 @@ fn cell_type_as_number_returns_validation_error() {
 #[test]
 fn cell_type_code_passes_enum_check() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("cell_type", json!("code")),
     ]);
@@ -254,7 +255,7 @@ fn cell_type_code_passes_enum_check() {
 #[test]
 fn cell_type_markdown_passes_enum_check() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("cell_type", json!("markdown")),
     ]);
@@ -266,7 +267,7 @@ fn cell_type_markdown_passes_enum_check() {
 #[test]
 fn cell_type_raw_passes_enum_check() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("cell_type", json!("raw")),
     ]);
@@ -279,7 +280,7 @@ fn cell_type_raw_passes_enum_check() {
 fn missing_cell_type_arg_passes_enum_check() {
     // PINS DOC: cell_type is optional.
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
     ]);
     let (msg, is_err) = dispatch_notebook(&args);
@@ -297,7 +298,7 @@ fn cell_number_above_usize_range_returns_platform_specific_error() {
     // the try_from succeeds and the value passes through. We
     // just verify no panic + reasonable error path.
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("cell_number", json!(u64::MAX)),
     ]);
@@ -310,7 +311,7 @@ fn cell_number_above_usize_range_returns_platform_specific_error() {
 #[test]
 fn cell_number_negative_is_rejected_as_non_u64() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("cell_number", json!(-1)),
     ]);
@@ -322,7 +323,7 @@ fn cell_number_negative_is_rejected_as_non_u64() {
 #[test]
 fn cell_id_as_number_returns_validation_error() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("notebook_path", json!("nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("cell_id", json!(42)),
     ]);
@@ -338,7 +339,7 @@ fn cell_id_as_number_returns_validation_error() {
 #[test]
 fn dispatch_never_panics_on_arbitrary_extra_args() {
     let args = args_with(&[
-        ("notebook_path", json!("/tmp/x.ipynb")),
+        ("notebook_path", json!("x.ipynb")),
         ("new_source", json!("body")),
         ("unknown_arg", json!("ignored")),
         ("nested", json!([1, 2, 3])),

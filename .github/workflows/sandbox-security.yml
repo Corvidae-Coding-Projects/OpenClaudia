@@ -1,0 +1,53 @@
+name: Sandbox security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install and authorize Bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor-profiles bubblewrap
+          sudo install -m 0644 \
+            /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          /usr/bin/bwrap \
+            --unshare-all \
+            --unshare-user \
+            --disable-userns \
+            --assert-userns-disabled \
+            --cap-drop ALL \
+            --ro-bind / / \
+            --proc /proc \
+            --dev /dev \
+            -- /usr/bin/true
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets -- --test-threads=1
+      - run: cargo test --test sandbox_escape_e2e -- --test-threads=1
+      - run: cargo test --test session_filesystem_capabilities_e2e -- --test-threads=1
+
+  platform-fail-closed:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --all-targets
+      - run: cargo test --test sandbox_platform_fail_closed_e2e -- --test-threads=1

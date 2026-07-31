@@ -1,32 +1,10 @@
-use super::{canonicalize_or_walk_up, resolve_open_path, resolve_path, READ_TRACKER};
+use super::{canonicalize_or_walk_up, resolve_open_path, resolve_path, secure_fs, READ_TRACKER};
 use crate::tools::args::ToolArgs as _;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
-
-/// Open the file once for read+write with `O_NOFOLLOW` on the leaf so a
-/// symlink-swap between [`resolve_path`]'s canonicalize and this open call
-/// fails with `ELOOP` instead of silently writing through the attacker's
-/// symlink. See crosslink #417 (dup #428).
-#[cfg(unix)]
-fn open_for_edit_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_for_edit_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-}
 
 /// Truncate the open handle to zero and rewrite it with `new_content`.
 /// Keeps `execute_edit_file` under the clippy line budget while preserving
@@ -170,6 +148,7 @@ fn format_edit_success(
 /// when `true` every occurrence of `old_string` is replaced; when `false`
 /// or absent, multi-occurrence inputs are rejected so callers must provide
 /// a uniquely-matching `old_string`.
+#[allow(clippy::too_many_lines)]
 pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
     // crosslink #675: typed accessor.
     let user_path = match args.arg_str_strict("path") {
@@ -245,9 +224,14 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
 
     // Open ONCE with O_NOFOLLOW against the LEAF-PRESERVING path; all
     // I/O goes through this FD. See crosslink #417 (dup #428).
-    let mut file = match open_for_edit_nofollow(&open_path) {
+    let mut file = match secure_fs::open_regular_edit(&open_path) {
         Ok(f) => f,
-        Err(e) => return (format!("Failed to open file '{path}': {e}"), true),
+        Err(error) => {
+            return (
+                format!("Failed to securely open file '{path}': {error}"),
+                true,
+            )
+        }
     };
 
     let mut content = String::new();
@@ -349,7 +333,7 @@ mod tests {
     /// Write content to a `NamedTempFile`, mark it as read in `READ_TRACKER`,
     /// and return (file, `canonical_path_string`).
     fn tmp_readable(content: &str) -> (NamedTempFile, String) {
-        let mut f = NamedTempFile::new().expect("tempfile");
+        let mut f = NamedTempFile::new_in(".").expect("tempfile");
         f.write_all(content.as_bytes()).expect("write");
         let canon = f.path().canonicalize().expect("canonicalize");
         READ_TRACKER.mark_read(&canon);
@@ -638,7 +622,7 @@ mod tests {
     fn edit_requires_prior_read() {
         // Not in #525 spec directly, but the read-before-edit enforcement is a
         // contract that interacts with all Behavior 4/5 tests; pin it explicitly.
-        let mut f = NamedTempFile::new().expect("tempfile");
+        let mut f = NamedTempFile::new_in(".").expect("tempfile");
         f.write_all(b"some content\n").expect("write");
         let path = f.path().canonicalize().expect("canon");
         // Deliberately do NOT call READ_TRACKER.mark_read() for this file
@@ -723,7 +707,7 @@ mod tests {
     #[test]
     fn fix417_edit_rejects_symlink_at_target() {
         use tempfile::TempDir;
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let target = dir.path().join("attacker_target.txt");
         std::fs::write(&target, "PROTECTED\n").expect("setup target");
         let leaf = dir.path().join("leaf.txt");

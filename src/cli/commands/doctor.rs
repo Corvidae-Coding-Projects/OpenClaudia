@@ -153,6 +153,29 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
 
     let mut has_failures = false;
 
+    let sandbox = openclaudia::tools::sandbox_diagnostics();
+    println!(
+        "Agent sandbox... {}",
+        if sandbox.healthy { "OK" } else { "FAILED" }
+    );
+    println!("  Backend: {}", sandbox.backend);
+    println!("  Detail: {}", sandbox.detail);
+    println!("  Network: {}", sandbox.network);
+    println!("  Syscall policy: {}", sandbox.syscall_filter);
+    println!("  Resource limits: {}", sandbox.resource_limits);
+    println!(
+        "  Capability roots: {} read-only, {} read-write",
+        sandbox.read_only_root_count, sandbox.read_write_root_count
+    );
+    println!(
+        "  Explicit environment grants: {} variable name(s), values redacted",
+        sandbox.environment_grant_count
+    );
+    if sandbox.explicit_host_opt_out {
+        println!("  WARNING: host operator explicitly disabled process isolation");
+    }
+    has_failures |= !sandbox.healthy;
+
     // Check configuration
     print!("Configuration... ");
     let loaded_config = if config::config_file_exists() {
@@ -348,11 +371,23 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
         if !all_mcp.is_empty() {
             println!("\n  MCP Servers from plugins:");
             for (plugin, server) in all_mcp {
+                let effective_permissions = if server.transport == "stdio" {
+                    format!(
+                        "trust=required, profile=mcp-stdio, network=denied, env-grants={}",
+                        server.env.len()
+                    )
+                } else {
+                    format!(
+                        "trust=required, brokered transport, header-grants={}",
+                        server.headers.len()
+                    )
+                };
                 println!(
-                    "    - {} from {} ({})",
+                    "    - {} from {} ({}; {})",
                     server.name,
                     plugin.name(),
-                    server.transport
+                    server.transport,
+                    effective_permissions
                 );
             }
         }

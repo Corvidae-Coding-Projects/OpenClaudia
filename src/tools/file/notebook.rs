@@ -6,27 +6,6 @@ use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 
-/// Open the notebook ONCE with `O_NOFOLLOW` on the leaf. All reads/writes go
-/// through this single file handle — closing the TOCTOU window between
-/// canonicalize and write described in crosslink #417 (dup #428).
-#[cfg(unix)]
-fn open_notebook_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_notebook_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-}
-
 /// Split source text into a JSON array of line strings for notebook cell source format.
 /// Each line except possibly the last ends with '\n'.
 #[must_use]
@@ -271,10 +250,9 @@ fn preflight_and_open(raw_path: &str) -> Result<NotebookHandle, ToolFailure> {
 
     crate::guardrails::check_file_access(&canonical_path).map_err(|msg| (msg, true))?;
 
-    // Open ONCE with O_NOFOLLOW against the LEAF-PRESERVING path. All
-    // subsequent reads/writes use this FD — closing the TOCTOU window
-    // described in crosslink #417 (dup #428).
-    let file = open_notebook_nofollow(&open_path).map_err(|e| {
+    // Open once through the capability-root descriptor. `openat2` rejects
+    // symlinks in every component, not just the final notebook name.
+    let file = super::secure_fs::open_regular_edit(&open_path).map_err(|e| {
         (
             format!("Failed to open notebook '{canonical_path}': {e}"),
             true,
@@ -686,7 +664,7 @@ mod tests {
     /// Write a notebook JSON to a `NamedTempFile`, mark it read in `READ_TRACKER`,
     /// and return (file, `canonical_path_string`).
     fn tmp_notebook(nb: &Value) -> (NamedTempFile, String) {
-        let mut f = NamedTempFile::new().expect("tempfile");
+        let mut f = NamedTempFile::new_in(".").expect("tempfile");
         let text = serde_json::to_string_pretty(nb).expect("serialize");
         f.write_all(text.as_bytes()).expect("write");
         let canon = f.path().canonicalize().expect("canonicalize");
@@ -1092,7 +1070,7 @@ mod tests {
     #[test]
     fn notebook_invalid_json_returns_error() {
         // Behavior 7 error path: invalid JSON → error (both CC and OC agree)
-        let mut f = NamedTempFile::new().expect("tempfile");
+        let mut f = NamedTempFile::new_in(".").expect("tempfile");
         f.write_all(b"not valid json {{{{").expect("write");
         let canon = f.path().canonicalize().expect("canon");
         READ_TRACKER.mark_read(&canon);
@@ -1172,7 +1150,7 @@ mod tests {
     #[test]
     fn fix417_notebook_rejects_symlink_at_target() {
         use tempfile::TempDir;
-        let dir = TempDir::new().expect("tempdir");
+        let dir = TempDir::new_in(".").expect("tempdir");
         let target = dir.path().join("attacker_target.ipynb");
         let nb = make_notebook(&json!([
             {"id": "guarded", "cell_type": "code", "source": "SAFE", "metadata": {}, "outputs": [], "execution_count": null}

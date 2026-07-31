@@ -81,11 +81,11 @@ regex = "1"
 shlex = "2"
 
 # OAuth and cryptography
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.11"
 rand = "0.10"
 url = "2"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 urlencoding = "2"
 
 # CLI enhancements

@@ -18,6 +18,8 @@ pub(crate) mod args;
 mod ask_user;
 mod bash;
 pub(crate) use bash::record_command_observation_for_session;
+pub use bash::sandbox::{sandbox_diagnostics, sandbox_preflight, SandboxDiagnostics};
+pub(crate) use bash::sandbox::{sandboxed_hook_command, sandboxed_process_command, SandboxProfile};
 pub(crate) mod command;
 mod cron;
 pub(crate) mod crosslink;
@@ -27,7 +29,9 @@ pub(crate) mod crosslink;
 /// reach these via the module path.
 pub use cron::{execute_cron_create, execute_cron_delete, execute_cron_list};
 mod file;
+pub(crate) use file::open_capability_regular_read;
 mod grounding;
+pub mod security;
 /// Re-export the notebook-source-to-line-array helper so the
 /// E2E test suite (`tests/notebook_edit_e2e.rs`) can construct
 /// nbformat-compatible test fixtures without re-implementing
@@ -84,6 +88,13 @@ pub use bash::{
     check_command_against_global as check_bash_path_against_global, clear_global_path_constraints,
     install_global_path_constraints, PathConstraints,
 };
+pub(crate) use bash::{terminate_process_tree, terminate_session_background_jobs};
+pub(crate) use command::run_sandboxed_with_timeout_with_env;
+pub(crate) use command::{
+    cancel_all_sandbox_processes, cancel_session_sandbox_processes,
+    clear_session_process_cancellation,
+};
+pub(crate) use command::{run_prepared_sandboxed_with_timeout, CommandError};
 /// RAII guard that marks the current thread as executing inside a subagent
 /// task, so `execute_enter_plan_mode` refuses with the CC-parity error
 /// (crosslink #620). Subagent runners construct one of these for the
@@ -283,10 +294,40 @@ fn gate_or_legacy_result(
             target,
         } => Some(ToolResult {
             tool_call_id,
-            content: format!("PERMISSION_PROMPT: Allow {tool} on '{target}'? [y/n/a(lways)]"),
+            content: legacy_permission_prompt(&tool, &target),
             is_error: true,
         }),
     }
+}
+
+/// Describe the effective authority behind an interactive tool permission.
+///
+/// This is deliberately about the enforced boundary, not the command text:
+/// prompts must not imply that approving one string grants ambient host
+/// filesystem or network access.
+#[must_use]
+pub const fn permission_scope_summary(tool: &str) -> &'static str {
+    if tool.eq_ignore_ascii_case("bash") {
+        "project/explicit roots; controls masked; subprocess network denied"
+    } else if tool.eq_ignore_ascii_case("write")
+        || tool.eq_ignore_ascii_case("write_file")
+        || tool.eq_ignore_ascii_case("edit")
+        || tool.eq_ignore_ascii_case("edit_file")
+        || tool.eq_ignore_ascii_case("notebook_edit")
+    {
+        "named path within session write roots; control paths masked"
+    } else if tool.eq_ignore_ascii_case("webfetch") || tool.eq_ignore_ascii_case("web_fetch") {
+        "brokered URL only; redirects and resolved IPs pass SSRF policy"
+    } else {
+        "active session capabilities; no ambient host authority"
+    }
+}
+
+fn legacy_permission_prompt(tool: &str, target: &str) -> String {
+    format!(
+        "PERMISSION_PROMPT: Allow {tool} on '{target}'? [y/n/a(lways)]\nScope: {}",
+        permission_scope_summary(tool)
+    )
 }
 
 /// Execute a tool call with optional memory and permission manager.
@@ -336,6 +377,7 @@ fn execute_tool_with_memory_unchecked(
     }
 
     let mut ctx = ToolContext {
+        security: security::current_context(),
         memory_db,
         app_config: None,
         task_mgr: None,
@@ -403,6 +445,7 @@ fn execute_tool_full_unchecked(
         "task_stop" => subagent::execute_task_stop_tool(&args),
         _ => {
             let mut ctx = ToolContext {
+                security: security::current_context(),
                 memory_db,
                 app_config,
                 task_mgr: None,
@@ -677,7 +720,7 @@ pub fn check_tool_permission(
             target,
         } => Some(ToolResult {
             tool_call_id,
-            content: format!("PERMISSION_PROMPT: Allow {tool} on '{target}'? [y/n/a(lways)]"),
+            content: legacy_permission_prompt(&tool, &target),
             is_error: true,
         }),
     }
@@ -741,6 +784,7 @@ pub(crate) fn execute_tool_with_tasks_unchecked(
     // All other tools — including task_create/task_update/task_get/task_list —
     // go through the registry with the full context bundle.
     let mut ctx = ToolContext {
+        security: security::current_context(),
         memory_db,
         app_config,
         task_mgr,
@@ -781,7 +825,7 @@ pub fn execute_tool_with_permission_required(
         } => {
             return ToolResult {
                 tool_call_id,
-                content: format!("PERMISSION_PROMPT: Allow {tool} on '{target}'? [y/n/a(lways)]"),
+                content: legacy_permission_prompt(&tool, &target),
                 is_error: true,
             };
         }
@@ -1042,7 +1086,7 @@ mod tests {
     #[test]
     fn test_list_files() {
         let _cwd_lock = testutil::process_cwd_lock();
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(".").expect("tempdir");
         std::fs::write(
             dir.path().join("Cargo.toml"),
             "[package]\nname = \"fixture\"\n",
@@ -1372,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_read_notebook_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("test.ipynb");
         let notebook = json!({
             "cells": [
@@ -1415,7 +1459,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_replace() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("test.ipynb");
         let notebook = json!({
             "cells": [
@@ -1458,7 +1502,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_insert() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("test.ipynb");
         let notebook = json!({
             "cells": [
@@ -1503,7 +1547,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_delete() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("test.ipynb");
         let notebook = json!({
             "cells": [
@@ -1556,7 +1600,9 @@ mod tests {
         let mut args = HashMap::new();
         args.insert(
             "notebook_path".to_string(),
-            json!("/tmp/nonexistent_unread_notebook.ipynb"),
+            json!(std::env::current_dir()
+                .unwrap()
+                .join(".tmp-nonexistent-unread-notebook.ipynb")),
         );
         args.insert("cell_number".to_string(), json!(0));
         args.insert("new_source".to_string(), json!("test"));
@@ -1568,7 +1614,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_out_of_bounds() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("test.ipynb");
         let notebook = json!({
             "cells": [
@@ -1603,7 +1649,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_insert_requires_cell_type() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("test.ipynb");
         let notebook = json!({
             "cells": [],
@@ -1634,7 +1680,7 @@ mod tests {
 
     #[test]
     fn test_read_image_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let img_path = dir.path().join("test.png");
         // Write some fake PNG bytes
         let fake_png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -1655,7 +1701,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_insert_code_cell_has_outputs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("test.ipynb");
         let notebook = json!({
             "cells": [],
@@ -1699,7 +1745,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_resolves_by_cell_id() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("by-id.ipynb");
         let notebook = json!({
             "cells": [
@@ -1730,7 +1776,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_insert_after_cell_id() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("insert-after.ipynb");
         let notebook = json!({
             "cells": [
@@ -1766,7 +1812,7 @@ mod tests {
 
     #[test]
     fn test_notebook_edit_unknown_cell_id_errors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         let nb_path = dir.path().join("unknown.ipynb");
         let notebook = json!({
             "cells": [

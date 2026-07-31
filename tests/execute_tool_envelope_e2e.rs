@@ -69,7 +69,7 @@ fn execute_tool_result_has_owned_string_fields() {
 
 #[test]
 fn execute_tool_dispatches_list_files() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let tc = call(
         "c1",
         "list_files",
@@ -240,7 +240,7 @@ fn execute_tool_unknown_tool_is_deterministic_across_5_calls() {
 
 #[test]
 fn execute_tool_with_same_args_yields_same_envelope_for_list_files() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let tc = call(
         "c1",
         "list_files",

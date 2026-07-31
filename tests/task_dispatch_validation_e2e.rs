@@ -20,6 +20,7 @@ const NO_SESSION_MARKER: &str = "Task management not available (no session)";
 
 fn dispatch_without_session(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -35,6 +36,7 @@ fn dispatch_with_session(
     tm: &mut TaskManager,
 ) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: Some(tm),

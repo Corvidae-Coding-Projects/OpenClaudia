@@ -1,8 +1,7 @@
-use super::resolve_path;
+use super::{resolve_path, secure_fs};
 use crate::tools::args::ToolArgs as _;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
 
 /// List files in a directory.
 ///
@@ -23,7 +22,7 @@ pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (e, true),
     };
 
-    match fs::read_dir(&path) {
+    match secure_fs::open_directory(&path).and_then(|directory| directory.entries()) {
         Ok(entries) => {
             // (is_dir, name) tuples — sort puts every dir before every
             // file (false < true under default Ord, so `is_dir`'s
@@ -36,20 +35,9 @@ pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
             // model to scan candidates by kind.
             let mut items: Vec<(bool, String)> = Vec::new();
             for entry in entries {
-                match entry {
-                    Ok(entry) => {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
-                        items.push((is_dir, name));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "list_files: skipping unreadable entry",
-                        );
-                    }
-                }
+                let name = entry.name.to_string_lossy().to_string();
+                let is_dir = entry.kind == secure_fs::SecureFileType::Directory;
+                items.push((is_dir, name));
             }
             // Primary key: dirs before files (so invert is_dir).
             // Secondary key: name (case-sensitive lexicographic, same as before).
@@ -142,7 +130,7 @@ mod tests {
 
         // Happy path: real call into the production function, confirming
         // it still returns successfully and produces a non-error result.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(".").unwrap();
         std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
         let mut args = HashMap::new();
         args.insert("path".to_string(), json!(tmp.path().to_str().unwrap()));

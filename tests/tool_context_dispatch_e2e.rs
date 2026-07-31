@@ -23,6 +23,7 @@ use std::collections::HashMap;
 #[test]
 fn tool_context_struct_literal_with_all_none_fields() {
     let ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -40,6 +41,7 @@ const fn accept_mut_ref(c: &mut ToolContext<'_>) {
 #[test]
 fn tool_context_can_be_taken_by_mut_reference_for_dispatch() {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -52,6 +54,7 @@ fn tool_context_can_be_taken_by_mut_reference_for_dispatch() {
 fn tool_context_field_assignment_via_struct_literal_works() {
     // PINS SHAPE: 3 documented fields, all Option types.
     let ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -70,6 +73,7 @@ fn tool_context_field_assignment_via_struct_literal_works() {
 fn dispatch_unknown_tool_returns_none() {
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -83,6 +87,7 @@ fn dispatch_unknown_tool_returns_none() {
 fn dispatch_empty_string_tool_name_returns_none() {
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -96,6 +101,7 @@ fn dispatch_empty_string_tool_name_returns_none() {
 fn dispatch_whitespace_only_tool_name_returns_none() {
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -113,6 +119,7 @@ fn dispatch_whitespace_only_tool_name_returns_none() {
 fn get_returns_some_iff_dispatch_returns_some_for_same_name() {
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -156,6 +163,7 @@ fn registry_get_for_known_tool_returns_some_handler() {
 fn dispatch_tool_search_returns_some_tuple() {
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -180,6 +188,7 @@ fn dispatch_tool_search_returns_some_tuple() {
 fn dispatch_unknown_tool_with_arbitrary_args_still_returns_none() {
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -198,6 +207,7 @@ fn dispatch_known_tool_with_empty_args_invokes_handler() {
     // handler decides what to do with empty.
     let reg = registry();
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,

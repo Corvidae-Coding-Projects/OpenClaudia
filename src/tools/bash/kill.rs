@@ -41,6 +41,20 @@ pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, 
     if agent_id.is_empty() {
         return ("Missing 'agent_id' argument".to_string(), true);
     }
+    let caller = crate::tools::todo::current_session_key();
+    if agent_id != caller {
+        tracing::warn!(
+            target: "openclaudia::bash",
+            event = "cross_session_shell_cleanup_denied",
+            caller,
+            requested_owner = agent_id,
+            "Denied model-requested cleanup of another session's processes"
+        );
+        return (
+            "Cannot terminate background shells owned by another session".to_string(),
+            true,
+        );
+    }
 
     (BACKGROUND_SHELLS.kill_for_agent(agent_id), false)
 }
@@ -55,7 +69,12 @@ pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, 
 ///
 /// On Windows, uses `taskkill /T` which terminates the process tree.
 pub fn terminate_process_tree(pid: u32) {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        terminate_linux_process_tree(pid);
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::time::{Duration, Instant};
 
@@ -128,6 +147,75 @@ pub fn terminate_process_tree(pid: u32) {
                 .output();
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_process_tree(pid: u32) {
+    use std::collections::{HashSet, VecDeque};
+    use std::time::{Duration, Instant};
+
+    let Ok(root) = i32::try_from(pid) else {
+        return;
+    };
+    let descendants = || {
+        let mut found = Vec::new();
+        let mut seen = HashSet::from([root]);
+        let mut queue = VecDeque::from([root]);
+        while let Some(parent) = queue.pop_front() {
+            let task_dir = format!("/proc/{parent}/task");
+            let Ok(tasks) = std::fs::read_dir(task_dir) else {
+                continue;
+            };
+            for task in tasks.flatten() {
+                let children_path = task.path().join("children");
+                let Ok(children) = std::fs::read_to_string(children_path) else {
+                    continue;
+                };
+                for child in children
+                    .split_whitespace()
+                    .filter_map(|value| value.parse::<i32>().ok())
+                {
+                    if child > 0 && seen.insert(child) {
+                        found.push(child);
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+        found
+    };
+    let signal_tree = |signal| {
+        let mut targets = descendants();
+        targets.reverse();
+        for target in targets {
+            unsafe {
+                libc::kill(target, signal);
+            }
+        }
+        // Also cover conventional process-group children, then the wrapper.
+        unsafe {
+            libc::kill(-root, signal);
+            libc::kill(root, signal);
+        }
+    };
+
+    signal_tree(libc::SIGTERM);
+    // A long grace period makes cancellation itself a denial-of-service
+    // vector, and a terminated-but-not-yet-reaped wrapper remains visible to
+    // `kill(pid, 0)` as a zombie. Give cooperative children a short grace,
+    // then deterministically escalate; the owning caller performs the reap.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        let root_exists = unsafe { libc::kill(root, 0) } == 0;
+        if !root_exists && descendants().is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Re-scan immediately before SIGKILL so children forked by a signal
+    // handler or daemonization attempt are included.
+    signal_tree(libc::SIGKILL);
+    std::thread::sleep(Duration::from_millis(100));
 }
 
 #[cfg(test)]

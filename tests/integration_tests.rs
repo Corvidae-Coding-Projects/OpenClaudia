@@ -35,7 +35,7 @@ fn make_tool_call(name: &str, args: &Value) -> ToolCall {
 
 /// Helper to create a temp directory with test files
 fn setup_test_dir() -> TempDir {
-    let dir = TempDir::new().expect("Failed to create temp dir");
+    let dir = TempDir::new_in(".").expect("Failed to create temp dir");
 
     // Create test file
     fs::write(
@@ -101,7 +101,7 @@ mod file_tools {
         let tool_call = make_tool_call(
             "read_file",
             &json!({
-                "path": "/nonexistent/path/file.txt"
+                "path": "definitely-nonexistent-integration-file.txt"
             }),
         );
 
@@ -154,7 +154,7 @@ mod file_tools {
 
     #[test]
     fn test_write_file_new() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("new_file.txt");
 
         let tool_call = make_tool_call(
@@ -329,7 +329,7 @@ mod file_tools {
 
     #[test]
     fn test_read_file_unicode_content() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("unicode.txt");
 
         // Write Unicode content including emojis and various scripts
@@ -356,7 +356,7 @@ mod file_tools {
 
     #[test]
     fn test_write_file_unicode_content() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("unicode_write.txt");
 
         let unicode_content = "Writing Unicode: 你好 🌍 مرحبا";
@@ -382,7 +382,7 @@ mod file_tools {
 
     #[test]
     fn test_read_file_empty() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("empty.txt");
         fs::write(&file_path, "").expect("Failed to write empty file");
 
@@ -404,7 +404,7 @@ mod file_tools {
 
     #[test]
     fn test_read_file_large() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("large.txt");
 
         // Create a large file (10000 lines)
@@ -437,7 +437,7 @@ mod file_tools {
 
     #[test]
     fn test_read_file_with_limit_large() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("large_limit.txt");
 
         let content: String = (0..1000).fold(String::new(), |mut s, i| {
@@ -469,7 +469,7 @@ mod file_tools {
     fn test_edit_file_multiline() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
         reset_read_tracker(); // Clear tracker for clean test state
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("multiline.txt");
 
         let original = "function foo() {\n    console.log('old');\n}";
@@ -508,7 +508,7 @@ mod file_tools {
     fn test_edit_file_special_characters() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
         reset_read_tracker(); // Clear tracker for clean test state
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("special.txt");
 
         let original = "Price: $100 (50% off!) [limited]";
@@ -565,7 +565,7 @@ mod file_tools {
 
     #[test]
     fn test_write_file_creates_parent_dirs() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("new_dir/sub_dir/file.txt");
 
         let tool_call = make_tool_call(
@@ -590,7 +590,7 @@ mod file_tools {
 
     #[test]
     fn test_read_file_binary_detection() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("binary.bin");
 
         // Write some binary content (PNG magic bytes + nulls)
@@ -630,7 +630,7 @@ mod file_tools {
     fn test_edit_file_without_prior_read() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
         reset_read_tracker();
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("unread.txt");
         fs::write(&file_path, "original content").expect("Failed to write");
 
@@ -667,7 +667,7 @@ mod file_tools {
 
     #[test]
     fn test_write_file_empty_content() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("empty_write.txt");
 
         let tool_call = make_tool_call(
@@ -695,7 +695,7 @@ mod file_tools {
     fn test_edit_file_identical_old_new() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
         reset_read_tracker();
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("identical.txt");
         fs::write(&file_path, "some content here").expect("Failed to write");
 
@@ -748,7 +748,7 @@ mod file_tools {
 
     #[test]
     fn test_write_file_very_long_filename() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let long_name = "a".repeat(300);
         let file_path = dir.path().join(&long_name);
 
@@ -840,13 +840,21 @@ mod bash_tools {
 
     #[test]
     fn test_bash_working_directory() {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = tempfile::Builder::new()
+            .prefix("openclaudia-bash-cwd-")
+            .tempdir_in(".")
+            .expect("Failed to create project temp dir");
 
         // Create a file in the temp dir
         fs::write(dir.path().join("marker.txt"), "exists").expect("write failed");
 
         // Convert Windows path to Unix-style for bash
-        let path_str = dir.path().to_string_lossy().replace('\\', "/");
+        let path_str = dir
+            .path()
+            .canonicalize()
+            .expect("canonical project temp dir")
+            .to_string_lossy()
+            .replace('\\', "/");
 
         let tool_call = make_tool_call(
             "bash",
@@ -1374,7 +1382,7 @@ mod auto_learn_integration {
     use openclaudia::auto_learn::AutoLearner;
 
     fn setup_memory_db() -> (TempDir, MemoryDb) {
-        let dir = TempDir::new().expect("Failed to create temp dir");
+        let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let db_path = dir.path().join("test_memory.db");
         let db = MemoryDb::open(&db_path).expect("Failed to create memory db");
         (dir, db)

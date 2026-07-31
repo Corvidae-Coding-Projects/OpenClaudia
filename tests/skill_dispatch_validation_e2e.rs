@@ -36,6 +36,7 @@ fn run_in_tempdir<R>(f: impl FnOnce() -> R) -> R {
 
 fn dispatch_skill(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,

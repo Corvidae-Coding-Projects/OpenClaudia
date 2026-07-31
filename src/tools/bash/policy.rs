@@ -238,15 +238,9 @@ const ENV_ALLOWLIST_EXACT: &[&str] = &[
     "HOSTTYPE",
     "OSTYPE",
     "MACHTYPE",
-    "DISPLAY", // GUI sub-tools (xdg-open etc.)
-    "WAYLAND_DISPLAY",
     "COLORTERM",
-    "EDITOR",
-    "PAGER",
     "MANPATH",
     "INFOPATH",
-    "LD_LIBRARY_PATH",
-    "DYLD_LIBRARY_PATH",
     "PKG_CONFIG_PATH",
     // Rust toolchain — needed by cargo/rustc.
     "CARGO_HOME",
@@ -265,10 +259,7 @@ const ENV_ALLOWLIST_EXACT: &[&str] = &[
     // Node / Python / Go / Java — non-secret toolchain knobs.
     "NODE_ENV",
     "NPM_CONFIG_PREFIX",
-    "NPM_CONFIG_USERCONFIG",
     "NVM_DIR",
-    "PYTHONPATH",
-    "PYTHONHOME",
     "VIRTUAL_ENV",
     "PIPENV_VENV_IN_PROJECT",
     "POETRY_HOME",
@@ -276,7 +267,6 @@ const ENV_ALLOWLIST_EXACT: &[&str] = &[
     "JDK_HOME",
     "GOPATH",
     "GOROOT",
-    "GOPROXY",
     // CI introspection (presence-only, not credentials).
     "CI",
     // Locale fallbacks beyond LC_*.
@@ -292,17 +282,14 @@ const ENV_ALLOWLIST_EXACT: &[&str] = &[
 /// would subsume `CARGO_REGISTRY_TOKEN`, so we exclude that prefix and
 /// instead enumerate the safe CARGO_* knobs in [`ENV_ALLOWLIST_EXACT`].
 const ENV_ALLOWLIST_PREFIXES: &[&str] = &[
-    "LC_",   // locale families: LC_CTYPE, LC_NUMERIC, LC_TIME, ...
-    "XDG_",  // freedesktop base-dir spec: XDG_RUNTIME_DIR, XDG_CONFIG_HOME, ...
-    "SSH_",  // SSH agent socket / TTY — names only, no SSH_PRIVATE_KEY (caught by suffix).
-    "DBUS_", // session bus address (Linux desktop integration).
+    "LC_", // locale families: LC_CTYPE, LC_NUMERIC, LC_TIME, ...
 ];
 
 /// True if `key` is on the allowlist AND is not classified as sensitive.
 ///
 /// The sensitivity check is a belt-and-braces second gate so that even if
 /// a future allowlist entry accidentally subsumes a credential family
-/// (e.g. someone adds `SSH_` and `SSH_PRIVATE_KEY` snuck through), the
+/// (e.g. someone adds a broad prefix and `SSH_PRIVATE_KEY` snuck through), the
 /// suffix/prefix denylist in [`is_sensitive_env`] still drops it.
 #[must_use]
 pub fn is_env_allowed(key: &str) -> bool {
@@ -1092,17 +1079,17 @@ mod tests {
         }
     }
 
-    /// #730-d: prefix families (LC_*, XDG_*) are inherited; `SSH_PRIVATE_KEY`
-    /// is NOT (sensitive denylist overrides allowlist prefix SSH_).
+    /// Only locale prefixes are inherited. Desktop/IPC prefix families remain
+    /// denied even when their individual values do not look secret.
     #[test]
     fn allowlist_prefix_families_and_belt_and_braces() {
         assert!(is_env_allowed("LC_CTYPE"));
         assert!(is_env_allowed("LC_NUMERIC"));
-        assert!(is_env_allowed("XDG_RUNTIME_DIR"));
-        assert!(is_env_allowed("XDG_CONFIG_HOME"));
-        assert!(is_env_allowed("SSH_AUTH_SOCK"));
-        // Belt-and-braces: even though the SSH_ prefix matches, the
-        // sensitive denylist drops SSH_PRIVATE_KEY first.
+        assert!(!is_env_allowed("XDG_RUNTIME_DIR"));
+        assert!(!is_env_allowed("XDG_CONFIG_HOME"));
+        assert!(!is_env_allowed("SSH_AUTH_SOCK"));
+        assert!(!is_env_allowed("DBUS_SESSION_BUS_ADDRESS"));
+        // Belt-and-braces: sensitive names remain denied independently.
         assert!(
             !is_env_allowed("SSH_PRIVATE_KEY"),
             "#730: is_sensitive_env must override allowlist prefix"

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -76,7 +77,7 @@ fn path_arg_as_null_returns_validation_error() {
 
 #[test]
 fn pdf_pages_arg_as_number_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("bad_pages.pdf");
     std::fs::write(&path, b"%PDF-1.4\n").expect("write");
 
@@ -107,10 +108,7 @@ fn parent_dir_traversal_in_path_rejected() {
 
 #[test]
 fn nonexistent_path_errors_with_stat_message() {
-    let args = args_with(&[(
-        "path",
-        json!("/tmp/definitely_nonexistent_xyz_marker_144.txt"),
-    )]);
+    let args = args_with(&[("path", json!("definitely_nonexistent_xyz_marker_144.txt"))]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
     assert!(
@@ -130,7 +128,7 @@ fn nonexistent_path_errors_with_stat_message() {
 
 #[test]
 fn read_simple_text_file_returns_content_with_line_numbers() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("simple.txt");
     std::fs::write(&path, "line one\nline two\nline three\n").expect("write");
     let path_str = path.to_str().unwrap();
@@ -156,7 +154,7 @@ fn read_file_records_observation_when_session_ledger_is_active() {
     let _ledger_guard =
         openclaudia::ledger::install_active_ledger_for_session("readledger", Arc::clone(&ledger));
 
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("ledgered.txt");
     std::fs::write(&path, "alpha\nbeta\n").expect("write");
 
@@ -202,7 +200,7 @@ fn read_file_records_observation_when_session_ledger_is_active() {
 
 #[test]
 fn read_empty_file_returns_no_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("empty.txt");
     std::fs::write(&path, "").expect("write");
     let path_str = path.to_str().unwrap();
@@ -214,7 +212,7 @@ fn read_empty_file_returns_no_error() {
 
 #[test]
 fn read_unicode_content_preserves_bytes() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("unicode.txt");
     std::fs::write(&path, "日本語コンテンツ\n🎉 emoji line\n").expect("write");
     let path_str = path.to_str().unwrap();
@@ -232,7 +230,7 @@ fn read_unicode_content_preserves_bytes() {
 
 #[test]
 fn offset_skips_initial_lines() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("offset.txt");
     let body = (1..=10)
         .map(|i| format!("line_{i}_marker"))
@@ -256,7 +254,7 @@ fn offset_skips_initial_lines() {
 
 #[test]
 fn limit_caps_returned_lines() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("limit.txt");
     let body = (1..=10)
         .map(|i| format!("limit_line_{i}_marker"))
@@ -279,7 +277,7 @@ fn limit_caps_returned_lines() {
 
 #[test]
 fn offset_plus_limit_window_selection() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("window.txt");
     let body = (1..=20)
         .map(|i| format!("win_{i}"))
@@ -304,7 +302,7 @@ fn offset_plus_limit_window_selection() {
 
 #[test]
 fn offset_beyond_file_length_returns_no_lines_but_no_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("offset_huge.txt");
     std::fs::write(&path, "only one line\n").expect("write");
     let path_str = path.to_str().unwrap();
@@ -317,7 +315,7 @@ fn offset_beyond_file_length_returns_no_lines_but_no_error() {
 
 #[test]
 fn offset_zero_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("offset_zero.txt");
     std::fs::write(&path, "first\nsecond\n").expect("write");
     let path_str = path.to_str().unwrap();
@@ -333,7 +331,7 @@ fn offset_zero_returns_validation_error() {
 
 #[test]
 fn limit_zero_returns_validation_error() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("limit_zero.txt");
     std::fs::write(&path, "first\nsecond\n").expect("write");
     let path_str = path.to_str().unwrap();
@@ -349,7 +347,7 @@ fn limit_zero_returns_validation_error() {
 
 #[test]
 fn offset_above_u64_max_coerces_no_panic() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("offset_max.txt");
     std::fs::write(&path, "x\n").expect("write");
     let path_str = path.to_str().unwrap();
@@ -362,7 +360,7 @@ fn offset_above_u64_max_coerces_no_panic() {
 
 #[test]
 fn limit_above_u64_max_coerces_no_panic() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("limit_max.txt");
     std::fs::write(&path, "a\nb\nc\n").expect("write");
     let path_str = path.to_str().unwrap();
@@ -388,7 +386,7 @@ fn missing_path_arg_takes_precedence_over_invalid_offset() {
 
 #[test]
 fn read_dispatch_never_panics_on_arbitrary_extra_args() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("extras.txt");
     std::fs::write(&path, "body\n").expect("write");
     let path_str = path.to_str().unwrap();

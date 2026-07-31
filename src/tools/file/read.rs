@@ -2,7 +2,6 @@ use base64::Engine;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -40,30 +39,24 @@ fn pdfinfo_bin() -> Option<&'static Path> {
     (*PDFINFO_BIN).as_deref()
 }
 
-/// Return `(error_message, is_error=true)` if `path` is too large or is a
-/// special device file that bypasses the size check (e.g., `/dev/zero`
-/// reports `len()==0` but is effectively infinite).
-fn check_file_safety(path: &str) -> Option<(String, bool)> {
-    let meta = match fs::metadata(path) {
+/// Return `(error_message, is_error=true)` if an already-confined open handle
+/// is too large or is not a regular file. Authorization and inspection must
+/// apply to the same kernel object; checking a pathname here would reopen the
+/// TOCTOU window closed by `secure_fs`.
+fn check_file_safety(file: &std::fs::File, path: &str) -> Option<(String, bool)> {
+    let meta = match file.metadata() {
         Ok(m) => m,
-        Err(e) => return Some((format!("Cannot stat '{path}': {e}"), true)),
+        Err(e) => return Some((format!("Cannot inspect open file '{path}': {e}"), true)),
     };
 
-    // On Unix, block character devices, block devices, FIFOs, and sockets —
-    // these can have metadata.len()==0 but produce unbounded data on read.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt as _;
-        let ft = meta.file_type();
-        if ft.is_char_device() || ft.is_block_device() || ft.is_fifo() || ft.is_socket() {
-            return Some((
-                format!(
-                    "File '{path}' is a special device (char/block/fifo/socket) and cannot be \
-                     read safely. Provide a regular file path."
-                ),
-                true,
-            ));
-        }
+    if !meta.file_type().is_file() {
+        return Some((
+            format!(
+                "File '{path}' is not a regular file and cannot be read safely. \
+                 Directories, devices, FIFOs, and sockets are not file-tool capabilities."
+            ),
+            true,
+        ));
     }
 
     if meta.len() > MAX_FILE_SIZE_BYTES {
@@ -78,6 +71,36 @@ fn check_file_safety(path: &str) -> Option<(String, bool)> {
     }
 
     None
+}
+
+fn open_safe_read(path: &str) -> Result<std::fs::File, (String, bool)> {
+    let file = super::secure_fs::open_regular_read(Path::new(path)).map_err(|error| {
+        (
+            format!("Failed to securely open file '{path}': {error}"),
+            true,
+        )
+    })?;
+    if let Some(error) = check_file_safety(&file, path) {
+        return Err(error);
+    }
+    Ok(file)
+}
+
+fn read_safe_bytes(path: &str) -> Result<Vec<u8>, (String, bool)> {
+    let file = open_safe_read(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_SIZE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| (format!("Failed to read file '{path}': {error}"), true))?;
+    if bytes.len() > usize::try_from(MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX) {
+        return Err((
+            format!(
+                "File '{path}' grew beyond the {MAX_FILE_SIZE_BYTES}-byte safety cap while it was being read"
+            ),
+            true,
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Image formats the harness can hand to vision-capable models.
@@ -160,18 +183,9 @@ pub fn detect_file_type(path: &str) -> FileType {
 /// rather than as a raw MIME-type `&str`, so callers can no longer fabricate a
 /// nonsense MIME like `"image/whatever"` at the call site.
 pub fn read_image_file(path: &str, kind: ImageKind) -> (String, bool) {
-    if let Some(err) = check_file_safety(path) {
-        return err;
-    }
-    let bytes = match fs::File::open(path) {
-        Ok(f) => {
-            let mut buf = Vec::new();
-            if let Err(e) = f.take(MAX_FILE_SIZE_BYTES).read_to_end(&mut buf) {
-                return (format!("Failed to read image file '{path}': {e}"), true);
-            }
-            buf
-        }
-        Err(e) => return (format!("Failed to read image file '{path}': {e}"), true),
+    let bytes = match read_safe_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
     };
 
     // Fail fast at the boundary: a 0-byte image is never valid input for any
@@ -270,7 +284,7 @@ const PDF_TIMEOUT_SECS: u64 = 30;
 /// # Subprocess hardening
 ///
 /// `pdftotext` and `pdfinfo` are spawned via
-/// [`crate::tools::command::run_with_timeout`] with a 30 s deadline so
+/// [`crate::tools::command::run_sandboxed_with_timeout`] with a 30 s deadline so
 /// a malformed PDF cannot pin the worker (crosslink #827, #836). Both
 /// stdout and stderr are captured (`Stdio::piped`); on a non-zero
 /// exit, the stderr tail is included in the error message so the
@@ -294,6 +308,17 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
         Ok(path) => path,
         Err(msg) => return (msg, true),
     };
+    let project_root = match super::project_root() {
+        Ok(root) => root,
+        Err(message) => return (message, true),
+    };
+    // Feed the parser bytes read from the already-confined descriptor. Passing
+    // the original pathname would let a concurrent rename swap the parser's
+    // input after authorization.
+    let pdf_bytes = match read_safe_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
 
     let timeout = std::time::Duration::from_secs(PDF_TIMEOUT_SECS);
 
@@ -301,11 +326,15 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
     if pages.is_none() {
         // `--` terminates options so a hostile filename cannot be parsed as a flag
         // (defence-in-depth alongside reject_flag_prefix above).
-        let info_args = ["--", path];
+        let info_args = ["--", "-"];
         if let Some(pdfinfo) = pdfinfo_bin() {
-            if let Ok(info) =
-                crate::tools::command::run_with_timeout(pdfinfo, &info_args, None, timeout)
-            {
+            if let Ok(info) = crate::tools::command::run_sandboxed_with_timeout_with_input(
+                pdfinfo,
+                &info_args,
+                &project_root,
+                timeout,
+                &pdf_bytes,
+            ) {
                 if info.status.success() {
                     let info_text = String::from_utf8_lossy(&info.stdout);
                     for line in info_text.lines() {
@@ -348,11 +377,17 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
         }
     }
     argv.push("--".to_string());
-    argv.push(path.to_string());
+    argv.push("-".to_string()); // stdin, from the confined file descriptor
     argv.push("-".to_string()); // stdout sentinel
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
 
-    match crate::tools::command::run_with_timeout(pdftotext, &argv_refs, None, timeout) {
+    match crate::tools::command::run_sandboxed_with_timeout_with_input(
+        pdftotext,
+        &argv_refs,
+        &project_root,
+        timeout,
+        &pdf_bytes,
+    ) {
         Ok(output) => {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -471,18 +506,13 @@ fn render_cell_outputs(output: &mut String, outputs: &[Value]) {
 
 /// Read a Jupyter notebook (.ipynb) and format cells for display
 pub fn read_notebook_file(path: &str) -> (String, bool) {
-    if let Some(err) = check_file_safety(path) {
-        return err;
-    }
-    let content = match fs::File::open(path) {
-        Ok(f) => {
-            let mut buf = String::new();
-            if let Err(e) = f.take(MAX_FILE_SIZE_BYTES).read_to_string(&mut buf) {
-                return (format!("Failed to read notebook '{path}': {e}"), true);
-            }
-            buf
-        }
-        Err(e) => return (format!("Failed to read notebook '{path}': {e}"), true),
+    let mut file = match open_safe_read(path) {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    let content = match super::secure_fs::read_to_string(&mut file, Path::new(path)) {
+        Ok(content) => content,
+        Err(error) => return (error, true),
     };
 
     let notebook: Value = match serde_json::from_str(&content) {
@@ -530,10 +560,6 @@ pub fn read_notebook_file(path: &str) -> (String, bool) {
 }
 /// Read a plain text file with optional offset/limit
 pub fn read_text_file(path: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    if let Some(err) = check_file_safety(path) {
-        return err;
-    }
-
     // Get optional offset (1-indexed line number to start from)
     let offset = match parse_read_offset_arg(args.get("offset")) {
         Ok(offset) => offset,
@@ -546,15 +572,13 @@ pub fn read_text_file(path: &str, args: &HashMap<String, Value>) -> (String, boo
         Err(msg) => return (msg, true),
     };
 
-    let file_content = match fs::File::open(path) {
-        Ok(f) => {
-            let mut buf = String::new();
-            if let Err(e) = f.take(MAX_FILE_SIZE_BYTES).read_to_string(&mut buf) {
-                return (format!("Failed to read file '{path}': {e}"), true);
-            }
-            buf
-        }
-        Err(e) => return (format!("Failed to read file '{path}': {e}"), true),
+    let mut file = match open_safe_read(path) {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    let file_content = match super::secure_fs::read_to_string(&mut file, Path::new(path)) {
+        Ok(content) => content,
+        Err(error) => return (error, true),
     };
 
     let lines: Vec<&str> = file_content.lines().collect();
@@ -663,7 +687,7 @@ mod tests {
 
     /// Helper: write content to a `NamedTempFile` and return (file, `path_string`).
     fn tmp_text(content: &str) -> (NamedTempFile, String) {
-        let mut f = NamedTempFile::new().expect("tempfile");
+        let mut f = NamedTempFile::new_in(".").expect("tempfile");
         f.write_all(content.as_bytes()).expect("write");
         let path = f.path().to_string_lossy().to_string();
         (f, path)
@@ -801,14 +825,16 @@ mod tests {
 
     #[test]
     fn read_text_missing_file_returns_error() {
-        // Behavior 1 error path: file not found.
-        // check_file_safety now stats the file first, so the error comes from
-        // the stat call ("Cannot stat") rather than the open ("Failed to read").
+        // Keep the nonexistent fixture inside the readable capability so this
+        // exercises secure-open ENOENT rather than the outer capability gate.
+        let path = std::env::current_dir()
+            .expect("cwd")
+            .join("__oc_test_does_not_exist_xyz.txt");
         let args = HashMap::new();
-        let (output, is_err) = read_text_file("/tmp/__oc_test_does_not_exist_xyz.txt", &args);
+        let (output, is_err) = read_text_file(&path.to_string_lossy(), &args);
         assert!(is_err);
         assert!(
-            output.contains("Cannot stat") || output.contains("Failed to read file"),
+            output.contains("does not exist") || output.contains("securely open"),
             "error message: {output}"
         );
     }
@@ -821,7 +847,7 @@ mod tests {
     fn read_image_returns_base64_text_block() {
         // Behavior 2: OC returns a plain-text string with base64 inline
         // (not a structured image block — CC parity gap, pinned as current behavior).
-        let mut f = NamedTempFile::new().expect("tempfile");
+        let mut f = NamedTempFile::new_in(".").expect("tempfile");
         // Minimal valid PNG bytes (1×1 red pixel)
         let minimal_png: &[u8] = &[
             0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
@@ -850,7 +876,7 @@ mod tests {
         // Behavior 2 edge: empty image file is rejected at the boundary
         // (crosslink #942 — previously OC accepted 0-byte images and let the
         // upstream vision API reject the empty base64 after a turn was burned).
-        let f = NamedTempFile::new().expect("tempfile");
+        let f = NamedTempFile::new_in(".").expect("tempfile");
         // Write nothing — file is 0 bytes
         let path = f.path().to_string_lossy().to_string();
         let (output, is_err) = read_image_file(&path, ImageKind::Png);
@@ -863,13 +889,13 @@ mod tests {
 
     #[test]
     fn read_image_nonexistent_returns_error() {
-        // Behavior 2 error path: file not found.
-        // check_file_safety stats first, so the message may be "Cannot stat"
-        // rather than "Failed to read image file".
-        let (output, is_err) = read_image_file("/tmp/__oc_no_such_image.png", ImageKind::Png);
+        let path = std::env::current_dir()
+            .expect("cwd")
+            .join("__oc_no_such_image.png");
+        let (output, is_err) = read_image_file(&path.to_string_lossy(), ImageKind::Png);
         assert!(is_err);
         assert!(
-            output.contains("Cannot stat") || output.contains("Failed to read image file"),
+            output.contains("does not exist") || output.contains("securely open"),
             "error message: {output}"
         );
     }
@@ -933,7 +959,7 @@ mod tests {
                                            // Need > 100_000 chars in the numbered output: with "   N| " prefix (~7 chars)
                                            // each line becomes ~208 chars; 600 lines = ~124 800 chars → triggers truncation.
         let content = line.repeat(600);
-        let mut f = NamedTempFile::new().expect("tempfile");
+        let mut f = NamedTempFile::new_in(".").expect("tempfile");
         f.write_all(content.as_bytes()).expect("write");
         let path = f.path().to_string_lossy().to_string();
         let args = HashMap::new();
@@ -978,7 +1004,7 @@ mod tests {
 
     /// Helper: write `size` bytes of 'a' to a temp file.
     fn tmp_sized(size: usize) -> (NamedTempFile, String) {
-        let mut f = NamedTempFile::new().expect("tempfile");
+        let mut f = NamedTempFile::new_in(".").expect("tempfile");
         let buf = vec![b'a'; size];
         f.write_all(&buf).expect("write");
         let path = f.path().to_string_lossy().to_string();
@@ -1015,7 +1041,7 @@ mod tests {
     fn read_text_empty_file_is_ok() {
         // Behavior 9 edge: zero-byte regular file — not a device, not oversized.
         // Must succeed with an empty body.
-        let f = NamedTempFile::new().expect("tempfile");
+        let f = NamedTempFile::new_in(".").expect("tempfile");
         let path = f.path().to_string_lossy().to_string();
         let args = HashMap::new();
         let (output, is_err) = read_text_file(&path, &args);
@@ -1024,15 +1050,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_text_char_device_is_rejected() {
-        // Behavior 9 (Unix): /dev/null is a char device; metadata.len()==0 but
-        // check_file_safety must reject it before any read attempt.
+    fn read_text_device_outside_capability_is_rejected() {
+        // Devices are never session file capabilities. The outer capability
+        // check should reject /dev before the implementation can open it.
         let args = HashMap::new();
         let (output, is_err) = read_text_file("/dev/null", &args);
         assert!(is_err, "/dev/null (char device) must be rejected: {output}");
         assert!(
-            output.contains("special device"),
-            "error must mention 'special device': {output}"
+            output.contains("outside the session") || output.contains("not a regular file"),
+            "error must explain the capability/type denial: {output}"
         );
     }
 

@@ -910,79 +910,64 @@ async fn run_shell_command_async(
     cwd_owned: std::path::PathBuf,
     timeout_seconds: u64,
 ) -> ShellResult {
-    let mut cmd = tokio::process::Command::new(&program_owned);
-    cmd.args(&args_owned)
-        .current_dir(&cwd_owned)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // crosslink #395: when the wall-clock timer fires and the
-        // outer `tokio::time::timeout` returns Err, dropping the
-        // wait_with_output future drops the underlying Child. With
-        // `kill_on_drop(true)`, that drop reliably SIGKILLs the
-        // child instead of leaking it for `timeout_seconds == 30`
-        // worth of sleep. Critical for the `sleep 30` regression
-        // test and for keeping CI runners from accumulating
-        // orphaned processes.
-        .kill_on_drop(true);
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!(
-                program = %program_owned,
-                error = %e,
-                "Quality gate: program not found on PATH"
-            );
-            return ShellResult::ShellMissing {
-                tried: vec![program_owned],
-            };
-        }
-        Err(e) => {
-            error!(program = %program_owned, error = %e, "Quality gate: spawn failed");
+    // Quality gates execute project-controlled build files, compiler plugins,
+    // and test binaries. Running argv directly prevents shell injection but
+    // does not prevent those programs from accessing the host, so use the
+    // same OS boundary as the model-facing Bash tool.
+    let Ok(resolved_program) = which::which(&program_owned) else {
+        return ShellResult::ShellMissing {
+            tried: vec![program_owned],
+        };
+    };
+    let sandbox_args: Vec<std::ffi::OsString> =
+        args_owned.iter().map(std::ffi::OsString::from).collect();
+    let sandboxed = match crate::tools::sandboxed_process_command(
+        crate::tools::SandboxProfile::QualityGate,
+        resolved_program.as_os_str(),
+        &sandbox_args,
+        &cwd_owned,
+    ) {
+        Ok(command) => command,
+        Err(error) => {
+            error!(program = %program_owned, %error, "Quality gate: sandbox setup failed");
             return ShellResult::ExitFailed {
                 code: -1,
                 stdout: String::new(),
-                stderr: format!("Failed to execute: {e}"),
+                stderr: error,
             };
         }
     };
-
-    // `wait_with_output()` consumes the child; if we time out we
-    // have to kill+reap separately using the pre-take Child handle.
-    // Take stdout/stderr handles first so we can drain them in
-    // parallel with the wait inside `wait_with_output`.
-    let wait_fut = child.wait_with_output();
-
-    let result = if timeout_seconds == 0 {
-        match wait_fut.await {
-            Ok(output) => Some(output),
-            Err(e) => {
-                error!(error = %e, "Quality gate: wait_with_output failed");
-                None
-            }
-        }
+    let effective_timeout = Duration::from_secs(if timeout_seconds == 0 {
+        300
     } else {
-        match tokio::time::timeout(Duration::from_secs(timeout_seconds), wait_fut).await {
-            Ok(Ok(output)) => Some(output),
-            Ok(Err(e)) => {
-                error!(error = %e, "Quality gate: wait_with_output failed");
-                None
-            }
-            Err(_) => {
-                // Wall-clock timer fired. Dropping `wait_fut`
-                // drops the Child, which (because we set
-                // `kill_on_drop(true)` above) SIGKILLs the
-                // process before this function returns. The
-                // tokio reaper then collects the zombie
-                // asynchronously.
-                warn!(
-                    program = %program_owned,
-                    timeout_seconds = timeout_seconds,
-                    "Quality gate: command timed out, killing child"
-                );
-                return ShellResult::Timeout;
-            }
+        timeout_seconds
+    });
+    let program_for_worker = program_owned.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        crate::tools::run_prepared_sandboxed_with_timeout(
+            sandboxed,
+            &program_for_worker,
+            effective_timeout,
+        )
+    })
+    .await
+    {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(crate::tools::CommandError::TimedOut { .. })) => {
+            warn!(
+                program = %program_owned,
+                timeout_seconds = effective_timeout.as_secs(),
+                "Quality gate: command timed out; sandbox process tree terminated"
+            );
+            return ShellResult::Timeout;
+        }
+        Ok(Err(error)) => {
+            error!(%error, "Quality gate: sandboxed command failed");
+            None
+        }
+        Err(error) => {
+            error!(%error, "Quality gate: blocking worker failed");
+            None
         }
     };
 
@@ -2228,6 +2213,21 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn quality_gate_project_code_cannot_write_host_temp_files() {
+        let host_dir = tempfile::TempDir::new().expect("quality-gate host tempdir");
+        let host_file = host_dir.path().join("escape.txt");
+        let command = format!("sh -c \"printf escaped > {}\"", host_file.to_string_lossy());
+
+        let _ = run_shell_command_sync(&command, 5);
+
+        assert!(
+            !host_file.exists(),
+            "project-controlled quality gate escaped its OS sandbox"
+        );
     }
 
     /// Shell-metacharacter survival check: the pre-#395 code used

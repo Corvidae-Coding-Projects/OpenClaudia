@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::hash::BuildHasher;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -207,11 +208,18 @@ fn resolve_language_server(language_or_ext: &str) -> Option<(&'static str, Vec<&
 /// an un-reaped zombie on Unix and a leaking handle on Windows.
 struct ChildGuard {
     child: Option<Child>,
+    _registration: Option<crate::tools::command::ActiveSandboxProcess>,
 }
 
 impl ChildGuard {
-    const fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+    fn new(child: Child) -> Self {
+        let registration = Some(crate::tools::command::ActiveSandboxProcess::register(
+            child.id(),
+        ));
+        Self {
+            child: Some(child),
+            _registration: registration,
+        }
     }
 
     /// Return a mutable reference to the wrapped child.
@@ -225,7 +233,8 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // Best-effort kill; ignore errors (process may have already exited).
+            crate::tools::terminate_process_tree(child.id());
+            // Best-effort fallback; ignore errors (process may have already exited).
             let _ = child.kill();
             // Reap the zombie; ignore the exit status.
             let _ = child.wait();
@@ -618,10 +627,20 @@ fn apply_lsp_env_scrub(cmd: &mut Command) {
 /// Extracted from `run_lsp_request` (crosslink #869) so the credential-
 /// stripping path lives in one place and `run_lsp_request` stays under
 /// the project's per-function line budget.
-fn spawn_language_server(server_cmd: &str, server_args: &[&str]) -> Result<Child, String> {
-    let mut cmd = Command::new(server_cmd);
-    cmd.args(server_args)
-        .stdin(Stdio::piped())
+fn spawn_language_server(
+    server_cmd: &str,
+    server_args: &[&str],
+    project_root: &Path,
+) -> Result<Child, String> {
+    let args: Vec<OsString> = server_args.iter().map(OsString::from).collect();
+    let mut cmd = crate::tools::sandboxed_process_command(
+        crate::tools::SandboxProfile::LanguageServer,
+        std::ffi::OsStr::new(server_cmd),
+        &args,
+        project_root,
+    )
+    .map_err(|error| format!("Failed to sandbox language server {server_cmd}: {error}"))?;
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_lsp_env_scrub(&mut cmd);
@@ -711,29 +730,6 @@ pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String,
             ),
             true,
         );
-    }
-
-    // 10 MiB file-size guard (#648): refuse to ship enormous buffers across
-    // the LSP wire — they reliably time out and starve the server of memory.
-    // Parity with CC `LSPTool.ts:53,264-269`.  We probe the size BEFORE
-    // canonicalising or reading the file so the failure mode is "cheap and
-    // honest" rather than "OOM the proxy".
-    //
-    // `metadata()` can fail for legitimate reasons (e.g. permission denied
-    // on a symlink target); we tolerate those and let `run_lsp_request`
-    // surface the canonical error rather than masking it here.
-    if let Ok(meta) = std::fs::metadata(file_path) {
-        if meta.len() > LSP_MAX_FILE_SIZE {
-            return (
-                format!(
-                    "File too large for LSP analysis: {} bytes exceeds the {}-byte limit \
-                     (10 MiB).  Trim the file or use grep/Read on a focused range.",
-                    meta.len(),
-                    LSP_MAX_FILE_SIZE
-                ),
-                true,
-            );
-        }
     }
 
     // crosslink #645: workspace/symbol takes a `query` string instead of a
@@ -934,20 +930,37 @@ fn run_lsp_request(
     // stringify only at this boundary because `run_lsp_request` returns
     // `Result<_, String>` to its caller; the rendered message now always
     // names the offending file.
-    let abs_path = std::fs::canonicalize(file_path)
-        .map_err(crate::file_error::FileError::with_path(file_path))
-        .map_err(|e| e.to_string())?;
-    let root_uri = find_project_root(&abs_path);
+    let (abs_path, file) = crate::tools::open_capability_regular_read(file_path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Cannot inspect confined LSP input '{file_path}': {error}"))?;
+    if metadata.len() > LSP_MAX_FILE_SIZE {
+        return Err(format!(
+            "File too large for LSP analysis: {} bytes exceeds the {}-byte limit (10 MiB)",
+            metadata.len(),
+            LSP_MAX_FILE_SIZE
+        ));
+    }
+    let security = crate::tools::security::current_context()?;
+    let root_uri = format!("file://{}", security.project_root().display());
     let file_uri = format!("file://{}", abs_path.display());
 
-    // Read file content for textDocument/didOpen
-    let content = crate::file_error::read_file(&abs_path).map_err(|e| e.to_string())?;
+    // Read from the already-confined descriptor. Reopening `abs_path` here
+    // would reintroduce a validation/open race.
+    let mut content = String::new();
+    file.take(LSP_MAX_FILE_SIZE + 1)
+        .read_to_string(&mut content)
+        .map_err(|error| format!("Cannot read confined LSP input '{file_path}': {error}"))?;
 
     // Spawn the server.  stderr is captured into a ring buffer (last 1 KiB) so
     // that crash diagnostics survive instead of being silently discarded
     // (original: Stdio::null() — fix #355 point 5). Env is scrubbed inside
     // `spawn_language_server` (crosslink #869).
-    let mut raw_child = spawn_language_server(server_cmd, server_args)?;
+    let project_root = root_uri
+        .strip_prefix("file://")
+        .map(Path::new)
+        .ok_or_else(|| format!("Invalid LSP root URI: {root_uri}"))?;
+    let mut raw_child = spawn_language_server(server_cmd, server_args, project_root)?;
 
     // Take pipes before handing the child to the guard.
     let mut stdin = raw_child.stdin.take().ok_or("Failed to get stdin")?;
@@ -1306,6 +1319,7 @@ fn write_lsp_raw(writer: &mut impl Write, msg: &Value) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn find_project_root(file_path: &Path) -> String {
     let mut dir = file_path.parent().unwrap_or(file_path);
     loop {
@@ -1598,10 +1612,13 @@ fn filter_gitignored(locations: Vec<LspLocation>) -> Vec<LspLocation> {
     // ignored; 1 = none ignored; 128 = error (not a repo etc).
     let input = format!("{}\n", path_strings.join("\n"));
     let output = match git_bin().and_then(|git| {
-        crate::tools::command::run_with_timeout_with_input(
+        let project_root = crate::tools::security::current_context()?
+            .working_directory()
+            .to_path_buf();
+        crate::tools::command::run_sandboxed_with_timeout_with_input(
             git,
             &["check-ignore", "--stdin"],
-            None,
+            &project_root,
             LSP_GITIGNORE_TIMEOUT,
             input.as_bytes(),
         )
@@ -1849,7 +1866,10 @@ mod tests {
 
     #[test]
     fn child_guard_missing_child_returns_error_not_panic() {
-        let mut guard = ChildGuard { child: None };
+        let mut guard = ChildGuard {
+            child: None,
+            _registration: None,
+        };
         let err = guard
             .child_mut()
             .expect_err("missing child handle should be a normal LSP error");
@@ -2993,7 +3013,10 @@ mod tests {
     #[test]
     fn fix648_oversized_file_is_rejected_before_server_spawn() {
         use std::io::Write as _;
-        let tmp = tempfile::NamedTempFile::with_suffix(".rs").expect("tempfile");
+        let tmp = tempfile::Builder::new()
+            .suffix(".rs")
+            .tempfile_in(".")
+            .expect("project-local tempfile");
         // Write 10 MiB + 1 byte so we strictly exceed the limit.
         let payload = vec![b'a'; usize::try_from(LSP_MAX_FILE_SIZE).unwrap() + 1];
         {
@@ -3038,7 +3061,10 @@ mod tests {
     #[test]
     fn fix648_file_at_limit_is_not_rejected_by_size_guard() {
         use std::io::Write as _;
-        let tmp = tempfile::NamedTempFile::with_suffix(".rs").expect("tempfile");
+        let tmp = tempfile::Builder::new()
+            .suffix(".rs")
+            .tempfile_in(".")
+            .expect("project-local tempfile");
         let payload = vec![b'a'; usize::try_from(LSP_MAX_FILE_SIZE).unwrap()];
         {
             let mut f = std::fs::File::create(tmp.path()).expect("create");
@@ -3154,6 +3180,41 @@ mod tests {
                 "#869: {key} must be on the LSP env allowlist"
             );
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn language_server_profile_cannot_read_host_or_create_socket() {
+        let outside = tempfile::NamedTempFile::new().expect("host sentinel");
+        std::fs::write(outside.path(), "lsp-secret").expect("sentinel");
+        let marker_dir = tempfile::tempdir_in(".").expect("project marker directory");
+        let marker = marker_dir.path().join("result");
+        let script = format!(
+            r#"
+import errno, pathlib, socket
+outside = pathlib.Path({outside:?})
+marker = pathlib.Path({marker:?})
+file_blocked = not outside.exists()
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    network_blocked = False
+except OSError as error:
+    network_blocked = error.errno in (errno.EPERM, errno.EACCES)
+marker.write_text("confined" if file_blocked and network_blocked else "escaped")
+"#,
+            outside = outside.path().to_string_lossy(),
+            marker = marker.to_string_lossy(),
+        );
+        let security = crate::tools::security::current_context().expect("security context");
+        let mut child =
+            spawn_language_server("python3", &["-c", &script], security.working_directory())
+                .expect("sandboxed language server");
+        let status = child.wait().expect("language server probe");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker"),
+            "confined"
+        );
     }
 
     /// #869 — Sensitive credentials never reach the language server.

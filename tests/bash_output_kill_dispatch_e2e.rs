@@ -12,11 +12,13 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
 fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -28,6 +30,7 @@ fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
 
 fn dispatch_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -39,6 +42,7 @@ fn dispatch_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
 
 fn dispatch_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -199,13 +203,24 @@ fn kill_shells_for_agent_with_empty_agent_id_treated_as_missing() {
 
 #[test]
 fn kill_shells_for_agent_with_unknown_agent_id_is_idempotent_success() {
-    let args = args_with(&[("agent_id", json!("no-shells-for-this-agent"))]);
+    let owner = "no-shells-for-this-agent";
+    let _guard = SessionIdGuard::set(owner);
+    let args = args_with(&[("agent_id", json!(owner))]);
     let (msg, is_err) = dispatch_kill_shells_for_agent(&args);
     assert!(!is_err);
     assert!(
         msg.contains("No background shells found"),
         "unknown agent cleanup should be idempotent; got {msg:?}"
     );
+}
+
+#[test]
+fn kill_shells_for_agent_rejects_cross_session_cleanup() {
+    let _guard = SessionIdGuard::set("caller-session");
+    let args = args_with(&[("agent_id", json!("different-session"))]);
+    let (msg, is_err) = dispatch_kill_shells_for_agent(&args);
+    assert!(is_err);
+    assert!(msg.contains("another session"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

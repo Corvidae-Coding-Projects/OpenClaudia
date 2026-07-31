@@ -11,6 +11,8 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -273,6 +275,7 @@ pub trait McpTransport: Send + Sync {
 /// Stdio transport - communicates with MCP server via stdin/stdout
 pub struct StdioTransport {
     child: Arc<Mutex<Child>>,
+    _process_registration: crate::tools::command::ActiveSandboxProcess,
     reader: Mutex<BufReader<tokio::process::ChildStdout>>,
     request_id: AtomicU64,
     /// Serialises the (`write_request` → `read_response`) pair so
@@ -355,26 +358,58 @@ impl StdioTransport {
         args: &[&str],
         env: &HashMap<String, String>,
     ) -> Result<Self, McpError> {
+        let resolved_command = resolve_trusted_mcp_executable(command)?;
+        let sensitive_grants = mcp_sensitive_environment_grants()?;
+        for key in env.keys() {
+            if is_host_loader_environment(key) {
+                return Err(McpError::Transport(format!(
+                    "Refusing MCP environment variable '{key}' because it can alter the host \
+                     sandbox launcher's dynamic loader"
+                )));
+            }
+            if crate::tools::is_sensitive_env(key) && !sensitive_grants.contains(key) {
+                return Err(McpError::Transport(format!(
+                    "Refusing undeclared-sensitive MCP environment grant '{key}'. \
+                     The host operator must name it in OPENCLAUDIA_MCP_ENV_GRANTS."
+                )));
+            }
+        }
+        let security = crate::tools::security::current_context().map_err(McpError::Transport)?;
+        let sandbox_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let command = crate::tools::sandboxed_process_command(
+            crate::tools::SandboxProfile::McpStdio,
+            resolved_command.as_os_str(),
+            &sandbox_args,
+            security.working_directory(),
+        )
+        .map_err(|error| {
+            McpError::Transport(format!("MCP stdio sandbox is unavailable: {error}"))
+        })?;
         info!(
-            command = %command,
-            args = ?args,
+            command = %resolved_command.display(),
+            arg_count = args.len(),
             env_vars = env.len(),
-            "Spawning MCP server"
+            profile = "mcp-stdio",
+            network = "disabled",
+            "Spawning sandboxed MCP server"
         );
 
-        let mut cmd = Command::new(command);
-        cmd.args(args)
-            .envs(
-                env.iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str())),
-            )
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut cmd = Command::from(command);
+        cmd.envs(
+            env.iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
         let mut child = cmd
             .spawn()
             .map_err(|e| McpError::Transport(format!("Failed to spawn process: {e}")))?;
+        let process_registration =
+            crate::tools::command::ActiveSandboxProcess::register(child.id().ok_or_else(|| {
+                McpError::Transport("Sandboxed MCP process has no process id".to_string())
+            })?);
 
         // Take stdout from the child once and wrap in a persistent BufReader
         let stdout = child
@@ -396,6 +431,7 @@ impl StdioTransport {
 
         Ok(Self {
             child: Arc::new(Mutex::new(child)),
+            _process_registration: process_registration,
             reader: Mutex::new(reader),
             request_id: AtomicU64::new(1),
             request_lock: Mutex::new(()), // Fix #732
@@ -483,6 +519,118 @@ impl StdioTransport {
 
         Ok(true)
     }
+}
+
+fn is_host_loader_environment(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || matches!(
+            upper.as_str(),
+            "GCONV_PATH" | "GLIBC_TUNABLES" | "LOCPATH" | "NLSPATH"
+        )
+}
+
+fn mcp_sensitive_environment_grants() -> Result<std::collections::HashSet<String>, McpError> {
+    let Some(raw) = std::env::var_os("OPENCLAUDIA_MCP_ENV_GRANTS") else {
+        return Ok(std::collections::HashSet::new());
+    };
+    let raw = raw.to_str().ok_or_else(|| {
+        McpError::Transport(
+            "OPENCLAUDIA_MCP_ENV_GRANTS contains non-Unicode data; MCP launch is blocked"
+                .to_string(),
+        )
+    })?;
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .try_fold(std::collections::HashSet::new(), |mut grants, name| {
+            let mut chars = name.chars();
+            let valid = chars
+                .next()
+                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+            if !valid {
+                return Err(McpError::Transport(format!(
+                    "Invalid environment variable name in OPENCLAUDIA_MCP_ENV_GRANTS: '{name}'"
+                )));
+            }
+            grants.insert(name.to_string());
+            Ok(grants)
+        })
+}
+
+fn resolve_trusted_mcp_executable(command: &str) -> Result<PathBuf, McpError> {
+    let candidate = if Path::new(command).is_absolute() {
+        PathBuf::from(command)
+    } else {
+        which::which(command).map_err(|error| {
+            McpError::Transport(format!(
+                "Cannot resolve MCP executable '{command}' from the host startup PATH: {error}"
+            ))
+        })?
+    };
+    let resolved = candidate.canonicalize().map_err(|error| {
+        McpError::Transport(format!(
+            "Cannot pin MCP executable '{}': {error}",
+            candidate.display()
+        ))
+    })?;
+    let metadata = std::fs::metadata(&resolved).map_err(|error| {
+        McpError::Transport(format!(
+            "Cannot inspect MCP executable '{}': {error}",
+            resolved.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(McpError::Transport(format!(
+            "MCP executable '{}' is not a regular file",
+            resolved.display()
+        )));
+    }
+    let security = crate::tools::security::current_context().map_err(McpError::Transport)?;
+    if security
+        .read_write_roots()
+        .iter()
+        .any(|root| resolved == *root || resolved.starts_with(root))
+    {
+        return Err(McpError::Transport(format!(
+            "Refusing MCP executable '{}' because it is inside an agent-writable capability root",
+            resolved.display()
+        )));
+    }
+    verify_trusted_executable_ancestry(&resolved)?;
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn verify_trusted_executable_ancestry(path: &Path) -> Result<(), McpError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    for component in path.ancestors() {
+        let metadata = std::fs::symlink_metadata(component).map_err(|error| {
+            McpError::Transport(format!(
+                "Cannot inspect MCP executable ancestry '{}': {error}",
+                component.display()
+            ))
+        })?;
+        if metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+            return Err(McpError::Transport(format!(
+                "Refusing MCP executable '{}': component '{}' is not root-owned and non-writable by group/other",
+                path.display(),
+                component.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_trusted_executable_ancestry(_path: &Path) -> Result<(), McpError> {
+    Err(McpError::Transport(
+        "MCP stdio is blocked: trusted executable ancestry verification is unsupported on this platform"
+            .to_string(),
+    ))
 }
 
 fn build_client_feature_response(id: u64, method: &str) -> Value {
@@ -1724,11 +1872,14 @@ fn run_headers_helper(
     env.insert("CLAUDE_CODE_MCP_SERVER_URL".to_string(), url.to_string());
 
     let (program, args) = shell_command(command);
+    let program = resolve_trusted_mcp_executable(program)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = crate::tools::command::run_with_timeout_with_env(
-        program,
+    let security = crate::tools::security::current_context().map_err(McpError::Transport)?;
+    let output = crate::tools::command::run_sandboxed_with_timeout_with_env(
+        crate::tools::SandboxProfile::McpStdio,
+        &program,
         &arg_refs,
-        None,
+        security.working_directory(),
         HEADERS_HELPER_TIMEOUT,
         &env,
     )

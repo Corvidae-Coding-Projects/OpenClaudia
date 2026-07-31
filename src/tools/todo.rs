@@ -100,6 +100,13 @@ impl SessionIdGuard {
     /// before (which is almost always `None`).
     pub fn set(id: impl Into<String>) -> Self {
         let id = id.into();
+        if let Err(error) = super::security::ensure_session_context(&id) {
+            tracing::error!(
+                session_id = %id,
+                %error,
+                "Failed to initialize immutable tool security context"
+            );
+        }
         let previous = CURRENT_SESSION_ID.with(|cell| cell.replace(Some(id)));
         Self { previous }
     }

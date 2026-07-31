@@ -237,14 +237,17 @@ fn validate_branch_name(name: &str) -> Result<(), String> {
     }
 
     // Defer the remaining ref-format rules (foo.lock, @, a@{b, leading '/',
-    // empty path segments, etc.) to git itself. We pin the cwd to the system
-    // temp dir so this check never depends on being inside a git repo.
-    let tmp = std::env::temp_dir();
-    let output = crate::tools::command::run_with_timeout(
+    // empty path segments, etc.) to git itself. Although this invocation does
+    // not inspect a repository, its argument is model-controlled, so keep it
+    // inside the common subprocess boundary.
+    let security = crate::tools::security::current_context()?;
+    let output = crate::tools::run_sandboxed_with_timeout_with_env(
+        crate::tools::SandboxProfile::StaticAnalyzer,
         git_bin()?,
         &["check-ref-format", "--branch", name],
-        Some(tmp.as_path()),
+        security.working_directory(),
         std::time::Duration::from_secs(GIT_TIMEOUT_SECS),
+        &HashMap::new(),
     )
     .map_err(|err| match err {
         crate::tools::command::CommandError::SpawnFailed { source, .. } => {
@@ -291,11 +294,35 @@ fn git_in(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     // one timeout/backoff implementation. The git-specific timeout
     // and argv-tail formatting are kept here so the caller-visible
     // error string is unchanged.
-    crate::tools::command::run_with_timeout(
+    let mut hardened_args = vec![
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "protocol.file.allow=never",
+        "-c",
+        "protocol.ext.allow=never",
+    ];
+    hardened_args.extend_from_slice(args);
+    let env = HashMap::from([
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+    ]);
+    crate::tools::run_sandboxed_with_timeout_with_env(
+        crate::tools::SandboxProfile::GitWorktree,
         git,
-        args,
-        Some(cwd),
+        &hardened_args,
+        cwd,
         std::time::Duration::from_secs(GIT_TIMEOUT_SECS),
+        &env,
     )
     .map_err(|err| match err {
         crate::tools::command::CommandError::SpawnFailed { source, .. } => {
@@ -345,9 +372,14 @@ pub fn execute_enter_worktree<S: std::hash::BuildHasher>(
         return (format!("Error: {e}"), true);
     }
 
-    let cwd = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => return (format!("Error: cannot read current directory: {e}"), true),
+    let cwd = match crate::tools::security::current_context() {
+        Ok(context) => context.working_directory().to_path_buf(),
+        Err(e) => {
+            return (
+                format!("Error: cannot resolve session working directory: {e}"),
+                true,
+            )
+        }
     };
 
     match git_in(&cwd, &["rev-parse", "--is-inside-work-tree"]) {
@@ -868,7 +900,15 @@ pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
 /// git but does not mutate any state.
 #[must_use]
 pub fn execute_list_worktrees() -> (String, bool) {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = match crate::tools::security::current_context() {
+        Ok(context) => context.working_directory().to_path_buf(),
+        Err(error) => {
+            return (
+                format!("Failed to resolve session working directory: {error}"),
+                true,
+            )
+        }
+    };
     let output = git_in(&cwd, &["worktree", "list", "--porcelain"]);
 
     match output {
@@ -1020,9 +1060,16 @@ mod tests {
     fn enter_worktree_outside_git_repo_is_error() {
         let _lock = cwd_lock();
         let tmp = tempfile::tempdir().expect("temp dir");
-        let original = std::env::current_dir().ok();
-
-        let _ = std::env::set_current_dir(tmp.path());
+        let session_id = "worktree-outside-repository";
+        crate::tools::security::register_session_context(
+            session_id,
+            tmp.path(),
+            tmp.path(),
+            &[],
+            &[],
+        )
+        .expect("register isolated test capability");
+        let _session = crate::tools::SessionIdGuard::set(session_id);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1030,10 +1077,7 @@ mod tests {
             serde_json::Value::String("test-branch".to_string()),
         );
         let (msg, is_err) = execute_enter_worktree(&args);
-
-        if let Some(orig) = original {
-            let _ = std::env::set_current_dir(orig);
-        }
+        crate::tools::security::release_session_context(session_id);
 
         assert!(is_err, "must error outside a git repo");
         assert!(

@@ -27,6 +27,7 @@ fn todo_lock() -> MutexGuard<'static, ()> {
 
 fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
+        security: openclaudia::tools::security::current_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,

@@ -24,7 +24,9 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::{execute_cron_create, execute_cron_delete, execute_cron_list};
+use openclaudia::tools::{
+    execute_cron_create, execute_cron_delete, execute_cron_list, SessionIdGuard,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -57,13 +59,18 @@ fn cwd_lock() -> MutexGuard<'static, ()> {
 /// helper MUST run single-threaded (`--test-threads=1`).
 struct CwdGuard {
     prev: PathBuf,
+    _session: SessionIdGuard,
 }
 
 impl CwdGuard {
     fn set_to(path: &std::path::Path) -> Self {
         let prev = std::env::current_dir().expect("current_dir");
         std::env::set_current_dir(path).expect("set_current_dir");
-        Self { prev }
+        let session = SessionIdGuard::set(format!("cron-e2e-{}", path.display()));
+        Self {
+            prev,
+            _session: session,
+        }
     }
 }
 

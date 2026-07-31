@@ -16,7 +16,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
@@ -40,8 +39,38 @@ fn git_bin() -> Result<&'static Path, String> {
     }
 }
 
-fn git_command() -> Result<Command, String> {
-    Ok(Command::new(git_bin()?))
+fn sandboxed_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    let mut hardened = vec![
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "protocol.file.allow=never",
+        "-c",
+        "protocol.ext.allow=never",
+    ];
+    hardened.extend_from_slice(args);
+    let env = HashMap::from([
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+    ]);
+    crate::tools::run_sandboxed_with_timeout_with_env(
+        crate::tools::SandboxProfile::GitWorktree,
+        git_bin()?,
+        &hardened,
+        cwd,
+        Duration::from_secs(30),
+        &env,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn agent_field_guard<'a, T>(
@@ -1014,12 +1043,9 @@ impl WorktreeIsolation {
         let branch_name = format!("agent/{agent_id}");
 
         // Find the git root
-        let git_root = git_command()
-            .and_then(|mut cmd| {
-                cmd.args(["rev-parse", "--show-toplevel"])
-                    .output()
-                    .map_err(|e| e.to_string())
-            })
+        let security = crate::tools::security::current_context()?;
+        let cwd = security.working_directory();
+        let git_root = sandboxed_git(cwd, &["rev-parse", "--show-toplevel"])
             .map_err(|e| format!("git not available: {e}"))?;
 
         if !git_root.status.success() {
@@ -1027,7 +1053,7 @@ impl WorktreeIsolation {
         }
 
         let root = String::from_utf8_lossy(&git_root.stdout).trim().to_string();
-        let worktree_dir = Path::new(&root).join(".openclaudia").join("worktrees");
+        let worktree_dir = Path::new(&root).join(".worktrees").join("subagents");
 
         // Ensure worktree directory exists
         std::fs::create_dir_all(&worktree_dir)
@@ -1036,16 +1062,10 @@ impl WorktreeIsolation {
         let worktree_path = worktree_dir.join(agent_id);
 
         // Create the worktree
-        let result = git_command()
-            .and_then(|mut cmd| {
-                cmd.arg("worktree")
-                    .arg("add")
-                    .arg(&worktree_path)
-                    .arg("-b")
-                    .arg(&branch_name)
-                    .output()
-                    .map_err(|e| e.to_string())
-            })
+        let worktree_arg = worktree_path
+            .to_str()
+            .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
+        let result = sandboxed_git(cwd, &["worktree", "add", worktree_arg, "-b", &branch_name])
             .map_err(|e| format!("Failed to create worktree: {e}"))?;
 
         if !result.status.success() {
@@ -1062,12 +1082,15 @@ impl WorktreeIsolation {
     /// Check if the worktree has uncommitted changes
     #[must_use]
     pub fn has_changes(&self) -> bool {
-        let result = git_command().and_then(|mut cmd| {
-            cmd.arg("-C")
-                .arg(&self.worktree_path)
-                .args(["diff", "--stat"])
-                .output()
-                .map_err(|e| e.to_string())
+        let result = crate::tools::security::current_context().and_then(|security| {
+            let worktree = self
+                .worktree_path
+                .to_str()
+                .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
+            sandboxed_git(
+                security.working_directory(),
+                &["-C", worktree, "diff", "--stat"],
+            )
         });
 
         match result {
@@ -1091,16 +1114,16 @@ impl WorktreeIsolation {
             ));
         }
 
-        let result = git_command()
-            .and_then(|mut cmd| {
-                cmd.arg("worktree")
-                    .arg("remove")
-                    .arg(&self.worktree_path)
-                    .arg("--force")
-                    .output()
-                    .map_err(|e| e.to_string())
-            })
-            .map_err(|e| format!("Failed to remove worktree: {e}"))?;
+        let security = crate::tools::security::current_context()?;
+        let worktree = self
+            .worktree_path
+            .to_str()
+            .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
+        let result = sandboxed_git(
+            security.working_directory(),
+            &["worktree", "remove", worktree, "--force"],
+        )
+        .map_err(|e| format!("Failed to remove worktree: {e}"))?;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -1108,11 +1131,10 @@ impl WorktreeIsolation {
         }
 
         // Also delete the branch
-        let _ = git_command().and_then(|mut cmd| {
-            cmd.args(["branch", "-D", &self.branch_name])
-                .output()
-                .map_err(|e| e.to_string())
-        });
+        let _ = sandboxed_git(
+            security.working_directory(),
+            &["branch", "-D", &self.branch_name],
+        );
 
         Ok(())
     }
