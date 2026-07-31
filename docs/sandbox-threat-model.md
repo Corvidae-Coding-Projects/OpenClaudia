@@ -69,8 +69,13 @@ surface starts. Each process starts from an empty mount namespace with:
 - explicit session roots mounted with their declared access;
 - private `/tmp`, `/run`, `/proc`, `/dev`, `HOME`, and package-manager state;
 - no host `/sys`, `/etc`, home directory, runtime directory, or IPC sockets;
-- all capabilities dropped, a new PID/user/network namespace, nested user
-  namespaces disabled, and parent-death/process-group cleanup;
+- all capabilities dropped, new PID/user namespaces, nested user namespaces
+  disabled, and parent-death/process-group cleanup;
+- a new network namespace when the host permits Bubblewrap to configure its
+  loopback device; on restricted container hosts that reject only that
+  operation, the probed fallback retains the host network namespace while the
+  seccomp filter still denies socket creation and use and inherited descriptors
+  remain closed;
 - a versioned seccomp filter denying socket creation, mount and namespace
   changes, `ptrace`, BPF, performance events, keyrings, kernel module/kexec,
   cross-process memory access, file-handle APIs, `userfaultfd`, and

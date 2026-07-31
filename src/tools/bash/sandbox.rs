@@ -35,7 +35,14 @@ const SECCOMP_FILTER_FD: libc::c_int = 198;
 const MAX_PROJECT_SCAN_ENTRIES: usize = 1_000_000;
 
 #[cfg(target_os = "linux")]
-static BWRAP_BIN: LazyLock<Result<PathBuf, String>> = LazyLock::new(find_bwrap);
+#[derive(Clone, Debug)]
+struct BubblewrapBackend {
+    path: PathBuf,
+    share_network_namespace: bool,
+}
+
+#[cfg(target_os = "linux")]
+static BWRAP_BACKEND: LazyLock<Result<BubblewrapBackend, String>> = LazyLock::new(find_bwrap);
 static SANDBOX_DISABLED: LazyLock<Result<bool, String>> =
     LazyLock::new(sandbox_explicitly_disabled_from_env);
 
@@ -104,7 +111,7 @@ pub fn sandbox_diagnostics() -> SandboxDiagnostics {
     #[cfg(target_os = "linux")]
     let (backend, result, syscall_filter) = (
         "bubblewrap",
-        BWRAP_BIN.as_ref().map(|_| ()).map_err(Clone::clone),
+        BWRAP_BACKEND.as_ref().map(|_| ()).map_err(Clone::clone),
         "seccomp-v1",
     );
     #[cfg(target_os = "macos")]
@@ -383,7 +390,7 @@ fn linux_bubblewrap_command(
     cwd: &Path,
 ) -> Result<Command, String> {
     let cwd = canonical_working_directory(cwd)?;
-    let bwrap = BWRAP_BIN.as_ref().map_err(Clone::clone)?;
+    let backend = BWRAP_BACKEND.as_ref().map_err(Clone::clone)?;
     let security = crate::tools::security::current_context()?;
     if !security.permits_read(&cwd) {
         return Err(format!(
@@ -426,11 +433,12 @@ fn linux_bubblewrap_command(
         .unwrap_or_else(|| PathBuf::from("/home/openclaudia"));
     let pinned_bind_roots = security.duplicate_linux_bind_roots()?;
     let mut metadata_bind_fds = Vec::new();
-    let mut cmd = Command::new(bwrap);
+    let mut cmd = Command::new(&backend.path);
+    cmd.args(["--die-with-parent", "--new-session", "--unshare-all"]);
+    if backend.share_network_namespace {
+        cmd.arg("--share-net");
+    }
     cmd.args([
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-all",
         "--unshare-user",
         "--disable-userns",
         "--assert-userns-disabled",
@@ -598,7 +606,7 @@ fn canonical_working_directory(cwd: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn find_bwrap() -> Result<PathBuf, String> {
+fn find_bwrap() -> Result<BubblewrapBackend, String> {
     const TRUSTED_LOCATIONS: &[&str] = &[
         "/usr/bin/bwrap",
         "/usr/sbin/bwrap",
@@ -621,8 +629,23 @@ fn find_bwrap() -> Result<PathBuf, String> {
                     resolved.display()
                 ));
             }
-            probe_bwrap(&resolved)?;
-            return Ok(resolved);
+            let share_network_namespace = match probe_bwrap(&resolved, false) {
+                Ok(()) => false,
+                Err(error) if is_network_namespace_probe_failure(&error) => {
+                    probe_bwrap(&resolved, true).map_err(|fallback_error| {
+                        format!(
+                            "{error}; Bubblewrap also failed with the seccomp-enforced network \
+                             fallback: {fallback_error}"
+                        )
+                    })?;
+                    true
+                }
+                Err(error) => return Err(error),
+            };
+            return Ok(BubblewrapBackend {
+                path: resolved,
+                share_network_namespace,
+            });
         }
     }
     Err(format!(
@@ -633,7 +656,7 @@ fn find_bwrap() -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn probe_bwrap(bwrap: &Path) -> Result<(), String> {
+fn probe_bwrap(bwrap: &Path, share_network_namespace: bool) -> Result<(), String> {
     let true_bin = ["/usr/bin/true", "/bin/true"]
         .iter()
         .map(Path::new)
@@ -648,12 +671,15 @@ fn probe_bwrap(bwrap: &Path) -> Result<(), String> {
     );
     let root_fd = root.as_raw_fd();
     let root_for_child = Arc::clone(&root);
+    let filter = Arc::new(linux_seccomp_filter()?);
+    let filter_for_child = Arc::clone(&filter);
     let mut command = Command::new(bwrap);
+    command.args(["--die-with-parent", "--new-session", "--unshare-all"]);
+    if share_network_namespace {
+        command.arg("--share-net");
+    }
     command
         .args([
-            "--die-with-parent",
-            "--new-session",
-            "--unshare-all",
             "--unshare-user",
             "--disable-userns",
             "--assert-userns-disabled",
@@ -662,7 +688,16 @@ fn probe_bwrap(bwrap: &Path) -> Result<(), String> {
             "--ro-bind-fd",
         ])
         .arg(root_fd.to_string())
-        .args(["/", "--proc", "/proc", "--dev", "/dev", "--"])
+        .args([
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--seccomp",
+            "198",
+            "--",
+        ])
         .arg(true_bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -671,11 +706,11 @@ fn probe_bwrap(bwrap: &Path) -> Result<(), String> {
     // descriptor until spawn completes.
     unsafe {
         command.pre_exec(move || {
-            if libc::fcntl(root_for_child.as_raw_fd(), libc::F_SETFD, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
+            if libc::fcntl(root_for_child.as_raw_fd(), libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
             }
+            install_seccomp_filter_fd(&filter_for_child)?;
+            close_inherited_file_descriptors(&[root_for_child.as_raw_fd(), SECCOMP_FILTER_FD])
         });
     }
     let output = command.output().map_err(|error| {
@@ -694,6 +729,13 @@ fn probe_bwrap(bwrap: &Path) -> Result<(), String> {
          ({category}, status {}): {diagnostic}",
         output.status,
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn is_network_namespace_probe_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("loopback")
+        && (lower.contains("rtm_newaddr") || lower.contains("operation not permitted"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1472,6 +1514,30 @@ mod tests {
             classify_bwrap_probe_failure("mount source failed"),
             "required mount behavior unavailable"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn network_namespace_fallback_only_accepts_loopback_setup_failures() {
+        assert!(is_network_namespace_probe_failure(
+            "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
+        ));
+        assert!(!is_network_namespace_probe_failure(
+            "Creating new namespace failed: Operation not permitted"
+        ));
+        assert!(!is_network_namespace_probe_failure(
+            "bwrap: Can't mount proc on /newroot/proc: Operation not permitted"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn seccomp_network_fallback_probe_is_usable() {
+        let backend = BWRAP_BACKEND
+            .as_ref()
+            .expect("Bubblewrap backend must be usable");
+        probe_bwrap(&backend.path, true)
+            .expect("shared network namespace must remain blocked by the seccomp filter");
     }
 
     #[test]
