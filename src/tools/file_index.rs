@@ -299,7 +299,7 @@ mod tests {
         let index = index_from_paths(&["src/main.rs", "src/domain/maintain.rs"]);
         let results = index.search("main", 10);
         // "main.rs" should score higher (boundary match after /)
-        assert!(results[0].path == "src/main.rs");
+        assert_eq!(results[0].path, "src/main.rs");
     }
 
     #[test]

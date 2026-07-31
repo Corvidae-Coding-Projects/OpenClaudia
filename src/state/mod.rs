@@ -81,7 +81,7 @@ mod tests {
         let state = SessionState::default();
         assert!(!state.identity.session_id.as_str().is_empty());
         assert!(state.conversation.messages.is_empty());
-        assert!(state.transcript.watermark == 0);
+        assert_eq!(state.transcript.watermark, 0);
     }
 
     #[test]

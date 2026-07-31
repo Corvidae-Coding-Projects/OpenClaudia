@@ -1660,8 +1660,7 @@ mod tests {
         for window in nums.windows(2) {
             assert!(
                 window[0] < window[1],
-                "turn_numbers must be strictly increasing after eviction: {:?}",
-                &window
+                "turn_numbers must be strictly increasing after eviction: {window:?}"
             );
         }
 

@@ -998,7 +998,7 @@ impl WelcomeScreen {
                 Style::default().fg(PURPLE),
             )),
             Line::from(Span::styled(
-                format!("Model: {}", &self.model),
+                format!("Model: {}", self.model),
                 Style::default().fg(GOLD),
             )),
             Line::from(Span::styled(&self.working_dir, Style::default().fg(DIM))),

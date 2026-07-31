@@ -4652,7 +4652,7 @@ mod acp_permission_gate_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod pre_tool_gate_tests {
     use super::pre_tool_use_gate;
     use crate::config::{Hook, HookEntry, HookPolicy, HooksConfig};
