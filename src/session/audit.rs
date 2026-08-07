@@ -95,7 +95,23 @@ impl AuditLogger {
     /// created, or [`AuditError::Open`] if the JSONL file cannot be
     /// opened for appending.
     pub fn new(session_id: &str) -> Result<Self, AuditError> {
-        Self::new_in(Path::new(".openclaudia/logs"), session_id)
+        match Self::new_in(Path::new(".openclaudia/logs"), session_id) {
+            Ok(logger) => Ok(logger),
+            Err(invalid @ AuditError::InvalidSessionId { .. }) => Err(invalid),
+            Err(project_error) => {
+                // The project directory can be read-only (for example when
+                // an external supervisor mounts the workspace read-only for
+                // a sandboxed agent). Audit logging must not kill the
+                // session in that case: fall back to the per-user data
+                // directory, and only fail when neither location works.
+                let Some(fallback) = dirs::data_local_dir()
+                    .map(|data_dir| data_dir.join("openclaudia").join("logs"))
+                else {
+                    return Err(project_error);
+                };
+                Self::new_in(&fallback, session_id).map_err(|_| project_error)
+            }
+        }
     }
 
     /// Variant of [`Self::new`] that targets a caller-supplied directory.
@@ -382,5 +398,21 @@ mod tests {
             "no tracing output expected on success, got: {}",
             captured.contents()
         );
+    }
+
+    #[test]
+    fn new_in_fails_cleanly_when_directory_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let read_only = dir.path().join("frozen");
+        std::fs::create_dir(&read_only).unwrap();
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let target = read_only.join("logs");
+
+        let error = AuditLogger::new_in(&target, "ro-session")
+            .err()
+            .expect("read-only parent must fail");
+        assert!(matches!(error, AuditError::Mkdir { .. }), "{error:?}");
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
