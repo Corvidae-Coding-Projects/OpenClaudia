@@ -318,10 +318,31 @@ impl RealityLedger {
     pub fn open_project_session(session_key: &str) -> Result<Self, LedgerError> {
         let path = project_session_ledger_path(session_key)?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| LedgerError::CreateDir {
-                path: parent.to_path_buf(),
-                source,
-            })?;
+            if let Err(source) = std::fs::create_dir_all(parent) {
+                // The project directory can be read-only (an external
+                // supervisor can mount the workspace read-only for a
+                // sandboxed agent). The reality ledger must not block the
+                // session in that case: fall back to the per-user data
+                // directory, keyed the same way, and only fail when
+                // neither location is writable.
+                let Some(fallback_dir) = dirs::data_local_dir()
+                    .map(|data_dir| data_dir.join("openclaudia").join("reality-ledgers"))
+                else {
+                    return Err(LedgerError::CreateDir {
+                        path: parent.to_path_buf(),
+                        source,
+                    });
+                };
+                let project_error = LedgerError::CreateDir {
+                    path: parent.to_path_buf(),
+                    source,
+                };
+                if std::fs::create_dir_all(&fallback_dir).is_err() {
+                    return Err(project_error);
+                }
+                let file_name = path.file_name().ok_or(project_error)?.to_os_string();
+                return Self::open(fallback_dir.join(file_name));
+            }
         }
         Self::open(path)
     }
@@ -334,10 +355,25 @@ impl RealityLedger {
     /// absent, or the existing database cannot be opened/read.
     pub fn open_existing_project_session(session_key: &str) -> Result<Self, LedgerError> {
         let path = project_session_ledger_path(session_key)?;
-        if !path.is_file() {
-            return Err(LedgerError::MissingSessionLedger { path });
+        if path.is_file() {
+            return Self::open_read_only(path);
         }
-        Self::open_read_only(path)
+        // Mirror open_project_session's read-only-workspace fallback: a
+        // ledger created under the per-user data directory must stay
+        // readable through the same key.
+        if let Some(file_name) = path.file_name() {
+            if let Some(fallback) = dirs::data_local_dir().map(|data_dir| {
+                data_dir
+                    .join("openclaudia")
+                    .join("reality-ledgers")
+                    .join(file_name)
+            }) {
+                if fallback.is_file() {
+                    return Self::open_read_only(fallback);
+                }
+            }
+        }
+        Err(LedgerError::MissingSessionLedger { path })
     }
 
     #[must_use]
