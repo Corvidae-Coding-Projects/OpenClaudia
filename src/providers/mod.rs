@@ -457,14 +457,14 @@ pub fn api_key_env_var_for_target(provider_name: &str) -> &'static str {
     match provider_name.trim().to_ascii_lowercase().as_str() {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
-        "google" | "gemini" => "GOOGLE_API_KEY",
+        "google" | "gemini" => "GOOGLE_API_KEY or GEMINI_API_KEY",
         "zai" | "glm" | "zhipu" => "ZAI_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
-        "qwen" | "alibaba" => "QWEN_API_KEY",
+        "qwen" | "alibaba" => "QWEN_API_KEY, DASHSCOPE_API_KEY, or ALIYUN_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY or MOONSHOT_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        "opencode" | "opencode-go" => "OPENCODE_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY",
+        "opencode" | "opencode-go" => "OPENCODE_API_KEY or OPENCODE_GO_API_KEY",
         "openai-compatible" => "OPENAI_COMPATIBLE_API_KEY or API_KEY",
         _ => "API_KEY",
     }
@@ -641,10 +641,12 @@ pub async fn fetch_models_with_headers(
 
     let mut request = client.get(&url);
 
-    // Add auth header if API key provided. Unredacted access is confined to
-    // `.as_str()` at the request boundary.
+    // Use the adapter's auth contract rather than assuming every provider
+    // authenticates model-list requests with a Bearer token.
     if let Some(key) = api_key {
-        request = request.header("Authorization", format!("Bearer {}", key.as_str()));
+        for (header, value) in adapter.get_headers(key) {
+            request = request.header(header, value);
+        }
     }
     for (key, value) in extra_headers {
         request = request.header(key.as_str(), value.as_str());
@@ -674,6 +676,42 @@ mod tests {
     use super::*;
     use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
     use serde_json::json;
+
+    struct ApiKeyHeaderModelAdapter;
+
+    impl ProviderAdapter for ApiKeyHeaderModelAdapter {
+        fn name(&self) -> &'static str {
+            "api-key-header-test"
+        }
+
+        fn transform_request(
+            &self,
+            request: &ChatCompletionRequest,
+        ) -> Result<Value, ProviderError> {
+            serde_json::to_value(request)
+                .map_err(|error| ProviderError::RequestFailed(error.to_string()))
+        }
+
+        fn transform_response(
+            &self,
+            response: Value,
+            _stream: bool,
+        ) -> Result<Value, ProviderError> {
+            Ok(response)
+        }
+
+        fn chat_endpoint(&self, _model: &str) -> String {
+            "/v1/chat/completions".to_string()
+        }
+
+        fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
+            vec![("x-api-key".to_string(), api_key.as_str().to_string())]
+        }
+
+        fn supports_model_listing(&self) -> bool {
+            true
+        }
+    }
 
     fn create_test_request() -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -1064,6 +1102,55 @@ mod tests {
         server.join().expect("server thread must finish");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "openrouter/test-model");
+    }
+
+    #[tokio::test]
+    async fn fetch_models_uses_the_adapter_auth_headers() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut buf = [0_u8; 4096];
+            let read = stream.read(&mut buf).expect("read request");
+            let request = String::from_utf8_lossy(&buf[..read]).to_ascii_lowercase();
+            assert!(
+                request.contains("x-api-key: model-list-key"),
+                "request missing adapter auth header:\n{request}"
+            );
+            assert!(
+                !request.contains("authorization:"),
+                "request incorrectly assumed bearer auth:\n{request}"
+            );
+
+            let body = r#"{"object":"list","data":[{"id":"test-model"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let key = ApiKey::try_from_string("model-list-key".to_string()).expect("valid key");
+        let models = fetch_models(
+            &format!("http://{addr}"),
+            Some(&key),
+            &ApiKeyHeaderModelAdapter,
+        )
+        .await
+        .expect("model list should fetch");
+
+        server.join().expect("server thread must finish");
+        assert_eq!(models[0].id, "test-model");
     }
 
     #[test]
@@ -1655,11 +1742,19 @@ mod tests {
         );
         assert_eq!(
             api_key_env_var_for_target("OpenRouter"),
-            "OPENROUTER_API_KEY"
+            "OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY"
         );
         assert_eq!(
             api_key_env_var_for_target("opencode-go"),
-            "OPENCODE_API_KEY"
+            "OPENCODE_API_KEY or OPENCODE_GO_API_KEY"
+        );
+        assert_eq!(
+            api_key_env_var_for_target("gemini"),
+            "GOOGLE_API_KEY or GEMINI_API_KEY"
+        );
+        assert_eq!(
+            api_key_env_var_for_target("alibaba"),
+            "QWEN_API_KEY, DASHSCOPE_API_KEY, or ALIYUN_API_KEY"
         );
         assert_eq!(
             api_key_env_var_for_target("openai-compatible"),

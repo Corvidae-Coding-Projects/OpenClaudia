@@ -96,10 +96,11 @@ providers:
   # Google Gemini - Models: gemini-3.5-flash, gemini-3.1-pro-preview-customtools
   google:
     base_url: https://generativelanguage.googleapis.com
-    # api_key: ${GOOGLE_API_KEY}
+    # api_key: ${GOOGLE_API_KEY}  # or ${GEMINI_API_KEY}
   # Z.AI/GLM (OpenAI-compatible) - Models: glm-5.2, glm-5v-turbo, glm-5-turbo
   zai:
-    base_url: https://api.z.ai/api/coding/paas/v4
+    base_url: https://api.z.ai/api/paas/v4
+    # Coding Plan users: https://api.z.ai/api/coding/paas/v4
     # api_key: ${ZAI_API_KEY}
   # DeepSeek (OpenAI-compatible) - Models: deepseek-v4-pro, deepseek-v4-flash
   deepseek:
@@ -108,7 +109,7 @@ providers:
   # Qwen/Alibaba (OpenAI-compatible) - Models: qwen3.7-plus, qwen3.7-max
   qwen:
     base_url: https://dashscope.aliyuncs.com/compatible-mode
-    # api_key: ${QWEN_API_KEY}
+    # api_key: ${QWEN_API_KEY}  # or ${DASHSCOPE_API_KEY} / ${ALIYUN_API_KEY}
   # Kimi/Moonshot (OpenAI-compatible) - Models: kimi-k2.7-code, kimi-k2.6
   kimi:
     base_url: https://api.moonshot.ai/v1
@@ -120,14 +121,14 @@ providers:
   # OpenRouter (OpenAI-compatible aggregator) - /model list fetches /v1/models
   openrouter:
     base_url: https://openrouter.ai/api/v1
-    # api_key: ${OPENROUTER_API_KEY}
+    # api_key: ${OPENROUTER_API_KEY}  # or ${OPEN_ROUTER_API_KEY}
     # headers:
     #   HTTP-Referer: https://example.com
     #   X-OpenRouter-Title: OpenClaudia
   # OpenCode Go OpenAI-compatible endpoint subset
   opencode:
     base_url: https://opencode.ai/zen/go/v1
-    # api_key: ${OPENCODE_API_KEY}
+    # api_key: ${OPENCODE_API_KEY}  # or ${OPENCODE_GO_API_KEY}
   # Generic remote OpenAI-compatible endpoint
   openai-compatible:
     base_url: https://api.example.com/v1
@@ -196,7 +197,7 @@ session:
 #     provider: google           # MUST differ from proxy.target
 #     model: gemini-3.1-pro-preview
 #     # model is optional; omitted uses the provider default
-#     # api_key: ${GOOGLE_API_KEY}  # Optional, uses provider's key if omitted
+#     # api_key: ${GOOGLE_API_KEY}  # or ${GEMINI_API_KEY}; optional
 #     temperature: 0.3           # Lower = more deterministic critique
 #     max_tokens: 4096
 #   thresholds:

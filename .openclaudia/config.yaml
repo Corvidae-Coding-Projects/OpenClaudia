@@ -15,10 +15,11 @@ providers:
     # api_key: ${OPENAI_API_KEY}
   google:
     base_url: https://generativelanguage.googleapis.com
-    # api_key: ${GOOGLE_API_KEY}
+    # api_key: ${GOOGLE_API_KEY}  # or ${GEMINI_API_KEY}
   # Z.AI/GLM (OpenAI-compatible) - Models: GLM-4.7, GLM-4.5-air
   zai:
-    base_url: https://api.z.ai/api/coding/paas/v4
+    base_url: https://api.z.ai/api/paas/v4
+    # Coding Plan users: https://api.z.ai/api/coding/paas/v4
     # api_key: ${ZAI_API_KEY}
   # DeepSeek (OpenAI-compatible) - Models: deepseek-chat, deepseek-coder
   deepseek:
@@ -27,7 +28,7 @@ providers:
   # Qwen/Alibaba (OpenAI-compatible) - Models: qwen-turbo, qwen-plus
   qwen:
     base_url: https://dashscope.aliyuncs.com/compatible-mode
-    # api_key: ${QWEN_API_KEY}
+    # api_key: ${QWEN_API_KEY}  # or ${DASHSCOPE_API_KEY} / ${ALIYUN_API_KEY}
 
 # Hooks run at key moments in the agent lifecycle
 # See: https://github.com/yourusername/openclaudia/docs/hooks.md

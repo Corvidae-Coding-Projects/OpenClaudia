@@ -186,9 +186,17 @@ pub fn configure_provider_api_key() {
     let providers = [
         ("anthropic", "Anthropic (Claude)", "ANTHROPIC_API_KEY"),
         ("openai", "OpenAI (GPT)", "OPENAI_API_KEY"),
-        ("google", "Google (Gemini)", "GOOGLE_API_KEY"),
+        (
+            "google",
+            "Google (Gemini)",
+            "GOOGLE_API_KEY or GEMINI_API_KEY",
+        ),
         ("deepseek", "DeepSeek", "DEEPSEEK_API_KEY"),
-        ("qwen", "Qwen (Alibaba)", "QWEN_API_KEY"),
+        (
+            "qwen",
+            "Qwen (Alibaba)",
+            "QWEN_API_KEY, DASHSCOPE_API_KEY, or ALIYUN_API_KEY",
+        ),
         ("zai", "Z.AI (GLM)", "ZAI_API_KEY"),
         (
             "kimi",

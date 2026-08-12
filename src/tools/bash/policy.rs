@@ -92,12 +92,19 @@ pub fn is_sensitive_env(key: &str) -> bool {
             | "DEEPSEEK_API_KEY"
             | "QWEN_API_KEY"
             | "DASHSCOPE_API_KEY"
+            | "ALIYUN_API_KEY"
             | "ZAI_API_KEY"
             | "GLM_API_KEY"
             | "KIMI_API_KEY"
             | "MOONSHOT_API_KEY"
             | "MINIMAX_API_KEY"
             | "OLLAMA_API_KEY"
+            | "OPENROUTER_API_KEY"
+            | "OPEN_ROUTER_API_KEY"
+            | "OPENCODE_API_KEY"
+            | "OPENCODE_GO_API_KEY"
+            | "OPENAI_COMPATIBLE_API_KEY"
+            | "API_KEY"
             | "SERPER_API_KEY"
             | "PERPLEXITY_API_KEY"
             | "HUGGINGFACE_API_KEY"
@@ -807,7 +814,7 @@ mod tests {
     // B4 — env scrub: is_sensitive_env coverage
     // Spec: crosslink #526 §B4
 
-    /// B4-unit-a: all 30 exact-matched provider keys are classified sensitive.
+    /// B4-unit-a: all exact-matched provider keys are classified sensitive.
     #[test]
     fn b4_exact_match_provider_keys_are_sensitive() {
         let exact_keys = [
@@ -821,12 +828,19 @@ mod tests {
             "DEEPSEEK_API_KEY",
             "QWEN_API_KEY",
             "DASHSCOPE_API_KEY",
+            "ALIYUN_API_KEY",
             "ZAI_API_KEY",
             "GLM_API_KEY",
             "KIMI_API_KEY",
             "MOONSHOT_API_KEY",
             "MINIMAX_API_KEY",
             "OLLAMA_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPEN_ROUTER_API_KEY",
+            "OPENCODE_API_KEY",
+            "OPENCODE_GO_API_KEY",
+            "OPENAI_COMPATIBLE_API_KEY",
+            "API_KEY",
             "SERPER_API_KEY",
             "PERPLEXITY_API_KEY",
             "HUGGINGFACE_API_KEY",

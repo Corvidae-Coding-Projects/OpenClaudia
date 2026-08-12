@@ -400,6 +400,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn new_in_fails_cleanly_when_directory_is_read_only() {
         use std::os::unix::fs::PermissionsExt;

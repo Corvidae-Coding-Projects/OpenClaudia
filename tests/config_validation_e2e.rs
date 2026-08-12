@@ -44,15 +44,35 @@ const CONFIG_ENV_VARS: &[&str] = &[
     "OPENCLAUDIA_PROVIDERS_LMSTUDIO_BASE_URL",
     "OPENCLAUDIA_PROVIDERS_LOCALAI_BASE_URL",
     "OPENCLAUDIA_PROVIDERS_TEXT-GENERATION-WEBUI_BASE_URL",
+    "OPENCLAUDIA_PROVIDERS_ANTHROPIC_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_OPENAI_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_GOOGLE_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_ZAI_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_DEEPSEEK_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_QWEN_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_KIMI_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_MINIMAX_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_OPENROUTER_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_OPENCODE_API_KEY",
+    "OPENCLAUDIA_PROVIDERS_OPENAI_COMPATIBLE_API_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
     "DEEPSEEK_API_KEY",
     "QWEN_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "ALIYUN_API_KEY",
     "ZAI_API_KEY",
     "KIMI_API_KEY",
     "MOONSHOT_API_KEY",
     "MINIMAX_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OPEN_ROUTER_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENCODE_GO_API_KEY",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "API_KEY",
 ];
 
 fn process_env_lock() -> MutexGuard<'static, ()> {
@@ -95,6 +115,12 @@ impl EnvGuard {
     fn remove(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
         std::env::remove_var(key);
+        Self { key, previous }
+    }
+
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
         Self { key, previous }
     }
 }
@@ -548,4 +574,101 @@ fn load_config_seeds_advertised_local_provider_defaults() {
         validate_provider_base_url(name, &provider.base_url)
             .unwrap_or_else(|err| panic!("default {name} base_url must validate: {err}"));
     }
+}
+
+#[test]
+fn load_config_accepts_provider_api_key_env_aliases() {
+    let _lock = process_env_lock();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let _cwd_guard = CwdGuard::set_to(cwd.path());
+    let _home_guard = EnvGuard::set_path("HOME", home.path());
+    let _clean_env: Vec<EnvGuard> = CONFIG_ENV_VARS
+        .iter()
+        .copied()
+        .map(EnvGuard::remove)
+        .collect();
+    let _alias_env = [
+        EnvGuard::set("GEMINI_API_KEY", "gemini-alias-key"),
+        EnvGuard::set("DASHSCOPE_API_KEY", "dashscope-alias-key"),
+        EnvGuard::set("OPEN_ROUTER_API_KEY", "open-router-alias-key"),
+        EnvGuard::set("OPENCODE_GO_API_KEY", "opencode-go-alias-key"),
+    ];
+
+    let cfg = load_config().expect("alias-only config must load");
+    for (provider, expected_key) in [
+        ("google", "gemini-alias-key"),
+        ("qwen", "dashscope-alias-key"),
+        ("openrouter", "open-router-alias-key"),
+        ("opencode", "opencode-go-alias-key"),
+    ] {
+        let actual_key = cfg.providers[provider]
+            .api_key
+            .as_ref()
+            .unwrap_or_else(|| panic!("{provider} alias key must be discovered"));
+        assert_eq!(actual_key.as_str(), expected_key);
+    }
+}
+
+#[test]
+fn load_config_accepts_advertised_prefixed_provider_api_keys() {
+    let _lock = process_env_lock();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let _cwd_guard = CwdGuard::set_to(cwd.path());
+    let _home_guard = EnvGuard::set_path("HOME", home.path());
+    let _clean_env: Vec<EnvGuard> = CONFIG_ENV_VARS
+        .iter()
+        .copied()
+        .map(EnvGuard::remove)
+        .collect();
+    let _prefixed_env = [
+        EnvGuard::set(
+            "OPENCLAUDIA_PROVIDERS_GOOGLE_API_KEY",
+            "prefixed-google-key",
+        ),
+        EnvGuard::set("OPENCLAUDIA_PROVIDERS_QWEN_API_KEY", "prefixed-qwen-key"),
+        EnvGuard::set(
+            "OPENCLAUDIA_PROVIDERS_OPENROUTER_API_KEY",
+            "prefixed-openrouter-key",
+        ),
+        EnvGuard::set(
+            "OPENCLAUDIA_PROVIDERS_OPENCODE_API_KEY",
+            "prefixed-opencode-key",
+        ),
+    ];
+
+    let cfg = load_config().expect("prefixed API-key config must load");
+    for (provider, expected_key) in [
+        ("google", "prefixed-google-key"),
+        ("qwen", "prefixed-qwen-key"),
+        ("openrouter", "prefixed-openrouter-key"),
+        ("opencode", "prefixed-opencode-key"),
+    ] {
+        let actual_key = cfg.providers[provider]
+            .api_key
+            .as_ref()
+            .unwrap_or_else(|| panic!("{provider} prefixed key must be discovered"));
+        assert_eq!(actual_key.as_str(), expected_key);
+    }
+}
+
+#[test]
+fn load_config_defaults_zai_to_the_general_api() {
+    let _lock = process_env_lock();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let _cwd_guard = CwdGuard::set_to(cwd.path());
+    let _home_guard = EnvGuard::set_path("HOME", home.path());
+    let _env_guards: Vec<EnvGuard> = CONFIG_ENV_VARS
+        .iter()
+        .copied()
+        .map(EnvGuard::remove)
+        .collect();
+
+    let cfg = load_config().expect("default config must load");
+    assert_eq!(
+        cfg.providers["zai"].base_url,
+        "https://api.z.ai/api/paas/v4"
+    );
 }

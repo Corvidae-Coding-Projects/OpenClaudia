@@ -77,7 +77,7 @@ cargo build --release --no-default-features
 # Set your API key (choose your provider)
 export ANTHROPIC_API_KEY="your-key-here"
 # or: export OPENAI_API_KEY="your-key-here"
-# or: export GOOGLE_API_KEY="your-key-here"
+# or: export GOOGLE_API_KEY="your-key-here"  # GEMINI_API_KEY also works
 # or: export DEEPSEEK_API_KEY="your-key-here"
 
 # Initialize configuration in your project
@@ -105,14 +105,14 @@ openclaudia --mode debug      # Investigation-first debugging
 |----------|----------|----------|
 | `ANTHROPIC_API_KEY` | Anthropic (Claude) | For Anthropic |
 | `OPENAI_API_KEY` | OpenAI (GPT) | For OpenAI |
-| `GOOGLE_API_KEY` | Google (Gemini) | For Google |
+| `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Google (Gemini) | For Google |
 | `DEEPSEEK_API_KEY` | DeepSeek | For DeepSeek |
-| `QWEN_API_KEY` | Qwen/Alibaba | For Qwen |
+| `QWEN_API_KEY`, `DASHSCOPE_API_KEY`, or `ALIYUN_API_KEY` | Qwen/Alibaba | For Qwen |
 | `ZAI_API_KEY` | Z.AI (GLM) | For Z.AI |
 | `KIMI_API_KEY` or `MOONSHOT_API_KEY` | Kimi/Moonshot | For Kimi |
 | `MINIMAX_API_KEY` | MiniMax | For MiniMax |
-| `OPENROUTER_API_KEY` | OpenRouter | For OpenRouter |
-| `OPENCODE_API_KEY` | OpenCode Go | For OpenCode Go |
+| `OPENROUTER_API_KEY` or `OPEN_ROUTER_API_KEY` | OpenRouter | For OpenRouter |
+| `OPENCODE_API_KEY` or `OPENCODE_GO_API_KEY` | OpenCode Go | For OpenCode Go |
 | `OPENAI_COMPATIBLE_API_KEY` or `API_KEY` | Generic OpenAI-compatible endpoint | For `openai-compatible` |
 
 Sandbox policy is fixed at host startup:
@@ -159,7 +159,8 @@ providers:
     thinking:
       budget_tokens: 10000        # Google Gemini thinking budget
   zai:
-    base_url: https://api.z.ai/api/coding/paas/v4
+    base_url: https://api.z.ai/api/paas/v4
+    # Coding Plan users: https://api.z.ai/api/coding/paas/v4
   deepseek:
     base_url: https://api.deepseek.com
   qwen:
@@ -171,14 +172,14 @@ providers:
   # OpenRouter (OpenAI-compatible aggregator)
   openrouter:
     base_url: https://openrouter.ai/api/v1
-    # api_key: ${OPENROUTER_API_KEY}
+    # api_key: ${OPENROUTER_API_KEY}  # or ${OPEN_ROUTER_API_KEY}
     # headers:
     #   HTTP-Referer: https://example.com
     #   X-OpenRouter-Title: OpenClaudia
   # OpenCode Go OpenAI-compatible endpoint subset
   opencode:
     base_url: https://opencode.ai/zen/go/v1
-    # api_key: ${OPENCODE_API_KEY}
+    # api_key: ${OPENCODE_API_KEY}  # or ${OPENCODE_GO_API_KEY}
   # Generic OpenAI-compatible endpoint
   openai-compatible:
     base_url: https://example.com/v1
