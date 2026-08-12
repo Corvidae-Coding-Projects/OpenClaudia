@@ -32,7 +32,7 @@
 
 use openclaudia::tools::lsp::{is_lsp_connected, mark_closed, mark_opened};
 use openclaudia::tools::worktree::{
-    cwd_cache_generation, execute_enter_worktree, execute_list_worktrees,
+    cwd_cache_generation, execute_enter_worktree, execute_list_worktrees, validate_branch_name,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -122,26 +122,9 @@ fn enter_worktree_refuses_attack_branch_catalog() {
 }
 
 #[test]
-fn enter_worktree_accepts_canonical_branch_name_then_fails_on_git() {
-    // A valid branch name passes validate_branch_name and proceeds
-    // to the git rev-parse check. If we're NOT in a git repo (or
-    // we are but the cwd has no worktree set up for the requested
-    // branch), git_in returns a failure — but the error message
-    // must NOT mention "invalid" or "forbidden" (those are reserved
-    // for validation failures).
-    let (msg, is_err) = execute_enter_worktree(&args(&[("branch", json!("feature/test-branch"))]));
-    // We don't know whether this happens to land in a git repo or
-    // not (the test cwd is the project root which IS a git repo).
-    // So we can't assert is_err one way or the other — we just
-    // assert: if it errored, it wasn't a validation error.
-    if is_err {
-        let lowered = msg.to_lowercase();
-        assert!(
-            !lowered.contains("forbidden"),
-            "canonical branch name refused as validation-forbidden; \
-             got {msg:?}"
-        );
-    }
+fn canonical_branch_validation_has_no_repository_side_effects() {
+    validate_branch_name("feature/test-branch")
+        .expect("canonical branch must pass validation without entering a worktree");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

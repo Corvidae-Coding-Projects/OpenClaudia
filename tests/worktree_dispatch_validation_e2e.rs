@@ -12,6 +12,7 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::worktree::validate_branch_name;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -262,16 +263,9 @@ fn enter_worktree_branch_with_null_byte_rejected() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn enter_worktree_canonical_branch_passes_validation_layer() {
+fn canonical_branch_passes_validation_without_creating_a_worktree() {
     // PINS DOC: "feature/foo" is documented as valid.
-    // Hits the git layer next — may error there for git/cwd
-    // reasons, but MUST NOT error with "invalid branch".
-    let args = args_with(&[("branch", json!("feature/foo"))]);
-    let (msg, _is_err) = dispatch("enter_worktree", &args);
-    assert!(
-        !msg.contains("forbidden character") && !msg.contains("must not"),
-        "canonical branch MUST pass validation; got {msg:?}"
-    );
+    validate_branch_name("feature/foo").expect("canonical branch must pass validation");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

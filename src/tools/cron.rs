@@ -746,21 +746,23 @@ mod tests {
 
     #[test]
     fn test_cron_list_empty() {
-        // Use a nonexistent path so we get empty store
-        let (msg, is_err) = execute_cron_list(&HashMap::new());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = temp_schedules_path(&tmp);
+        let (msg, is_err) = execute_cron_list_at(&HashMap::new(), &path);
         assert!(!is_err);
-        // Either an empty metadata message or shows existing schedules.
-        assert!(!msg.is_empty());
+        assert_eq!(msg, "No schedule metadata stored.");
     }
 
     #[test]
     fn test_cron_delete_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = temp_schedules_path(&tmp);
         let mut args = HashMap::new();
         args.insert(
             "id".to_string(),
             Value::String("nonexistent-id".to_string()),
         );
-        let (msg, is_err) = execute_cron_delete(&args);
+        let (msg, is_err) = execute_cron_delete_at(&args, &path);
         assert!(is_err);
         assert!(msg.contains("No schedule found"));
     }

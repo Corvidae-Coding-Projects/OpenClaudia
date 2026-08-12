@@ -47,6 +47,12 @@ tool_struggles.txt
 # Project-local Chromium profile used by browser-backed web tools.
 .openclaudia/browser_profile/
 
+# Machine-local runtime state. Ledgers and advisory locks are regenerated;
+# agent worktrees are represented by their branches, not committed as a tree.
+.openclaudia/reality-ledgers/
+.openclaudia/schedules.json.lock
+.worktrees/
+
 # oh-my-claudecode / aider machine-local orchestration state (never commit)
 .omc/
 .aider*

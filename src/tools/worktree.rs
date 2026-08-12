@@ -173,7 +173,13 @@ fn unregister_active_worktree(worktree_dir: &Path) {
 /// Both layers are required: the first guarantees we never spawn a git
 /// subprocess with an unsafe argument, the second guarantees we honor
 /// every git rule (e.g. `foo.lock`, `@`, `a@{b`) without re-implementing them.
-fn validate_branch_name(name: &str) -> Result<(), String> {
+/// Validate a proposed worktree branch without creating a branch or worktree.
+///
+/// # Errors
+///
+/// Returns a descriptive error when the name could enable option injection,
+/// shell interpretation, path traversal, or violates Git ref syntax.
+pub fn validate_branch_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("branch name is required".to_string());
     }
