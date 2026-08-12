@@ -704,6 +704,9 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     app.rules_content = rules_content;
     app.apply_startup_resume(resume, session_id);
     app.set_permission_bypass(dangerously_skip_permissions);
+    app.set_analytics_sink(std::sync::Arc::new(
+        openclaudia::services::analytics::TracingAnalytics,
+    ));
     app.run()
         .await
         .map_err(|e| anyhow::anyhow!("TUI error: {e}"))

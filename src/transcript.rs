@@ -27,6 +27,8 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::state::{StateEvent, StateStore, StateSubscription};
+
 /// Crate version baked in by Cargo. Matches Claude Code's `version`
 /// field on each serialized message.
 pub const TRANSCRIPT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -305,6 +307,95 @@ pub fn append_entry(
     Ok(())
 }
 
+/// Event-driven writer for the canonical session transcript tail.
+///
+/// Multiple queued message events are coalesced into one snapshot and one
+/// tail flush. If the bounded event channel lags, the writer reconciles from
+/// the canonical watermark so skipped notifications cannot drop messages.
+pub struct TranscriptStateSubscriber {
+    state: StateStore,
+    subscription: StateSubscription,
+}
+
+impl TranscriptStateSubscriber {
+    #[must_use]
+    pub fn new(state: StateStore) -> Self {
+        let subscription = state.subscribe_log_lag();
+        Self {
+            state,
+            subscription,
+        }
+    }
+
+    /// Drain queued events and flush once when any message may have changed.
+    pub fn drain_pending(&mut self) -> usize {
+        let mut should_flush = false;
+        while let Some(event) = self.subscription.try_recv() {
+            if matches!(event, StateEvent::MessageAppended { .. }) {
+                should_flush = true;
+            }
+        }
+        should_flush |= self.subscription.take_lagged();
+        if should_flush {
+            self.flush_now()
+        } else {
+            0
+        }
+    }
+
+    /// Reconcile the on-disk transcript with the canonical watermark now.
+    ///
+    /// Save and shutdown boundaries call this even without a fresh event so a
+    /// previously failed append gets another chance. The watermark advances
+    /// only across entries that were actually persisted.
+    pub fn flush_now(&mut self) -> usize {
+        let (cwd, session_id, watermark, messages) = self.state.inspect(|state| {
+            (
+                state.transcript.transcript_cwd.clone(),
+                state.identity.session_id.clone(),
+                state.transcript.watermark,
+                state.conversation.messages.clone(),
+            )
+        });
+        let total = messages.len();
+        let start = watermark.min(total);
+        let mut appended = 0;
+        for message in &messages[start..] {
+            let kind = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("system");
+            let entry = envelope_for(kind, &cwd, session_id.as_str(), Some(message.clone()));
+            match append_entry(&cwd, session_id.as_str(), &entry) {
+                Ok(()) => appended += 1,
+                Err(err) => {
+                    let remaining = total - start - appended;
+                    tracing::warn!(
+                        error = %err,
+                        appended,
+                        remaining,
+                        "transcript append failed; watermark advanced only over persisted entries"
+                    );
+                    break;
+                }
+            }
+        }
+
+        self.state.update(|state, _| {
+            if state.identity.session_id == session_id {
+                state.transcript.watermark = start + appended;
+            } else {
+                tracing::warn!(
+                    flushed_session_id = %session_id,
+                    active_session_id = %state.identity.session_id,
+                    "session switched during transcript flush; discarded stale watermark"
+                );
+            }
+        });
+        appended
+    }
+}
+
 /// Open `path` for append, creating it with mode `0o600` on Unix so the
 /// file never exists at a wider permission than its final mode. On
 /// non-Unix targets the open is the standard append-create — NTFS ACLs
@@ -507,7 +598,7 @@ pub fn find_transcript_by_id(session_id: &str) -> Option<PathBuf> {
 /// runner otherwise races between tests that point the var at
 /// different `TempDir`s, producing flaky path / `list_transcripts`
 /// assertions. Crosslink #709 promoted this lock to crate-visible so
-/// the TUI `persist_transcript_tail` tests can share the same gate as
+/// the TUI transcript-subscriber tests can share the same gate as
 /// the transcript module's own tests rather than ship a second mutex
 /// for the same global.
 #[cfg(test)]

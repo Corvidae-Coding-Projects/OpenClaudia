@@ -213,11 +213,26 @@ impl TuiSession {
 
     fn replace_messages(&self, messages: Vec<serde_json::Value>) {
         self.state.update(|state, events| {
-            let was_non_empty = !state.conversation.messages.is_empty();
+            let previous_len = state.conversation.messages.len();
             state.conversation.messages = messages;
-            if was_non_empty && state.conversation.messages.is_empty() {
+            if previous_len > 0 && state.conversation.messages.is_empty() {
                 events.push(crate::state::StateEvent::Cleared);
             }
+            events.extend(
+                state
+                    .conversation
+                    .messages
+                    .iter()
+                    .skip(previous_len)
+                    .map(|message| {
+                        message
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
+                    .map(|role| crate::state::StateEvent::MessageAppended { role }),
+            );
         });
     }
 
@@ -255,17 +270,6 @@ impl TuiSession {
         self.state.inspect(|state| state.budgets.estimated_tokens)
     }
 
-    #[must_use]
-    fn transcript_snapshot(&self) -> (PathBuf, usize, Vec<serde_json::Value>) {
-        self.state.inspect(|state| {
-            (
-                state.transcript.transcript_cwd.clone(),
-                state.transcript.watermark,
-                state.conversation.messages.clone(),
-            )
-        })
-    }
-
     fn set_transcript_position(&self, cwd: PathBuf, watermark: usize) {
         self.state.update(|state, _| {
             state.transcript.transcript_cwd = cwd;
@@ -273,9 +277,19 @@ impl TuiSession {
         });
     }
 
-    fn set_transcript_watermark(&self, watermark: usize) {
-        self.state
-            .update(|state, _| state.transcript.watermark = watermark);
+    #[must_use]
+    fn state_store(&self) -> crate::state::StateStore {
+        self.state.clone()
+    }
+
+    fn apply_loaded(&mut self, loaded: &Self) {
+        self.title.clone_from(&loaded.title);
+        self.created_at = loaded.created_at;
+        self.updated_at = loaded.updated_at;
+        self.model.clone_from(&loaded.model);
+        self.provider.clone_from(&loaded.provider);
+        self.mode = loaded.mode;
+        self.state.replace(loaded.state.snapshot());
     }
 
     #[must_use]
@@ -383,11 +397,25 @@ impl TuiSession {
     }
 
     fn redo(&mut self) -> bool {
-        let changed = self.state.update(|state, _| {
+        let changed = self.state.update(|state, events| {
             let conversation = &mut state.conversation;
             if let Some((user, assistant)) = conversation.undo_stack.pop() {
+                let user_role = user
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let assistant_role = assistant
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
                 conversation.messages.push(user);
                 conversation.messages.push(assistant);
+                events.push(crate::state::StateEvent::MessageAppended { role: user_role });
+                events.push(crate::state::StateEvent::MessageAppended {
+                    role: assistant_role,
+                });
                 true
             } else {
                 false
@@ -1148,6 +1176,12 @@ pub struct App {
     runtime_handle: Option<tokio::runtime::Handle>,
     /// Persistent chat session (for save/load/resume)
     pub chat_session: TuiSession,
+    /// Coalescing transcript writer subscribed to canonical state changes.
+    transcript_subscriber: crate::transcript::TranscriptStateSubscriber,
+    /// Optional lifecycle analytics subscriber. Production installs the
+    /// tracing sink after startup resume; tests and headless users remain
+    /// silent unless they explicitly provide a sink.
+    analytics_subscriber: Option<crate::services::analytics::StateAnalyticsSubscriber>,
     /// Active permission prompt (if any). Tool execution blocks until resolved.
     pending_permission: Option<PendingPermission>,
     /// Active `ask_user_question` modal (if any). The pipeline's
@@ -1202,6 +1236,9 @@ impl App {
         provider: &str,
         policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     ) -> Self {
+        let chat_session = TuiSession::new(model, provider);
+        let transcript_subscriber =
+            crate::transcript::TranscriptStateSubscriber::new(chat_session.state_store());
         Self {
             messages: MessageList::new(),
             input: TextInput::new(),
@@ -1224,7 +1261,9 @@ impl App {
             vdd_engine: None,
             vdd_builder_auth: crate::vdd::VddProviderAuth::None,
             runtime_handle: None,
-            chat_session: TuiSession::new(model, provider),
+            chat_session,
+            transcript_subscriber,
+            analytics_subscriber: None,
             pending_permission: None,
             pending_user_question: None,
             hook_engine: None,
@@ -1245,7 +1284,10 @@ impl App {
     }
 
     fn apply_loaded_session(&mut self, loaded: &TuiSession) {
-        self.chat_session = loaded.detached_clone();
+        // Flush the old snapshot before replacement. Subscribers stay attached
+        // because `apply_loaded` replaces the shared store in place.
+        self.transcript_subscriber.flush_now();
+        self.chat_session.apply_loaded(loaded);
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
         self.mode = tui_mode_for_agent(loaded.mode);
@@ -1279,6 +1321,26 @@ impl App {
                 kind,
                 content: content.to_string(),
             });
+        }
+        self.drain_state_subscribers();
+    }
+
+    /// Install the lifecycle analytics sink for the active state store.
+    pub fn set_analytics_sink(
+        &mut self,
+        sink: std::sync::Arc<dyn crate::services::analytics::AnalyticsSink>,
+    ) {
+        self.analytics_subscriber =
+            Some(crate::services::analytics::StateAnalyticsSubscriber::new(
+                self.chat_session.state_store(),
+                sink,
+            ));
+    }
+
+    fn drain_state_subscribers(&mut self) {
+        self.transcript_subscriber.drain_pending();
+        if let Some(analytics) = self.analytics_subscriber.as_mut() {
+            analytics.drain_pending();
         }
     }
 
@@ -1392,57 +1454,13 @@ impl App {
         }
     }
 
-    /// Append every canonical session message past the watermark to the
-    /// Claude Code-layout JSONL transcript at
-    /// `$CLAUDE_CONFIG_HOME_DIR/projects/<sanitized-cwd>/<session>.jsonl`.
-    /// Best-effort: transcript I/O failures are logged but never bubble
-    /// up — a missing transcript must never break the live turn.
-    fn persist_transcript_tail(&self) {
-        let (cwd, watermark, messages) = self.chat_session.transcript_snapshot();
-        let session_id = self.chat_session.id();
-        // crosslink #709: track ONLY the entries that were actually
-        // persisted. The previous implementation unconditionally jumped
-        // the watermark to the message count after an early break,
-        // which silently dropped every message past the failure point
-        // from the transcript permanently (the next call would skip them
-        // entirely). Advance by the appended count so retried calls
-        // resume exactly where the failure occurred.
-        let total = messages.len();
-        // Undo/rewind can legitimately shorten the canonical message list.
-        // Clamp the old offset before slicing so the next branched turn is
-        // appended instead of panicking or being skipped permanently.
-        let start = watermark.min(total);
-        let mut appended: usize = 0;
-        for msg in &messages[start..] {
-            let kind = msg
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("system")
-                .to_string();
-            let entry =
-                crate::transcript::envelope_for(&kind, &cwd, &session_id, Some(msg.clone()));
-            match crate::transcript::append_entry(&cwd, &session_id, &entry) {
-                Ok(()) => appended += 1,
-                Err(err) => {
-                    let remaining = total - start - appended;
-                    tracing::warn!(
-                        error = %err,
-                        appended,
-                        remaining,
-                        "transcript append failed; watermark advanced only over persisted entries"
-                    );
-                    break;
-                }
-            }
-        }
-        self.chat_session.set_transcript_watermark(start + appended);
-    }
-
     /// Keep the append-only transcript and JSON session snapshot coherent:
     /// only persist a watermark after the corresponding JSONL appends have
     /// succeeded.
-    fn persist_session(&self) {
-        self.persist_transcript_tail();
+    fn persist_session(&mut self) {
+        // An unconditional reconciliation gives failed writes a retry even
+        // when no new state event arrived since the last attempt.
+        self.transcript_subscriber.flush_now();
         let _ = save_session(&self.chat_session);
     }
 
@@ -1598,6 +1616,7 @@ impl App {
                     }
                 }
             }
+            self.drain_state_subscribers();
             if channel_dead || self.should_quit {
                 break;
             }
@@ -1621,6 +1640,9 @@ impl App {
         // Save session and any final transcript tail on exit.
         self.chat_session.touch();
         self.persist_session();
+        if let Some(analytics) = self.analytics_subscriber.as_mut() {
+            analytics.finish();
+        }
 
         // Fire SessionEnd hooks. Best-effort: the app is already exiting
         // so we can't recover from a failure, and we must not spam the
@@ -6056,7 +6078,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Behavior: persist_transcript_tail watermark — crosslink #709
+    // Behavior: event-driven transcript watermark — crosslink #709
     // =========================================================================
 
     /// Drop guard restoring `CLAUDE_CONFIG_HOME_DIR` to its previous
@@ -6139,12 +6161,22 @@ mod tests {
         save_session(&newer).expect("newer session should save");
 
         let mut app = App::new("initial-model", "initial-provider");
+        let initial_id = app.chat_session.id();
+        let mut state_events = app.chat_session.state_store().subscribe_log_lag();
         app.apply_startup_resume(true, None);
 
         assert_eq!(app.chat_session.id(), "newer-session");
         assert_eq!(app.model, "new-model");
         assert_eq!(app.provider, "new-provider");
         assert_eq!(app.chat_session.messages_snapshot()[0]["content"], "newer");
+        assert!(matches!(
+            state_events.try_recv(),
+            Some(crate::state::StateEvent::SessionSwitched {
+                from,
+                to,
+                from_messages: 0,
+            }) if from.as_str() == initial_id && to.as_str() == "newer-session"
+        ));
     }
 
     #[test]
@@ -6219,7 +6251,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_transcript_tail_advances_watermark_to_len_on_success() {
+    fn transcript_subscriber_advances_watermark_to_len_on_message_events() {
         // Happy path: every queued message persists successfully, so the
         // watermark moves all the way to session_messages.len(). The
         // transcript writes land under `CLAUDE_CONFIG_HOME_DIR/projects/...`
@@ -6228,16 +6260,17 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
 
-        let app = App::new("test-model", "test-provider");
-        app.chat_session.replace_messages(vec![
-            serde_json::json!({"role": "user", "content": "one"}),
-            serde_json::json!({"role": "assistant", "content": "two"}),
-            serde_json::json!({"role": "user", "content": "three"}),
-        ]);
+        let mut app = App::new("test-model", "test-provider");
         app.chat_session
             .set_transcript_position(tmp.path().to_path_buf(), 0);
+        app.chat_session
+            .push_message(serde_json::json!({"role": "user", "content": "one"}));
+        app.chat_session
+            .push_message(serde_json::json!({"role": "assistant", "content": "two"}));
+        app.chat_session
+            .push_message(serde_json::json!({"role": "user", "content": "three"}));
 
-        app.persist_transcript_tail();
+        app.drain_state_subscribers();
 
         assert_eq!(
             app.chat_session.state_snapshot().transcript.watermark,
@@ -6247,7 +6280,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_transcript_tail_only_advances_for_persisted_entries_on_failure() {
+    fn transcript_subscriber_retries_after_a_failed_append() {
         // crosslink #709 regression: when `append_entry` fails, the
         // watermark must NOT jump to session_messages.len() (which would
         // permanently drop the un-persisted tail). Instead it must
@@ -6264,16 +6297,17 @@ mod tests {
             .expect("write blocker file");
         let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
 
-        let app = App::new("test-model", "test-provider");
-        app.chat_session.replace_messages(vec![
-            serde_json::json!({"role": "user", "content": "one"}),
-            serde_json::json!({"role": "assistant", "content": "two"}),
-            serde_json::json!({"role": "user", "content": "three"}),
-        ]);
+        let mut app = App::new("test-model", "test-provider");
         app.chat_session
             .set_transcript_position(tmp.path().to_path_buf(), 0);
+        app.chat_session
+            .push_message(serde_json::json!({"role": "user", "content": "one"}));
+        app.chat_session
+            .push_message(serde_json::json!({"role": "assistant", "content": "two"}));
+        app.chat_session
+            .push_message(serde_json::json!({"role": "user", "content": "three"}));
 
-        app.persist_transcript_tail();
+        app.drain_state_subscribers();
 
         assert_eq!(
             app.chat_session.state_snapshot().transcript.watermark,
@@ -6281,14 +6315,22 @@ mod tests {
             "watermark must NOT advance past entries that failed to persist (was: {})",
             app.chat_session.state_snapshot().transcript.watermark
         );
+
+        std::fs::remove_file(tmp.path().join("projects")).expect("remove blocker file");
+        app.transcript_subscriber.flush_now();
+        assert_eq!(
+            app.chat_session.state_snapshot().transcript.watermark,
+            3,
+            "a later save boundary must retry the previously failed tail"
+        );
     }
 
     #[test]
-    fn persist_transcript_tail_clamps_watermark_after_rewind() {
+    fn transcript_subscriber_clamps_watermark_after_rewind() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
 
-        let app = App::new("test-model", "test-provider");
+        let mut app = App::new("test-model", "test-provider");
         app.chat_session.replace_messages(vec![serde_json::json!({
             "role": "user",
             "content": "branched turn"
@@ -6296,12 +6338,38 @@ mod tests {
         app.chat_session
             .set_transcript_position(tmp.path().to_path_buf(), 3);
 
-        app.persist_transcript_tail();
+        app.transcript_subscriber.flush_now();
 
         assert_eq!(
             app.chat_session.state_snapshot().transcript.watermark,
             1,
             "a rewind-shortened message list must reset the offset safely"
         );
+    }
+
+    #[test]
+    fn transcript_subscriber_reconciles_after_event_channel_lag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
+        let mut app = App::new("test-model", "test-provider");
+        app.chat_session
+            .set_transcript_position(tmp.path().to_path_buf(), 0);
+
+        for index in 0..65 {
+            app.chat_session.push_message(serde_json::json!({
+                "role": "user",
+                "content": format!("message-{index}")
+            }));
+        }
+        app.drain_state_subscribers();
+
+        assert_eq!(
+            app.chat_session.state_snapshot().transcript.watermark,
+            65,
+            "lag recovery must reconcile the entire canonical tail"
+        );
+        let transcript =
+            crate::transcript::transcript_path(tmp.path(), app.chat_session.id().as_str());
+        assert_eq!(crate::transcript::load_transcript(&transcript).len(), 65);
     }
 }

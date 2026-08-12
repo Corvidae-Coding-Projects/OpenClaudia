@@ -97,6 +97,21 @@ impl ChatSession {
         self.state.inspect(inspect)
     }
 
+    #[must_use]
+    pub fn state_store(&self) -> openclaudia::state::StateStore {
+        self.state.clone()
+    }
+
+    pub fn apply_loaded(&mut self, loaded: Self) {
+        self.title = loaded.title;
+        self.created_at = loaded.created_at;
+        self.updated_at = loaded.updated_at;
+        self.model = loaded.model;
+        self.provider = loaded.provider;
+        self.mode = loaded.mode;
+        self.state.replace(loaded.state.snapshot());
+    }
+
     pub fn update_state<R>(
         &self,
         update: impl FnOnce(
@@ -131,11 +146,26 @@ impl ChatSession {
 
     pub fn replace_messages(&self, messages: Vec<serde_json::Value>) {
         self.update_state(|state, events| {
-            let was_non_empty = !state.conversation.messages.is_empty();
+            let previous_len = state.conversation.messages.len();
             state.conversation.messages = messages;
-            if was_non_empty && state.conversation.messages.is_empty() {
+            if previous_len > 0 && state.conversation.messages.is_empty() {
                 events.push(openclaudia::state::StateEvent::Cleared);
             }
+            events.extend(
+                state
+                    .conversation
+                    .messages
+                    .iter()
+                    .skip(previous_len)
+                    .map(|message| {
+                        message
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
+                    .map(|role| openclaudia::state::StateEvent::MessageAppended { role }),
+            );
         });
     }
 
@@ -230,11 +260,25 @@ impl ChatSession {
 
     /// Redo the last undone message pair
     pub fn redo(&mut self) -> bool {
-        let changed = self.state.update(|state, _| {
+        let changed = self.state.update(|state, events| {
             let conversation = &mut state.conversation;
             if let Some((user, assistant)) = conversation.undo_stack.pop() {
+                let user_role = user
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let assistant_role = assistant
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
                 conversation.messages.push(user);
                 conversation.messages.push(assistant);
+                events.push(openclaudia::state::StateEvent::MessageAppended { role: user_role });
+                events.push(openclaudia::state::StateEvent::MessageAppended {
+                    role: assistant_role,
+                });
                 true
             } else {
                 false
@@ -551,6 +595,27 @@ mod tests {
 
         session.set_permission_bypass(false);
         assert!(!session.permission_bypass_enabled());
+    }
+
+    #[test]
+    fn apply_loaded_keeps_subscribers_and_emits_session_boundary() {
+        let mut current = test_session();
+        current.set_id("current".to_string());
+        current.push_message(serde_json::json!({"role": "user"}));
+        let mut subscription = current.state_store().subscribe_log_lag();
+
+        let loaded = test_session();
+        loaded.set_id("loaded".to_string());
+        current.apply_loaded(loaded);
+
+        assert!(matches!(
+            subscription.try_recv(),
+            Some(openclaudia::state::StateEvent::SessionSwitched {
+                from,
+                to,
+                from_messages: 1,
+            }) if from.as_str() == "current" && to.as_str() == "loaded"
+        ));
     }
 
     #[test]

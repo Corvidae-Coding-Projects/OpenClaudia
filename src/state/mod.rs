@@ -1,10 +1,11 @@
 //! Centralized session state — crosslink #510.
 //!
 //! Migration strategy is phased (see `docs/designs/510-session-state.md`).
-//! Phases 1 through 3 are complete: both interactive frontends keep identity,
+//! Phases 1 through 4 are complete: both interactive frontends keep identity,
 //! conversation, budget, session UI, permission, and transcript data here,
 //! while `TuiSession` and `ChatSession` remain thin compatibility wrappers for
-//! frontend metadata. ACP keeps its IDE snapshot here as well.
+//! frontend metadata. ACP keeps its IDE snapshot here as well. State-event
+//! subscribers now drive lifecycle analytics and TUI transcript appends.
 //!
 //! The per-session fields live here. Process-scoped handles
 //! (`memory_db`, `permission_mgr`, `hook_engine`, …) stay on the
@@ -20,7 +21,7 @@ pub use categories::{
     Identity, ModesState, PermissionsState, SessionId, TranscriptState, UiState,
 };
 pub use persist::{SessionDocument, SessionStateV1};
-pub use store::{StateEvent, StateStore};
+pub use store::{StateEvent, StateStore, StateSubscription};
 
 use serde::{Deserialize, Serialize};
 

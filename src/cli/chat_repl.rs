@@ -176,6 +176,7 @@ pub struct ChatRepl {
     model: String,
     rl: rustyline::DefaultEditor,
     chat_session: ChatSession,
+    analytics_subscriber: openclaudia::services::analytics::StateAnalyticsSubscriber,
     current_task_obs: Option<openclaudia::ledger::ObsId>,
     active_theme: tui::Theme,
     vim_enabled: bool,
@@ -476,6 +477,10 @@ impl ChatRepl {
         // so a saved session can neither enable nor disable the current CLI's
         // explicit posture.
         chat_session.set_permission_bypass(args.dangerously_skip_permissions);
+        let analytics_subscriber = openclaudia::services::analytics::StateAnalyticsSubscriber::new(
+            chat_session.state_store(),
+            std::sync::Arc::new(openclaudia::services::analytics::TracingAnalytics),
+        );
 
         let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id())?;
         let memory_db: Option<memory::MemoryDb> = init_memory_with_banner();
@@ -502,6 +507,7 @@ impl ChatRepl {
             model,
             rl,
             chat_session,
+            analytics_subscriber,
             current_task_obs: None,
             active_theme: tui::Theme::load(),
             vim_enabled: false,
@@ -536,11 +542,12 @@ impl ChatRepl {
             let readline = self.rl.readline(&prompt);
             match readline {
                 Ok(line) => {
-                    if self
+                    let should_break = self
                         .process_line(line, memory_db.as_ref(), &mut auto_learner)
                         .await?
-                        == Some(true)
-                    {
+                        == Some(true);
+                    self.analytics_subscriber.drain_pending();
+                    if should_break {
                         break;
                     }
                 }
@@ -562,6 +569,7 @@ impl ChatRepl {
             &mut self.rl,
             &self.history_path,
         );
+        self.analytics_subscriber.finish();
         // Drop the learner before memory_db.
         drop(auto_learner);
         drop(memory_db);
@@ -794,14 +802,17 @@ impl ChatRepl {
             SlashCommandResult::Clear => {
                 save_session_to_short_term_memory(&self.chat_session, memory_db);
                 let prev_mode = self.chat_session.behavior_mode();
-                self.chat_session =
-                    ChatSession::new(&self.model, &self.config.proxy.target, prev_mode);
+                self.chat_session.apply_loaded(ChatSession::new(
+                    &self.model,
+                    &self.config.proxy.target,
+                    prev_mode,
+                ));
                 SlashOutcome::Continue
             }
             SlashCommandResult::LoadSession(sid) => {
                 match load_chat_session(&sid) {
                     Ok(Some(loaded)) => {
-                        self.chat_session = loaded;
+                        self.chat_session.apply_loaded(loaded);
                         println!(
                             "Loaded {} messages from previous session.\n",
                             self.chat_session.message_count()

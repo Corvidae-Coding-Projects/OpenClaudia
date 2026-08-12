@@ -532,7 +532,7 @@ pub struct IdeDiagnostic {
 pub struct TranscriptState {
     /// Count of `conversation.messages` already appended to the
     /// JSONL transcript. Everything past this index gets appended
-    /// on the next `persist_transcript_tail` call.
+    /// on the next transcript-subscriber flush.
     #[serde(default)]
     pub watermark: usize,
     /// The cwd captured when the transcript first opened. Stays

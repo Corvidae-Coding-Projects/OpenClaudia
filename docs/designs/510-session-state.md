@@ -206,9 +206,21 @@ Each phase compiles + tests green on its own.
   prompt visibility, injection escaping, and existing IDE wire-shape coverage.
 
 **Phase 4 — StateEvent broadcast**
-- Analytics sink subscribes; emits `SessionStart` / `SessionEnd` from `SessionSwitched`.
-- Transcript writer subscribes; `MessageAppended` triggers `persist_transcript_tail` automatically.
-- Tests: subscribe → drive switch → assert event fires.
+- Complete.
+- Both interactive frontends keep their `StateStore` allocation stable across
+  runtime session loads, so subscribers survive `SessionSwitched` boundaries.
+- The analytics adapter records the current `SessionStart`, translates every
+  `SessionSwitched` into an exact-count `SessionEnd` plus the next
+  `SessionStart`, and records the final `SessionEnd` once on shutdown.
+- The TUI transcript writer subscribes to `MessageAppended`, coalesces queued
+  notifications into one tail reconciliation per event-loop cycle, and retries
+  failed appends at save/shutdown boundaries without advancing past unwritten
+  entries. Lag forces a canonical-snapshot reconciliation.
+- `subscribe_log_lag()` centralizes bounded-channel lag logging and exposes a
+  reconciliation signal to snapshot-based consumers.
+- Tests cover switch delivery across TUI and REPL loads, analytics ordering and
+  exact counts, automatic transcript appends, failed-write retry, rewind
+  clamping, and event-channel lag recovery.
 
 **Phase 5 — delete TuiSession / ChatSession compat shims**
 - Only after every caller migrated.

@@ -20,12 +20,78 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// Granular state changes emitted after a successful mutation.
 #[derive(Debug, Clone)]
 pub enum StateEvent {
-    SessionSwitched { from: SessionId, to: SessionId },
-    MessageAppended { role: String },
-    ModeChanged { new: BehaviorMode },
-    EffortChanged { new: EffortLevel },
+    SessionSwitched {
+        from: SessionId,
+        to: SessionId,
+        from_messages: usize,
+    },
+    MessageAppended {
+        role: String,
+    },
+    ModeChanged {
+        new: BehaviorMode,
+    },
+    EffortChanged {
+        new: EffortLevel,
+    },
     PermissionsMutated,
     Cleared,
+}
+
+/// A broadcast receiver that applies the store's standard lag policy.
+///
+/// State notifications are best-effort: the canonical snapshot remains the
+/// source of truth. A slow subscriber logs skipped notifications and resumes
+/// at the oldest event still in the bounded channel instead of terminating.
+pub struct StateSubscription {
+    receiver: broadcast::Receiver<StateEvent>,
+    lagged: bool,
+}
+
+impl StateSubscription {
+    /// Receive the next available event, continuing after channel lag.
+    pub async fn recv(&mut self) -> Option<StateEvent> {
+        loop {
+            match self.receiver.recv().await {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    self.note_lag(skipped);
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// Receive the next immediately available event, continuing after lag.
+    #[must_use]
+    pub fn try_recv(&mut self) -> Option<StateEvent> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    self.note_lag(skipped);
+                }
+                Err(
+                    broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed,
+                ) => return None,
+            }
+        }
+    }
+
+    /// Report whether one or more events were skipped since the last call.
+    ///
+    /// Snapshot-based consumers can use this to force a full reconciliation.
+    pub fn take_lagged(&mut self) -> bool {
+        std::mem::take(&mut self.lagged)
+    }
+
+    fn note_lag(&mut self, skipped: u64) {
+        self.lagged = true;
+        tracing::warn!(
+            skipped,
+            "state event subscriber lagged; reconciling from snapshot"
+        );
+    }
 }
 
 /// Shared session state plus a best-effort change notification channel.
@@ -48,6 +114,15 @@ impl StateStore {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<StateEvent> {
         self.events.subscribe()
+    }
+
+    /// Subscribe with consistent lag logging and recovery behavior.
+    #[must_use]
+    pub fn subscribe_log_lag(&self) -> StateSubscription {
+        StateSubscription {
+            receiver: self.subscribe(),
+            lagged: false,
+        }
     }
 
     /// Clone a coherent point-in-time view of the state.
@@ -97,10 +172,15 @@ impl StateStore {
     pub fn replace(&self, replacement: SessionState) {
         self.update(|state, events| {
             let from = state.identity.session_id.clone();
+            let from_messages = state.conversation.messages.len();
             let to = replacement.identity.session_id.clone();
             *state = replacement;
             if from != to {
-                events.push(StateEvent::SessionSwitched { from, to });
+                events.push(StateEvent::SessionSwitched {
+                    from,
+                    to,
+                    from_messages,
+                });
             }
         });
     }
@@ -212,8 +292,32 @@ mod tests {
         store.replace(SessionState::default());
         assert!(matches!(
             rx.recv().await.unwrap(),
-            StateEvent::SessionSwitched { .. }
+            StateEvent::SessionSwitched {
+                from_messages: 0,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn lag_logging_subscription_resumes_and_requests_reconciliation() {
+        let store = StateStore::default();
+        let mut subscription = store.subscribe_log_lag();
+
+        for index in 0..=EVENT_CHANNEL_CAPACITY {
+            store.update(|_, events| {
+                events.push(StateEvent::MessageAppended {
+                    role: format!("role-{index}"),
+                });
+            });
+        }
+
+        assert!(matches!(
+            subscription.try_recv(),
+            Some(StateEvent::MessageAppended { .. })
+        ));
+        assert!(subscription.take_lagged());
+        assert!(!subscription.take_lagged());
     }
 
     #[test]

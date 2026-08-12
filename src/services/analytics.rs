@@ -18,7 +18,11 @@
 /// Structured event variants. New fields or new variants land here
 /// so the type system forces every sink to handle them — a stringly-
 /// typed event bag would silently drop unknown events.
-#[derive(Debug, Clone)]
+use std::sync::Arc;
+
+use crate::state::{StateEvent, StateStore, StateSubscription};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalyticsEvent {
     /// A new session started. Payload: session id.
     SessionStart { session_id: String },
@@ -132,6 +136,79 @@ impl AnalyticsSink for TracingAnalytics {
                 );
             }
         }
+    }
+}
+
+/// Converts state-store lifecycle notifications into analytics events.
+///
+/// The subscriber is polled by the owning frontend, keeping analytics sinks
+/// off the state mutation path and avoiding a dedicated background task. It
+/// records the current session at installation time, session boundaries on
+/// every store replacement, and one final end event when finished.
+pub struct StateAnalyticsSubscriber {
+    state: StateStore,
+    subscription: StateSubscription,
+    sink: Arc<dyn AnalyticsSink>,
+    finished: bool,
+}
+
+impl StateAnalyticsSubscriber {
+    #[must_use]
+    pub fn new(state: StateStore, sink: Arc<dyn AnalyticsSink>) -> Self {
+        let subscription = state.subscribe_log_lag();
+        let session_id = state.inspect(|snapshot| snapshot.identity.session_id.to_string());
+        sink.record(AnalyticsEvent::SessionStart { session_id });
+        Self {
+            state,
+            subscription,
+            sink,
+            finished: false,
+        }
+    }
+
+    /// Process all lifecycle events currently queued by the state store.
+    pub fn drain_pending(&mut self) {
+        while let Some(event) = self.subscription.try_recv() {
+            if let StateEvent::SessionSwitched {
+                from,
+                to,
+                from_messages,
+            } = event
+            {
+                self.sink.record(AnalyticsEvent::SessionEnd {
+                    session_id: from.to_string(),
+                    messages: from_messages,
+                });
+                self.sink.record(AnalyticsEvent::SessionStart {
+                    session_id: to.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Record the active session's final message count exactly once.
+    pub fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.drain_pending();
+        let (session_id, messages) = self.state.inspect(|snapshot| {
+            (
+                snapshot.identity.session_id.to_string(),
+                snapshot.conversation.messages.len(),
+            )
+        });
+        self.sink.record(AnalyticsEvent::SessionEnd {
+            session_id,
+            messages,
+        });
+        self.finished = true;
+    }
+}
+
+impl Drop for StateAnalyticsSubscriber {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -285,5 +362,52 @@ mod tests {
         });
         handle.join().expect("thread must not panic");
         sink.record(AnalyticsEvent::PromptSubmitted { prompt_chars: 3 });
+    }
+
+    #[test]
+    fn state_subscriber_emits_start_switch_and_final_end() {
+        let mut initial = crate::state::SessionState::default();
+        initial.identity.session_id = crate::state::SessionId::from_raw_unchecked("first");
+        initial
+            .conversation
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "hello"}));
+        let state = StateStore::new(initial);
+        let recording = Arc::new(Recording {
+            events: Mutex::new(Vec::new()),
+        });
+        let sink: Arc<dyn AnalyticsSink> = recording.clone();
+        let mut subscriber = StateAnalyticsSubscriber::new(state.clone(), sink);
+
+        let mut replacement = crate::state::SessionState::default();
+        replacement.identity.session_id = crate::state::SessionId::from_raw_unchecked("second");
+        replacement.conversation.messages.extend([
+            serde_json::json!({"role": "user"}),
+            serde_json::json!({"role": "assistant"}),
+        ]);
+        state.replace(replacement);
+        subscriber.drain_pending();
+        subscriber.finish();
+        subscriber.finish();
+
+        assert_eq!(
+            *recording.events.lock().unwrap(),
+            vec![
+                AnalyticsEvent::SessionStart {
+                    session_id: "first".to_string(),
+                },
+                AnalyticsEvent::SessionEnd {
+                    session_id: "first".to_string(),
+                    messages: 1,
+                },
+                AnalyticsEvent::SessionStart {
+                    session_id: "second".to_string(),
+                },
+                AnalyticsEvent::SessionEnd {
+                    session_id: "second".to_string(),
+                    messages: 2,
+                },
+            ]
+        );
     }
 }
