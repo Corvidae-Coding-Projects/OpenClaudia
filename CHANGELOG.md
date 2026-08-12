@@ -100,6 +100,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI: every turn now dual-writes — the existing JSON snapshot at `~/.local/share/openclaudia/chat_sessions/<uuid>.json` stays for backward compat, and new entries also append to the JSONL transcript via `App::persist_transcript_tail`. Watermark tracking skips re-appending on resume
 
 ### Fixed
+- tests: serialize sandbox escape probes around process-wide security context and hostile project fixtures, preventing parallel test runs from mistaking a sibling probe's temporary hardlink, socket, FIFO, file descriptor, or environment canary for repository state.
 - permissions: `PermissionManager::unrestricted()` now skips prompts/rules without bypassing hard safety checks for denylisted/dangerous Bash commands, `dangerously_disable_sandbox` tool args, `.git` writes, or `.claude/settings.json`.
 - permissions: auto-allow scoring now gives dangerous Bash constructs a zero score and treats zero as a veto, so safe-looking prefixes such as `echo ... | sh` cannot be auto-approved.
 - repl: `/rewind [N]` and `/checkpoint [N]` now work in the legacy line REPL, listing turns with no count and rewinding multiple turns through the existing undo stack when a count is supplied.

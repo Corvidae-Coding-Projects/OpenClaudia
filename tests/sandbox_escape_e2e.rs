@@ -11,8 +11,26 @@ use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 use serde_json::json;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixListener;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+// Every probe shares the process-wide default security context, whose writable
+// root is this repository. A few probes deliberately place hostile filesystem
+// entries in that root. Keep setup, sandbox validation, and teardown atomic so
+// a sibling probe cannot observe another probe's temporary attack fixture.
+static SANDBOX_PROBE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn sandbox_probe_lock() -> MutexGuard<'static, ()> {
+    SANDBOX_PROBE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn bash(command: &str) -> openclaudia::tools::ToolResult {
+    let _probe = sandbox_probe_lock();
+    bash_unlocked(command)
+}
+
+fn bash_unlocked(command: &str) -> openclaudia::tools::ToolResult {
     execute_tool(&ToolCall {
         id: "sandbox-escape-probe".to_string(),
         call_type: "function".to_string(),
@@ -62,10 +80,11 @@ print("network_blocked=" + str(all(blocked)).lower())
 
 #[test]
 fn project_socket_and_fifo_block_sandbox_startup() {
+    let _probe = sandbox_probe_lock();
     let fixture = project_fixture(".tmp-openclaudia-special-");
     let socket = fixture.path().join("service.sock");
     let listener = UnixListener::bind(&socket).expect("local Unix listener");
-    let socket_result = bash("true");
+    let socket_result = bash_unlocked("true");
     assert!(
         socket_result.is_error && socket_result.content.contains("socket, FIFO, or device"),
         "project socket was not rejected: {}",
@@ -77,7 +96,7 @@ fn project_socket_and_fifo_block_sandbox_startup() {
     let fifo = fixture.path().join("pipe");
     let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("FIFO path");
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-    let fifo_result = bash("true");
+    let fifo_result = bash_unlocked("true");
     assert!(
         fifo_result.is_error && fifo_result.content.contains("socket, FIFO, or device"),
         "project FIFO was not rejected: {}",
@@ -87,6 +106,7 @@ fn project_socket_and_fifo_block_sandbox_startup() {
 
 #[test]
 fn external_hardlink_alias_is_rejected_but_internal_alias_is_supported() {
+    let _probe = sandbox_probe_lock();
     let outside = tempfile::Builder::new()
         .prefix(".tmp-openclaudia-outside-hardlink-")
         .tempdir_in("..")
@@ -96,7 +116,7 @@ fn external_hardlink_alias_is_rejected_but_internal_alias_is_supported() {
     let fixture = project_fixture(".tmp-openclaudia-hardlink-");
     let alias = fixture.path().join("outside-alias");
     std::fs::hard_link(&sentinel, &alias).expect("same-filesystem hardlink fixture");
-    let rejected = bash("true");
+    let rejected = bash_unlocked("true");
     assert!(
         rejected.is_error,
         "external hardlink alias must block startup"
@@ -115,7 +135,7 @@ fn external_hardlink_alias_is_rejected_but_internal_alias_is_supported() {
         "printf changed > {}",
         shlex::try_quote(first.to_str().expect("UTF-8 path")).expect("quote")
     );
-    let allowed = bash(&command);
+    let allowed = bash_unlocked(&command);
     assert!(
         !allowed.is_error,
         "internal hardlinks should be usable: {}",
@@ -129,13 +149,14 @@ fn external_hardlink_alias_is_rejected_but_internal_alias_is_supported() {
 
 #[test]
 fn inherited_host_file_descriptor_is_closed() {
+    let _probe = sandbox_probe_lock();
     let outside = tempfile::NamedTempFile::new().expect("outside sentinel");
     std::fs::write(outside.path(), "fd-secret").expect("sentinel contents");
     let path = std::ffi::CString::new(outside.path().as_os_str().as_encoded_bytes()).expect("path");
     let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
     assert!(raw >= 0, "open inherited descriptor");
     let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
-    let result = bash(&format!(
+    let result = bash_unlocked(&format!(
         "cat /proc/self/fd/{} 2>/dev/null || echo fd_blocked",
         inherited.as_raw_fd()
     ));
@@ -273,8 +294,10 @@ fn ambient_ipc_proxy_and_secret_shaped_environment_is_absent() {
     struct EnvironmentCanaries;
     impl Drop for EnvironmentCanaries {
         fn drop(&mut self) {
-            // SAFETY: the required security test suite runs this integration
-            // binary with one test thread; these names are test-unique.
+            // SAFETY: this probe holds SANDBOX_PROBE_LOCK for the full
+            // environment mutation lifetime, and every sibling sandbox probe
+            // acquires the same lock before launching a child process. These
+            // names are test-unique.
             unsafe {
                 std::env::remove_var("SSH_OPENCLAUDIA_CANARY");
                 std::env::remove_var("DBUS_OPENCLAUDIA_CANARY");
@@ -283,7 +306,8 @@ fn ambient_ipc_proxy_and_secret_shaped_environment_is_absent() {
             }
         }
     }
-    // SAFETY: see the guard above.
+    let _probe = sandbox_probe_lock();
+    // SAFETY: see the lock and cleanup guard above.
     unsafe {
         std::env::set_var("SSH_OPENCLAUDIA_CANARY", "secret");
         std::env::set_var("DBUS_OPENCLAUDIA_CANARY", "secret");
@@ -291,7 +315,7 @@ fn ambient_ipc_proxy_and_secret_shaped_environment_is_absent() {
         std::env::set_var("OPENCLAUDIA_TEST_API_KEY", "secret");
     }
     let _canaries = EnvironmentCanaries;
-    let result = bash(
+    let result = bash_unlocked(
         "env | grep -E '^(SSH_OPENCLAUDIA_CANARY|DBUS_OPENCLAUDIA_CANARY|\
          HTTPS_PROXY_OPENCLAUDIA_CANARY|OPENCLAUDIA_TEST_API_KEY)=' \
          && echo env_leaked || echo env_confined",
