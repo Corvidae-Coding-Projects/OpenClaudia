@@ -1,8 +1,9 @@
 # Design: Centralized SessionState (crosslink #510)
 
-> Implementation status: Phases 0–2 are complete. The TUI and legacy REPL now
+> Implementation status: Phases 0–3 are complete. The TUI and legacy REPL now
 > share identity, conversation state, agent mode, budgets, session UI state,
-> and a compatible session document. Phases 3–5 remain planned.
+> permission state, transcript bookkeeping, IDE state, and a compatible session
+> document. Phases 4–5 remain planned.
 
 ## Problem
 
@@ -187,10 +188,22 @@ Each phase compiles + tests green on its own.
 - Tests: effort parsing/cycling and cross-frontend budget/UI round trips pass.
 
 **Phase 3 — migrate Permissions / Transcript / IDE**
-- `App.transcript_watermark` → `state.transcript.watermark`.
-- Permission flags move.
-- `AcpServer::ide_state` reads from `StateStore`, writes propagate.
-- Tests: existing IDE-bridge tests still pass.
+- Complete.
+- Removed `App.transcript_watermark` / `App.transcript_cwd`; TUI transcript
+  appends now read and advance `state.transcript`, then save the canonical
+  watermark only after successful JSONL writes. Rewind-shortened histories
+  clamp the offset before slicing so a branched turn cannot panic or be skipped.
+- Removed the legacy REPL's permission-bypass mirror. Both interactive
+  frontends read `state.permissions.bypass_mode`, while startup deliberately
+  reapplies the current command-line value after resume so a dangerous choice
+  never leaks into a later process. The other permission flags already had no
+  frontend-owned duplicates and remain canonical snapshot data.
+- Moved ACP `IdeState` and its wire types into `state.ide`. IDE notifications
+  mutate the shared `StateStore`; prompt construction reads a detached snapshot
+  and injects bounded, XML-escaped editor context on the next turn.
+- Tests: permission/transcript cross-frontend round trips, rewind watermark
+  clamping, backward-compatible missing-IDE defaults, IDE bridge propagation,
+  prompt visibility, injection escaping, and existing IDE wire-shape coverage.
 
 **Phase 4 — StateEvent broadcast**
 - Analytics sink subscribes; emits `SessionStart` / `SessionEnd` from `SessionSwitched`.

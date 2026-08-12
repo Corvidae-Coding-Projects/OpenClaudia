@@ -1397,7 +1397,7 @@ impl App {
     /// `$CLAUDE_CONFIG_HOME_DIR/projects/<sanitized-cwd>/<session>.jsonl`.
     /// Best-effort: transcript I/O failures are logged but never bubble
     /// up — a missing transcript must never break the live turn.
-    fn persist_transcript_tail(&mut self) {
+    fn persist_transcript_tail(&self) {
         let (cwd, watermark, messages) = self.chat_session.transcript_snapshot();
         let session_id = self.chat_session.id();
         // crosslink #709: track ONLY the entries that were actually
@@ -1441,7 +1441,7 @@ impl App {
     /// Keep the append-only transcript and JSON session snapshot coherent:
     /// only persist a watermark after the corresponding JSONL appends have
     /// succeeded.
-    fn persist_session(&mut self) {
+    fn persist_session(&self) {
         self.persist_transcript_tail();
         let _ = save_session(&self.chat_session);
     }
@@ -6228,7 +6228,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
 
-        let mut app = App::new("test-model", "test-provider");
+        let app = App::new("test-model", "test-provider");
         app.chat_session.replace_messages(vec![
             serde_json::json!({"role": "user", "content": "one"}),
             serde_json::json!({"role": "assistant", "content": "two"}),
@@ -6264,7 +6264,7 @@ mod tests {
             .expect("write blocker file");
         let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
 
-        let mut app = App::new("test-model", "test-provider");
+        let app = App::new("test-model", "test-provider");
         app.chat_session.replace_messages(vec![
             serde_json::json!({"role": "user", "content": "one"}),
             serde_json::json!({"role": "assistant", "content": "two"}),
@@ -6288,7 +6288,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
 
-        let mut app = App::new("test-model", "test-provider");
+        let app = App::new("test-model", "test-provider");
         app.chat_session.replace_messages(vec![serde_json::json!({
             "role": "user",
             "content": "branched turn"

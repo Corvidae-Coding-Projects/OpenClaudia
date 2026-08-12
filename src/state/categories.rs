@@ -7,6 +7,7 @@
 //! `AppHandles` struct that callers pass alongside a
 //! [`super::StateStore`] when both are needed.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -477,6 +478,47 @@ pub struct BudgetsState {
     /// authoritative — the provider response carries the real count.
     #[serde(default)]
     pub estimated_tokens: usize,
+}
+
+// ─── IDE ───────────────────────────────────────────────────────────
+
+/// Snapshot of editor context pushed over the ACP IDE bridge.
+///
+/// Each notification updates only the fields it carries. The snapshot stays
+/// plain cloneable data so prompt construction can copy it without holding a
+/// [`super::StateStore`] lock across network awaits.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IdeState {
+    /// Currently focused file in the editor.
+    pub active_file: Option<String>,
+    /// Recently opened files, most-recent-first.
+    pub recent_files: Vec<String>,
+    /// Current text selection, if any.
+    pub selection: Option<IdeSelection>,
+    /// LSP diagnostics keyed by file path.
+    pub diagnostics: HashMap<String, Vec<IdeDiagnostic>>,
+}
+
+/// Current editor selection, using ACP's zero-indexed line convention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeSelection {
+    pub file_path: String,
+    pub line_start: u32,
+    pub line_count: u32,
+    pub text: String,
+}
+
+/// One LSP diagnostic received through the ACP editor bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeDiagnostic {
+    /// Zero-indexed line number.
+    pub line: u32,
+    /// `error` / `warning` / `info` / `hint`.
+    pub severity: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 // ─── Transcript ─────────────────────────────────────────────────────

@@ -1,10 +1,10 @@
 //! Centralized session state — crosslink #510.
 //!
 //! Migration strategy is phased (see `docs/designs/510-session-state.md`).
-//! Phases 1 and 2 are complete, and Phase 3 is in progress: both interactive
-//! frontends keep identity, conversation, budget, session UI, permission, and
-//! transcript data here, while `TuiSession` and `ChatSession` remain thin
-//! compatibility wrappers for frontend metadata. ACP IDE state migrates next.
+//! Phases 1 through 3 are complete: both interactive frontends keep identity,
+//! conversation, budget, session UI, permission, and transcript data here,
+//! while `TuiSession` and `ChatSession` remain thin compatibility wrappers for
+//! frontend metadata. ACP keeps its IDE snapshot here as well.
 //!
 //! The per-session fields live here. Process-scoped handles
 //! (`memory_db`, `permission_mgr`, `hook_engine`, …) stay on the
@@ -16,8 +16,8 @@ pub mod persist;
 pub mod store;
 
 pub use categories::{
-    AgentMode, BudgetsState, Conversation, EffortLevel, Identity, ModesState, PermissionsState,
-    SessionId, TranscriptState, UiState,
+    AgentMode, BudgetsState, Conversation, EffortLevel, IdeDiagnostic, IdeSelection, IdeState,
+    Identity, ModesState, PermissionsState, SessionId, TranscriptState, UiState,
 };
 pub use persist::{SessionDocument, SessionStateV1};
 pub use store::{StateEvent, StateStore};
@@ -37,6 +37,8 @@ pub struct SessionState {
     pub modes: ModesState,
     pub permissions: PermissionsState,
     pub budgets: BudgetsState,
+    #[serde(default)]
+    pub ide: IdeState,
     pub transcript: TranscriptState,
 }
 
@@ -58,6 +60,7 @@ impl SessionState {
             modes: ModesState::default(),
             permissions: PermissionsState::default(),
             budgets: BudgetsState::default(),
+            ide: IdeState::default(),
             transcript,
         }
     }
@@ -109,6 +112,7 @@ mod tests {
         }));
         state.budgets.effort_level = categories::EffortLevel::High;
         state.ui.plan_mode.has_exited = true;
+        state.ide.active_file = Some("/x/src/main.rs".to_string());
 
         let json = serde_json::to_string(&state).unwrap();
         let round: SessionState = serde_json::from_str(&json).unwrap();
@@ -116,5 +120,6 @@ mod tests {
         assert_eq!(round.conversation.messages, state.conversation.messages);
         assert_eq!(round.budgets.effort_level, state.budgets.effort_level);
         assert!(round.ui.plan_mode.has_exited);
+        assert_eq!(round.ide.active_file, state.ide.active_file);
     }
 }

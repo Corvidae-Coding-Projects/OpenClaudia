@@ -2790,6 +2790,13 @@ mod tests {
             state.permissions.persistence_disabled = true;
             state.transcript.watermark = 17;
             state.transcript.transcript_cwd = PathBuf::from("/tmp/transcript-root");
+            state.ide.active_file = Some("/tmp/project/src/lib.rs".to_string());
+            state.ide.selection = Some(openclaudia::state::IdeSelection {
+                file_path: "/tmp/project/src/lib.rs".to_string(),
+                line_start: 12,
+                line_count: 2,
+                text: "selected source".to_string(),
+            });
         });
 
         let repl_json = serde_json::to_string(&repl_session).expect("serialize REPL session");
@@ -2831,6 +2838,18 @@ mod tests {
         assert_eq!(
             state.transcript.transcript_cwd,
             PathBuf::from("/tmp/transcript-root")
+        );
+        assert_eq!(
+            state.ide.active_file.as_deref(),
+            Some("/tmp/project/src/lib.rs")
+        );
+        assert_eq!(
+            state
+                .ide
+                .selection
+                .as_ref()
+                .map(|selection| selection.text.as_str()),
+            Some("selected source")
         );
     }
 

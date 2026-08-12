@@ -258,6 +258,23 @@ mod tests {
     }
 
     #[test]
+    fn pre_phase_three_payload_defaults_missing_ide_state() {
+        let state = SessionState::new(PathBuf::from("/tmp/legacy-v1"));
+        let mut payload = serde_json::to_value(SessionStateV1::wrap(state)).unwrap();
+        payload
+            .as_object_mut()
+            .expect("versioned state is an object")
+            .remove("ide");
+
+        let decoded = decode(&serde_json::to_string(&payload).unwrap()).unwrap();
+
+        assert!(decoded.ide.active_file.is_none());
+        assert!(decoded.ide.recent_files.is_empty());
+        assert!(decoded.ide.selection.is_none());
+        assert!(decoded.ide.diagnostics.is_empty());
+    }
+
+    #[test]
     fn future_schema_is_rejected() {
         // Simulate a file written by a newer harness version.
         let payload = serde_json::json!({
@@ -274,6 +291,7 @@ mod tests {
             "modes": {},
             "permissions": {},
             "budgets": {},
+            "ide": {},
             "transcript": {}
         })
         .to_string();
@@ -304,6 +322,7 @@ mod tests {
             "modes": {},
             "permissions": {},
             "budgets": {},
+            "ide": {},
             "transcript": {}
         })
         .to_string();

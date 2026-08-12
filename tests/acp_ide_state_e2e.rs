@@ -109,14 +109,11 @@ fn ide_state_full_shape_round_trips() {
 
 #[test]
 fn ide_state_deserialize_from_minimal_json_uses_defaults() {
-    // Empty object: serde defaults for vec/hashmap/option.
-    let json_str = "{}";
-    let outcome: Result<IdeState, _> = serde_json::from_str(json_str);
-    // IdeState derives Default but doesn't add #[serde(default)]
-    // at the struct level — missing fields error unless every
-    // one has a serde default annotation. The contract IS the
-    // resulting error (or pass) — pin whichever shipping.
-    let _ = outcome; // tolerate either shape
+    let state: IdeState = serde_json::from_str("{}").expect("missing fields use defaults");
+    assert!(state.active_file.is_none());
+    assert!(state.recent_files.is_empty());
+    assert!(state.selection.is_none());
+    assert!(state.diagnostics.is_empty());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
