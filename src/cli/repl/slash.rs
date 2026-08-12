@@ -1406,8 +1406,9 @@ pub fn slash_sessions() -> SlashCommandResult {
         println!("\nSaved Sessions ({}):\n", sessions.len());
         for (i, session) in sessions.iter().take(10).enumerate() {
             let date = session.updated_at.format("%Y-%m-%d %H:%M");
-            let msg_count = session.messages.len();
-            let id_prefix = safe_truncate(&session.id, 8);
+            let msg_count = session.inspect_state(|state| state.conversation.messages.len());
+            let session_id = session.id();
+            let id_prefix = safe_truncate(&session_id, 8);
             println!(
                 "  {}. \x1b[36m{}\x1b[0m  \x1b[90m{} · {} · {} msgs\x1b[0m",
                 i + 1,
@@ -1438,7 +1439,7 @@ pub fn slash_continue(args: &str) -> SlashCommandResult {
         let sessions = list_chat_sessions();
         if let Some(session) = sessions.first() {
             println!("\nContinuing: {}\n", session.title);
-            return SlashCommandResult::LoadSession(session.id.clone());
+            return SlashCommandResult::LoadSession(session.id());
         }
         println!("\nNo sessions to continue.\n");
     } else if let Some(session_id) = parse_session_uuid_arg(args) {
@@ -1449,7 +1450,7 @@ pub fn slash_continue(args: &str) -> SlashCommandResult {
         if num > 0 && num <= sessions.len() {
             let session = &sessions[num - 1];
             println!("\nContinuing: {}\n", session.title);
-            return SlashCommandResult::LoadSession(session.id.clone());
+            return SlashCommandResult::LoadSession(session.id());
         }
         println!("\nInvalid session number. Use /sessions to see available sessions.\n");
     } else {

@@ -907,7 +907,7 @@ fn read_multiline_continuation(input: &mut String, rl: &mut rustyline::DefaultEd
 ///
 /// Extracted from `cmd_chat` per crosslink #262.
 fn maybe_auto_compact(chat_session: &mut ChatSession, model: &str) {
-    if chat_session.messages.len() <= 6 {
+    if chat_session.inspect_state(|state| state.conversation.messages.len()) <= 6 {
         return;
     }
     let est = estimate_session_tokens(chat_session);
@@ -985,7 +985,10 @@ fn maybe_resume_session(chat_session: &mut ChatSession, resume: bool, session_id
     }
     let sessions = list_chat_sessions();
     let target = if let Some(id) = session_id {
-        sessions.iter().find(|s| s.id.starts_with(id)).cloned()
+        sessions
+            .iter()
+            .find(|session| session.id().starts_with(id))
+            .cloned()
     } else {
         sessions.into_iter().next()
     };
@@ -993,7 +996,7 @@ fn maybe_resume_session(chat_session: &mut ChatSession, resume: bool, session_id
         eprintln!(
             "Resuming session: {} ({})",
             loaded.title,
-            safe_truncate(&loaded.id, 8)
+            safe_truncate(&loaded.id(), 8)
         );
         *chat_session = loaded;
     } else {
@@ -2730,6 +2733,77 @@ mod tests {
     }
 
     #[test]
+    fn tui_session_document_loads_in_legacy_repl() {
+        let seed = ChatSession::new(
+            "claude-sonnet-4-6",
+            "anthropic",
+            openclaudia::modes::BehaviorMode::default(),
+        );
+        let seed_json = serde_json::to_string(&seed).expect("serialize seed session");
+        let tui_session: openclaudia::tui::app::TuiSession =
+            serde_json::from_str(&seed_json).expect("TUI must load shared session document");
+        tui_session.push_message(serde_json::json!({
+            "role": "user",
+            "content": "shared conversation"
+        }));
+
+        let json = serde_json::to_string(&tui_session).expect("serialize TUI session");
+        let repl_session: ChatSession =
+            serde_json::from_str(&json).expect("REPL must load TUI session document");
+
+        assert_eq!(repl_session.id(), tui_session.id());
+        assert_eq!(
+            repl_session.messages_snapshot(),
+            tui_session.messages_snapshot()
+        );
+        assert!(json.contains("\"session_state\""));
+    }
+
+    #[test]
+    fn repl_session_document_round_trips_through_tui_without_state_loss() {
+        let mut repl_session = ChatSession::new(
+            "gpt-5.5",
+            "openai",
+            openclaudia::modes::BehaviorMode::default(),
+        );
+        repl_session.mode = openclaudia::state::AgentMode::Extend;
+        repl_session.push_message(serde_json::json!({
+            "role": "assistant",
+            "content": "persist me"
+        }));
+        repl_session.update_state(|state, _| {
+            state.conversation.approved_plan = Some("approved steps".to_string());
+            state
+                .identity
+                .additional_directories_for_claude_md
+                .push(PathBuf::from("/tmp/shared-context"));
+        });
+
+        let repl_json = serde_json::to_string(&repl_session).expect("serialize REPL session");
+        let tui_session: openclaudia::tui::app::TuiSession =
+            serde_json::from_str(&repl_json).expect("TUI must load REPL session document");
+        let tui_json = serde_json::to_string(&tui_session).expect("re-serialize TUI session");
+        let restored: ChatSession =
+            serde_json::from_str(&tui_json).expect("REPL must reload TUI document");
+        let state = restored.state_snapshot();
+
+        assert_eq!(restored.id(), repl_session.id());
+        assert_eq!(restored.mode, openclaudia::state::AgentMode::Extend);
+        assert_eq!(
+            state.conversation.approved_plan.as_deref(),
+            Some("approved steps")
+        );
+        assert_eq!(
+            state.identity.additional_directories_for_claude_md,
+            vec![PathBuf::from("/tmp/shared-context")]
+        );
+        assert_eq!(
+            state.conversation.messages,
+            repl_session.messages_snapshot()
+        );
+    }
+
+    #[test]
     fn maybe_auto_compact_is_noop_for_small_sessions() {
         // Under the 6-message short-circuit, auto-compact must not touch
         // the session. Build the smallest possible ChatSession with an
@@ -2739,10 +2813,13 @@ mod tests {
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
         );
-        let before_len = session.messages.len();
+        let before_len = session.inspect_state(|state| state.conversation.messages.len());
         // Any model name is fine — the short-circuit fires before the
         // model lookup.
         maybe_auto_compact(&mut session, "claude-sonnet-4-6");
-        assert_eq!(session.messages.len(), before_len);
+        assert_eq!(
+            session.inspect_state(|state| state.conversation.messages.len()),
+            before_len
+        );
     }
 }

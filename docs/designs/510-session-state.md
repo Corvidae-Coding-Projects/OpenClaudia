@@ -1,5 +1,9 @@
 # Design: Centralized SessionState (crosslink #510)
 
+> Implementation status: Phases 0 and 1 are complete. The TUI and legacy REPL
+> now share identity, conversation state, agent mode, and a compatible session
+> document. Phases 2–5 remain planned.
+
 ## Problem
 
 OpenClaudia's per-session state is scattered across three concrete types and an assortment of unrelated modules:
@@ -116,15 +120,18 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    pub fn read(&self) -> RwLockReadGuard<'_, SessionState>;
-    pub fn write(&self) -> StateWriteGuard<'_>;   // guard that emits on drop
+    pub fn snapshot(&self) -> SessionState;
+    pub fn inspect<R>(&self, inspect: impl FnOnce(&SessionState) -> R) -> R;
+    pub fn update<R>(
+        &self,
+        update: impl FnOnce(&mut SessionState, &mut Vec<StateEvent>) -> R,
+    ) -> R;
 
     pub fn subscribe(&self) -> broadcast::Receiver<StateEvent>;
 }
 
-/// Emitted from inside StateWriteGuard on drop. Granular events let
-/// subscribers (analytics sink, transcript writer, TUI redraw) react
-/// to only the categories they care about.
+/// Queued inside `update` and emitted after the lock is released. Granular
+/// events let subscribers react to only the categories they care about.
 pub enum StateEvent {
     SessionSwitched { from: SessionId, to: SessionId },
     MessageAppended { role: String },
@@ -145,11 +152,12 @@ them out of SessionState keeps serialization + snapshots simple.
 
 ### Persistence is a separate concern
 
-`state/persist.rs` owns one serde-compatible shape (`SessionStateV1`)
-that both the TUI and the chat REPL emit. Today's divergent
-`TuiSession` / `ChatSession` struct are deprecated to compat shims
-that deserialize-then-convert. New sessions land in the V1 shape; a
-migration (via #506's framework) rewrites old files lazily on read.
+`state/persist.rs` owns one compatibility document with an embedded
+`SessionStateV1` payload that both the TUI and chat REPL emit. Current readers
+accept legacy top-level-only files and prefer the V1 payload when present.
+`TuiSession` / `ChatSession` are metadata shims that
+deserialize-then-convert. A later migration (via #506's framework) can remove
+the duplicated legacy fields.
 
 ## Integration plan (phased)
 
@@ -157,12 +165,14 @@ The migration must be incremental — a single-PR rewrite would stall.
 Each phase compiles + tests green on its own.
 
 **Phase 0 — ship the module, empty**
+- Complete.
 - Create `src/state/` with the structs above. Nothing uses it yet.
 - `SessionState::new(...)` constructs from existing `TuiSession` for compat.
 - Tests: default construction, roundtrip serde.
 
 **Phase 1 — migrate Identity + Conversation**
-- Replace `App.chat_session.messages` / `App.chat_session.id` reads with `StateStore::read().conversation.messages` / `identity.session_id`.
+- Complete.
+- Replace `App.chat_session.messages` / `App.chat_session.id` reads with short-lived `StateStore::inspect` / `update` closures.
 - Same for the REPL. `TuiSession` / `ChatSession` forward to the new fields.
 - Tests: `/load`, `/resume`, `/undo`, `/redo` still pass.
 
@@ -197,12 +207,12 @@ Phases 0–2 are single-commit each. Phases 3–4 are two-commit each. Phase 5 r
 
 ## Risks and open questions
 
-1. **Deadlock via lock holding**. `RwLockReadGuard` held across an `.await` is a recipe for deadlocks in async paths. Guard against this by keeping read guards short-lived (clone out the field you need) and never holding a write guard across any await. Consider using `parking_lot` instead of `std::sync::RwLock` for the consistent-priority policy.
+1. **Deadlock via lock holding**. Addressed in Phase 1 by exposing closure-based `inspect` / `update` methods instead of lock guards. References into state cannot escape a closure, so callers clone the data they need before any `.await`.
 2. **Broadcast channel bound**. `tokio::sync::broadcast` drops messages when the receiver falls behind. Subscribers must handle `RecvError::Lagged` — easy to forget. Ship a helper `StateStore::subscribe_log_lag()` that wraps recv + logs on lag so every caller gets the same behavior.
 3. **Serialization drift with plugins**. Plugins persist per-plugin config (already in #514 policy work); keep those out of `SessionState` so the version-bump cost stays bounded to core fields.
 4. **Migration atomicity**. Phase 5 rewrites every old session file. Must be crash-safe: write-temp + rename. Reuse the file-atomicity helpers the transcript writer already uses.
-5. **Observability during the migration**. Each phase adds a tracing span around the `StateStore::write` call. If a user reports a broken `/undo` mid-migration, we can grep the log for which phase/writer moved the field without sprinkling `eprintln!`s.
-6. **API stability**. `pub` fields on `SessionState` let callers reach in directly, which feels nice but locks the shape. Counter-pattern: make fields `pub(crate)` and expose `read().identity()` accessors. Trade-off: borrow-checker ergonomics vs future flexibility. Recommend: `pub(crate)` fields + `pub fn` getters.
+5. **Observability during the migration**. Later phases should add tracing around important `StateStore::update` calls. If a user reports a broken `/undo`, the log should identify which writer moved the field without sprinkling `eprintln!`s.
+6. **API stability**. `pub` fields on `SessionState` make snapshot and closure access ergonomic but expose the shape. Revisit field visibility after Phase 5 removes the compatibility shims.
 
 ## Out of scope
 

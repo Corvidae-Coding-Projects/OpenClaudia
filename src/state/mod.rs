@@ -1,13 +1,10 @@
 //! Centralized session state — crosslink #510.
 //!
-//! Migration strategy is phased (see `docs/designs/510-session-state.md`):
-//!
-//! - **Phase 0 (this commit)**: the module exists, compiles, has
-//!   roundtrip-serializable types and a `StateStore` with change-
-//!   notification. Nothing in the TUI / REPL consumes it yet.
-//! - **Phase 1+**: per-category migration of the fields that today
-//!   live on `tui::app::App` / `tui::app::TuiSession` /
-//!   `cli::repl::ChatSession`. Each phase compiles + tests green.
+//! Migration strategy is phased (see `docs/designs/510-session-state.md`).
+//! Phase 1 is complete: both interactive frontends keep identity and
+//! conversation data here, while `TuiSession` and `ChatSession` remain thin
+//! compatibility wrappers for frontend metadata. Later phases move the
+//! remaining UI, budget, permission, and transcript fields.
 //!
 //! The per-session fields live here. Process-scoped handles
 //! (`memory_db`, `permission_mgr`, `hook_engine`, …) stay on the
@@ -22,8 +19,8 @@ pub use categories::{
     AgentMode, BudgetsState, Conversation, EffortLevel, Identity, ModesState, PermissionsState,
     SessionId, TranscriptState, UiState,
 };
-pub use persist::SessionStateV1;
-pub use store::{StateEvent, StateStore, StateWriteGuard};
+pub use persist::{SessionDocument, SessionStateV1};
+pub use store::{StateEvent, StateStore};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,8 +44,7 @@ impl SessionState {
     /// A blank session rooted at `cwd`. Generates a fresh UUID for
     /// `identity.session_id` and leaves every other category at its
     /// default. Matches the behavior of the existing
-    /// `TuiSession::new` / `ChatSession::new` constructors so Phase 1
-    /// can drop this in without behavior changes.
+    /// `TuiSession::new` / `ChatSession::new` constructors.
     #[must_use]
     pub fn new(cwd: std::path::PathBuf) -> Self {
         Self {

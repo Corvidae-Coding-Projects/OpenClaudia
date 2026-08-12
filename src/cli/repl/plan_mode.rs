@@ -34,8 +34,8 @@ pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
     let plans_dir = std::fs::canonicalize(&plans_dir).unwrap_or(plans_dir);
 
     // Sanitize session ID to prevent path traversal (e.g. "../../etc/evil")
-    let safe_id: String = chat_session
-        .id
+    let session_id = chat_session.id();
+    let safe_id: String = session_id
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '_' {
@@ -53,7 +53,7 @@ pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
     if !plan_file.exists() {
         let header = format!(
             "# Implementation Plan\n\nSession: {}\nCreated: {}\n\n## Plan\n\n",
-            chat_session.id,
+            session_id,
             chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
         );
         if let Err(e) = fs::write(&plan_file, &header) {
@@ -87,7 +87,7 @@ pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
         }
     };
 
-    chat_session.plan_mode = Some(plan_state);
+    chat_session.update_state(|state, _| state.conversation.plan_mode = Some(plan_state));
     chat_session.mode = AgentMode::Plan;
 
     println!(
@@ -131,21 +131,28 @@ fn handle_plan_edit(
             }
             if input2.trim().to_lowercase().starts_with('y') {
                 let allowed_prompts = tools::parse_exit_plan_mode_prompts(allowed_prompts_json);
-                let restored = restore_previous_mode(chat_session.plan_mode.as_ref());
-                chat_session.plan_mode = None;
+                let restored = chat_session.inspect_state(|state| {
+                    restore_previous_mode(state.conversation.plan_mode.as_ref())
+                });
                 chat_session.mode = restored;
-                chat_session.approved_plan = Some(edited_content.clone());
                 println!("\n\x1b[1;32m>> Plan Approved - Returning to Build Mode\x1b[0m\n");
-                chat_session.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": format!(
-                        "[Approved Implementation Plan (edited by user)]\n\
-                         The user has edited and approved the following plan. Execute it step by step.\n\n{}\n\n{}",
-                        edited_content,
-                        if allowed_prompts.is_empty() { String::new() }
-                        else { format!("Allowed operations:\n{}", allowed_prompts.iter().map(|p| format!("- {}: {}", p.tool, p.prompt)).collect::<Vec<_>>().join("\n")) }
-                    )
-                }));
+                chat_session.update_state(|state, events| {
+                    state.conversation.plan_mode = None;
+                    state.conversation.approved_plan = Some(edited_content.clone());
+                    state.conversation.messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": format!(
+                            "[Approved Implementation Plan (edited by user)]\n\
+                             The user has edited and approved the following plan. Execute it step by step.\n\n{}\n\n{}",
+                            edited_content,
+                            if allowed_prompts.is_empty() { String::new() }
+                            else { format!("Allowed operations:\n{}", allowed_prompts.iter().map(|p| format!("- {}: {}", p.tool, p.prompt)).collect::<Vec<_>>().join("\n")) }
+                        )
+                    }));
+                    events.push(openclaudia::state::StateEvent::MessageAppended {
+                        role: "system".to_string(),
+                    });
+                });
                 ("Plan edited and approved by user. Full tool access restored. Proceed with implementation according to the edited plan.".to_string(), true)
             } else {
                 println!("\n\x1b[1;31m>> Plan Rejected - Staying in Plan Mode\x1b[0m\n");
@@ -178,7 +185,8 @@ pub fn handle_exit_plan_mode(
 ) -> (String, bool) {
     use std::io::{self, Write};
 
-    let plan_state = match &chat_session.plan_mode {
+    let plan_mode = chat_session.inspect_state(|state| state.conversation.plan_mode.clone());
+    let plan_state = match &plan_mode {
         Some(state) if state.active => state.clone(),
         _ => {
             return ("Not currently in plan mode.".to_string(), false);
@@ -216,36 +224,43 @@ pub fn handle_exit_plan_mode(
         "y" | "yes" => {
             let allowed_prompts = tools::parse_exit_plan_mode_prompts(allowed_prompts_json);
 
-            let restored = restore_previous_mode(chat_session.plan_mode.as_ref());
-            chat_session.plan_mode = None;
+            let restored = chat_session.inspect_state(|state| {
+                restore_previous_mode(state.conversation.plan_mode.as_ref())
+            });
             chat_session.mode = restored;
-            chat_session.approved_plan = Some(plan_content.clone());
 
             println!(
                 "\n\x1b[1;32m>> Plan Approved - Returning to Build Mode\x1b[0m\n\
                  \x1b[90mFull tool access restored. Plan injected as context.\x1b[0m\n"
             );
 
-            chat_session.messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!(
-                    "[Approved Implementation Plan]\n\
-                     The user has approved the following plan. Execute it step by step.\n\n{}\n\n{}",
-                    plan_content,
-                    if allowed_prompts.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "Allowed operations:\n{}",
-                            allowed_prompts
-                                .iter()
-                                .map(|p| format!("- {}: {}", p.tool, p.prompt))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        )
-                    }
-                )
-            }));
+            chat_session.update_state(|state, events| {
+                state.conversation.plan_mode = None;
+                state.conversation.approved_plan = Some(plan_content.clone());
+                state.conversation.messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Approved Implementation Plan]\n\
+                         The user has approved the following plan. Execute it step by step.\n\n{}\n\n{}",
+                        plan_content,
+                        if allowed_prompts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "Allowed operations:\n{}",
+                                allowed_prompts
+                                    .iter()
+                                    .map(|p| format!("- {}: {}", p.tool, p.prompt))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            )
+                        }
+                    )
+                }));
+                events.push(openclaudia::state::StateEvent::MessageAppended {
+                    role: "system".to_string(),
+                });
+            });
 
             (
                 "Plan approved by user. Full tool access restored. Proceed with implementation according to the plan.".to_string(),
@@ -281,7 +296,8 @@ pub fn check_plan_mode_restriction(
     tool_name: &str,
     tool_args: &str,
 ) -> Option<String> {
-    let plan_state = match &chat_session.plan_mode {
+    let plan_mode = chat_session.inspect_state(|state| state.conversation.plan_mode.clone());
+    let plan_state = match &plan_mode {
         Some(state) if state.active => state,
         _ => return None,
     };
@@ -395,7 +411,9 @@ mod tests {
             openclaudia::modes::BehaviorMode::default(),
         );
         session.mode = AgentMode::Plan;
-        session.plan_mode = Some(make_plan_state(None));
+        session.update_state(|state, _| {
+            state.conversation.plan_mode = Some(make_plan_state(None));
+        });
         session
     }
 

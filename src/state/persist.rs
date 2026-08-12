@@ -1,16 +1,10 @@
 //! On-disk serialization shape for [`super::SessionState`].
 //!
-//! Today's code ships two divergent on-disk shapes:
-//!
-//! - `src/tui/app.rs :: TuiSession` — used by the ratatui TUI.
-//! - `src/cli/repl/mod.rs :: ChatSession` — used by the chat REPL.
-//!
-//! They carry the same fields with different serde layouts.
-//! Load-saved-in-TUI-resume-in-REPL is not round-trip safe. The
-//! [`SessionStateV1`] struct here is the new single source of truth;
-//! Phase 5 of the migration (see `docs/designs/510-session-state.md`)
-//! retires both back-compat shims once every caller reads / writes
-//! through this module.
+//! The ratatui TUI and legacy line REPL historically wrote divergent shapes.
+//! They now serialize through [`SessionDocument`], which keeps the legacy
+//! top-level field layout readable and embeds [`SessionStateV1`] as the
+//! canonical payload. Phase 5 of the migration (see
+//! `docs/designs/510-session-state.md`) retires the compatibility wrappers.
 //!
 //! This module is intentionally thin — a `SessionStateV1` is
 //! equivalent to a [`super::SessionState`] plus a schema version
@@ -20,7 +14,116 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::SessionState;
+use std::path::{Path, PathBuf};
+
+use super::{AgentMode, SessionId, SessionState};
+
+/// Compatibility document shared by the TUI and legacy line REPL.
+///
+/// The top-level fields let current readers migrate pre-Phase-1 JSON.
+/// `session_state` is the canonical V1 payload used for new round trips. The
+/// duplicated compatibility fields can be removed together with the frontend
+/// wrappers in Phase 5.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDocument {
+    pub id: String,
+    pub title: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub model: String,
+    pub provider: String,
+    #[serde(default)]
+    pub mode: AgentMode,
+    #[serde(default)]
+    pub behavior_mode: crate::modes::BehaviorMode,
+    #[serde(default)]
+    pub messages: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub undo_stack: Vec<(serde_json::Value, serde_json::Value)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode: Option<crate::session::PlanModeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_dirs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<SessionStateV1>,
+}
+
+impl SessionDocument {
+    /// Build a compatibility document from canonical session state.
+    #[must_use]
+    pub fn from_state(
+        title: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        model: String,
+        provider: String,
+        state: SessionState,
+    ) -> Self {
+        Self {
+            id: state.identity.session_id.to_string(),
+            title,
+            created_at,
+            updated_at,
+            model,
+            provider,
+            mode: state.modes.agent_mode,
+            behavior_mode: state.conversation.behavior_mode.clone(),
+            messages: state.conversation.messages.clone(),
+            undo_stack: state.conversation.undo_stack.clone(),
+            plan_mode: state.conversation.plan_mode.clone(),
+            approved_plan: state.conversation.approved_plan.clone(),
+            working_dirs: state.identity.additional_directories_for_claude_md.clone(),
+            session_state: Some(SessionStateV1::wrap(state)),
+        }
+    }
+
+    /// Recover canonical state, preferring the embedded V1 payload and
+    /// falling back to the legacy top-level fields for older session files.
+    ///
+    /// `cwd` supplies the directory capabilities absent from legacy files.
+    /// The caller remains responsible for validating the recovered identifier
+    /// before using it as a filename.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError::InconsistentSessionId`] when a new-format file
+    /// carries different identifiers in its compatibility and canonical
+    /// sections.
+    pub fn into_state(self, cwd: &Path) -> Result<SessionState, PersistError> {
+        if let Some(versioned) = self.session_state {
+            if versioned.version > SessionStateV1::CURRENT_VERSION {
+                return Err(PersistError::FutureSchema {
+                    found: versioned.version,
+                    supported: SessionStateV1::CURRENT_VERSION,
+                });
+            }
+            let state = versioned.into_state();
+            if state.identity.session_id.as_str() != self.id {
+                return Err(PersistError::InconsistentSessionId {
+                    legacy: self.id,
+                    canonical: state.identity.session_id.to_string(),
+                });
+            }
+            return Ok(state);
+        }
+
+        let mut state = SessionState::new(cwd.to_path_buf());
+        // Legacy session IDs were already validated as filename-safe by both
+        // frontends but were not required to be UUIDs. Preserve those files
+        // losslessly while new sessions continue to generate UUIDs.
+        state.identity.session_id = SessionId::from_raw_unchecked(self.id);
+        state.identity.additional_directories_for_claude_md = self.working_dirs;
+        state.conversation.messages = self.messages;
+        state.conversation.undo_stack = self.undo_stack;
+        state.conversation.approved_plan = self.approved_plan;
+        state.conversation.plan_mode = self.plan_mode;
+        state.conversation.behavior_mode = self.behavior_mode;
+        state.modes.agent_mode = self.mode;
+        Ok(state)
+    }
+}
 
 /// Schema version 1 — matches [`super::SessionState`] field-for-field.
 /// Shipping the version tag from day one gives future migrations a
@@ -72,6 +175,10 @@ pub enum PersistError {
         "schema version {found} is newer than the max supported ({supported}); upgrade your harness"
     )]
     FutureSchema { found: u32, supported: u32 },
+    #[error(
+        "session id mismatch between compatibility field '{legacy}' and canonical state '{canonical}'"
+    )]
+    InconsistentSessionId { legacy: String, canonical: String },
 }
 
 /// Encode a [`SessionState`] as pretty-printed JSON ready to write.
@@ -208,5 +315,92 @@ mod tests {
     fn malformed_json_is_a_json_error() {
         let err = decode("{not valid").unwrap_err();
         assert!(matches!(err, PersistError::Json(_)));
+    }
+
+    #[test]
+    fn session_document_round_trips_canonical_state() {
+        let mut state = SessionState::new(PathBuf::from("/tmp/project"));
+        state.modes.agent_mode = AgentMode::Refactor;
+        state
+            .conversation
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "hello"}));
+        state.conversation.approved_plan = Some("keep this plan".to_string());
+        state
+            .identity
+            .additional_directories_for_claude_md
+            .push(PathBuf::from("/tmp/shared"));
+        let expected_id = state.identity.session_id.clone();
+
+        let document = SessionDocument::from_state(
+            "title".to_string(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            "model".to_string(),
+            "provider".to_string(),
+            state,
+        );
+        let encoded = serde_json::to_string(&document).unwrap();
+        let decoded: SessionDocument = serde_json::from_str(&encoded).unwrap();
+        let restored = decoded.into_state(Path::new("/unused")).unwrap();
+
+        assert_eq!(restored.identity.session_id, expected_id);
+        assert_eq!(restored.modes.agent_mode, AgentMode::Refactor);
+        assert_eq!(restored.conversation.messages.len(), 1);
+        assert_eq!(
+            restored.conversation.approved_plan.as_deref(),
+            Some("keep this plan")
+        );
+        assert_eq!(
+            restored.identity.additional_directories_for_claude_md,
+            vec![PathBuf::from("/tmp/shared")]
+        );
+    }
+
+    #[test]
+    fn legacy_session_document_migrates_top_level_fields() {
+        let encoded = serde_json::json!({
+            "id": "legacy-session-id",
+            "title": "legacy",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "model": "model",
+            "provider": "provider",
+            "mode": "Extend",
+            "messages": [{"role": "assistant", "content": "remember me"}],
+            "working_dirs": ["/tmp/legacy-extra"]
+        })
+        .to_string();
+
+        let document: SessionDocument = serde_json::from_str(&encoded).unwrap();
+        let restored = document.into_state(Path::new("/tmp/current")).unwrap();
+
+        assert_eq!(restored.identity.session_id.as_str(), "legacy-session-id");
+        assert_eq!(restored.identity.cwd, PathBuf::from("/tmp/current"));
+        assert_eq!(restored.modes.agent_mode, AgentMode::Extend);
+        assert_eq!(restored.conversation.messages.len(), 1);
+        assert_eq!(
+            restored.identity.additional_directories_for_claude_md,
+            vec![PathBuf::from("/tmp/legacy-extra")]
+        );
+    }
+
+    #[test]
+    fn session_document_rejects_conflicting_identity_fields() {
+        let state = SessionState::default();
+        let mut document = SessionDocument::from_state(
+            "title".to_string(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            "model".to_string(),
+            "provider".to_string(),
+            state,
+        );
+        document.id = "different-id".to_string();
+
+        assert!(matches!(
+            document.into_state(Path::new(".")),
+            Err(PersistError::InconsistentSessionId { .. })
+        ));
     }
 }

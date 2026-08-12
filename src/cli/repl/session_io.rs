@@ -6,14 +6,17 @@ use std::fs;
 
 /// Estimate tokens in a chat session (rough: ~4 chars per token)
 pub fn estimate_session_tokens(session: &ChatSession) -> usize {
-    session
-        .messages
-        .iter()
-        .map(|msg| {
-            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            content.len() / 4 + 4 // content tokens + overhead
-        })
-        .sum()
+    session.inspect_state(|state| {
+        state
+            .conversation
+            .messages
+            .iter()
+            .map(|msg| {
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                content.len() / 4 + 4 // content tokens + overhead
+            })
+            .sum()
+    })
 }
 
 /// Compact a chat session by summarizing older messages
@@ -27,7 +30,8 @@ pub fn compact_chat_session_with_instructions(
     custom_instructions: Option<&str>,
 ) -> (usize, usize) {
     let before_tokens = estimate_session_tokens(session);
-    let msg_count = session.messages.len();
+    let messages = session.inspect_state(|state| state.conversation.messages.clone());
+    let msg_count = messages.len();
 
     if msg_count <= 6 {
         println!("\nSession too short to compact ({msg_count} messages).\n");
@@ -38,7 +42,7 @@ pub fn compact_chat_session_with_instructions(
     let to_summarize = msg_count - preserve_count;
 
     let mut summary_parts = Vec::new();
-    for msg in session.messages.iter().take(to_summarize) {
+    for msg in messages.iter().take(to_summarize) {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
@@ -67,19 +71,16 @@ pub fn compact_chat_session_with_instructions(
         );
     }
 
-    let preserved: Vec<_> = session
-        .messages
-        .iter()
-        .skip(to_summarize)
-        .cloned()
-        .collect();
+    let preserved: Vec<_> = messages.iter().skip(to_summarize).cloned().collect();
 
-    session.messages.clear();
-    session.messages.push(serde_json::json!({
-        "role": "system",
-        "content": summary
-    }));
-    session.messages.extend(preserved);
+    session.update_state(|state, _| {
+        state.conversation.messages.clear();
+        state.conversation.messages.push(serde_json::json!({
+            "role": "system",
+            "content": summary
+        }));
+        state.conversation.messages.extend(preserved);
+    });
     session.touch();
 
     let after_tokens = estimate_session_tokens(session);
@@ -108,7 +109,8 @@ pub fn export_chat_session(session: &ChatSession) {
     let _ = writeln!(content, "**Provider:** {}  \n", session.provider);
     content.push_str("---\n\n");
 
-    for msg in &session.messages {
+    let messages = session.inspect_state(|state| state.conversation.messages.clone());
+    for msg in &messages {
         let role = msg
             .get("role")
             .and_then(|r| r.as_str())
@@ -155,7 +157,8 @@ pub fn save_session_to_short_term_memory(
     let mut user_requests = Vec::new();
     let mut last_assistant_summary = String::new();
 
-    for msg in &session.messages {
+    let messages = session.inspect_state(|state| state.conversation.messages.clone());
+    for msg in &messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
@@ -186,14 +189,15 @@ pub fn save_session_to_short_term_memory(
 
     let summary = summary_parts.join("\n");
 
+    let session_id = session.id();
     let files_modified = db
-        .get_session_files_modified(&session.id)
+        .get_session_files_modified(&session_id)
         .unwrap_or_default();
-    let issues_worked = db.get_session_issues(&session.id).unwrap_or_default();
+    let issues_worked = db.get_session_issues(&session_id).unwrap_or_default();
 
     let started_at = session.created_at.format("%Y-%m-%d %H:%M:%S").to_string();
     match db.save_session_summary(
-        &session.id,
+        &session_id,
         &summary,
         &files_modified,
         &issues_worked,
@@ -223,17 +227,19 @@ mod tests {
     use super::*;
 
     fn session_with_messages(count: usize) -> ChatSession {
-        let mut session = ChatSession::new(
+        let session = ChatSession::new(
             "test-model",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
         );
         for index in 0..count {
             let role = if index % 2 == 0 { "user" } else { "assistant" };
-            session.messages.push(serde_json::json!({
-                "role": role,
-                "content": format!("message {index}")
-            }));
+            session.update_state(|state, _| {
+                state.conversation.messages.push(serde_json::json!({
+                    "role": role,
+                    "content": format!("message {index}")
+                }));
+            });
         }
         session
     }
@@ -245,13 +251,16 @@ mod tests {
         let _ = compact_chat_session_with_instructions(&mut session, Some("preserve test context"));
 
         assert_eq!(
-            session.messages.len(),
+            session.inspect_state(|state| state.conversation.messages.len()),
             5,
             "compaction should replace old messages with one summary plus preserved tail"
         );
-        let summary = session.messages[0]["content"]
-            .as_str()
-            .expect("summary content");
+        let summary = session.inspect_state(|state| {
+            state.conversation.messages[0]["content"]
+                .as_str()
+                .expect("summary content")
+                .to_string()
+        });
         assert!(summary.contains("[COMPACTION INSTRUCTIONS]"));
         assert!(summary.contains("preserve test context"));
     }
@@ -262,9 +271,12 @@ mod tests {
 
         let _ = compact_chat_session_with_instructions(&mut session, Some("   "));
 
-        let summary = session.messages[0]["content"]
-            .as_str()
-            .expect("summary content");
+        let summary = session.inspect_state(|state| {
+            state.conversation.messages[0]["content"]
+                .as_str()
+                .expect("summary content")
+                .to_string()
+        });
         assert!(!summary.contains("[COMPACTION INSTRUCTIONS]"));
     }
 }

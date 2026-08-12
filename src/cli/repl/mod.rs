@@ -10,6 +10,7 @@ pub mod slash;
 pub mod vim;
 
 use anyhow::{bail, Context};
+pub use openclaudia::state::AgentMode;
 use openclaudia::tools::safe_truncate;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,88 +32,9 @@ pub fn get_sessions_dir() -> PathBuf {
     get_data_dir().join("chat_sessions")
 }
 
-/// Agent operating mode.
-///
-/// `Build` is the default full-access mode. `Plan` is the read-only review
-/// mode entered via `enter_plan_mode`. `Extend` and `Refactor` mirror the
-/// `modes::Preset` scope axis so the REPL can record (and restore) a
-/// non-Plan working mode across plan-mode entry — see crosslink #618 for
-/// the `previous_mode` snapshot that `ExitPlanMode` consults instead of
-/// unconditionally falling back to `Build`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentMode {
-    /// Full access mode - can make changes
-    #[default]
-    Build,
-    /// Read-only mode - only suggestions
-    Plan,
-    /// Extending an existing implementation (write-allowed, scope-locked).
-    Extend,
-    /// Refactor mode — write-allowed, structural changes expected.
-    Refactor,
-}
-
-impl AgentMode {
-    /// Toggle Build <-> Plan. Non-Build/Plan modes flip into Plan so the
-    /// keybinding still has a sensible effect; the previous mode is
-    /// remembered by [`PlanModeState::previous_mode`] (crosslink #618).
-    pub const fn toggle(self) -> Self {
-        match self {
-            Self::Build | Self::Extend | Self::Refactor => Self::Plan,
-            Self::Plan => Self::Build,
-        }
-    }
-
-    pub const fn display(self) -> &'static str {
-        match self {
-            Self::Build => "Build",
-            Self::Plan => "Plan",
-            Self::Extend => "Extend",
-            Self::Refactor => "Refactor",
-        }
-    }
-
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::Build => "Full access - can make changes",
-            Self::Plan => "Read-only - suggestions only",
-            Self::Extend => "Write-allowed; scope locked to an existing surface",
-            Self::Refactor => "Write-allowed; structural changes expected",
-        }
-    }
-
-    /// Stable lowercase token used when persisting the mode into
-    /// [`PlanModeState::previous_mode`] (which is a `String` so the
-    /// session module doesn't depend on the binary-side enum).
-    pub const fn as_token(self) -> &'static str {
-        match self {
-            Self::Build => "build",
-            Self::Plan => "plan",
-            Self::Extend => "extend",
-            Self::Refactor => "refactor",
-        }
-    }
-
-    /// Parse the token produced by [`Self::as_token`]. Unknown tokens fall
-    /// back to `Build` so a future variant added on a newer binary doesn't
-    /// crash an older one reading the saved session — the worst case is a
-    /// degraded restore to Build, which matches the pre-#618 behaviour.
-    pub fn from_token(s: &str) -> Self {
-        match s {
-            "plan" => Self::Plan,
-            "extend" => Self::Extend,
-            "refactor" => Self::Refactor,
-            _ => Self::Build,
-        }
-    }
-}
-
 /// A saved chat session with messages
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ChatSession {
-    /// Session ID
-    pub id: String,
     /// Session title (first user message or default)
     pub title: String,
     /// When the session was created
@@ -124,25 +46,8 @@ pub struct ChatSession {
     /// The provider used
     pub provider: String,
     /// Agent mode (Build or Plan)
-    #[serde(default)]
     pub mode: AgentMode,
-    /// Behavioral mode (agency/quality/scope axes + modifiers)
-    #[serde(default)]
-    pub behavior_mode: openclaudia::modes::BehaviorMode,
-    /// Conversation messages
-    pub messages: Vec<serde_json::Value>,
-    /// Undo stack for undone message pairs (user + assistant)
-    #[serde(default)]
-    pub undo_stack: Vec<(serde_json::Value, serde_json::Value)>,
-    /// Plan mode state (None when not in plan mode)
-    #[serde(default)]
-    pub plan_mode: Option<openclaudia::session::PlanModeState>,
-    /// Approved plan content injected as system context
-    #[serde(default)]
-    pub approved_plan: Option<String>,
-    /// Additional working directories added via `/add-dir`
-    #[serde(default)]
-    pub working_dirs: Vec<std::path::PathBuf>,
+    state: openclaudia::state::StateStore,
 }
 
 impl ChatSession {
@@ -152,78 +57,185 @@ impl ChatSession {
         behavior_mode: openclaudia::modes::BehaviorMode,
     ) -> Self {
         let now = chrono::Utc::now();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut state = openclaudia::state::SessionState::new(cwd);
+        state.conversation.behavior_mode = behavior_mode;
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
             title: "New conversation".to_string(),
             created_at: now,
             updated_at: now,
             model: model.to_string(),
             provider: provider.to_string(),
             mode: AgentMode::default(),
-            behavior_mode,
-            messages: Vec::new(),
-            undo_stack: Vec::new(),
-            plan_mode: None,
-            approved_plan: None,
-            working_dirs: Vec::new(),
+            state: openclaudia::state::StateStore::new(state),
         }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> String {
+        self.state
+            .inspect(|state| state.identity.session_id.to_string())
+    }
+
+    #[cfg(test)]
+    pub fn set_id(&self, id: String) {
+        self.state.update(|state, _| {
+            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked(id);
+        });
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn state_snapshot(&self) -> openclaudia::state::SessionState {
+        self.state.snapshot()
+    }
+
+    pub fn inspect_state<R>(
+        &self,
+        inspect: impl FnOnce(&openclaudia::state::SessionState) -> R,
+    ) -> R {
+        self.state.inspect(inspect)
+    }
+
+    pub fn update_state<R>(
+        &self,
+        update: impl FnOnce(
+            &mut openclaudia::state::SessionState,
+            &mut Vec<openclaudia::state::StateEvent>,
+        ) -> R,
+    ) -> R {
+        self.state.update(update)
+    }
+
+    #[must_use]
+    pub fn messages_snapshot(&self) -> Vec<serde_json::Value> {
+        self.inspect_state(|state| state.conversation.messages.clone())
+    }
+
+    #[must_use]
+    pub fn message_count(&self) -> usize {
+        self.inspect_state(|state| state.conversation.messages.len())
+    }
+
+    pub fn push_message(&self, message: serde_json::Value) {
+        let role = message
+            .get("role")
+            .and_then(|role| role.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        self.update_state(|state, events| {
+            state.conversation.messages.push(message);
+            events.push(openclaudia::state::StateEvent::MessageAppended { role });
+        });
+    }
+
+    pub fn replace_messages(&self, messages: Vec<serde_json::Value>) {
+        self.update_state(|state, events| {
+            let was_non_empty = !state.conversation.messages.is_empty();
+            state.conversation.messages = messages;
+            if was_non_empty && state.conversation.messages.is_empty() {
+                events.push(openclaudia::state::StateEvent::Cleared);
+            }
+        });
+    }
+
+    pub fn update_messages<R>(&self, update: impl FnOnce(&mut Vec<serde_json::Value>) -> R) -> R {
+        self.update_state(|state, _| update(&mut state.conversation.messages))
+    }
+
+    #[must_use]
+    pub fn behavior_mode(&self) -> openclaudia::modes::BehaviorMode {
+        self.inspect_state(|state| state.conversation.behavior_mode.clone())
+    }
+
+    pub fn set_behavior_mode(&self, mode: openclaudia::modes::BehaviorMode) {
+        self.update_state(|state, events| {
+            state.conversation.behavior_mode = mode.clone();
+            events.push(openclaudia::state::StateEvent::ModeChanged { new: mode });
+        });
     }
 
     /// Undo the last user+assistant message pair
     pub fn undo(&mut self) -> bool {
-        if self.messages.len() >= 2 {
-            if let (Some(assistant), Some(user)) = (self.messages.pop(), self.messages.pop()) {
-                self.undo_stack.push((user, assistant));
-                self.touch();
-                return true;
+        let changed = self.state.update(|state, _| {
+            let conversation = &mut state.conversation;
+            if conversation.messages.len() >= 2 {
+                if let (Some(assistant), Some(user)) =
+                    (conversation.messages.pop(), conversation.messages.pop())
+                {
+                    conversation.undo_stack.push((user, assistant));
+                    return true;
+                }
             }
+            false
+        });
+        if changed {
+            self.touch();
         }
-        false
+        changed
     }
 
     /// Redo the last undone message pair
     pub fn redo(&mut self) -> bool {
-        if let Some((user, assistant)) = self.undo_stack.pop() {
-            self.messages.push(user);
-            self.messages.push(assistant);
+        let changed = self.state.update(|state, _| {
+            let conversation = &mut state.conversation;
+            if let Some((user, assistant)) = conversation.undo_stack.pop() {
+                conversation.messages.push(user);
+                conversation.messages.push(assistant);
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             self.touch();
-            true
-        } else {
-            false
         }
+        changed
     }
 
     /// Clear undo stack (call when new messages are added)
-    pub fn clear_undo_stack(&mut self) {
-        self.undo_stack.clear();
+    pub fn clear_undo_stack(&self) {
+        self.state
+            .update(|state, _| state.conversation.undo_stack.clear());
     }
 
     /// Add a working directory to the session scope (deduplicates by canonical path).
     ///
     /// Returns `true` if the directory was added, `false` if it was already present.
     pub fn add_working_dir(&mut self, path: std::path::PathBuf) -> bool {
-        if self.working_dirs.contains(&path) {
-            return false;
+        let added = self.state.update(|state, _| {
+            let directories = &mut state.identity.additional_directories_for_claude_md;
+            if directories.contains(&path) {
+                false
+            } else {
+                directories.push(path);
+                true
+            }
+        });
+        if added {
+            self.touch();
         }
-        self.working_dirs.push(path);
-        self.touch();
-        true
+        added
     }
 
     pub fn update_title(&mut self) {
-        if let Some(first_user) = self
-            .messages
-            .iter()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-        {
-            if let Some(content) = first_user.get("content").and_then(|c| c.as_str()) {
-                let title = if content.len() > 50 {
-                    format!("{}...", safe_truncate(content, 47))
-                } else {
-                    content.to_string()
-                };
-                self.title = title;
-            }
+        let title = self.state.inspect(|state| {
+            state
+                .conversation
+                .messages
+                .iter()
+                .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
+                .and_then(|message| message.get("content").and_then(|content| content.as_str()))
+                .map(|content| {
+                    if content.len() > 50 {
+                        format!("{}...", safe_truncate(content, 47))
+                    } else {
+                        content.to_string()
+                    }
+                })
+        });
+        if let Some(title) = title {
+            self.title = title;
         }
     }
 
@@ -232,9 +244,59 @@ impl ChatSession {
     }
 }
 
+impl serde::Serialize for ChatSession {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = self.state.snapshot();
+        state.modes.agent_mode = self.mode;
+        serde::Serialize::serialize(
+            &openclaudia::state::SessionDocument::from_state(
+                self.title.clone(),
+                self.created_at,
+                self.updated_at,
+                self.model.clone(),
+                self.provider.clone(),
+                state,
+            ),
+            serializer,
+        )
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ChatSession {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let document =
+            <openclaudia::state::SessionDocument as serde::Deserialize>::deserialize(deserializer)?;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let title = document.title.clone();
+        let created_at = document.created_at;
+        let updated_at = document.updated_at;
+        let model = document.model.clone();
+        let provider = document.provider.clone();
+        let state = document.into_state(&cwd).map_err(D::Error::custom)?;
+        let mode = state.modes.agent_mode;
+        Ok(Self {
+            title,
+            created_at,
+            updated_at,
+            model,
+            provider,
+            mode,
+            state: openclaudia::state::StateStore::new(state),
+        })
+    }
+}
+
 /// Save a chat session to disk
 pub fn save_chat_session(session: &ChatSession) -> anyhow::Result<()> {
-    let path = chat_session_path(&session.id)?;
+    let path = chat_session_path(&session.id())?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -277,7 +339,7 @@ fn read_chat_session_file(path: &Path) -> anyhow::Result<ChatSession> {
         .with_context(|| format!("failed to read chat session {}", path.display()))?;
     let session: ChatSession = serde_json::from_str(&json)
         .with_context(|| format!("failed to parse chat session {}", path.display()))?;
-    validate_chat_session_id(&session.id)
+    validate_chat_session_id(&session.id())
         .with_context(|| format!("invalid chat session id in {}", path.display()))?;
     Ok(session)
 }
@@ -296,7 +358,7 @@ pub fn load_chat_session(id: &str) -> anyhow::Result<Option<ChatSession>> {
 
     let session: ChatSession = serde_json::from_str(&json)
         .with_context(|| format!("failed to parse chat session {}", path.display()))?;
-    validate_chat_session_id(&session.id)
+    validate_chat_session_id(&session.id())
         .with_context(|| format!("invalid chat session id in {}", path.display()))?;
     Ok(Some(session))
 }
@@ -396,8 +458,8 @@ mod tests {
 
     #[test]
     fn save_chat_session_rejects_path_segments() {
-        let mut session = test_session();
-        session.id = "../outside".to_string();
+        let session = test_session();
+        session.set_id("../outside".to_string());
 
         let err = save_chat_session(&session).expect_err("path traversal must be rejected");
 
@@ -425,8 +487,8 @@ mod tests {
     fn read_chat_session_file_reports_invalid_stored_id() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("invalid-id.json");
-        let mut session = test_session();
-        session.id = "../outside".to_string();
+        let session = test_session();
+        session.set_id("../outside".to_string());
         fs::write(&path, serde_json::to_string(&session).unwrap()).unwrap();
 
         let err = read_chat_session_file(&path).expect_err("invalid stored id must be an error");

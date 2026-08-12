@@ -147,36 +147,110 @@ pub fn request_tui_shutdown() {
     TUI_SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Chat session state — compatible with the CLI's `ChatSession` JSON format
-/// so sessions saved by one can be loaded by the other.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// TUI compatibility wrapper around the shared session state store.
+#[derive(Debug, Clone)]
 pub struct TuiSession {
-    pub id: String,
     pub title: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub model: String,
     pub provider: String,
-    #[serde(default)]
-    pub mode: Mode,
-    pub messages: Vec<serde_json::Value>,
-    #[serde(default)]
-    undo_stack: Vec<(serde_json::Value, serde_json::Value)>,
+    pub mode: crate::state::AgentMode,
+    state: crate::state::StateStore,
 }
 
 impl TuiSession {
+    #[must_use]
     fn new(model: &str, provider: &str) -> Self {
         let now = chrono::Utc::now();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
             title: "New conversation".to_string(),
             created_at: now,
             updated_at: now,
             model: model.to_string(),
             provider: provider.to_string(),
-            mode: Mode::Build,
-            messages: Vec::new(),
-            undo_stack: Vec::new(),
+            mode: crate::state::AgentMode::Build,
+            state: crate::state::StateStore::new(crate::state::SessionState::new(cwd)),
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> String {
+        self.state
+            .inspect(|state| state.identity.session_id.to_string())
+    }
+
+    #[cfg(test)]
+    fn set_id(&self, id: String) {
+        self.state.update(|state, _| {
+            state.identity.session_id = crate::state::SessionId::from_raw_unchecked(id);
+        });
+    }
+
+    #[must_use]
+    pub fn messages_snapshot(&self) -> Vec<serde_json::Value> {
+        self.state
+            .inspect(|state| state.conversation.messages.clone())
+    }
+
+    fn message_count(&self) -> usize {
+        self.state
+            .inspect(|state| state.conversation.messages.len())
+    }
+
+    pub fn push_message(&self, message: serde_json::Value) {
+        let role = message
+            .get("role")
+            .and_then(|role| role.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        self.state.update(|state, events| {
+            state.conversation.messages.push(message);
+            events.push(crate::state::StateEvent::MessageAppended { role });
+        });
+    }
+
+    fn replace_messages(&self, messages: Vec<serde_json::Value>) {
+        self.state.update(|state, events| {
+            let was_non_empty = !state.conversation.messages.is_empty();
+            state.conversation.messages = messages;
+            if was_non_empty && state.conversation.messages.is_empty() {
+                events.push(crate::state::StateEvent::Cleared);
+            }
+        });
+    }
+
+    fn update_messages<R>(&self, update: impl FnOnce(&mut Vec<serde_json::Value>) -> R) -> R {
+        self.state
+            .update(|state, _| update(&mut state.conversation.messages))
+    }
+
+    fn update_state<R>(
+        &self,
+        update: impl FnOnce(&mut crate::state::SessionState, &mut Vec<crate::state::StateEvent>) -> R,
+    ) -> R {
+        self.state.update(update)
+    }
+
+    #[must_use]
+    pub fn state_snapshot(&self) -> crate::state::SessionState {
+        self.state.snapshot()
+    }
+
+    /// Copy the compatibility wrapper without sharing its mutable store.
+    ///
+    /// `StateStore::clone` intentionally shares state, but load/recovery paths
+    /// historically treated a cloned `TuiSession` as an independent value.
+    fn detached_clone(&self) -> Self {
+        Self {
+            title: self.title.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            mode: self.mode,
+            state: crate::state::StateStore::new(self.state.snapshot()),
         }
     }
 
@@ -185,18 +259,23 @@ impl TuiSession {
     }
 
     fn update_title(&mut self) {
-        if let Some(first_user) = self
-            .messages
-            .iter()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-        {
-            if let Some(content) = first_user.get("content").and_then(|c| c.as_str()) {
-                self.title = if content.len() > 50 {
-                    format!("{}...", crate::tools::safe_truncate(content, 47))
-                } else {
-                    content.to_string()
-                };
-            }
+        let title = self.state.inspect(|state| {
+            state
+                .conversation
+                .messages
+                .iter()
+                .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
+                .and_then(|message| message.get("content").and_then(|content| content.as_str()))
+                .map(|content| {
+                    if content.len() > 50 {
+                        format!("{}...", crate::tools::safe_truncate(content, 47))
+                    } else {
+                        content.to_string()
+                    }
+                })
+        });
+        if let Some(title) = title {
+            self.title = title;
         }
     }
 
@@ -209,39 +288,117 @@ impl TuiSession {
     }
 
     fn undo(&mut self) -> bool {
-        if self.messages.len() >= 2 {
-            if let (Some(assistant), Some(user)) = (self.messages.pop(), self.messages.pop()) {
-                self.undo_stack.push((user, assistant));
-                self.touch();
-                return true;
+        let changed = self.state.update(|state, _| {
+            let conversation = &mut state.conversation;
+            if conversation.messages.len() >= 2 {
+                if let (Some(assistant), Some(user)) =
+                    (conversation.messages.pop(), conversation.messages.pop())
+                {
+                    conversation.undo_stack.push((user, assistant));
+                    return true;
+                }
             }
+            false
+        });
+        if changed {
+            self.touch();
         }
-        false
+        changed
     }
 
     fn redo(&mut self) -> bool {
-        if let Some((user, assistant)) = self.undo_stack.pop() {
-            self.messages.push(user);
-            self.messages.push(assistant);
+        let changed = self.state.update(|state, _| {
+            let conversation = &mut state.conversation;
+            if let Some((user, assistant)) = conversation.undo_stack.pop() {
+                conversation.messages.push(user);
+                conversation.messages.push(assistant);
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             self.touch();
-            true
-        } else {
-            false
         }
+        changed
     }
 
     fn estimate_tokens(&self) -> usize {
-        self.messages
-            .iter()
-            .map(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .len()
-                    / 4
-                    + 4
-            })
-            .sum()
+        self.state.inspect(|state| {
+            state
+                .conversation
+                .messages
+                .iter()
+                .map(|message| {
+                    message
+                        .get("content")
+                        .and_then(|content| content.as_str())
+                        .unwrap_or("")
+                        .len()
+                        / 4
+                        + 4
+                })
+                .sum()
+        })
+    }
+}
+
+impl serde::Serialize for TuiSession {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = self.state.snapshot();
+        state.modes.agent_mode = self.mode;
+        serde::Serialize::serialize(
+            &crate::state::SessionDocument::from_state(
+                self.title.clone(),
+                self.created_at,
+                self.updated_at,
+                self.model.clone(),
+                self.provider.clone(),
+                state,
+            ),
+            serializer,
+        )
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TuiSession {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let document =
+            <crate::state::SessionDocument as serde::Deserialize>::deserialize(deserializer)?;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let title = document.title.clone();
+        let created_at = document.created_at;
+        let updated_at = document.updated_at;
+        let model = document.model.clone();
+        let provider = document.provider.clone();
+        let state = document.into_state(&cwd).map_err(D::Error::custom)?;
+        let mode = state.modes.agent_mode;
+        Ok(Self {
+            title,
+            created_at,
+            updated_at,
+            model,
+            provider,
+            mode,
+            state: crate::state::StateStore::new(state),
+        })
+    }
+}
+
+const fn tui_mode_for_agent(mode: crate::state::AgentMode) -> Mode {
+    match mode {
+        crate::state::AgentMode::Plan => Mode::Plan,
+        crate::state::AgentMode::Build
+        | crate::state::AgentMode::Extend
+        | crate::state::AgentMode::Refactor => Mode::Build,
     }
 }
 
@@ -403,12 +560,12 @@ fn iso_of_systemtime(t: std::time::SystemTime) -> String {
 
 fn save_session(session: &TuiSession) -> Result<(), FileError> {
     let dir = sessions_dir();
-    validate_tui_session_id(&session.id).map_err(|reason| FileError::Invalid {
+    validate_tui_session_id(&session.id()).map_err(|reason| FileError::Invalid {
         path: dir.clone(),
         reason,
     })?;
     file_error::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", session.id));
+    let path = dir.join(format!("{}.json", session.id()));
     match file_error::write_json_pretty(&path, session) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -437,9 +594,10 @@ fn save_session_with_recovery(
     session: &TuiSession,
     path: &std::path::Path,
 ) -> Result<(), FileError> {
-    let mut salvaged = session.clone();
+    let salvaged = session.detached_clone();
+    let mut messages = salvaged.messages_snapshot();
     let mut lost = 0usize;
-    for msg in &mut salvaged.messages {
+    for msg in &mut messages {
         if serde_json::to_string(msg).is_err() {
             *msg = serde_json::json!({
                 "role": "system",
@@ -451,10 +609,11 @@ fn save_session_with_recovery(
     if lost > 0 {
         tracing::warn!(
             lost,
-            session_id = %salvaged.id,
+            session_id = %salvaged.id(),
             "save_session: replaced {lost} unserializable message(s) with placeholders"
         );
     }
+    salvaged.replace_messages(messages);
     file_error::write_json_pretty(path, &salvaged)
 }
 
@@ -476,7 +635,7 @@ fn read_tui_session_file(path: &Path) -> Result<TuiSession, FileError> {
     let json = file_error::read_file(path)?;
     let session: TuiSession =
         serde_json::from_str(&json).map_err(file_error::FileError::json_with_path(path))?;
-    validate_tui_session_id(&session.id).map_err(|reason| FileError::Invalid {
+    validate_tui_session_id(&session.id()).map_err(|reason| FileError::Invalid {
         path: path.to_path_buf(),
         reason,
     })?;
@@ -929,8 +1088,6 @@ pub struct App {
     pub vdd_engine: Option<std::sync::Arc<crate::vdd::VddEngine>>,
     /// Auth used by VDD's builder-side verifier for the current chat provider.
     pub vdd_builder_auth: crate::vdd::VddProviderAuth,
-    /// Conversation messages in the provider's wire format.
-    pub session_messages: Vec<serde_json::Value>,
     /// Async runtime handle for spawning API tasks from the sync event loop.
     runtime_handle: Option<tokio::runtime::Handle>,
     /// Persistent chat session (for save/load/resume)
@@ -956,7 +1113,7 @@ pub struct App {
     pub rules_content: Option<String>,
     /// Whether rules have been injected into session messages.
     rules_injected: bool,
-    /// Count of `session_messages` already appended to the Claude Code
+    /// Count of canonical conversation messages already appended to the Claude Code
     /// JSONL transcript. Everything past this index is persisted on the
     /// next call to `persist_transcript_tail`. Rebuilt to 0 on resume
     /// because resuming re-points at an existing transcript file, so we
@@ -1021,7 +1178,6 @@ impl App {
             permission_mgr: None,
             vdd_engine: None,
             vdd_builder_auth: crate::vdd::VddProviderAuth::None,
-            session_messages: Vec::new(),
             runtime_handle: None,
             chat_session: TuiSession::new(model, provider),
             pending_permission: None,
@@ -1046,18 +1202,17 @@ impl App {
     }
 
     fn apply_loaded_session(&mut self, loaded: &TuiSession) {
-        self.chat_session.clone_from(loaded);
-        self.session_messages.clone_from(&loaded.messages);
+        self.chat_session = loaded.detached_clone();
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
-        self.mode = loaded.mode;
+        self.mode = tui_mode_for_agent(loaded.mode);
         self.refresh_app_config_target();
         self.tokens = self.chat_session.estimate_tokens();
         self.transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        self.transcript_watermark = self.session_messages.len();
+        self.transcript_watermark = self.chat_session.message_count();
         // Repaint the transcript.
         self.messages = super::messages::MessageList::new();
-        for msg in &loaded.messages {
+        for msg in loaded.messages_snapshot() {
             let role: super::messages::Role = msg
                 .get("role")
                 .and_then(|r| r.as_str())
@@ -1089,7 +1244,10 @@ impl App {
     /// with a user-visible system message when no match is found.
     fn resume_session_by_id(&mut self, id: &str) {
         let sessions = list_sessions();
-        let Some(loaded) = sessions.into_iter().find(|s| s.id.starts_with(id)) else {
+        let Some(loaded) = sessions
+            .into_iter()
+            .find(|session| session.id().starts_with(id))
+        else {
             self.messages.add(DisplayMessage::error(format!(
                 "No session found with id prefix '{id}'.",
             )));
@@ -1153,7 +1311,7 @@ impl App {
             (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
         {
             let engine = engine.clone();
-            let session_id = self.chat_session.id.clone();
+            let session_id = self.chat_session.id();
             handle.spawn(async move {
                 let input = crate::hooks::HookInput::new(crate::hooks::HookEvent::Stop)
                     .with_session_id(session_id);
@@ -1169,7 +1327,7 @@ impl App {
             (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
         {
             let engine = engine.clone();
-            let session_id = self.chat_session.id.clone();
+            let session_id = self.chat_session.id();
             let message = message.to_string();
             let level = level.to_string();
             handle.spawn(async move {
@@ -1183,25 +1341,26 @@ impl App {
         }
     }
 
-    /// Append every `session_messages` entry past the watermark to the
+    /// Append every canonical session message past the watermark to the
     /// Claude Code-layout JSONL transcript at
     /// `$CLAUDE_CONFIG_HOME_DIR/projects/<sanitized-cwd>/<session>.jsonl`.
     /// Best-effort: transcript I/O failures are logged but never bubble
     /// up — a missing transcript must never break the live turn.
     fn persist_transcript_tail(&mut self) {
         let cwd = self.transcript_cwd.clone();
-        let session_id = self.chat_session.id.clone();
+        let session_id = self.chat_session.id();
         // crosslink #709: track ONLY the entries that were actually
         // persisted. The previous implementation unconditionally jumped
-        // the watermark to `session_messages.len()` after an early break,
+        // the watermark to the message count after an early break,
         // which silently dropped every message past the failure point
         // from the transcript permanently (the next call would skip them
         // entirely). Advance by the appended count so retried calls
         // resume exactly where the failure occurred.
         let start = self.transcript_watermark;
-        let total = self.session_messages.len();
+        let messages = self.chat_session.messages_snapshot();
+        let total = messages.len();
         let mut appended: usize = 0;
-        for msg in &self.session_messages[start..] {
+        for msg in &messages[start..] {
             let kind = msg
                 .get("role")
                 .and_then(|r| r.as_str())
@@ -1330,7 +1489,7 @@ impl App {
 
         // Inject system prompt as the first message
         if !self.system_prompt.is_empty() {
-            self.session_messages.push(serde_json::json!({
+            self.chat_session.push_message(serde_json::json!({
                 "role": "system",
                 "content": self.system_prompt
             }));
@@ -1400,9 +1559,6 @@ impl App {
         execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
 
         // Save session on exit
-        self.chat_session
-            .messages
-            .clone_from(&self.session_messages);
         self.chat_session.touch();
         let _ = save_session(&self.chat_session);
 
@@ -1416,7 +1572,7 @@ impl App {
         // within a runtime" panic that surfaced when the TUI was launched
         // via `#[tokio::main(flavor = "current_thread")]`.
         if let Some(engine) = self.hook_engine.as_ref() {
-            let session_id = self.chat_session.id.clone();
+            let session_id = self.chat_session.id();
             let input = crate::hooks::HookInput::new(crate::hooks::HookEvent::SessionEnd)
                 .with_session_id(session_id);
             let _ = engine
@@ -1512,7 +1668,7 @@ impl App {
                 self.spawn_api_turn();
             }
             Ok(AppEvent::SyncMessages(messages)) => {
-                self.session_messages = messages;
+                self.chat_session.replace_messages(messages);
             }
             Ok(AppEvent::PermissionRequest {
                 tool_name,
@@ -1623,9 +1779,6 @@ impl App {
         self.messages.finish_streaming();
         self.streaming_raw_text.clear();
         self.is_waiting = false;
-        self.chat_session
-            .messages
-            .clone_from(&self.session_messages);
         self.chat_session.update_title();
         self.chat_session.touch();
         let _ = save_session(&self.chat_session);
@@ -1646,7 +1799,7 @@ impl App {
         } else {
             self.streaming_raw_text.clone()
         };
-        match render_live_final_response_for_display(&self.chat_session.id, &content) {
+        match render_live_final_response_for_display(&self.chat_session.id(), &content) {
             Some(rendered) => self.messages.streaming_text = rendered,
             None => self.messages.streaming_text.clear(),
         }
@@ -2205,7 +2358,7 @@ impl App {
                     .map(|s| {
                         format!(
                             "  {} — {} ({})",
-                            crate::tools::safe_truncate(&s.id, 8),
+                            crate::tools::safe_truncate(&s.id(), 8),
                             s.title,
                             s.updated_at.format("%Y-%m-%d %H:%M")
                         )
@@ -2229,7 +2382,6 @@ impl App {
         }
         if text == "/undo" {
             if self.chat_session.undo() {
-                self.session_messages = self.chat_session.messages.clone();
                 if self.messages.len() >= 2 {
                     self.messages.pop_last(2);
                 }
@@ -2244,7 +2396,6 @@ impl App {
         }
         if text == "/redo" {
             if self.chat_session.redo() {
-                self.session_messages = self.chat_session.messages.clone();
                 self.messages
                     .add(DisplayMessage::system("Redone last undone messages."));
                 let _ = save_session(&self.chat_session);
@@ -2264,7 +2415,7 @@ impl App {
         if arg.is_empty() {
             let mut turn_list = String::new();
             let mut turn_num = 0;
-            for msg in &self.chat_session.messages {
+            for msg in self.chat_session.messages_snapshot() {
                 if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
                     turn_num += 1;
                     let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -2294,7 +2445,6 @@ impl App {
                     }
                 }
                 if rewound > 0 {
-                    self.session_messages = self.chat_session.messages.clone();
                     let to_remove = rewound * 2;
                     if self.messages.len() >= to_remove {
                         self.messages.pop_last(to_remove);
@@ -2334,7 +2484,7 @@ impl App {
                 self.provider,
                 self.chat_session.created_at.format("%Y-%m-%d %H:%M")
             );
-            for msg in &self.session_messages {
+            for msg in self.chat_session.messages_snapshot() {
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 if role == "system" {
@@ -2344,7 +2494,7 @@ impl App {
             }
             let export_path = format!(
                 "conversation-{}.md",
-                crate::tools::safe_truncate(&self.chat_session.id, 8)
+                crate::tools::safe_truncate(&self.chat_session.id(), 8)
             );
             let path_for_render = export_path.clone();
             self.spawn_fs(SpawnTarget::Files, move || {
@@ -2440,8 +2590,12 @@ impl App {
     fn slash_clear(&mut self) {
         self.messages = MessageList::new();
         // Reset session but keep system prompt.
-        self.session_messages
-            .retain(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
+        self.chat_session.update_state(|state, events| {
+            state.conversation.messages.retain(|message| {
+                message.get("role").and_then(|role| role.as_str()) == Some("system")
+            });
+            events.push(crate::state::StateEvent::Cleared);
+        });
     }
 
     /// Table-handler entry point for `/status`.
@@ -2451,7 +2605,7 @@ impl App {
             self.model,
             self.provider,
             self.effort_level,
-            self.session_messages.len(),
+            self.chat_session.message_count(),
             self.tokens,
         )));
     }
@@ -2459,7 +2613,7 @@ impl App {
     /// Table-handler entry point for `/mode`.
     fn slash_mode(&mut self) {
         self.chat_session.toggle_mode();
-        self.mode = self.chat_session.mode;
+        self.mode = tui_mode_for_agent(self.chat_session.mode);
         self.messages.add(DisplayMessage::system(format!(
             "Mode: {} — {}",
             self.chat_session.mode,
@@ -2502,8 +2656,8 @@ impl App {
                 skill.name
             )));
             self.apply_skill_turn_metadata(&skill);
-            self.session_messages
-                .push(serde_json::json!({ "role": "user", "content": skill.prompt }));
+            self.chat_session
+                .push_message(serde_json::json!({ "role": "user", "content": skill.prompt }));
             self.is_waiting = true;
             self.spawn_api_turn();
             return;
@@ -2887,7 +3041,7 @@ impl App {
             return true;
         }
         if text == "/context" {
-            let msg_count = self.session_messages.len();
+            let msg_count = self.chat_session.message_count();
             let tokens = self.chat_session.estimate_tokens();
             self.messages.add(DisplayMessage::system(format!(
                 "Context usage:\n  Messages: {msg_count}\n  Est. tokens: ~{tokens}\n  Model: {}\n  Provider: {}",
@@ -2939,7 +3093,7 @@ impl App {
 
         self.messages.add(DisplayMessage::user(text));
 
-        self.session_messages.push(serde_json::json!({
+        self.chat_session.push_message(serde_json::json!({
             "role": "user",
             "content": expanded
         }));
@@ -2947,13 +3101,15 @@ impl App {
         // Inject rules as system message on first turn
         if !self.rules_injected {
             if let Some(ref rules) = self.rules_content {
-                self.session_messages.insert(
-                    0,
-                    serde_json::json!({
-                        "role": "system",
-                        "content": rules
-                    }),
-                );
+                self.chat_session.update_messages(|messages| {
+                    messages.insert(
+                        0,
+                        serde_json::json!({
+                            "role": "system",
+                            "content": rules
+                        }),
+                    );
+                });
             }
             self.rules_injected = true;
         }
@@ -3055,7 +3211,7 @@ impl App {
         target: SpawnTarget,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let tx = self.api_event_tx.clone();
-        let session_id = self.chat_session.id.clone();
+        let session_id = self.chat_session.id();
         let cwd = std::env::current_dir().ok();
         let ledger_target = target.clone();
         // Eagerly own the argv as Strings — the future outlives `&self`.
@@ -3166,7 +3322,7 @@ impl App {
         let prompt_blocks = api.prompt_blocks;
         let wire_api = api.wire_api;
         let hook_engine = self.hook_engine.clone();
-        let session_id_for_task = self.chat_session.id.clone();
+        let session_id_for_task = self.chat_session.id();
         let memory_db = self.memory_db.clone();
         let app_config = self.app_config.clone();
         let permission_mgr = self.permission_mgr.clone();
@@ -3174,8 +3330,9 @@ impl App {
         let vdd_builder_auth = self.vdd_builder_auth.clone();
         let policy_enforcer = std::sync::Arc::clone(&self.policy_enforcer);
         let task_mgr = self.task_mgr.clone();
-        // Clone session messages so the async task can build follow-up requests
-        let session_messages = self.session_messages.clone();
+        // Clone the canonical state snapshot so the async task can build
+        // follow-up requests without holding the state lock across awaits.
+        let session_messages = self.chat_session.messages_snapshot();
 
         handle.spawn(run_api_turn_async(ApiTurnParams {
             session_messages,
@@ -5343,7 +5500,7 @@ mod tests {
     #[test]
     fn apply_provider_switch_updates_metadata_and_transport() {
         let mut app = App::new("old-model", "anthropic");
-        let original_session_id = app.chat_session.id.clone();
+        let original_session_id = app.chat_session.id();
         let blocks = crate::prompt::SystemPromptBlocks {
             stable_prefix: "stable".to_string(),
             dynamic_suffix: "dynamic".to_string(),
@@ -5370,7 +5527,7 @@ mod tests {
 
         assert_eq!(app.provider, "kimi");
         assert_eq!(app.model, "kimi-k2.7-code");
-        assert_eq!(app.chat_session.id, original_session_id);
+        assert_eq!(app.chat_session.id(), original_session_id);
         assert_eq!(app.chat_session.provider, "kimi");
         assert_eq!(app.chat_session.model, "kimi-k2.7-code");
         assert_eq!(
@@ -5473,7 +5630,7 @@ mod tests {
 
         assert_eq!(app.input.content, "first\n");
         assert!(
-            app.session_messages.is_empty(),
+            app.chat_session.message_count() == 0,
             "modified Enter must not submit the prompt"
         );
     }
@@ -5488,7 +5645,7 @@ mod tests {
 
         assert_eq!(app.input.content, "first\n");
         assert!(
-            app.session_messages.is_empty(),
+            app.chat_session.message_count() == 0,
             "Ctrl+J must not submit the prompt"
         );
     }
@@ -5500,7 +5657,7 @@ mod tests {
         app.handle_app_event(Ok(AppEvent::Paste("first\r\nsecond".to_string())));
 
         assert_eq!(app.input.content, "first\nsecond");
-        assert!(app.session_messages.is_empty());
+        assert_eq!(app.chat_session.message_count(), 0);
     }
 
     #[test]
@@ -5512,10 +5669,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(app.input.is_empty());
+        let messages = app.chat_session.messages_snapshot();
         assert_eq!(
-            app.session_messages
-                .last()
-                .and_then(|msg| msg.get("content")),
+            messages.last().and_then(|msg| msg.get("content")),
             Some(&serde_json::json!("first\nsecond"))
         );
     }
@@ -5698,7 +5854,7 @@ mod tests {
         let rx = wire_app(&mut app);
         let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
         let _guard =
-            crate::ledger::install_active_ledger_for_session(&app.chat_session.id, ledger.clone());
+            crate::ledger::install_active_ledger_for_session(app.chat_session.id(), ledger.clone());
 
         let join = app
             .spawn_shell(
@@ -5766,7 +5922,7 @@ mod tests {
         );
         assert_eq!(exit_code, None);
         assert!(
-            app.session_messages.is_empty(),
+            app.chat_session.message_count() == 0,
             "! shell escapes must not be submitted as chat messages"
         );
     }
@@ -5798,8 +5954,8 @@ mod tests {
         let mut app = App::new("test-model", "test-provider");
         app.handle_input(format!("please read @{file_name}"));
 
-        let content = app
-            .session_messages
+        let messages = app.chat_session.messages_snapshot();
+        let content = messages
             .last()
             .and_then(|message| message.get("content"))
             .and_then(serde_json::Value::as_str)
@@ -5906,22 +6062,18 @@ mod tests {
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
         let mut older = TuiSession::new("old-model", "old-provider");
-        older.id = "older-session".to_string();
+        older.set_id("older-session".to_string());
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
-        older
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "older"}));
+        older.push_message(serde_json::json!({"role": "user", "content": "older"}));
 
         let mut newer = TuiSession::new("new-model", "new-provider");
-        newer.id = "newer-session".to_string();
+        newer.set_id("newer-session".to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
-        newer
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "newer"}));
+        newer.push_message(serde_json::json!({"role": "user", "content": "newer"}));
 
         save_session(&older).expect("older session should save");
         save_session(&newer).expect("newer session should save");
@@ -5929,10 +6081,10 @@ mod tests {
         let mut app = App::new("initial-model", "initial-provider");
         app.apply_startup_resume(true, None);
 
-        assert_eq!(app.chat_session.id, "newer-session");
+        assert_eq!(app.chat_session.id(), "newer-session");
         assert_eq!(app.model, "new-model");
         assert_eq!(app.provider, "new-provider");
-        assert_eq!(app.session_messages[0]["content"], "newer");
+        assert_eq!(app.chat_session.messages_snapshot()[0]["content"], "newer");
     }
 
     #[test]
@@ -5941,13 +6093,13 @@ mod tests {
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
         let mut older = TuiSession::new("old-model", "old-provider");
-        older.id = "older-session".to_string();
+        older.set_id("older-session".to_string());
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
 
         let mut newer = TuiSession::new("new-model", "new-provider");
-        newer.id = "newer-session".to_string();
+        newer.set_id("newer-session".to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
@@ -5958,7 +6110,7 @@ mod tests {
         let mut app = App::new("initial-model", "initial-provider");
         app.apply_startup_resume(true, Some("older"));
 
-        assert_eq!(app.chat_session.id, "older-session");
+        assert_eq!(app.chat_session.id(), "older-session");
         assert_eq!(app.model, "old-model");
     }
 
@@ -5967,8 +6119,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut session = TuiSession::new("model", "provider");
-        session.id = "../outside".to_string();
+        let session = TuiSession::new("model", "provider");
+        session.set_id("../outside".to_string());
 
         let err = save_session(&session).expect_err("path traversal id must be rejected");
 
@@ -5986,14 +6138,14 @@ mod tests {
         let _guard = SessionDirGuard::set(session_dir.clone());
 
         let mut valid = TuiSession::new("valid-model", "provider");
-        valid.id = "abc".to_string();
+        valid.set_id("abc".to_string());
         valid.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
         save_session(&valid).expect("short valid id should save");
 
-        let mut invalid = TuiSession::new("invalid-model", "provider");
-        invalid.id = "../outside".to_string();
+        let invalid = TuiSession::new("invalid-model", "provider");
+        invalid.set_id("../outside".to_string());
         std::fs::write(
             session_dir.join("invalid.json"),
             serde_json::to_string(&invalid).expect("serialize invalid fixture"),
@@ -6003,7 +6155,7 @@ mod tests {
         let sessions = list_sessions();
 
         assert_eq!(sessions.len(), 1, "invalid stored session must be skipped");
-        assert_eq!(sessions[0].id, "abc");
+        assert_eq!(sessions[0].id(), "abc");
     }
 
     #[test]
@@ -6018,11 +6170,11 @@ mod tests {
 
         let mut app = App::new("test-model", "test-provider");
         app.transcript_cwd = tmp.path().to_path_buf();
-        app.session_messages = vec![
+        app.chat_session.replace_messages(vec![
             serde_json::json!({"role": "user", "content": "one"}),
             serde_json::json!({"role": "assistant", "content": "two"}),
             serde_json::json!({"role": "user", "content": "three"}),
-        ];
+        ]);
         app.transcript_watermark = 0;
 
         app.persist_transcript_tail();
@@ -6053,11 +6205,11 @@ mod tests {
 
         let mut app = App::new("test-model", "test-provider");
         app.transcript_cwd = tmp.path().to_path_buf();
-        app.session_messages = vec![
+        app.chat_session.replace_messages(vec![
             serde_json::json!({"role": "user", "content": "one"}),
             serde_json::json!({"role": "assistant", "content": "two"}),
             serde_json::json!({"role": "user", "content": "three"}),
-        ];
+        ]);
         app.transcript_watermark = 0;
 
         app.persist_transcript_tail();

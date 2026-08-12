@@ -107,7 +107,7 @@ fn push_observed_cli_tool_result_message(
     final_is_error: bool,
 ) {
     observe_cli_model_visible_tool_result(
-        &session.id,
+        &session.id(),
         tool_call,
         tool_call_id,
         final_content,
@@ -474,7 +474,7 @@ impl ChatRepl {
             ChatSession::new(&model, &config.proxy.target, initial_behavior_mode);
         maybe_resume_session(&mut chat_session, args.resume, args.session_id.as_deref());
 
-        let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id)?;
+        let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id())?;
         let memory_db: Option<memory::MemoryDb> = init_memory_with_banner();
         let permission_mgr = init_permission_manager(&config, args.dangerously_skip_permissions);
         let policy_enforcer = std::sync::Arc::new(
@@ -570,7 +570,7 @@ impl ChatRepl {
 
     /// Build the readline prompt string and render the status/bottom bars.
     fn build_prompt_string(&self) -> String {
-        let behavior_name = self.chat_session.behavior_mode.display_name();
+        let behavior_name = self.chat_session.behavior_mode().display_name();
         let mode_str = format!(
             "{} ({})",
             self.chat_session.mode.display().to_lowercase(),
@@ -642,7 +642,7 @@ impl ChatRepl {
                     execute_shell_command_with_permission(cmd, &mut self.permissions)
                 {
                     openclaudia::grounded_loop::observe_shell_command_for_session(
-                        &self.chat_session.id,
+                        &self.chat_session.id(),
                         &execution.cwd,
                         &execution.command,
                         execution.exit_code,
@@ -665,16 +665,18 @@ impl ChatRepl {
             return Ok(Some(false));
         }
 
-        self.current_task_obs = latest_user_message_content(&self.chat_session.messages)
-            .and_then(|content| observe_cli_user_task(&self.chat_session.id, content));
+        let task_messages = self.chat_session.messages_snapshot();
+        self.current_task_obs = latest_user_message_content(&task_messages)
+            .and_then(|content| observe_cli_user_task(&self.chat_session.id(), content));
 
         self.inject_rules_from_extensions();
         let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
         self.install_system_prompt(&prompt_blocks);
+        let request_state = self.chat_session.messages_snapshot();
         let request_messages = match request_messages_with_cli_grounding(
-            &self.chat_session.id,
+            &self.chat_session.id(),
             self.current_task_obs,
-            &self.chat_session.messages,
+            &request_state,
         ) {
             Ok(messages) => messages,
             Err(err) => {
@@ -753,7 +755,7 @@ impl ChatRepl {
         if note.is_empty() {
             return;
         }
-        self.chat_session.messages.push(serde_json::json!({
+        self.chat_session.push_message(serde_json::json!({
             "role": "system",
             "content": format!("[Note: {}]", note),
             "metadata": { "type": "note" }
@@ -773,12 +775,10 @@ impl ChatRepl {
         input: &mut String,
         memory_db: Option<&memory::MemoryDb>,
     ) -> SlashOutcome {
-        let Some(result) = handle_slash_command(
-            input,
-            &mut self.chat_session.messages,
-            &self.config.proxy.target,
-            &self.model,
-        ) else {
+        let result = self.chat_session.update_messages(|messages| {
+            handle_slash_command(input, messages, &self.config.proxy.target, &self.model)
+        });
+        let Some(result) = result else {
             return SlashOutcome::FallThrough;
         };
         match result {
@@ -788,7 +788,7 @@ impl ChatRepl {
             }
             SlashCommandResult::Clear => {
                 save_session_to_short_term_memory(&self.chat_session, memory_db);
-                let prev_mode = self.chat_session.behavior_mode.clone();
+                let prev_mode = self.chat_session.behavior_mode();
                 self.chat_session =
                     ChatSession::new(&self.model, &self.config.proxy.target, prev_mode);
                 SlashOutcome::Continue
@@ -799,7 +799,7 @@ impl ChatRepl {
                         self.chat_session = loaded;
                         println!(
                             "Loaded {} messages from previous session.\n",
-                            self.chat_session.messages.len()
+                            self.chat_session.message_count()
                         );
                     }
                     Ok(None) => {
@@ -869,11 +869,12 @@ impl ChatRepl {
                 SlashOutcome::Continue
             }
             SlashCommandResult::SideQuestion(question) => {
-                let saved = self.chat_session.messages.clone();
-                self.chat_session.messages =
-                    vec![serde_json::json!({"role":"user","content":question})];
+                let saved = self.chat_session.messages_snapshot();
+                self.chat_session
+                    .replace_messages(vec![serde_json::json!({"role":"user","content":question})]);
                 eprintln!("\x1b[90m[/btw aside — main flow will be restored]\x1b[0m");
-                self.chat_session.messages.extend(saved);
+                self.chat_session
+                    .update_messages(|messages| messages.extend(saved));
                 SlashOutcome::FallThrough
             }
             SlashCommandResult::Skill(invocation) => {
@@ -983,7 +984,7 @@ impl ChatRepl {
             SlashCommandResult::Keybindings => display_keybindings(&self.config.keybindings),
             SlashCommandResult::Memory(args) => handle_memory_command(&args, memory_db),
             SlashCommandResult::Activity(args) => {
-                handle_activity_command(&args, &self.chat_session.id, memory_db);
+                handle_activity_command(&args, &self.chat_session.id(), memory_db);
             }
             SlashCommandResult::ThemeChanged(name) => {
                 if let Some(theme) = tui::Theme::from_name(&name) {
@@ -1001,7 +1002,7 @@ impl ChatRepl {
                 model,
             ),
             SlashCommandResult::SetBehaviorMode(new_mode) => {
-                self.chat_session.behavior_mode = new_mode;
+                self.chat_session.set_behavior_mode(new_mode);
             }
             // BranchSession plus the five already-handled-in-head variants
             // (Exit/Clear/LoadSession/Export/Compact) plus the catch-all
@@ -1019,7 +1020,7 @@ impl ChatRepl {
         } else {
             editor_content
         };
-        self.chat_session.messages.push(serde_json::json!({
+        self.chat_session.push_message(serde_json::json!({
             "role": "user",
             "content": expanded
         }));
@@ -1041,7 +1042,7 @@ impl ChatRepl {
             println!(
                 "\n{} last exchange. {} messages {}.\n",
                 verb,
-                self.chat_session.messages.len(),
+                self.chat_session.message_count(),
                 after_word
             );
             if let Err(e) = save_chat_session(&self.chat_session) {
@@ -1059,7 +1060,7 @@ impl ChatRepl {
         if rewound > 0 {
             println!(
                 "\nRewound {rewound} turn(s). {} messages remaining.\n",
-                self.chat_session.messages.len()
+                self.chat_session.message_count()
             );
             if let Err(e) = save_chat_session(&self.chat_session) {
                 tracing::warn!("Failed to save session: {}", e);
@@ -1071,14 +1072,14 @@ impl ChatRepl {
 
     /// Replace the active transcript with a named `/branch` snapshot.
     fn handle_teleport(&mut self, name: &str, messages: Vec<serde_json::Value>) {
-        self.chat_session.messages = messages;
+        self.chat_session.replace_messages(messages);
         self.chat_session.clear_undo_stack();
         self.chat_session.update_title();
         self.chat_session.touch();
 
         println!(
             "\nTeleported to branch snapshot '{name}'. {} messages active.\n",
-            self.chat_session.messages.len()
+            self.chat_session.message_count()
         );
 
         if let Err(e) = save_chat_session(&self.chat_session) {
@@ -1108,20 +1109,20 @@ impl ChatRepl {
 
     fn print_status(&self) {
         let tokens = estimate_session_tokens(&self.chat_session);
-        let msg_count = self.chat_session.messages.len();
+        let msg_count = self.chat_session.message_count();
         let duration = chrono::Utc::now().signed_duration_since(self.chat_session.created_at);
         let mins = duration.num_minutes();
         println!("\n=== Session Status ===");
         println!(
             "  Session ID: {}...",
-            safe_truncate(&self.chat_session.id, 8)
+            safe_truncate(&self.chat_session.id(), 8)
         );
         println!("  Title:      {}", self.chat_session.title);
         println!("  Provider:   {}", self.chat_session.provider);
         println!("  Model:      {}", self.chat_session.model);
         println!(
             "  Behavior:   {}",
-            self.chat_session.behavior_mode.description()
+            self.chat_session.behavior_mode().description()
         );
         println!(
             "  Mode:       {} ({})",
@@ -1220,7 +1221,7 @@ impl ChatRepl {
             input.to_string()
         };
 
-        self.chat_session.messages.push(serde_json::json!({
+        self.chat_session.push_message(serde_json::json!({
             "role": "user",
             "content": expanded_input.clone()
         }));
@@ -1229,9 +1230,8 @@ impl ChatRepl {
         self.chat_session.clear_undo_stack();
 
         if let Some(ref mut learner) = auto_learner {
-            let prev_assistant = self
-                .chat_session
-                .messages
+            let messages = self.chat_session.messages_snapshot();
+            let prev_assistant = messages
                 .iter()
                 .rev()
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
@@ -1259,20 +1259,22 @@ impl ChatRepl {
 
         for output in &hook_result.outputs {
             if let Some(sys_msg) = &output.system_message {
-                self.chat_session.messages.insert(
-                    0,
-                    serde_json::json!({
-                        "role": "system",
-                        "content": sys_msg
-                    }),
-                );
+                self.chat_session.update_messages(|messages| {
+                    messages.insert(
+                        0,
+                        serde_json::json!({
+                            "role": "system",
+                            "content": sys_msg
+                        }),
+                    );
+                });
             }
             if let Some(ctx) = &output.additional_context {
                 // Route through the centralized envelope builder so the
                 // crosslink #502 XML-escape (which neutralizes any
                 // attacker-supplied `</system-reminder>` closing tag)
                 // is applied here too, not just in `ContextInjector`.
-                self.chat_session.messages.push(serde_json::json!({
+                self.chat_session.push_message(serde_json::json!({
                     "role": "system",
                     "content": openclaudia::context::wrap_system_reminder(ctx),
                 }));
@@ -1282,17 +1284,18 @@ impl ChatRepl {
     }
 
     fn request_messages_with_grounding(&self) -> Result<Vec<serde_json::Value>, String> {
+        let session_messages = self.chat_session.messages_snapshot();
         let mut messages = request_messages_with_cli_grounding(
-            &self.chat_session.id,
+            &self.chat_session.id(),
             self.current_task_obs,
-            &self.chat_session.messages,
+            &session_messages,
         )?;
         let normalized =
             openclaudia::pipeline::normalize_message_tool_arguments_for_history(&mut messages);
         if normalized > 0 {
             tracing::warn!(
                 normalized,
-                session_id = %self.chat_session.id,
+                session_id = %self.chat_session.id(),
                 "normalized malformed historical tool-call arguments before provider request"
             );
         }
@@ -1320,13 +1323,14 @@ impl ChatRepl {
 
     fn current_grounding_system_content(&self) -> Option<String> {
         self.current_task_obs
-            .and_then(|task_obs| cli_grounding_system_content(&self.chat_session.id, task_obs))
+            .and_then(|task_obs| cli_grounding_system_content(&self.chat_session.id(), task_obs))
     }
 
     fn policy_denied_tool_result(&self, tool_call: &tools::ToolCall) -> Option<tools::ToolResult> {
+        let session_id = self.chat_session.id();
         let tool_policy = openclaudia::services::policy::ToolExecutionPolicy::new(
             Some(self.policy_enforcer.as_ref()),
-            Some(&self.chat_session.id),
+            Some(&session_id),
         );
         tool_policy
             .check_tool(&tool_call.function.name)
@@ -1345,7 +1349,7 @@ impl ChatRepl {
     ) -> Option<tools::ToolResult> {
         openclaudia::services::tool_executor::ToolExecutor::run_pre_tool_use(
             &self.hook_engine,
-            Some(&self.chat_session.id),
+            Some(&self.chat_session.id()),
             &tool_call.function.name,
             tool_args,
         )
@@ -1358,7 +1362,7 @@ impl ChatRepl {
         if !final_response_requires_grounding(content, cancelled) {
             return true;
         }
-        match validate_cli_agentic_final_response(&self.chat_session.id, content.trim()) {
+        match validate_cli_agentic_final_response(&self.chat_session.id(), content.trim()) {
             Ok(()) => true,
             Err(reason) => {
                 eprintln!("\n\x1b[31mFinal answer failed grounding gate: {reason}\x1b[0m");
@@ -1368,16 +1372,17 @@ impl ChatRepl {
     }
 
     fn record_failed_turn(&mut self, reason: &str) {
-        session::append_failed_turn_message(&mut self.chat_session.messages, reason);
+        self.chat_session.update_messages(|messages| {
+            session::append_failed_turn_message(messages, reason);
+        });
         persist_chat_session_update(&mut self.chat_session, "failed turn marker");
     }
 
     /// Extract file extensions from recent messages and inject combined
     /// rules content (once per session) at the head of `messages`.
-    fn inject_rules_from_extensions(&mut self) {
-        let extensions: Vec<String> = self
-            .chat_session
-            .messages
+    fn inject_rules_from_extensions(&self) {
+        let messages = self.chat_session.messages_snapshot();
+        let extensions: Vec<String> = messages
             .iter()
             .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
             .flat_map(|text| {
@@ -1399,19 +1404,21 @@ impl ChatRepl {
                 .collect::<Vec<_>>(),
         );
         if !rules_content.is_empty()
-            && !self.chat_session.messages.iter().any(|m| {
+            && !messages.iter().any(|m| {
                 m.get("content")
                     .and_then(|c| c.as_str())
                     .is_some_and(|s| s.contains("## Rules"))
             })
         {
-            self.chat_session.messages.insert(
-                0,
-                serde_json::json!({
-                    "role": "system",
-                    "content": rules_content
-                }),
-            );
+            self.chat_session.update_messages(|messages| {
+                messages.insert(
+                    0,
+                    serde_json::json!({
+                        "role": "system",
+                        "content": rules_content
+                    }),
+                );
+            });
         }
     }
 
@@ -1421,9 +1428,8 @@ impl ChatRepl {
         &self,
         memory_db: Option<&memory::MemoryDb>,
     ) -> prompt::SystemPromptBlocks {
-        let hook_instructions: Option<String> = self
-            .chat_session
-            .messages
+        let messages = self.chat_session.messages_snapshot();
+        let hook_instructions: Option<String> = messages
             .iter()
             .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
             .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
@@ -1435,8 +1441,9 @@ impl ChatRepl {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let behavior_mode = self.chat_session.behavior_mode();
         let mut prompt_blocks = prompt::build_system_prompt_blocks(
-            &self.chat_session.behavior_mode,
+            &behavior_mode,
             hook_instructions.as_deref(),
             None,
             memory_db,
@@ -1454,7 +1461,7 @@ impl ChatRepl {
         if let Some(db) = memory_db {
             let mut injected_files: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            for msg in self.chat_session.messages.iter().rev().take(10) {
+            for msg in messages.iter().rev().take(10) {
                 if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
                     if role == "tool" || role == "assistant" {
                         if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
@@ -1511,26 +1518,29 @@ impl ChatRepl {
 
     /// Replace (or insert) the combined Claudia system prompt at the
     /// front of `messages` so non-Anthropic providers see it directly.
-    fn install_system_prompt(&mut self, prompt_blocks: &prompt::SystemPromptBlocks) {
+    fn install_system_prompt(&self, prompt_blocks: &prompt::SystemPromptBlocks) {
         let combined = prompt_blocks.to_combined();
-        if let Some(pos) = self.chat_session.messages.iter().position(|m| {
-            m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|s| s.contains("Persona: Claudia"))
-        }) {
-            self.chat_session.messages[pos] = serde_json::json!({
-                "role": "system",
-                "content": combined
-            });
-        } else {
-            self.chat_session.messages.insert(
-                0,
-                serde_json::json!({
+        self.chat_session.update_messages(|messages| {
+            if let Some(pos) = messages.iter().position(|message| {
+                message
+                    .get("content")
+                    .and_then(|content| content.as_str())
+                    .is_some_and(|content| content.contains("Persona: Claudia"))
+            }) {
+                messages[pos] = serde_json::json!({
                     "role": "system",
                     "content": combined
-                }),
-            );
-        }
+                });
+            } else {
+                messages.insert(
+                    0,
+                    serde_json::json!({
+                        "role": "system",
+                        "content": combined
+                    }),
+                );
+            }
+        });
     }
 
     /// Send the initial turn request and dispatch the response to the
@@ -1766,7 +1776,7 @@ impl ChatRepl {
         // typed signal, matching CC's QueryEngine.ts:851-873 behaviour.
         if max_iterations > 0 && iteration >= max_iterations && !state.tool_calls.is_empty() {
             let _ = emit_max_turns_event(
-                &self.chat_session.id,
+                &self.chat_session.id(),
                 "google_gemini",
                 max_iterations,
                 iteration,
@@ -1800,16 +1810,18 @@ impl ChatRepl {
         }
 
         if let Some(ref engine) = self.vdd_engine {
-            let before_len = self.chat_session.messages.len();
+            let original = self.chat_session.messages_snapshot();
+            let mut messages = original.clone();
             run_vdd_review(
                 engine,
                 full_content,
-                &mut self.chat_session.messages,
+                &mut messages,
                 &self.config.proxy.target,
                 self.api_key.as_ref(),
             )
             .await;
-            if self.chat_session.messages.len() != before_len {
+            if messages != original {
+                self.chat_session.replace_messages(messages);
                 persist_chat_session_update(&mut self.chat_session, "gemini VDD context injection");
             }
         }
@@ -1841,7 +1853,7 @@ impl ChatRepl {
     }
 
     /// Record the model's tool-call turn into both `gemini_contents`
-    /// (native format) and `chat_session.messages` (`OpenAI` format).
+    /// (native format) and the canonical session conversation (`OpenAI` format).
     fn gemini_record_model_turn(
         &mut self,
         full_content: &str,
@@ -2055,7 +2067,7 @@ impl ChatRepl {
             memory_db,
             &self.permission_mgr,
             permission_already_checked,
-            &self.chat_session.id,
+            &self.chat_session.id(),
             Some(self.policy_enforcer.as_ref()),
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
@@ -2084,7 +2096,7 @@ impl ChatRepl {
             &tool_call.function.name,
             tool_input,
             &final_content,
-            Some(&self.chat_session.id),
+            Some(&self.chat_session.id()),
         )
         .await;
         display_tool_result(&tool_call.function.name, &final_content, final_is_error);
@@ -2367,16 +2379,18 @@ impl ChatRepl {
                 println!();
                 return;
             }
-            let before_len = self.chat_session.messages.len();
+            let original = self.chat_session.messages_snapshot();
+            let mut messages = original.clone();
             run_vdd_review(
                 engine,
                 &final_content,
-                &mut self.chat_session.messages,
+                &mut messages,
                 &self.config.proxy.target,
                 self.api_key.as_ref(),
             )
             .await;
-            if self.chat_session.messages.len() != before_len {
+            if messages != original {
+                self.chat_session.replace_messages(messages);
                 persist_chat_session_update(
                     &mut self.chat_session,
                     "anthropic VDD context injection",
@@ -2598,7 +2612,7 @@ impl ChatRepl {
                 // before printing the user-facing warning so subscribers
                 // see a typed event, not just a stderr string.
                 let _ = emit_max_turns_event(
-                    &self.chat_session.id,
+                    &self.chat_session.id(),
                     "anthropic_proxy",
                     max_proxy_iterations,
                     proxy_iteration,
@@ -2771,7 +2785,7 @@ impl ChatRepl {
             &tool_call.function.name,
             tool_input,
             &final_content,
-            Some(&self.chat_session.id),
+            Some(&self.chat_session.id()),
         )
         .await;
         display_tool_result(&tool_call.function.name, &final_content, final_is_error);
@@ -2903,7 +2917,7 @@ impl ChatRepl {
             memory_db,
             &self.permission_mgr,
             permission_already_checked,
-            &self.chat_session.id,
+            &self.chat_session.id(),
             Some(self.policy_enforcer.as_ref()),
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
@@ -3061,7 +3075,7 @@ impl ChatRepl {
         {
             // #601 — structured `error_max_turns` for the XML-intercept path.
             let _ = emit_max_turns_event(
-                &self.chat_session.id,
+                &self.chat_session.id(),
                 "anthropic_xml_intercept",
                 max_proxy_iterations,
                 proxy_iteration,
@@ -3179,7 +3193,7 @@ impl ChatRepl {
             all_tools,
             memory_db,
             Some(&self.permission_mgr),
-            Some(&self.chat_session.id),
+            Some(&self.chat_session.id()),
             Some(self.policy_enforcer.as_ref()),
         );
         let results_xml = tool_intercept::format_execution_results_xml(&results);
@@ -3350,7 +3364,7 @@ impl ChatRepl {
         if max_iterations > 0 && iteration >= max_iterations && tool_accumulator.has_tool_calls() {
             // #601 — structured `error_max_turns` for the OpenAI path.
             let _ =
-                emit_max_turns_event(&self.chat_session.id, "openai", max_iterations, iteration);
+                emit_max_turns_event(&self.chat_session.id(), "openai", max_iterations, iteration);
             eprintln!(
                 "\n\x1b[33m⚠ Reached max_turns limit ({max_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
             );
@@ -3459,16 +3473,18 @@ impl ChatRepl {
         if current_content.trim().is_empty() {
             return;
         }
-        let before_len = self.chat_session.messages.len();
+        let original = self.chat_session.messages_snapshot();
+        let mut messages = original.clone();
         run_vdd_review(
             engine,
             current_content,
-            &mut self.chat_session.messages,
+            &mut messages,
             &self.config.proxy.target,
             self.api_key.as_ref(),
         )
         .await;
-        if self.chat_session.messages.len() != before_len {
+        if messages != original {
+            self.chat_session.replace_messages(messages);
             persist_chat_session_update(&mut self.chat_session, "openai VDD context injection");
         }
     }
@@ -3648,7 +3664,12 @@ impl ChatRepl {
         );
         let final_is_error = if was_marker { false } else { result.is_error };
 
-        Self::log_openai_activity(memory_db, &self.chat_session.id, tool_call, final_is_error);
+        Self::log_openai_activity(
+            memory_db,
+            &self.chat_session.id(),
+            tool_call,
+            final_is_error,
+        );
         let tool_input = parse_tool_args(&tool_call.function).unwrap_or_else(
             |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
         );
@@ -3658,7 +3679,7 @@ impl ChatRepl {
             &tool_call.function.name,
             tool_input,
             &final_content,
-            Some(&self.chat_session.id),
+            Some(&self.chat_session.id()),
         )
         .await;
         display_tool_result(&tool_call.function.name, &final_content, final_is_error);
@@ -3687,7 +3708,7 @@ impl ChatRepl {
             memory_db,
             &self.permission_mgr,
             permission_already_checked,
-            &self.chat_session.id,
+            &self.chat_session.id(),
             Some(self.policy_enforcer.as_ref()),
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
@@ -3744,7 +3765,7 @@ impl ChatRepl {
                 let preview: String = qg.stderr.lines().take(3).collect::<Vec<_>>().join("\n");
                 eprintln!("  {preview}");
             }
-            self.chat_session.messages.push(serde_json::json!({
+            self.chat_session.push_message(serde_json::json!({
                 "role": "system",
                 "content": format!(
                     "[Quality Gate '{}' {}] exit code {}\nstdout: {}\nstderr: {}",
@@ -3765,11 +3786,12 @@ impl ChatRepl {
             return;
         }
         let mut ledger =
-            match openclaudia::ledger::RealityLedger::open_project_session(&self.chat_session.id) {
+            match openclaudia::ledger::RealityLedger::open_project_session(&self.chat_session.id())
+            {
                 Ok(ledger) => ledger,
                 Err(err) => {
                     tracing::warn!(
-                        session_id = %self.chat_session.id,
+                        session_id = %self.chat_session.id(),
                         error = %err,
                         "failed to open session reality ledger for CLI quality gates"
                     );
@@ -3781,7 +3803,7 @@ impl ChatRepl {
                 openclaudia::grounded_loop::append_quality_gate_observations(&mut ledger, gate)
             {
                 tracing::warn!(
-                    session_id = %self.chat_session.id,
+                    session_id = %self.chat_session.id(),
                     gate = %gate.name,
                     error = %err,
                     "failed to append CLI quality-gate observations to reality ledger"
@@ -3910,7 +3932,7 @@ fn push_chat_session_message_and_persist(
     message: serde_json::Value,
     reason: &str,
 ) {
-    session.messages.push(message);
+    session.push_message(message);
     persist_chat_session_update(session, reason);
 }
 
@@ -4381,17 +4403,17 @@ providers: {}
     }
 
     fn chat_session_with_turns(turns: usize) -> ChatSession {
-        let mut session = ChatSession::new(
+        let session = ChatSession::new(
             "claude-sonnet",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
         );
         for i in 0..turns {
-            session.messages.push(serde_json::json!({
+            session.push_message(serde_json::json!({
                 "role": "user",
                 "content": format!("user {i}")
             }));
-            session.messages.push(serde_json::json!({
+            session.push_message(serde_json::json!({
                 "role": "assistant",
                 "content": format!("assistant {i}")
             }));
@@ -4406,10 +4428,11 @@ providers: {}
         let rewound = rewind_chat_session(&mut session, 2);
 
         assert_eq!(rewound, 2);
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.undo_stack.len(), 2);
-        assert_eq!(session.messages[0]["content"], "user 0");
-        assert_eq!(session.messages[1]["content"], "assistant 0");
+        let state = session.state_snapshot();
+        assert_eq!(state.conversation.messages.len(), 2);
+        assert_eq!(state.conversation.undo_stack.len(), 2);
+        assert_eq!(state.conversation.messages[0]["content"], "user 0");
+        assert_eq!(state.conversation.messages[1]["content"], "assistant 0");
     }
 
     #[test]
@@ -4419,8 +4442,9 @@ providers: {}
         let rewound = rewind_chat_session(&mut session, 5);
 
         assert_eq!(rewound, 1);
-        assert!(session.messages.is_empty());
-        assert_eq!(session.undo_stack.len(), 1);
+        let state = session.state_snapshot();
+        assert!(state.conversation.messages.is_empty());
+        assert_eq!(state.conversation.undo_stack.len(), 1);
     }
 
     #[test]
@@ -4665,7 +4689,7 @@ providers: {}
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
         );
-        let id = session.id.clone();
+        let id = session.id();
 
         push_chat_session_message_and_persist(
             &mut session,
@@ -4679,9 +4703,10 @@ providers: {}
         let loaded = load_chat_session(&id)
             .expect("session load must not fail")
             .expect("session file must exist");
-        assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.messages[0]["role"], "assistant");
-        assert_eq!(loaded.messages[0]["content"], "partial provider text");
+        let messages = loaded.messages_snapshot();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "partial provider text");
     }
 
     #[test]
@@ -4696,7 +4721,7 @@ providers: {}
         );
         let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
         let _ledger_guard = openclaudia::ledger::install_active_ledger_for_session(
-            &session.id,
+            session.id(),
             Arc::clone(&ledger),
         );
         let tool_call = tools::ToolCall {
@@ -4716,12 +4741,10 @@ providers: {}
             true,
         );
 
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0]["role"], "tool");
-        assert_eq!(
-            session.messages[0]["content"],
-            "[ERROR] Permission denied: policy"
-        );
+        let messages = session.messages_snapshot();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["content"], "[ERROR] Permission denied: policy");
 
         let observation = {
             let ledger = ledger.lock().expect("ledger lock");

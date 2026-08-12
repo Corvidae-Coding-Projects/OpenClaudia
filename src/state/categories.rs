@@ -153,7 +153,7 @@ pub struct Conversation {
     pub approved_plan: Option<String>,
     /// Plan-mode state machine — re-exported from the existing
     /// session module so we don't invalidate on-disk formats that
-    /// reference it. Phase 1 moves all reads to this field.
+    /// reference it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<crate::session::PlanModeState>,
     /// Active behavioral mode (agency/quality/scope axes + modifiers).
@@ -205,29 +205,95 @@ impl UiState {
 
 // ─── Modes ──────────────────────────────────────────────────────────
 
-/// Build / Plan — legacy two-state agent mode.
+/// Canonical agent mode shared by both interactive frontends.
 ///
-/// Duplicates the enum at `bin::cli::repl::AgentMode`; kept here because
-/// `src/state/` is library-visible and `cli` is not. Phase 5 of the migration
-/// retires the binary-side copy and this becomes canonical. Values must match
-/// the existing on-disk serde so resumed sessions don't silently shift mode.
+/// Lowercase names are the current wire format. `PascalCase` aliases preserve
+/// compatibility with sessions written by the legacy REPL enum.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentMode {
     /// Full access — write/edit/bash permitted.
+    #[serde(alias = "Build")]
     #[default]
     Build,
     /// Read-only — tools that mutate are blocked.
+    #[serde(alias = "Plan")]
     Plan,
+    /// Write-enabled work constrained to an existing surface.
+    #[serde(alias = "Extend")]
+    Extend,
+    /// Write-enabled structural cleanup.
+    #[serde(alias = "Refactor")]
+    Refactor,
+}
+
+impl AgentMode {
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Build | Self::Extend | Self::Refactor => Self::Plan,
+            Self::Plan => Self::Build,
+        }
+    }
+
+    #[must_use]
+    pub const fn toggle(self) -> Self {
+        self.toggled()
+    }
+
+    #[must_use]
+    pub const fn display(self) -> &'static str {
+        match self {
+            Self::Build => "Build",
+            Self::Plan => "Plan",
+            Self::Extend => "Extend",
+            Self::Refactor => "Refactor",
+        }
+    }
+
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Build => "Full access - can make changes",
+            Self::Plan => "Read-only - suggestions only",
+            Self::Extend => "Write-allowed; scope locked to an existing surface",
+            Self::Refactor => "Write-allowed; structural changes expected",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Plan => "plan",
+            Self::Extend => "extend",
+            Self::Refactor => "refactor",
+        }
+    }
+
+    #[must_use]
+    pub fn from_token(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "plan" => Self::Plan,
+            "extend" => Self::Extend,
+            "refactor" => Self::Refactor,
+            _ => Self::Build,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.display())
+    }
 }
 
 /// Agent / behavior mode toggles that aren't already in
 /// [`Conversation::behavior_mode`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModesState {
-    /// Build / Plan — legacy two-state mode. Kept for back-compat
-    /// with existing `TuiSession` field; new code should use
-    /// `Conversation::behavior_mode` for fine-grained control.
+    /// Coarse agent mode kept for compatibility with existing session files;
+    /// new code can use `Conversation::behavior_mode` for finer control.
     #[serde(default)]
     pub agent_mode: AgentMode,
     /// Coordinator mode active — leader orchestrating teammates.
@@ -430,9 +496,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_mode_accepts_both_legacy_wire_formats() {
+        assert_eq!(
+            serde_json::from_str::<AgentMode>(r#""build""#).unwrap(),
+            AgentMode::Build
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentMode>(r#""Build""#).unwrap(),
+            AgentMode::Build
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentMode>(r#""Plan""#).unwrap(),
+            AgentMode::Plan
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentMode>(r#""extend""#).unwrap(),
+            AgentMode::Extend
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentMode::Refactor).unwrap(),
+            r#""refactor""#
+        );
+    }
+
+    #[test]
     fn defaults_match_existing_tui_session_defaults() {
-        // When Phase 1 drops this in place of TuiSession, these
-        // defaults must match what TuiSession produced so resumed
+        // These defaults match the compatibility session wrappers so resumed
         // sessions look the same to the user.
         let conv = Conversation::default();
         assert!(conv.messages.is_empty());
