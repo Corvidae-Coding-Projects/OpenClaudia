@@ -17,11 +17,13 @@
 //!    the consumer to know about the inner type — enough to distinguish the
 //!    common cases (missing, permission denied) in a render or retry path.
 //!
-//! Helpers [`read_file`], [`write_file`], [`read_json`], [`read_yaml`],
-//! [`write_json_pretty`], and [`create_dir_all`] are provided for the
-//! ergonomically common case where callers want the typed error for free
-//! without writing the `.map_err(...)` themselves.
+//! Helpers [`read_file`], [`write_file`], [`write_file_atomic`], [`read_json`],
+//! [`read_yaml`], [`write_json_pretty`], [`write_json_pretty_atomic`], and
+//! [`create_dir_all`] are provided for the ergonomically common case where
+//! callers want the typed error for free without writing the `.map_err(...)`
+//! themselves.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -142,6 +144,113 @@ pub fn write_file(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<
     std::fs::write(path, contents).map_err(FileError::with_path(path))
 }
 
+/// Atomically and durably replace `path` with `contents`.
+///
+/// Bytes are written to a unique sibling file, flushed with `fsync`, and then
+/// renamed over the destination. Readers therefore observe either the old
+/// complete file or the new complete file, never a partial write. The sibling
+/// is removed on every recoverable failure.
+///
+/// # Errors
+/// Returns [`FileError::Io`] when the parent directory cannot be created or a
+/// staging-file write, sync, rename, or parent-directory sync fails.
+pub fn write_file_atomic(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+) -> Result<(), FileError> {
+    let path = path.as_ref();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(FileError::with_path(parent))?;
+    }
+
+    let file_name = path.file_name().map_or_else(
+        || "file".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let write_result = (|| -> Result<(), FileError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp_path)
+            .map_err(FileError::with_path(&tmp_path))?;
+        file.write_all(contents.as_ref())
+            .map_err(FileError::with_path(&tmp_path))?;
+        file.sync_all().map_err(FileError::with_path(&tmp_path))?;
+        replace_file_atomic(&tmp_path, path).map_err(FileError::with_path(path))?;
+
+        #[cfg(unix)]
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(FileError::with_path(parent))?;
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+/// Atomically publish `tmp` at `path`, replacing an existing file.
+///
+/// `std::fs::rename` replaces on Unix but not on Windows, so every durable
+/// writer shares this platform-specific boundary.
+#[cfg(unix)]
+pub(crate) fn replace_file_atomic(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
+#[cfg(windows)]
+pub(crate) fn replace_file_atomic(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let from = tmp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let flags = windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+        | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
+    // SAFETY: both buffers are NUL-terminated and remain alive for the call.
+    let succeeded = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), flags)
+    };
+    if succeeded == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn replace_file_atomic(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
 /// Create `path` and all parent directories as needed.
 ///
 /// # Errors
@@ -185,6 +294,20 @@ pub fn write_json_pretty<T: serde::Serialize>(
     let path = path.as_ref();
     let json = serde_json::to_string_pretty(value).map_err(FileError::json_with_path(path))?;
     write_file(path, json)
+}
+
+/// Serialize `value` as pretty JSON and atomically replace `path`.
+///
+/// # Errors
+/// Returns [`FileError::Json`] on serialization failure or
+/// [`FileError::Io`] on an underlying filesystem failure.
+pub fn write_json_pretty_atomic<T: serde::Serialize>(
+    path: impl AsRef<Path>,
+    value: &T,
+) -> Result<(), FileError> {
+    let path = path.as_ref();
+    let json = serde_json::to_string_pretty(value).map_err(FileError::json_with_path(path))?;
+    write_file_atomic(path, json)
 }
 
 #[cfg(test)]
@@ -280,5 +403,46 @@ mod tests {
             "expected Json variant, got: {err:?}"
         );
         assert_eq!(err.path(), p.as_path());
+    }
+
+    #[test]
+    fn atomic_write_replaces_complete_file_without_staging_debris() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, b"old complete bytes").unwrap();
+
+        write_file_atomic(&path, b"new complete bytes").expect("atomic replacement");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new complete bytes");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_write_cleans_staging_file_when_rename_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.json");
+        std::fs::create_dir(&path).unwrap();
+
+        write_file_atomic(&path, b"new bytes").expect_err("cannot replace a directory");
+
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![path.file_name().unwrap()]);
+        assert!(path.is_dir(), "failed replacement must preserve the target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_publishes_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.json");
+        write_file_atomic(&path, b"secret").unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

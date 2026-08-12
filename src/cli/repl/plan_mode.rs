@@ -1,5 +1,5 @@
 use super::input::{handle_user_questions, run_external_editor};
-use super::{AgentMode, ChatSession};
+use super::{AgentMode, Session};
 use openclaudia::tools;
 use std::fs;
 
@@ -25,7 +25,7 @@ fn plan_mode_allowed_tools_display() -> String {
 }
 
 /// Handle entering plan mode. Creates plan file and sets up state.
-pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
+pub fn handle_enter_plan_mode(chat_session: &Session) -> String {
     let plans_dir = std::path::PathBuf::from(".openclaudia/plans");
     if let Err(e) = fs::create_dir_all(&plans_dir) {
         return format!("Failed to create plans directory: {e}");
@@ -72,10 +72,11 @@ pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
     // flipping back to `Build`. Plan-mode itself is not a meaningful
     // "previous" mode to restore to (it would be a no-op), so we only
     // record non-Plan modes.
-    let previous_mode = if chat_session.mode == AgentMode::Plan {
+    let current_mode = chat_session.agent_mode();
+    let previous_mode = if current_mode == AgentMode::Plan {
         None
     } else {
-        Some(chat_session.mode.as_token().to_string())
+        Some(current_mode.as_token().to_string())
     };
     let plan_state = match openclaudia::session::PlanModeState::enter_with_previous_mode(
         plan_file.clone(),
@@ -88,7 +89,7 @@ pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
     };
 
     chat_session.update_state(|state, _| state.conversation.plan_mode = Some(plan_state));
-    chat_session.mode = AgentMode::Plan;
+    chat_session.set_agent_mode(AgentMode::Plan);
 
     println!(
         "\n\x1b[1;33m>> Entered Plan Mode\x1b[0m\n\
@@ -109,7 +110,7 @@ pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
 }
 
 fn handle_plan_edit(
-    chat_session: &mut ChatSession,
+    chat_session: &Session,
     plan_state: &openclaudia::session::PlanModeState,
     allowed_prompts_json: &str,
 ) -> (String, bool) {
@@ -134,7 +135,7 @@ fn handle_plan_edit(
                 let restored = chat_session.inspect_state(|state| {
                     restore_previous_mode(state.conversation.plan_mode.as_ref())
                 });
-                chat_session.mode = restored;
+                chat_session.set_agent_mode(restored);
                 println!("\n\x1b[1;32m>> Plan Approved - Returning to Build Mode\x1b[0m\n");
                 chat_session.update_state(|state, events| {
                     state.conversation.plan_mode = None;
@@ -179,10 +180,7 @@ fn handle_plan_edit(
 
 /// Handle exiting plan mode. Reads plan file, shows to user for approval.
 /// Returns (`result_text`, `should_exit_plan_mode`).
-pub fn handle_exit_plan_mode(
-    chat_session: &mut ChatSession,
-    allowed_prompts_json: &str,
-) -> (String, bool) {
+pub fn handle_exit_plan_mode(chat_session: &Session, allowed_prompts_json: &str) -> (String, bool) {
     use std::io::{self, Write};
 
     let plan_mode = chat_session.inspect_state(|state| state.conversation.plan_mode.clone());
@@ -227,7 +225,7 @@ pub fn handle_exit_plan_mode(
             let restored = chat_session.inspect_state(|state| {
                 restore_previous_mode(state.conversation.plan_mode.as_ref())
             });
-            chat_session.mode = restored;
+            chat_session.set_agent_mode(restored);
 
             println!(
                 "\n\x1b[1;32m>> Plan Approved - Returning to Build Mode\x1b[0m\n\
@@ -292,7 +290,7 @@ pub fn handle_exit_plan_mode(
 
 /// Check if a tool call is blocked by plan mode and return an error message if so.
 pub fn check_plan_mode_restriction(
-    chat_session: &ChatSession,
+    chat_session: &Session,
     tool_name: &str,
     tool_args: &str,
 ) -> Option<String> {
@@ -357,7 +355,7 @@ const fn json_value_type_name(value: &serde_json::Value) -> &'static str {
 /// Process a tool result, checking for special markers (`user_question`, plan mode).
 /// Returns the (possibly replaced) result content and whether it was a special marker.
 pub fn process_tool_result_marker(
-    chat_session: &mut ChatSession,
+    chat_session: &Session,
     tool_name: &str,
     result_content: &str,
 ) -> (String, bool) {
@@ -404,13 +402,13 @@ mod tests {
             .expect("enter must succeed")
     }
 
-    fn chat_session_in_plan_mode() -> ChatSession {
-        let mut session = ChatSession::new(
+    fn chat_session_in_plan_mode() -> Session {
+        let session = Session::new_with_behavior_mode(
             "claude-sonnet-4-6",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
         );
-        session.mode = AgentMode::Plan;
+        session.set_agent_mode(AgentMode::Plan);
         session.update_state(|state, _| {
             state.conversation.plan_mode = Some(make_plan_state(None));
         });

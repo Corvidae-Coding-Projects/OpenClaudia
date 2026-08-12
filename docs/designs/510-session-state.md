@@ -1,9 +1,8 @@
 # Design: Centralized SessionState (crosslink #510)
 
-> Implementation status: Phases 0–3 are complete. The TUI and legacy REPL now
-> share identity, conversation state, agent mode, budgets, session UI state,
-> permission state, transcript bookkeeping, IDE state, and a compatible session
-> document. Phases 4–5 remain planned.
+> Implementation status: Complete. The TUI and legacy REPL use one canonical
+> `state::Session`, one `StateStore`, and one V1 persistence document. Startup
+> migration `m001-session-state-v1` atomically upgrades older saved sessions.
 
 ## Problem
 
@@ -153,12 +152,12 @@ them out of SessionState keeps serialization + snapshots simple.
 
 ### Persistence is a separate concern
 
-`state/persist.rs` owns one compatibility document with an embedded
-`SessionStateV1` payload that both the TUI and chat REPL emit. Current readers
-accept legacy top-level-only files and prefer the V1 payload when present.
-`TuiSession` / `ChatSession` are metadata shims that
-deserialize-then-convert. A later migration (via #506's framework) can remove
-the duplicated legacy fields.
+`state/persist.rs` owns the canonical document emitted by both interactive
+frontends: picker metadata next to one required `SessionStateV1` payload. The
+shared `state::Session` handle is the only runtime serde boundary. Its reader
+still accepts old top-level and transitional duplicated documents so recovery
+tools remain useful, while startup migration `m001-session-state-v1` rewrites
+those files atomically and all new writes contain no duplicate session fields.
 
 ## Integration plan (phased)
 
@@ -223,16 +222,25 @@ Each phase compiles + tests green on its own.
   clamping, and event-channel lag recovery.
 
 **Phase 5 — delete TuiSession / ChatSession compat shims**
-- Only after every caller migrated.
-- Migration `m0xx_session_state_v1` rewrites on-disk old-format files to V1 on first load.
+- Complete.
+- Replaced both frontend-specific wrappers with `state::Session`; agent mode now
+  lives only in `SessionState` rather than a public mirror field.
+- Migration `m001-session-state-v1` scans saved sessions at startup and
+  atomically rewrites legacy or transitional documents to canonical V1.
+- Normal TUI and REPL saves use the same durable write-temp, fsync, rename, and
+  parent-fsync helper as migration writes.
+- Unsafe ids, filename/id mismatches, non-regular files, malformed JSON, and
+  future schemas fail closed without modifying their original bytes.
 
-Phases 0–2 are single-commit each. Phases 3–4 are two-commit each. Phase 5 requires the migrations framework (already shipped in #506) and lands last.
+Phases 0–2 landed as single commits, phases 3–4 as two commits each, and Phase
+5 landed last on top of the migration framework shipped in #506.
 
 ## Test strategy
 
 - `state::mod::tests` — field-per-field serde roundtrip against a golden JSON fixture.
 - `state::store::tests` — subscribe-fires-on-change, write-guard-drop emits event, concurrent readers don't starve writers.
-- Migration test: load an existing fixture of TuiSession JSON, assert the resulting V1 shape is lossless.
+- Migration tests load old TUI/REPL-compatible and transitional JSON, assert
+  lossless V1 output, idempotence, failure preservation, and no duplicate keys.
 - Every phase's commit passes the whole suite — the phased plan is what keeps that tractable.
 
 ## Risks and open questions
@@ -240,9 +248,13 @@ Phases 0–2 are single-commit each. Phases 3–4 are two-commit each. Phase 5 r
 1. **Deadlock via lock holding**. Addressed in Phase 1 by exposing closure-based `inspect` / `update` methods instead of lock guards. References into state cannot escape a closure, so callers clone the data they need before any `.await`.
 2. **Broadcast channel bound**. `tokio::sync::broadcast` drops messages when the receiver falls behind. Subscribers must handle `RecvError::Lagged` — easy to forget. Ship a helper `StateStore::subscribe_log_lag()` that wraps recv + logs on lag so every caller gets the same behavior.
 3. **Serialization drift with plugins**. Plugins persist per-plugin config (already in #514 policy work); keep those out of `SessionState` so the version-bump cost stays bounded to core fields.
-4. **Migration atomicity**. Phase 5 rewrites every old session file. Must be crash-safe: write-temp + rename. Reuse the file-atomicity helpers the transcript writer already uses.
+4. **Migration atomicity**. Addressed in Phase 5 with unique sibling files,
+   owner-only creation, file fsync, atomic rename, parent-directory fsync, and
+   cleanup on failure.
 5. **Observability during the migration**. Later phases should add tracing around important `StateStore::update` calls. If a user reports a broken `/undo`, the log should identify which writer moved the field without sprinkling `eprintln!`s.
-6. **API stability**. `pub` fields on `SessionState` make snapshot and closure access ergonomic but expose the shape. Revisit field visibility after Phase 5 removes the compatibility shims.
+6. **API stability**. `pub` fields on `SessionState` keep snapshot and closure
+   access ergonomic; serialized compatibility is protected by the versioned
+   document and explicit migrations.
 
 ## Out of scope
 

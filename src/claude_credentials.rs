@@ -478,7 +478,7 @@ fn write_credentials_file(path: &Path, creds: &CredentialsFile) -> Result<(), St
         Err(e) => return Err(format!("Failed to write credentials temp file: {e}")),
     };
 
-    if let Err(e) = replace_file_atomic(&tmp, path) {
+    if let Err(e) = crate::file_error::replace_file_atomic(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("Failed to replace {}: {e}", path.display()));
     }
@@ -526,40 +526,6 @@ fn write_secret_tmp(parent: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
             "could not allocate unique credentials temp file",
         )
     }))
-}
-
-#[cfg(unix)]
-fn replace_file_atomic(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, path)
-}
-
-#[cfg(windows)]
-fn replace_file_atomic(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    fn wide(path: &OsStr) -> Vec<u16> {
-        path.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    let from = wide(tmp.as_os_str());
-    let to = wide(path.as_os_str());
-    let flags = windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
-        | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
-    // SAFETY: pointers are NUL-terminated and live for the call duration.
-    let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), flags)
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn replace_file_atomic(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, path)
 }
 
 #[cfg(unix)]

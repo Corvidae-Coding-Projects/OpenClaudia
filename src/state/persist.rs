@@ -1,10 +1,10 @@
 //! On-disk serialization shape for [`super::SessionState`].
 //!
 //! The ratatui TUI and legacy line REPL historically wrote divergent shapes.
-//! They now serialize through [`SessionDocument`], which keeps the legacy
-//! top-level field layout readable and embeds [`SessionStateV1`] as the
-//! canonical payload. Phase 5 of the migration (see
-//! `docs/designs/510-session-state.md`) retires the compatibility wrappers.
+//! Both now serialize through [`SessionDocument`], which stores picker
+//! metadata next to one required [`SessionStateV1`] payload. Legacy top-level
+//! fields remain read-only input handled by the migration decoder; new writes
+//! never duplicate identity or conversation state.
 //!
 //! This module is intentionally thin — a `SessionStateV1` is
 //! equivalent to a [`super::SessionState`] plus a schema version
@@ -18,42 +18,26 @@ use std::path::{Path, PathBuf};
 
 use super::{AgentMode, SessionId, SessionState};
 
-/// Compatibility document shared by the TUI and legacy line REPL.
-///
-/// The top-level fields let current readers migrate pre-Phase-1 JSON.
-/// `session_state` is the canonical V1 payload used for new round trips. The
-/// duplicated compatibility fields can be removed together with the frontend
-/// wrappers in Phase 5.
+/// Canonical session document shared by every interactive frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDocument {
-    pub id: String,
     pub title: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub model: String,
     pub provider: String,
-    #[serde(default)]
-    pub mode: AgentMode,
-    #[serde(default)]
-    pub behavior_mode: crate::modes::BehaviorMode,
-    #[serde(default)]
-    pub messages: Vec<serde_json::Value>,
-    #[serde(default)]
-    pub undo_stack: Vec<(serde_json::Value, serde_json::Value)>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_mode: Option<crate::session::PlanModeState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approved_plan: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub working_dirs: Vec<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_state: Option<SessionStateV1>,
+    pub session_state: SessionStateV1,
+    /// Transitional Phase 1–4 documents carried a duplicated top-level id.
+    /// Accept it long enough to verify that it agrees with canonical state,
+    /// but never write it again.
+    #[serde(default, rename = "id", skip_serializing)]
+    compatibility_id: Option<String>,
 }
 
 impl SessionDocument {
     /// Build a compatibility document from canonical session state.
     #[must_use]
-    pub fn from_state(
+    pub const fn from_state(
         title: String,
         created_at: chrono::DateTime<chrono::Utc>,
         updated_at: chrono::DateTime<chrono::Utc>,
@@ -62,57 +46,72 @@ impl SessionDocument {
         state: SessionState,
     ) -> Self {
         Self {
-            id: state.identity.session_id.to_string(),
             title,
             created_at,
             updated_at,
             model,
             provider,
-            mode: state.modes.agent_mode,
-            behavior_mode: state.conversation.behavior_mode.clone(),
-            messages: state.conversation.messages.clone(),
-            undo_stack: state.conversation.undo_stack.clone(),
-            plan_mode: state.conversation.plan_mode.clone(),
-            approved_plan: state.conversation.approved_plan.clone(),
-            working_dirs: state.identity.additional_directories_for_claude_md.clone(),
-            session_state: Some(SessionStateV1::wrap(state)),
+            session_state: SessionStateV1::wrap(state),
+            compatibility_id: None,
         }
     }
 
-    /// Recover canonical state, preferring the embedded V1 payload and
-    /// falling back to the legacy top-level fields for older session files.
-    ///
-    /// `cwd` supplies the directory capabilities absent from legacy files.
-    /// The caller remains responsible for validating the recovered identifier
-    /// before using it as a filename.
+    /// Recover canonical state from the required V1 payload.
     ///
     /// # Errors
     ///
-    /// Returns [`PersistError::InconsistentSessionId`] when a new-format file
-    /// carries different identifiers in its compatibility and canonical
-    /// sections.
-    pub fn into_state(self, cwd: &Path) -> Result<SessionState, PersistError> {
-        if let Some(versioned) = self.session_state {
-            if versioned.version > SessionStateV1::CURRENT_VERSION {
-                return Err(PersistError::FutureSchema {
-                    found: versioned.version,
-                    supported: SessionStateV1::CURRENT_VERSION,
-                });
-            }
-            let state = versioned.into_state();
-            if state.identity.session_id.as_str() != self.id {
+    /// Returns [`PersistError::FutureSchema`] when the document was written by
+    /// a newer binary, or [`PersistError::InconsistentSessionId`] when a
+    /// transitional file carries conflicting identities.
+    pub fn into_state(self) -> Result<SessionState, PersistError> {
+        if self.session_state.version > SessionStateV1::CURRENT_VERSION {
+            return Err(PersistError::FutureSchema {
+                found: self.session_state.version,
+                supported: SessionStateV1::CURRENT_VERSION,
+            });
+        }
+        let state = self.session_state.into_state();
+        if let Some(legacy) = self.compatibility_id {
+            if state.identity.session_id.as_str() != legacy {
                 return Err(PersistError::InconsistentSessionId {
-                    legacy: self.id,
+                    legacy,
                     canonical: state.identity.session_id.to_string(),
                 });
             }
-            return Ok(state);
         }
+        Ok(state)
+    }
+}
 
+/// Pre-V1 top-level session layout. Read-only: new files are never emitted in
+/// this shape. Defaults cover both the old TUI and line-REPL variants.
+#[derive(Debug, Deserialize)]
+struct LegacySessionDocument {
+    id: String,
+    title: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    model: String,
+    provider: String,
+    #[serde(default)]
+    mode: AgentMode,
+    #[serde(default)]
+    behavior_mode: crate::modes::BehaviorMode,
+    #[serde(default)]
+    messages: Vec<serde_json::Value>,
+    #[serde(default)]
+    undo_stack: Vec<(serde_json::Value, serde_json::Value)>,
+    #[serde(default)]
+    plan_mode: Option<crate::session::PlanModeState>,
+    #[serde(default)]
+    approved_plan: Option<String>,
+    #[serde(default)]
+    working_dirs: Vec<PathBuf>,
+}
+
+impl LegacySessionDocument {
+    fn upgrade(self, cwd: &Path) -> SessionDocument {
         let mut state = SessionState::new(cwd.to_path_buf());
-        // Legacy session IDs were already validated as filename-safe by both
-        // frontends but were not required to be UUIDs. Preserve those files
-        // losslessly while new sessions continue to generate UUIDs.
         state.identity.session_id = SessionId::from_raw_unchecked(self.id);
         state.identity.additional_directories_for_claude_md = self.working_dirs;
         state.conversation.messages = self.messages;
@@ -121,8 +120,67 @@ impl SessionDocument {
         state.conversation.plan_mode = self.plan_mode;
         state.conversation.behavior_mode = self.behavior_mode;
         state.modes.agent_mode = self.mode;
-        Ok(state)
+        SessionDocument::from_state(
+            self.title,
+            self.created_at,
+            self.updated_at,
+            self.model,
+            self.provider,
+            state,
+        )
     }
+}
+
+/// Decode either the canonical document or a pre-V1 top-level document.
+pub(crate) fn decode_document_value(
+    value: serde_json::Value,
+    cwd: &Path,
+) -> Result<SessionDocument, PersistError> {
+    if value.get("session_state").is_some() {
+        let document: SessionDocument = serde_json::from_value(value)?;
+        // Validate future versions and transitional duplicated identities now,
+        // before a caller can use the session id in a path.
+        let state = document.clone().into_state()?;
+        let mut canonical = document;
+        canonical.compatibility_id = None;
+        canonical.session_state = SessionStateV1::wrap(state);
+        return Ok(canonical);
+    }
+    let legacy: LegacySessionDocument = serde_json::from_value(value)?;
+    Ok(legacy.upgrade(cwd))
+}
+
+/// Decode a session document and report whether it already used the canonical
+/// non-duplicated V1 layout.
+///
+/// # Errors
+///
+/// Returns [`PersistError::Json`] for malformed or structurally invalid JSON,
+/// [`PersistError::FutureSchema`] for a newer state version, or
+/// [`PersistError::InconsistentSessionId`] for conflicting transitional ids.
+pub fn decode_document_for_migration(
+    raw: &str,
+    cwd: &Path,
+) -> Result<(SessionDocument, bool), PersistError> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let canonical = value
+        .get("session_state")
+        .and_then(|state| state.get("version"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(u64::from(SessionStateV1::CURRENT_VERSION))
+        && [
+            "id",
+            "mode",
+            "behavior_mode",
+            "messages",
+            "undo_stack",
+            "plan_mode",
+            "approved_plan",
+            "working_dirs",
+        ]
+        .iter()
+        .all(|key| value.get(key).is_none());
+    Ok((decode_document_value(value, cwd)?, canonical))
 }
 
 /// Schema version 1 — matches [`super::SessionState`] field-for-field.
@@ -226,9 +284,8 @@ struct VersionPeek {
 }
 
 const fn default_version() -> u32 {
-    // A file written BEFORE the version tag existed (TuiSession /
-    // ChatSession legacy shape) decodes to version 0. That steers
-    // callers through the migrations framework when we ship Phase 5.
+    // A bare state file written before the version tag existed decodes to
+    // version 0 so a caller can identify it as pre-V1.
     0
 }
 
@@ -307,8 +364,7 @@ mod tests {
 
     #[test]
     fn missing_version_decodes_as_zero() {
-        // A blob without the `version` tag is the legacy shape —
-        // Phase 5's migration path lives on the version=0 branch.
+        // A bare state blob without the `version` tag is pre-V1.
         let payload = serde_json::json!({
             "identity": {
                 "session_id": "legacy-id",
@@ -361,7 +417,7 @@ mod tests {
         );
         let encoded = serde_json::to_string(&document).unwrap();
         let decoded: SessionDocument = serde_json::from_str(&encoded).unwrap();
-        let restored = decoded.into_state(Path::new("/unused")).unwrap();
+        let restored = decoded.into_state().unwrap();
 
         assert_eq!(restored.identity.session_id, expected_id);
         assert_eq!(restored.modes.agent_mode, AgentMode::Refactor);
@@ -391,8 +447,9 @@ mod tests {
         })
         .to_string();
 
-        let document: SessionDocument = serde_json::from_str(&encoded).unwrap();
-        let restored = document.into_state(Path::new("/tmp/current")).unwrap();
+        let value = serde_json::from_str(&encoded).unwrap();
+        let document = decode_document_value(value, Path::new("/tmp/current")).unwrap();
+        let restored = document.into_state().unwrap();
 
         assert_eq!(restored.identity.session_id.as_str(), "legacy-session-id");
         assert_eq!(restored.identity.cwd, PathBuf::from("/tmp/current"));
@@ -415,10 +472,10 @@ mod tests {
             "provider".to_string(),
             state,
         );
-        document.id = "different-id".to_string();
+        document.compatibility_id = Some("different-id".to_string());
 
         assert!(matches!(
-            document.into_state(Path::new(".")),
+            document.into_state(),
             Err(PersistError::InconsistentSessionId { .. })
         ));
     }

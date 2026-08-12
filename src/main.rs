@@ -34,7 +34,7 @@ use cli::display::tips::get_random_tip;
 use cli::repl::session_io::{
     compact_chat_session, estimate_session_tokens, save_session_to_short_term_memory,
 };
-use cli::repl::{get_history_path, list_chat_sessions, ChatSession};
+use cli::repl::{get_history_path, list_chat_sessions, Session};
 
 /// Absolute, PATH-independent location of `git` for startup repository probes.
 static GIT_BIN: LazyLock<Result<PathBuf, String>> =
@@ -910,7 +910,7 @@ fn read_multiline_continuation(input: &mut String, rl: &mut rustyline::DefaultEd
 /// - `should_warn` (without compact) prints a hint about `/compact`.
 ///
 /// Extracted from `cmd_chat` per crosslink #262.
-fn maybe_auto_compact(chat_session: &mut ChatSession, model: &str) {
+fn maybe_auto_compact(chat_session: &mut Session, model: &str) {
     if chat_session.inspect_state(|state| state.conversation.messages.len()) <= 6 {
         return;
     }
@@ -983,7 +983,7 @@ fn init_permission_manager(
 /// Prints a user-facing status line in either case.
 ///
 /// Extracted from `cmd_chat` per crosslink #262.
-fn maybe_resume_session(chat_session: &mut ChatSession, resume: bool, session_id: Option<&str>) {
+fn maybe_resume_session(chat_session: &mut Session, resume: bool, session_id: Option<&str>) {
     if !resume && session_id.is_none() {
         return;
     }
@@ -1101,7 +1101,7 @@ fn init_vdd_engine_if_enabled_with_auth(
 /// exit. Extracted from `cmd_chat` per crosslink #262.
 fn finalize_chat(
     auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner>,
-    chat_session: &ChatSession,
+    chat_session: &Session,
     memory_db: Option<&memory::MemoryDb>,
     rl: &mut rustyline::DefaultEditor,
     history_path: &std::path::Path,
@@ -2738,13 +2738,13 @@ mod tests {
 
     #[test]
     fn tui_session_document_loads_in_legacy_repl() {
-        let seed = ChatSession::new(
+        let seed = Session::new_with_behavior_mode(
             "claude-sonnet-4-6",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
         );
         let seed_json = serde_json::to_string(&seed).expect("serialize seed session");
-        let tui_session: openclaudia::tui::app::TuiSession =
+        let tui_session: Session =
             serde_json::from_str(&seed_json).expect("TUI must load shared session document");
         tui_session.push_message(serde_json::json!({
             "role": "user",
@@ -2752,7 +2752,7 @@ mod tests {
         }));
 
         let json = serde_json::to_string(&tui_session).expect("serialize TUI session");
-        let repl_session: ChatSession =
+        let repl_session: Session =
             serde_json::from_str(&json).expect("REPL must load TUI session document");
 
         assert_eq!(repl_session.id(), tui_session.id());
@@ -2765,12 +2765,12 @@ mod tests {
 
     #[test]
     fn repl_session_document_round_trips_through_tui_without_state_loss() {
-        let mut repl_session = ChatSession::new(
+        let repl_session = Session::new_with_behavior_mode(
             "gpt-5.5",
             "openai",
             openclaudia::modes::BehaviorMode::default(),
         );
-        repl_session.mode = openclaudia::state::AgentMode::Extend;
+        repl_session.set_agent_mode(openclaudia::state::AgentMode::Extend);
         repl_session.push_message(serde_json::json!({
             "role": "assistant",
             "content": "persist me"
@@ -2803,15 +2803,15 @@ mod tests {
         });
 
         let repl_json = serde_json::to_string(&repl_session).expect("serialize REPL session");
-        let tui_session: openclaudia::tui::app::TuiSession =
+        let tui_session: Session =
             serde_json::from_str(&repl_json).expect("TUI must load REPL session document");
         let tui_json = serde_json::to_string(&tui_session).expect("re-serialize TUI session");
-        let restored: ChatSession =
+        let restored: Session =
             serde_json::from_str(&tui_json).expect("REPL must reload TUI document");
         let state = restored.state_snapshot();
 
         assert_eq!(restored.id(), repl_session.id());
-        assert_eq!(restored.mode, openclaudia::state::AgentMode::Extend);
+        assert_eq!(restored.agent_mode(), openclaudia::state::AgentMode::Extend);
         assert_eq!(
             state.conversation.approved_plan.as_deref(),
             Some("approved steps")
@@ -2859,9 +2859,9 @@ mod tests {
     #[test]
     fn maybe_auto_compact_is_noop_for_small_sessions() {
         // Under the 6-message short-circuit, auto-compact must not touch
-        // the session. Build the smallest possible ChatSession with an
+        // the session. Build the smallest possible canonical session with an
         // empty message history.
-        let mut session = ChatSession::new(
+        let mut session = Session::new_with_behavior_mode(
             "claude-sonnet-4-6",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),

@@ -1,22 +1,22 @@
-use super::{get_data_dir, ChatSession};
+use super::{get_data_dir, Session};
 use openclaudia::memory;
 use openclaudia::tools::safe_truncate;
 use std::fmt::Write;
 use std::fs;
 
 /// Estimate tokens in a chat session (rough: ~4 chars per token)
-pub fn estimate_session_tokens(session: &ChatSession) -> usize {
+pub fn estimate_session_tokens(session: &Session) -> usize {
     session.refresh_estimated_tokens()
 }
 
 /// Compact a chat session by summarizing older messages
-pub fn compact_chat_session(session: &mut ChatSession) -> (usize, usize) {
+pub fn compact_chat_session(session: &mut Session) -> (usize, usize) {
     compact_chat_session_with_instructions(session, None)
 }
 
 /// Compact a chat session while preserving optional user instructions.
 pub fn compact_chat_session_with_instructions(
-    session: &mut ChatSession,
+    session: &mut Session,
     custom_instructions: Option<&str>,
 ) -> (usize, usize) {
     let before_tokens = estimate_session_tokens(session);
@@ -78,7 +78,7 @@ pub fn compact_chat_session_with_instructions(
 }
 
 /// Export chat session to markdown file
-pub fn export_chat_session(session: &ChatSession) {
+pub fn export_chat_session(session: &Session) {
     let exports_dir = get_data_dir().join("exports");
     if let Err(e) = fs::create_dir_all(&exports_dir) {
         eprintln!("\nFailed to create exports directory: {e}\n");
@@ -133,10 +133,7 @@ pub fn export_chat_session(session: &ChatSession) {
 }
 
 /// Save session summary to short-term memory for continuity across restarts
-pub fn save_session_to_short_term_memory(
-    session: &ChatSession,
-    memory_db: Option<&memory::MemoryDb>,
-) {
+pub fn save_session_to_short_term_memory(session: &Session, memory_db: Option<&memory::MemoryDb>) {
     let Some(db) = memory_db else {
         return;
     };
@@ -216,8 +213,8 @@ pub fn save_session_to_short_term_memory(
 mod tests {
     use super::*;
 
-    fn session_with_messages(count: usize) -> ChatSession {
-        let session = ChatSession::new(
+    fn session_with_messages(count: usize) -> Session {
+        let session = Session::new_with_behavior_mode(
             "test-model",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),

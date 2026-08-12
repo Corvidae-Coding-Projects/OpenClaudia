@@ -162,7 +162,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         return Err(e);
     }
 
-    if let Err(e) = fs::rename(&tmp_path, path) {
+    if let Err(e) = crate::file_error::replace_file_atomic(&tmp_path, path) {
         // Best-effort cleanup; ignore the unlink error so the caller
         // sees the original rename failure, which is the actionable one.
         let _ = fs::remove_file(&tmp_path);

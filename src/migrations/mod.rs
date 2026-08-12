@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 mod ledger;
 mod registry;
+mod session_state_v1;
 mod stamp_transcript_schema_v1;
 
 #[cfg(test)]

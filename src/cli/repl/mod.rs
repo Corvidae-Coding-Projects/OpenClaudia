@@ -9,9 +9,8 @@ pub mod session_io;
 pub mod slash;
 pub mod vim;
 
-use anyhow::{bail, Context};
-pub use openclaudia::state::AgentMode;
-use openclaudia::tools::safe_truncate;
+use anyhow::Context;
+pub use openclaudia::state::{AgentMode, Session};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,374 +31,11 @@ pub fn get_sessions_dir() -> PathBuf {
     get_data_dir().join("chat_sessions")
 }
 
-/// A saved chat session with messages
-#[derive(Debug, Clone)]
-pub struct ChatSession {
-    /// Session title (first user message or default)
-    pub title: String,
-    /// When the session was created
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    /// When the session was last updated
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-    /// The model used
-    pub model: String,
-    /// The provider used
-    pub provider: String,
-    /// Agent mode (Build or Plan)
-    pub mode: AgentMode,
-    state: openclaudia::state::StateStore,
-}
-
-impl ChatSession {
-    pub fn new(
-        model: &str,
-        provider: &str,
-        behavior_mode: openclaudia::modes::BehaviorMode,
-    ) -> Self {
-        let now = chrono::Utc::now();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut state = openclaudia::state::SessionState::new(cwd);
-        state.conversation.behavior_mode = behavior_mode;
-        Self {
-            title: "New conversation".to_string(),
-            created_at: now,
-            updated_at: now,
-            model: model.to_string(),
-            provider: provider.to_string(),
-            mode: AgentMode::default(),
-            state: openclaudia::state::StateStore::new(state),
-        }
-    }
-
-    #[must_use]
-    pub fn id(&self) -> String {
-        self.state
-            .inspect(|state| state.identity.session_id.to_string())
-    }
-
-    #[cfg(test)]
-    pub fn set_id(&self, id: String) {
-        self.state.update(|state, _| {
-            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked(id);
-        });
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub fn state_snapshot(&self) -> openclaudia::state::SessionState {
-        self.state.snapshot()
-    }
-
-    pub fn inspect_state<R>(
-        &self,
-        inspect: impl FnOnce(&openclaudia::state::SessionState) -> R,
-    ) -> R {
-        self.state.inspect(inspect)
-    }
-
-    #[must_use]
-    pub fn state_store(&self) -> openclaudia::state::StateStore {
-        self.state.clone()
-    }
-
-    pub fn apply_loaded(&mut self, loaded: Self) {
-        self.title = loaded.title;
-        self.created_at = loaded.created_at;
-        self.updated_at = loaded.updated_at;
-        self.model = loaded.model;
-        self.provider = loaded.provider;
-        self.mode = loaded.mode;
-        self.state.replace(loaded.state.snapshot());
-    }
-
-    pub fn update_state<R>(
-        &self,
-        update: impl FnOnce(
-            &mut openclaudia::state::SessionState,
-            &mut Vec<openclaudia::state::StateEvent>,
-        ) -> R,
-    ) -> R {
-        self.state.update(update)
-    }
-
-    #[must_use]
-    pub fn messages_snapshot(&self) -> Vec<serde_json::Value> {
-        self.inspect_state(|state| state.conversation.messages.clone())
-    }
-
-    #[must_use]
-    pub fn message_count(&self) -> usize {
-        self.inspect_state(|state| state.conversation.messages.len())
-    }
-
-    pub fn push_message(&self, message: serde_json::Value) {
-        let role = message
-            .get("role")
-            .and_then(|role| role.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        self.update_state(|state, events| {
-            state.conversation.messages.push(message);
-            events.push(openclaudia::state::StateEvent::MessageAppended { role });
-        });
-    }
-
-    pub fn replace_messages(&self, messages: Vec<serde_json::Value>) {
-        self.update_state(|state, events| {
-            let previous_len = state.conversation.messages.len();
-            state.conversation.messages = messages;
-            if previous_len > 0 && state.conversation.messages.is_empty() {
-                events.push(openclaudia::state::StateEvent::Cleared);
-            }
-            events.extend(
-                state
-                    .conversation
-                    .messages
-                    .iter()
-                    .skip(previous_len)
-                    .map(|message| {
-                        message
-                            .get("role")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_string()
-                    })
-                    .map(|role| openclaudia::state::StateEvent::MessageAppended { role }),
-            );
-        });
-    }
-
-    pub fn update_messages<R>(&self, update: impl FnOnce(&mut Vec<serde_json::Value>) -> R) -> R {
-        self.update_state(|state, _| update(&mut state.conversation.messages))
-    }
-
-    #[must_use]
-    pub fn behavior_mode(&self) -> openclaudia::modes::BehaviorMode {
-        self.inspect_state(|state| state.conversation.behavior_mode.clone())
-    }
-
-    pub fn set_behavior_mode(&self, mode: openclaudia::modes::BehaviorMode) {
-        self.update_state(|state, events| {
-            state.conversation.behavior_mode = mode.clone();
-            events.push(openclaudia::state::StateEvent::ModeChanged { new: mode });
-        });
-    }
-
-    #[must_use]
-    pub fn effort_level(&self) -> openclaudia::state::EffortLevel {
-        self.inspect_state(|state| state.budgets.effort_level)
-    }
-
-    pub fn set_effort_level(&self, level: openclaudia::state::EffortLevel) {
-        self.update_state(|state, events| {
-            state.budgets.effort_level = level;
-            events.push(openclaudia::state::StateEvent::EffortChanged { new: level });
-        });
-    }
-
-    #[must_use]
-    pub fn permission_bypass_enabled(&self) -> bool {
-        self.inspect_state(|state| state.permissions.bypass_mode)
-    }
-
-    /// Apply the process-launch permission posture to this session.
-    ///
-    /// Although the flag is serialized as part of a coherent snapshot, a
-    /// resumed session must never silently inherit a previous process's
-    /// dangerous bypass choice. Startup calls this after resume selection so
-    /// the current command line always wins.
-    pub fn set_permission_bypass(&self, enabled: bool) {
-        self.update_state(|state, events| {
-            if state.permissions.bypass_mode != enabled {
-                state.permissions.bypass_mode = enabled;
-                events.push(openclaudia::state::StateEvent::PermissionsMutated);
-            }
-        });
-    }
-
-    pub fn refresh_estimated_tokens(&self) -> usize {
-        self.update_state(|state, _| {
-            let estimated = state
-                .conversation
-                .messages
-                .iter()
-                .map(|message| {
-                    message
-                        .get("content")
-                        .and_then(|content| content.as_str())
-                        .unwrap_or("")
-                        .len()
-                        / 4
-                        + 4
-                })
-                .sum();
-            state.budgets.estimated_tokens = estimated;
-            estimated
-        })
-    }
-
-    /// Undo the last user+assistant message pair
-    pub fn undo(&mut self) -> bool {
-        let changed = self.state.update(|state, _| {
-            let conversation = &mut state.conversation;
-            if conversation.messages.len() >= 2 {
-                if let (Some(assistant), Some(user)) =
-                    (conversation.messages.pop(), conversation.messages.pop())
-                {
-                    conversation.undo_stack.push((user, assistant));
-                    return true;
-                }
-            }
-            false
-        });
-        if changed {
-            self.touch();
-        }
-        changed
-    }
-
-    /// Redo the last undone message pair
-    pub fn redo(&mut self) -> bool {
-        let changed = self.state.update(|state, events| {
-            let conversation = &mut state.conversation;
-            if let Some((user, assistant)) = conversation.undo_stack.pop() {
-                let user_role = user
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                let assistant_role = assistant
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                conversation.messages.push(user);
-                conversation.messages.push(assistant);
-                events.push(openclaudia::state::StateEvent::MessageAppended { role: user_role });
-                events.push(openclaudia::state::StateEvent::MessageAppended {
-                    role: assistant_role,
-                });
-                true
-            } else {
-                false
-            }
-        });
-        if changed {
-            self.touch();
-        }
-        changed
-    }
-
-    /// Clear undo stack (call when new messages are added)
-    pub fn clear_undo_stack(&self) {
-        self.state
-            .update(|state, _| state.conversation.undo_stack.clear());
-    }
-
-    /// Add a working directory to the session scope (deduplicates by canonical path).
-    ///
-    /// Returns `true` if the directory was added, `false` if it was already present.
-    pub fn add_working_dir(&mut self, path: std::path::PathBuf) -> bool {
-        let added = self.state.update(|state, _| {
-            let directories = &mut state.identity.additional_directories_for_claude_md;
-            if directories.contains(&path) {
-                false
-            } else {
-                directories.push(path);
-                true
-            }
-        });
-        if added {
-            self.touch();
-        }
-        added
-    }
-
-    pub fn update_title(&mut self) {
-        let title = self.state.inspect(|state| {
-            state
-                .conversation
-                .messages
-                .iter()
-                .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
-                .and_then(|message| message.get("content").and_then(|content| content.as_str()))
-                .map(|content| {
-                    if content.len() > 50 {
-                        format!("{}...", safe_truncate(content, 47))
-                    } else {
-                        content.to_string()
-                    }
-                })
-        });
-        if let Some(title) = title {
-            self.title = title;
-        }
-    }
-
-    pub fn touch(&mut self) {
-        self.updated_at = chrono::Utc::now();
-    }
-}
-
-impl serde::Serialize for ChatSession {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut state = self.state.snapshot();
-        state.modes.agent_mode = self.mode;
-        serde::Serialize::serialize(
-            &openclaudia::state::SessionDocument::from_state(
-                self.title.clone(),
-                self.created_at,
-                self.updated_at,
-                self.model.clone(),
-                self.provider.clone(),
-                state,
-            ),
-            serializer,
-        )
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ChatSession {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error as _;
-
-        let document =
-            <openclaudia::state::SessionDocument as serde::Deserialize>::deserialize(deserializer)?;
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let title = document.title.clone();
-        let created_at = document.created_at;
-        let updated_at = document.updated_at;
-        let model = document.model.clone();
-        let provider = document.provider.clone();
-        let state = document.into_state(&cwd).map_err(D::Error::custom)?;
-        let mode = state.modes.agent_mode;
-        Ok(Self {
-            title,
-            created_at,
-            updated_at,
-            model,
-            provider,
-            mode,
-            state: openclaudia::state::StateStore::new(state),
-        })
-    }
-}
-
 /// Save a chat session to disk
-pub fn save_chat_session(session: &ChatSession) -> anyhow::Result<()> {
+pub fn save_chat_session(session: &Session) -> anyhow::Result<()> {
     let path = chat_session_path(&session.id())?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    session.refresh_estimated_tokens();
-    let json = serde_json::to_string_pretty(session)?;
-    fs::write(path, json)?;
+    let _ = session.refresh_estimated_tokens();
+    openclaudia::file_error::write_json_pretty_atomic(path, session)?;
     Ok(())
 }
 
@@ -411,20 +47,13 @@ pub struct ChatSessionLoadIssue {
 
 #[derive(Debug, Clone)]
 pub struct ChatSessionList {
-    pub sessions: Vec<ChatSession>,
+    pub sessions: Vec<Session>,
     pub issues: Vec<ChatSessionLoadIssue>,
 }
 
 fn validate_chat_session_id(id: &str) -> anyhow::Result<()> {
-    if id.is_empty() {
-        bail!("chat session id must not be empty");
-    }
-
-    if id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-        Ok(())
-    } else {
-        bail!("chat session id contains invalid characters: {id:?}");
-    }
+    openclaudia::state::validate_session_id(id)
+        .map_err(|reason| anyhow::anyhow!("invalid chat session id {id:?}: {reason}"))
 }
 
 fn chat_session_path(id: &str) -> anyhow::Result<PathBuf> {
@@ -432,31 +61,59 @@ fn chat_session_path(id: &str) -> anyhow::Result<PathBuf> {
     Ok(get_sessions_dir().join(format!("{id}.json")))
 }
 
-fn read_chat_session_file(path: &Path) -> anyhow::Result<ChatSession> {
+fn reject_chat_session_symlink(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect chat session {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "saved chat session {} must not be a symlink",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_chat_session_file(path: &Path) -> anyhow::Result<Session> {
+    reject_chat_session_symlink(path)?;
     let json = fs::read_to_string(path)
         .with_context(|| format!("failed to read chat session {}", path.display()))?;
-    let session: ChatSession = serde_json::from_str(&json)
+    let session: Session = serde_json::from_str(&json)
         .with_context(|| format!("failed to parse chat session {}", path.display()))?;
-    validate_chat_session_id(&session.id())
+    openclaudia::state::validate_session_file(path, &session.id())
+        .map_err(anyhow::Error::msg)
         .with_context(|| format!("invalid chat session id in {}", path.display()))?;
     Ok(session)
 }
 
 /// Load a chat session by ID
-pub fn load_chat_session(id: &str) -> anyhow::Result<Option<ChatSession>> {
+pub fn load_chat_session(id: &str) -> anyhow::Result<Option<Session>> {
     let path = chat_session_path(id)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "saved chat session {} must not be a symlink",
+                path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect chat session {}", path.display()));
+        }
+    }
     let json = match fs::read_to_string(&path) {
         Ok(json) => json,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("failed to read chat session {}", path.display()));
         }
     };
 
-    let session: ChatSession = serde_json::from_str(&json)
+    let session: Session = serde_json::from_str(&json)
         .with_context(|| format!("failed to parse chat session {}", path.display()))?;
-    validate_chat_session_id(&session.id())
+    openclaudia::state::validate_session_file(&path, &session.id())
+        .map_err(anyhow::Error::msg)
         .with_context(|| format!("invalid chat session id in {}", path.display()))?;
     Ok(Some(session))
 }
@@ -515,7 +172,7 @@ pub fn list_chat_sessions_with_issues() -> ChatSessionList {
 }
 
 /// List all chat sessions, sorted by most recent
-pub fn list_chat_sessions() -> Vec<ChatSession> {
+pub fn list_chat_sessions() -> Vec<Session> {
     let listed = list_chat_sessions_with_issues();
     for issue in &listed.issues {
         tracing::warn!(
@@ -537,8 +194,8 @@ pub fn list_chat_sessions() -> Vec<ChatSession> {
 mod tests {
     use super::*;
 
-    fn test_session() -> ChatSession {
-        ChatSession::new(
+    fn test_session() -> Session {
+        Session::new_with_behavior_mode(
             "test-model",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
@@ -557,7 +214,10 @@ mod tests {
     #[test]
     fn save_chat_session_rejects_path_segments() {
         let session = test_session();
-        session.set_id("../outside".to_string());
+        session.update_state(|state, _| {
+            state.identity.session_id =
+                openclaudia::state::SessionId::from_raw_unchecked("../outside");
+        });
 
         let err = save_chat_session(&session).expect_err("path traversal must be rejected");
 
@@ -600,13 +260,18 @@ mod tests {
     #[test]
     fn apply_loaded_keeps_subscribers_and_emits_session_boundary() {
         let mut current = test_session();
-        current.set_id("current".to_string());
+        current.update_state(|state, _| {
+            state.identity.session_id =
+                openclaudia::state::SessionId::from_raw_unchecked("current");
+        });
         current.push_message(serde_json::json!({"role": "user"}));
         let mut subscription = current.state_store().subscribe_log_lag();
 
         let loaded = test_session();
-        loaded.set_id("loaded".to_string());
-        current.apply_loaded(loaded);
+        loaded.update_state(|state, _| {
+            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("loaded");
+        });
+        current.apply_loaded(&loaded);
 
         assert!(matches!(
             subscription.try_recv(),
@@ -637,7 +302,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("invalid-id.json");
         let session = test_session();
-        session.set_id("../outside".to_string());
+        session.update_state(|state, _| {
+            state.identity.session_id =
+                openclaudia::state::SessionId::from_raw_unchecked("../outside");
+        });
         fs::write(&path, serde_json::to_string(&session).unwrap()).unwrap();
 
         let err = read_chat_session_file(&path).expect_err("invalid stored id must be an error");
@@ -653,7 +321,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let valid_path = tmp.path().join("valid.json");
         let corrupt_path = tmp.path().join("corrupt.json");
-        fs::write(&valid_path, serde_json::to_string(&test_session()).unwrap()).unwrap();
+        let valid = test_session();
+        valid.update_state(|state, _| {
+            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("valid");
+        });
+        fs::write(&valid_path, serde_json::to_string(&valid).unwrap()).unwrap();
         fs::write(&corrupt_path, "{not-json").unwrap();
 
         let listed = list_chat_sessions_in_dir(tmp.path());
@@ -668,5 +340,24 @@ mod tests {
             "unexpected issue: {:?}",
             listed.issues[0]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_chat_session_file_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("linked.json");
+        let session = test_session();
+        session.update_state(|state, _| {
+            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("linked");
+        });
+        fs::write(&target, serde_json::to_vec(&session).unwrap()).unwrap();
+        symlink(target, &link).unwrap();
+
+        let error = read_chat_session_file(&link).expect_err("symlinks must be rejected");
+        assert!(error.to_string().contains("must not be a symlink"));
     }
 }

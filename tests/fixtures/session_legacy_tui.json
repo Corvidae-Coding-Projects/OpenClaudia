@@ -1,0 +1,31 @@
+{
+  "id": "legacy-session",
+  "title": "legacy title",
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-02T00:00:00Z",
+  "model": "legacy-model",
+  "provider": "legacy-provider",
+  "mode": "Extend",
+  "messages": [
+    {
+      "role": "user",
+      "content": "remember me"
+    }
+  ],
+  "undo_stack": [
+    [
+      {
+        "role": "user",
+        "content": "undo user"
+      },
+      {
+        "role": "assistant",
+        "content": "undo assistant"
+      }
+    ]
+  ],
+  "approved_plan": "ship it",
+  "working_dirs": [
+    "/tmp/shared"
+  ]
+}

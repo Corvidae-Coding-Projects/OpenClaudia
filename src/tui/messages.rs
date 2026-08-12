@@ -126,7 +126,7 @@ impl std::fmt::Display for Role {
 
 /// The agent operating mode.
 ///
-/// Replaces `TuiSession.mode: String` and `App.mode: String`.
+/// UI rendering mode, distinct from the canonical session's agent mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum Mode {

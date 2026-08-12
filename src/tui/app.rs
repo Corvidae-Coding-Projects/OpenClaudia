@@ -25,6 +25,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::file_error::{self, FileError};
+use crate::state::Session;
 
 const INPUT_PROMPT_WIDTH: u16 = 2;
 const MIN_INPUT_HEIGHT: u16 = 3;
@@ -145,337 +146,6 @@ pub static TUI_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// underlying store is lock-free.
 pub fn request_tui_shutdown() {
     TUI_SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// TUI compatibility wrapper around the shared session state store.
-#[derive(Debug, Clone)]
-pub struct TuiSession {
-    pub title: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-    pub model: String,
-    pub provider: String,
-    pub mode: crate::state::AgentMode,
-    state: crate::state::StateStore,
-}
-
-impl TuiSession {
-    #[must_use]
-    fn new(model: &str, provider: &str) -> Self {
-        let now = chrono::Utc::now();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self {
-            title: "New conversation".to_string(),
-            created_at: now,
-            updated_at: now,
-            model: model.to_string(),
-            provider: provider.to_string(),
-            mode: crate::state::AgentMode::Build,
-            state: crate::state::StateStore::new(crate::state::SessionState::new(cwd)),
-        }
-    }
-
-    #[must_use]
-    pub fn id(&self) -> String {
-        self.state
-            .inspect(|state| state.identity.session_id.to_string())
-    }
-
-    #[cfg(test)]
-    fn set_id(&self, id: String) {
-        self.state.update(|state, _| {
-            state.identity.session_id = crate::state::SessionId::from_raw_unchecked(id);
-        });
-    }
-
-    #[must_use]
-    pub fn messages_snapshot(&self) -> Vec<serde_json::Value> {
-        self.state
-            .inspect(|state| state.conversation.messages.clone())
-    }
-
-    fn message_count(&self) -> usize {
-        self.state
-            .inspect(|state| state.conversation.messages.len())
-    }
-
-    pub fn push_message(&self, message: serde_json::Value) {
-        let role = message
-            .get("role")
-            .and_then(|role| role.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        self.state.update(|state, events| {
-            state.conversation.messages.push(message);
-            events.push(crate::state::StateEvent::MessageAppended { role });
-        });
-    }
-
-    fn replace_messages(&self, messages: Vec<serde_json::Value>) {
-        self.state.update(|state, events| {
-            let previous_len = state.conversation.messages.len();
-            state.conversation.messages = messages;
-            if previous_len > 0 && state.conversation.messages.is_empty() {
-                events.push(crate::state::StateEvent::Cleared);
-            }
-            events.extend(
-                state
-                    .conversation
-                    .messages
-                    .iter()
-                    .skip(previous_len)
-                    .map(|message| {
-                        message
-                            .get("role")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_string()
-                    })
-                    .map(|role| crate::state::StateEvent::MessageAppended { role }),
-            );
-        });
-    }
-
-    fn update_messages<R>(&self, update: impl FnOnce(&mut Vec<serde_json::Value>) -> R) -> R {
-        self.state
-            .update(|state, _| update(&mut state.conversation.messages))
-    }
-
-    fn update_state<R>(
-        &self,
-        update: impl FnOnce(&mut crate::state::SessionState, &mut Vec<crate::state::StateEvent>) -> R,
-    ) -> R {
-        self.state.update(update)
-    }
-
-    #[must_use]
-    pub fn state_snapshot(&self) -> crate::state::SessionState {
-        self.state.snapshot()
-    }
-
-    #[must_use]
-    fn effort_level(&self) -> EffortLevel {
-        self.state.inspect(|state| state.budgets.effort_level)
-    }
-
-    fn set_effort_level(&self, level: EffortLevel) {
-        self.state.update(|state, events| {
-            state.budgets.effort_level = level;
-            events.push(crate::state::StateEvent::EffortChanged { new: level });
-        });
-    }
-
-    #[must_use]
-    fn estimated_tokens(&self) -> usize {
-        self.state.inspect(|state| state.budgets.estimated_tokens)
-    }
-
-    fn set_transcript_position(&self, cwd: PathBuf, watermark: usize) {
-        self.state.update(|state, _| {
-            state.transcript.transcript_cwd = cwd;
-            state.transcript.watermark = watermark;
-        });
-    }
-
-    #[must_use]
-    fn state_store(&self) -> crate::state::StateStore {
-        self.state.clone()
-    }
-
-    fn apply_loaded(&mut self, loaded: &Self) {
-        self.title.clone_from(&loaded.title);
-        self.created_at = loaded.created_at;
-        self.updated_at = loaded.updated_at;
-        self.model.clone_from(&loaded.model);
-        self.provider.clone_from(&loaded.provider);
-        self.mode = loaded.mode;
-        self.state.replace(loaded.state.snapshot());
-    }
-
-    #[must_use]
-    fn transcript_cwd(&self) -> PathBuf {
-        self.state
-            .inspect(|state| state.transcript.transcript_cwd.clone())
-    }
-
-    fn set_permission_bypass(&self, enabled: bool) {
-        self.state.update(|state, events| {
-            if state.permissions.bypass_mode != enabled {
-                state.permissions.bypass_mode = enabled;
-                events.push(crate::state::StateEvent::PermissionsMutated);
-            }
-        });
-    }
-
-    fn refresh_estimated_tokens(&self) -> usize {
-        self.state.update(|state, _| {
-            let estimated = state
-                .conversation
-                .messages
-                .iter()
-                .map(|message| {
-                    message
-                        .get("content")
-                        .and_then(|content| content.as_str())
-                        .unwrap_or("")
-                        .len()
-                        / 4
-                        + 4
-                })
-                .sum();
-            state.budgets.estimated_tokens = estimated;
-            estimated
-        })
-    }
-
-    /// Copy the compatibility wrapper without sharing its mutable store.
-    ///
-    /// `StateStore::clone` intentionally shares state, but load/recovery paths
-    /// historically treated a cloned `TuiSession` as an independent value.
-    fn detached_clone(&self) -> Self {
-        Self {
-            title: self.title.clone(),
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            model: self.model.clone(),
-            provider: self.provider.clone(),
-            mode: self.mode,
-            state: crate::state::StateStore::new(self.state.snapshot()),
-        }
-    }
-
-    fn touch(&mut self) {
-        self.updated_at = chrono::Utc::now();
-    }
-
-    fn update_title(&mut self) {
-        let title = self.state.inspect(|state| {
-            state
-                .conversation
-                .messages
-                .iter()
-                .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
-                .and_then(|message| message.get("content").and_then(|content| content.as_str()))
-                .map(|content| {
-                    if content.len() > 50 {
-                        format!("{}...", crate::tools::safe_truncate(content, 47))
-                    } else {
-                        content.to_string()
-                    }
-                })
-        });
-        if let Some(title) = title {
-            self.title = title;
-        }
-    }
-
-    const fn toggle_mode(&mut self) {
-        self.mode = self.mode.toggled();
-    }
-
-    const fn mode_description(&self) -> &'static str {
-        self.mode.description()
-    }
-
-    fn undo(&mut self) -> bool {
-        let changed = self.state.update(|state, _| {
-            let conversation = &mut state.conversation;
-            if conversation.messages.len() >= 2 {
-                if let (Some(assistant), Some(user)) =
-                    (conversation.messages.pop(), conversation.messages.pop())
-                {
-                    conversation.undo_stack.push((user, assistant));
-                    return true;
-                }
-            }
-            false
-        });
-        if changed {
-            self.touch();
-        }
-        changed
-    }
-
-    fn redo(&mut self) -> bool {
-        let changed = self.state.update(|state, events| {
-            let conversation = &mut state.conversation;
-            if let Some((user, assistant)) = conversation.undo_stack.pop() {
-                let user_role = user
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                let assistant_role = assistant
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                conversation.messages.push(user);
-                conversation.messages.push(assistant);
-                events.push(crate::state::StateEvent::MessageAppended { role: user_role });
-                events.push(crate::state::StateEvent::MessageAppended {
-                    role: assistant_role,
-                });
-                true
-            } else {
-                false
-            }
-        });
-        if changed {
-            self.touch();
-        }
-        changed
-    }
-}
-
-impl serde::Serialize for TuiSession {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut state = self.state.snapshot();
-        state.modes.agent_mode = self.mode;
-        serde::Serialize::serialize(
-            &crate::state::SessionDocument::from_state(
-                self.title.clone(),
-                self.created_at,
-                self.updated_at,
-                self.model.clone(),
-                self.provider.clone(),
-                state,
-            ),
-            serializer,
-        )
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for TuiSession {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error as _;
-
-        let document =
-            <crate::state::SessionDocument as serde::Deserialize>::deserialize(deserializer)?;
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let title = document.title.clone();
-        let created_at = document.created_at;
-        let updated_at = document.updated_at;
-        let model = document.model.clone();
-        let provider = document.provider.clone();
-        let state = document.into_state(&cwd).map_err(D::Error::custom)?;
-        let mode = state.modes.agent_mode;
-        Ok(Self {
-            title,
-            created_at,
-            updated_at,
-            model,
-            provider,
-            mode,
-            state: crate::state::StateStore::new(state),
-        })
-    }
 }
 
 const fn tui_mode_for_agent(mode: crate::state::AgentMode) -> Mode {
@@ -643,16 +313,16 @@ fn iso_of_systemtime(t: std::time::SystemTime) -> String {
     }
 }
 
-fn save_session(session: &TuiSession) -> Result<(), FileError> {
+fn save_session(session: &Session) -> Result<(), FileError> {
     let dir = sessions_dir();
-    validate_tui_session_id(&session.id()).map_err(|reason| FileError::Invalid {
+    crate::state::validate_session_id(&session.id()).map_err(|reason| FileError::Invalid {
         path: dir.clone(),
-        reason,
+        reason: reason.to_string(),
     })?;
     file_error::create_dir_all(&dir)?;
-    session.refresh_estimated_tokens();
+    let _ = session.refresh_estimated_tokens();
     let path = dir.join(format!("{}.json", session.id()));
-    match file_error::write_json_pretty(&path, session) {
+    match file_error::write_json_pretty_atomic(&path, session) {
         Ok(()) => Ok(()),
         Err(err) => {
             // crosslink #889: a single un-serializable message previously
@@ -676,10 +346,7 @@ fn save_session(session: &TuiSession) -> Result<(), FileError> {
 ///
 /// The path is reused (no second `create_dir_all` needed — the original
 /// `save_session` already created the directory).
-fn save_session_with_recovery(
-    session: &TuiSession,
-    path: &std::path::Path,
-) -> Result<(), FileError> {
+fn save_session_with_recovery(session: &Session, path: &std::path::Path) -> Result<(), FileError> {
     let salvaged = session.detached_clone();
     let mut messages = salvaged.messages_snapshot();
     let mut lost = 0usize;
@@ -700,35 +367,30 @@ fn save_session_with_recovery(
         );
     }
     salvaged.replace_messages(messages);
-    file_error::write_json_pretty(path, &salvaged)
+    file_error::write_json_pretty_atomic(path, &salvaged)
 }
 
-fn validate_tui_session_id(id: &str) -> Result<(), String> {
-    if id.is_empty() {
-        return Err("TUI session id must not be empty".to_string());
+fn read_tui_session_file(path: &Path) -> Result<Session, FileError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(FileError::with_path(path))?;
+    if metadata.file_type().is_symlink() {
+        return Err(FileError::Invalid {
+            path: path.to_path_buf(),
+            reason: "saved session must not be a symlink".to_string(),
+        });
     }
-
-    if id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-        Ok(())
-    } else {
-        Err(format!(
-            "TUI session id contains invalid characters: {id:?}"
-        ))
-    }
-}
-
-fn read_tui_session_file(path: &Path) -> Result<TuiSession, FileError> {
     let json = file_error::read_file(path)?;
-    let session: TuiSession =
+    let session: Session =
         serde_json::from_str(&json).map_err(file_error::FileError::json_with_path(path))?;
-    validate_tui_session_id(&session.id()).map_err(|reason| FileError::Invalid {
-        path: path.to_path_buf(),
-        reason,
+    crate::state::validate_session_file(path, &session.id()).map_err(|reason| {
+        FileError::Invalid {
+            path: path.to_path_buf(),
+            reason,
+        }
     })?;
     Ok(session)
 }
 
-fn list_sessions() -> Vec<TuiSession> {
+fn list_sessions() -> Vec<Session> {
     let dir = sessions_dir();
     let mut sessions = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -1175,7 +837,7 @@ pub struct App {
     /// Async runtime handle for spawning API tasks from the sync event loop.
     runtime_handle: Option<tokio::runtime::Handle>,
     /// Persistent chat session (for save/load/resume)
-    pub chat_session: TuiSession,
+    pub chat_session: Session,
     /// Coalescing transcript writer subscribed to canonical state changes.
     transcript_subscriber: crate::transcript::TranscriptStateSubscriber,
     /// Optional lifecycle analytics subscriber. Production installs the
@@ -1236,7 +898,7 @@ impl App {
         provider: &str,
         policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     ) -> Self {
-        let chat_session = TuiSession::new(model, provider);
+        let chat_session = Session::new(model, provider);
         let transcript_subscriber =
             crate::transcript::TranscriptStateSubscriber::new(chat_session.state_store());
         Self {
@@ -1283,16 +945,16 @@ impl App {
         self.overlay = Some(ActiveOverlay::Help(super::components::HelpOverlay::new()));
     }
 
-    fn apply_loaded_session(&mut self, loaded: &TuiSession) {
+    fn apply_loaded_session(&mut self, loaded: &Session) {
         // Flush the old snapshot before replacement. Subscribers stay attached
         // because `apply_loaded` replaces the shared store in place.
         self.transcript_subscriber.flush_now();
         self.chat_session.apply_loaded(loaded);
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
-        self.mode = tui_mode_for_agent(loaded.mode);
+        self.mode = tui_mode_for_agent(loaded.agent_mode());
         self.refresh_app_config_target();
-        self.chat_session.refresh_estimated_tokens();
+        let _ = self.chat_session.refresh_estimated_tokens();
         let transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         self.chat_session
             .set_transcript_position(transcript_cwd, self.chat_session.message_count());
@@ -1863,7 +1525,7 @@ impl App {
         self.is_waiting = false;
         self.chat_session.update_title();
         self.chat_session.touch();
-        self.chat_session.refresh_estimated_tokens();
+        let _ = self.chat_session.refresh_estimated_tokens();
         self.persist_session();
         self.fire_stop_hook();
     }
@@ -2696,10 +2358,10 @@ impl App {
     /// Table-handler entry point for `/mode`.
     fn slash_mode(&mut self) {
         self.chat_session.toggle_mode();
-        self.mode = tui_mode_for_agent(self.chat_session.mode);
+        self.mode = tui_mode_for_agent(self.chat_session.agent_mode());
         self.messages.add(DisplayMessage::system(format!(
             "Mode: {} — {}",
-            self.chat_session.mode,
+            self.chat_session.agent_mode(),
             self.chat_session.mode_description()
         )));
     }
@@ -4775,11 +4437,12 @@ mod tests {
     use super::{
         current_exe_command, format_api_retry_delay, format_api_retry_message,
         format_init_command_output, format_review_command_output, format_stream_timeout_message,
-        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, resolve_provider_switch_auth,
-        save_session, ApiClient, App, AppEvent, EffortLevel, MessageKind, ProviderSwitch,
-        SpawnTarget, TuiSession, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
+        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, read_tui_session_file,
+        resolve_provider_switch_auth, save_session, ApiClient, App, AppEvent, EffortLevel,
+        MessageKind, ProviderSwitch, SpawnTarget, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
     };
     use crate::slash_commands::all_tui_commands;
+    use crate::state::Session;
     use crate::tui::events::ApiRetryKind;
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -6143,14 +5806,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut older = TuiSession::new("old-model", "old-provider");
+        let mut older = Session::new("old-model", "old-provider");
         older.set_id("older-session".to_string());
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
         older.push_message(serde_json::json!({"role": "user", "content": "older"}));
 
-        let mut newer = TuiSession::new("new-model", "new-provider");
+        let mut newer = Session::new("new-model", "new-provider");
         newer.set_id("newer-session".to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
@@ -6184,13 +5847,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut older = TuiSession::new("old-model", "old-provider");
+        let mut older = Session::new("old-model", "old-provider");
         older.set_id("older-session".to_string());
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
 
-        let mut newer = TuiSession::new("new-model", "new-provider");
+        let mut newer = Session::new("new-model", "new-provider");
         newer.set_id("newer-session".to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
@@ -6211,7 +5874,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let session = TuiSession::new("model", "provider");
+        let session = Session::new("model", "provider");
         session.set_id("../outside".to_string());
 
         let err = save_session(&session).expect_err("path traversal id must be rejected");
@@ -6229,14 +5892,14 @@ mod tests {
         let session_dir = tmp.path().join("chat_sessions");
         let _guard = SessionDirGuard::set(session_dir.clone());
 
-        let mut valid = TuiSession::new("valid-model", "provider");
+        let mut valid = Session::new("valid-model", "provider");
         valid.set_id("abc".to_string());
         valid.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
         save_session(&valid).expect("short valid id should save");
 
-        let invalid = TuiSession::new("invalid-model", "provider");
+        let invalid = Session::new("invalid-model", "provider");
         invalid.set_id("../outside".to_string());
         std::fs::write(
             session_dir.join("invalid.json"),
@@ -6248,6 +5911,23 @@ mod tests {
 
         assert_eq!(sessions.len(), 1, "invalid stored session must be skipped");
         assert_eq!(sessions[0].id(), "abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_tui_session_file_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("linked.json");
+        let session = Session::new("model", "provider");
+        session.set_id("linked".to_string());
+        std::fs::write(&target, serde_json::to_vec(&session).unwrap()).unwrap();
+        symlink(target, &link).unwrap();
+
+        let error = read_tui_session_file(&link).expect_err("symlinks must be rejected");
+        assert!(error.to_string().contains("must not be a symlink"));
     }
 
     #[test]

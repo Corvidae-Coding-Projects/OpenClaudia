@@ -34,7 +34,7 @@ use crate::cli::repl::slash::{
     PluginActionRunner, PluginCommandInvocation, SkillInvocation, SlashCommandResult,
 };
 use crate::cli::repl::vim::{self, VimState};
-use crate::cli::repl::{load_chat_session, save_chat_session, ChatSession};
+use crate::cli::repl::{load_chat_session, save_chat_session, Session};
 use crate::{
     build_chat_endpoint_and_headers, build_chat_request_body, build_hook_engine, chdir_to_git_root,
     check_tool_permission_interactive, check_tool_unrestricted, finalize_chat,
@@ -101,7 +101,7 @@ fn observe_cli_model_visible_tool_result(
 }
 
 fn push_observed_cli_tool_result_message(
-    session: &mut ChatSession,
+    session: &mut Session,
     tool_call: &tools::ToolCall,
     tool_call_id: &str,
     final_content: &str,
@@ -118,7 +118,7 @@ fn push_observed_cli_tool_result_message(
 }
 
 fn push_cli_tool_result_message(
-    session: &mut ChatSession,
+    session: &mut Session,
     tool_call_id: &str,
     final_content: &str,
     final_is_error: bool,
@@ -175,7 +175,7 @@ pub struct ChatRepl {
     // ── Per-session mutable state ──
     model: String,
     rl: rustyline::DefaultEditor,
-    chat_session: ChatSession,
+    chat_session: Session,
     analytics_subscriber: openclaudia::services::analytics::StateAnalyticsSubscriber,
     current_task_obs: Option<openclaudia::ledger::ObsId>,
     active_theme: tui::Theme,
@@ -471,7 +471,7 @@ impl ChatRepl {
         let _ = tui::setup_pinned_bar();
 
         let mut chat_session =
-            ChatSession::new(&model, &config.proxy.target, initial_behavior_mode);
+            Session::new_with_behavior_mode(&model, &config.proxy.target, initial_behavior_mode);
         maybe_resume_session(&mut chat_session, args.resume, args.session_id.as_deref());
         // A dangerous bypass is a launch-scoped choice. Apply it after resume
         // so a saved session can neither enable nor disable the current CLI's
@@ -582,7 +582,7 @@ impl ChatRepl {
         let behavior_name = self.chat_session.behavior_mode().display_name();
         let mode_str = format!(
             "{} ({})",
-            self.chat_session.mode.display().to_lowercase(),
+            self.chat_session.agent_mode().display().to_lowercase(),
             behavior_name,
         );
         let _ = tui::render_input_prompt(&mode_str);
@@ -802,17 +802,18 @@ impl ChatRepl {
             SlashCommandResult::Clear => {
                 save_session_to_short_term_memory(&self.chat_session, memory_db);
                 let prev_mode = self.chat_session.behavior_mode();
-                self.chat_session.apply_loaded(ChatSession::new(
-                    &self.model,
-                    &self.config.proxy.target,
-                    prev_mode,
-                ));
+                self.chat_session
+                    .apply_loaded(&Session::new_with_behavior_mode(
+                        &self.model,
+                        &self.config.proxy.target,
+                        prev_mode,
+                    ));
                 SlashOutcome::Continue
             }
             SlashCommandResult::LoadSession(sid) => {
                 match load_chat_session(&sid) {
                     Ok(Some(loaded)) => {
-                        self.chat_session.apply_loaded(loaded);
+                        self.chat_session.apply_loaded(&loaded);
                         println!(
                             "Loaded {} messages from previous session.\n",
                             self.chat_session.message_count()
@@ -986,11 +987,11 @@ impl ChatRepl {
             }
             SlashCommandResult::Status => self.print_status(),
             SlashCommandResult::ToggleMode => {
-                self.chat_session.mode = self.chat_session.mode.toggle();
+                self.chat_session.toggle_mode();
                 println!(
                     "\nSwitched to {} mode: {}\n",
-                    self.chat_session.mode.display(),
-                    self.chat_session.mode.description()
+                    self.chat_session.agent_mode().display(),
+                    self.chat_session.mode_description()
                 );
             }
             SlashCommandResult::Keybindings => display_keybindings(&self.config.keybindings),
@@ -1136,8 +1137,8 @@ impl ChatRepl {
         );
         println!(
             "  Mode:       {} ({})",
-            self.chat_session.mode.display(),
-            self.chat_session.mode.description()
+            self.chat_session.agent_mode().display(),
+            self.chat_session.mode_description()
         );
         println!("  Messages:   {msg_count}");
         println!("  Est tokens: ~{tokens}");
@@ -1857,7 +1858,7 @@ impl ChatRepl {
             &self.model,
             tokens,
             cost,
-            self.chat_session.mode.display(),
+            self.chat_session.agent_mode().display(),
             &dur_str,
         );
         println!();
@@ -2093,7 +2094,7 @@ impl ChatRepl {
         result: &tools::ToolResult,
     ) -> serde_json::Value {
         let (final_content, was_marker) = process_tool_result_marker(
-            &mut self.chat_session,
+            &self.chat_session,
             &tool_call.function.name,
             &result.content,
         );
@@ -2353,7 +2354,7 @@ impl ChatRepl {
             &self.model,
             tokens,
             cost,
-            self.chat_session.mode.display(),
+            self.chat_session.agent_mode().display(),
             &dur_str,
         );
     }
@@ -2770,7 +2771,7 @@ impl ChatRepl {
         );
 
         let (final_content, was_marker) = process_tool_result_marker(
-            &mut self.chat_session,
+            &self.chat_session,
             &tool_call.function.name,
             &result.content,
         );
@@ -3669,7 +3670,7 @@ impl ChatRepl {
         );
 
         let (final_content, was_marker) = process_tool_result_marker(
-            &mut self.chat_session,
+            &self.chat_session,
             &tool_call.function.name,
             &result.content,
         );
@@ -3854,11 +3855,11 @@ impl ChatRepl {
                 true
             }
             SlashCommandResult::ToggleMode => {
-                self.chat_session.mode = self.chat_session.mode.toggle();
+                self.chat_session.toggle_mode();
                 println!(
                     "\nSwitched to {} mode: {}\n",
-                    self.chat_session.mode.display(),
-                    self.chat_session.mode.description()
+                    self.chat_session.agent_mode().display(),
+                    self.chat_session.mode_description()
                 );
                 false
             }
@@ -3868,7 +3869,7 @@ impl ChatRepl {
                     chrono::Utc::now().signed_duration_since(self.chat_session.created_at);
                 println!(
                     "\n[{}] {} | ~{} tokens | {} min\n",
-                    self.chat_session.mode.display(),
+                    self.chat_session.agent_mode().display(),
                     self.chat_session.model,
                     tokens,
                     duration.num_minutes()
@@ -3927,7 +3928,7 @@ fn attach_reasoning_content(message: &mut serde_json::Value, reasoning_content: 
     }
 }
 
-fn persist_chat_session_update(session: &mut ChatSession, reason: &str) {
+fn persist_chat_session_update(session: &mut Session, reason: &str) {
     session.touch();
     if let Err(e) = save_chat_session(session) {
         tracing::warn!(
@@ -3939,7 +3940,7 @@ fn persist_chat_session_update(session: &mut ChatSession, reason: &str) {
 }
 
 fn push_chat_session_message_and_persist(
-    session: &mut ChatSession,
+    session: &mut Session,
     message: serde_json::Value,
     reason: &str,
 ) {
@@ -3980,7 +3981,7 @@ fn normalize_prompt_effort(effort: &str) -> Option<EffortLevel> {
     }
 }
 
-fn rewind_chat_session(session: &mut ChatSession, turns: usize) -> usize {
+fn rewind_chat_session(session: &mut Session, turns: usize) -> usize {
     let mut rewound = 0;
     for _ in 0..turns {
         if session.undo() {
@@ -3994,7 +3995,7 @@ fn rewind_chat_session(session: &mut ChatSession, turns: usize) -> usize {
 
 fn apply_fast_mode_result(
     model: &mut String,
-    session: &mut ChatSession,
+    session: &mut Session,
     effort: &str,
     fast_model: Option<String>,
 ) {
@@ -4412,8 +4413,8 @@ providers: {}
             .any(|finding| finding.contains("run cargo fmt")));
     }
 
-    fn chat_session_with_turns(turns: usize) -> ChatSession {
-        let session = ChatSession::new(
+    fn chat_session_with_turns(turns: usize) -> Session {
+        let session = Session::new_with_behavior_mode(
             "claude-sonnet",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
@@ -4686,7 +4687,7 @@ providers: {}
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         let tmp = tempfile::tempdir().expect("tempdir");
         let _xdg = EnvGuard::set_path("XDG_DATA_HOME", tmp.path());
-        let mut session = ChatSession::new(
+        let mut session = Session::new_with_behavior_mode(
             "claude-sonnet",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),
@@ -4716,7 +4717,7 @@ providers: {}
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         let tmp = tempfile::tempdir().expect("tempdir");
         let _xdg = EnvGuard::set_path("XDG_DATA_HOME", tmp.path());
-        let mut session = ChatSession::new(
+        let mut session = Session::new_with_behavior_mode(
             "claude-sonnet",
             "anthropic",
             openclaudia::modes::BehaviorMode::default(),

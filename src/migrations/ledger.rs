@@ -178,7 +178,7 @@ impl CompletionLedger {
 
         // Atomic rename: readers see either the prior complete file or
         // the new complete file — never a half-written intermediate.
-        if let Err(err) = std::fs::rename(&tmp, path) {
+        if let Err(err) = crate::file_error::replace_file_atomic(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(anyhow!(err).context(format!(
                 "failed to rename ledger temp {} -> {}",

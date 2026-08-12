@@ -68,10 +68,9 @@ type Bucket = HashMap<PathBuf, u64>;
 /// canonical absolute against a raw relative). `mark_read` on a path
 /// whose `canonicalize` fails logs a warning and skips the insertion.
 ///
-/// crosslink #440 phase 1: session isolation lives inside this
-/// singleton (keyed by the thread-local session id), not yet threaded
-/// through `ToolContext`. Phase 2 (follow-up issue) will own the
-/// tracker on `ChatSession` / `ToolContext` directly.
+/// crosslink #440 phase 1: session isolation lives inside this singleton,
+/// keyed by the thread-local session id rather than threaded through
+/// `ToolContext`.
 ///
 /// [`HashSet`]: std::collections::HashSet
 pub static READ_TRACKER: LazyLock<ReadFileTracker> = LazyLock::new(ReadFileTracker::new);
