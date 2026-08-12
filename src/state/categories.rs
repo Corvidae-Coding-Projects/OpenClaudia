@@ -181,7 +181,7 @@ pub struct PlanModeFlags {
     pub needs_auto_exit_attachment: bool,
 }
 
-/// Ephemeral UI flags that don't survive a clean quit.
+/// Session-scoped UI flags persisted with the rest of the session document.
 ///
 /// Matches CC's REQ-1 "UI State" group.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -332,6 +332,8 @@ pub struct PermissionsState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EffortLevel {
+    None,
+    Minimal,
     Low,
     #[default]
     Medium,
@@ -345,11 +347,87 @@ impl EffortLevel {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
             Self::Max => "max",
             Self::Auto => "auto",
+        }
+    }
+
+    /// Return the Unicode status-bar symbol for this effort level.
+    #[must_use]
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::None => "\u{25CC}",
+            Self::Minimal | Self::Low => "\u{25CB}",
+            Self::Medium => "\u{25D0}",
+            Self::High => "\u{25CF}",
+            Self::Max => "\u{25C6}",
+            Self::Auto => "\u{25C7}",
+        }
+    }
+
+    /// Cycle through the generic effort sequence used outside a provider
+    /// context.
+    #[must_use]
+    pub const fn cycled(self) -> Self {
+        match self {
+            Self::None => Self::Minimal,
+            Self::Minimal | Self::High | Self::Max | Self::Auto => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+        }
+    }
+
+    /// Cycle through only the levels the active provider can express.
+    #[must_use]
+    pub fn cycled_for_provider(self, provider: &str, model: &str) -> Self {
+        let options = Self::provider_options(provider, model);
+        let Some(index) = options.iter().position(|level| *level == self) else {
+            return options.first().copied().unwrap_or(Self::Medium);
+        };
+        options[(index + 1) % options.len()]
+    }
+
+    /// Selectable effort levels for a provider/model pair.
+    #[must_use]
+    pub fn provider_options(provider: &str, model: &str) -> &'static [Self] {
+        const OPENAI: &[EffortLevel] = &[
+            EffortLevel::None,
+            EffortLevel::Minimal,
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Max,
+        ];
+        const ANTHROPIC_GEMINI: &[EffortLevel] = &[
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Max,
+        ];
+        const DEEPSEEK: &[EffortLevel] = &[EffortLevel::High, EffortLevel::Max];
+        const GLM_REASONING: &[EffortLevel] = &[
+            EffortLevel::None,
+            EffortLevel::Minimal,
+            EffortLevel::High,
+            EffortLevel::Max,
+        ];
+        const THINKING_TOGGLE: &[EffortLevel] = &[EffortLevel::Auto, EffortLevel::High];
+        const LOCAL: &[EffortLevel] = &[EffortLevel::Auto];
+
+        match provider.to_ascii_lowercase().as_str() {
+            "openai" => OPENAI,
+            "deepseek" => DEEPSEEK,
+            "zai" | "glm" | "zhipu" if model.eq_ignore_ascii_case("glm-5.2") => GLM_REASONING,
+            "qwen" | "alibaba" | "zai" | "glm" | "zhipu" | "kimi" | "moonshot" | "minimax" => {
+                THINKING_TOGGLE
+            }
+            "ollama" | "local" | "lmstudio" | "localai" | "text-generation-webui" => LOCAL,
+            _ => ANTHROPIC_GEMINI,
         }
     }
 
@@ -359,6 +437,8 @@ impl EffortLevel {
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
+            "none" | "off" => Some(Self::None),
+            "minimal" | "min" => Some(Self::Minimal),
             "low" | "l" => Some(Self::Low),
             "medium" | "med" | "m" => Some(Self::Medium),
             "high" | "h" => Some(Self::High),
@@ -366,6 +446,20 @@ impl EffortLevel {
             "auto" | "unset" => Some(Self::Auto),
             _ => None,
         }
+    }
+}
+
+impl std::fmt::Display for EffortLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for EffortLevel {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::parse(value.trim()).unwrap_or(Self::Medium))
     }
 }
 
@@ -472,6 +566,8 @@ mod tests {
 
     #[test]
     fn effort_level_parses_common_aliases() {
+        assert_eq!(EffortLevel::parse("off"), Some(EffortLevel::None));
+        assert_eq!(EffortLevel::parse("min"), Some(EffortLevel::Minimal));
         assert_eq!(EffortLevel::parse("low"), Some(EffortLevel::Low));
         assert_eq!(EffortLevel::parse("l"), Some(EffortLevel::Low));
         assert_eq!(EffortLevel::parse("MEDIUM"), Some(EffortLevel::Medium));
@@ -488,11 +584,29 @@ mod tests {
     #[test]
     fn effort_level_as_str_matches_wire_format() {
         // Matches what pipeline::build_request expects.
+        assert_eq!(EffortLevel::None.as_str(), "none");
+        assert_eq!(EffortLevel::Minimal.as_str(), "minimal");
         assert_eq!(EffortLevel::Low.as_str(), "low");
         assert_eq!(EffortLevel::Medium.as_str(), "medium");
         assert_eq!(EffortLevel::High.as_str(), "high");
         assert_eq!(EffortLevel::Max.as_str(), "max");
         assert_eq!(EffortLevel::Auto.as_str(), "auto");
+    }
+
+    #[test]
+    fn effort_level_keeps_provider_specific_cycles() {
+        assert_eq!(
+            EffortLevel::Max.cycled_for_provider("openai", "gpt-5.5"),
+            EffortLevel::None
+        );
+        assert_eq!(
+            EffortLevel::Low.cycled_for_provider("deepseek", "deepseek-reasoner"),
+            EffortLevel::High
+        );
+        assert_eq!(
+            EffortLevel::High.cycled_for_provider("ollama", "local-model"),
+            EffortLevel::Auto
+        );
     }
 
     #[test]

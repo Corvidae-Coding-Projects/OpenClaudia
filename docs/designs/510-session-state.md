@@ -1,8 +1,8 @@
 # Design: Centralized SessionState (crosslink #510)
 
-> Implementation status: Phases 0 and 1 are complete. The TUI and legacy REPL
-> now share identity, conversation state, agent mode, and a compatible session
-> document. Phases 2–5 remain planned.
+> Implementation status: Phases 0–2 are complete. The TUI and legacy REPL now
+> share identity, conversation state, agent mode, budgets, session UI state,
+> and a compatible session document. Phases 3–5 remain planned.
 
 ## Problem
 
@@ -177,9 +177,14 @@ Each phase compiles + tests green on its own.
 - Tests: `/load`, `/resume`, `/undo`, `/redo` still pass.
 
 **Phase 2 — migrate BudgetsState + UiState**
-- `App.effort_level` → `state.budgets.effort_level`.
-- Plan-mode UI flags move.
-- Tests: `/effort`, `/plan`, `/mode` still pass.
+- Complete.
+- Removed the TUI `App.effort_level` / token-cache fields and the legacy REPL's
+  string effort field; both now read and write `state.budgets`.
+- Token estimates refresh in the canonical budget state before session saves.
+- The plan/LSP UI flags already had no frontend-owned duplicates, so Phase 2
+  verifies that their canonical values survive TUI ↔ REPL serialization rather
+  than introducing unused mirror fields.
+- Tests: effort parsing/cycling and cross-frontend budget/UI round trips pass.
 
 **Phase 3 — migrate Permissions / Transcript / IDE**
 - `App.transcript_watermark` → `state.transcript.watermark`.

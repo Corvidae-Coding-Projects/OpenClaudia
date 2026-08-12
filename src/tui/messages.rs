@@ -7,6 +7,7 @@ use std::time::Instant;
 use ratatui::{buffer::CellWidth, prelude::*, widgets::Paragraph};
 
 use super::{GOLD, PURPLE, USER_BLUE};
+pub use crate::state::EffortLevel;
 
 // ─── MessageKind ────────────────────────────────────────────────────────────
 
@@ -178,136 +179,6 @@ impl FromStr for Mode {
         Ok(match s {
             "Plan" => Self::Plan,
             _ => Self::Build,
-        })
-    }
-}
-
-// ─── EffortLevel ────────────────────────────────────────────────────────────
-
-/// The reasoning-effort level forwarded to the provider.
-///
-/// Replaces `App.effort_level: String` and `ApiTurnParams.effort_level: String`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EffortLevel {
-    None,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    Max,
-    Auto,
-}
-
-impl EffortLevel {
-    /// Return the lowercase wire string expected by provider adapters.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Max => "max",
-            Self::Auto => "auto",
-        }
-    }
-
-    /// Return the Unicode bullet symbol used in the status bar.
-    #[must_use]
-    pub const fn symbol(self) -> &'static str {
-        match self {
-            Self::None => "\u{25CC}",
-            Self::Minimal | Self::Low => "\u{25CB}",
-            Self::Medium => "\u{25D0}",
-            Self::High => "\u{25CF}",
-            Self::Max => "\u{25C6}",
-            Self::Auto => "\u{25C7}",
-        }
-    }
-
-    /// Cycle through the generic effort sequence used outside a provider
-    /// context.
-    #[must_use]
-    pub const fn cycled(self) -> Self {
-        match self {
-            Self::None => Self::Minimal,
-            Self::Minimal | Self::High | Self::Max | Self::Auto => Self::Low,
-            Self::Low => Self::Medium,
-            Self::Medium => Self::High,
-        }
-    }
-
-    /// Cycle through only the effort levels that the active provider can
-    /// express without collapsing multiple choices to the same request shape.
-    #[must_use]
-    pub fn cycled_for_provider(self, provider: &str, model: &str) -> Self {
-        let options = Self::provider_options(provider, model);
-        let Some(index) = options.iter().position(|level| *level == self) else {
-            return options.first().copied().unwrap_or(Self::Medium);
-        };
-        options[(index + 1) % options.len()]
-    }
-
-    /// Return the selectable effort levels for a provider/model pair.
-    #[must_use]
-    pub fn provider_options(provider: &str, model: &str) -> &'static [Self] {
-        const OPENAI: &[EffortLevel] = &[
-            EffortLevel::None,
-            EffortLevel::Minimal,
-            EffortLevel::Low,
-            EffortLevel::Medium,
-            EffortLevel::High,
-            EffortLevel::Max,
-        ];
-        const ANTHROPIC_GEMINI: &[EffortLevel] = &[
-            EffortLevel::Low,
-            EffortLevel::Medium,
-            EffortLevel::High,
-            EffortLevel::Max,
-        ];
-        const DEEPSEEK: &[EffortLevel] = &[EffortLevel::High, EffortLevel::Max];
-        const GLM_REASONING: &[EffortLevel] = &[
-            EffortLevel::None,
-            EffortLevel::Minimal,
-            EffortLevel::High,
-            EffortLevel::Max,
-        ];
-        const THINKING_TOGGLE: &[EffortLevel] = &[EffortLevel::Auto, EffortLevel::High];
-        const LOCAL: &[EffortLevel] = &[EffortLevel::Auto];
-
-        match provider.to_ascii_lowercase().as_str() {
-            "openai" => OPENAI,
-            "deepseek" => DEEPSEEK,
-            "zai" | "glm" | "zhipu" if model.eq_ignore_ascii_case("glm-5.2") => GLM_REASONING,
-            "qwen" | "alibaba" | "zai" | "glm" | "zhipu" | "kimi" | "moonshot" | "minimax" => {
-                THINKING_TOGGLE
-            }
-            "ollama" | "local" | "lmstudio" | "localai" | "text-generation-webui" => LOCAL,
-            _ => ANTHROPIC_GEMINI,
-        }
-    }
-}
-
-impl std::fmt::Display for EffortLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for EffortLevel {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.trim().to_ascii_lowercase().as_str() {
-            "none" | "off" => Self::None,
-            "minimal" | "min" => Self::Minimal,
-            "low" | "l" => Self::Low,
-            "high" | "h" => Self::High,
-            "max" | "x" | "xhigh" => Self::Max,
-            "auto" | "unset" => Self::Auto,
-            _ => Self::Medium,
         })
     }
 }

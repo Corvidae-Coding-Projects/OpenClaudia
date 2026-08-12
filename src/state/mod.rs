@@ -1,10 +1,10 @@
 //! Centralized session state — crosslink #510.
 //!
 //! Migration strategy is phased (see `docs/designs/510-session-state.md`).
-//! Phase 1 is complete: both interactive frontends keep identity and
-//! conversation data here, while `TuiSession` and `ChatSession` remain thin
-//! compatibility wrappers for frontend metadata. Later phases move the
-//! remaining UI, budget, permission, and transcript fields.
+//! Phases 1 and 2 are complete: both interactive frontends keep identity,
+//! conversation, budget, and session UI data here, while `TuiSession` and
+//! `ChatSession` remain thin compatibility wrappers for frontend metadata.
+//! Later phases move permission, transcript, and IDE state.
 //!
 //! The per-session fields live here. Process-scoped handles
 //! (`memory_db`, `permission_mgr`, `hook_engine`, …) stay on the

@@ -155,6 +155,39 @@ impl ChatSession {
         });
     }
 
+    #[must_use]
+    pub fn effort_level(&self) -> openclaudia::state::EffortLevel {
+        self.inspect_state(|state| state.budgets.effort_level)
+    }
+
+    pub fn set_effort_level(&self, level: openclaudia::state::EffortLevel) {
+        self.update_state(|state, events| {
+            state.budgets.effort_level = level;
+            events.push(openclaudia::state::StateEvent::EffortChanged { new: level });
+        });
+    }
+
+    pub fn refresh_estimated_tokens(&self) -> usize {
+        self.update_state(|state, _| {
+            let estimated = state
+                .conversation
+                .messages
+                .iter()
+                .map(|message| {
+                    message
+                        .get("content")
+                        .and_then(|content| content.as_str())
+                        .unwrap_or("")
+                        .len()
+                        / 4
+                        + 4
+                })
+                .sum();
+            state.budgets.estimated_tokens = estimated;
+            estimated
+        })
+    }
+
     /// Undo the last user+assistant message pair
     pub fn undo(&mut self) -> bool {
         let changed = self.state.update(|state, _| {
@@ -300,6 +333,7 @@ pub fn save_chat_session(session: &ChatSession) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
+    session.refresh_estimated_tokens();
     let json = serde_json::to_string_pretty(session)?;
     fs::write(path, json)?;
     Ok(())
@@ -467,6 +501,24 @@ mod tests {
             err.to_string().contains("invalid characters"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn budget_state_is_owned_by_the_session_store() {
+        let session = test_session();
+        session.set_effort_level(openclaudia::state::EffortLevel::Minimal);
+        session.push_message(serde_json::json!({
+            "role": "user",
+            "content": "12345678"
+        }));
+
+        assert_eq!(session.refresh_estimated_tokens(), 6);
+        let state = session.state_snapshot();
+        assert_eq!(
+            state.budgets.effort_level,
+            openclaudia::state::EffortLevel::Minimal
+        );
+        assert_eq!(state.budgets.estimated_tokens, 6);
     }
 
     #[test]

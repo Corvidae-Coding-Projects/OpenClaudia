@@ -238,6 +238,44 @@ impl TuiSession {
         self.state.snapshot()
     }
 
+    #[must_use]
+    fn effort_level(&self) -> EffortLevel {
+        self.state.inspect(|state| state.budgets.effort_level)
+    }
+
+    fn set_effort_level(&self, level: EffortLevel) {
+        self.state.update(|state, events| {
+            state.budgets.effort_level = level;
+            events.push(crate::state::StateEvent::EffortChanged { new: level });
+        });
+    }
+
+    #[must_use]
+    fn estimated_tokens(&self) -> usize {
+        self.state.inspect(|state| state.budgets.estimated_tokens)
+    }
+
+    fn refresh_estimated_tokens(&self) -> usize {
+        self.state.update(|state, _| {
+            let estimated = state
+                .conversation
+                .messages
+                .iter()
+                .map(|message| {
+                    message
+                        .get("content")
+                        .and_then(|content| content.as_str())
+                        .unwrap_or("")
+                        .len()
+                        / 4
+                        + 4
+                })
+                .sum();
+            state.budgets.estimated_tokens = estimated;
+            estimated
+        })
+    }
+
     /// Copy the compatibility wrapper without sharing its mutable store.
     ///
     /// `StateStore::clone` intentionally shares state, but load/recovery paths
@@ -321,25 +359,6 @@ impl TuiSession {
             self.touch();
         }
         changed
-    }
-
-    fn estimate_tokens(&self) -> usize {
-        self.state.inspect(|state| {
-            state
-                .conversation
-                .messages
-                .iter()
-                .map(|message| {
-                    message
-                        .get("content")
-                        .and_then(|content| content.as_str())
-                        .unwrap_or("")
-                        .len()
-                        / 4
-                        + 4
-                })
-                .sum()
-        })
     }
 }
 
@@ -565,6 +584,7 @@ fn save_session(session: &TuiSession) -> Result<(), FileError> {
         reason,
     })?;
     file_error::create_dir_all(&dir)?;
+    session.refresh_estimated_tokens();
     let path = dir.join(format!("{}.json", session.id()));
     match file_error::write_json_pretty(&path, session) {
         Ok(()) => Ok(()),
@@ -1053,7 +1073,6 @@ pub struct App {
     pub input: TextInput,
     pub model: String,
     pub provider: String,
-    pub tokens: usize,
     pub mode: Mode,
     pub should_quit: bool,
     pub is_waiting: bool,
@@ -1070,7 +1089,6 @@ pub struct App {
     /// fields `client`, `endpoint`, `headers`, `claude_code_token`,
     /// `prompt_blocks` that used to live directly on `App`.
     pub api_client: ApiClient,
-    pub effort_level: EffortLevel,
     next_turn_effort_level: Option<EffortLevel>,
     next_turn_model: Option<String>,
     next_turn_allowed_tool_rules: Vec<crate::permissions::PermissionRule>,
@@ -1160,7 +1178,6 @@ impl App {
             input: TextInput::new(),
             model: model.to_string(),
             provider: provider.to_string(),
-            tokens: 0,
             mode: Mode::Build,
             should_quit: false,
             is_waiting: false,
@@ -1168,7 +1185,6 @@ impl App {
             streaming_raw_text: String::new(),
             api_event_tx: None,
             api_client: ApiClient::new(),
-            effort_level: EffortLevel::Medium,
             next_turn_effort_level: None,
             next_turn_model: None,
             next_turn_allowed_tool_rules: Vec::new(),
@@ -1207,7 +1223,7 @@ impl App {
         self.provider.clone_from(&loaded.provider);
         self.mode = tui_mode_for_agent(loaded.mode);
         self.refresh_app_config_target();
-        self.tokens = self.chat_session.estimate_tokens();
+        self.chat_session.refresh_estimated_tokens();
         self.transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         self.transcript_watermark = self.chat_session.message_count();
         // Repaint the transcript.
@@ -1781,9 +1797,9 @@ impl App {
         self.is_waiting = false;
         self.chat_session.update_title();
         self.chat_session.touch();
+        self.chat_session.refresh_estimated_tokens();
         let _ = save_session(&self.chat_session);
         self.persist_transcript_tail();
-        self.tokens = self.chat_session.estimate_tokens();
         self.fire_stop_hook();
     }
 
@@ -2467,7 +2483,7 @@ impl App {
     }
 
     /// Handle /export and /effort slash commands. Returns true if handled.
-    fn handle_export_effort_slash(&mut self, text: &str) -> bool {
+    fn handle_export_effort_slash(&self, text: &str) -> bool {
         if text == "/export" {
             // Build the markdown body synchronously — needs `&self` and is
             // bounded by session size. The blocking part is the disk write,
@@ -2509,11 +2525,14 @@ impl App {
             if parts.len() == 2 {
                 let level = parts[1].trim();
                 // FromStr for EffortLevel is Infallible; unknown strings map to Medium.
-                self.effort_level = level.parse().unwrap_or(EffortLevel::Medium);
+                self.chat_session
+                    .set_effort_level(level.parse().unwrap_or(EffortLevel::Medium));
             } else {
-                self.effort_level = self
-                    .effort_level
+                let effort = self
+                    .chat_session
+                    .effort_level()
                     .cycled_for_provider(&self.provider, &self.model);
+                self.chat_session.set_effort_level(effort);
             }
             return true;
         }
@@ -2604,9 +2623,9 @@ impl App {
             "Model: {}\nProvider: {}\nEffort: {}\nMessages: {}\n~{} tokens",
             self.model,
             self.provider,
-            self.effort_level,
+            self.chat_session.effort_level(),
             self.chat_session.message_count(),
-            self.tokens,
+            self.chat_session.estimated_tokens(),
         )));
     }
 
@@ -2912,7 +2931,7 @@ impl App {
 
     /// Handle the `/cost` slash command.
     fn handle_slash_cost(&mut self) {
-        let tokens = self.chat_session.estimate_tokens();
+        let tokens = self.chat_session.refresh_estimated_tokens();
         let tokens_f64 = f64::from(u32::try_from(tokens).unwrap_or(u32::MAX));
         let cost = match self.model.as_str() {
             m if m.contains("opus") => tokens_f64.mul_add(0.000_015, tokens_f64 * 0.000_075),
@@ -3042,7 +3061,7 @@ impl App {
         }
         if text == "/context" {
             let msg_count = self.chat_session.message_count();
-            let tokens = self.chat_session.estimate_tokens();
+            let tokens = self.chat_session.refresh_estimated_tokens();
             self.messages.add(DisplayMessage::system(format!(
                 "Context usage:\n  Messages: {msg_count}\n  Est. tokens: ~{tokens}\n  Model: {}\n  Provider: {}",
                 self.model, self.provider
@@ -3316,7 +3335,7 @@ impl App {
         let effort_level = self
             .next_turn_effort_level
             .take()
-            .unwrap_or(self.effort_level);
+            .unwrap_or_else(|| self.chat_session.effort_level());
         let transient_allowed_tool_rules = std::mem::take(&mut self.next_turn_allowed_tool_rules);
         let claude_code_token = api.claude_code_token;
         let prompt_blocks = api.prompt_blocks;
@@ -3425,8 +3444,9 @@ impl App {
 
         // ── Status bar ──
         let left_text = "? for shortcuts";
-        let effort_symbol = self.effort_level.symbol();
-        let right_text = format!("{effort_symbol} {} \u{00B7} /effort", self.effort_level);
+        let effort = self.chat_session.effort_level();
+        let effort_symbol = effort.symbol();
+        let right_text = format!("{effort_symbol} {effort} \u{00B7} /effort");
 
         let bar_width = chunks[3].width as usize;
         let content_len = left_text.len() + right_text.len() + 2;
@@ -5164,11 +5184,11 @@ mod tests {
 
     #[test]
     fn tui_effort_slash_updates_status_without_chat_message() {
-        let mut app = App::new("claude-sonnet-4-6", "anthropic");
+        let app = App::new("claude-sonnet-4-6", "anthropic");
 
         assert!(app.handle_export_effort_slash("/effort high"));
 
-        assert_eq!(app.effort_level, EffortLevel::High);
+        assert_eq!(app.chat_session.effort_level(), EffortLevel::High);
         assert!(
             app.messages.is_empty(),
             "/effort is already reflected in the status bar and must not add chat noise"
@@ -5300,18 +5320,18 @@ mod tests {
     #[test]
     fn bare_effort_cycles_with_provider_capabilities() {
         let mut app = App::new("gpt-5.5", "openai");
-        app.effort_level = EffortLevel::High;
+        app.chat_session.set_effort_level(EffortLevel::High);
 
         assert!(app.handle_export_effort_slash("/effort"));
-        assert_eq!(app.effort_level, EffortLevel::Max);
+        assert_eq!(app.chat_session.effort_level(), EffortLevel::Max);
         assert!(app.handle_export_effort_slash("/effort"));
-        assert_eq!(app.effort_level, EffortLevel::None);
+        assert_eq!(app.chat_session.effort_level(), EffortLevel::None);
 
         app.provider = "anthropic".to_string();
         app.model = "claude-sonnet-4-6".to_string();
-        app.effort_level = EffortLevel::High;
+        app.chat_session.set_effort_level(EffortLevel::High);
         assert!(app.handle_export_effort_slash("/effort"));
-        assert_eq!(app.effort_level, EffortLevel::Max);
+        assert_eq!(app.chat_session.effort_level(), EffortLevel::Max);
     }
 
     #[tokio::test]

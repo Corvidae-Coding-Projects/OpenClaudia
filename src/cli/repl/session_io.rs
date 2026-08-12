@@ -6,17 +6,7 @@ use std::fs;
 
 /// Estimate tokens in a chat session (rough: ~4 chars per token)
 pub fn estimate_session_tokens(session: &ChatSession) -> usize {
-    session.inspect_state(|state| {
-        state
-            .conversation
-            .messages
-            .iter()
-            .map(|msg| {
-                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                content.len() / 4 + 4 // content tokens + overhead
-            })
-            .sum()
-    })
+    session.refresh_estimated_tokens()
 }
 
 /// Compact a chat session by summarizing older messages

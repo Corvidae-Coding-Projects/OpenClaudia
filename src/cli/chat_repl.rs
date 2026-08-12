@@ -50,6 +50,7 @@ use openclaudia::providers::{
     convert_messages_to_anthropic_checked, convert_tool_definitions_to_anthropic_checked,
     convert_tools_to_gemini_functions, extract_gemini_text_content,
 };
+use openclaudia::state::EffortLevel;
 use openclaudia::tools::safe_truncate;
 use openclaudia::{
     config, guardrails, memory,
@@ -180,7 +181,6 @@ pub struct ChatRepl {
     active_theme: tui::Theme,
     vim_enabled: bool,
     vim_state: VimState,
-    effort_level: String,
     audit_logger: openclaudia::session::AuditLogger,
     memory_db: Option<memory::MemoryDb>,
     // `auto_learner` borrows `memory_db` so it can't live on the same
@@ -190,7 +190,7 @@ pub struct ChatRepl {
     always_allowed_tools: std::collections::HashSet<String>,
     transient_allowed_tool_rules: Vec<PermissionRule>,
     transient_model_restore: Option<String>,
-    transient_effort_restore: Option<String>,
+    transient_effort_override: Option<EffortLevel>,
     plugin_manager: plugins::PluginManager,
 }
 
@@ -504,14 +504,13 @@ impl ChatRepl {
             active_theme: tui::Theme::load(),
             vim_enabled: false,
             vim_state: VimState::new(),
-            effort_level: "medium".to_string(),
             audit_logger,
             memory_db,
             permissions: std::collections::HashSet::new(),
             always_allowed_tools: std::collections::HashSet::new(),
             transient_allowed_tool_rules: Vec::new(),
             transient_model_restore: None,
-            transient_effort_restore: None,
+            transient_effort_override: None,
             plugin_manager,
         })
     }
@@ -577,7 +576,8 @@ impl ChatRepl {
             behavior_name,
         );
         let _ = tui::render_input_prompt(&mode_str);
-        let _ = tui::render_bottom_bar(&self.effort_level, &mode_str);
+        let effort = self.chat_session.effort_level();
+        let _ = tui::render_bottom_bar(effort.as_str(), &mode_str);
 
         if self.vim_enabled {
             let pending = self.vim_state.pending_display();
@@ -695,12 +695,15 @@ impl ChatRepl {
             return Ok(Some(false));
         }
 
+        let effort = self
+            .transient_effort_override
+            .unwrap_or_else(|| self.chat_session.effort_level());
         let request_body = match build_chat_request_body(
             &self.config.proxy.target,
             &request_messages,
             &self.model,
             &prompt_blocks,
-            &self.effort_level,
+            effort.as_str(),
             self.claude_code_token.as_deref(),
         ) {
             Ok(request_body) => request_body,
@@ -938,9 +941,7 @@ impl ChatRepl {
         }
 
         if let Some(effort) = effort.and_then(normalize_prompt_effort) {
-            self.transient_effort_restore
-                .get_or_insert_with(|| self.effort_level.clone());
-            self.effort_level = effort.to_string();
+            self.transient_effort_override = Some(effort);
         }
     }
 
@@ -955,9 +956,7 @@ impl ChatRepl {
             self.model = model;
             self.chat_session.model.clone_from(&self.model);
         }
-        if let Some(effort) = self.transient_effort_restore.take() {
-            self.effort_level = effort;
-        }
+        self.transient_effort_override = None;
     }
 
     /// Handle the simple state-mutation slash results that share a
@@ -992,15 +991,13 @@ impl ChatRepl {
                 }
             }
             SlashCommandResult::ToggleVim => self.toggle_vim(),
-            SlashCommandResult::SetEffort(level) => self.effort_level = level,
+            SlashCommandResult::SetEffort(level) => self
+                .chat_session
+                .set_effort_level(EffortLevel::parse(&level).unwrap_or(EffortLevel::Medium)),
             SlashCommandResult::CycleEffort => self.cycle_effort(),
-            SlashCommandResult::FastMode { effort, model } => apply_fast_mode_result(
-                &mut self.model,
-                &mut self.chat_session,
-                &mut self.effort_level,
-                effort,
-                model,
-            ),
+            SlashCommandResult::FastMode { effort, model } => {
+                apply_fast_mode_result(&mut self.model, &mut self.chat_session, &effort, model);
+            }
             SlashCommandResult::SetBehaviorMode(new_mode) => {
                 self.chat_session.set_behavior_mode(new_mode);
             }
@@ -1191,15 +1188,16 @@ impl ChatRepl {
         }
     }
 
-    fn cycle_effort(&mut self) {
-        self.effort_level = match self.effort_level.as_str() {
-            "low" => "medium".to_string(),
-            "medium" => "high".to_string(),
-            _ => "low".to_string(),
+    fn cycle_effort(&self) {
+        let effort = match self.chat_session.effort_level() {
+            EffortLevel::Low => EffortLevel::Medium,
+            EffortLevel::Medium => EffortLevel::High,
+            _ => EffortLevel::Low,
         };
-        let label = match self.effort_level.as_str() {
-            "low" => "\x1b[33mlow\x1b[0m (faster, less thorough)",
-            "high" => "\x1b[32mhigh\x1b[0m (thorough, slower)",
+        self.chat_session.set_effort_level(effort);
+        let label = match effort {
+            EffortLevel::Low => "\x1b[33mlow\x1b[0m (faster, less thorough)",
+            EffortLevel::High => "\x1b[32mhigh\x1b[0m (thorough, slower)",
             _ => "\x1b[36mmedium\x1b[0m (balanced)",
         };
         println!("\n\u{2713} Effort set to {label}\n");
@@ -3958,13 +3956,13 @@ fn canonical_provider_name(provider: &str) -> &str {
     }
 }
 
-fn normalize_prompt_effort(effort: &str) -> Option<&'static str> {
+fn normalize_prompt_effort(effort: &str) -> Option<EffortLevel> {
     match effort.trim().to_ascii_lowercase().as_str() {
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" => Some("high"),
-        "max" => Some("max"),
-        "auto" => Some("auto"),
+        "low" => Some(EffortLevel::Low),
+        "medium" => Some(EffortLevel::Medium),
+        "high" => Some(EffortLevel::High),
+        "max" => Some(EffortLevel::Max),
+        "auto" => Some(EffortLevel::Auto),
         _ => None,
     }
 }
@@ -3984,11 +3982,10 @@ fn rewind_chat_session(session: &mut ChatSession, turns: usize) -> usize {
 fn apply_fast_mode_result(
     model: &mut String,
     session: &mut ChatSession,
-    effort_level: &mut String,
-    effort: String,
+    effort: &str,
     fast_model: Option<String>,
 ) {
-    *effort_level = effort;
+    session.set_effort_level(EffortLevel::parse(effort).unwrap_or(EffortLevel::Medium));
     if let Some(fast_model) = fast_model {
         *model = fast_model;
         session.model.clone_from(model);
@@ -4451,17 +4448,15 @@ providers: {}
     fn apply_fast_mode_result_sets_effort_and_model() {
         let mut session = chat_session_with_turns(0);
         let mut model = "claude-opus-4-6".to_string();
-        let mut effort = "medium".to_string();
 
         apply_fast_mode_result(
             &mut model,
             &mut session,
-            &mut effort,
-            "low".to_string(),
+            "low",
             Some("claude-haiku-4-5-20251001".to_string()),
         );
 
-        assert_eq!(effort, "low");
+        assert_eq!(session.effort_level(), EffortLevel::Low);
         assert_eq!(model, "claude-haiku-4-5-20251001");
         assert_eq!(session.model, "claude-haiku-4-5-20251001");
     }
@@ -4471,17 +4466,11 @@ providers: {}
         let mut session = chat_session_with_turns(0);
         let mut model = "custom-local".to_string();
         session.model.clone_from(&model);
-        let mut effort = "high".to_string();
+        session.set_effort_level(EffortLevel::High);
 
-        apply_fast_mode_result(
-            &mut model,
-            &mut session,
-            &mut effort,
-            "low".to_string(),
-            None,
-        );
+        apply_fast_mode_result(&mut model, &mut session, "low", None);
 
-        assert_eq!(effort, "low");
+        assert_eq!(session.effort_level(), EffortLevel::Low);
         assert_eq!(model, "custom-local");
         assert_eq!(session.model, "custom-local");
     }

@@ -2777,6 +2777,13 @@ mod tests {
                 .identity
                 .additional_directories_for_claude_md
                 .push(PathBuf::from("/tmp/shared-context"));
+            state.budgets.effort_level = openclaudia::state::EffortLevel::Minimal;
+            state.budgets.thinking_budget_override = Some(8_192);
+            state.budgets.estimated_tokens = 4_242;
+            state.ui.plan_mode.has_exited = true;
+            state.ui.plan_mode.needs_exit_attachment = true;
+            state.ui.plan_mode.needs_auto_exit_attachment = true;
+            state.ui.lsp_recommendation_shown_this_session = true;
         });
 
         let repl_json = serde_json::to_string(&repl_session).expect("serialize REPL session");
@@ -2801,6 +2808,16 @@ mod tests {
             state.conversation.messages,
             repl_session.messages_snapshot()
         );
+        assert_eq!(
+            state.budgets.effort_level,
+            openclaudia::state::EffortLevel::Minimal
+        );
+        assert_eq!(state.budgets.thinking_budget_override, Some(8_192));
+        assert_eq!(state.budgets.estimated_tokens, 4_242);
+        assert!(state.ui.plan_mode.has_exited);
+        assert!(state.ui.plan_mode.needs_exit_attachment);
+        assert!(state.ui.plan_mode.needs_auto_exit_attachment);
+        assert!(state.ui.lsp_recommendation_shown_this_session);
     }
 
     #[test]
