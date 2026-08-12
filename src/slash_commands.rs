@@ -113,9 +113,12 @@ const CORE: &[SlashCommand] = &[
 const MEMORY: &[SlashCommand] = &[
     cmd("/memory", "Show auto-learning stats"),
     cmd("/memory patterns", "Show learned coding patterns"),
-    cmd("/memory errors", "Show known error patterns"),
+    cmd("/memory errors <path>", "Show known errors for a file"),
     cmd("/memory prefs", "Show learned preferences"),
-    cmd("/memory files", "Show file co-edit relationships"),
+    cmd(
+        "/memory files <path>",
+        "Show co-edit relationships for a file",
+    ),
     cmd(
         "/memory reset",
         "Reset all learned data (with confirmation)",
@@ -438,6 +441,23 @@ mod tests {
             assert!(
                 invocations.contains(&canonical),
                 "CC-parity command {canonical} missing from SLASH_SECTIONS"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_file_queries_advertise_required_paths() {
+        let invocations: Vec<&str> = all_commands().map(|c| c.invocation).collect();
+        for invocation in ["/memory errors <path>", "/memory files <path>"] {
+            assert!(
+                invocations.contains(&invocation),
+                "memory query must advertise its required path: {invocation}"
+            );
+        }
+        for stale in ["/memory errors", "/memory files"] {
+            assert!(
+                !invocations.contains(&stale),
+                "memory query must not advertise an argument-free form: {stale}"
             );
         }
     }

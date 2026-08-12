@@ -129,11 +129,12 @@ providers:
   opencode:
     base_url: https://opencode.ai/zen/go/v1
     # api_key: ${OPENCODE_API_KEY}  # or ${OPENCODE_GO_API_KEY}
-  # Generic remote OpenAI-compatible endpoint
-  openai-compatible:
-    base_url: https://api.example.com/v1
-    # api_key: ${OPENAI_COMPATIBLE_API_KEY}
-    # model: my-model-name
+  # Generic remote OpenAI-compatible endpoint. Uncomment and replace the
+  # placeholder before selecting `openai-compatible` as the proxy target.
+  # openai-compatible:
+  #   base_url: https://your-provider.example/v1
+  #   api_key: ${OPENAI_COMPATIBLE_API_KEY}
+  #   model: my-model-name
   # Ollama for local LLM inference
   ollama:
     base_url: http://localhost:11434

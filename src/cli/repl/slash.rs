@@ -1353,46 +1353,37 @@ pub fn slash_context(messages: &[serde_json::Value], current_model: &str) -> Sla
 }
 
 pub fn slash_login() -> SlashCommandResult {
-    if openclaudia::claude_credentials::has_claude_code_credentials() {
-        println!("\n✓ Authenticated via Claude Code credentials.");
-        println!("  File: ~/.claude/.credentials.json");
-        // crosslink #932: previously this used `Handle::current()` which
-        // panics when called outside a runtime. `try_current` mirrors the
-        // pattern used by `slash_model` above. When called from a worker
-        // thread that is itself driving the runtime, `block_on` would also
-        // panic — degrade gracefully to "details unavailable" rather than
-        // crashing the REPL.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                let load_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.block_on(openclaudia::claude_credentials::load_credentials())
-                }));
-                if let Ok(Ok(creds)) = load_result {
-                    println!(
-                        "  Type: {}",
-                        creds.subscription_type.as_deref().unwrap_or("unknown")
-                    );
-                    println!(
-                        "  Tier: {}",
-                        creds.rate_limit_tier.as_deref().unwrap_or("default")
-                    );
-                } else {
-                    println!(
-                        "  (credential details unavailable — cannot block on current runtime)"
-                    );
-                }
-            }
-            Err(_) => {
-                println!("  (credential details unavailable — no tokio runtime active)");
+    match openclaudia::claude_credentials::peek_credentials() {
+        Ok(Some(status)) => {
+            println!("\n✓ Authenticated via Claude Code credentials.");
+            println!("  File: ~/.claude/.credentials.json");
+            println!(
+                "  Type: {}",
+                status.subscription_type.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "  Tier: {}",
+                status.rate_limit_tier.as_deref().unwrap_or("default")
+            );
+            if status.expired {
+                println!("  Status: expired (auto-refreshes on next use)");
+            } else if status.expires_soon {
+                println!("  Status: valid, expiring soon");
+            } else {
+                println!("  Status: valid");
             }
         }
-    } else {
-        println!("\n✗ Not authenticated via Claude Code.");
-        println!("  To log in:");
-        println!("  1. Install Claude Code: npm install -g @anthropic-ai/claude-code");
-        println!("  2. Run: claude");
-        println!("  3. Complete the login flow");
-        println!("  4. Restart OpenClaudia");
+        Ok(None) => {
+            println!("\n✗ Not authenticated via Claude Code.");
+            println!("  To log in:");
+            println!("  1. Install Claude Code: npm install -g @anthropic-ai/claude-code");
+            println!("  2. Run: claude");
+            println!("  3. Complete the login flow");
+            println!("  4. Restart OpenClaudia");
+        }
+        Err(error) => {
+            println!("\n✗ Could not read Claude Code credentials: {error}");
+        }
     }
     println!();
     SlashCommandResult::Handled

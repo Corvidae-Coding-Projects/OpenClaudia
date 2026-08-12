@@ -641,6 +641,8 @@ pub struct CredentialStatus {
     pub has_inference_scope: bool,
     /// Recorded subscription type, when present.
     pub subscription_type: Option<String>,
+    /// Recorded rate-limit tier, when present.
+    pub rate_limit_tier: Option<String>,
 }
 
 /// Inspect the shared Claude credential store without refreshing tokens.
@@ -676,6 +678,7 @@ fn status_from_oauth(oauth: &ClaudeAiOauth, now_ms: i64) -> CredentialStatus {
         expires_soon: now_ms < oauth.expires_at && now_ms + REFRESH_BUFFER_MS >= oauth.expires_at,
         has_inference_scope: oauth.scopes.iter().any(|scope| scope == "user:inference"),
         subscription_type: oauth.subscription_type.clone(),
+        rate_limit_tier: oauth.rate_limit_tier.clone(),
     }
 }
 
@@ -1128,6 +1131,7 @@ mod tests {
         assert!(!far.expires_soon);
         assert!(far.has_inference_scope);
         assert_eq!(far.subscription_type.as_deref(), Some("pro"));
+        assert_eq!(far.rate_limit_tier, None);
 
         let expired = ClaudeAiOauth {
             expires_at: 100,

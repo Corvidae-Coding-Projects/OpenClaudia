@@ -180,6 +180,56 @@ fn run_auth_with_stdin(input: &str) -> Output {
     child.wait_with_output().expect("openclaudia auth must run")
 }
 
+#[test]
+fn legacy_repl_login_reads_status_without_nesting_a_runtime() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    write_local_provider_config(&cwd);
+    write_claude_oauth_credentials(&home.path().join(".claude"));
+
+    let mut child = isolated_command(&cwd, &home)
+        .args([
+            "--tui-mode",
+            "--dangerously-skip-permissions",
+            "--target",
+            "local",
+            "--model",
+            "local-test-model",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("legacy REPL must spawn");
+    child
+        .stdin
+        .take()
+        .expect("legacy REPL stdin")
+        .write_all(b"/login\n/exit\n")
+        .expect("legacy REPL should accept slash commands");
+
+    let output = child.wait_with_output().expect("legacy REPL must exit");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "legacy REPL should exit cleanly after /login; got {combined:?}"
+    );
+    assert!(
+        combined.contains("Authenticated via Claude Code credentials")
+            && combined.contains("Type: max")
+            && combined.contains("Tier: max"),
+        "/login should report synchronous credential status; got {combined:?}"
+    );
+    assert!(
+        !combined.contains("panicked") && !combined.contains("Cannot start a runtime"),
+        "/login must not attempt to nest a Tokio runtime; got {combined:?}"
+    );
+}
+
 fn readme_cli_command_invocations() -> Vec<String> {
     let readme = include_str!("../README.md");
     let section = readme
@@ -2706,6 +2756,17 @@ fn init_refuses_overwrite_unless_force_and_creates_documented_tree() {
     assert!(
         config.contains("OpenClaudia Configuration") && !config.contains("sentinel"),
         "init --force must replace the previous config contents"
+    );
+
+    let output = isolated_command(&cwd, &home)
+        .arg("config")
+        .output()
+        .expect("openclaudia config must run after init");
+    assert!(
+        output.status.success(),
+        "the generated config must load without edits; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
