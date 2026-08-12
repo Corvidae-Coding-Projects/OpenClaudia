@@ -255,6 +255,44 @@ impl TuiSession {
         self.state.inspect(|state| state.budgets.estimated_tokens)
     }
 
+    #[must_use]
+    fn transcript_snapshot(&self) -> (PathBuf, usize, Vec<serde_json::Value>) {
+        self.state.inspect(|state| {
+            (
+                state.transcript.transcript_cwd.clone(),
+                state.transcript.watermark,
+                state.conversation.messages.clone(),
+            )
+        })
+    }
+
+    fn set_transcript_position(&self, cwd: PathBuf, watermark: usize) {
+        self.state.update(|state, _| {
+            state.transcript.transcript_cwd = cwd;
+            state.transcript.watermark = watermark;
+        });
+    }
+
+    fn set_transcript_watermark(&self, watermark: usize) {
+        self.state
+            .update(|state, _| state.transcript.watermark = watermark);
+    }
+
+    #[must_use]
+    fn transcript_cwd(&self) -> PathBuf {
+        self.state
+            .inspect(|state| state.transcript.transcript_cwd.clone())
+    }
+
+    fn set_permission_bypass(&self, enabled: bool) {
+        self.state.update(|state, events| {
+            if state.permissions.bypass_mode != enabled {
+                state.permissions.bypass_mode = enabled;
+                events.push(crate::state::StateEvent::PermissionsMutated);
+            }
+        });
+    }
+
     fn refresh_estimated_tokens(&self) -> usize {
         self.state.update(|state, _| {
             let estimated = state
@@ -1131,15 +1169,6 @@ pub struct App {
     pub rules_content: Option<String>,
     /// Whether rules have been injected into session messages.
     rules_injected: bool,
-    /// Count of canonical conversation messages already appended to the Claude Code
-    /// JSONL transcript. Everything past this index is persisted on the
-    /// next call to `persist_transcript_tail`. Rebuilt to 0 on resume
-    /// because resuming re-points at an existing transcript file, so we
-    /// want to skip re-appending the already-on-disk history.
-    transcript_watermark: usize,
-    /// Absolute cwd used for the transcript path. Captured once so
-    /// later appends survive the user changing dirs within a skill.
-    transcript_cwd: PathBuf,
     /// Active modal overlay (help / log picker / …). At most one at a
     /// time. `None` when the main chat UI has focus. Closing an
     /// overlay goes through its `OverlayAction` return value so the
@@ -1205,8 +1234,6 @@ impl App {
             ),
             rules_content: None,
             rules_injected: false,
-            transcript_watermark: 0,
-            transcript_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             overlay: None,
         }
     }
@@ -1224,8 +1251,9 @@ impl App {
         self.mode = tui_mode_for_agent(loaded.mode);
         self.refresh_app_config_target();
         self.chat_session.refresh_estimated_tokens();
-        self.transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        self.transcript_watermark = self.chat_session.message_count();
+        let transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.chat_session
+            .set_transcript_position(transcript_cwd, self.chat_session.message_count());
         // Repaint the transcript.
         self.messages = super::messages::MessageList::new();
         for msg in loaded.messages_snapshot() {
@@ -1297,6 +1325,13 @@ impl App {
         self.apply_loaded_session(&loaded);
     }
 
+    /// Apply the current process's permission posture after any startup
+    /// resume. This prevents a persisted session from carrying a dangerous
+    /// bypass choice into a later invocation that omitted the flag.
+    pub fn set_permission_bypass(&self, enabled: bool) {
+        self.chat_session.set_permission_bypass(enabled);
+    }
+
     /// Open the log-selector (session picker) overlay seeded with
     /// every transcript for the current project's cwd. No-op when
     /// there are zero saved sessions — the caller should show a
@@ -1304,7 +1339,7 @@ impl App {
     /// overlay still opens with an empty-state message, matching
     /// Claude Code's `/resume` UX).
     pub fn open_log_selector(&mut self) {
-        let transcripts = crate::transcript::list_transcripts(&self.transcript_cwd);
+        let transcripts = crate::transcript::list_transcripts(&self.chat_session.transcript_cwd());
         let rows = transcripts
             .into_iter()
             .map(|info| super::components::log_selector::SessionRow {
@@ -1363,7 +1398,7 @@ impl App {
     /// Best-effort: transcript I/O failures are logged but never bubble
     /// up — a missing transcript must never break the live turn.
     fn persist_transcript_tail(&mut self) {
-        let cwd = self.transcript_cwd.clone();
+        let (cwd, watermark, messages) = self.chat_session.transcript_snapshot();
         let session_id = self.chat_session.id();
         // crosslink #709: track ONLY the entries that were actually
         // persisted. The previous implementation unconditionally jumped
@@ -1372,9 +1407,11 @@ impl App {
         // from the transcript permanently (the next call would skip them
         // entirely). Advance by the appended count so retried calls
         // resume exactly where the failure occurred.
-        let start = self.transcript_watermark;
-        let messages = self.chat_session.messages_snapshot();
         let total = messages.len();
+        // Undo/rewind can legitimately shorten the canonical message list.
+        // Clamp the old offset before slicing so the next branched turn is
+        // appended instead of panicking or being skipped permanently.
+        let start = watermark.min(total);
         let mut appended: usize = 0;
         for msg in &messages[start..] {
             let kind = msg
@@ -1398,7 +1435,15 @@ impl App {
                 }
             }
         }
-        self.transcript_watermark = start + appended;
+        self.chat_session.set_transcript_watermark(start + appended);
+    }
+
+    /// Keep the append-only transcript and JSON session snapshot coherent:
+    /// only persist a watermark after the corresponding JSONL appends have
+    /// succeeded.
+    fn persist_session(&mut self) {
+        self.persist_transcript_tail();
+        let _ = save_session(&self.chat_session);
     }
 
     /// Set the API connection details needed to make requests.
@@ -1448,8 +1493,7 @@ impl App {
             claude_code_token,
         );
         self.vdd_builder_auth = vdd_builder_auth;
-        let _ = save_session(&self.chat_session);
-        self.persist_transcript_tail();
+        self.persist_session();
         self.messages.add(DisplayMessage::system(format!(
             "Provider switched to {} ({})",
             self.provider, self.model
@@ -1574,9 +1618,9 @@ impl App {
         disable_raw_mode()?;
         execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
 
-        // Save session on exit
+        // Save session and any final transcript tail on exit.
         self.chat_session.touch();
-        let _ = save_session(&self.chat_session);
+        self.persist_session();
 
         // Fire SessionEnd hooks. Best-effort: the app is already exiting
         // so we can't recover from a failure, and we must not spam the
@@ -1798,8 +1842,7 @@ impl App {
         self.chat_session.update_title();
         self.chat_session.touch();
         self.chat_session.refresh_estimated_tokens();
-        let _ = save_session(&self.chat_session);
-        self.persist_transcript_tail();
+        self.persist_session();
         self.fire_stop_hook();
     }
 
@@ -2403,7 +2446,7 @@ impl App {
                 }
                 self.messages
                     .add(DisplayMessage::system("Undone last message pair."));
-                let _ = save_session(&self.chat_session);
+                self.persist_session();
             } else {
                 self.messages
                     .add(DisplayMessage::system("Nothing to undo."));
@@ -2414,7 +2457,7 @@ impl App {
             if self.chat_session.redo() {
                 self.messages
                     .add(DisplayMessage::system("Redone last undone messages."));
-                let _ = save_session(&self.chat_session);
+                self.persist_session();
             } else {
                 self.messages
                     .add(DisplayMessage::system("Nothing to redo."));
@@ -2468,8 +2511,7 @@ impl App {
                     self.messages.add(DisplayMessage::system(format!(
                         "Rewound {rewound} turn(s)."
                     )));
-                    let _ = save_session(&self.chat_session);
-                    self.persist_transcript_tail();
+                    self.persist_session();
                 } else {
                     self.messages
                         .add(DisplayMessage::system("Nothing to rewind."));
@@ -2689,8 +2731,7 @@ impl App {
             } else {
                 self.chat_session.title = new_title.to_string();
                 self.chat_session.touch();
-                let _ = save_session(&self.chat_session);
-                self.persist_transcript_tail();
+                self.persist_session();
                 self.messages.add(DisplayMessage::system(format!(
                     "Session renamed to: {new_title}"
                 )));
@@ -2920,8 +2961,7 @@ impl App {
         self.model = model;
         self.chat_session.model.clone_from(&self.model);
         self.chat_session.touch();
-        let _ = save_session(&self.chat_session);
-        self.persist_transcript_tail();
+        self.persist_session();
         self.messages.add(DisplayMessage::system(format!(
             "Model switched to {}",
             self.model
@@ -6189,18 +6229,19 @@ mod tests {
         let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
 
         let mut app = App::new("test-model", "test-provider");
-        app.transcript_cwd = tmp.path().to_path_buf();
         app.chat_session.replace_messages(vec![
             serde_json::json!({"role": "user", "content": "one"}),
             serde_json::json!({"role": "assistant", "content": "two"}),
             serde_json::json!({"role": "user", "content": "three"}),
         ]);
-        app.transcript_watermark = 0;
+        app.chat_session
+            .set_transcript_position(tmp.path().to_path_buf(), 0);
 
         app.persist_transcript_tail();
 
         assert_eq!(
-            app.transcript_watermark, 3,
+            app.chat_session.state_snapshot().transcript.watermark,
+            3,
             "watermark advances to len when every append succeeds"
         );
     }
@@ -6224,20 +6265,43 @@ mod tests {
         let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
 
         let mut app = App::new("test-model", "test-provider");
-        app.transcript_cwd = tmp.path().to_path_buf();
         app.chat_session.replace_messages(vec![
             serde_json::json!({"role": "user", "content": "one"}),
             serde_json::json!({"role": "assistant", "content": "two"}),
             serde_json::json!({"role": "user", "content": "three"}),
         ]);
-        app.transcript_watermark = 0;
+        app.chat_session
+            .set_transcript_position(tmp.path().to_path_buf(), 0);
 
         app.persist_transcript_tail();
 
         assert_eq!(
-            app.transcript_watermark, 0,
+            app.chat_session.state_snapshot().transcript.watermark,
+            0,
             "watermark must NOT advance past entries that failed to persist (was: {})",
-            app.transcript_watermark
+            app.chat_session.state_snapshot().transcript.watermark
+        );
+    }
+
+    #[test]
+    fn persist_transcript_tail_clamps_watermark_after_rewind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
+
+        let mut app = App::new("test-model", "test-provider");
+        app.chat_session.replace_messages(vec![serde_json::json!({
+            "role": "user",
+            "content": "branched turn"
+        })]);
+        app.chat_session
+            .set_transcript_position(tmp.path().to_path_buf(), 3);
+
+        app.persist_transcript_tail();
+
+        assert_eq!(
+            app.chat_session.state_snapshot().transcript.watermark,
+            1,
+            "a rewind-shortened message list must reset the offset safely"
         );
     }
 }

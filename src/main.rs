@@ -703,6 +703,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     app.app_config = Some(std::sync::Arc::new(config.clone()));
     app.rules_content = rules_content;
     app.apply_startup_resume(resume, session_id);
+    app.set_permission_bypass(dangerously_skip_permissions);
     app.run()
         .await
         .map_err(|e| anyhow::anyhow!("TUI error: {e}"))
@@ -2784,6 +2785,11 @@ mod tests {
             state.ui.plan_mode.needs_exit_attachment = true;
             state.ui.plan_mode.needs_auto_exit_attachment = true;
             state.ui.lsp_recommendation_shown_this_session = true;
+            state.permissions.bypass_mode = true;
+            state.permissions.trust_accepted = true;
+            state.permissions.persistence_disabled = true;
+            state.transcript.watermark = 17;
+            state.transcript.transcript_cwd = PathBuf::from("/tmp/transcript-root");
         });
 
         let repl_json = serde_json::to_string(&repl_session).expect("serialize REPL session");
@@ -2818,6 +2824,14 @@ mod tests {
         assert!(state.ui.plan_mode.needs_exit_attachment);
         assert!(state.ui.plan_mode.needs_auto_exit_attachment);
         assert!(state.ui.lsp_recommendation_shown_this_session);
+        assert!(state.permissions.bypass_mode);
+        assert!(state.permissions.trust_accepted);
+        assert!(state.permissions.persistence_disabled);
+        assert_eq!(state.transcript.watermark, 17);
+        assert_eq!(
+            state.transcript.transcript_cwd,
+            PathBuf::from("/tmp/transcript-root")
+        );
     }
 
     #[test]

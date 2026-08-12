@@ -158,7 +158,6 @@ pub struct ChatRepl {
     // ── Configuration captured during setup ──
     config: config::AppConfig,
     coordinator: bool,
-    dangerously_skip_permissions: bool,
     ext_regex: regex::Regex,
     // Crosslink #433: was `Box<dyn ProviderAdapter>`. Now `&'static dyn …`
     // — `get_adapter` returns a shared static singleton, so the REPL just
@@ -473,6 +472,10 @@ impl ChatRepl {
         let mut chat_session =
             ChatSession::new(&model, &config.proxy.target, initial_behavior_mode);
         maybe_resume_session(&mut chat_session, args.resume, args.session_id.as_deref());
+        // A dangerous bypass is a launch-scoped choice. Apply it after resume
+        // so a saved session can neither enable nor disable the current CLI's
+        // explicit posture.
+        chat_session.set_permission_bypass(args.dangerously_skip_permissions);
 
         let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id())?;
         let memory_db: Option<memory::MemoryDb> = init_memory_with_banner();
@@ -485,7 +488,6 @@ impl ChatRepl {
         Ok(Self {
             config,
             coordinator: args.coordinator,
-            dangerously_skip_permissions: args.dangerously_skip_permissions,
             ext_regex,
             adapter,
             client,
@@ -2010,7 +2012,7 @@ impl ChatRepl {
             );
             return Err(gemini_tool_error_response(tool_call, &result.content));
         }
-        let result = if self.dangerously_skip_permissions {
+        let result = if self.chat_session.permission_bypass_enabled() {
             check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
         } else {
             check_tool_permission_interactive(
@@ -2860,7 +2862,7 @@ impl ChatRepl {
             );
             return None;
         }
-        let result = if self.dangerously_skip_permissions {
+        let result = if self.chat_session.permission_bypass_enabled() {
             check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
         } else {
             check_tool_permission_interactive(

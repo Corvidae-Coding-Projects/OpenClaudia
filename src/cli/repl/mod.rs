@@ -167,6 +167,26 @@ impl ChatSession {
         });
     }
 
+    #[must_use]
+    pub fn permission_bypass_enabled(&self) -> bool {
+        self.inspect_state(|state| state.permissions.bypass_mode)
+    }
+
+    /// Apply the process-launch permission posture to this session.
+    ///
+    /// Although the flag is serialized as part of a coherent snapshot, a
+    /// resumed session must never silently inherit a previous process's
+    /// dangerous bypass choice. Startup calls this after resume selection so
+    /// the current command line always wins.
+    pub fn set_permission_bypass(&self, enabled: bool) {
+        self.update_state(|state, events| {
+            if state.permissions.bypass_mode != enabled {
+                state.permissions.bypass_mode = enabled;
+                events.push(openclaudia::state::StateEvent::PermissionsMutated);
+            }
+        });
+    }
+
     pub fn refresh_estimated_tokens(&self) -> usize {
         self.update_state(|state, _| {
             let estimated = state
@@ -519,6 +539,18 @@ mod tests {
             openclaudia::state::EffortLevel::Minimal
         );
         assert_eq!(state.budgets.estimated_tokens, 6);
+    }
+
+    #[test]
+    fn permission_bypass_is_owned_by_the_session_store() {
+        let session = test_session();
+        session.set_permission_bypass(true);
+
+        assert!(session.permission_bypass_enabled());
+        assert!(session.state_snapshot().permissions.bypass_mode);
+
+        session.set_permission_bypass(false);
+        assert!(!session.permission_bypass_enabled());
     }
 
     #[test]

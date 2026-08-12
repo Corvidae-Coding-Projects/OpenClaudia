@@ -1,10 +1,10 @@
 //! Centralized session state — crosslink #510.
 //!
 //! Migration strategy is phased (see `docs/designs/510-session-state.md`).
-//! Phases 1 and 2 are complete: both interactive frontends keep identity,
-//! conversation, budget, and session UI data here, while `TuiSession` and
-//! `ChatSession` remain thin compatibility wrappers for frontend metadata.
-//! Later phases move permission, transcript, and IDE state.
+//! Phases 1 and 2 are complete, and Phase 3 is in progress: both interactive
+//! frontends keep identity, conversation, budget, session UI, permission, and
+//! transcript data here, while `TuiSession` and `ChatSession` remain thin
+//! compatibility wrappers for frontend metadata. ACP IDE state migrates next.
 //!
 //! The per-session fields live here. Process-scoped handles
 //! (`memory_db`, `permission_mgr`, `hook_engine`, …) stay on the
@@ -47,6 +47,10 @@ impl SessionState {
     /// `TuiSession::new` / `ChatSession::new` constructors.
     #[must_use]
     pub fn new(cwd: std::path::PathBuf) -> Self {
+        let transcript = TranscriptState {
+            transcript_cwd: cwd.clone(),
+            ..TranscriptState::default()
+        };
         Self {
             identity: Identity::rooted_at(cwd),
             conversation: Conversation::default(),
@@ -54,7 +58,7 @@ impl SessionState {
             modes: ModesState::default(),
             permissions: PermissionsState::default(),
             budgets: BudgetsState::default(),
-            transcript: TranscriptState::default(),
+            transcript,
         }
     }
 }
@@ -86,6 +90,7 @@ mod tests {
         let state = SessionState::new(cwd.clone());
         assert_eq!(state.identity.cwd, cwd);
         assert_eq!(state.identity.original_cwd, cwd);
+        assert_eq!(state.transcript.transcript_cwd, cwd);
     }
 
     #[test]
