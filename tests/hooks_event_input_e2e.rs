@@ -279,11 +279,11 @@ fn hook_result_denied_sets_allowed_false_with_reason_in_outputs() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section G — HookResult::system_messages + modified_prompt
+// Section G — legacy hook fields become typed reference context
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn system_messages_collects_from_all_outputs_in_order() {
+fn legacy_system_fields_become_source_labeled_references_in_order() {
     let r = HookResult {
         allowed: true,
         outputs: vec![
@@ -302,12 +302,17 @@ fn system_messages_collects_from_all_outputs_in_order() {
         ],
         errors: vec![],
     };
-    let msgs = r.system_messages();
-    assert_eq!(msgs, vec!["first", "third"]);
+    let items = openclaudia::context::hook_result_reference_items(&r, "fixture", 10);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].content(), "first");
+    assert_eq!(items[1].content(), "third");
+    assert!(items
+        .iter()
+        .all(|item| { item.authority() == openclaudia::context::ContextAuthority::Reference }));
 }
 
 #[test]
-fn modified_prompt_returns_first_set_prompt_across_outputs() {
+fn prompt_fields_are_all_preserved_as_reference_suggestions() {
     let r = HookResult {
         allowed: true,
         outputs: vec![
@@ -326,13 +331,16 @@ fn modified_prompt_returns_first_set_prompt_across_outputs() {
         ],
         errors: vec![],
     };
-    assert_eq!(r.modified_prompt(), Some("modified"));
+    let items = openclaudia::context::hook_result_reference_items(&r, "fixture", 10);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].content(), "modified");
+    assert_eq!(items[1].content(), "ignored");
 }
 
 #[test]
-fn modified_prompt_returns_none_when_no_output_carries_a_prompt() {
+fn no_hook_context_produces_no_reference_items() {
     let r = HookResult::allowed();
-    assert!(r.modified_prompt().is_none());
+    assert!(openclaudia::context::hook_result_reference_items(&r, "fixture", 10).is_empty());
 }
 
 // ───────────────────────────────────────────────────────────────────────────

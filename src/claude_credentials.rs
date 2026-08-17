@@ -730,37 +730,27 @@ pub fn get_oauth_endpoint(_model: &str) -> String {
 ///    (alongside the bearer token and `anthropic-beta` header), not a
 ///    free-form prompt fragment, and so belongs in the credentials module
 ///    that owns the rest of that contract.
-/// 2. **Single source of truth.** Both `inject_system_prompt` (full chat
-///    mode) and `inject_oauth_prefix_only` (proxy mode) reference the same
-///    constant; moving the literal into `prompt.rs` would split the OAuth
-///    contract across two crates with no compile-time link between them.
+/// 2. **Single source of truth.** Every OAuth-authenticated transport uses
+///    `inject_oauth_prefix_only`; behavioral context is assembled separately
+///    by the typed prompt authority boundary.
 /// 3. **Operational risk is bounded.** If Anthropic changes the literal,
 ///    the failure mode is a 401 from `/v1/messages` with a clear server
 ///    message ("invalid system prefix") — not a silent degradation.
 ///    Updating the constant is a one-line fix in one file.
 ///
-/// The follow-up work to move OAuth prefix-block construction into
-/// `build_system_prompt_blocks(..., oauth_prefix: Option<&str>)` is
-/// tracked in the same issue thread but is deferred because it would
-/// require threading the credential state through every prompt-builder
-/// callsite without changing what the wire actually carries.
+/// The prefix remains a provider-protocol compatibility credential, not a
+/// general prompt extension API.
 pub const CLAUDE_CODE_SYSTEM_PROMPT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
-
-/// Additional system prompt content sent as a separate block after the prefix.
-/// This is where behavioral instructions and persona go.
-pub const CLAUDIA_SYSTEM_PROMPT: &str = include_str!("claude_code_prompt.txt");
 
 /// Inject only the Claude Code prefix block required for OAuth tokens.
 ///
 /// Block 0: The exact one-liner prefix (API validates this string for OAuth)
 /// Block 1+: Whatever was already in the system field (preserved as-is)
 ///
-/// Unlike [`inject_system_prompt`], this does NOT prepend the Claudia
-/// behavioral persona — it is the minimum mutation required for the
-/// Anthropic API to accept an OAuth Bearer request, and is used by the
-/// `/v1/messages` proxy endpoint where the caller (an arbitrary
-/// Anthropic SDK client) owns its own system prompt content.
+/// This does not prepend behavioral prose. It is the minimum mutation required
+/// for the Anthropic API to accept an OAuth Bearer request; caller/system
+/// context remains owned by the typed prompt or proxy boundary.
 ///
 /// Centralized here so that the magic-string prefix and the three-way
 /// match on the existing `system` shape live in one place. Previously
@@ -845,46 +835,6 @@ fn strip_cache_control_ttl_inner(value: &mut serde_json::Value, depth: usize, pa
             }
         }
         _ => {}
-    }
-}
-
-/// Inject the Claude Code system prompt into a request body.
-///
-/// Block 0: The exact one-liner prefix (API validates this string for OAuth)
-/// Block 1: Full behavioral instructions + Claudia persona (from `claude_code_prompt.txt`)
-/// Block 2+: Whatever was already in the system array (our per-session prompt)
-///
-/// This matches Claude Code's multi-block system array structure.
-pub fn inject_system_prompt(request: &mut serde_json::Value) {
-    // Block 0: exact prefix — API validates this for OAuth access
-    let prefix_block = serde_json::json!({
-        "type": "text",
-        "text": CLAUDE_CODE_SYSTEM_PROMPT,
-    });
-
-    // Block 1: behavioral instructions + Claudia persona (cached)
-    let behavioral_block = serde_json::json!({
-        "type": "text",
-        "text": CLAUDIA_SYSTEM_PROMPT,
-        "cache_control": {"type": "ephemeral"}
-    });
-
-    match request.get_mut("system") {
-        Some(serde_json::Value::Array(arr)) => {
-            // Existing blocks become block 2+
-            arr.insert(0, behavioral_block);
-            arr.insert(0, prefix_block);
-        }
-        Some(serde_json::Value::String(existing)) => {
-            let existing_obj = serde_json::json!({
-                "type": "text",
-                "text": existing.clone(),
-            });
-            request["system"] = serde_json::json!([prefix_block, behavioral_block, existing_obj]);
-        }
-        _ => {
-            request["system"] = serde_json::json!([prefix_block, behavioral_block]);
-        }
     }
 }
 
@@ -1243,9 +1193,8 @@ mod tests {
         assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
     }
 
-    /// Spec — `inject_oauth_prefix_only` does NOT inject the Claudia
-    /// behavioral persona block. That belongs to `inject_system_prompt`
-    /// for the CLI client, not to the proxy's pass-through behavior.
+    /// Spec — `inject_oauth_prefix_only` does not inject a second behavioral
+    /// prompt. Behavioral context comes from the typed context projector.
     #[test]
     fn inject_oauth_prefix_only_does_not_add_behavioral_block() {
         let mut req = serde_json::json!({});

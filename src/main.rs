@@ -643,14 +643,8 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     let memory_db: Option<memory::MemoryDb> = open_project_memory_db(&cwd_path);
 
     let cwd = cwd_path.to_string_lossy().to_string();
-    let tui_prompt_blocks = prompt::build_system_prompt_blocks(
-        behavior_mode,
-        None,
-        None,
-        memory_db.as_ref(),
-        Some(&cwd),
-    );
-    let system_prompt = tui_prompt_blocks.to_combined();
+    let tui_prompt_blocks =
+        prompt::build_prompt_context(behavior_mode, memory_db.as_ref(), Some(&cwd));
 
     let claude_hooks = load_claude_code_hooks();
     let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
@@ -675,7 +669,6 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         endpoint,
         headers,
         wire_api,
-        system_prompt,
         Some(tui_prompt_blocks),
         claude_code_token,
     );
@@ -2138,14 +2131,12 @@ async fn run_vdd_review(
                         status_icon, finding.severity, finding.description
                     );
                 }
-                if !result.context_injection.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": format!(
-                            "<vdd-review>\n{}\n</vdd-review>",
-                            result.context_injection
-                        )
-                    }));
+                if let Some(observation) = result.context_observation {
+                    let projection = openclaudia::context::ContextProjector::project(
+                        vec![observation],
+                        openclaudia::context::ContextBudget::default(),
+                    );
+                    projection.append_reference_to_json_messages(messages);
                 }
             }
         }
@@ -2606,10 +2597,17 @@ mod tests {
         }
 
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let prompt_blocks = openclaudia::prompt::SystemPromptBlocks {
-            stable_prefix: "stable".to_string(),
-            dynamic_suffix: String::new(),
-        };
+        let prompt_blocks = openclaudia::prompt::SystemPromptBlocks::from_items(
+            vec![openclaudia::context::ContextItem::host_instruction(
+                "test.stable",
+                openclaudia::context::HostInstructionSource::CorePolicy,
+                "compiled:test",
+                "stable",
+                openclaudia::context::ContextFreshness::Static,
+                1,
+            )],
+            openclaudia::context::ContextBudget::default(),
+        );
 
         let anthropic = build_chat_request_body(
             "anthropic",

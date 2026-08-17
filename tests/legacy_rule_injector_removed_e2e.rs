@@ -6,7 +6,7 @@
 use openclaudia::config::{Hook, HookEntry, HooksConfig};
 use openclaudia::hooks::HookEngine;
 use openclaudia::modes::BehaviorMode;
-use openclaudia::prompt::build_system_prompt_blocks;
+use openclaudia::prompt::build_prompt_context;
 use openclaudia::services::tool_executor::ToolExecutor;
 use std::path::{Path, PathBuf};
 
@@ -31,7 +31,7 @@ fn repository_rule_file_cannot_enter_the_system_prompt() {
     std::fs::write(legacy_directory.join("global.md"), SENTINEL).expect("legacy file fixture");
 
     let cwd = project.path().to_string_lossy();
-    let blocks = build_system_prompt_blocks(&BehaviorMode::default(), None, None, None, Some(&cwd));
+    let blocks = build_prompt_context(&BehaviorMode::default(), None, Some(&cwd));
     let prompt = blocks.to_combined();
 
     assert!(!prompt.contains(SENTINEL));

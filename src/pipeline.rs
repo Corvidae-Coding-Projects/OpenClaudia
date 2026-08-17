@@ -141,7 +141,7 @@ pub fn build_anthropic_request(
     }
 
     if claude_code_token.is_some() {
-        crate::claude_credentials::inject_system_prompt(&mut req);
+        crate::claude_credentials::inject_oauth_prefix_only(&mut req);
     }
 
     // Apply effort level. `high` / `max` switch Anthropic into thinking mode.
@@ -585,15 +585,21 @@ pub fn build_request_for_wire(
     // effort level, omitting provider effort hints.
     let resolved = crate::thinking::resolve_effort(effort_level, messages);
     let effective = resolved.as_deref().unwrap_or("medium");
+    let prepared_messages = prompt_blocks.map(|context| context.prepare_json_messages(messages));
+    let effective_messages = prepared_messages.as_deref().unwrap_or(messages);
     if wire_api == WireApi::OpenAiResponses {
-        return build_openai_responses_request(model, messages, effective);
+        return build_openai_responses_request(model, effective_messages, effective);
     }
     match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => {
-            build_anthropic_request(model, messages, effective, claude_code_token, prompt_blocks)
-        }
-        "google" | "gemini" => build_google_request(messages, effective),
-        _ => build_adapter_request(provider, model, messages, effective),
+        "anthropic" => build_anthropic_request(
+            model,
+            effective_messages,
+            effective,
+            claude_code_token,
+            prompt_blocks,
+        ),
+        "google" | "gemini" => build_google_request(effective_messages, effective),
+        _ => build_adapter_request(provider, model, effective_messages, effective),
     }
 }
 
@@ -2958,6 +2964,34 @@ pub fn build_assistant_message_with_tools(
 mod tests {
     use super::*;
 
+    fn typed_test_blocks(prefix: &str, suffix: &str) -> crate::prompt::SystemPromptBlocks {
+        let mut items = Vec::new();
+        if !prefix.is_empty() {
+            items.push(crate::context::ContextItem::host_instruction(
+                "test.stable",
+                crate::context::HostInstructionSource::CorePolicy,
+                "compiled:test",
+                prefix,
+                crate::context::ContextFreshness::Static,
+                1,
+            ));
+        }
+        if !suffix.is_empty() {
+            items.push(crate::context::ContextItem::host_instruction(
+                "test.dynamic",
+                crate::context::HostInstructionSource::RuntimePolicy,
+                "host:test",
+                suffix,
+                crate::context::ContextFreshness::Turn,
+                2,
+            ));
+        }
+        crate::prompt::SystemPromptBlocks::from_items(
+            items,
+            crate::context::ContextBudget::default(),
+        )
+    }
+
     #[test]
     fn quality_gate_records_command_and_failed_gate_findings() {
         let mut ledger = crate::ledger::RealityLedger::new();
@@ -3851,10 +3885,7 @@ mod tests {
     #[test]
     fn test_build_anthropic_request_multi_block() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let blocks = crate::prompt::SystemPromptBlocks {
-            stable_prefix: "identity and tools".to_string(),
-            dynamic_suffix: "hooks and env".to_string(),
-        };
+        let blocks = typed_test_blocks("identity and tools", "hooks and env");
         let req = build_anthropic_request(
             "claude-sonnet-4-6",
             &messages,
@@ -3882,10 +3913,7 @@ mod tests {
     #[test]
     fn test_build_anthropic_request_empty_suffix_single_block() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let blocks = crate::prompt::SystemPromptBlocks {
-            stable_prefix: "everything is static".to_string(),
-            dynamic_suffix: String::new(),
-        };
+        let blocks = typed_test_blocks("everything is static", "");
         let req = build_anthropic_request(
             "claude-sonnet-4-6",
             &messages,

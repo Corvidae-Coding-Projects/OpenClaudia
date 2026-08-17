@@ -55,7 +55,7 @@ pub enum VddResult {
 /// Advisory mode result
 pub struct VddAdvisoryResult {
     pub findings: Vec<Finding>,
-    pub context_injection: String,
+    pub context_observation: Option<crate::context::ContextItem>,
     pub static_analysis: Vec<StaticAnalysisResult>,
     pub tokens_used: TokenUsage,
 }

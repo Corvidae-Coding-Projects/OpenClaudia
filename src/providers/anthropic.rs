@@ -744,22 +744,27 @@ fn extract_usage(response: &Value) -> (u64, u64) {
 /// If the dynamic suffix is empty, only one block is returned.
 #[must_use]
 pub fn build_system_blocks(blocks: &crate::prompt::SystemPromptBlocks) -> Value {
-    if blocks.dynamic_suffix.is_empty() {
+    if blocks.dynamic_suffix().is_empty() {
         json!([{
             "type": "text",
-            "text": blocks.stable_prefix,
+            "text": blocks.stable_prefix(),
             "cache_control": {"type": "ephemeral"}
+        }])
+    } else if blocks.stable_prefix().is_empty() {
+        json!([{
+            "type": "text",
+            "text": blocks.dynamic_suffix()
         }])
     } else {
         json!([
             {
                 "type": "text",
-                "text": blocks.stable_prefix,
+                "text": blocks.stable_prefix(),
                 "cache_control": {"type": "ephemeral"}
             },
             {
                 "type": "text",
-                "text": blocks.dynamic_suffix
+                "text": blocks.dynamic_suffix()
             }
         ])
     }

@@ -708,8 +708,8 @@ pub struct SessionManager {
     persist_dir: PathBuf,
     /// Current active session
     current_session: Option<Session>,
-    /// VDD advisory context to inject into the next turn
-    vdd_pending_context: Option<String>,
+    /// Typed VDD advisory observation for the next turn.
+    vdd_pending_observation: Option<crate::context::ContextItem>,
     /// Structured task manager for `task_create`/`update`/`get`/`list` tools
     pub task_manager: TaskManager,
 }
@@ -727,7 +727,7 @@ impl SessionManager {
         Self {
             persist_dir,
             current_session: None,
-            vdd_pending_context: None,
+            vdd_pending_observation: None,
             task_manager: TaskManager::new(),
         }
     }
@@ -779,14 +779,14 @@ impl SessionManager {
         session
     }
 
-    /// Store VDD advisory context to inject into the next turn
-    pub fn store_vdd_context(&mut self, context: String) {
-        self.vdd_pending_context = Some(context);
+    /// Store a typed VDD advisory observation for the next turn.
+    pub fn store_vdd_observation(&mut self, observation: crate::context::ContextItem) {
+        self.vdd_pending_observation = Some(observation);
     }
 
-    /// Take (consume) the pending VDD context for injection
-    pub const fn take_vdd_context(&mut self) -> Option<String> {
-        self.vdd_pending_context.take()
+    /// Take (consume) the pending VDD observation.
+    pub const fn take_vdd_observation(&mut self) -> Option<crate::context::ContextItem> {
+        self.vdd_pending_observation.take()
     }
 
     fn create_session_for_persist_dir(persist_dir: &Path) -> Session {
@@ -1582,23 +1582,35 @@ mod tests {
 
     /// Spec — VDD context round-trips through store/take.
     #[test]
-    fn vdd_context_store_and_take() {
+    fn vdd_observation_store_and_take() {
         let dir = TempDir::new().unwrap();
         let mut manager = SessionManager::new(dir.path().join("sessions"));
 
         assert!(
-            manager.take_vdd_context().is_none(),
-            "initially no VDD context"
+            manager.take_vdd_observation().is_none(),
+            "initially no VDD observation"
         );
 
-        manager.store_vdd_context("advisory: review tool calls".to_string());
-        let ctx = manager.take_vdd_context();
-        assert_eq!(ctx.as_deref(), Some("advisory: review tool calls"));
+        manager.store_vdd_observation(crate::context::ContextItem::reference(
+            "vdd.test",
+            crate::context::ReferenceSource::Vdd,
+            "vdd:test",
+            "advisory: review tool calls",
+            crate::context::ContextFreshness::Turn,
+            700,
+        ));
+        let observation = manager.take_vdd_observation();
+        assert_eq!(
+            observation
+                .as_ref()
+                .map(crate::context::ContextItem::content),
+            Some("advisory: review tool calls")
+        );
 
         // take is destructive — second take returns None
         assert!(
-            manager.take_vdd_context().is_none(),
-            "take_vdd_context must be destructive"
+            manager.take_vdd_observation().is_none(),
+            "take_vdd_observation must be destructive"
         );
     }
 

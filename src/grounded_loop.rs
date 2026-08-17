@@ -372,6 +372,9 @@ pub fn request_messages_with_grounding(
         serde_json::json!({
             "role": "system",
             "content": content,
+            "metadata": {
+                "openclaudia_context_source": "reality"
+            }
         }),
     );
     Ok(request_messages)

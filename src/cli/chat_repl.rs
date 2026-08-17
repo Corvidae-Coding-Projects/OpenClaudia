@@ -280,20 +280,6 @@ fn request_messages_with_cli_grounding(
     )
 }
 
-fn append_gemini_system_instruction_text(request: &mut serde_json::Value, content: &str) {
-    if let Some(parts) = request
-        .get_mut("systemInstruction")
-        .and_then(|instruction| instruction.get_mut("parts"))
-        .and_then(|parts| parts.as_array_mut())
-    {
-        parts.push(serde_json::json!({ "text": content }));
-        return;
-    }
-    request["systemInstruction"] = serde_json::json!({
-        "parts": [{ "text": content }]
-    });
-}
-
 fn cli_grounding_system_content(
     session_id: &str,
     task_obs: openclaudia::ledger::ObsId,
@@ -660,7 +646,6 @@ impl ChatRepl {
             .and_then(|content| observe_cli_user_task(&self.chat_session.id(), content));
 
         let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
-        self.install_system_prompt(&prompt_blocks);
         let request_state = self.chat_session.messages_snapshot();
         let request_messages = match request_messages_with_cli_grounding(
             &self.chat_session.id(),
@@ -1248,28 +1233,19 @@ impl ChatRepl {
             return false;
         }
 
-        for output in &hook_result.outputs {
-            if let Some(sys_msg) = &output.system_message {
-                self.chat_session.update_messages(|messages| {
-                    messages.insert(
-                        0,
-                        serde_json::json!({
-                            "role": "system",
-                            "content": sys_msg
-                        }),
-                    );
-                });
-            }
-            if let Some(ctx) = &output.additional_context {
-                // Route through the centralized envelope builder so the
-                // crosslink #502 XML-escape (which neutralizes any
-                // attacker-supplied `</system-reminder>` closing tag)
-                // is applied here too, not just in `ContextInjector`.
-                self.chat_session.push_message(serde_json::json!({
-                    "role": "system",
-                    "content": openclaudia::context::wrap_system_reminder(ctx),
-                }));
-            }
+        let hook_items = openclaudia::context::hook_result_reference_items(
+            &hook_result,
+            "user_prompt_submit",
+            500,
+        );
+        if !hook_items.is_empty() {
+            let projection = openclaudia::context::ContextProjector::project(
+                hook_items,
+                openclaudia::context::ContextBudget::default(),
+            );
+            self.chat_session.update_messages(|messages| {
+                projection.append_reference_to_json_messages(messages);
+            });
         }
         true
     }
@@ -1369,40 +1345,27 @@ impl ChatRepl {
         persist_chat_session_update(&mut self.chat_session, "failed turn marker");
     }
 
-    /// Build Claudia's split system-prompt blocks for this turn
-    /// (coordinator + file-knowledge injections live here).
+    /// Build Claudia's typed, bounded prompt context for this turn.
     fn build_prompt_blocks_for_turn(
         &self,
         memory_db: Option<&memory::MemoryDb>,
     ) -> prompt::SystemPromptBlocks {
         let messages = self.chat_session.messages_snapshot();
-        let hook_instructions: Option<String> = messages
-            .iter()
-            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-            .filter(|c| !c.contains("Persona: Claudia"))
-            .map(std::string::ToString::to_string)
-            .reduce(|acc, s| format!("{acc}\n\n{s}"));
-
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-
         let behavior_mode = self.chat_session.behavior_mode();
-        let mut prompt_blocks = prompt::build_system_prompt_blocks(
-            &behavior_mode,
-            hook_instructions.as_deref(),
-            None,
-            memory_db,
-            Some(&cwd),
-        );
+        let mut additional_items = Vec::new();
 
         if self.coordinator {
-            prompt_blocks.stable_prefix = format!(
-                "{}\n\n{}",
+            additional_items.push(openclaudia::context::ContextItem::host_instruction(
+                "repl.coordinator_policy",
+                openclaudia::context::HostInstructionSource::CoordinatorPolicy,
+                "host:coordinator-role",
                 openclaudia::subagent::AgentType::Coordinator.system_prompt(),
-                prompt_blocks.stable_prefix
-            );
+                openclaudia::context::ContextFreshness::Static,
+                5,
+            ));
         }
 
         if let Some(db) = memory_db {
@@ -1442,52 +1405,30 @@ impl ChatRepl {
                     }
                 }
             }
-            let mut file_knowledge_parts = Vec::new();
-            for file_path in injected_files.iter().take(3) {
+            let mut injected_files: Vec<String> = injected_files.into_iter().collect();
+            injected_files.sort();
+            for (index, file_path) in injected_files.iter().take(3).enumerate() {
                 if let Ok(knowledge) = db.format_file_knowledge(file_path) {
                     if !knowledge.is_empty() {
-                        file_knowledge_parts.push(knowledge);
+                        additional_items.push(openclaudia::context::ContextItem::reference(
+                            format!("memory.file_knowledge.{index}"),
+                            openclaudia::context::ReferenceSource::Memory,
+                            format!("memory-db:file:{file_path}"),
+                            knowledge,
+                            openclaudia::context::ContextFreshness::Turn,
+                            320,
+                        ));
                     }
                 }
             }
-            if !file_knowledge_parts.is_empty() {
-                if !prompt_blocks.dynamic_suffix.is_empty() {
-                    prompt_blocks.dynamic_suffix.push_str("\n\n");
-                }
-                prompt_blocks.dynamic_suffix.push_str("## File Knowledge\n");
-                prompt_blocks
-                    .dynamic_suffix
-                    .push_str(&file_knowledge_parts.join("\n"));
-            }
         }
-        prompt_blocks
-    }
-
-    /// Replace (or insert) the combined Claudia system prompt at the
-    /// front of `messages` so non-Anthropic providers see it directly.
-    fn install_system_prompt(&self, prompt_blocks: &prompt::SystemPromptBlocks) {
-        let combined = prompt_blocks.to_combined();
-        self.chat_session.update_messages(|messages| {
-            if let Some(pos) = messages.iter().position(|message| {
-                message
-                    .get("content")
-                    .and_then(|content| content.as_str())
-                    .is_some_and(|content| content.contains("Persona: Claudia"))
-            }) {
-                messages[pos] = serde_json::json!({
-                    "role": "system",
-                    "content": combined
-                });
-            } else {
-                messages.insert(
-                    0,
-                    serde_json::json!({
-                        "role": "system",
-                        "content": combined
-                    }),
-                );
-            }
-        });
+        prompt::build_prompt_context_with_items(
+            &behavior_mode,
+            memory_db,
+            Some(&cwd),
+            additional_items,
+            openclaudia::context::ContextBudget::default(),
+        )
     }
 
     /// Send the initial turn request and dispatch the response to the
@@ -2110,16 +2051,31 @@ impl ChatRepl {
             }
         };
 
+        let mut grounded_contents = gemini_contents.to_vec();
+        if let Some(grounding) = self.current_grounding_system_content() {
+            let projection = openclaudia::context::ContextProjector::project(
+                vec![openclaudia::context::ContextItem::reference(
+                    "reality.grounding",
+                    openclaudia::context::ReferenceSource::Reality,
+                    "reality-ledger:current-task",
+                    grounding,
+                    openclaudia::context::ContextFreshness::Turn,
+                    800,
+                )],
+                openclaudia::context::ContextBudget::default(),
+            );
+            grounded_contents.push(serde_json::json!({
+                "role": "user",
+                "parts": [{"text": projection.reference}]
+            }));
+        }
         let mut followup_req = serde_json::json!({
-            "contents": gemini_contents,
+            "contents": grounded_contents,
             "generationConfig": {"maxOutputTokens": 4096},
             "tools": [{"functionDeclarations": functions}]
         });
         if let Some(sys) = request_body.get("systemInstruction") {
             followup_req["systemInstruction"] = sys.clone();
-        }
-        if let Some(grounding) = self.current_grounding_system_content() {
-            append_gemini_system_instruction_text(&mut followup_req, &grounding);
         }
 
         let mut req = self.client.post(transport.endpoint).json(&followup_req);
@@ -2230,6 +2186,7 @@ impl ChatRepl {
                 cancelled,
             },
             transport,
+            prompt_blocks,
             memory_db,
             auto_learner,
         )
@@ -2877,7 +2834,8 @@ impl ChatRepl {
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let request_messages = self.request_messages_with_grounding()?;
+        let request_messages =
+            prompt_blocks.prepare_json_messages(&self.request_messages_with_grounding()?);
         let anthropic_messages =
             convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
         let openai_tools = tools::get_all_tool_definitions(true);
@@ -2893,7 +2851,7 @@ impl ChatRepl {
         });
         followup_req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
         if self.claude_code_token.is_some() {
-            openclaudia::claude_credentials::inject_system_prompt(&mut followup_req);
+            openclaudia::claude_credentials::inject_oauth_prefix_only(&mut followup_req);
         }
         Ok(followup_req)
     }
@@ -3163,7 +3121,8 @@ impl ChatRepl {
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let request_messages = self.request_messages_with_grounding()?;
+        let request_messages =
+            prompt_blocks.prepare_json_messages(&self.request_messages_with_grounding()?);
         let anthropic_messages =
             convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
         let mut followup_req = serde_json::json!({
@@ -3174,7 +3133,7 @@ impl ChatRepl {
         });
         followup_req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
         if self.claude_code_token.is_some() {
-            openclaudia::claude_credentials::inject_system_prompt(&mut followup_req);
+            openclaudia::claude_credentials::inject_oauth_prefix_only(&mut followup_req);
         }
         Ok(followup_req)
     }
@@ -3247,6 +3206,7 @@ impl ChatRepl {
         tool_accumulator: &mut tools::ToolCallAccumulator,
         mut state: OpenAiLoopState,
         transport: TurnTransport<'_>,
+        prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
@@ -3285,7 +3245,7 @@ impl ChatRepl {
                 .await;
 
             println!("\n\x1b[90mContinuing with tool results...\x1b[0m\n");
-            let request_body = match self.build_openai_followup_request() {
+            let request_body = match self.build_openai_followup_request(prompt_blocks) {
                 Ok(req) => req,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build OpenAI follow-up request");
@@ -3438,14 +3398,13 @@ impl ChatRepl {
 
     /// Build the OpenAI-compatible follow-up request body (handles both
     /// the Anthropic direct branch and the generic `OpenAI` shape).
-    fn build_openai_followup_request(&self) -> Result<serde_json::Value, String> {
-        let request_messages = self.request_messages_with_grounding()?;
+    fn build_openai_followup_request(
+        &self,
+        prompt_blocks: &prompt::SystemPromptBlocks,
+    ) -> Result<serde_json::Value, String> {
+        let request_messages =
+            prompt_blocks.prepare_json_messages(&self.request_messages_with_grounding()?);
         if self.config.proxy.target.eq_ignore_ascii_case("anthropic") {
-            let system_msg = request_messages
-                .iter()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-                .map(String::from);
             let anthropic_messages = convert_messages_to_anthropic_checked(&request_messages)
                 .map_err(|e| e.to_string())?;
             let openai_tools = tools::get_all_tool_definitions(true);
@@ -3458,13 +3417,7 @@ impl ChatRepl {
                 "stream": true,
                 "tools": anthropic_tools
             });
-            if let Some(sys) = system_msg {
-                req["system"] = serde_json::json!([{
-                    "type": "text",
-                    "text": sys,
-                    "cache_control": {"type": "ephemeral"}
-                }]);
-            }
+            req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
             Ok(req)
         } else {
             Ok(serde_json::json!({
@@ -3719,7 +3672,10 @@ impl ChatRepl {
                     qg.name, severity, qg.exit_code,
                     if qg.stdout.len() > 500 { safe_truncate(&qg.stdout, 500) } else { &qg.stdout },
                     if qg.stderr.len() > 500 { safe_truncate(&qg.stderr, 500) } else { &qg.stderr }
-                )
+                ),
+                "metadata": {
+                    "openclaudia_context_source": "reality"
+                }
             }));
             injected_failure = true;
         }

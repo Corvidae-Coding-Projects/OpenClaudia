@@ -335,12 +335,15 @@ pub struct HookOutput {
     pub decision: Option<String>,
     /// Reason for the decision
     pub reason: Option<String>,
-    /// System message to inject
+    /// Legacy hook field name. The runtime treats this as reference data;
+    /// hooks cannot create system instructions.
     #[serde(rename = "systemMessage")]
     pub system_message: Option<String>,
-    /// Modified prompt (for `UserPromptSubmit`)
+    /// Legacy prompt suggestion (for `UserPromptSubmit`). The runtime keeps
+    /// the user's original prompt and attaches this as reference data.
     pub prompt: Option<String>,
-    /// Additional context from hook (plain text output or hookSpecificOutput.additionalContext)
+    /// Reference context from hook (plain text output or
+    /// hookSpecificOutput.additionalContext).
     #[serde(rename = "additionalContext")]
     pub additional_context: Option<String>,
     /// Additional data from the hook
@@ -379,21 +382,6 @@ impl HookResult {
             }],
             errors: vec![],
         }
-    }
-
-    /// Get all system messages from hook outputs
-    #[must_use]
-    pub fn system_messages(&self) -> Vec<&str> {
-        self.outputs
-            .iter()
-            .filter_map(|o| o.system_message.as_deref())
-            .collect()
-    }
-
-    /// Get modified prompt if any hook provided one
-    #[must_use]
-    pub fn modified_prompt(&self) -> Option<&str> {
-        self.outputs.iter().find_map(|o| o.prompt.as_deref())
     }
 }
 
@@ -753,7 +741,7 @@ impl HookEngine {
     /// Parse hook output — matches Claude Code behavior:
     /// - Empty output → default
     /// - Starts with '{' → try JSON parse, fall back to plain text on failure
-    /// - Anything else → treat as plain text (`additionalContext` / system-reminder)
+    /// - Anything else → treat as plain-text reference context
     fn parse_hook_output(stdout: &str) -> HookOutput {
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
@@ -832,10 +820,11 @@ impl HookEngine {
                 .await
             }
             Hook::Prompt { prompt, .. } => {
-                // Prompt hooks just return the prompt as system message
+                // Hook-authored prompts are observations/suggestions. They do
+                // not acquire system authority from the hook transport.
                 Ok((
                     HookOutput {
-                        system_message: Some(prompt.clone()),
+                        additional_context: Some(prompt.clone()),
                         ..Default::default()
                     },
                     0,
@@ -1198,7 +1187,7 @@ impl HookEngine {
         match timeout(Duration::from_secs(timeout_secs), future).await {
             Ok(Ok(response)) => Ok((
                 HookOutput {
-                    system_message: Some(response),
+                    additional_context: Some(response),
                     ..Default::default()
                 },
                 0,
@@ -1278,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_result_system_messages() {
+    fn test_hook_output_system_message_becomes_typed_reference() {
         let result = HookResult {
             allowed: true,
             outputs: vec![
@@ -1294,10 +1283,15 @@ mod tests {
             errors: vec![],
         };
 
-        let messages = result.system_messages();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], "Message 1");
-        assert_eq!(messages[1], "Message 2");
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| {
+            item.source()
+                == crate::context::ContextSource::Reference(crate::context::ReferenceSource::Hook)
+                && item.authority() == crate::context::ContextAuthority::Reference
+        }));
+        assert_eq!(items[0].content(), "Message 1");
+        assert_eq!(items[1].content(), "Message 2");
     }
 
     #[tokio::test]
@@ -1582,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_result_modified_prompt() {
+    fn test_hook_prompt_suggestion_becomes_typed_reference() {
         let result = HookResult {
             allowed: true,
             outputs: vec![HookOutput {
@@ -1592,17 +1586,23 @@ mod tests {
             errors: vec![],
         };
 
-        assert_eq!(result.modified_prompt(), Some("Modified user prompt"));
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content(), "Modified user prompt");
+        assert_eq!(
+            items[0].authority(),
+            crate::context::ContextAuthority::Reference
+        );
     }
 
     #[test]
-    fn test_hook_result_no_modified_prompt() {
+    fn test_hook_result_without_context_has_no_reference_items() {
         let result = HookResult::allowed();
-        assert_eq!(result.modified_prompt(), None);
+        assert!(crate::context::hook_result_reference_items(&result, "fixture", 10).is_empty());
     }
 
     #[test]
-    fn test_hook_result_multiple_system_messages() {
+    fn test_hook_result_multiple_legacy_system_fields_keep_order_as_references() {
         let result = HookResult {
             allowed: true,
             outputs: vec![
@@ -1619,10 +1619,10 @@ mod tests {
             errors: vec![],
         };
 
-        let messages = result.system_messages();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], "Security warning");
-        assert_eq!(messages[1], "Style guide reminder");
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].content(), "Security warning");
+        assert_eq!(items[1].content(), "Style guide reminder");
     }
 
     // ========================================================================
@@ -1896,9 +1896,10 @@ mod tests {
         assert!(result.allowed);
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(
-            result.outputs[0].system_message,
+            result.outputs[0].additional_context,
             Some("Remember to backup".to_string())
         );
+        assert!(result.outputs[0].system_message.is_none());
     }
 
     #[tokio::test]

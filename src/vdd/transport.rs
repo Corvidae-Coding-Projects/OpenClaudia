@@ -295,7 +295,7 @@ fn adversary_headers_and_endpoint(
                     config.adversary.provider
                 )));
             }
-            crate::claude_credentials::inject_system_prompt(transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(transformed);
             Ok((
                 crate::claude_credentials::get_oauth_headers(token),
                 crate::claude_credentials::get_oauth_endpoint(&request.model),
@@ -488,7 +488,7 @@ pub async fn send_to_builder(
                     "Claude Code auth can only be used with Anthropic builder, got '{provider_name}'"
                 )));
             }
-            crate::claude_credentials::inject_system_prompt(&mut transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
             (
                 crate::claude_credentials::get_oauth_headers(token),
                 crate::claude_credentials::get_oauth_endpoint(&request.model),
@@ -582,7 +582,7 @@ pub async fn send_to_builder_for_verification(
                     "Claude Code auth can only be used with Anthropic verifier, got '{provider_name}'"
                 )));
             }
-            crate::claude_credentials::inject_system_prompt(&mut transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
             (
                 crate::claude_credentials::get_oauth_headers(token),
                 crate::claude_credentials::get_oauth_endpoint(&request.model),

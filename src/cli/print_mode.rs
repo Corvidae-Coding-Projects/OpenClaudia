@@ -72,7 +72,7 @@ fn build_print_request(
         .transform_request_with_thinking(request, thinking)
         .map_err(|e| format!("request transform error: {e}"))?;
     if claude_code_token.is_some() {
-        openclaudia::claude_credentials::inject_system_prompt(&mut body);
+        openclaudia::claude_credentials::inject_oauth_prefix_only(&mut body);
     }
     Ok(body)
 }
@@ -82,16 +82,25 @@ fn build_print_chat_request(
     model: &str,
     prompt: String,
 ) -> openclaudia::proxy::ChatCompletionRequest {
+    let user_messages = vec![openclaudia::proxy::ChatMessage {
+        role: "user".to_string(),
+        content: openclaudia::proxy::MessageContent::Text(prompt),
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+        extra: std::collections::HashMap::new(),
+    }];
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let prompt_context = openclaudia::prompt::build_prompt_context(
+        &openclaudia::modes::BehaviorMode::default(),
+        None,
+        cwd.as_deref(),
+    );
     openclaudia::proxy::ChatCompletionRequest {
         model: model.to_string(),
-        messages: vec![openclaudia::proxy::ChatMessage {
-            role: "user".to_string(),
-            content: openclaudia::proxy::MessageContent::Text(prompt),
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-            extra: std::collections::HashMap::new(),
-        }],
+        messages: prompt_context.prepare_chat_messages(&user_messages),
         temperature: None,
         max_tokens: Some(openclaudia::DEFAULT_MAX_TOKENS),
         stream: Some(adapter.name() != "google"),

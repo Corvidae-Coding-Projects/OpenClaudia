@@ -820,7 +820,6 @@ pub struct App {
     next_turn_effort_level: Option<EffortLevel>,
     next_turn_model: Option<String>,
     next_turn_allowed_tool_rules: Vec<crate::permissions::PermissionRule>,
-    pub system_prompt: String,
     /// Memory database for auto-learning from tool execution.
     pub memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     /// Loaded app configuration passed to tools that need provider/config state
@@ -912,7 +911,6 @@ impl App {
             next_turn_effort_level: None,
             next_turn_model: None,
             next_turn_allowed_tool_rules: Vec::new(),
-            system_prompt: String::new(),
             memory_db: None,
             app_config: None,
             permission_mgr: None,
@@ -1126,14 +1124,12 @@ impl App {
         endpoint: String,
         headers: Vec<(String, String)>,
         wire_api: crate::pipeline::WireApi,
-        system_prompt: String,
         prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
         claude_code_token: Option<String>,
     ) {
         self.api_client.endpoint = endpoint;
         self.api_client.headers = headers;
         self.api_client.wire_api = wire_api;
-        self.system_prompt = system_prompt;
         self.api_client.prompt_blocks = prompt_blocks;
         self.api_client.claude_code_token = claude_code_token;
     }
@@ -1157,12 +1153,10 @@ impl App {
         self.chat_session.touch();
         self.refresh_app_config_target();
 
-        let system_prompt = self.system_prompt.clone();
         self.set_api_config(
             endpoint,
             headers,
             wire_api,
-            system_prompt,
             prompt_blocks,
             claude_code_token,
         );
@@ -1220,14 +1214,6 @@ impl App {
         let events = EventHandler::new(Duration::from_millis(100));
         // Store a sender clone so spawn_api_turn can push events into the same channel
         self.api_event_tx = Some(events.sender());
-
-        // Inject system prompt as the first message
-        if !self.system_prompt.is_empty() {
-            self.chat_session.push_message(serde_json::json!({
-                "role": "system",
-                "content": self.system_prompt
-            }));
-        }
 
         // No welcome message added to the message list — the welcome
         // box is rendered directly in draw() as a ratatui widget.
@@ -3600,8 +3586,8 @@ fn check_provider_request_policy_for_messages(
 }
 
 /// Run the pre-turn `UserPromptSubmit` hook. Returns `false` and sends an
-/// `ApiError` event if the hook denies the request; injects any system
-/// messages from hook outputs and returns `true` on success.
+/// `ApiError` event if the hook denies the request; allowed model-visible
+/// outputs are appended as typed reference data.
 async fn run_preturn_hooks(
     engine: &crate::hooks::HookEngine,
     session_messages: &mut Vec<serde_json::Value>,
@@ -3628,10 +3614,14 @@ async fn run_preturn_hooks(
         )));
         return false;
     }
-    for output in &hook_result.outputs {
-        if let Some(ref sys_msg) = output.system_message {
-            session_messages.push(serde_json::json!({ "role": "system", "content": sys_msg }));
-        }
+    let hook_items =
+        crate::context::hook_result_reference_items(&hook_result, "user_prompt_submit", 500);
+    if !hook_items.is_empty() {
+        let projection = crate::context::ContextProjector::project(
+            hook_items,
+            crate::context::ContextBudget::default(),
+        );
+        projection.append_reference_to_json_messages(session_messages);
     }
     true
 }
@@ -4365,11 +4355,12 @@ async fn run_tui_vdd_review(
                 },
                 ctx.session_id,
             );
-            if !result.context_injection.is_empty() {
-                session_messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": format!("<vdd-review>\n{}\n</vdd-review>", result.context_injection),
-                }));
+            if let Some(observation) = result.context_observation {
+                let projection = crate::context::ContextProjector::project(
+                    vec![observation],
+                    crate::context::ContextBudget::default(),
+                );
+                projection.append_reference_to_json_messages(session_messages);
             }
         }
         Err(error) => {
@@ -5200,7 +5191,6 @@ mod tests {
             "https://example.com/v1".to_string(),
             vec![("x-api-key".to_string(), "secret".to_string())],
             crate::pipeline::WireApi::OpenAiResponses,
-            "system prompt".to_string(),
             None,
             Some("oauth-token".to_string()),
         );
@@ -5209,7 +5199,7 @@ mod tests {
             app.api_client.headers,
             vec![("x-api-key".to_string(), "secret".to_string())]
         );
-        assert_eq!(app.system_prompt, "system prompt");
+        assert!(app.api_client.prompt_blocks.is_none());
         assert_eq!(
             app.api_client.claude_code_token.as_deref(),
             Some("oauth-token")
@@ -5224,15 +5214,31 @@ mod tests {
     fn apply_provider_switch_updates_metadata_and_transport() {
         let mut app = App::new("old-model", "anthropic");
         let original_session_id = app.chat_session.id();
-        let blocks = crate::prompt::SystemPromptBlocks {
-            stable_prefix: "stable".to_string(),
-            dynamic_suffix: "dynamic".to_string(),
-        };
+        let blocks = crate::prompt::SystemPromptBlocks::from_items(
+            vec![
+                crate::context::ContextItem::host_instruction(
+                    "test.stable",
+                    crate::context::HostInstructionSource::CorePolicy,
+                    "compiled:test",
+                    "stable",
+                    crate::context::ContextFreshness::Static,
+                    1,
+                ),
+                crate::context::ContextItem::host_instruction(
+                    "test.dynamic",
+                    crate::context::HostInstructionSource::RuntimePolicy,
+                    "host:test",
+                    "dynamic",
+                    crate::context::ContextFreshness::Turn,
+                    2,
+                ),
+            ],
+            crate::context::ContextBudget::default(),
+        );
         app.set_api_config(
             "https://old.example/v1/messages".to_string(),
             vec![("x-api-key".to_string(), "old-key".to_string())],
             crate::pipeline::WireApi::ChatCompletions,
-            "system prompt".to_string(),
             Some(blocks.clone()),
             Some("oauth-token".to_string()),
         );

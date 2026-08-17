@@ -1334,17 +1334,10 @@ async fn run_subagent_inner(
     // is a no-op and preserves the existing turn counter / state.
     let (agent_id, mut messages) = if let Some(preallocated_id) = preallocated_agent_id {
         BACKGROUND_AGENTS.register_with_id(config.agent_type, &config.task, preallocated_id);
-        let system_prompt = config.agent_type.system_prompt();
-        let msgs = vec![
-            json!({
-                "role": "system",
-                "content": system_prompt
-            }),
-            json!({
-                "role": "user",
-                "content": format!("Task: {}\n\n{}", config.task, config.prompt)
-            }),
-        ];
+        let msgs = vec![json!({
+            "role": "user",
+            "content": format!("Task: {}\n\n{}", config.task, config.prompt)
+        })];
         (preallocated_id.to_string(), msgs)
     } else if let Some(ref resume_id) = config.resume_agent_id {
         match load_transcript(resume_id) {
@@ -1371,17 +1364,10 @@ async fn run_subagent_inner(
         }
     } else {
         let id = BACKGROUND_AGENTS.register(config.agent_type, &config.task);
-        let system_prompt = config.agent_type.system_prompt();
-        let msgs = vec![
-            json!({
-                "role": "system",
-                "content": system_prompt
-            }),
-            json!({
-                "role": "user",
-                "content": format!("Task: {}\n\n{}", config.task, config.prompt)
-            }),
-        ];
+        let msgs = vec![json!({
+            "role": "user",
+            "content": format!("Task: {}\n\n{}", config.task, config.prompt)
+        })];
         (id, msgs)
     };
     let task_obs = crate::grounded_loop::observe_session_user_task(
@@ -1392,17 +1378,7 @@ async fn run_subagent_inner(
     // Set up worktree isolation if requested
     let worktree = if config.isolation.as_deref() == Some("worktree") {
         match WorktreeIsolation::create(&agent_id) {
-            Ok(wt) => {
-                // Set working directory for tool execution by injecting context
-                messages.push(json!({
-                    "role": "system",
-                    "content": format!(
-                        "You are running in an isolated git worktree at: {}\nBranch: {}\nAll file operations should use paths relative to or within this directory.",
-                        wt.worktree_path.display(), wt.branch_name
-                    )
-                }));
-                Some(wt)
-            }
+            Ok(wt) => Some(wt),
             Err(e) => {
                 return SubagentResult {
                     agent_id,
@@ -1417,6 +1393,41 @@ async fn run_subagent_inner(
     } else {
         None
     };
+
+    let mut subagent_context = vec![crate::context::ContextItem::host_instruction(
+        "subagent.role_policy",
+        crate::context::HostInstructionSource::AgentRole,
+        format!("compiled:agent-role:{:?}", config.agent_type),
+        config.agent_type.system_prompt(),
+        crate::context::ContextFreshness::Static,
+        10,
+    )];
+    if let Some(worktree) = &worktree {
+        subagent_context.push(crate::context::ContextItem::host_instruction(
+            "subagent.worktree_policy",
+            crate::context::HostInstructionSource::RuntimePolicy,
+            "host:worktree-isolation",
+            "All file operations for this isolated run must remain within the host-provided worktree in reference context.",
+            crate::context::ContextFreshness::Session,
+            20,
+        ));
+        subagent_context.push(crate::context::ContextItem::reference(
+            "subagent.worktree_identity",
+            crate::context::ReferenceSource::Project,
+            "host-observation:worktree-isolation",
+            format!(
+                "Isolated worktree: {}\nBranch: {}",
+                worktree.worktree_path.display(),
+                worktree.branch_name
+            ),
+            crate::context::ContextFreshness::Session,
+            30,
+        ));
+    }
+    let subagent_prompt_blocks = crate::prompt::SystemPromptBlocks::from_items(
+        subagent_context,
+        crate::context::ContextBudget::default(),
+    );
 
     let allowed_tools = config.agent_type.allowed_tools();
 
@@ -1538,9 +1549,11 @@ async fn run_subagent_inner(
                 };
             }
         };
+        let prepared_request_messages =
+            subagent_prompt_blocks.prepare_json_messages(&request_messages);
         let request_body = json!({
             "model": model,
-            "messages": request_messages,
+            "messages": prepared_request_messages,
             "tools": filtered_tools,
             "max_tokens": SUBAGENT_MAX_TOKENS
         });

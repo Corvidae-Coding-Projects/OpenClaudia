@@ -270,13 +270,9 @@ const IDE_DIAGNOSTIC_FILES_IN_PROMPT: usize = 20;
 const IDE_DIAGNOSTICS_PER_FILE_IN_PROMPT: usize = 20;
 const IDE_DIAGNOSTIC_MESSAGE_BYTES: usize = 1_024;
 
-/// Render a bounded, escaped prompt attachment from an IDE snapshot.
-///
-/// Editor fields are client-controlled data. Routing the complete attachment
-/// through `wrap_system_reminder` prevents a selected closing tag from
-/// forging a second system envelope, while the caps keep a noisy language
-/// server from consuming an unbounded model context.
-fn ide_context_for_prompt(state: &IdeState) -> Option<String> {
+/// Render a bounded, source-labeled reference item from an IDE snapshot.
+/// Editor fields are client-controlled data and never receive system authority.
+fn ide_context_item(state: &IdeState) -> Option<crate::context::ContextItem> {
     use std::fmt::Write as _;
 
     if state.active_file.is_none()
@@ -339,16 +335,28 @@ fn ide_context_for_prompt(state: &IdeState) -> Option<String> {
         }
     }
 
-    Some(crate::context::wrap_system_reminder(&context))
+    Some(crate::context::ContextItem::reference(
+        "acp.ide_snapshot",
+        crate::context::ReferenceSource::Ide,
+        "acp:ide-state",
+        context,
+        crate::context::ContextFreshness::Turn,
+        400,
+    ))
 }
 
-fn build_acp_system_prompt(cwd: Option<&str>, ide_state: &IdeState) -> String {
-    let mut prompt = crate::prompt::build_system_prompt_with_cwd(None, None, None, cwd);
-    if let Some(ide_context) = ide_context_for_prompt(ide_state) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&ide_context);
-    }
-    prompt
+fn build_acp_prompt_context(
+    cwd: Option<&str>,
+    ide_state: &IdeState,
+) -> crate::prompt::SystemPromptBlocks {
+    let items = ide_context_item(ide_state).into_iter().collect();
+    crate::prompt::build_prompt_context_with_items(
+        &crate::modes::BehaviorMode::default(),
+        None,
+        cwd,
+        items,
+        crate::context::ContextBudget::default(),
+    )
 }
 
 /// Run the `PreToolUse` hook gate for a single tool dispatch.
@@ -1423,18 +1431,7 @@ impl AcpServer {
                 .ok()
                 .map(|context| context.working_directory().to_string_lossy().into_owned());
             let ide_state = self.ide_state();
-            let system_prompt = build_acp_system_prompt(cwd_string.as_deref(), &ide_state);
-
-            // Prepend system prompt to messages
-            let mut all_messages: Vec<crate::proxy::ChatMessage> =
-                vec![crate::proxy::ChatMessage {
-                    role: "system".to_string(),
-                    content: crate::proxy::MessageContent::Text(system_prompt),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    extra: std::collections::HashMap::new(),
-                }];
+            let prompt_context = build_acp_prompt_context(cwd_string.as_deref(), &ide_state);
             let grounded_messages = match crate::grounded_loop::request_messages_with_grounding(
                 oc_session_id,
                 task_obs,
@@ -1455,7 +1452,7 @@ impl AcpServer {
                     );
                 }
             };
-            all_messages.extend(decoded_messages);
+            let all_messages = prompt_context.prepare_chat_messages(&decoded_messages);
 
             // Build a ChatCompletionRequest for the adapter
             let chat_request = crate::proxy::ChatCompletionRequest {
@@ -1498,7 +1495,7 @@ impl AcpServer {
             if claude_code_token.is_some()
                 && self.config.proxy.target.eq_ignore_ascii_case("anthropic")
             {
-                crate::claude_credentials::inject_system_prompt(&mut transformed);
+                crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
             }
             let endpoint = match crate::pipeline::resolve_endpoint(
                 &self.config.proxy.target,
@@ -2948,7 +2945,12 @@ mod ide_tests {
             diagnostics: HashMap::new(),
         };
 
-        let context = ide_context_for_prompt(&state).expect("non-empty IDE context");
+        let item = ide_context_item(&state).expect("non-empty IDE context");
+        let projection = crate::context::ContextProjector::project(
+            vec![item],
+            crate::context::ContextBudget::default(),
+        );
+        let context = projection.reference;
 
         assert!(context.contains("Active file: /workspace/src/main.rs"));
         assert!(context.contains("&lt;/system-reminder&gt;"));
@@ -3622,7 +3624,7 @@ mod tool_argument_tests {
 #[cfg(test)]
 mod session_mode_tests {
     use super::{
-        acp_mode_label, build_acp_system_prompt, AcpServer, ACP_CONFIG_MODEL_ID,
+        acp_mode_label, build_acp_prompt_context, AcpServer, ACP_CONFIG_MODEL_ID,
         ACP_CONFIG_MODE_ID, INVALID_PARAMS,
     };
     use crate::config::{AppConfig, HooksConfig};
@@ -3961,9 +3963,11 @@ providers:
                 "end": {"line": 4, "character": 16}
             }
         }));
-        let prompt = build_acp_system_prompt(Some("."), &server.ide_state());
-        assert!(prompt.contains("Selection: src/lib.rs:4 (1 line(s))"));
-        assert!(prompt.contains("fn selected() {}"));
+        let prompt = build_acp_prompt_context(Some("."), &server.ide_state());
+        assert!(prompt
+            .reference_context()
+            .contains("Selection: src/lib.rs:4 (1 line(s))"));
+        assert!(prompt.reference_context().contains("fn selected() {}"));
 
         let outside = tempfile::NamedTempFile::new().expect("outside IDE fixture");
         server.handle_ide_file_opened(&json!({

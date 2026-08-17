@@ -148,7 +148,10 @@ fn handle_plan_edit(
                             edited_content,
                             if allowed_prompts.is_empty() { String::new() }
                             else { format!("Allowed operations:\n{}", allowed_prompts.iter().map(|p| format!("- {}: {}", p.tool, p.prompt)).collect::<Vec<_>>().join("\n")) }
-                        )
+                        ),
+                        "metadata": {
+                            "openclaudia_context_source": "user_approved_plan"
+                        }
                     }));
                     events.push(openclaudia::state::StateEvent::MessageAppended {
                         role: "system".to_string(),
@@ -253,7 +256,10 @@ pub fn handle_exit_plan_mode(chat_session: &Session, allowed_prompts_json: &str)
                                     .join("\n")
                             )
                         }
-                    )
+                    ),
+                    "metadata": {
+                        "openclaudia_context_source": "user_approved_plan"
+                    }
                 }));
                 events.push(openclaudia::state::StateEvent::MessageAppended {
                     role: "system".to_string(),

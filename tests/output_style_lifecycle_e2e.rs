@@ -6,7 +6,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::missing_panics_doc)]
 
-use openclaudia::output_style::load_output_style;
+use openclaudia::output_style::load_output_style_context;
 use std::sync::{Mutex, OnceLock};
 
 fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -28,7 +28,7 @@ fn repository_output_style_is_ignored() {
     std::fs::write(project_config.join("output-style.md"), sentinel).expect("project style");
     std::env::set_current_dir(directory.path()).expect("set cwd");
 
-    let loaded = load_output_style();
+    let loaded = load_output_style_context().map(|item| item.content().to_string());
 
     std::env::set_current_dir(previous).expect("restore cwd");
     assert_ne!(loaded.as_deref(), Some(sentinel));

@@ -3265,38 +3265,44 @@ mod vdd_tests {
     // Session Manager VDD Context Integration
     // ========================================================================
 
-    #[test]
-    fn test_session_manager_vdd_context_store_and_take() {
-        let dir = TempDir::new().unwrap();
-        let mut manager = SessionManager::new(dir.path().to_path_buf());
-
-        // Initially no VDD context
-        assert!(manager.take_vdd_context().is_none());
-
-        // Store advisory findings context
-        let context = "<vdd-advisory>\nSQLi found in db.rs:45\n</vdd-advisory>".to_string();
-        manager.store_vdd_context(context.clone());
-
-        // Take it once
-        let taken = manager.take_vdd_context();
-        assert!(taken.is_some());
-        assert_eq!(taken.unwrap(), context);
-
-        // Second take returns None (consumed)
-        assert!(manager.take_vdd_context().is_none());
+    fn vdd_item(content: &str) -> openclaudia::context::ContextItem {
+        openclaudia::context::ContextItem::reference(
+            "vdd.integration",
+            openclaudia::context::ReferenceSource::Vdd,
+            "vdd:integration-test",
+            content,
+            openclaudia::context::ContextFreshness::Turn,
+            700,
+        )
     }
 
     #[test]
-    fn test_session_manager_vdd_context_overwrite() {
+    fn test_session_manager_vdd_observation_store_and_take() {
         let dir = TempDir::new().unwrap();
         let mut manager = SessionManager::new(dir.path().to_path_buf());
 
-        manager.store_vdd_context("first finding".to_string());
-        manager.store_vdd_context("second finding".to_string());
+        assert!(manager.take_vdd_observation().is_none());
 
-        // Should get the latest one
-        let taken = manager.take_vdd_context();
-        assert_eq!(taken.unwrap(), "second finding");
+        let context = "<vdd-advisory>\nSQLi found in db.rs:45\n</vdd-advisory>".to_string();
+        manager.store_vdd_observation(vdd_item(&context));
+
+        let taken = manager.take_vdd_observation();
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().content(), context);
+
+        assert!(manager.take_vdd_observation().is_none());
+    }
+
+    #[test]
+    fn test_session_manager_vdd_observation_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let mut manager = SessionManager::new(dir.path().to_path_buf());
+
+        manager.store_vdd_observation(vdd_item("first finding"));
+        manager.store_vdd_observation(vdd_item("second finding"));
+
+        let taken = manager.take_vdd_observation();
+        assert_eq!(taken.unwrap().content(), "second finding");
     }
 
     // ========================================================================

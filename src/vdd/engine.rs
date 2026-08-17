@@ -15,7 +15,7 @@ use crate::session::TokenUsage;
 use crate::vdd::confabulation::{ConfabulationTracker, FindingIdentity};
 use crate::vdd::error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
 use crate::vdd::finding::{Finding, FindingStatus};
-use crate::vdd::helpers::{extract_user_task, format_findings_for_injection};
+use crate::vdd::helpers::{extract_user_task, findings_context_observation};
 use crate::vdd::prompts::{build_adversary_request, build_revision_request};
 use crate::vdd::review::{AdversaryReview, VddIteration, VddSession};
 use crate::vdd::sink::{create_crosslink_issues, persist_session};
@@ -129,7 +129,7 @@ impl VddEngine {
             // return an empty result rather than spending an adversary call.
             return Ok(VddAdvisoryResult {
                 findings: vec![],
-                context_injection: String::new(),
+                context_observation: None,
                 static_analysis: vec![],
                 tokens_used: TokenUsage::default(),
             });
@@ -197,8 +197,7 @@ impl VddEngine {
         };
         triage_findings(&mut findings, &triage_ctx).await;
 
-        // Build context injection string
-        let context_injection = format_findings_for_injection(&findings, &static_results);
+        let context_observation = findings_context_observation(&findings, &static_results);
 
         let genuine_count = findings
             .iter()
@@ -213,7 +212,7 @@ impl VddEngine {
 
         Ok(VddAdvisoryResult {
             findings,
-            context_injection,
+            context_observation,
             static_analysis: static_results,
             tokens_used,
         })

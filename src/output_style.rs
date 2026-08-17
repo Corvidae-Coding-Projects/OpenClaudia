@@ -7,6 +7,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::context::{ContextFreshness, ContextItem, ContextSensitivity, UserInstructionSource};
 use crate::file_error::{self, FileError};
 
 const USER_STYLE_DISPLAY_PATH: &str = "~/.openclaudia/output-style.md";
@@ -22,8 +23,20 @@ fn user_style_path() -> Option<PathBuf> {
 /// "no style configured" so the caller can continue without a style. A
 /// missing file (`NotFound`) is the normal "no style" path and stays silent.
 #[must_use]
-pub fn load_output_style() -> Option<String> {
-    user_style_path().as_deref().and_then(read_style)
+pub fn load_output_style_context() -> Option<ContextItem> {
+    let path = user_style_path()?;
+    let content = read_style(&path)?;
+    Some(
+        ContextItem::user_instruction(
+            "user.output_style",
+            UserInstructionSource::OutputStyle,
+            path.display().to_string(),
+            format!("## User Output Style\n{content}"),
+            ContextFreshness::Session,
+            120,
+        )
+        .with_sensitivity(ContextSensitivity::Confidential),
+    )
 }
 
 fn read_style(path: &Path) -> Option<String> {
@@ -33,10 +46,10 @@ fn read_style(path: &Path) -> Option<String> {
             if trimmed.is_empty() {
                 None
             } else {
-                // A user style is interpolated into a prompt wrapper.
-                // Escaping `<`, `>`, and `&` prevents it from breaking out of
-                // that wrapper while preserving ordinary Markdown.
-                Some(crate::memory::xml_escape_for_prompt(trimmed).into_owned())
+                // This file is explicitly user-owned instruction input. Its
+                // authority is carried by ContextItem rather than inferred
+                // from delimiter escaping.
+                Some(trimmed.to_string())
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -141,7 +154,7 @@ mod tests {
     #[test]
     fn test_load_style_nonexistent() {
         // Should return None when no style file exists (may or may not depending on env)
-        let _ = load_output_style();
+        let _ = load_output_style_context();
     }
 
     /// In-memory writer used to capture tracing output emitted during a test.
