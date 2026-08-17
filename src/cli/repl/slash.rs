@@ -368,10 +368,26 @@ pub fn slash_hooks() -> SlashCommandResult {
     println!("\nHooks:\n");
     match openclaudia::config::load_config() {
         Ok(cfg) => {
-            let claude_hooks = openclaudia::hooks::load_claude_code_hooks();
-            let hooks = openclaudia::hooks::merge_hooks_config(cfg.hooks, claude_hooks);
+            let hooks = openclaudia::hooks::load_effective_hooks(cfg.hooks);
             for line in hook_status_lines(&hooks) {
                 println!("  {line}");
+            }
+            let imports = openclaudia::hooks::inspect_repository_hook_imports();
+            for proposal in imports.proposals {
+                println!(
+                    "  Import {:?}: {} ({})",
+                    proposal.state,
+                    proposal.source.display(),
+                    proposal.proposal_digest
+                );
+                println!(
+                    "    events: {}; effects: {}",
+                    proposal.requested_events.join(", "),
+                    proposal.requested_effects.join(", ")
+                );
+            }
+            for diagnostic in imports.diagnostics {
+                println!("  Import unavailable: {}", diagnostic.message);
             }
         }
         Err(e) => println!("  Config: failed to load ({e})"),
@@ -638,7 +654,7 @@ fn hook_status_lines(config: &HooksConfig) -> Vec<String> {
         .sum();
 
     let mut lines = vec![
-        "Sources: .openclaudia/config.yaml plus Claude Code settings when present".to_string(),
+        "Sources: host config plus exact host-approved repository imports".to_string(),
         format!(
             "Configured: {}, {}, {}",
             count_label(active_slots, "active event", "active events"),

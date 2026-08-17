@@ -31,6 +31,9 @@ intended feature.
 | `openclaudia loop -n 10` | loop | works: applies a finite iteration override | unsupported: one counter is not aggregate token/cost/effect admission | not_applicable | unsupported: hook failures/cancellation still need canonical status | Finite value is safer but not sufficient. |
 | `openclaudia config` | config | works: renders the current loaded configuration | not_applicable | not_applicable | not_applicable | Secret redaction/provenance and duplicate loaders need W14. |
 | `openclaudia doctor` | doctor | works: executes the current diagnostic command | not_applicable | not_applicable | not_applicable | Several checks are synthetic or effectful; not release evidence. |
+| `openclaudia hooks status` | hooks | works: discovers recognized repository hook files as inert proposals and displays canonical source, digests, events, effects, commands, and bound files | not_applicable | works: file presence alone grants no hook authority | not_applicable | Exact approval is host-owned; broader extension identity and TOCTOU hardening remain assigned to S-058/S-060. |
+| `openclaudia hooks approve <sha256:...>` | hooks | works: accepts only a proposal digest currently derived from the canonical workspace | not_applicable | works: writes an exact host-store receipt; changed source or bound script content becomes inert | not_applicable | Approval does not bypass the hook sandbox or host policy. |
+| `openclaudia hooks revoke <sha256:...>` | hooks | works: removes one exact receipt from the host store | not_applicable | works: revocation takes effect on the next hook-engine construction | not_applicable | Per-invocation revocation and executable identity remain S-060. |
 
 The release matrix will eventually be generated from versioned capability
 metadata and trace-backed end-to-end acceptance tests. Until then, the full

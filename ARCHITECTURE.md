@@ -25,7 +25,7 @@ User/client
 ```
 
 Subcommands: init, auth, start,
-acp, config, doctor, loop.
+acp, config, doctor, hooks, loop.
 
 The important current fact is duplication: those frontends do not all use one
 request state machine, one tool executor, one event log, one budget/cancellation

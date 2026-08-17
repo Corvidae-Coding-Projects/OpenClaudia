@@ -14,8 +14,8 @@
 
 use openclaudia::config::Hook;
 use openclaudia::hooks::{
-    load_claude_code_hooks, load_claude_settings, ClaudeCodeHook, ClaudeCodeHookEntry,
-    ClaudeCodeSettings,
+    inspect_repository_hook_imports, load_claude_code_hooks, load_claude_settings, ClaudeCodeHook,
+    ClaudeCodeHookEntry, ClaudeCodeSettings, HookImportState,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -278,7 +278,7 @@ fn load_claude_code_hooks_handles_missing_dot_claude_dir_gracefully() {
 }
 
 #[test]
-fn load_claude_code_hooks_uses_layered_user_project_and_local_settings() {
+fn runtime_loader_keeps_repository_layers_inert_without_host_approval() {
     let _g = cwd_lock();
     let project = tempfile::TempDir::new().expect("project tempdir");
     let home = tempfile::TempDir::new().expect("home tempdir");
@@ -325,12 +325,23 @@ fn load_claude_code_hooks_uses_layered_user_project_and_local_settings() {
 
     let config = load_claude_code_hooks();
     let commands = command_names(&config.pre_tool_use);
-    assert!(
-        commands.starts_with(&[
-            "user-hook".to_string(),
-            "project-hook".to_string(),
-            "local-hook".to_string()
-        ]),
-        "runtime hook loader MUST use the layered Claude settings path"
+    assert_eq!(
+        commands,
+        ["user-hook".to_string()],
+        "host-owned user settings remain active; repository settings do not"
     );
+    let imports = inspect_repository_hook_imports();
+    assert_eq!(imports.proposals.len(), 2);
+    assert!(imports
+        .proposals
+        .iter()
+        .all(|proposal| proposal.state == HookImportState::Pending));
+    assert!(imports
+        .proposals
+        .iter()
+        .any(|proposal| proposal.commands == ["project-hook".to_string()]));
+    assert!(imports
+        .proposals
+        .iter()
+        .any(|proposal| proposal.commands == ["local-hook".to_string()]));
 }

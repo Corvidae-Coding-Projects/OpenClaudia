@@ -44,6 +44,7 @@ const CONFIG_ENV_VARS: &[&str] = &[
     "API_KEY",
     "CLAUDE_CONFIG_HOME_DIR",
     "CLAUDE_CONFIG_DIR",
+    "OPENCLAUDIA_HOOK_APPROVALS_PATH",
 ];
 
 fn assert_missing_config_is_failure(args: &[&str]) {
@@ -157,6 +158,32 @@ fn isolated_command(cwd: &tempfile::TempDir, home: &tempfile::TempDir) -> Comman
         command.env_remove(var);
     }
     command
+}
+
+fn approve_first_repository_hook_proposal(cwd: &tempfile::TempDir, home: &tempfile::TempDir) {
+    let status = isolated_command(cwd, home)
+        .args(["hooks", "status"])
+        .output()
+        .expect("hook proposal status must run");
+    assert!(
+        status.status.success(),
+        "hook proposal status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8(status.stdout).expect("hook status must be UTF-8");
+    let digest = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Proposal digest: "))
+        .expect("hook status must display a proposal digest");
+    let approval = isolated_command(cwd, home)
+        .args(["hooks", "approve", digest])
+        .output()
+        .expect("hook proposal approval must run");
+    assert!(
+        approval.status.success(),
+        "hook proposal approval failed: {}",
+        String::from_utf8_lossy(&approval.stderr)
+    );
 }
 
 fn run_auth_with_stdin(input: &str) -> Output {
@@ -536,14 +563,17 @@ hooks:
   stop:
     - hooks:
         - type: command
-          shell: true
           timeout: 2
-          command: |
-            printf '%s' '{{"decision":"deny","reason":"stop hook requested shutdown"}}'
+          command: python3 .openclaudia/stop-hook.py
 "#,
         ),
     )
     .expect("config file");
+    fs::write(
+        config_dir.join("stop-hook.py"),
+        "import json\nprint(json.dumps({'decision': 'deny', 'reason': 'stop hook requested shutdown'}))\n",
+    )
+    .expect("stop hook script");
 }
 
 fn write_openai_provider_config(cwd: &tempfile::TempDir) {
@@ -1305,6 +1335,7 @@ fn loop_stop_hook_denial_shuts_down_unlimited_loop_after_first_iteration() {
     let home = tempfile::tempdir().expect("home tempdir");
     let (server, base_url) = spawn_local_chat_server_rejecting_auth();
     write_local_provider_config_with_stop_hook(&cwd, &base_url);
+    approve_first_repository_hook_proposal(&cwd, &home);
     let proxy_port = unused_loopback_port();
     let proxy_port_arg = proxy_port.to_string();
 
@@ -2648,7 +2679,9 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
 #[test]
 fn architecture_cli_overview_lists_all_binary_subcommands() {
     let architecture = include_str!("../ARCHITECTURE.md");
-    for command in ["init", "auth", "start", "acp", "config", "doctor", "loop"] {
+    for command in [
+        "init", "auth", "start", "acp", "config", "doctor", "hooks", "loop",
+    ] {
         assert!(
             architecture.contains(command),
             "ARCHITECTURE.md high-level CLI overview must mention `{command}`"
@@ -2656,7 +2689,7 @@ fn architecture_cli_overview_lists_all_binary_subcommands() {
     }
     assert!(
         architecture.contains("Subcommands: init, auth, start,")
-            && architecture.contains("acp, config, doctor, loop"),
+            && architecture.contains("acp, config, doctor, hooks, loop"),
         "ARCHITECTURE.md must keep the command inventory in the high-level overview"
     );
 }

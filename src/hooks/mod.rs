@@ -12,6 +12,7 @@
 //! - 2: Block the action
 
 pub mod claude_compat;
+pub mod compat_import;
 pub mod merge;
 
 // Re-export everything public from submodules
@@ -19,7 +20,25 @@ pub use claude_compat::{
     load_claude_code_hooks, load_claude_code_hooks_layered, load_claude_settings, ClaudeCodeHook,
     ClaudeCodeHookEntry, ClaudeCodeSettings, LayeredSettings,
 };
+pub use compat_import::{
+    approve_repository_hook_import, approve_repository_hook_import_at,
+    hook_import_approval_store_path, inspect_repository_hook_imports,
+    inspect_repository_hook_imports_at, load_approved_repository_hooks_at,
+    revoke_repository_hook_import, revoke_repository_hook_import_at, HookImportBoundFile,
+    HookImportDiagnostic, HookImportError, HookImportKind, HookImportProposal, HookImportReport,
+    HookImportState,
+};
 pub use merge::merge_hooks_config;
+
+/// Compose explicitly approved compatibility hooks below native host hooks.
+///
+/// Repository sources never activate merely because the files exist. Native
+/// hooks supplied by the host configuration are the final merge layer, so an
+/// imported matcher or policy cannot override them.
+#[must_use]
+pub fn load_effective_hooks(host_hooks: HooksConfig) -> HooksConfig {
+    merge::merge_host_hooks(load_claude_code_hooks(), host_hooks)
+}
 
 use crate::config::{Hook, HookEntry, HookMatcherTarget, HookPolicy, HooksConfig, SandboxMode};
 use crate::tools::is_sensitive_env;

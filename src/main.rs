@@ -173,6 +173,12 @@ enum Commands {
     /// Check configuration and connectivity
     Doctor,
 
+    /// Review, approve, or revoke repository hook imports
+    Hooks {
+        #[command(subcommand)]
+        command: Option<HookCommands>,
+    },
+
     /// Start ACP server on stdin/stdout for agent interoperability (acpx)
     Acp {
         /// Target provider (overrides config)
@@ -211,6 +217,22 @@ enum Commands {
             value_parser = PossibleValuesParser::new(openclaudia::providers::SUPPORTED_PROVIDERS),
         )]
         target: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCommands {
+    /// Show inert and approved repository hook proposals
+    Status,
+    /// Approve the exact proposal digest shown by `hooks status`
+    Approve {
+        /// Full `sha256:...` proposal digest
+        proposal_digest: String,
+    },
+    /// Revoke an exact approved proposal digest
+    Revoke {
+        /// Full `sha256:...` proposal digest
+        proposal_digest: String,
     },
 }
 
@@ -329,6 +351,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Config) => cli::commands::config_cmd::cmd_config(),
         Some(Commands::Doctor) => cli::commands::doctor::cmd_doctor().await,
+        Some(Commands::Hooks { command }) => match command.unwrap_or(HookCommands::Status) {
+            HookCommands::Status => {
+                cli::commands::hooks::cmd_hooks_status();
+                Ok(())
+            }
+            HookCommands::Approve { proposal_digest } => {
+                cli::commands::hooks::cmd_hooks_approve(&proposal_digest)
+            }
+            HookCommands::Revoke { proposal_digest } => {
+                cli::commands::hooks::cmd_hooks_revoke(&proposal_digest)
+            }
+        },
         Some(Commands::Loop {
             max_iterations,
             port,
@@ -411,6 +445,7 @@ const fn subcommand_name(command: &Commands) -> &'static str {
         Commands::Start { .. } => "start",
         Commands::Config => "config",
         Commands::Doctor => "doctor",
+        Commands::Hooks { .. } => "hooks",
         Commands::Acp { .. } => "acp",
         Commands::Loop { .. } => "loop",
     }
@@ -622,7 +657,7 @@ struct TuiLaunchOptions<'a> {
 }
 
 async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
-    use openclaudia::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
+    use openclaudia::hooks::{load_effective_hooks, HookEngine};
 
     let TuiLaunchOptions {
         config,
@@ -646,8 +681,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     let tui_prompt_blocks =
         prompt::build_prompt_context(behavior_mode, memory_db.as_ref(), Some(&cwd));
 
-    let claude_hooks = load_claude_code_hooks();
-    let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
+    let merged_hooks = load_effective_hooks(config.hooks.clone());
     let hook_engine = std::sync::Arc::new(HookEngine::new(merged_hooks));
 
     // Install a process-wide MCP manager so `list_mcp_resources` /
@@ -906,12 +940,11 @@ fn maybe_auto_compact(chat_session: &mut Session, model: &str) {
     }
 }
 
-/// Build a hook engine from config + Claude Code settings.json.
+/// Build a hook engine from host config plus explicitly approved imports.
 ///
 /// Extracted from `cmd_chat` per crosslink #262.
 fn build_hook_engine(config: &config::AppConfig) -> openclaudia::hooks::HookEngine {
-    let claude_hooks = openclaudia::hooks::load_claude_code_hooks();
-    let merged_hooks = openclaudia::hooks::merge_hooks_config(config.hooks.clone(), claude_hooks);
+    let merged_hooks = openclaudia::hooks::load_effective_hooks(config.hooks.clone());
     openclaudia::hooks::HookEngine::new(merged_hooks)
 }
 

@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
-use crate::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
+use crate::hooks::{load_effective_hooks, HookEngine};
 use crate::permissions::{CheckResult, PermissionContext, PermissionManager};
 use crate::providers::get_adapter;
 use crate::session::{SessionManager, SessionMode};
@@ -792,8 +792,7 @@ impl AcpServer {
             .join("openclaudia")
             .join("sessions");
 
-        let claude_hooks = load_claude_code_hooks();
-        let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
+        let merged_hooks = load_effective_hooks(config.hooks.clone());
         let hook_engine = HookEngine::new(merged_hooks);
         let permission_mgr = Arc::new(crate::permissions::PermissionManager::new(
             std::path::PathBuf::from(".openclaudia/permissions.json"),

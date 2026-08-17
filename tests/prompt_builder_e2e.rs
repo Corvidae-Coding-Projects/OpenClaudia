@@ -13,9 +13,9 @@ use openclaudia::prompt::build_prompt_context;
 fn stable_host_sections_keep_canonical_order() {
     let blocks = build_prompt_context(&BehaviorMode::from_preset(Preset::Create), None, None);
     let prefix = blocks.stable_prefix();
-    let identity = prefix.find("Persona: Claudia").expect("identity");
+    let identity = prefix.find("## Runtime Role").expect("identity");
     let agency = prefix.find("# Agency:").expect("behavior mode");
-    let tools = prefix.find("## Your Tools").expect("tools");
+    let tools = prefix.find("## Runtime Capabilities").expect("tools");
     let principles = prefix.find("## Working Principles").expect("principles");
     let communication = prefix
         .find("## Communication Style")
@@ -102,7 +102,7 @@ fn typed_path_replaces_unknown_historical_system_messages() {
         .filter_map(|message| message["content"].as_str())
         .collect();
     assert_eq!(system.len(), 1);
-    assert!(system[0].contains("Persona: Claudia"));
+    assert!(system[0].contains("## Runtime Role"));
     assert!(!system[0].contains("VDD says"));
     assert!(!system[0].contains("hook says"));
     let user = prepared

@@ -1,53 +1,39 @@
 {
-  "allowedTools": [
-    "Bash(tmux *)",
-    "Bash(git worktree *)"
-  ],
-  "enableAllProjectMcpServers": true,
   "hooks": {
     "PostToolUse": [
       {
         "hooks": [
           {
-            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.claude/hooks/post-edit-check.py\"; if [ -f \"$HOOK\" ]; then python3 \"$HOOK\"; else exit 0; fi",
+            "command": "python3 .claude/hooks/post-edit-check.py",
             "timeout": 5,
             "type": "command"
           }
         ],
-        "matcher": "Write|Edit"
-      },
-      {
-        "hooks": [
-          {
-            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.claude/hooks/heartbeat.py\"; if [ -f \"$HOOK\" ]; then python3 \"$HOOK\"; else exit 0; fi",
-            "timeout": 3,
-            "type": "command"
-          }
-        ]
+        "matcher": "^(Write|Edit|write_file|edit_file)$"
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
           {
-            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.claude/hooks/work-check.py\"; if [ -f \"$HOOK\" ]; then python3 \"$HOOK\"; else exit 0; fi",
+            "command": "python3 .claude/hooks/work-check.py",
             "timeout": 3,
             "type": "command"
           }
         ],
-        "matcher": "Write|Edit|Bash"
+        "matcher": "^(Write|Edit|Bash|write_file|edit_file|bash)$"
       }
     ],
     "SessionStart": [
       {
         "hooks": [
           {
-            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.claude/hooks/session-start.py\"; if [ -f \"$HOOK\" ]; then python3 \"$HOOK\"; else exit 0; fi",
+            "command": "python3 .claude/hooks/session-start.py",
             "timeout": 10,
             "type": "command"
           }
         ],
-        "matcher": "startup|resume"
+        "matcher": "^(startup|resume|session_start)$"
       }
     ]
   }

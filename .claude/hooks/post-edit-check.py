@@ -389,10 +389,15 @@ def main():
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
 
+    tool_name = {
+        "write_file": "Write",
+        "edit_file": "Edit",
+    }.get(tool_name, tool_name)
+
     if tool_name not in ("Write", "Edit"):
         sys.exit(0)
 
-    file_path = tool_input.get("file_path", "")
+    file_path = tool_input.get("file_path") or tool_input.get("path", "")
 
     code_extensions = (
         '.rs', '.py', '.js', '.ts', '.tsx', '.jsx', '.go', '.java',
@@ -474,17 +479,21 @@ Fix these NOW - replace with real implementation.""")
         messages.append(test_reminder)
 
     if messages:
+        additional_context = "\n\n".join(messages)
         output = {
+            "additionalContext": additional_context,
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": "\n\n".join(messages)
+                "additionalContext": additional_context
             }
         }
     else:
+        additional_context = f"✓ {os.path.basename(file_path)} - no issues detected"
         output = {
+            "additionalContext": additional_context,
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": f"✓ {os.path.basename(file_path)} - no issues detected"
+                "additionalContext": additional_context
             }
         }
 

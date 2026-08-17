@@ -6,7 +6,7 @@
 
 use crate::config::{Hook, HookEntry, HooksConfig};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -125,6 +125,67 @@ pub fn merge_hooks_config(base: HooksConfig, other: HooksConfig) -> HooksConfig 
     dedup_hook_entries(&mut merged.vdd_converged, other.vdd_converged);
 
     merged
+}
+
+/// Merge a lower-authority hook layer with a host-owned layer.
+///
+/// When the lower layer carries a command allowlist and the host has not
+/// supplied an explicit replacement policy, include the host's statically
+/// configured command executables before merging. This prevents an approved
+/// repository import from accidentally disabling pre-existing host hooks
+/// while retaining the import's full-sandbox default. A host policy, when
+/// present, remains authoritative and replaces the lower policy normally.
+#[must_use]
+pub(crate) fn merge_host_hooks(mut lower: HooksConfig, host: HooksConfig) -> HooksConfig {
+    if host.policy.is_none() {
+        if let Some(allowed_commands) = lower
+            .policy
+            .as_mut()
+            .and_then(|policy| policy.allowed_commands.as_mut())
+        {
+            collect_command_executables(&host, allowed_commands);
+        }
+    }
+    merge_hooks_config(lower, host)
+}
+
+fn collect_command_executables(config: &HooksConfig, commands: &mut HashSet<String>) {
+    for entries in [
+        &config.session_start,
+        &config.session_end,
+        &config.pre_tool_use,
+        &config.post_tool_use,
+        &config.post_tool_use_failure,
+        &config.user_prompt_submit,
+        &config.stop,
+        &config.subagent_start,
+        &config.subagent_stop,
+        &config.pre_compact,
+        &config.permission_request,
+        &config.notification,
+        &config.pre_adversary_review,
+        &config.post_adversary_review,
+        &config.vdd_conflict,
+        &config.vdd_converged,
+    ] {
+        for entry in entries {
+            for hook in &entry.hooks {
+                let Hook::Command { command, .. } = hook else {
+                    continue;
+                };
+                if let Some(executable) = shlex::split(command).and_then(|tokens| {
+                    tokens.first().and_then(|token| {
+                        Path::new(token)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(str::to_string)
+                    })
+                }) {
+                    commands.insert(executable);
+                }
+            }
+        }
+    }
 }
 
 /// Normalize a hook matcher key: treat `None` and `Some("")` identically so

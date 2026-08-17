@@ -29,10 +29,7 @@ use crate::context::{
     HostInstructionSource, ReferenceSource, UserInstructionSource,
 };
 use crate::file_types::extensions_from_tool_input;
-use crate::hooks::{
-    load_claude_code_hooks, merge_hooks_config, HookEngine, HookError, HookEvent, HookInput,
-    HookResult,
-};
+use crate::hooks::{load_effective_hooks, HookEngine, HookError, HookEvent, HookInput, HookResult};
 use crate::mcp::McpManager;
 use crate::oauth::OAuthStore;
 use crate::plugins::PluginManager;
@@ -2302,9 +2299,8 @@ async fn build_proxy_state_with_loop_control(
         .timeout(std::time::Duration::from_mins(5))
         .build()?;
 
-    // Load hooks from both OpenClaudia config and Claude Code settings.json
-    let claude_hooks = load_claude_code_hooks();
-    let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
+    // Compose host hooks above exact, explicitly approved compatibility imports.
+    let merged_hooks = load_effective_hooks(config.hooks.clone());
     let hook_engine = HookEngine::new(merged_hooks);
 
     // Compaction overrides default to "no overrides" — the per-request

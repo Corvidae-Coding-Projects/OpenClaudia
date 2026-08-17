@@ -492,8 +492,11 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
         "README no-default-features build note must explain web_search's browser-feature requirement"
     );
     assert!(
-        prompt_tools.contains("No search API key is required"),
-        "model-facing tool prompt must not tell the model to require a paid search API key"
+        prompt_tools.contains(
+            "tool definitions attached to the current request are the authoritative list"
+        ) && !prompt_tools.contains("web_search")
+            && !prompt_tools.contains("search API key"),
+        "model-facing base policy must stay capability-neutral instead of hard-coding web-search availability"
     );
     assert!(
         claude_code_features.contains("free DuckDuckGo/Bing browser scraping"),

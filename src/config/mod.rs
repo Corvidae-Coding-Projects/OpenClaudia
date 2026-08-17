@@ -50,7 +50,7 @@ pub use webfetch::{
     default_preapproved_domains, is_preapproved, WebFetchConfig, CC_MAX_MARKDOWN_LENGTH,
 };
 
-use config::{Config, ConfigError, Environment, File};
+use config::{Config, ConfigError, Environment, File, FileFormat};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -225,10 +225,34 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
             "http://localhost:5000/v1",
         )?;
 
-    // Load from project config file
+    // Load repository configuration without granting its `hooks:` block
+    // executable or instruction authority. The hook importer discovers that
+    // block separately as an inert, digest-bound proposal; trusted home/env
+    // sources below remain ordinary host configuration.
     let project_config = PathBuf::from(".openclaudia/config.yaml");
     if project_config.exists() {
-        builder = builder.add_source(File::from(project_config).required(false));
+        let content = std::fs::read_to_string(&project_config).map_err(|error| {
+            ConfigError::Message(format!(
+                "failed to read project config {}: {error}",
+                project_config.display()
+            ))
+        })?;
+        let mut document: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|error| {
+            ConfigError::Message(format!(
+                "failed to parse project config {}: {error}",
+                project_config.display()
+            ))
+        })?;
+        if let Some(mapping) = document.as_mapping_mut() {
+            mapping.remove(serde_yaml::Value::String("hooks".to_string()));
+        }
+        let inert_project_config = serde_yaml::to_string(&document).map_err(|error| {
+            ConfigError::Message(format!(
+                "failed to normalize project config {}: {error}",
+                project_config.display()
+            ))
+        })?;
+        builder = builder.add_source(File::from_str(&inert_project_config, FileFormat::Yaml));
     }
 
     // Load from home directory config file

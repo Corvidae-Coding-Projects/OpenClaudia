@@ -12,31 +12,6 @@ use crate::memory::MemoryDb;
 use crate::modes::fragments::{BASE_COMMS, BASE_IDENTITY, BASE_PRINCIPLES, BASE_TOOLS};
 use crate::modes::BehaviorMode;
 use serde_json::Value;
-#[cfg(not(feature = "browser"))]
-use std::sync::LazyLock;
-
-#[cfg(feature = "browser")]
-const fn base_tools_prompt() -> &'static str {
-    BASE_TOOLS
-}
-
-#[cfg(not(feature = "browser"))]
-fn base_tools_prompt() -> &'static str {
-    static BASE_TOOLS_NO_BROWSER: LazyLock<String> = LazyLock::new(|| {
-        let start = BASE_TOOLS
-            .find("### `web_search` - Search the Web")
-            .expect("base tools prompt must contain web_search section");
-        let end = BASE_TOOLS[start..]
-            .find("\n### `chainlink`")
-            .map_or(BASE_TOOLS.len(), |relative| start + relative);
-        let mut prompt = String::new();
-        prompt.push_str(BASE_TOOLS[..start].trim_end());
-        prompt.push_str("\n\n");
-        prompt.push_str(BASE_TOOLS[end..].trim_start_matches('\n'));
-        prompt
-    });
-    &BASE_TOOLS_NO_BROWSER
-}
 
 /// Provider-ready context split plus its bounded reference projection and
 /// deterministic receipt.
@@ -415,7 +390,7 @@ fn core_items(mode: &BehaviorMode) -> Vec<ContextItem> {
             "core.tools",
             HostInstructionSource::CorePolicy,
             "compiled:modes/tools",
-            base_tools_prompt(),
+            BASE_TOOLS,
             ContextFreshness::Static,
             30,
         ),
@@ -560,13 +535,11 @@ mod tests {
         let left = build_prompt_context(&mode, None, None);
         let right = build_prompt_context(&mode, None, None);
         assert_eq!(left, right);
-        assert!(left.stable_prefix().contains("Persona: Claudia"));
-        assert!(left.stable_prefix().contains("## Your Tools"));
-        assert_eq!(
-            left.stable_prefix()
-                .contains("### `web_search` - Search the Web"),
-            cfg!(feature = "browser")
-        );
+        assert!(left.stable_prefix().contains("## Runtime Role"));
+        assert!(left.stable_prefix().contains("## Runtime Capabilities"));
+        assert!(!left.stable_prefix().contains("IMPORTANT OVERRIDE"));
+        assert!(!left.stable_prefix().contains("<invoke name="));
+        assert!(!left.stable_prefix().contains("`chainlink`"));
         assert!(left.context_trace.entries.iter().all(|entry| {
             entry.authority == ContextAuthority::HostInstruction
                 && entry.lane == Some(ContextLane::StableSystem)

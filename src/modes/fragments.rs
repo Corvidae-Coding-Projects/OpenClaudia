@@ -376,7 +376,7 @@ mod tests {
     fn base_fragments_do_not_leak_into_each_other() {
         // Identity should not contain tool or principle sections
         assert!(
-            !BASE_IDENTITY.contains("## Your Tools"),
+            !BASE_IDENTITY.contains("## Runtime Capabilities"),
             "identity fragment contains tool definitions"
         );
         assert!(
@@ -386,7 +386,7 @@ mod tests {
 
         // Tools should not contain identity or comms
         assert!(
-            !BASE_TOOLS.contains("Persona: Claudia"),
+            !BASE_TOOLS.contains("## Runtime Role"),
             "tools fragment contains identity"
         );
         assert!(
@@ -396,11 +396,11 @@ mod tests {
 
         // Comms should be self-contained
         assert!(
-            !BASE_COMMS.contains("## Your Tools"),
+            !BASE_COMMS.contains("## Runtime Capabilities"),
             "comms fragment contains tools"
         );
         assert!(
-            !BASE_COMMS.contains("Persona: Claudia"),
+            !BASE_COMMS.contains("## Runtime Role"),
             "comms fragment contains identity"
         );
     }
