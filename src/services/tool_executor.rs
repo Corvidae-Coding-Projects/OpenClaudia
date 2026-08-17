@@ -7,10 +7,10 @@
 //! task-manager-aware execution.
 
 use crate::config::AppConfig;
+use crate::file_types::extensions_from_tool_input;
 use crate::hooks::{HookEngine, HookError, HookEvent, HookInput};
 use crate::memory::MemoryDb;
 use crate::permissions::PermissionManager;
-use crate::rules::extract_extensions_from_tool_input;
 use crate::services::policy::{PolicyEnforcer, ToolExecutionPolicy};
 use crate::session::TaskManager;
 use crate::tools::{self, ToolCall, ToolResult};
@@ -123,7 +123,7 @@ impl ToolExecutor {
         tool_name: &str,
         tool_input: &Value,
     ) -> Result<(), ToolExecutionBlock> {
-        let extensions = extract_extensions_from_tool_input(tool_name, tool_input);
+        let extensions = extensions_from_tool_input(tool_name, tool_input);
 
         let mut hook_input =
             HookInput::new(HookEvent::PreToolUse).with_tool(tool_name, tool_input.clone());

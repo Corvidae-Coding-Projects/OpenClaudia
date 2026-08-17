@@ -70,7 +70,7 @@ const CORE: &[SlashCommand] = &[
     cmd("/model list", "List available models for current provider"),
     cmd("/model <name>", "Switch to a different model"),
     cmd("/copy", "Copy last assistant response to clipboard"),
-    cmd("/init", "Initialize project config with auto-detection"),
+    cmd("/init", "Initialize project config and skills directory"),
     cmd("/review", "Review uncommitted git changes"),
     cmd(
         "/commit",
@@ -317,8 +317,8 @@ mod tests {
             .split_once("## Slash Commands (Default TUI)")
             .expect("README must document default TUI slash commands")
             .1
-            .split_once("### TUI Shell & Files")
-            .expect("default TUI slash command section must end before shell syntax")
+            .split_once("## Keyboard Shortcuts (Default TUI)")
+            .expect("default TUI slash command section must end before keyboard shortcuts")
             .0;
 
         section

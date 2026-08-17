@@ -1,6 +1,5 @@
 use super::models::get_available_models;
 use super::{get_data_dir, get_history_path, get_sessions_dir, list_chat_sessions};
-use crate::cli::commands::init::init_project_rules;
 use openclaudia::config::{Hook, HookEntry, HooksConfig, PermissionsConfig, SandboxMode};
 use openclaudia::memory;
 use openclaudia::permissions::{PermissionDecision, PermissionRule};
@@ -1026,28 +1025,6 @@ pub fn slash_init() {
         println!("Use /config to view, or delete the file to reinitialize.\n");
     } else {
         let _ = std::fs::create_dir_all(".openclaudia/skills");
-        let mut project_types = Vec::new();
-        if Path::new("Cargo.toml").exists() {
-            project_types.push("Rust");
-        }
-        if Path::new("package.json").exists() {
-            project_types.push("Node.js");
-        }
-        if Path::new("pyproject.toml").exists() || Path::new("setup.py").exists() {
-            project_types.push("Python");
-        }
-        if Path::new("go.mod").exists() {
-            project_types.push("Go");
-        }
-        if Path::new("pom.xml").exists() {
-            project_types.push("Java");
-        }
-        if Path::new("Gemfile").exists() {
-            project_types.push("Ruby");
-        }
-        if !project_types.is_empty() {
-            println!("\nDetected: {}", project_types.join(", "));
-        }
         let default_config = "# OpenClaudia Configuration\nproxy:\n  port: 8080\n  host: \"127.0.0.1\"\n  target: anthropic\n\nproviders:\n  anthropic:\n    base_url: https://api.anthropic.com\n\nsession:\n  timeout_minutes: 30\n  persist_path: .openclaudia/session\n";
         let _ = std::fs::create_dir_all(".openclaudia");
         match std::fs::write(".openclaudia/config.yaml", default_config) {
@@ -1059,7 +1036,6 @@ pub fn slash_init() {
             Err(e) => println!("\n\u{2717} Failed to create config: {e}\n"),
         }
     }
-    init_project_rules();
 }
 
 pub fn slash_model(

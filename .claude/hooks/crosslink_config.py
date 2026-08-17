@@ -3,7 +3,7 @@
 Shared configuration and utility functions for crosslink Claude Code hooks.
 
 This module is deployed to .claude/hooks/crosslink_config.py by `crosslink init`
-and imported by the other hook scripts (work-check.py, prompt-guard.py, etc.).
+and imported by the lifecycle hook scripts.
 """
 
 import json
@@ -202,58 +202,6 @@ def find_crosslink_binary(crosslink_dir):
                 return candidate
 
     return "crosslink"  # fallback to PATH lookup
-
-
-def load_guard_state(crosslink_dir):
-    """Read drift tracking state from .crosslink/.cache/guard-state.json.
-
-    Returns a dict with keys:
-      prompts_since_crosslink (int)
-      total_prompts (int)
-      last_crosslink_at (str ISO timestamp or None)
-      last_reminder_at (str ISO timestamp or None)
-    """
-    if not crosslink_dir:
-        return {"prompts_since_crosslink": 0, "total_prompts": 0,
-                "last_crosslink_at": None, "last_reminder_at": None}
-    state_path = os.path.join(crosslink_dir, ".cache", "guard-state.json")
-    try:
-        with open(state_path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        # Ensure required keys exist
-        state.setdefault("prompts_since_crosslink", 0)
-        state.setdefault("total_prompts", 0)
-        state.setdefault("last_crosslink_at", None)
-        state.setdefault("last_reminder_at", None)
-        return state
-    except (OSError, json.JSONDecodeError):
-        return {"prompts_since_crosslink": 0, "total_prompts": 0,
-                "last_crosslink_at": None, "last_reminder_at": None}
-
-
-def save_guard_state(crosslink_dir, state):
-    """Write drift tracking state to .crosslink/.cache/guard-state.json."""
-    if not crosslink_dir:
-        return
-    cache_dir = os.path.join(crosslink_dir, ".cache")
-    try:
-        os.makedirs(cache_dir, exist_ok=True)
-        state_path = os.path.join(cache_dir, "guard-state.json")
-        with open(state_path, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-    except OSError:
-        pass
-
-
-def reset_drift_counter(crosslink_dir):
-    """Reset the drift counter (agent just used crosslink)."""
-    if not crosslink_dir:
-        return
-    from datetime import datetime
-    state = load_guard_state(crosslink_dir)
-    state["prompts_since_crosslink"] = 0
-    state["last_crosslink_at"] = datetime.now().isoformat()
-    save_guard_state(crosslink_dir, state)
 
 
 def is_agent_context(crosslink_dir):

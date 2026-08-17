@@ -101,7 +101,7 @@ pub struct Identity {
     /// during a session (a `bash cd` tool call updates this).
     pub cwd: PathBuf,
     /// Project root (git toplevel or `original_cwd` when not in a
-    /// repo). Used by MEMORY.md discovery and rules/plugins scope.
+    /// repo). Used by project-scoped memory and plugin discovery.
     pub project_root: PathBuf,
     /// Where transcripts / session-memory / subagent metadata all
     /// anchor. Today derives from `cwd`; kept separate so a future

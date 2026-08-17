@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 use crate::compaction::{CompactionOverrides, ContextCompactor};
 use crate::config::{AppConfig, ProviderConfig};
 use crate::context::ContextInjector;
+use crate::file_types::extensions_from_tool_input;
 use crate::hooks::{
     load_claude_code_hooks, merge_hooks_config, HookEngine, HookError, HookEvent, HookInput,
     HookResult,
@@ -33,7 +34,6 @@ use crate::mcp::McpManager;
 use crate::oauth::OAuthStore;
 use crate::plugins::PluginManager;
 use crate::providers::{self, get_adapter, ApiKey, ProviderAdapter};
-use crate::rules::{extract_extensions_from_tool_input, RulesEngine};
 use crate::services::policy::{
     request_output_token_budget, ProviderRequestPolicy, ProviderRequestPolicyInput,
 };
@@ -57,7 +57,6 @@ pub struct ProxyState {
     pub config: Arc<AppConfig>,
     pub client: Client,
     pub hook_engine: HookEngine,
-    pub rules_engine: RulesEngine,
     /// Operator-supplied overrides for compaction behavior.
     ///
     /// Stored as overrides — *not* a fully realized [`ContextCompactor`] —
@@ -568,7 +567,7 @@ async fn run_pre_tool_use_hooks(
     // Security enforcement handled by the permissions system (src/permissions.rs)
 
     // Extract file extensions from tool input for context
-    let extensions = extract_extensions_from_tool_input(tool_name, tool_input);
+    let extensions = extensions_from_tool_input(tool_name, tool_input);
 
     let mut hook_input =
         HookInput::new(HookEvent::PreToolUse).with_tool(tool_name, tool_input.clone());
@@ -594,112 +593,12 @@ async fn run_pre_tool_use_hooks(
     result
 }
 
-/// Lazily-compiled regex for extracting file extensions from message text.
-///
-/// The path prefix is bounded to `{1,256}` and the extension to `{1,10}` so
-/// no single match can scan an unbounded run of dotted characters — closes
-/// the ReDoS-shaped concern in crosslink #819 alongside the per-request
-/// byte cap enforced by [`extract_extensions_from_messages`].
-static EXTENSION_PATTERN: std::sync::LazyLock<Option<regex::Regex>> =
-    std::sync::LazyLock::new(|| compile_extension_pattern(EXTENSION_PATTERN_SOURCE));
-
-const EXTENSION_PATTERN_SOURCE: &str = r"[A-Za-z0-9_/\\.-]{1,256}\.([A-Za-z0-9]{1,10})\b";
-
-fn compile_extension_pattern(pattern: &str) -> Option<regex::Regex> {
-    match regex::Regex::new(pattern) {
-        Ok(regex) => Some(regex),
-        Err(error) => {
-            warn!(
-                pattern,
-                error = %error,
-                "Invalid extension extraction regex; request-message rule inference disabled",
-            );
-            None
-        }
-    }
-}
-
-/// Max bytes of message text the extension scanner is allowed to look at per
-/// request. A 1 MiB user message previously made the regex sweep the whole
-/// payload; 64 KiB is enough to catch path mentions in any realistic prompt
-/// while keeping the per-request cost bounded (crosslink #819).
-const EXTENSION_SCAN_BUDGET_BYTES: usize = 64 * 1024;
-
-/// Cap on distinct extensions returned per request. The downstream rules
-/// engine looks up a handful of extensions at most; an attacker who packs a
-/// message with thousands of `.foo`-style tokens should not be able to
-/// inflate the lookup set unboundedly (crosslink #819).
-const EXTENSION_UNIQUE_CAP: usize = 32;
-
-/// Extract file extensions from message content (looks for file paths).
-///
-/// Borrows message text instead of cloning it, caps total scanned bytes per
-/// request, and caps the number of distinct extensions returned. See
-/// [`EXTENSION_SCAN_BUDGET_BYTES`] / [`EXTENSION_UNIQUE_CAP`].
-fn extract_extensions_from_messages(messages: &[ChatMessage]) -> Vec<String> {
-    use std::collections::HashSet;
-
-    let Some(extension_pattern) = (*EXTENSION_PATTERN).as_ref() else {
-        return Vec::new();
-    };
-    let mut extensions: HashSet<String> = HashSet::new();
-    let mut remaining = EXTENSION_SCAN_BUDGET_BYTES;
-
-    // Helper closure: scan a single borrowed text slice into `extensions`,
-    // honouring the scan-byte and unique-extension caps. Returns once either
-    // cap is hit so we don't keep iterating captures for nothing.
-    let scan_slice = |text: &str, remaining: &mut usize, extensions: &mut HashSet<String>| {
-        if *remaining == 0 || extensions.len() >= EXTENSION_UNIQUE_CAP {
-            return;
-        }
-        let take = text.len().min(*remaining);
-        // Trim to a UTF-8 boundary so the &str slice is always valid even
-        // when `take` lands mid-codepoint.
-        let mut end = take;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let slice = &text[..end];
-        *remaining = remaining.saturating_sub(end);
-
-        for cap in extension_pattern.captures_iter(slice) {
-            if let Some(ext) = cap.get(1) {
-                extensions.insert(ext.as_str().to_lowercase());
-                if extensions.len() >= EXTENSION_UNIQUE_CAP {
-                    return;
-                }
-            }
-        }
-    };
-
-    for msg in messages {
-        if remaining == 0 || extensions.len() >= EXTENSION_UNIQUE_CAP {
-            break;
-        }
-        match &msg.content {
-            MessageContent::Text(t) => scan_slice(t, &mut remaining, &mut extensions),
-            MessageContent::Parts(parts) => {
-                for p in parts {
-                    if remaining == 0 || extensions.len() >= EXTENSION_UNIQUE_CAP {
-                        break;
-                    }
-                    if let Some(ref part_text) = p.text {
-                        scan_slice(part_text, &mut remaining, &mut extensions);
-                    }
-                }
-            }
-        }
-    }
-
-    extensions.into_iter().collect()
-}
-
-/// Prepare a chat completion request: run hooks, inject context, rules,
-/// MCP tools, plugins, VDD.
+/// Prepare a chat completion request: run hooks, inject context, MCP tools,
+/// plugins, and VDD.
 ///
 /// The `#[allow(clippy::too_many_lines)]` below is deliberately retained
 /// — this function is a long linear sequence of independent injection
-/// phases (hook, prompt-mod, context inject, rules, MCP tools, plugin
+/// phases (hook, prompt-mod, context inject, MCP tools, plugin
 /// tools, VDD context). Breaking it further without an enclosing
 /// orchestrator would just move line count around. A follow-up PR can
 /// formalize a `RequestContextPipeline` if it becomes worth the weight.
@@ -764,20 +663,6 @@ async fn prepare_request_context(
         }
     }
     ContextInjector::inject(request, &hook_result);
-
-    // Inject rules based on file extensions
-    let extensions = extract_extensions_from_messages(&request.messages);
-    if !extensions.is_empty() {
-        let rules_content = state.rules_engine.get_combined_rules(
-            &extensions
-                .iter()
-                .map(std::string::String::as_str)
-                .collect::<Vec<_>>(),
-        );
-        if !rules_content.is_empty() {
-            ContextInjector::inject_system_prefix(request, &rules_content);
-        }
-    }
 
     // Add MCP tools
     let mcp_tools = state
@@ -1503,7 +1388,7 @@ async fn proxy_chat_completions(
 
     bump_session_request_count(&state).await;
 
-    // Prepare request: run hooks, inject context, rules, MCP tools, VDD
+    // Prepare request: run hooks, inject context, MCP tools, plugins, and VDD.
     prepare_request_context(&mut request, &state).await?;
     compact_request_context(&mut request, &state).await;
     let estimated_input = crate::compaction::estimate_request_tokens(&request);
@@ -2341,8 +2226,6 @@ async fn build_proxy_state_with_loop_control(
     let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
     let hook_engine = HookEngine::new(merged_hooks);
 
-    let rules_engine = RulesEngine::new(".openclaudia/rules");
-
     // Compaction overrides default to "no overrides" — the per-request
     // model-specific compactor is built in `compact_request_context` using
     // these as a delta on top of the model defaults (crosslink #489).
@@ -2402,7 +2285,6 @@ async fn build_proxy_state_with_loop_control(
         config: Arc::new(config),
         client,
         hook_engine,
-        rules_engine,
         compactor_overrides,
         session_manager,
         plugin_manager,
@@ -2644,7 +2526,7 @@ pub async fn start_server_with_shutdown(
     // Build the proxy state + fire SessionStart hook via the SAME
     // helpers that `start_server` uses. The previous implementation of
     // this function duplicated ~150 lines of initialization (Client,
-    // hook merging, rules engine, compactor, session manager, plugin
+    // hook merging, compactor, session manager, plugin
     // discovery, MCP connect loop, OAuth store, VDD engine setup,
     // SessionStart hook). Any change to provisioning had to land in
     // two places — classic stovepipe. See crosslink #246.
@@ -2773,7 +2655,6 @@ mod tests {
             config: Arc::new(config),
             client: Client::new(),
             hook_engine: HookEngine::new(crate::config::HooksConfig::default()),
-            rules_engine: RulesEngine::new(".openclaudia/rules"),
             compactor_overrides: CompactionOverrides::default(),
             session_manager: Arc::new(RwLock::new(SessionManager::new(&session_path))),
             plugin_manager: Arc::new(PluginManager::with_paths(vec![])),
@@ -2962,33 +2843,6 @@ mod tests {
             .await
             .expect("read response body");
         serde_json::from_slice(&bytes).expect("response body must be JSON")
-    }
-
-    #[test]
-    fn invalid_extension_pattern_is_skipped() {
-        assert!(compile_extension_pattern("[").is_none());
-    }
-
-    #[test]
-    fn extract_extensions_from_messages_finds_text_paths() {
-        let regex =
-            compile_extension_pattern(EXTENSION_PATTERN_SOURCE).expect("source regex compiles");
-        assert!(
-            regex.is_match("inspect src/main.rs and docs/README.md"),
-            "source regex must match file paths in text"
-        );
-
-        let mut extensions = extract_extensions_from_messages(&[ChatMessage {
-            role: "user".to_string(),
-            content: MessageContent::Text("inspect src/main.rs and docs/README.md".to_string()),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            extra: std::collections::HashMap::new(),
-        }]);
-        extensions.sort();
-
-        assert_eq!(extensions, vec!["md", "rs"]);
     }
 
     #[tokio::test]

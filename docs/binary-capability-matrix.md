@@ -1,34 +1,37 @@
-# Binary Capability Matrix
+# Binary Capability Matrix — Audit Status
 
-Each row corresponds to a command advertised in the README CLI command block.
-Cells use one of three explicit states:
+This matrix describes current route/entrypoint evidence after the 2026-08-16
+audit. `works:` means only the narrow fact stated in that cell. It never means
+the whole command is production-ready. `unsupported:` records a missing or
+unsafe contract that must be repaired; it is not a proposal to delete the
+intended feature.
 
-- `works`: implemented for this entrypoint and covered by focused tests or smoke tests.
-- `unsupported: ...`: intentionally not implemented for this entrypoint; the note must name why.
-- `not_applicable`: the entrypoint does not exercise that capability.
-
-| README invocation | Entrypoint | Startup smoke | Provider policy | Tool policy/hooks | Grounding/final gate | Notes |
+| README invocation | Entrypoint | Startup/shape evidence | Provider policy/state | Tool policy/hooks | Grounding/final state | Notes |
 |---|---|---|---|---|---|---|
-| `openclaudia` | default_tui | works: default full-screen TUI starts after config/auth resolution | works: direct provider requests use ProviderRequestPolicy | works: local tool calls use shared ToolExecutor gates | works: agentic finals use structured/cited final gate | Default interactive path. |
-| `openclaudia -m <model>` | default_tui | works: model override is accepted before TUI launch | works: overridden model is checked by ProviderRequestPolicy | works: local tool calls use shared ToolExecutor gates | works: agentic finals use structured/cited final gate | Provider may be auto-detected from model. |
-| `openclaudia -v` | default_tui | works: verbose flag enables logging before TUI launch | works: direct provider requests use ProviderRequestPolicy | works: local tool calls use shared ToolExecutor gates | works: agentic finals use structured/cited final gate | Logging flag only changes diagnostics. |
-| `openclaudia --resume` | default_tui | works: resume selects latest saved session before TUI launch | works: direct provider requests use ProviderRequestPolicy | works: local tool calls use shared ToolExecutor gates | works: agentic finals use structured/cited final gate | Fails with documented error when no matching session exists. |
-| `openclaudia --session-id <id>` | default_tui | works: explicit session id takes precedence over resume | works: direct provider requests use ProviderRequestPolicy | works: local tool calls use shared ToolExecutor gates | works: agentic finals use structured/cited final gate | Prefix matching is intentional. |
-| `openclaudia --coordinator --tui-mode` | legacy_repl | works: coordinator is accepted only with legacy REPL | works: legacy REPL provider requests use ProviderRequestPolicy | works: legacy REPL tool calls use shared ToolExecutor gates | works: legacy REPL finals use structured/cited final gate | Coordinator remains experimental. |
-| `openclaudia --tui-mode` | legacy_repl | works: launches line-oriented legacy REPL | works: legacy REPL provider requests use ProviderRequestPolicy | works: legacy REPL tool calls use shared ToolExecutor gates | works: legacy REPL finals use structured/cited final gate | Additional legacy slash commands live here. |
-| `openclaudia --mode <preset>` | default_tui | works: supported behavior preset is accepted before TUI launch | works: direct provider requests use ProviderRequestPolicy | works: local tool calls use shared ToolExecutor gates | works: agentic finals use structured/cited final gate | Clap rejects unknown presets. |
-| `openclaudia --print "prompt"` | print | works: sends one prompt and exits | works: one-shot request uses ProviderRequestPolicy | not_applicable | unsupported: print mode has no tools, reality ledger, or agentic final gate | Non-interactive compatibility mode. |
-| `openclaudia init` | init | works: creates config when absent | not_applicable | not_applicable | not_applicable | Filesystem-only setup command. |
-| `openclaudia init --force` | init | works: overwrites existing config intentionally | not_applicable | not_applicable | not_applicable | Requires explicit force. |
-| `openclaudia auth` | auth | works: starts OAuth/auth flow | not_applicable | not_applicable | not_applicable | Interactive authentication command. |
-| `openclaudia auth --status` | auth | works: reports auth state without starting OAuth | not_applicable | not_applicable | not_applicable | Read-only auth check. |
-| `openclaudia auth --logout` | auth | works: clears native OAuth cache | not_applicable | not_applicable | not_applicable | Does not delete shared Claude credentials. |
-| `openclaudia start` | proxy | works: starts proxy server after config/auth resolution | works: proxy requests use ProviderRequestPolicy | not_applicable | not_applicable | Proxy forwards provider protocol. |
-| `openclaudia start -p 9090` | proxy | works: port override is applied before bind | works: proxy requests use ProviderRequestPolicy | not_applicable | not_applicable | Bind errors are surfaced. |
-| `openclaudia start -t openai` | proxy | works: target override is applied before auth preflight | works: proxy requests use ProviderRequestPolicy | not_applicable | not_applicable | Clap validates supported providers. |
-| `openclaudia acp` | acp | works: starts ACP server on stdio | works: ACP provider requests use ProviderRequestPolicy | works: ACP tool calls use shared ToolExecutor gates | works: ACP finals use structured/cited final gate | ACP tool execution still prompts through ACP permission flow. |
-| `openclaudia acp -m <model>` | acp | works: model override is accepted before ACP loop | works: overridden model is checked by ProviderRequestPolicy | works: ACP tool calls use shared ToolExecutor gates | works: ACP finals use structured/cited final gate | ACP model validation accepts configured/free-form models. |
-| `openclaudia loop` | loop | works: starts iteration proxy mode | works: loop proxy requests use ProviderRequestPolicy | not_applicable | not_applicable | Stop hooks own iteration control. |
-| `openclaudia loop -n 10` | loop | works: max-iteration override is applied | works: loop proxy requests use ProviderRequestPolicy | not_applicable | not_applicable | Zero means unlimited. |
-| `openclaudia config` | config | works: prints current configuration | not_applicable | not_applicable | not_applicable | Redacts configured API keys. |
-| `openclaudia doctor` | doctor | works: checks config/auth/connectivity | not_applicable | not_applicable | not_applicable | Avoids network probes when auth preflight fails. |
+| `openclaudia` | default_tui | works: command selects the default full-screen TUI | unsupported: provider-native continuation and one canonical request policy are not proven | unsupported: execution remains frontend-coupled and several capability gates fail open | unsupported: interruption and final status do not form one supervised run | Main interactive path, not production-ready. |
+| `openclaudia -m <model>` | default_tui | works: CLI accepts a model override | unsupported: static/name heuristics are not availability or policy evidence | unsupported: same TUI tool gaps as default | unsupported: same TUI final-state gaps as default | Model acceptance is not provider compatibility. |
+| `openclaudia -v` | default_tui | works: verbose flag selects logging setup | unsupported: logs do not repair request-state gaps | unsupported: logs can expose untrusted/sensitive fields in some paths | unsupported: logging is not completion evidence | Diagnostics only. |
+| `openclaudia --resume` | default_tui | works: selects the latest saved-session lookup | unsupported: resumed provider identity can diverge from displayed state | unsupported: persisted authority and tool state are not safely rebound | unsupported: transcript/session causality is incomplete | Resume outcome retained under W12/W15. |
+| `openclaudia --session-id <id>` | default_tui | works: accepts an explicit session selector | unsupported: prefix/identity semantics need canonical ownership | unsupported: persisted authority and tool state are not safely rebound | unsupported: exact causal generation is not proven | Explicit selection is not isolation. |
+| `openclaudia --coordinator --tui-mode` | legacy_repl | works: CLI accepts coordinator only on the legacy path | unsupported: coordinator dispatch remains non-executable/unused | unsupported: delegation isolation and supervision are incomplete | unsupported: coordinator label/prompt is not an enforced lifecycle | Coordinator outcome is preserved by W8. |
+| `openclaudia --tui-mode` | legacy_repl | works: launches the line-oriented REPL | unsupported: separate request/provider loop drifts from TUI | unsupported: separate tool and hook ordering drifts from TUI | unsupported: separate transcript/final behavior drifts from TUI | Compatibility frontend to migrate under W12. |
+| `openclaudia --mode <preset>` | default_tui | works: parser accepts known preset names | unsupported: prompt axes do not constrain provider effects | unsupported: readonly/director/scope modes are not capability boundaries | unsupported: mode labels can overstate actual behavior | Preserve useful modes under W17. |
+| `openclaudia --print "prompt"` | print | works: sends one non-interactive request and exits | unsupported: fourth direct request path lacks canonical state/budgets | not_applicable | unsupported: no canonical run trace or typed partial/cancelled state | W12/W27 target a script-safe run contract. |
+| `openclaudia init` | init | works: creates current project scaffold when absent | not_applicable | not_applicable | not_applicable | Current scaffold advertises deprecated/unsafe paths; W14/W15 will replace it. |
+| `openclaudia init --force` | init | works: explicit force reaches overwrite path | not_applicable | not_applicable | not_applicable | Current multi-file overwrite is not transactional. |
+| `openclaudia auth` | auth | works: starts the current native OAuth UI/flow | not_applicable | not_applicable | not_applicable | Current subscription-client impersonation path is selected for removal. |
+| `openclaudia auth --status` | auth | works: reports current cache-shaped auth state | not_applicable | not_applicable | not_applicable | Report is not end-to-end token validity. |
+| `openclaudia auth --logout` | auth | works: clears only the native cache path | not_applicable | not_applicable | not_applicable | Does not prove provider revocation or shared-store cleanup. |
+| `openclaudia start` | proxy | works: starts the configured HTTP listener when bind succeeds | unsupported: callers are unauthenticated and share mutable request/session state | not_applicable | unsupported: only a subset of routes receives advertised lifecycle checks | Never expose current proxy to untrusted clients. |
+| `openclaudia start -p 9090` | proxy | works: applies a port override before bind | unsupported: port selection does not add caller authentication/isolation | not_applicable | unsupported: same proxy lifecycle gaps as default | External bind requires W27. |
+| `openclaudia start -t openai` | proxy | works: accepts a target override | unsupported: provider transform loses native state and has duplicated policy | not_applicable | unsupported: same proxy lifecycle gaps as default | Adapter selection is not protocol conformance. |
+| `openclaudia acp` | acp | works: starts a stdio JSON-RPC loop | unsupported: session IDs do not isolate provider/transcript/config state | unsupported: advertised modes/tools and cancellation are incomplete | unsupported: partial protocol data can be finalized as normal output | ACP outcome preserved under W12. |
+| `openclaudia acp -m <model>` | acp | works: accepts a model override | unsupported: static/free-form options are not provider conformance | unsupported: same ACP tool/cancellation gaps as default | unsupported: same ACP final-state gaps as default | Model choice does not repair session isolation. |
+| `openclaudia loop` | loop | works: starts the current iteration/proxy command path | unsupported: uses a separate lifecycle and unlimited default semantics | not_applicable | unsupported: Stop-hook prose is not a durable terminal condition | W10 supplies finite budgets and typed stops. |
+| `openclaudia loop -n 10` | loop | works: applies a finite iteration override | unsupported: one counter is not aggregate token/cost/effect admission | not_applicable | unsupported: hook failures/cancellation still need canonical status | Finite value is safer but not sufficient. |
+| `openclaudia config` | config | works: renders the current loaded configuration | not_applicable | not_applicable | not_applicable | Secret redaction/provenance and duplicate loaders need W14. |
+| `openclaudia doctor` | doctor | works: executes the current diagnostic command | not_applicable | not_applicable | not_applicable | Several checks are synthetic or effectful; not release evidence. |
+
+The release matrix will eventually be generated from versioned capability
+metadata and trace-backed end-to-end acceptance tests. Until then, the full
+audit is authoritative.

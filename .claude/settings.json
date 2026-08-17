@@ -30,16 +30,6 @@
       {
         "hooks": [
           {
-            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.claude/hooks/pre-web-check.py\"; if [ -f \"$HOOK\" ]; then python3 \"$HOOK\"; else exit 0; fi",
-            "timeout": 5,
-            "type": "command"
-          }
-        ],
-        "matcher": "WebFetch|WebSearch"
-      },
-      {
-        "hooks": [
-          {
             "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.claude/hooks/work-check.py\"; if [ -f \"$HOOK\" ]; then python3 \"$HOOK\"; else exit 0; fi",
             "timeout": 3,
             "type": "command"
@@ -58,17 +48,6 @@
           }
         ],
         "matcher": "startup|resume"
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.claude/hooks/prompt-guard.py\"; if [ -f \"$HOOK\" ]; then python3 \"$HOOK\"; else exit 0; fi",
-            "timeout": 5,
-            "type": "command"
-          }
-        ]
       }
     ]
   }

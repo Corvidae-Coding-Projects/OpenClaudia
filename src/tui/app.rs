@@ -861,10 +861,6 @@ pub struct App {
     /// `None` for `task_mgr` and the dispatcher returned
     /// "Task management not available (no session)".
     pub task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
-    /// Rules content injected as system message (loaded once at startup).
-    pub rules_content: Option<String>,
-    /// Whether rules have been injected into session messages.
-    rules_injected: bool,
     /// Active modal overlay (help / log picker / …). At most one at a
     /// time. `None` when the main chat UI has focus. Closing an
     /// overlay goes through its `OverlayAction` return value so the
@@ -933,8 +929,6 @@ impl App {
             task_mgr: std::sync::Arc::new(
                 std::sync::Mutex::new(crate::session::TaskManager::new()),
             ),
-            rules_content: None,
-            rules_injected: false,
             overlay: None,
         }
     }
@@ -2840,22 +2834,6 @@ impl App {
             "role": "user",
             "content": expanded
         }));
-
-        // Inject rules as system message on first turn
-        if !self.rules_injected {
-            if let Some(ref rules) = self.rules_content {
-                self.chat_session.update_messages(|messages| {
-                    messages.insert(
-                        0,
-                        serde_json::json!({
-                            "role": "system",
-                            "content": rules
-                        }),
-                    );
-                });
-            }
-            self.rules_injected = true;
-        }
 
         crate::guardrails::reset_turn();
         self.is_waiting = true;

@@ -1,16 +1,21 @@
 //! Output style customization for response formatting.
 //!
-//! Loads style definitions from markdown files in `.openclaudia/output-style.md`
-//! or `~/.openclaudia/output-style.md`. The style content is injected into the
-//! system prompt to customize how the model formats responses.
+//! Loads an explicitly user-owned style from `~/.openclaudia/output-style.md`.
+//! Repository files are deliberately not consulted because project content
+//! must not gain automatic system-prompt authority.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::file_error::{self, FileError};
 
-/// Load the active output style, if any.
-/// Checks project-level first, then user-level.
+const USER_STYLE_DISPLAY_PATH: &str = "~/.openclaudia/output-style.md";
+
+fn user_style_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".openclaudia/output-style.md"))
+}
+
+/// Load the active user-owned output style, if any.
 ///
 /// Read errors other than `NotFound` (e.g. permission denied, encoding) are
 /// logged at WARN with the file path and error message, then treated as
@@ -18,19 +23,7 @@ use crate::file_error::{self, FileError};
 /// missing file (`NotFound`) is the normal "no style" path and stays silent.
 #[must_use]
 pub fn load_output_style() -> Option<String> {
-    let project_style = PathBuf::from(".openclaudia/output-style.md");
-    if project_style.exists() {
-        return read_style(&project_style);
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        let user_style = home.join(".openclaudia/output-style.md");
-        if user_style.exists() {
-            return read_style(&user_style);
-        }
-    }
-
-    None
+    user_style_path().as_deref().and_then(read_style)
 }
 
 fn read_style(path: &Path) -> Option<String> {
@@ -40,16 +33,9 @@ fn read_style(path: &Path) -> Option<String> {
             if trimmed.is_empty() {
                 None
             } else {
-                // Crosslink #828: the output-style file content is
-                // user-provided (and may be repo-committed, so a hostile
-                // contributor in a multi-author project can plant it).
-                // It is interpolated VERBATIM into the system prompt, so
-                // a `</output_style>` injection plus sibling
-                // instructions would escape the style block and steer
-                // the model. `xml_escape_for_prompt` neutralises the
-                // three bytes (`<`, `>`, `&`) that can close the
-                // surrounding tag — markdown formatting and ASCII
-                // English remain untouched.
+                // A user style is interpolated into a prompt wrapper.
+                // Escaping `<`, `>`, and `&` prevents it from breaking out of
+                // that wrapper while preserving ordinary Markdown.
                 Some(crate::memory::xml_escape_for_prompt(trimmed).into_owned())
             }
         }
@@ -92,7 +78,33 @@ pub fn builtin_styles() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Save a style to the project output-style file.
+fn save_style_at(path: &Path, content: &str) -> Result<(), FileError> {
+    let Some(directory) = path.parent() else {
+        return Err(FileError::Invalid {
+            path: path.to_path_buf(),
+            reason: "output-style path has no parent directory".to_string(),
+        });
+    };
+    file_error::create_dir_all(directory)?;
+    file_error::write_file(path, content)
+}
+
+fn clear_style_at(path: &Path) -> Result<(), FileError> {
+    if path.exists() {
+        std::fs::remove_file(path).map_err(FileError::with_path(path))
+    } else {
+        Ok(())
+    }
+}
+
+fn configured_user_style_path() -> Result<PathBuf, FileError> {
+    user_style_path().ok_or_else(|| FileError::Invalid {
+        path: PathBuf::from(USER_STYLE_DISPLAY_PATH),
+        reason: "cannot resolve the user home directory".to_string(),
+    })
+}
+
+/// Save a style to the user-owned output-style file.
 ///
 /// # Errors
 ///
@@ -100,24 +112,18 @@ pub fn builtin_styles() -> Vec<(&'static str, &'static str)> {
 /// cannot be written. The returned error carries the offending path and the
 /// underlying `io::ErrorKind` for programmatic discrimination — see #492.
 pub fn save_output_style(content: &str) -> Result<(), FileError> {
-    let dir = PathBuf::from(".openclaudia");
-    file_error::create_dir_all(&dir)?;
-    let path = dir.join("output-style.md");
-    file_error::write_file(&path, content)
+    let path = configured_user_style_path()?;
+    save_style_at(&path, content)
 }
 
-/// Remove the project output-style file.
+/// Remove the user-owned output-style file.
 ///
 /// # Errors
 ///
 /// Returns [`FileError::Io`] if the file exists but cannot be removed.
 pub fn clear_output_style() -> Result<(), FileError> {
-    let path = PathBuf::from(".openclaudia/output-style.md");
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(FileError::with_path(&path))
-    } else {
-        Ok(())
-    }
+    let path = configured_user_style_path()?;
+    clear_style_at(&path)
 }
 
 #[cfg(test)]
@@ -245,43 +251,17 @@ mod tests {
     /// a stringly-typed error) so callers can branch on
     /// [`std::io::ErrorKind`]. Regression guard for crosslink #492.
     ///
-    /// Pointing `.openclaudia/output-style.md` at an entry whose parent is a
-    /// regular file (not a directory) forces a deterministic `io::Error` on
-    /// `remove_file` that the typed variant must preserve through to the
-    /// caller, instead of being flattened to a `String`.
+    /// Removing a directory through the file API forces a deterministic I/O
+    /// error whose typed path must survive to the caller.
     #[test]
     fn clear_output_style_returns_typed_io_error_with_path() {
         use std::io::ErrorKind;
 
-        // Drive `clear_output_style` from a tempdir so we don't touch the
-        // user's real `.openclaudia/`. The function reads `.openclaudia/...`
-        // relative to the process cwd, so we chdir into the tempdir first.
-        let _cwd_lock = crate::tools::testutil::process_cwd_lock();
         let dir = tempfile::tempdir().expect("tempdir");
-        let prev_cwd = std::env::current_dir().expect("cwd");
-        // NOTE: process-wide cwd mutation. Hold the shared cwd lock so
-        // cwd-sensitive tests cannot initialize global path state from this
-        // tempdir while this test is running.
-        std::env::set_current_dir(dir.path()).expect("chdir");
-
-        // Create `.openclaudia` as a FILE (not a directory). Then the
-        // implementation's `path.exists()` returns false for the
-        // not-actually-present `output-style.md`, so we instead force a
-        // failure by making `.openclaudia/output-style.md` itself a
-        // permission-denied target: easiest cross-platform reproduction is
-        // to make the path resolve to a non-empty directory and call
-        // `remove_file` on it (returns `IsADirectory` or `PermissionDenied`
-        // depending on platform, both of which are `io::Error` variants).
-        let dot = dir.path().join(".openclaudia");
-        std::fs::create_dir_all(&dot).unwrap();
-        let target = dot.join("output-style.md");
+        let target = dir.path().join("output-style.md");
         std::fs::create_dir_all(&target).unwrap(); // make the leaf a dir!
 
-        let result = clear_output_style();
-
-        // Restore cwd before any assertion so a failure doesn't poison other
-        // tests sharing the process.
-        std::env::set_current_dir(prev_cwd).expect("restore cwd");
+        let result = clear_style_at(&target);
 
         let err = result.expect_err("removing a directory via remove_file must fail");
         // The typed variant — not a String — must come through.
@@ -304,5 +284,16 @@ mod tests {
             "FileError must carry the offending path, got: {}",
             err.path().display()
         );
+    }
+
+    #[test]
+    fn explicit_user_store_round_trips_without_project_discovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("home/.openclaudia/output-style.md");
+
+        save_style_at(&path, "  Be concise.  ").expect("save");
+        assert_eq!(read_style(&path).as_deref(), Some("Be concise."));
+        clear_style_at(&path).expect("clear");
+        assert!(read_style(&path).is_none());
     }
 }

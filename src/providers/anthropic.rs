@@ -159,7 +159,7 @@ impl AnthropicAdapter {
     /// silently dropped. Anthropic's API takes a single `system` field, so
     /// we now concatenate every system-role text with `\n\n` separators
     /// so callers that route multiple system blocks (e.g. injected prompt
-    /// plus project rules) see all of them. Non-text parts (e.g. `image_url`)
+    /// plus host-provided instructions) see all of them. Non-text parts (e.g. `image_url`)
     /// are still dropped but with a `warn!` so the dropping is visible.
     fn extract_system(messages: &[ChatMessage]) -> Option<String> {
         let mut pieces: Vec<String> = Vec::new();

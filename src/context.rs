@@ -91,8 +91,8 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
 ///
 /// # Threat model
 ///
-/// `ContextInjector` wraps hook output, rules-engine output, and other
-/// upstream-controlled text inside a literal `<system-reminder>…
+/// `ContextInjector` wraps hook output and other upstream-controlled text
+/// inside a literal `<system-reminder>…
 /// </system-reminder>` envelope and concatenates the result into the
 /// last user message. The model is instructed to treat the contents of
 /// that envelope as out-of-band guidance from the harness, not as
@@ -295,33 +295,6 @@ impl ContextInjector {
         }))
     }
 
-    /// Inject a system message at the beginning of the conversation
-    pub fn inject_system_prefix(request: &mut ChatCompletionRequest, content: &str) {
-        let reminder = wrap_system_reminder(content);
-
-        // Check if first message is already a system message
-        if let Some(first) = request.messages.first_mut() {
-            if first.role == "system" {
-                // Append to existing system message
-                Self::append_to_message(first, &reminder);
-                return;
-            }
-        }
-
-        // Insert new system message at the beginning
-        request.messages.insert(
-            0,
-            ChatMessage {
-                role: "system".to_string(),
-                content: MessageContent::Text(reminder),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                extra: std::collections::HashMap::new(),
-            },
-        );
-    }
-
     /// Inject a system message at the end of the conversation (before response)
     pub fn inject_system_suffix(request: &mut ChatCompletionRequest, content: &str) {
         let reminder = wrap_system_reminder(content);
@@ -360,7 +333,7 @@ impl ContextInjector {
         }
     }
 
-    /// Inject multiple context items from a rules engine or plugin
+    /// Inject multiple host-selected context items.
     pub fn inject_all(request: &mut ChatCompletionRequest, contexts: &[String]) {
         if contexts.is_empty() {
             return;
@@ -432,22 +405,6 @@ mod tests {
             assert!(text.contains("<system-reminder>"));
             assert!(text.contains("Remember to be concise."));
             assert!(text.contains("Use markdown formatting."));
-        } else {
-            panic!("Expected text content");
-        }
-    }
-
-    #[test]
-    fn test_inject_system_prefix() {
-        let mut request = create_test_request();
-        ContextInjector::inject_system_prefix(&mut request, "Security context here");
-
-        // Should append to existing system message
-        let system_msg = &request.messages[0];
-        if let MessageContent::Text(text) = &system_msg.content {
-            assert!(text.contains("You are a helpful assistant."));
-            assert!(text.contains("<system-reminder>"));
-            assert!(text.contains("Security context here"));
         } else {
             panic!("Expected text content");
         }
@@ -543,36 +500,6 @@ mod tests {
         // Should add a new system message at the end
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.messages[1].role, "system");
-    }
-
-    #[test]
-    fn test_inject_system_prefix_new_system() {
-        let mut request = ChatCompletionRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: MessageContent::Text("Hello".to_string()),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                extra: std::collections::HashMap::new(),
-            }],
-            temperature: None,
-            max_tokens: None,
-            stream: None,
-            tools: None,
-            tool_choice: None,
-            extra: std::collections::HashMap::new(),
-        };
-
-        ContextInjector::inject_system_prefix(&mut request, "Prefix content");
-
-        // Should insert new system message at the beginning
-        assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.messages[0].role, "system");
-        if let MessageContent::Text(text) = &request.messages[0].content {
-            assert!(text.contains("Prefix content"));
-        }
     }
 
     #[test]
@@ -1012,8 +939,8 @@ mod tests {
     // --- Regression tests for crosslink #502 ---
     //
     // These pin the prompt-injection defense in `xml_escape_for_prompt`
-    // and `wrap_system_reminder`. The threat model: untrusted hook /
-    // rules / tool output flows into a `<system-reminder>` envelope and
+    // and `wrap_system_reminder`. The threat model: untrusted hook or
+    // tool output flows into a `<system-reminder>` envelope and
     // then into the model's user message. Any way for the data to forge
     // a closing tag is a sandbox escape.
 

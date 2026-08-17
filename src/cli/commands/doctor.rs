@@ -4,7 +4,6 @@ use openclaudia::{
     pipeline,
     plugins::PluginManager,
     providers::{get_adapter, ProviderAdapter, ProviderError},
-    rules::RulesEngine,
     session::SessionManager,
 };
 use std::path::PathBuf;
@@ -291,25 +290,6 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
         println!("NOT FOUND");
     }
 
-    // Check for rules directory and load rules
-    print!("Rules directory... ");
-    if PathBuf::from(".openclaudia/rules").exists() {
-        println!("OK");
-        let rules_engine = RulesEngine::new(".openclaudia/rules");
-        let all_rules = rules_engine.all_rules();
-        if !all_rules.is_empty() {
-            println!("  Loaded rules: {}", all_rules.len());
-            for rule in all_rules {
-                println!("    - {} (languages: {:?})", rule.name, rule.languages);
-            }
-        }
-        let test_files = ["src/main.rs", "test.py"];
-        let matched = rules_engine.get_rules_for_files(&test_files);
-        println!("  Rules for test files: {} matched", matched.len());
-    } else {
-        println!("NOT FOUND");
-    }
-
     // Check plugins
     print!("\nPlugins... ");
     // crosslink #893: try_new surfaces missing-$HOME loudly in `doctor`
@@ -460,14 +440,6 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
     } else {
         println!("  No previous sessions");
     }
-
-    // Test rules reload and rules_dir
-    print!("\nRules engine... ");
-    let mut rules_engine = RulesEngine::new(".openclaudia/rules");
-    let rules_path = rules_engine.rules_dir().to_path_buf();
-    println!("path: {}", rules_path.display());
-    rules_engine.reload();
-    info!("Rules reloaded from {}", rules_path.display());
 
     // Test provider adapters and error variants
     print!("\nProvider adapters... ");

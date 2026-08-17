@@ -72,7 +72,7 @@ pub struct TurnMetrics {
     pub estimated_input_tokens: usize,
     /// Actual usage reported by the provider (if available)
     pub actual_usage: Option<TokenUsage>,
-    /// Tokens consumed by injected context (rules, hooks, session, MCP tools)
+    /// Tokens consumed by injected context (hooks, session, MCP tools, plugins)
     pub injected_context_tokens: usize,
     /// Tokens consumed by system prompt
     pub system_prompt_tokens: usize,

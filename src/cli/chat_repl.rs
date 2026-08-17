@@ -158,14 +158,12 @@ pub struct ChatRepl {
     // ── Configuration captured during setup ──
     config: config::AppConfig,
     coordinator: bool,
-    ext_regex: regex::Regex,
     // Crosslink #433: was `Box<dyn ProviderAdapter>`. Now `&'static dyn …`
     // — `get_adapter` returns a shared static singleton, so the REPL just
     // borrows it for the lifetime of the process. No allocation, no Drop.
     adapter: &'static dyn openclaudia::providers::ProviderAdapter,
     client: reqwest::Client,
     hook_engine: openclaudia::hooks::HookEngine,
-    rules_engine: openclaudia::rules::RulesEngine,
     api_key: Option<openclaudia::providers::ApiKey>,
     claude_code_token: Option<String>,
     permission_mgr: PermissionManager,
@@ -248,7 +246,6 @@ struct SseFrameCtx<'a> {
 
 /// Spinner template — uses indicatif placeholder syntax, not `format!`.
 const SPINNER_TMPL: &str = "{spinner:.cyan} {msg}";
-const EXTENSION_REGEX_PATTERN: &str = r"[\w/\\.-]+\.([a-zA-Z0-9]{1,10})\b";
 
 fn active_provider_for_turn(config: &config::AppConfig) -> Result<&config::ProviderConfig, String> {
     config.active_provider().ok_or_else(|| {
@@ -257,11 +254,6 @@ fn active_provider_for_turn(config: &config::AppConfig) -> Result<&config::Provi
             config.proxy.target
         )
     })
-}
-
-fn compile_extension_regex() -> Result<regex::Regex, String> {
-    regex::Regex::new(EXTENSION_REGEX_PATTERN)
-        .map_err(|err| format!("failed to compile file extension detector regex: {err}"))
 }
 
 fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
@@ -409,16 +401,7 @@ impl ChatRepl {
     /// same user-facing diagnostics as the default TUI path, so the process
     /// exits non-zero instead of making automation believe startup succeeded.
     pub async fn new(args: ChatReplArgs) -> anyhow::Result<Self> {
-        use openclaudia::rules::RulesEngine;
-
         chdir_to_git_root();
-        let ext_regex = match compile_extension_regex() {
-            Ok(regex) => regex,
-            Err(err) => {
-                eprintln!("{err}");
-                anyhow::bail!(err);
-            }
-        };
 
         let Some(config) = load_repl_config(
             args.model_override.as_deref(),
@@ -463,7 +446,6 @@ impl ChatRepl {
         };
         let client = reqwest::Client::new();
         let hook_engine = build_hook_engine(&config);
-        let rules_engine = RulesEngine::new(".openclaudia/rules");
         let plugin_manager = init_plugin_manager();
         let (rl, history_path) = init_rustyline_with_history()?;
 
@@ -493,11 +475,9 @@ impl ChatRepl {
         Ok(Self {
             config,
             coordinator: args.coordinator,
-            ext_regex,
             adapter,
             client,
             hook_engine,
-            rules_engine,
             api_key,
             claude_code_token,
             permission_mgr,
@@ -679,7 +659,6 @@ impl ChatRepl {
         self.current_task_obs = latest_user_message_content(&task_messages)
             .and_then(|content| observe_cli_user_task(&self.chat_session.id(), content));
 
-        self.inject_rules_from_extensions();
         let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
         self.install_system_prompt(&prompt_blocks);
         let request_state = self.chat_session.messages_snapshot();
@@ -1388,50 +1367,6 @@ impl ChatRepl {
             session::append_failed_turn_message(messages, reason);
         });
         persist_chat_session_update(&mut self.chat_session, "failed turn marker");
-    }
-
-    /// Extract file extensions from recent messages and inject combined
-    /// rules content (once per session) at the head of `messages`.
-    fn inject_rules_from_extensions(&self) {
-        let messages = self.chat_session.messages_snapshot();
-        let extensions: Vec<String> = messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-            .flat_map(|text| {
-                self.ext_regex
-                    .captures_iter(text)
-                    .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_lowercase()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        if extensions.is_empty() {
-            return;
-        }
-        let rules_content = self.rules_engine.get_combined_rules(
-            &extensions
-                .iter()
-                .map(std::string::String::as_str)
-                .collect::<Vec<_>>(),
-        );
-        if !rules_content.is_empty()
-            && !messages.iter().any(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("## Rules"))
-            })
-        {
-            self.chat_session.update_messages(|messages| {
-                messages.insert(
-                    0,
-                    serde_json::json!({
-                        "role": "system",
-                        "content": rules_content
-                    }),
-                );
-            });
-        }
     }
 
     /// Build Claudia's split system-prompt blocks for this turn
@@ -4783,18 +4718,5 @@ providers: {}
     fn rustyline_editor_mode_construction_is_fallible_not_panicking() {
         let _ = new_rustyline_editor(rustyline::EditMode::Emacs);
         let _ = new_rustyline_editor(rustyline::EditMode::Vi);
-    }
-
-    #[test]
-    fn extension_regex_construction_is_fallible_not_panicking() {
-        let regex = compile_extension_regex()
-            .expect("built-in file extension detector regex should compile");
-
-        let captures: Vec<_> = regex
-            .captures_iter("Review src/main.rs and crates/foo/lib.test.ts")
-            .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-            .collect();
-
-        assert_eq!(captures, ["rs", "ts"]);
     }
 }

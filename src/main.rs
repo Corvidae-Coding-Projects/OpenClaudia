@@ -603,7 +603,7 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
     .await
 }
 
-/// Build TUI system resources (memory, prompt, hooks, rules) and launch the app.
+/// Build TUI system resources (memory, prompt, hooks) and launch the app.
 ///
 /// Extracted from `cmd_tui` to keep that function under the line limit.
 struct TuiLaunchOptions<'a> {
@@ -623,7 +623,6 @@ struct TuiLaunchOptions<'a> {
 
 async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     use openclaudia::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
-    use openclaudia::rules::RulesEngine;
 
     let TuiLaunchOptions {
         config,
@@ -668,17 +667,6 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     openclaudia::proxy::connect_mcp_servers(&mcp_manager, &plugin_manager).await;
     let _ = openclaudia::mcp::install_manager(mcp_manager);
 
-    let rules_engine = RulesEngine::new(".openclaudia/rules");
-    let rules_content = {
-        let extensions: Vec<&str> = vec!["rs", "py", "ts", "js", "go", "java", "rb", "md"];
-        let content = rules_engine.get_combined_rules(&extensions);
-        if content.is_empty() {
-            None
-        } else {
-            Some(content)
-        }
-    };
-
     let policy_enforcer = std::sync::Arc::new(openclaudia::services::policy::PolicyEnforcer::new(
         config.policy.clone(),
     ));
@@ -701,7 +689,6 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         init_vdd_engine_if_enabled_with_auth(config, vdd_adversary_auth).map(std::sync::Arc::new);
     app.vdd_builder_auth = builder_vdd_auth;
     app.app_config = Some(std::sync::Arc::new(config.clone()));
-    app.rules_content = rules_content;
     app.apply_startup_resume(resume, session_id);
     app.set_permission_bypass(dangerously_skip_permissions);
     app.set_analytics_sink(std::sync::Arc::new(

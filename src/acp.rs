@@ -30,7 +30,6 @@ use crate::config::AppConfig;
 use crate::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
 use crate::permissions::{CheckResult, PermissionContext, PermissionManager};
 use crate::providers::get_adapter;
-use crate::rules::RulesEngine;
 use crate::session::{SessionManager, SessionMode};
 use crate::tools::args::ToolArgs as _;
 
@@ -107,10 +106,6 @@ pub struct AcpServer {
     /// [`Self::execute_tool_via_acp`] so `PreToolUse` / `PostToolUse`
     /// gates apply to the ACP path (crosslink #694).
     hook_engine: HookEngine,
-    /// Rules engine — consulted on every system-prompt build so
-    /// `.openclaudia/rules` content lands in the ACP model context
-    /// (crosslink #694).
-    rules_engine: RulesEngine,
     /// Active ACP session ID → `OpenClaudia` session ID mapping.
     /// Bounded to [`MAX_ACP_SESSIONS`] entries; oldest insertion is
     /// evicted when a new session would push the count over the cap
@@ -347,8 +342,8 @@ fn ide_context_for_prompt(state: &IdeState) -> Option<String> {
     Some(crate::context::wrap_system_reminder(&context))
 }
 
-fn build_acp_system_prompt(rules: Option<&str>, cwd: Option<&str>, ide_state: &IdeState) -> String {
-    let mut prompt = crate::prompt::build_system_prompt_with_cwd(None, rules, None, cwd);
+fn build_acp_system_prompt(cwd: Option<&str>, ide_state: &IdeState) -> String {
+    let mut prompt = crate::prompt::build_system_prompt_with_cwd(None, None, None, cwd);
     if let Some(ide_context) = ide_context_for_prompt(ide_state) {
         prompt.push_str("\n\n");
         prompt.push_str(&ide_context);
@@ -386,7 +381,7 @@ async fn pre_tool_use_gate(
 }
 
 /// Run the ACP dispatch through the same permission manager used by
-/// local tool execution, but project unmatched rules as a headless deny
+/// local tool execution, but project unmatched permission rules as a headless deny
 /// instead of an interactive prompt.
 fn acp_permission_gate(
     permission_mgr: &PermissionManager,
@@ -792,7 +787,6 @@ impl AcpServer {
         let claude_hooks = load_claude_code_hooks();
         let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
         let hook_engine = HookEngine::new(merged_hooks);
-        let rules_engine = RulesEngine::new(".openclaudia/rules");
         let permission_mgr = Arc::new(crate::permissions::PermissionManager::new(
             std::path::PathBuf::from(".openclaudia/permissions.json"),
             true,
@@ -806,7 +800,6 @@ impl AcpServer {
             config,
             session_manager: SessionManager::new(persist_dir),
             hook_engine,
-            rules_engine,
             session_map: HashMap::new(),
             session_order: VecDeque::new(),
             messages: Vec::new(),
@@ -1419,18 +1412,6 @@ impl AcpServer {
                         return self.fail_prompt_with_update(acp_session_id, &text);
                     }
                 };
-            // Crosslink #694: inject `.openclaudia/rules` content into the
-            // system prompt so the ACP path receives the same rules
-            // context the proxy path injects via `ContextInjector`. The
-            // rules engine is queried against extensions parsed out of
-            // every message in the turn buffer; an empty string is fine —
-            // `build_system_prompt` ignores it.
-            let rules_content = self.collect_rules_for_messages();
-            let rules_arg = if rules_content.is_empty() {
-                None
-            } else {
-                Some(rules_content.as_str())
-            };
             // crosslink #717: pass the working directory through so the
             // ACP-served prompt names the same cwd block the proxy path
             // injects. Skipping this dropped the `current working dir`
@@ -1442,8 +1423,7 @@ impl AcpServer {
                 .ok()
                 .map(|context| context.working_directory().to_string_lossy().into_owned());
             let ide_state = self.ide_state();
-            let system_prompt =
-                build_acp_system_prompt(rules_arg, cwd_string.as_deref(), &ide_state);
+            let system_prompt = build_acp_system_prompt(cwd_string.as_deref(), &ide_state);
 
             // Prepend system prompt to messages
             let mut all_messages: Vec<crate::proxy::ChatMessage> =
@@ -2121,43 +2101,6 @@ impl AcpServer {
                 }
             }
         }
-    }
-
-    /// Collect rule content for every file extension referenced by the
-    /// current message history.
-    ///
-    /// Mirrors `proxy.rs::prepare_request_context`'s rules injection so
-    /// the ACP path receives the same `.openclaudia/rules` context the
-    /// proxy path does (crosslink #694). Returns an empty string when
-    /// no extensions match a rule — callers can pass the result
-    /// straight to [`crate::prompt::build_system_prompt`] without a
-    /// branch.
-    fn collect_rules_for_messages(&self) -> String {
-        let mut extensions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let Ok(extension_pattern) = regex::Regex::new(r"[\w/\\.-]+\.([a-zA-Z0-9]{1,10})\b") else {
-            return String::new();
-        };
-        for msg in &self.messages {
-            let Some(content) = msg.get("content") else {
-                continue;
-            };
-            let text = match content {
-                Value::String(s) => s.clone(),
-                Value::Array(parts) => parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                _ => continue,
-            };
-            for cap in extension_pattern.captures_iter(&text) {
-                if let Some(ext) = cap.get(1) {
-                    extensions.insert(ext.as_str().to_lowercase());
-                }
-            }
-        }
-        let ext_refs: Vec<&str> = extensions.iter().map(String::as_str).collect();
-        self.rules_engine.get_combined_rules(&ext_refs)
     }
 
     // -- Locally confined file operations --
@@ -3685,7 +3628,6 @@ mod session_mode_tests {
     use crate::config::{AppConfig, HooksConfig};
     use crate::hooks::HookEngine;
     use crate::permissions::PermissionManager;
-    use crate::rules::RulesEngine;
     use crate::session::{SessionManager, SessionMode};
     use serde_json::{json, Value};
     use std::collections::{HashMap, VecDeque};
@@ -3719,7 +3661,6 @@ providers:
             config: test_config(),
             session_manager: SessionManager::new(tmp.path().join("sessions")),
             hook_engine: HookEngine::new(HooksConfig::default()),
-            rules_engine: RulesEngine::new(tmp.path().join("rules")),
             session_map: HashMap::new(),
             session_order: VecDeque::new(),
             messages: Vec::new(),
@@ -4020,7 +3961,7 @@ providers:
                 "end": {"line": 4, "character": 16}
             }
         }));
-        let prompt = build_acp_system_prompt(None, Some("."), &server.ide_state());
+        let prompt = build_acp_system_prompt(Some("."), &server.ide_state());
         assert!(prompt.contains("Selection: src/lib.rs:4 (1 line(s))"));
         assert!(prompt.contains("fn selected() {}"));
 

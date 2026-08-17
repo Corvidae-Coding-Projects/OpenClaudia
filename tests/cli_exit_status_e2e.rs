@@ -2703,17 +2703,16 @@ fn init_refuses_overwrite_unless_force_and_creates_documented_tree() {
     );
 
     let config_dir = cwd.path().join(".openclaudia");
-    for path in [
-        "config.yaml",
-        "hooks/session-start.py",
-        "rules/global.md",
-        "plugins",
-    ] {
+    for path in ["config.yaml", "hooks/session-start.py", "plugins"] {
         assert!(
             config_dir.join(path).exists(),
             "init should create documented path .openclaudia/{path}"
         );
     }
+    assert!(
+        !config_dir.join("rules").exists(),
+        "init must not recreate the removed repository rule-injector path"
+    );
 
     fs::write(config_dir.join("config.yaml"), "sentinel: true\n").expect("replace config");
     let output = isolated_command(&cwd, &home)
