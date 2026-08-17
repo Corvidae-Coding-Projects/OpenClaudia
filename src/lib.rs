@@ -44,6 +44,7 @@ pub mod plugins;
 pub mod prompt;
 pub mod providers;
 pub mod proxy;
+pub mod runtime;
 pub mod services;
 pub mod session;
 pub mod skills;
