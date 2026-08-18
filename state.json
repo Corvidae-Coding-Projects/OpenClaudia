@@ -1,6 +1,6 @@
 {
   "next_display_id": 1006,
-  "next_comment_id": 691,
+  "next_comment_id": 692,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -12917,7 +12917,7 @@
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-18T22:08:13.492515592Z",
-      "updated_at": "2026-08-18T22:25:32.586141427Z",
+      "updated_at": "2026-08-18T22:54:33.510318884Z",
       "labels": [
         "remediation"
       ],
@@ -12930,6 +12930,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAK8ypQ0+glEL84NErHtH5H5d6pXVim0WgbO8Jf9G6rLN1jgsjQLVICij37tg4/QsewoEiGY4Iu8E4gxyZZ6clAg=="
+        },
+        "352709bd-2b35-4855-ac7a-019d00df9cd9": {
+          "display_id": 691,
+          "author": "6Vw9",
+          "content": "Deterministic gates all pass:\n- cargo fmt --all -- --check: PASS\n- git diff --check: PASS\n- cargo clippy --workspace --all-targets --all-features -D warnings (only the pre-existing AppEvent large_enum_variant waiver): PASS\n- cargo test --test mandatory_tool_effect_classification_e2e: 20/20 PASS\n- cargo test --workspace --all-features --test-threads=1: 7689 passed, 0 failed\n\nChange set: src/tools/effect.rs (new), tests/mandatory_tool_effect_classification_e2e.rs (new), src/tools/registry.rs, src/tools/crosslink.rs, src/tools/worktree.rs, src/tools/mod.rs, src/permissions.rs, plus 5 test files updated for the new contract.\n\nOut-of-scope repair required to get the suite green: crosslink init had re-activated .crosslink/integrations/hooks/prompt-guard.py (UserPromptSubmit + SubagentStart) and pre-web-check.py in .claude/settings.json, plus a .crosslink/rules.local/ gitignore line. prompt-guard.py reads .crosslink/rules/*.md and emits them as prompt context - the filesystem Markdown rule injector S-007 removed and CLAUDE.md forbids. tests/legacy_rule_injector_removed_e2e.rs was failing because of it. Removed those entries.\n\nAdversarial Opus subagent review now running.",
+          "created_at": "2026-08-18T22:54:33.497115104Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA78DLTDtaRG6BNeYbDRyQKKcIgOSy7vfzBb07V4jdJ0PUpJVwMuRyrQxi+D95mEnFd0YLOsXJ3jOfwhZjWbB2AA=="
         },
         "550d16ad-e07c-4fdb-8872-4dac72d7ae71": {
           "display_id": 690,
@@ -21695,11 +21704,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 11,
       "timestamp": "2026-08-18T22:25:32.586141427Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 12,
+      "timestamp": "2026-08-18T22:54:33.510318884Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-18T22:25:32.586141427Z",
+    "timestamp": "2026-08-18T22:54:33.510318884Z",
     "agent_id": "6Vw9",
-    "agent_seq": 11
+    "agent_seq": 12
   }
 }
