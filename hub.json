@@ -2,6 +2,7 @@
   "hub_version": 3,
   "migrated_from_commit": "b7a5e2b7da2e054b2f078d4ea9f8066609abab8e",
   "migrated_at": "2026-08-18T22:01:38.638847795Z",
+  "finalized_at": "2026-08-18T22:07:08.751291134Z",
   "genesis_checkpoint_commit": "d3207cba9fa0bd1ec0a25f26fa9757e5c1534142",
   "seed_agent_tips": {
     "lOrm": "19d374e074d3d57c56eabbdec00480e250c7f4f3"
