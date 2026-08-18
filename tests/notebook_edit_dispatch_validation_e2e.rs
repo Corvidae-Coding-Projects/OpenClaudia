@@ -25,6 +25,7 @@ fn dispatch_notebook(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("notebook_edit", args, &mut ctx)
         .expect("notebook_edit must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

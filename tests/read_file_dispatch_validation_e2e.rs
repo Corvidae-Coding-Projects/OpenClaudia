@@ -27,6 +27,7 @@ fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("read_file", args, &mut ctx)
         .expect("read_file must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

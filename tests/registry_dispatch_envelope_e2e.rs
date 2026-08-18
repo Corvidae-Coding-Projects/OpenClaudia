@@ -96,7 +96,8 @@ fn dispatch_known_tool_with_missing_required_args_returns_some_error_tuple() {
     let mut c = ctx();
     let (msg, is_err) = registry()
         .dispatch("bash", &HashMap::new(), &mut c)
-        .expect("Some on known tool");
+        .expect("Some on known tool")
+        .into_legacy();
     assert!(is_err, "missing required args MUST set is_err");
     assert!(!msg.is_empty(), "error tuple MUST carry a message");
 }
@@ -113,7 +114,8 @@ fn dispatch_tuple_first_element_is_always_a_string() {
     let mut c = ctx();
     let (msg, _) = registry()
         .dispatch("list_files", &HashMap::new(), &mut c)
-        .expect("Some");
+        .expect("Some")
+        .into_legacy();
     let _: String = msg;
 }
 
@@ -168,7 +170,8 @@ fn dispatch_tuple_message_non_empty_for_every_known_tool_with_empty_args() {
     for tool in known {
         let (msg, _) = registry()
             .dispatch(tool, &HashMap::new(), &mut c)
-            .unwrap_or_else(|| panic!("dispatch({tool}) MUST return Some"));
+            .unwrap_or_else(|| panic!("dispatch({tool}) MUST return Some"))
+            .into_legacy();
         assert!(
             !msg.is_empty(),
             "{tool}: empty-args dispatch MUST return non-empty message"
@@ -248,7 +251,8 @@ fn dispatch_repeated_with_same_args_returns_consistent_envelope_shape() {
     for _ in 0..5 {
         let (msg, is_err) = registry()
             .dispatch("list_files", &args, &mut c)
-            .expect("Some");
+            .expect("Some")
+            .into_legacy();
         shapes.push((msg, is_err));
     }
     // All 5 calls produced the same envelope.
@@ -299,6 +303,7 @@ fn dispatching_to_kill_shell_does_not_actually_kill_anything_with_unknown_id() {
             .collect();
     let (_msg, is_err) = registry()
         .dispatch("kill_shell", &args, &mut c)
-        .expect("Some");
+        .expect("Some")
+        .into_legacy();
     assert!(is_err, "kill_shell with unknown id MUST report error");
 }

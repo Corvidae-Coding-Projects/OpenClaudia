@@ -44,6 +44,7 @@ fn dispatch_skill(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("skill", args, &mut ctx)
         .expect("skill must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

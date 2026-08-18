@@ -34,6 +34,7 @@ fn execute_web_fetch(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("web_fetch", args, &mut ctx)
         .expect("web_fetch must be registered")
+        .into_legacy()
 }
 
 #[cfg(feature = "browser")]
@@ -47,6 +48,7 @@ fn execute_web_browser(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("web_browser", args, &mut ctx)
         .expect("web_browser must be registered")
+        .into_legacy()
 }
 
 // ───────────────────────────────────────────────────────────────────────────

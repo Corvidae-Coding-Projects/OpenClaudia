@@ -24,7 +24,7 @@ use crate::cli::display::tool_result::display_tool_result;
 use crate::cli::repl::input::expand_file_references;
 use crate::cli::repl::keybindings::{display_keybindings, execute_key_action, key_event_to_string};
 use crate::cli::repl::permissions::execute_shell_command_with_permission;
-use crate::cli::repl::plan_mode::{check_plan_mode_restriction, process_tool_result_marker};
+use crate::cli::repl::plan_mode::{check_plan_mode_restriction, process_tool_follow_up};
 use crate::cli::repl::session_io::{
     compact_chat_session_with_instructions, estimate_session_tokens, export_chat_session,
     save_session_to_short_term_memory,
@@ -55,7 +55,7 @@ use openclaudia::tools::safe_truncate;
 use openclaudia::{
     config, guardrails, memory,
     permissions::{allowed_tool_specs_to_permission_rules, PermissionManager, PermissionRule},
-    plugins, prompt, proxy, session, tool_intercept, tools, tui, vdd,
+    plugins, prompt, proxy, session, tools, tui, vdd,
 };
 use rustyline::error::ReadlineError;
 
@@ -88,15 +88,34 @@ fn observe_cli_model_visible_tool_result(
     content: &str,
     is_error: bool,
 ) {
-    let result = tools::ToolResult {
-        tool_call_id: tool_call_id.to_string(),
-        content: content.to_string(),
-        is_error,
-    };
+    let mut bound_call = tool_call.clone();
+    bound_call.id = tool_call_id.to_string();
+    let result = tools::ToolResult::bind(
+        &bound_call,
+        &tool_call.function.name,
+        tools::ToolHandlerResult::legacy(content.to_string(), is_error),
+    );
     openclaudia::grounded_loop::observe_tool_result_for_session(
         session_id,
         &tool_call.function.name,
         &result,
+    );
+}
+
+fn push_observed_cli_typed_tool_result_message(
+    session: &mut Session,
+    tool_call: &tools::ToolCall,
+    result: &tools::ToolResult,
+) {
+    openclaudia::grounded_loop::observe_tool_result_for_session(
+        &session.id(),
+        &tool_call.function.name,
+        result,
+    );
+    push_chat_session_message_and_persist(
+        session,
+        result.openai_message(),
+        "typed CLI tool result",
     );
 }
 
@@ -1302,10 +1321,13 @@ impl ChatRepl {
         tool_policy
             .check_tool(&tool_call.function.name)
             .err()
-            .map(|err| tools::ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!("Blocked by policy: {err}"),
-                is_error: true,
+            .map(|err| {
+                tools::ToolResult::failure(
+                    tool_call,
+                    tools::ToolFailureCode::PolicyDenied,
+                    format!("Blocked by policy: {err}"),
+                    tools::ToolRetryability::Never,
+                )
             })
     }
 
@@ -1322,7 +1344,7 @@ impl ChatRepl {
         )
         .await
         .err()
-        .map(|blocked| blocked.into_tool_result(tool_call.id.clone()))
+        .map(|blocked| blocked.into_tool_result(tool_call))
     }
 
     fn final_response_allowed(&self, content: &str, cancelled: bool) -> bool {
@@ -1881,24 +1903,12 @@ impl ChatRepl {
             .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
             .await
         {
-            push_observed_cli_tool_result_message(
-                &mut self.chat_session,
-                tool_call,
-                &result.tool_call_id,
-                &result.content,
-                true,
-            );
-            return Err(gemini_tool_error_response(tool_call, &result.content));
+            push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
+            return Err(gemini_tool_error_response(tool_call, result.content()));
         }
         if let Some(result) = self.policy_denied_tool_result(tool_call) {
-            push_observed_cli_tool_result_message(
-                &mut self.chat_session,
-                tool_call,
-                &result.tool_call_id,
-                &result.content,
-                true,
-            );
-            return Err(gemini_tool_error_response(tool_call, &result.content));
+            push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
+            return Err(gemini_tool_error_response(tool_call, result.content()));
         }
         let result = if self.chat_session.permission_bypass_enabled() {
             check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
@@ -1969,12 +1979,9 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         result: &tools::ToolResult,
     ) -> serde_json::Value {
-        let (final_content, was_marker) = process_tool_result_marker(
-            &self.chat_session,
-            &tool_call.function.name,
-            &result.content,
-        );
-        let final_is_error = if was_marker { false } else { result.is_error };
+        let final_result = process_tool_follow_up(&self.chat_session, result);
+        let final_content = final_result.content();
+        let final_is_error = final_result.is_error();
         let tool_input = parse_tool_args(&tool_call.function).unwrap_or_else(
             |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
         );
@@ -1983,46 +1990,24 @@ impl ChatRepl {
             !final_is_error,
             &tool_call.function.name,
             tool_input,
-            &final_content,
+            final_content,
             Some(&self.chat_session.id()),
         )
         .await;
-        display_tool_result(&tool_call.function.name, &final_content, final_is_error);
-        push_observed_cli_tool_result_message(
+        display_tool_result(&final_result);
+        push_observed_cli_typed_tool_result_message(
             &mut self.chat_session,
             tool_call,
-            &result.tool_call_id,
-            &final_content,
-            final_is_error,
+            &final_result,
         );
 
-        let response_content = if final_is_error {
-            serde_json::json!({"error": final_content})
-        } else {
-            serde_json::json!({"result": final_content})
-        };
         let response = serde_json::json!({
             "functionResponse": {
+                "id": final_result.tool_call_id(),
                 "name": tool_call.function.name,
-                "response": response_content
+                "response": final_result.model_payload()
             }
         });
-
-        let result_content = if final_is_error {
-            format!("[ERROR] {final_content}")
-        } else {
-            final_content
-        };
-        push_chat_session_message_and_persist(
-            &mut self.chat_session,
-            serde_json::json!({
-                "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "content": result_content,
-                "is_error": final_is_error
-            }),
-            "gemini tool result",
-        );
         response
     }
 
@@ -2251,9 +2236,8 @@ impl ChatRepl {
         );
     }
 
-    /// Pick between the structured Anthropic `tool_use` loop and the
-    /// XML-intercept fallback, then run VDD review and emit the trailing
-    /// newline. Returns nothing — callers always continue the REPL.
+    /// Run Anthropic's native `tool_use` loop, then VDD review and the
+    /// trailing newline. Ordinary assistant text is never scanned for calls.
     async fn dispatch_anthropic_tool_path(
         &mut self,
         anthropic_accumulator: &mut tools::AnthropicToolAccumulator,
@@ -2263,9 +2247,8 @@ impl ChatRepl {
         memory_db: Option<&memory::MemoryDb>,
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
-        let handled_structured = anthropic_accumulator.has_tool_use();
-        let final_content = if handled_structured {
-            self.run_anthropic_structured_tool_loop(
+        let final_content = self
+            .run_anthropic_structured_tool_loop(
                 anthropic_accumulator,
                 full_content,
                 transport,
@@ -2273,11 +2256,7 @@ impl ChatRepl {
                 memory_db,
                 auto_learner,
             )
-            .await
-        } else {
-            self.run_xml_intercept_tool_loop(full_content, transport, prompt_blocks, memory_db)
-                .await
-        };
+            .await;
         if let Some(ref engine) = self.vdd_engine {
             if final_content.trim().is_empty() {
                 println!();
@@ -2662,12 +2641,9 @@ impl ChatRepl {
             permission_already_checked,
         );
 
-        let (final_content, was_marker) = process_tool_result_marker(
-            &self.chat_session,
-            &tool_call.function.name,
-            &result.content,
-        );
-        let final_is_error = if was_marker { false } else { result.is_error };
+        let final_result = process_tool_follow_up(&self.chat_session, &result);
+        let final_content = final_result.content();
+        let final_is_error = final_result.is_error();
 
         if let Err(e) = self.audit_logger.log_security(
             "tool_result",
@@ -2688,17 +2664,15 @@ impl ChatRepl {
             !final_is_error,
             &tool_call.function.name,
             tool_input,
-            &final_content,
+            final_content,
             Some(&self.chat_session.id()),
         )
         .await;
-        display_tool_result(&tool_call.function.name, &final_content, final_is_error);
-        push_observed_cli_tool_result_message(
+        display_tool_result(&final_result);
+        push_observed_cli_typed_tool_result_message(
             &mut self.chat_session,
             tool_call,
-            &result.tool_call_id,
-            &final_content,
-            final_is_error,
+            &final_result,
         );
     }
 
@@ -2747,23 +2721,11 @@ impl ChatRepl {
             .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
             .await
         {
-            push_observed_cli_tool_result_message(
-                &mut self.chat_session,
-                tool_call,
-                &result.tool_call_id,
-                &result.content,
-                true,
-            );
+            push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
             return None;
         }
         if let Some(result) = self.policy_denied_tool_result(tool_call) {
-            push_observed_cli_tool_result_message(
-                &mut self.chat_session,
-                tool_call,
-                &result.tool_call_id,
-                &result.content,
-                true,
-            );
+            push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
             return None;
         }
         let result = if self.chat_session.permission_bypass_enabled() {
@@ -2911,290 +2873,6 @@ impl ChatRepl {
             Err(e) => {
                 eprintln!("\nFollow-up request error: {e}");
                 false
-            }
-        }
-    }
-
-    /// Text-based XML tool interception fallback for Anthropic.
-    async fn run_xml_intercept_tool_loop(
-        &mut self,
-        mut full_content: String,
-        transport: TurnTransport<'_>,
-        prompt_blocks: &prompt::SystemPromptBlocks,
-        memory_db: Option<&memory::MemoryDb>,
-    ) -> String {
-        let mut tool_interceptor = tool_intercept::ToolInterceptor::new();
-        tool_interceptor.push(&full_content);
-
-        let max_proxy_iterations = self.config.session.max_turns;
-        let mut proxy_iteration: u32 = 0;
-        let mut executed_tool_signatures: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        while tool_interceptor.has_complete_block()
-            && (max_proxy_iterations == 0 || proxy_iteration < max_proxy_iterations)
-        {
-            proxy_iteration += 1;
-            let (all_tools, text_parts) = tool_interceptor.extract_all_tool_calls();
-            if all_tools.is_empty() {
-                break;
-            }
-
-            if Self::xml_loop_should_break_on_duplicates(
-                &all_tools,
-                &mut executed_tool_signatures,
-                proxy_iteration,
-            ) {
-                break;
-            }
-
-            self.push_xml_assistant_text(&text_parts);
-            let surviving_tools = self.filter_xml_plan_blocked_tools(all_tools);
-            self.send_xml_tool_results(&surviving_tools, memory_db);
-
-            let followup_req = match self.build_xml_followup_request(prompt_blocks) {
-                Ok(req) => req,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to build XML follow-up request");
-                    eprintln!("\n\x1b[31mRequest build error: {e}\x1b[0m");
-                    break;
-                }
-            };
-            if !self.followup_request_policy_allows("anthropic XML follow-up") {
-                break;
-            }
-            let next = self.send_xml_followup_stream(followup_req, transport).await;
-            match next {
-                Some(content) => {
-                    tool_interceptor.clear();
-                    tool_interceptor.push(&content);
-                    full_content = content;
-                }
-                None => break,
-            }
-        }
-
-        if max_proxy_iterations > 0
-            && proxy_iteration >= max_proxy_iterations
-            && tool_interceptor.has_complete_block()
-        {
-            // #601 — structured `error_max_turns` for the XML-intercept path.
-            let _ = emit_max_turns_event(
-                &self.chat_session.id(),
-                "anthropic_xml_intercept",
-                max_proxy_iterations,
-                proxy_iteration,
-            );
-            eprintln!(
-                "\n\x1b[33m⚠ Reached max_turns limit ({max_proxy_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
-            );
-        }
-        if !full_content.trim().is_empty() && !tool_interceptor.has_pending_tool_calls() {
-            if !self.final_response_allowed(full_content.trim(), false) {
-                return String::new();
-            }
-            push_chat_session_message_and_persist(
-                &mut self.chat_session,
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": full_content.trim()
-                }),
-                "anthropic XML final assistant response",
-            );
-        }
-        full_content
-    }
-
-    /// Insert each tool's signature; return `true` when every signature
-    /// was already present AND this isn't the first iteration (so the
-    /// loop should break on duplicates).
-    fn xml_loop_should_break_on_duplicates(
-        all_tools: &[tool_intercept::InterceptedToolCall],
-        executed_tool_signatures: &mut std::collections::HashSet<String>,
-        proxy_iteration: u32,
-    ) -> bool {
-        let mut all_duplicates = true;
-        for tool in all_tools {
-            let params_str: String = tool
-                .parameters
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sig = format!("{}:{}", tool.name, params_str);
-            if executed_tool_signatures.insert(sig) {
-                all_duplicates = false;
-            }
-        }
-        if all_duplicates && proxy_iteration > 1 {
-            eprintln!("\n\x1b[33m⚠ Detected duplicate tool calls - breaking loop\x1b[0m");
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Push any pre-tool prose extracted by the interceptor as a single
-    /// assistant message (skip if empty).
-    fn push_xml_assistant_text(&mut self, text_parts: &[String]) {
-        let combined_text = text_parts.join("\n\n");
-        if !combined_text.is_empty() {
-            push_chat_session_message_and_persist(
-                &mut self.chat_session,
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": combined_text
-                }),
-                "anthropic XML assistant text",
-            );
-        }
-    }
-
-    /// Strip out tools blocked by plan mode (and push the user-visible
-    /// error message for each), returning the survivors.
-    fn filter_xml_plan_blocked_tools(
-        &mut self,
-        all_tools: Vec<tool_intercept::InterceptedToolCall>,
-    ) -> Vec<tool_intercept::InterceptedToolCall> {
-        all_tools
-            .into_iter()
-            .filter(|tool| {
-                let args_json = serde_json::to_string(
-                    &tool
-                        .parameters
-                        .iter()
-                        .collect::<std::collections::HashMap<_, _>>(),
-                )
-                .unwrap_or_default();
-                if let Some(block_msg) =
-                    check_plan_mode_restriction(&self.chat_session, &tool.name, &args_json)
-                {
-                    println!("\n\x1b[33m⚠ Blocked in plan mode: {}\x1b[0m", tool.name);
-                    push_chat_session_message_and_persist(
-                        &mut self.chat_session,
-                        serde_json::json!({
-                            "role": "user",
-                            "content": format!("[ERROR] {}", block_msg)
-                        }),
-                        "anthropic XML plan-mode block",
-                    );
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect()
-    }
-
-    /// Execute the surviving XML tools, append the formatted XML
-    /// results as a user message, and print the "sending N results"
-    /// banner.
-    fn send_xml_tool_results(
-        &mut self,
-        all_tools: &[tool_intercept::InterceptedToolCall],
-        memory_db: Option<&memory::MemoryDb>,
-    ) {
-        let results = tool_intercept::execute_intercepted_tools_for_session(
-            all_tools,
-            memory_db,
-            Some(&self.permission_mgr),
-            Some(&self.chat_session.id()),
-            Some(self.policy_enforcer.as_ref()),
-        );
-        let results_xml = tool_intercept::format_execution_results_xml(&results);
-        push_chat_session_message_and_persist(
-            &mut self.chat_session,
-            serde_json::json!({
-                "role": "user",
-                "content": results_xml
-            }),
-            "anthropic XML tool results",
-        );
-        println!(
-            "\n\x1b[90m(Sending {} tool result{} to Claude...)\x1b[0m",
-            results.len(),
-            if results.len() == 1 { "" } else { "s" }
-        );
-    }
-
-    fn build_xml_followup_request(
-        &self,
-        prompt_blocks: &prompt::SystemPromptBlocks,
-    ) -> Result<serde_json::Value, String> {
-        let request_messages =
-            prompt_blocks.prepare_json_messages(&self.request_messages_with_grounding()?);
-        let anthropic_messages =
-            convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
-        let mut followup_req = serde_json::json!({
-            "model": self.model,
-            "messages": anthropic_messages,
-            "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
-            "stream": true
-        });
-        followup_req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
-        if self.claude_code_token.is_some() {
-            openclaudia::claude_credentials::inject_oauth_prefix_only(&mut followup_req);
-        }
-        Ok(followup_req)
-    }
-
-    async fn send_xml_followup_stream(
-        &self,
-        followup_req: serde_json::Value,
-        transport: TurnTransport<'_>,
-    ) -> Option<String> {
-        use futures::StreamExt;
-        use std::io::Write;
-
-        let mut req = self.client.post(transport.endpoint).json(&followup_req);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
-        match req.send().await {
-            Ok(response) if response.status().is_success() => {
-                let mut stream = response.bytes_stream().eventsource();
-                let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
-                let mut followup_content = String::new();
-                loop {
-                    let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
-                        Ok(Some(Ok(sse))) => sse,
-                        Ok(Some(Err(e))) => {
-                            eprintln!("\nStream error: {e}");
-                            break;
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-                            Self::handle_stream_timeout(&followup_content);
-                            break;
-                        }
-                    };
-                    if sse.data == "[DONE]" {
-                        break;
-                    }
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse.data) {
-                        if json.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
-                        {
-                            if let Some(text) = json
-                                .get("delta")
-                                .and_then(|d| d.get("text"))
-                                .and_then(|t| t.as_str())
-                            {
-                                print!("{text}");
-                                std::io::stdout().flush().ok();
-                                followup_content.push_str(text);
-                            }
-                        }
-                    }
-                }
-                Some(followup_content)
-            }
-            Ok(response) => {
-                eprintln!("\nFollow-up request failed: {}", response.status());
-                None
-            }
-            Err(e) => {
-                eprintln!("\nFollow-up request error: {e}");
-                None
             }
         }
     }
@@ -3557,12 +3235,9 @@ impl ChatRepl {
             permission_already_checked,
         );
 
-        let (final_content, was_marker) = process_tool_result_marker(
-            &self.chat_session,
-            &tool_call.function.name,
-            &result.content,
-        );
-        let final_is_error = if was_marker { false } else { result.is_error };
+        let final_result = process_tool_follow_up(&self.chat_session, &result);
+        let final_content = final_result.content();
+        let final_is_error = final_result.is_error();
 
         Self::log_openai_activity(
             memory_db,
@@ -3578,17 +3253,15 @@ impl ChatRepl {
             !final_is_error,
             &tool_call.function.name,
             tool_input,
-            &final_content,
+            final_content,
             Some(&self.chat_session.id()),
         )
         .await;
-        display_tool_result(&tool_call.function.name, &final_content, final_is_error);
-        push_observed_cli_tool_result_message(
+        display_tool_result(&final_result);
+        push_observed_cli_typed_tool_result_message(
             &mut self.chat_session,
             tool_call,
-            &result.tool_call_id,
-            &final_content,
-            final_is_error,
+            &final_result,
         );
     }
 
@@ -3723,10 +3396,10 @@ impl ChatRepl {
         if let Some(ref mut learner) = auto_learner {
             let args: serde_json::Value =
                 serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
-            if result.is_error {
-                learner.on_tool_failure(&tool_call.function.name, &args, &result.content);
+            if result.is_error() {
+                learner.on_tool_failure(&tool_call.function.name, &args, result.content());
             } else {
-                learner.on_tool_success(&tool_call.function.name, &args, &result.content);
+                learner.on_tool_success(&tool_call.function.name, &args, result.content());
             }
         }
     }

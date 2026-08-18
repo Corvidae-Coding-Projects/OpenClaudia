@@ -27,6 +27,7 @@ fn dispatch_ask_user(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("ask_user_question", args, &mut ctx)
         .expect("ask_user_question must be registered")
+        .into_legacy()
 }
 
 fn args_with_questions(questions: Value) -> HashMap<String, Value> {

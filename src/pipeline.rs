@@ -2354,9 +2354,9 @@ struct SingleToolExecution<'a> {
 }
 
 /// Execute one tool call on a blocking thread, fire `PostToolUse` hooks, and
-/// return the JSON result to append to conversation history.
+/// return the canonical typed result for provider projection.
 /// Returns `None` when the event channel is broken (caller should `break`).
-async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
+async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolResult> {
     let SingleToolExecution {
         tool_call,
         memory_db,
@@ -2370,6 +2370,7 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
     } = p;
     let tool_name = &tool_call.function.name;
     let tool_call_clone = tool_call.clone();
+    let panic_tool_call = tool_call.clone();
     let mem_db = memory_db;
     let app_config_for_blocking = app_config;
     let perm_mgr = permission.mgr;
@@ -2400,16 +2401,19 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
         )
     })
     .await
-    .unwrap_or_else(|e| tools::ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content: format!("Tool execution panicked: {e}"),
-        is_error: true,
+    .unwrap_or_else(|e| {
+        tools::ToolResult::failure(
+            &panic_tool_call,
+            tools::ToolFailureCode::Internal,
+            format!("Tool execution panicked: {e}"),
+            tools::ToolRetryability::Never,
+        )
     });
     if tx
         .send(AppEvent::ToolDone {
             name: tool_name.clone(),
-            success: !result.is_error,
-            content: result.content.clone(),
+            success: !result.is_error(),
+            content: result.content().to_string(),
         })
         .is_err()
     {
@@ -2418,22 +2422,15 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
     if let Some((engine, tool_input)) = hook_context {
         crate::services::tool_executor::ToolExecutor::fire_post_tool(
             engine,
-            !result.is_error,
+            !result.is_error(),
             tool_name,
             tool_input,
-            &result.content,
+            result.content(),
             session_id,
         )
         .await;
     }
-    let result_content = if result.is_error {
-        format!("[ERROR] {}", result.content)
-    } else {
-        result.content
-    };
-    Some(
-        serde_json::json!({ "role": "tool", "tool_call_id": result.tool_call_id, "content": result_content, "is_error": result.is_error }),
-    )
+    Some(result)
 }
 
 /// Build a human-readable one-line description of what a tool call will do.
@@ -2826,15 +2823,12 @@ async fn execute_tool_calls_for_tui(
         .await;
         match tool_result {
             None => break, // channel broken
-            Some(mut result_json) => {
-                // ask_user_question bridge — see `intercept_user_question`.
-                // Returns `Err(())` only when the AppEvent channel is dead,
-                // matching the existing break-on-broken-channel semantics.
-                if intercept_user_question(&mut result_json, tx).await.is_err() {
+            Some(mut result) => {
+                if resolve_tui_follow_up(&mut result, tx).await.is_err() {
                     break;
                 }
-                observe_tool_result_json(session_id, tool_name, &result_json);
-                results.push(result_json);
+                observe_tool_result(session_id, tool_name, &result);
+                results.push(result.openai_message());
             }
         }
     }
@@ -2848,65 +2842,71 @@ fn observe_tool_result_json(session_id: Option<&str>, tool_name: &str, result_js
     let Some(session_id) = session_id else {
         return;
     };
-    let result = tools::ToolResult {
-        tool_call_id: result_json
+    let tool_call = ToolCall {
+        id: result_json
             .get("tool_call_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        content: result_json
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        is_error: result_json
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let result = tools::ToolResult::bind(
+        &tool_call,
+        tool_name,
+        tools::ToolHandlerResult::legacy(
+            result_json
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            result_json
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    observe_tool_result(Some(session_id), tool_name, &result);
+}
+
+fn observe_tool_result(session_id: Option<&str>, tool_name: &str, result: &tools::ToolResult) {
+    let Some(session_id) = session_id else {
+        return;
     };
     crate::services::tool_executor::ToolExecutor::observe_tool_result(
         Some(session_id),
         tool_name,
-        &result,
+        result,
     );
 }
 
-/// Bridge the sync `ask_user_question` tool's `USER_QUESTION_MARKER`
-/// payload onto the full-screen TUI's modal flow.
-///
-/// The sync tool returns a JSON object of shape `{"type":
-/// "user_question", "questions": [...]}` as the tool-result content.
-/// The REPL intercepts that via `process_tool_result_marker` and
-/// blocks on stdin (`handle_user_questions`). Under the full-screen
-/// TUI we route the question set to a modal via `AppEvent::
-/// UserQuestion`, park on a oneshot for the answer JSON, and
-/// rewrite `result_json["content"]` so the model only ever sees
-/// the user's answers — never the raw marker.
-///
-/// Returns `Err(())` only when the `AppEvent` channel is dead
-/// (TUI shut down mid-turn). Tool-result payloads that aren't a
-/// `user_question` marker are returned unchanged and `Ok(())`.
-async fn intercept_user_question(
-    result_json: &mut Value,
+/// Resolve a trusted typed follow-up through the full-screen TUI. Ordinary
+/// tool text is never inspected for control state.
+async fn resolve_tui_follow_up(
+    result: &mut tools::ToolResult,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<(), ()> {
-    let Some(content) = result_json.get("content").and_then(|v| v.as_str()) else {
-        return Ok(());
-    };
-    if !matches!(
-        crate::tools::parse_tool_control_signal(content),
-        Some(crate::tools::ToolControlSignal::UserQuestion)
-    ) {
-        return Ok(());
-    }
-    let Some(questions) = crate::tools::parse_user_questions(content) else {
+    let follow_up = result.follow_up().clone();
+    let tools::ToolFollowUp::UserQuestion { questions, .. } = follow_up else {
+        if result.follow_up().is_pending() {
+            let message = "This typed follow-up is not supported by the full-screen TUI";
+            *result = result
+                .cancel_follow_up(message.to_string(), message.to_string())
+                .expect("pending follow-up can be cancelled");
+        }
         return Ok(());
     };
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if tx
         .send(AppEvent::UserQuestion {
-            questions,
+            questions: questions
+                .iter()
+                .map(tools::ToolQuestion::widget_value)
+                .collect(),
             reply: reply_tx,
         })
         .is_err()
@@ -2920,9 +2920,11 @@ async fn intercept_user_question(
     let answers = reply_rx
         .await
         .unwrap_or_else(|_| "{\"_cancelled\": true}".to_string());
-    if let Some(obj) = result_json.as_object_mut() {
-        obj.insert("content".to_string(), Value::String(answers));
-    }
+    let response =
+        serde_json::from_str(&answers).unwrap_or_else(|_| Value::String(answers.clone()));
+    *result = result
+        .resolve_follow_up(answers, response)
+        .expect("typed user question has one pending follow-up");
     Ok(())
 }
 

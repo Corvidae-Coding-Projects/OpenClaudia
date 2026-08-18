@@ -21,6 +21,7 @@ fn dispatch(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("crosslink", args, &mut ctx)
         .expect("crosslink must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

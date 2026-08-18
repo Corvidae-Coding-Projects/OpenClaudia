@@ -27,6 +27,7 @@ fn dispatch_bash(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("bash", args, &mut ctx)
         .expect("bash must be registered")
+        .into_legacy()
 }
 
 fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
@@ -39,6 +40,7 @@ fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("bash_output", args, &mut ctx)
         .expect("bash_output must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

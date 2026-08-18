@@ -27,6 +27,7 @@ fn dispatch_lsp(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("lsp", args, &mut ctx)
         .expect("lsp must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

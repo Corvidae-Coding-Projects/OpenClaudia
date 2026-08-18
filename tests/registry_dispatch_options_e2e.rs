@@ -136,7 +136,8 @@ fn dispatch_returns_string_first_element() {
     let reg = registry();
     let (msg, _) = reg
         .dispatch("list_files", &empty_args(), &mut fresh_ctx())
-        .expect("known tool");
+        .expect("known tool")
+        .into_legacy();
     let _: String = msg; // compile-time check.
 }
 
@@ -145,7 +146,8 @@ fn dispatch_returns_bool_second_element() {
     let reg = registry();
     let (_, is_err) = reg
         .dispatch("list_files", &empty_args(), &mut fresh_ctx())
-        .expect("known tool");
+        .expect("known tool")
+        .into_legacy();
     let _: bool = is_err;
 }
 
@@ -156,7 +158,8 @@ fn dispatch_returns_non_empty_message_for_known_tool_with_empty_args() {
     let reg = registry();
     let (msg, _) = reg
         .dispatch("bash", &empty_args(), &mut fresh_ctx())
-        .expect("bash known");
+        .expect("bash known")
+        .into_legacy();
     // Likely an error (missing command arg) but still non-empty.
     assert!(!msg.is_empty(), "MUST surface diagnostic message");
 }
@@ -180,10 +183,12 @@ fn dispatch_list_files_repeated_yields_same_message_on_empty_args() {
     let reg = registry();
     let (m1, e1) = reg
         .dispatch("list_files", &empty_args(), &mut fresh_ctx())
-        .expect("ok");
+        .expect("ok")
+        .into_legacy();
     let (m2, e2) = reg
         .dispatch("list_files", &empty_args(), &mut fresh_ctx())
-        .expect("ok");
+        .expect("ok")
+        .into_legacy();
     assert_eq!(e1, e2);
     // Messages may differ slightly if cwd changes, but typically
     // identical in short test windows. Just verify both are populated.

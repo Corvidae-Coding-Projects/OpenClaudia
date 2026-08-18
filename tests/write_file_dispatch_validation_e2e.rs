@@ -28,6 +28,7 @@ fn dispatch_write(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("write_file", args, &mut ctx)
         .expect("write_file must be registered")
+        .into_legacy()
 }
 
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
@@ -40,6 +41,7 @@ fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("read_file", args, &mut ctx)
         .expect("read_file must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

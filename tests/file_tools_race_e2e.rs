@@ -66,7 +66,7 @@ fn call(name: &str, args: &Value) -> ToolCall {
 
 fn read(path: &str) -> (String, bool) {
     let r = execute_tool(&call("read_file", &json!({"path": path})));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 fn write(path: &str, content: &str) -> (String, bool) {
@@ -74,7 +74,7 @@ fn write(path: &str, content: &str) -> (String, bool) {
         "write_file",
         &json!({"path": path, "content": content}),
     ));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 fn edit(path: &str, old: &str, new: &str) -> (String, bool) {
@@ -82,7 +82,7 @@ fn edit(path: &str, old: &str, new: &str) -> (String, bool) {
         "edit_file",
         &json!({"path": path, "old_string": old, "new_string": new}),
     ));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 // ───────────────────────────────────────────────────────────────────────────

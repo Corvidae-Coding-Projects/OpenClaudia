@@ -37,7 +37,8 @@ fn execute_tool_returns_tool_call_id_in_result() {
     let tc = call("call_abc_183", "list_files", &json!({}));
     let result = execute_tool(&tc);
     assert_eq!(
-        result.tool_call_id, "call_abc_183",
+        result.tool_call_id(),
+        "call_abc_183",
         "tool_call_id MUST round-trip"
     );
 }
@@ -49,8 +50,8 @@ fn execute_tool_returns_non_empty_content_string() {
     let tc = call("c1", "bash", &json!({}));
     let result = execute_tool(&tc);
     assert!(
-        !result.content.is_empty(),
-        "ToolResult.content MUST be non-empty"
+        !result.content().is_empty(),
+        "ToolResult.content() MUST be non-empty"
     );
 }
 
@@ -59,8 +60,8 @@ fn execute_tool_result_has_owned_string_fields() {
     let tc = call("c1", "list_files", &json!({}));
     let result = execute_tool(&tc);
     // tool_call_id and content are owned String, not &str.
-    let _: String = result.tool_call_id;
-    let _: String = result.content;
+    let _: &str = result.tool_call_id();
+    let _: &str = result.content();
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -77,7 +78,7 @@ fn execute_tool_dispatches_list_files() {
     );
     let result = execute_tool(&tc);
     // Empty dir → empty result content but NOT an error.
-    assert!(!result.is_error, "valid list_files MUST NOT error");
+    assert!(!result.is_error(), "valid list_files MUST NOT error");
 }
 
 #[test]
@@ -86,7 +87,7 @@ fn execute_tool_dispatches_bash_output() {
     let tc = call("c1", "bash_output", &json!({}));
     let result = execute_tool(&tc);
     // Listing all shells (possibly empty) — not an error.
-    assert!(!result.is_error);
+    assert!(!result.is_error());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -98,7 +99,7 @@ fn execute_tool_missing_required_arg_sets_is_error_true() {
     let tc = call("c1", "bash", &json!({}));
     let result = execute_tool(&tc);
     assert!(
-        result.is_error,
+        result.is_error(),
         "missing required arg MUST set is_error=true"
     );
 }
@@ -107,13 +108,13 @@ fn execute_tool_missing_required_arg_sets_is_error_true() {
 fn execute_tool_missing_required_arg_carries_diagnostic_content() {
     let tc = call("c1", "read_file", &json!({}));
     let result = execute_tool(&tc);
-    assert!(result.is_error);
+    assert!(result.is_error());
     assert!(
-        result.content.to_lowercase().contains("file_path")
-            || result.content.contains("Missing")
-            || result.content.contains("required"),
+        result.content().to_lowercase().contains("file_path")
+            || result.content().contains("Missing")
+            || result.content().contains("required"),
         "diagnostic MUST mention what's missing; got {:?}",
-        result.content
+        result.content()
     );
 }
 
@@ -125,15 +126,15 @@ fn execute_tool_missing_required_arg_carries_diagnostic_content() {
 fn execute_tool_unknown_tool_name_returns_error_with_documented_message() {
     let tc = call("c1", "definitely_not_a_real_tool_xyz_183", &json!({}));
     let result = execute_tool(&tc);
-    assert!(result.is_error, "unknown tool MUST be error");
+    assert!(result.is_error(), "unknown tool MUST be error");
     assert!(
-        result.content.to_lowercase().contains("unknown")
-            || result.content.to_lowercase().contains("tool")
+        result.content().to_lowercase().contains("unknown")
+            || result.content().to_lowercase().contains("tool")
             || result
-                .content
+                .content()
                 .contains("definitely_not_a_real_tool_xyz_183"),
         "MUST surface unknown-tool diagnostic; got {:?}",
-        result.content
+        result.content()
     );
 }
 
@@ -141,7 +142,7 @@ fn execute_tool_unknown_tool_name_returns_error_with_documented_message() {
 fn execute_tool_empty_name_returns_error() {
     let tc = call("c1", "", &json!({}));
     let result = execute_tool(&tc);
-    assert!(result.is_error);
+    assert!(result.is_error());
 }
 
 #[test]
@@ -150,7 +151,7 @@ fn execute_tool_unknown_tool_id_still_propagates_to_result() {
     // so the assistant can match the error to its call.
     let tc = call("call_marker_unknown_183", "xyz", &json!({}));
     let result = execute_tool(&tc);
-    assert_eq!(result.tool_call_id, "call_marker_unknown_183");
+    assert_eq!(result.tool_call_id(), "call_marker_unknown_183");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -172,12 +173,12 @@ fn execute_tool_with_invalid_json_arguments_does_not_panic() {
     };
     let result = execute_tool(&tc);
     // tool_call_id round-trips regardless of arg parse outcome.
-    assert_eq!(result.tool_call_id, "c1");
-    assert!(result.is_error);
+    assert_eq!(result.tool_call_id(), "c1");
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Invalid tool arguments JSON"),
+        result.content().contains("Invalid tool arguments JSON"),
         "malformed arguments must be named directly; got {:?}",
-        result.content
+        result.content()
     );
 }
 
@@ -193,12 +194,12 @@ fn execute_tool_with_empty_arguments_string_handled_gracefully() {
         },
     };
     let result = execute_tool(&tc);
-    assert_eq!(result.tool_call_id, "c1");
-    assert!(result.is_error);
+    assert_eq!(result.tool_call_id(), "c1");
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Invalid tool arguments JSON"),
+        result.content().contains("Invalid tool arguments JSON"),
         "empty arguments string is malformed JSON; got {:?}",
-        result.content
+        result.content()
     );
 }
 
@@ -213,12 +214,12 @@ fn execute_tool_with_non_object_json_arguments_errors() {
         },
     };
     let result = execute_tool(&tc);
-    assert_eq!(result.tool_call_id, "c-array");
-    assert!(result.is_error);
+    assert_eq!(result.tool_call_id(), "c-array");
+    assert!(result.is_error());
     assert!(
-        result.content.contains("expected a JSON object"),
+        result.content().contains("expected a JSON object"),
         "non-object arguments must be rejected; got {:?}",
-        result.content
+        result.content()
     );
 }
 
@@ -232,9 +233,9 @@ fn execute_tool_unknown_tool_is_deterministic_across_5_calls() {
     let r1 = execute_tool(&tc);
     for _ in 0..4 {
         let r = execute_tool(&tc);
-        assert_eq!(r.tool_call_id, r1.tool_call_id);
-        assert_eq!(r.is_error, r1.is_error);
-        assert_eq!(r.content, r1.content);
+        assert_eq!(r.tool_call_id(), r1.tool_call_id());
+        assert_eq!(r.is_error(), r1.is_error());
+        assert_eq!(r.content(), r1.content());
     }
 }
 
@@ -248,8 +249,8 @@ fn execute_tool_with_same_args_yields_same_envelope_for_list_files() {
     );
     let r1 = execute_tool(&tc);
     let r2 = execute_tool(&tc);
-    assert_eq!(r1.is_error, r2.is_error);
-    assert_eq!(r1.content, r2.content);
+    assert_eq!(r1.is_error(), r2.is_error());
+    assert_eq!(r1.content(), r2.content());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -290,5 +291,5 @@ fn execute_tool_with_long_tool_name_no_panic() {
     let tc = call("c1", &long_name, &json!({}));
     let result = execute_tool(&tc);
     // Unknown tool → error, but no panic.
-    assert!(result.is_error);
+    assert!(result.is_error());
 }

@@ -61,12 +61,12 @@ fn call(name: &str, args: &Value) -> ToolCall {
 /// `READ_TRACKER` mark is recorded, then return the result tuple.
 fn mark_read(path: &str) -> (String, bool) {
     let r = execute_tool(&call("read_file", &json!({"path": path})));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 fn notebook_edit(args: &Value) -> (String, bool) {
     let r = execute_tool(&call("notebook_edit", args));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 /// Build a minimal valid nbformat-v4 notebook with the given cells.

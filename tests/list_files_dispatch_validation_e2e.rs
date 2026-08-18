@@ -26,6 +26,7 @@ fn dispatch_list(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("list_files", args, &mut ctx)
         .expect("list_files must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

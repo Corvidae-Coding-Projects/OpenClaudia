@@ -103,8 +103,29 @@ pub trait ToolHandler: Send + Sync {
         None
     }
 
-    /// Execute the tool and return `(output_text, is_error)`.
-    fn execute(&self, args: &HashMap<String, Value>, ctx: &mut ToolContext<'_>) -> (String, bool);
+    /// Execute the tool through the canonical typed result boundary.
+    ///
+    /// Existing leaf executors are adapted here while they migrate one by one;
+    /// registry/provider/frontend callers never receive their tuple shape.
+    fn execute(
+        &self,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        let (content, is_error) = self.execute_legacy(args, ctx);
+        ToolHandlerResult::legacy(content, is_error)
+    }
+
+    /// Temporary leaf-executor compatibility seam.  It is deliberately below
+    /// the handler contract: dispatch always calls [`Self::execute`].
+    #[doc(hidden)]
+    fn execute_legacy(
+        &self,
+        _args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
+        unreachable!("typed handler must override execute")
+    }
 }
 
 // ─── Registry ─────────────────────────────────────────────────────────────────
@@ -128,12 +149,13 @@ impl ToolRegistry {
         tool_name: &str,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> Option<(String, bool)> {
+    ) -> Option<ToolHandlerResult> {
         if let Err(error) = &ctx.security {
-            return Some((
+            return Some(ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::Unavailable,
                 format!("Tool execution is blocked because session capabilities are unavailable: {error}"),
-                true,
-            ));
+                ToolRetryability::Never,
+            )));
         }
         self.handlers.get(tool_name).map(|h| h.execute(args, ctx))
     }
@@ -144,7 +166,7 @@ impl ToolRegistry {
 use super::crosslink as crosslink_tool;
 use super::{
     ask_user, bash, cron, file, grounding, lsp, plan_mode, skill, task, todo, tool_search, web,
-    worktree,
+    worktree, ToolFailure, ToolFailureCode, ToolHandlerResult, ToolRetryability,
 };
 
 // ── bash ─────────────────────────────────────────────────────────────────────
@@ -184,8 +206,12 @@ impl ToolHandler for BashHandler {
             arg_key: "command",
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
-        bash::execute_bash(args)
+    fn execute(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        ToolHandlerResult::from_migrated(bash::try_execute_bash(args))
     }
 }
 
@@ -212,7 +238,11 @@ impl ToolHandler for BashOutputHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         bash::execute_bash_output(args)
     }
 }
@@ -241,7 +271,11 @@ impl ToolHandler for KillShellHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         bash::execute_kill_shell(args)
     }
 }
@@ -270,7 +304,11 @@ impl ToolHandler for KillShellsForAgentHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         bash::execute_kill_shells_for_agent(args)
     }
 }
@@ -315,7 +353,11 @@ impl ToolHandler for ReadFileHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         file::execute_read_file(args)
     }
 }
@@ -353,7 +395,11 @@ impl ToolHandler for GroundingContextHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         grounding::execute_grounding_context(args)
     }
 }
@@ -393,7 +439,11 @@ impl ToolHandler for WriteFileHandler {
             arg_key: "path",
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         file::execute_write_file(args)
     }
 }
@@ -441,7 +491,11 @@ impl ToolHandler for EditFileHandler {
             arg_key: "path",
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
         file::execute_edit_file(args)
     }
 }
@@ -502,7 +556,11 @@ impl ToolHandler for NotebookEditHandler {
             arg_key: "notebook_path",
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         file::execute_notebook_edit(args)
     }
 }
@@ -531,7 +589,11 @@ impl ToolHandler for ListFilesHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         file::execute_list_files(args)
     }
 }
@@ -564,7 +626,11 @@ impl ToolHandler for GlobHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         file::execute_glob(args)
     }
 }
@@ -606,7 +672,11 @@ impl ToolHandler for GrepHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         file::execute_grep(args)
     }
 }
@@ -641,7 +711,11 @@ impl ToolHandler for CrosslinkHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         crosslink_tool::execute_crosslink(args)
     }
 }
@@ -691,7 +765,11 @@ impl ToolHandler for WebFetchHandler {
             arg_key: "url",
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         web::execute_web_fetch_with_config(args, ctx.app_config)
     }
 }
@@ -738,7 +816,11 @@ impl ToolHandler for WebSearchHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         web::execute_web_search(args)
     }
 }
@@ -772,7 +854,11 @@ impl ToolHandler for WebBrowserHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         web::execute_web_browser(args)
     }
 }
@@ -836,7 +922,11 @@ impl ToolHandler for LspHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         lsp::execute_lsp(args)
     }
 }
@@ -886,7 +976,11 @@ impl ToolHandler for TodoWriteHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         todo::execute_todo_write(args)
     }
 }
@@ -910,7 +1004,7 @@ impl ToolHandler for TodoReadHandler {
             }
         })
     }
-    fn execute(
+    fn execute_legacy(
         &self,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
@@ -990,7 +1084,11 @@ impl ToolHandler for AskUserQuestionHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
         ask_user::execute_ask_user_question(args)
     }
 }
@@ -1021,7 +1119,11 @@ impl ToolHandler for EnterWorktreeHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         worktree::execute_enter_worktree(args)
     }
 }
@@ -1058,7 +1160,11 @@ impl ToolHandler for ExitWorktreeHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         worktree::execute_exit_worktree(args)
     }
 }
@@ -1082,7 +1188,7 @@ impl ToolHandler for ListWorktreesHandler {
             }
         })
     }
-    fn execute(
+    fn execute_legacy(
         &self,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
@@ -1133,7 +1239,11 @@ impl ToolHandler for CronCreateHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         cron::execute_cron_create(args)
     }
 }
@@ -1172,7 +1282,11 @@ impl ToolHandler for CronDeleteHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         cron::execute_cron_delete(args)
     }
 }
@@ -1196,7 +1310,7 @@ impl ToolHandler for CronListHandler {
             }
         })
     }
-    fn execute(
+    fn execute_legacy(
         &self,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
@@ -1236,7 +1350,7 @@ impl ToolHandler for EnterPlanModeHandler {
         &self,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
+    ) -> ToolHandlerResult {
         plan_mode::execute_enter_plan_mode()
     }
 }
@@ -1279,7 +1393,11 @@ impl ToolHandler for ExitPlanModeHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
         plan_mode::execute_exit_plan_mode(args)
     }
 }
@@ -1320,7 +1438,11 @@ impl ToolHandler for TaskCreateHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         ctx.task_mgr.as_deref_mut().map_or_else(
             || (NO_SESSION.0.to_string(), NO_SESSION.1),
             |tm| task::execute_task_create(args, tm),
@@ -1379,7 +1501,11 @@ impl ToolHandler for TaskUpdateHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         ctx.task_mgr.as_deref_mut().map_or_else(
             || (NO_SESSION.0.to_string(), NO_SESSION.1),
             |tm| task::execute_task_update(args, tm),
@@ -1411,7 +1537,11 @@ impl ToolHandler for TaskGetHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         ctx.task_mgr.as_deref_mut().map_or_else(
             || (NO_SESSION.0.to_string(), NO_SESSION.1),
             |tm| task::execute_task_get(args, tm),
@@ -1438,7 +1568,11 @@ impl ToolHandler for TaskListHandler {
             }
         })
     }
-    fn execute(&self, _args: &HashMap<String, Value>, ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        _args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         ctx.task_mgr.as_deref_mut().map_or_else(
             || (NO_SESSION.0.to_string(), NO_SESSION.1),
             |tm| task::execute_task_list(tm),
@@ -1477,7 +1611,11 @@ impl ToolHandler for ListMcpResourcesHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         let server_filter = match optional_registry_string_arg(args, "server") {
             Ok(server) => server.map(str::to_string),
             Err(err) => return (format!("list_mcp_resources: {err}"), true),
@@ -1569,7 +1707,11 @@ impl ToolHandler for ReadMcpResourceHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         let server = match required_registry_string_arg(args, "read_mcp_resource", "server") {
             Ok(server) => server,
             Err(result) => return result,
@@ -1669,7 +1811,11 @@ impl ToolHandler for SkillHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         skill::execute_skill(args)
     }
 }
@@ -1710,7 +1856,11 @@ impl ToolHandler for ToolSearchHandler {
             }
         })
     }
-    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+    fn execute_legacy(
+        &self,
+        args: &HashMap<String, Value>,
+        _ctx: &mut ToolContext<'_>,
+    ) -> (String, bool) {
         tool_search::execute_tool_search(args)
     }
 }

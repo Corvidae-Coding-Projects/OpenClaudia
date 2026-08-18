@@ -176,7 +176,7 @@ fn dispatch_tool_search_returns_some_tuple() {
         outcome.is_some(),
         "tool_search MUST be registered and dispatchable"
     );
-    let (_text, _is_err) = outcome.unwrap();
+    let (_text, _is_err) = outcome.unwrap().into_legacy();
     // Returns the documented tuple shape (String, bool).
 }
 
@@ -218,6 +218,6 @@ fn dispatch_known_tool_with_empty_args_invokes_handler() {
         outcome.is_some(),
         "dispatch MUST invoke handler even with empty args"
     );
-    let (_text, _is_err) = outcome.unwrap();
+    let (_text, _is_err) = outcome.unwrap().into_legacy();
     // Result tuple shape preserved.
 }

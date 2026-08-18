@@ -365,7 +365,10 @@ fn session_id_guards_are_stack_scoped_and_restore_on_drop() {
             "read_file",
             &json!({"path": path.to_string_lossy().to_string()}),
         ));
-        assert!(!read.is_error, "session A: read must succeed, got {read:?}");
+        assert!(
+            !read.is_error(),
+            "session A: read must succeed, got {read:?}"
+        );
     }
 
     // Session B: try to edit without reading first. The read-before-
@@ -384,9 +387,9 @@ fn session_id_guards_are_stack_scoped_and_restore_on_drop() {
         // requirement is acceptable; what we will NOT tolerate is
         // the edit succeeding (which would mean the gate leaked
         // across session boundaries).
-        let permitted = edit.is_error
-            || edit.content.to_lowercase().contains("read")
-            || edit.content.to_lowercase().contains("before");
+        let permitted = edit.is_error()
+            || edit.content().to_lowercase().contains("read")
+            || edit.content().to_lowercase().contains("before");
         assert!(
             permitted,
             "session B: edit without prior read must be refused; got {edit:?}"
@@ -405,7 +408,7 @@ fn session_id_guards_are_stack_scoped_and_restore_on_drop() {
             }),
         ));
         assert!(
-            !edit.is_error,
+            !edit.is_error(),
             "session A re-entry: edit must succeed (file was read in this session), got {edit:?}"
         );
     }

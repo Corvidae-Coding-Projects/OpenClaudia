@@ -233,6 +233,7 @@ impl From<ToolOutput> for (String, bool) {
 /// free function so call sites read as `into_legacy(result)` instead of
 /// fan-out `match` arms.
 #[must_use]
+#[cfg(test)]
 pub fn into_legacy(result: Result<ToolOutput, ToolError>) -> (String, bool) {
     match result {
         Ok(out) => out.into(),

@@ -85,13 +85,17 @@ mod file_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(!result.is_error, "Read should succeed: {}", result.content);
         assert!(
-            result.content.contains("Hello, World!"),
+            !result.is_error(),
+            "Read should succeed: {}",
+            result.content()
+        );
+        assert!(
+            result.content().contains("Hello, World!"),
             "Should contain file content"
         );
         assert!(
-            result.content.contains("Line 2"),
+            result.content().contains("Line 2"),
             "Should contain all lines"
         );
     }
@@ -107,11 +111,11 @@ mod file_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(result.is_error, "Read of nonexistent file should fail");
+        assert!(result.is_error(), "Read of nonexistent file should fail");
         // The path-jail (crosslink #269) rejects out-of-root paths before
         // attempting the read, so any of these error phrasings is acceptable:
         // strict-jail rejection, legacy not-found error, or a generic failure.
-        let c = result.content.to_lowercase();
+        let c = result.content().to_lowercase();
         assert!(
             c.contains("not found")
                 || c.contains("no such file")
@@ -120,7 +124,7 @@ mod file_tools {
                 || c.contains("outside the project root")
                 || c.contains("path traversal"),
             "Error should describe a path/file-access failure: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -141,13 +145,13 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Read with offset should succeed: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("Line 2"), "Should contain line 2");
+        assert!(result.content().contains("Line 2"), "Should contain line 2");
         assert!(
-            !result.content.contains("Hello"),
+            !result.content().contains("Hello"),
             "Should not contain line 1"
         );
     }
@@ -167,7 +171,11 @@ mod file_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(!result.is_error, "Write should succeed: {}", result.content);
+        assert!(
+            !result.is_error(),
+            "Write should succeed: {}",
+            result.content()
+        );
 
         // Verify the file was actually written
         let content = fs::read_to_string(&file_path).expect("Failed to read written file");
@@ -188,9 +196,9 @@ mod file_tools {
         let read_call = make_tool_call("read_file", &json!({"path": file_path.to_string_lossy()}));
         let read_result = execute_tool(&read_call);
         assert!(
-            !read_result.is_error,
+            !read_result.is_error(),
             "read_file precondition failed: {}",
-            read_result.content
+            read_result.content()
         );
 
         let tool_call = make_tool_call(
@@ -204,9 +212,9 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Write overwrite should succeed: {}",
-            result.content
+            result.content()
         );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -236,7 +244,11 @@ mod file_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(!result.is_error, "Edit should succeed: {}", result.content);
+        assert!(
+            !result.is_error(),
+            "Edit should succeed: {}",
+            result.content()
+        );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
         assert!(
@@ -272,13 +284,16 @@ mod file_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(result.is_error, "Edit with missing old_string should fail");
         assert!(
-            result.content.to_lowercase().contains("could not find")
-                || result.content.to_lowercase().contains("not found")
-                || result.content.to_lowercase().contains("no match"),
+            result.is_error(),
+            "Edit with missing old_string should fail"
+        );
+        assert!(
+            result.content().to_lowercase().contains("could not find")
+                || result.content().to_lowercase().contains("not found")
+                || result.content().to_lowercase().contains("no match"),
             "Error should mention string not found: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -297,11 +312,14 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "list_files should succeed: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("test.txt"), "Should find test.txt");
+        assert!(
+            result.content().contains("test.txt"),
+            "Should find test.txt"
+        );
     }
 
     #[test]
@@ -320,7 +338,7 @@ mod file_tools {
 
         // Should succeed but with no matches
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "list_files should succeed even with no matches"
         );
     }
@@ -346,12 +364,12 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Read should handle Unicode: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("世界"), "Should contain Chinese");
-        assert!(result.content.contains("🦀"), "Should contain emoji");
+        assert!(result.content().contains("世界"), "Should contain Chinese");
+        assert!(result.content().contains("🦀"), "Should contain emoji");
     }
 
     #[test]
@@ -371,9 +389,9 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Write should handle Unicode: {}",
-            result.content
+            result.content()
         );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -396,9 +414,9 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Read empty file should succeed: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -425,12 +443,12 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Read large file should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Line 0"),
+            result.content().contains("Line 0"),
             "Should contain first line"
         );
     }
@@ -458,9 +476,9 @@ mod file_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(!result.is_error, "Read with offset/limit should succeed");
+        assert!(!result.is_error(), "Read with offset/limit should succeed");
         assert!(
-            result.content.contains("Line 500") || result.content.contains("Line 501"),
+            result.content().contains("Line 500") || result.content().contains("Line 501"),
             "Should contain content from offset"
         );
     }
@@ -492,9 +510,9 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Multiline edit should succeed: {}",
-            result.content
+            result.content()
         );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -531,9 +549,9 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Edit with special chars should succeed: {}",
-            result.content
+            result.content()
         );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -555,12 +573,15 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Recursive list should succeed: {}",
-            result.content
+            result.content()
         );
         // Should find both test.txt and subdir/nested.txt
-        assert!(result.content.contains("test.txt"), "Should find test.txt");
+        assert!(
+            result.content().contains("test.txt"),
+            "Should find test.txt"
+        );
     }
 
     #[test]
@@ -580,9 +601,9 @@ mod file_tools {
 
         // write_file should create parent directories automatically
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "write_file should create parent dirs, got error: {}",
-            result.content
+            result.content()
         );
         let content = fs::read_to_string(&file_path).expect("Failed to read written file");
         assert_eq!(content, "Content in nested dir");
@@ -608,18 +629,18 @@ mod file_tools {
 
         // Must produce a non-empty response (either content or error message)
         assert!(
-            !result.content.is_empty(),
+            !result.content().is_empty(),
             "Binary file read should produce output (content or error), got empty"
         );
         // If it succeeded, it should have returned some representation of the bytes
         // If it errored, it should mention binary
-        if result.is_error {
+        if result.is_error() {
             assert!(
-                result.content.to_lowercase().contains("binary")
-                    || result.content.to_lowercase().contains("utf")
-                    || result.content.to_lowercase().contains("invalid"),
+                result.content().to_lowercase().contains("binary")
+                    || result.content().to_lowercase().contains("utf")
+                    || result.content().to_lowercase().contains("invalid"),
                 "Binary error should explain the issue, got: {}",
-                result.content
+                result.content()
             );
         }
     }
@@ -647,15 +668,15 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            result.is_error,
+            result.is_error(),
             "Edit without prior read should fail, got: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.to_lowercase().contains("read")
-                || result.content.to_lowercase().contains("must"),
+            result.content().to_lowercase().contains("read")
+                || result.content().to_lowercase().contains("must"),
             "Error should mention the read requirement, got: {}",
-            result.content
+            result.content()
         );
 
         // Verify file is unchanged
@@ -681,9 +702,9 @@ mod file_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Writing empty content should succeed: {}",
-            result.content
+            result.content()
         );
         let content = fs::read_to_string(&file_path).expect("Failed to read");
         assert_eq!(content, "", "File should be empty");
@@ -739,7 +760,7 @@ mod file_tools {
 
         // On Windows this path won't exist; on any OS this should fail or return safely
         assert!(
-            result.is_error || !result.content.contains("root:"),
+            result.is_error() || !result.content().contains("root:"),
             "Path traversal should not expose sensitive files"
         );
     }
@@ -764,9 +785,9 @@ mod file_tools {
 
         // Should fail gracefully — most filesystems reject names > 255 chars
         assert!(
-            result.is_error,
+            result.is_error(),
             "Very long filename should fail, got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -791,9 +812,13 @@ mod bash_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(!result.is_error, "Bash should succeed: {}", result.content);
         assert!(
-            result.content.contains("Hello from bash"),
+            !result.is_error(),
+            "Bash should succeed: {}",
+            result.content()
+        );
+        assert!(
+            result.content().contains("Hello from bash"),
             "Should contain echo output"
         );
     }
@@ -811,9 +836,9 @@ mod bash_tools {
 
         // A non-zero exit must be flagged as an error
         assert!(
-            result.is_error,
+            result.is_error(),
             "Non-zero exit code should set is_error=true, got content: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -830,11 +855,11 @@ mod bash_tools {
 
         // Should indicate command not found (either error or in content)
         assert!(
-            result.is_error
-                || result.content.to_lowercase().contains("not found")
-                || result.content.to_lowercase().contains("not recognized"),
+            result.is_error()
+                || result.content().to_lowercase().contains("not found")
+                || result.content().to_lowercase().contains("not recognized"),
             "Should indicate command not found: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -866,12 +891,12 @@ mod bash_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Bash cd should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("marker.txt"),
+            result.content().contains("marker.txt"),
             "Should list files in target dir"
         );
     }
@@ -890,10 +915,10 @@ mod bash_tools {
 
         // Should either error with timeout or produce some output
         assert!(
-            result.is_error
-                || result.content.contains("timeout")
-                || result.content.contains("timed out")
-                || !result.content.is_empty(),
+            result.is_error()
+                || result.content().contains("timeout")
+                || result.content().contains("timed out")
+                || !result.content().is_empty(),
             "Timeout test should produce output or error, got empty result"
         );
     }
@@ -911,12 +936,12 @@ mod bash_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Background bash should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("shell_") || result.content.contains("background"),
+            result.content().contains("shell_") || result.content().contains("background"),
             "Should return shell ID for background process"
         );
     }
@@ -932,7 +957,7 @@ mod bash_tools {
             }),
         );
         let bg_result = execute_tool(&bg_call);
-        assert!(!bg_result.is_error, "Background start should succeed");
+        assert!(!bg_result.is_error(), "Background start should succeed");
 
         // Small delay for process to start
         thread::sleep(Duration::from_millis(100));
@@ -942,17 +967,17 @@ mod bash_tools {
         let list_result = execute_tool(&list_call);
 
         assert!(
-            !list_result.is_error,
+            !list_result.is_error(),
             "bash_output list should succeed: {}",
-            list_result.content
+            list_result.content()
         );
         // Should list at least one shell
         assert!(
-            list_result.content.contains("shell_")
-                || list_result.content.contains("Background shells")
-                || list_result.content.contains("ping"),
+            list_result.content().contains("shell_")
+                || list_result.content().contains("Background shells")
+                || list_result.content().contains("ping"),
             "Should list running shells: {}",
-            list_result.content
+            list_result.content()
         );
     }
 
@@ -969,7 +994,7 @@ mod bash_tools {
         let bg_result = execute_tool(&bg_call);
 
         // Extract shell ID from result - look for pattern like "shell_abc123"
-        let shell_id = extract_shell_id(&bg_result.content);
+        let shell_id = extract_shell_id(bg_result.content());
 
         // Wait for some output
         thread::sleep(Duration::from_millis(500));
@@ -985,9 +1010,9 @@ mod bash_tools {
 
         // Should have some output (might be empty if command finished quickly)
         assert!(
-            !output_result.is_error,
+            !output_result.is_error(),
             "bash_output should succeed: {}",
-            output_result.content
+            output_result.content()
         );
     }
 
@@ -1004,7 +1029,7 @@ mod bash_tools {
         let bg_result = execute_tool(&bg_call);
 
         // Extract shell ID
-        let shell_id = extract_shell_id(&bg_result.content);
+        let shell_id = extract_shell_id(bg_result.content());
 
         thread::sleep(Duration::from_millis(100));
 
@@ -1018,16 +1043,16 @@ mod bash_tools {
         let kill_result = execute_tool(&kill_call);
 
         assert!(
-            !kill_result.is_error,
+            !kill_result.is_error(),
             "kill_shell should succeed: {}",
-            kill_result.content
+            kill_result.content()
         );
         assert!(
-            kill_result.content.to_lowercase().contains("kill")
-                || kill_result.content.to_lowercase().contains("terminated")
-                || kill_result.content.to_lowercase().contains("stopped"),
+            kill_result.content().to_lowercase().contains("kill")
+                || kill_result.content().to_lowercase().contains("terminated")
+                || kill_result.content().to_lowercase().contains("stopped"),
             "Should confirm shell was killed: {}",
-            kill_result.content
+            kill_result.content()
         );
     }
 
@@ -1045,13 +1070,13 @@ mod bash_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Multiline command should succeed: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("line1"), "Should contain line1");
-        assert!(result.content.contains("line2"), "Should contain line2");
-        assert!(result.content.contains("line3"), "Should contain line3");
+        assert!(result.content().contains("line1"), "Should contain line1");
+        assert!(result.content().contains("line2"), "Should contain line2");
+        assert!(result.content().contains("line3"), "Should contain line3");
     }
 
     #[test]
@@ -1066,12 +1091,12 @@ mod bash_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Pipe command should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("HELLO WORLD"),
+            result.content().contains("HELLO WORLD"),
             "Should contain uppercase output"
         );
     }
@@ -1088,12 +1113,12 @@ mod bash_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Variable expansion should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("test123"),
+            result.content().contains("test123"),
             "Should contain variable value"
         );
     }
@@ -1111,9 +1136,9 @@ mod bash_tools {
 
         // Stderr output must appear in result content regardless of is_error
         assert!(
-            result.content.contains("stderr test"),
+            result.content().contains("stderr test"),
             "Should capture stderr output in content, got: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1129,16 +1154,16 @@ mod bash_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Quoted strings should work: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("double quotes"),
+            result.content().contains("double quotes"),
             "Should have double quotes content"
         );
         assert!(
-            result.content.contains("single quotes"),
+            result.content().contains("single quotes"),
             "Should have single quotes content"
         );
     }
@@ -1156,9 +1181,9 @@ mod bash_tools {
 
         // Should fail or indicate shell not found
         assert!(
-            result.is_error || result.content.to_lowercase().contains("not found"),
+            result.is_error() || result.content().to_lowercase().contains("not found"),
             "Should indicate shell not found: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1175,9 +1200,9 @@ mod bash_tools {
 
         // Should fail or indicate shell not found
         assert!(
-            result.is_error || result.content.to_lowercase().contains("not found"),
+            result.is_error() || result.content().to_lowercase().contains("not found"),
             "Should indicate shell not found: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1196,12 +1221,12 @@ mod bash_tools {
 
         // Empty command should either error or produce a safe no-op result — not crash
         assert!(
-            result.is_error
-                || result.content.is_empty()
-                || result.content.to_lowercase().contains("no output")
-                || result.content.to_lowercase().contains("empty"),
+            result.is_error()
+                || result.content().is_empty()
+                || result.content().to_lowercase().contains("no output")
+                || result.content().to_lowercase().contains("empty"),
             "Empty command should fail gracefully or produce no-op output, got: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1219,14 +1244,14 @@ mod bash_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Quoted special chars should not be interpreted: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("hello; world & test | more"),
+            result.content().contains("hello; world & test | more"),
             "Should print literal special chars, got: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1245,20 +1270,20 @@ mod bash_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Large output command should succeed: {}",
-            result.content
+            result.content()
         );
         // Should contain at least some of the output
         assert!(
-            result.content.contains('1'),
+            result.content().contains('1'),
             "Should contain start of output"
         );
         // Content should be non-trivially sized
         assert!(
-            result.content.len() > 100,
+            result.content().len() > 100,
             "Large output should produce substantial content, got {} bytes",
-            result.content.len()
+            result.content().len()
         );
     }
 }
@@ -1300,12 +1325,12 @@ mod web_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(result.is_error, "loopback web_fetch must be rejected");
+        assert!(result.is_error(), "loopback web_fetch must be rejected");
         assert!(
-            result.content.contains("reserved/internal")
-                || result.content.contains("metadata endpoint"),
+            result.content().contains("reserved/internal")
+                || result.content().contains("metadata endpoint"),
             "SSRF rejection should explain the blocked target: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1322,18 +1347,18 @@ mod web_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "live web_fetch smoke failed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            !result.content.is_empty(),
+            !result.content().is_empty(),
             "web_fetch should return content"
         );
         assert!(
-            result.content.contains("URL: https://example.com/"),
+            result.content().contains("URL: https://example.com/"),
             "web_fetch raw output should include the fetched URL: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1349,7 +1374,7 @@ mod web_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(result.is_error, "Invalid URL should fail");
+        assert!(result.is_error(), "Invalid URL should fail");
     }
 
     // DuckDuckGo/Bing search uses the browser feature (enabled by default)
@@ -1367,8 +1392,8 @@ mod web_tools {
 
         let result = execute_tool(&tool_call);
 
-        if !result.is_error {
-            assert!(result.content.contains("http"), "Should contain URLs");
+        if !result.is_error() {
+            assert!(result.content().contains("http"), "Should contain URLs");
         }
     }
 }
@@ -1722,24 +1747,24 @@ mod todo_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "todo_write should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("2 total"),
+            result.content().contains("2 total"),
             "Should report 2 todos: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("1 in progress"),
+            result.content().contains("1 in progress"),
             "Should have 1 in progress: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Writing tests"),
+            result.content().contains("Writing tests"),
             "Should show current task: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1773,16 +1798,16 @@ mod todo_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.contains("2 completed"),
+            result.content().contains("2 completed"),
             "Should have 2 completed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("1 pending"),
+            result.content().contains("1 pending"),
             "Should have 1 pending: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1811,12 +1836,12 @@ mod todo_tools {
 
         let result = execute_tool(&tool_call);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.to_lowercase().contains("warning")
-                || result.content.contains("2 tasks marked as in_progress"),
+            result.content().to_lowercase().contains("warning")
+                || result.content().contains("2 tasks marked as in_progress"),
             "Should warn about multiple in_progress: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1841,14 +1866,14 @@ mod todo_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            result.is_error,
+            result.is_error(),
             "Should fail with missing field: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("activeForm"),
+            result.content().contains("activeForm"),
             "Should mention missing activeForm: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1873,17 +1898,17 @@ mod todo_tools {
         let result = execute_tool(&tool_call);
 
         assert!(
-            result.is_error,
+            result.is_error(),
             "Should fail with invalid status: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("invalid")
-                || result.content.contains("pending")
-                || result.content.contains("in_progress")
-                || result.content.contains("completed"),
+            result.content().contains("invalid")
+                || result.content().contains("pending")
+                || result.content().contains("in_progress")
+                || result.content().contains("completed"),
             "Should mention valid statuses: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1895,13 +1920,13 @@ mod todo_tools {
         let tool_call = make_tool_call("todo_read", &json!({}));
         let result = execute_tool(&tool_call);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.to_lowercase().contains("no todos")
-                || result.content.contains("empty")
-                || result.content.is_empty(),
+            result.content().to_lowercase().contains("no todos")
+                || result.content().contains("empty")
+                || result.content().is_empty(),
             "Should indicate empty list: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1939,31 +1964,31 @@ mod todo_tools {
         let read_call = make_tool_call("todo_read", &json!({}));
         let result = execute_tool(&read_call);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.contains("Research API"),
+            result.content().contains("Research API"),
             "Should contain first task: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Implement endpoint"),
+            result.content().contains("Implement endpoint"),
             "Should contain second task: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Write documentation"),
+            result.content().contains("Write documentation"),
             "Should contain third task: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("[x]") || result.content.contains("completed"),
+            result.content().contains("[x]") || result.content().contains("completed"),
             "Should show completed status: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("[>]") || result.content.contains("in_progress"),
+            result.content().contains("[>]") || result.content().contains("in_progress"),
             "Should show in_progress status: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -2070,11 +2095,11 @@ mod todo_tools {
         );
         let result = execute_tool(&write_empty);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.contains("0 total"),
+            result.content().contains("0 total"),
             "Should report 0 todos: {}",
-            result.content
+            result.content()
         );
 
         let todos = get_todo_list();
@@ -2097,16 +2122,16 @@ mod subagent_tools {
 
         // Should fail because subagent tools require config context
         assert!(
-            result.is_error,
+            result.is_error(),
             "task without config should fail: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("config")
-                || result.content.contains("description")
-                || result.content.contains("require"),
+            result.content().contains("config")
+                || result.content().contains("description")
+                || result.content().contains("require"),
             "Should mention configuration requirement: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -2118,23 +2143,23 @@ mod subagent_tools {
 
         // Must produce a meaningful response — either error about config or empty list message
         assert!(
-            !result.content.is_empty(),
+            !result.content().is_empty(),
             "agent_output should produce output, got empty"
         );
-        if result.is_error {
+        if result.is_error() {
             assert!(
-                result.content.to_lowercase().contains("config")
-                    || result.content.to_lowercase().contains("require"),
+                result.content().to_lowercase().contains("config")
+                    || result.content().to_lowercase().contains("require"),
                 "Error should mention config requirement: {}",
-                result.content
+                result.content()
             );
         } else {
             assert!(
-                result.content.to_lowercase().contains("no")
-                    || result.content.to_lowercase().contains("agent")
-                    || result.content.to_lowercase().contains("empty"),
+                result.content().to_lowercase().contains("no")
+                    || result.content().to_lowercase().contains("agent")
+                    || result.content().to_lowercase().contains("empty"),
                 "Should mention no agents: {}",
-                result.content
+                result.content()
             );
         }
     }
@@ -2151,11 +2176,11 @@ mod subagent_tools {
 
         // Should fail because agent doesn't exist or config is missing
         assert!(
-            result.is_error
-                || result.content.to_lowercase().contains("not found")
-                || result.content.to_lowercase().contains("config"),
+            result.is_error()
+                || result.content().to_lowercase().contains("not found")
+                || result.content().to_lowercase().contains("config"),
             "Should indicate agent not found or config missing: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -3559,18 +3584,18 @@ mod gated_dispatch_460 {
         match execute_tool_gated(&tc, None, None, None, Some(&mgr)) {
             ExecutionOutcome::Result(r) => {
                 assert!(
-                    r.is_error,
+                    r.is_error(),
                     "denial path must mark result as error, got: {r:?}"
                 );
                 assert!(
-                    r.content.to_lowercase().contains("denied"),
+                    r.content().to_lowercase().contains("denied"),
                     "expected 'denied' in content, got: {}",
-                    r.content
+                    r.content()
                 );
                 assert!(
-                    !r.content.contains("SIDE_EFFECT_THAT_SHOULD_NOT_PRINT"),
+                    !r.content().contains("SIDE_EFFECT_THAT_SHOULD_NOT_PRINT"),
                     "tool body ran despite rule denial — gate BYPASSED. content: {}",
-                    r.content
+                    r.content()
                 );
             }
             ExecutionOutcome::NeedsPrompt { tool, target, .. } => {

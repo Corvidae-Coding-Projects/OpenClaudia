@@ -46,17 +46,17 @@ fn bash_bg(command: &str) -> (String, bool) {
         "bash",
         &json!({"command": command, "run_in_background": true}),
     ));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 fn bash_output(shell_id: &str) -> (String, bool) {
     let r = execute_tool(&call("bash_output", &json!({"shell_id": shell_id})));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 fn kill_shell(shell_id: &str) -> (String, bool) {
     let r = execute_tool(&call("kill_shell", &json!({"shell_id": shell_id})));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 /// Extract the `shell_id` from a bash-background response. The

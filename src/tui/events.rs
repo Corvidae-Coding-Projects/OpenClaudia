@@ -136,8 +136,8 @@ pub enum AppEvent {
         tool_args: String,
         reply: tokio::sync::oneshot::Sender<PermissionResponse>,
     },
-    /// The `ask_user_question` tool returned its `USER_QUESTION_MARKER`
-    /// payload. The TUI should display a modal that walks the user
+    /// A trusted typed `ask_user_question` follow-up reached the TUI. The UI
+    /// should display a modal that walks the user
     /// through each question, collect answers, and send back a JSON
     /// object mapping `question_text → answer(s)` via the oneshot.
     ///

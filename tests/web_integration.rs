@@ -234,11 +234,11 @@ fn fetch_output_format_contains_url_header() {
     };
     let result = execute_tool(&call);
     // Spec §1 error path: prefix check fails → error string, is_error = true.
-    assert!(result.is_error, "invalid URL must return is_error=true");
+    assert!(result.is_error(), "invalid URL must return is_error=true");
     assert!(
-        result.content.contains("Invalid URL") || result.content.contains("Missing"),
+        result.content().contains("Invalid URL") || result.content().contains("Missing"),
         "expected error message, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -343,14 +343,15 @@ fn execute_web_fetch_prefix_check_catches_non_http() {
         };
         let result = execute_tool(&call);
         assert!(
-            result.is_error,
+            result.is_error(),
             "expected error for {bad_url}, got success: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Invalid URL") || result.content.contains("must start with"),
+            result.content().contains("Invalid URL")
+                || result.content().contains("must start with"),
             "wrong error message for {bad_url}: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -368,11 +369,11 @@ fn execute_web_fetch_missing_url_arg_returns_error() {
         },
     };
     let result = execute_tool(&call);
-    assert!(result.is_error);
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Missing"),
+        result.content().contains("Missing"),
         "expected 'Missing url' error, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -399,13 +400,13 @@ fn execute_web_search_short_query_returns_error() {
         };
         let result = execute_tool(&call);
         assert!(
-            result.is_error,
+            result.is_error(),
             "expected error for short query {bad_query:?}"
         );
         assert!(
-            result.content.contains("at least 2 characters"),
+            result.content().contains("at least 2 characters"),
             "expected min-length message, got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -424,11 +425,11 @@ fn execute_web_search_missing_query_returns_error() {
         },
     };
     let result = execute_tool(&call);
-    assert!(result.is_error);
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Missing"),
+        result.content().contains("Missing"),
         "expected 'Missing query' error, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -455,8 +456,11 @@ fn execute_web_search_rejects_non_string_query_before_browser_launch() {
             },
         };
         let result = execute_tool(&call);
-        assert!(result.is_error, "query case {name} should fail");
-        assert_eq!(result.content, "Invalid 'query' argument: expected string");
+        assert!(result.is_error(), "query case {name} should fail");
+        assert_eq!(
+            result.content(),
+            "Invalid 'query' argument: expected string"
+        );
     }
 }
 
@@ -484,13 +488,13 @@ fn execute_web_search_rejects_invalid_limit_before_browser_launch() {
             },
         };
         let result = execute_tool(&call);
-        assert!(result.is_error, "limit case {name} should fail");
+        assert!(result.is_error(), "limit case {name} should fail");
         assert!(
             result
-                .content
+                .content()
                 .contains("web_search limit must be an integer between 1 and 10"),
             "invalid limit should fail before search backend launch; got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -527,11 +531,11 @@ fn execute_web_search_rejects_invalid_domain_filters_before_browser_launch() {
             },
         };
         let result = execute_tool(&call);
-        assert!(result.is_error, "domain filter case {name} should fail");
+        assert!(result.is_error(), "domain filter case {name} should fail");
         assert!(
-            result.content.contains(expected),
+            result.content().contains(expected),
             "invalid domain filter should fail before search backend launch; got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -771,17 +775,17 @@ async fn browser_fetch_success_contains_url_line() {
         },
     };
     let result = execute_tool(&call);
-    if result.is_error {
+    if result.is_error() {
         eprintln!(
             "Browser fetch failed (Chrome may not be installed): {}",
-            result.content
+            result.content()
         );
         return;
     }
     // Spec §4: output contains "URL: <url>" line
     assert!(
-        result.content.contains("URL: https://example.com/"),
+        result.content().contains("URL: https://example.com/"),
         "URL line missing from browser fetch output: {}",
-        result.content
+        result.content()
     );
 }

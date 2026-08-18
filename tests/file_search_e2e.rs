@@ -45,17 +45,17 @@ fn call(name: &str, args: &Value) -> ToolCall {
 
 fn list_files(args: &Value) -> (String, bool) {
     let r = execute_tool(&call("list_files", args));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 fn glob(args: &Value) -> (String, bool) {
     let r = execute_tool(&call("glob", args));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 fn grep(args: &Value) -> (String, bool) {
     let r = execute_tool(&call("grep", args));
-    (r.content, r.is_error)
+    (r.content().to_string(), r.is_error())
 }
 
 fn touch(path: &Path, content: &str) {

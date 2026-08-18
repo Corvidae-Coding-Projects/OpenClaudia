@@ -4,7 +4,7 @@ use openclaudia::grounded_loop::{
 };
 use openclaudia::ledger::{Authority, ObservationKind, RealityLedger};
 use openclaudia::task_spec::TaskSpec;
-use openclaudia::tools::ToolResult;
+use openclaudia::tools::{FunctionCall, ToolCall, ToolHandlerResult, ToolResult};
 
 #[test]
 fn summary_observation_cannot_authorize_edit() {
@@ -189,11 +189,19 @@ fn newer_diff_marks_previous_diff_for_same_file_stale() {
 fn tool_result_observation_records_bounded_result_envelope() {
     let mut ledger = RealityLedger::new();
     let content = "x".repeat(TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES + 128);
-    let result = ToolResult {
-        tool_call_id: "call_tool".to_string(),
-        content,
-        is_error: false,
+    let tool_call = ToolCall {
+        id: "call_tool".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "list_files".to_string(),
+            arguments: "{}".to_string(),
+        },
     };
+    let result = ToolResult::bind(
+        &tool_call,
+        "list_files",
+        ToolHandlerResult::success_text(content),
+    );
 
     let id =
         append_tool_result_observation(&mut ledger, "list_files", &result).expect("tool result");

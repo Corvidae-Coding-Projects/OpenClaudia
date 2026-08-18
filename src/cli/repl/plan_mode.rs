@@ -112,7 +112,7 @@ pub fn handle_enter_plan_mode(chat_session: &Session) -> String {
 fn handle_plan_edit(
     chat_session: &Session,
     plan_state: &openclaudia::session::PlanModeState,
-    allowed_prompts_json: &str,
+    allowed_prompts: &[tools::ToolAllowedPrompt],
 ) -> (String, bool) {
     use std::io::{self, Write};
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
@@ -131,7 +131,6 @@ fn handle_plan_edit(
                 return ("Failed to read user input.".to_string(), false);
             }
             if input2.trim().to_lowercase().starts_with('y') {
-                let allowed_prompts = tools::parse_exit_plan_mode_prompts(allowed_prompts_json);
                 let restored = chat_session.inspect_state(|state| {
                     restore_previous_mode(state.conversation.plan_mode.as_ref())
                 });
@@ -183,7 +182,10 @@ fn handle_plan_edit(
 
 /// Handle exiting plan mode. Reads plan file, shows to user for approval.
 /// Returns (`result_text`, `should_exit_plan_mode`).
-pub fn handle_exit_plan_mode(chat_session: &Session, allowed_prompts_json: &str) -> (String, bool) {
+pub fn handle_exit_plan_mode(
+    chat_session: &Session,
+    allowed_prompts: &[tools::ToolAllowedPrompt],
+) -> (String, bool) {
     use std::io::{self, Write};
 
     let plan_mode = chat_session.inspect_state(|state| state.conversation.plan_mode.clone());
@@ -223,8 +225,6 @@ pub fn handle_exit_plan_mode(chat_session: &Session, allowed_prompts_json: &str)
 
     match input.as_str() {
         "y" | "yes" => {
-            let allowed_prompts = tools::parse_exit_plan_mode_prompts(allowed_prompts_json);
-
             let restored = chat_session.inspect_state(|state| {
                 restore_previous_mode(state.conversation.plan_mode.as_ref())
             });
@@ -282,7 +282,7 @@ pub fn handle_exit_plan_mode(chat_session: &Session, allowed_prompts_json: &str)
                 false,
             )
         }
-        "edit" | "e" => handle_plan_edit(chat_session, &plan_state, allowed_prompts_json),
+        "edit" | "e" => handle_plan_edit(chat_session, &plan_state, allowed_prompts),
         _ => {
             println!("\x1b[90mUnrecognized input. Staying in plan mode.\x1b[0m");
             (
@@ -358,36 +358,41 @@ const fn json_value_type_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Process a tool result, checking for special markers (`user_question`, plan mode).
-/// Returns the (possibly replaced) result content and whether it was a special marker.
-pub fn process_tool_result_marker(
+/// Process a trusted typed follow-up and retain its resolved state in the
+/// result passed to provider continuation. Ordinary text is never inspected.
+pub fn process_tool_follow_up(
     chat_session: &Session,
-    tool_name: &str,
-    result_content: &str,
-) -> (String, bool) {
-    // crosslink #980: dispatch on the typed control signal rather than the
-    // raw marker string. The marker constants exist only for serialisation
-    // / wire-format compatibility; the dispatcher matches the enum.
-    if let Some(signal) = tools::parse_tool_control_signal(result_content) {
-        match signal {
-            tools::ToolControlSignal::UserQuestion => {
-                if let Some(questions) = tools::parse_user_questions(result_content) {
-                    let answers = handle_user_questions(&questions);
-                    return (answers, true);
-                }
-            }
-            tools::ToolControlSignal::EnterPlanMode => {
-                let msg = handle_enter_plan_mode(chat_session);
-                return (msg, true);
-            }
-            tools::ToolControlSignal::ExitPlanMode => {
-                let (msg, _approved) = handle_exit_plan_mode(chat_session, result_content);
-                return (msg, true);
-            }
+    result: &tools::ToolResult,
+) -> tools::ToolResult {
+    let (content, response) = match result.follow_up() {
+        tools::ToolFollowUp::None => return result.clone(),
+        tools::ToolFollowUp::UserQuestion { questions, .. } => {
+            let widget_questions: Vec<serde_json::Value> = questions
+                .iter()
+                .map(tools::ToolQuestion::widget_value)
+                .collect();
+            let answers = handle_user_questions(&widget_questions);
+            let response = serde_json::from_str(&answers)
+                .unwrap_or_else(|_| serde_json::Value::String(answers.clone()));
+            (answers, response)
         }
-    }
-    let _ = tool_name; // suppress unused warning
-    (result_content.to_string(), false)
+        tools::ToolFollowUp::EnterPlanMode { .. } => {
+            let message = handle_enter_plan_mode(chat_session);
+            (message.clone(), serde_json::Value::String(message))
+        }
+        tools::ToolFollowUp::ExitPlanMode {
+            allowed_prompts, ..
+        } => {
+            let (message, approved) = handle_exit_plan_mode(chat_session, allowed_prompts);
+            (
+                message.clone(),
+                serde_json::json!({"message": message, "approved": approved}),
+            )
+        }
+    };
+    result
+        .resolve_follow_up(content, response)
+        .expect("trusted pending follow-up must resolve exactly once")
 }
 
 #[cfg(test)]

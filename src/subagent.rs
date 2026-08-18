@@ -1716,16 +1716,17 @@ async fn run_subagent_inner(
             }
 
             if let Err(content) = validate_subagent_tool_decision_for_session(&agent_id, &tc) {
-                let result = crate::tools::ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: format!("Error: {content}"),
-                    is_error: true,
-                };
+                let result = crate::tools::ToolResult::failure(
+                    &tc,
+                    crate::tools::ToolFailureCode::PolicyDenied,
+                    format!("Error: {content}"),
+                    crate::tools::ToolRetryability::Never,
+                );
                 observe_subagent_tool_result(&agent_id, &tc.function.name, &result);
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": result.content
+                    "content": result.content()
                 }));
                 continue;
             }
@@ -1755,7 +1756,7 @@ async fn run_subagent_inner(
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": executable_tc.id,
-                "content": result.content
+                "content": result.content()
             }));
         }
     }
@@ -2650,11 +2651,19 @@ mod tests {
         let agent_id = "subagent-tool-result-ledger-test";
         let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
         let _guard = crate::ledger::install_active_ledger_for_session(agent_id, ledger.clone());
-        let result = crate::tools::ToolResult {
-            tool_call_id: "call_1".to_string(),
-            content: "model-visible tool output".to_string(),
-            is_error: false,
+        let tool_call = crate::tools::ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "list_files".to_string(),
+                arguments: "{}".to_string(),
+            },
         };
+        let result = crate::tools::ToolResult::bind(
+            &tool_call,
+            &tool_call.function.name,
+            crate::tools::ToolHandlerResult::success_text("model-visible tool output"),
+        );
 
         observe_subagent_tool_result(agent_id, "list_files", &result);
 

@@ -1,8 +1,8 @@
 //! Shared local tool execution service.
 //!
 //! This centralizes the common "run an `OpenClaudia` tool locally" mechanics
-//! that were duplicated across TUI, legacy REPL, ACP local tools, subagents,
-//! and intercepted XML tools: optional enterprise tool cap, session id guard,
+//! that were duplicated across TUI, legacy REPL, ACP local tools, and subagents:
+//! optional enterprise tool cap, session id guard,
 //! active ledger installation, permission checked-vs-unchecked dispatch, and
 //! task-manager-aware execution.
 
@@ -13,7 +13,7 @@ use crate::memory::MemoryDb;
 use crate::permissions::PermissionManager;
 use crate::services::policy::{PolicyEnforcer, ToolExecutionPolicy};
 use crate::session::TaskManager;
-use crate::tools::{self, ToolCall, ToolResult};
+use crate::tools::{self, ToolCall, ToolFailureCode, ToolResult, ToolRetryability};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -27,12 +27,13 @@ pub struct ToolExecutionBlock {
 impl ToolExecutionBlock {
     /// Convert this block into a standard tool result.
     #[must_use]
-    pub fn into_tool_result(self, tool_call_id: impl Into<String>) -> ToolResult {
-        ToolResult {
-            tool_call_id: tool_call_id.into(),
-            content: self.content,
-            is_error: true,
-        }
+    pub fn into_tool_result(self, tool_call: &ToolCall) -> ToolResult {
+        ToolResult::failure(
+            tool_call,
+            ToolFailureCode::PolicyDenied,
+            self.content,
+            ToolRetryability::Never,
+        )
     }
 }
 
@@ -196,11 +197,12 @@ impl ToolExecutor {
 
         let tool_policy = ToolExecutionPolicy::new(policy_enforcer, session_id);
         if let Err(err) = tool_policy.check_and_record_tool(&tool_call.function.name) {
-            return ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!("Blocked by policy: {err}"),
-                is_error: true,
-            };
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by policy: {err}"),
+                ToolRetryability::Never,
+            );
         }
 
         let _session_guard = session_id.map(tools::SessionIdGuard::set);
@@ -270,9 +272,9 @@ mod tests {
             policy_enforcer: Some(&enforcer),
         });
 
-        assert!(result.is_error);
-        assert!(result.content.contains("Blocked by policy"));
-        assert!(!result.content.contains("tool-executor-should-not-run"));
+        assert!(result.is_error());
+        assert!(result.content().contains("Blocked by policy"));
+        assert!(!result.content().contains("tool-executor-should-not-run"));
     }
 
     #[test]
@@ -290,7 +292,7 @@ mod tests {
             policy_enforcer: None,
         });
 
-        assert!(!result.is_error, "unexpected error: {}", result.content);
-        assert!(result.content.contains("tool-executor-ok"));
+        assert!(!result.is_error(), "unexpected error: {}", result.content());
+        assert!(result.content().contains("tool-executor-ok"));
     }
 }

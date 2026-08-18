@@ -26,6 +26,7 @@ fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("bash_output", args, &mut ctx)
         .expect("bash_output must be registered")
+        .into_legacy()
 }
 
 fn dispatch_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
@@ -38,6 +39,7 @@ fn dispatch_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("kill_shell", args, &mut ctx)
         .expect("kill_shell must be registered")
+        .into_legacy()
 }
 
 fn dispatch_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, bool) {
@@ -50,6 +52,7 @@ fn dispatch_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, boo
     registry()
         .dispatch("kill_shells_for_agent", args, &mut ctx)
         .expect("kill_shells_for_agent must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

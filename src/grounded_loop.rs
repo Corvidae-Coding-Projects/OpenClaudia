@@ -229,15 +229,15 @@ pub fn append_tool_result_observation(
     result: &crate::tools::ToolResult,
 ) -> Result<ObsId, LedgerError> {
     let content =
-        crate::tools::safe_truncate(&result.content, TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES)
+        crate::tools::safe_truncate(result.content(), TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES)
             .to_string();
     ledger.observe_tool_result(
         tool_name,
         serde_json::json!({
-            "tool_call_id": &result.tool_call_id,
-            "is_error": result.is_error,
+            "tool_call_id": result.tool_call_id(),
+            "is_error": result.is_error(),
             "content": content,
-            "truncated": result.content.len() > content.len(),
+            "truncated": result.content().len() > content.len(),
         }),
     )
 }

@@ -28,6 +28,7 @@ fn dispatch_without_session(name: &str, args: &HashMap<String, Value>) -> (Strin
     registry()
         .dispatch(name, args, &mut ctx)
         .expect("tool must be registered")
+        .into_legacy()
 }
 
 fn dispatch_with_session(
@@ -44,6 +45,7 @@ fn dispatch_with_session(
     registry()
         .dispatch(name, args, &mut ctx)
         .expect("tool must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

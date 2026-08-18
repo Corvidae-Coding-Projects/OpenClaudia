@@ -30,6 +30,7 @@ fn dispatch_tool_search(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("tool_search", args, &mut ctx)
         .expect("tool_search must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

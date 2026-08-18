@@ -21,6 +21,7 @@ pub(crate) use bash::record_command_observation_for_session;
 pub use bash::sandbox::{sandbox_diagnostics, sandbox_preflight, SandboxDiagnostics};
 pub(crate) use bash::sandbox::{sandboxed_hook_command, sandboxed_process_command, SandboxProfile};
 pub(crate) mod command;
+mod continuation;
 mod cron;
 pub(crate) mod crosslink;
 /// Re-export the cron command entry points so the E2E test suite
@@ -43,6 +44,7 @@ pub mod lsp;
 mod plan_mode;
 pub mod registry;
 pub mod remote_trigger;
+mod result;
 pub mod skill;
 // `task` is exposed so the end-to-end test suite (`tests/tools_e2e.rs`)
 // can drive `execute_task_create` / `_update` / `_get` / `_list` against
@@ -95,12 +97,22 @@ pub(crate) use command::{
     clear_session_process_cancellation,
 };
 pub(crate) use command::{run_prepared_sandboxed_with_timeout, CommandError};
+pub use continuation::{
+    ToolContinuation, ToolContinuationError, ToolExchange, TOOL_CONTINUATION_SCHEMA_VERSION,
+};
 /// RAII guard that marks the current thread as executing inside a subagent
 /// task, so `execute_enter_plan_mode` refuses with the CC-parity error
 /// (crosslink #620). Subagent runners construct one of these for the
 /// duration of a `task` tool invocation; tests construct one directly.
 pub use plan_mode::{in_agent_task, AgentContextGuard};
 pub use registry::{PermissionTarget, ToolContext, ToolHandler, ToolRegistry};
+pub use result::{
+    ToolAllowedPrompt, ToolArtifact, ToolAttachment, ToolCompleteness, ToolContent, ToolDiff,
+    ToolDisplay, ToolExecutionResult, ToolFailure, ToolFailureCode, ToolFollowUp,
+    ToolFollowUpState, ToolHandlerResult, ToolInvocation, ToolObservation, ToolOutcome,
+    ToolQuestion, ToolQuestionOption, ToolResult, ToolResultError, ToolRetryability,
+    ToolSensitivity, ToolUsage, TOOL_RESULT_SCHEMA_VERSION,
+};
 pub use todo::{
     clear_all_todo_lists, clear_todo_list, get_todo_list, SessionIdGuard, TodoItem, TodoStatus,
 };
@@ -146,7 +158,7 @@ pub fn reset_read_tracker() {
 }
 
 /// Tool call from the model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -155,30 +167,11 @@ pub struct ToolCall {
 }
 
 /// Function call details
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
     pub arguments: String,
 }
-
-/// Result of executing a tool
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub tool_call_id: String,
-    pub content: String,
-    pub is_error: bool,
-}
-
-/// Marker type for `ask_user_question` results.
-/// The tool returns a JSON object with type "`user_question`" that the main loop
-/// intercepts to display questions and collect answers from the user.
-pub const USER_QUESTION_MARKER: &str = "user_question";
-
-/// Marker type for `enter_plan_mode` results.
-pub const ENTER_PLAN_MODE_MARKER: &str = "enter_plan_mode";
-
-/// Marker type for `exit_plan_mode` results.
-pub const EXIT_PLAN_MODE_MARKER: &str = "exit_plan_mode";
 
 /// Get all tool definitions for the API request (`OpenAI` function format).
 ///
@@ -230,35 +223,38 @@ fn invalid_tool_arguments_result(
     tool_call: &ToolCall,
     detail: impl std::fmt::Display,
 ) -> ToolResult {
-    ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content: format!(
+    ToolResult::failure(
+        tool_call,
+        ToolFailureCode::InvalidArguments,
+        format!(
             "Invalid tool arguments JSON for '{}': {detail}",
             tool_call.function.name
         ),
-        is_error: true,
-    }
+        ToolRetryability::Never,
+    )
 }
 
-fn parse_tool_arguments_value(tool_call: &ToolCall) -> Result<Value, ToolResult> {
+fn parse_tool_arguments_value(tool_call: &ToolCall) -> Result<Value, Box<ToolResult>> {
     let value = serde_json::from_str::<Value>(&tool_call.function.arguments)
-        .map_err(|err| invalid_tool_arguments_result(tool_call, err))?;
+        .map_err(|err| Box::new(invalid_tool_arguments_result(tool_call, err)))?;
     if !value.is_object() {
-        return Err(invalid_tool_arguments_result(
+        return Err(Box::new(invalid_tool_arguments_result(
             tool_call,
             format_args!("expected a JSON object, got {}", value_type_name(&value)),
-        ));
+        )));
     }
     Ok(value)
 }
 
-fn parse_tool_arguments_map(tool_call: &ToolCall) -> Result<HashMap<String, Value>, ToolResult> {
+fn parse_tool_arguments_map(
+    tool_call: &ToolCall,
+) -> Result<HashMap<String, Value>, Box<ToolResult>> {
     let value = parse_tool_arguments_value(tool_call)?;
     let Value::Object(map) = value else {
-        return Err(invalid_tool_arguments_result(
+        return Err(Box::new(invalid_tool_arguments_result(
             tool_call,
             format_args!("expected a JSON object, got {}", value_type_name(&value)),
-        ));
+        )));
     };
     Ok(map.into_iter().collect())
 }
@@ -289,14 +285,15 @@ fn gate_or_legacy_result(
         PermissionOutcome::Allowed => None,
         PermissionOutcome::Denied(result) => Some(result),
         PermissionOutcome::NeedsPrompt {
-            tool_call_id,
+            tool_call_id: _,
             tool,
             target,
-        } => Some(ToolResult {
-            tool_call_id,
-            content: legacy_permission_prompt(&tool, &target),
-            is_error: true,
-        }),
+        } => Some(ToolResult::failure(
+            tool_call,
+            ToolFailureCode::PermissionDenied,
+            legacy_permission_prompt(&tool, &target),
+            ToolRetryability::Never,
+        )),
     }
 }
 
@@ -358,7 +355,7 @@ fn execute_tool_with_memory_unchecked(
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
 
     // Subagent tools require full config context; surface a clear error here
@@ -367,13 +364,13 @@ fn execute_tool_with_memory_unchecked(
         tool_call.function.name.as_str(),
         "task" | "agent_output" | "task_stop"
     ) {
-        return ToolResult {
-            tool_call_id: tool_call.id.clone(),
-            content:
-                "Subagent tools require configuration context. Use execute_tool_full() instead."
-                    .to_string(),
-            is_error: true,
-        };
+        return ToolResult::failure(
+            tool_call,
+            ToolFailureCode::Unavailable,
+            "Subagent tools require configuration context. Use execute_tool_full() instead."
+                .to_string(),
+            ToolRetryability::Never,
+        );
     }
 
     let mut ctx = ToolContext {
@@ -383,15 +380,17 @@ fn execute_tool_with_memory_unchecked(
         task_mgr: None,
     };
 
-    let (content, is_error) = registry::registry()
+    let handler_result = registry::registry()
         .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-        .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true));
+        .unwrap_or_else(|| {
+            ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::Unavailable,
+                format!("Unknown tool: {}", tool_call.function.name),
+                ToolRetryability::Never,
+            ))
+        });
 
-    ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content,
-        is_error,
-    }
+    ToolResult::bind(tool_call, &tool_call.function.name, handler_result)
 }
 
 /// Execute a tool call with full context (memory + config for subagents).
@@ -423,7 +422,7 @@ fn execute_tool_full_unchecked(
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
 
     // Check for subagent tools first (they need config). Each match arm
@@ -431,18 +430,28 @@ fn execute_tool_full_unchecked(
     // wrapping happens *after* the match so there is a single return point
     // (crosslink #491 — previously the default arm returned mid-match,
     // bypassing the wrapper and creating asymmetric control flow).
-    let (content, is_error) = match tool_call.function.name.as_str() {
+    let handler_result = match tool_call.function.name.as_str() {
         "task" => app_config.map_or_else(
             || {
-                (
+                ToolHandlerResult::error(ToolFailure::new(
+                    ToolFailureCode::Unavailable,
                     "Task tool requires application configuration".to_string(),
-                    true,
-                )
+                    ToolRetryability::Never,
+                ))
             },
-            |config| subagent::execute_task_tool(&args, config),
+            |config| {
+                let (content, is_error) = subagent::execute_task_tool(&args, config);
+                ToolHandlerResult::legacy(content, is_error)
+            },
         ),
-        "agent_output" => subagent::execute_agent_output_tool(&args),
-        "task_stop" => subagent::execute_task_stop_tool(&args),
+        "agent_output" => {
+            let (content, is_error) = subagent::execute_agent_output_tool(&args);
+            ToolHandlerResult::legacy(content, is_error)
+        }
+        "task_stop" => {
+            let (content, is_error) = subagent::execute_task_stop_tool(&args);
+            ToolHandlerResult::legacy(content, is_error)
+        }
         _ => {
             let mut ctx = ToolContext {
                 security: security::current_context(),
@@ -452,15 +461,17 @@ fn execute_tool_full_unchecked(
             };
             registry::registry()
                 .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-                .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true))
+                .unwrap_or_else(|| {
+                    ToolHandlerResult::error(ToolFailure::new(
+                        ToolFailureCode::Unavailable,
+                        format!("Unknown tool: {}", tool_call.function.name),
+                        ToolRetryability::Never,
+                    ))
+                })
         }
     };
 
-    ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content,
-        is_error,
-    }
+    ToolResult::bind(tool_call, &tool_call.function.name, handler_result)
 }
 
 /// Get all tool definitions, optionally including subagent tools
@@ -480,96 +491,6 @@ pub fn get_all_tool_definitions(subagents: bool) -> Value {
     }
 
     tools
-}
-
-/// Typed control-plane signal carried by a tool result.
-///
-/// crosslink #980: the `enter_plan_mode` / `exit_plan_mode` / `ask_user_question`
-/// tools used to communicate with the main loop via JSON payloads whose `type`
-/// field carried a magic string marker. The dispatcher had to substring-parse
-/// every tool result and route on the marker. This enum is the typed control
-/// plane that the dispatcher should match on instead.
-///
-/// The legacy [`check_tool_result_marker`] returning `Option<String>` is kept
-/// for back-compat callers but should be considered deprecated in favour of
-/// [`parse_tool_control_signal`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolControlSignal {
-    /// `ask_user_question` — the dispatcher must prompt the user and feed
-    /// the answers back into the conversation.
-    UserQuestion,
-    /// `enter_plan_mode` — flip the session into read-only / plan mode.
-    EnterPlanMode,
-    /// `exit_plan_mode` — restore the previous permission posture and show
-    /// the proposed plan to the user for approval.
-    ExitPlanMode,
-}
-
-impl ToolControlSignal {
-    /// Marker string the tool layer embeds in its JSON `type` field. Used by
-    /// [`parse_tool_control_signal`] to recognise the signal.
-    #[must_use]
-    pub const fn marker(self) -> &'static str {
-        match self {
-            Self::UserQuestion => USER_QUESTION_MARKER,
-            Self::EnterPlanMode => ENTER_PLAN_MODE_MARKER,
-            Self::ExitPlanMode => EXIT_PLAN_MODE_MARKER,
-        }
-    }
-}
-
-/// Attempt to interpret `content` as a typed [`ToolControlSignal`].
-///
-/// Returns `None` for ordinary tool results (the overwhelmingly common case)
-/// — only the three control tools produce signals here. crosslink #980.
-#[must_use]
-pub fn parse_tool_control_signal(content: &str) -> Option<ToolControlSignal> {
-    let parsed: Value = serde_json::from_str(content).ok()?;
-    let marker_type = parsed.get("type").and_then(|v| v.as_str())?;
-    match marker_type {
-        USER_QUESTION_MARKER => Some(ToolControlSignal::UserQuestion),
-        ENTER_PLAN_MODE_MARKER => Some(ToolControlSignal::EnterPlanMode),
-        EXIT_PLAN_MODE_MARKER => Some(ToolControlSignal::ExitPlanMode),
-        _ => None,
-    }
-}
-
-/// Legacy back-compat shim around [`parse_tool_control_signal`] that returns
-/// the marker as `Option<String>` rather than the typed [`ToolControlSignal`].
-/// New call sites should prefer the typed variant.
-#[must_use]
-pub fn check_tool_result_marker(content: &str) -> Option<String> {
-    parse_tool_control_signal(content).map(|sig| sig.marker().to_string())
-}
-
-/// Parse user questions from a tool result with the `user_question` marker.
-#[must_use]
-pub fn parse_user_questions(content: &str) -> Option<Vec<Value>> {
-    let parsed: Value = serde_json::from_str(content).ok()?;
-    parsed.get("questions").and_then(|v| v.as_array()).cloned()
-}
-
-/// Parse allowed prompts from an `exit_plan_mode` tool result.
-#[must_use]
-pub fn parse_exit_plan_mode_prompts(content: &str) -> Vec<crate::session::AllowedPrompt> {
-    let parsed: Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    parsed
-        .get("allowed_prompts")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let tool = item.get("tool")?.as_str()?.to_string();
-                    let prompt = item.get("prompt")?.as_str()?.to_string();
-                    Some(crate::session::AllowedPrompt { tool, prompt })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // =========================================================================
@@ -615,7 +536,7 @@ pub fn check_tool_permission_outcome(
     let tool_name = tool_call.function.name.as_str();
     let args = match parse_tool_arguments_value(tool_call) {
         Ok(args) => args,
-        Err(result) => return PermissionOutcome::Denied(result),
+        Err(result) => return PermissionOutcome::Denied(*result),
     };
 
     let Some(mgr) = permission_mgr else {
@@ -644,11 +565,12 @@ pub fn check_tool_permission_outcome(
                 reason = %reason,
                 "permission DENIED"
             );
-            PermissionOutcome::Denied(ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!("Permission denied: {reason}"),
-                is_error: true,
-            })
+            PermissionOutcome::Denied(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: {reason}"),
+                ToolRetryability::Never,
+            ))
         }
         CheckResult::NeedsPrompt { tool, target } => {
             tracing::info!(
@@ -688,14 +610,15 @@ pub fn check_tool_permission_strict(
                 tool = %tool_name,
                 "strict permission check DENIED: no PermissionManager supplied"
             );
-            PermissionOutcome::Denied(ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!(
+            PermissionOutcome::Denied(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!(
                     "Permission denied: no permission manager is configured for tool '{tool_name}'. \
                      Construct PermissionManager::unrestricted() if you explicitly want allow-all."
                 ),
-                is_error: true,
-            })
+                ToolRetryability::Never,
+            ))
         },
         |m| check_tool_permission_outcome(tool_call, Some(m)),
     )
@@ -715,14 +638,15 @@ pub fn check_tool_permission(
         PermissionOutcome::Allowed => None,
         PermissionOutcome::Denied(result) => Some(result),
         PermissionOutcome::NeedsPrompt {
-            tool_call_id,
+            tool_call_id: _,
             tool,
             target,
-        } => Some(ToolResult {
-            tool_call_id,
-            content: legacy_permission_prompt(&tool, &target),
-            is_error: true,
-        }),
+        } => Some(ToolResult::failure(
+            tool_call,
+            ToolFailureCode::PermissionDenied,
+            legacy_permission_prompt(&tool, &target),
+            ToolRetryability::Never,
+        )),
     }
 }
 
@@ -769,7 +693,7 @@ pub(crate) fn execute_tool_with_tasks_unchecked(
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
 
     // Subagent tools (task / agent_output / task_stop) need app_config and are handled
@@ -790,15 +714,17 @@ pub(crate) fn execute_tool_with_tasks_unchecked(
         task_mgr,
     };
 
-    let (content, is_error) = registry::registry()
+    let handler_result = registry::registry()
         .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-        .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true));
+        .unwrap_or_else(|| {
+            ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::Unavailable,
+                format!("Unknown tool: {}", tool_call.function.name),
+                ToolRetryability::Never,
+            ))
+        });
 
-    ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content,
-        is_error,
-    }
+    ToolResult::bind(tool_call, &tool_call.function.name, handler_result)
 }
 
 /// New canonical dispatch: requires a [`PermissionManager`] and uses the strict fail-closed check.
@@ -823,11 +749,13 @@ pub fn execute_tool_with_permission_required(
             tool,
             target,
         } => {
-            return ToolResult {
-                tool_call_id,
-                content: legacy_permission_prompt(&tool, &target),
-                is_error: true,
-            };
+            let _ = tool_call_id;
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                legacy_permission_prompt(&tool, &target),
+                ToolRetryability::Never,
+            );
         }
         PermissionOutcome::Allowed => {}
     }
@@ -1062,7 +990,8 @@ mod tests {
         };
         let result = execute_tool_full(&call, None, None, None);
         assert_eq!(
-            result.tool_call_id, "call-#491-test",
+            result.tool_call_id(),
+            "call-#491-test",
             "default match arm must round-trip the tool_call_id through the single wrapper"
         );
         // Subagent arms behave the same — drive `agent_output` with no
@@ -1078,7 +1007,8 @@ mod tests {
         };
         let agent_result = execute_tool_full(&agent_call, None, None, None);
         assert_eq!(
-            agent_result.tool_call_id, "call-#491-agent",
+            agent_result.tool_call_id(),
+            "call-#491-agent",
             "subagent match arm must round-trip the tool_call_id through the single wrapper"
         );
     }
@@ -2015,8 +1945,8 @@ mod tests {
         };
         match check_tool_permission_strict(&tool_call, None) {
             PermissionOutcome::Denied(r) => {
-                assert!(r.is_error);
-                assert!(r.content.contains("no permission manager"));
+                assert!(r.is_error());
+                assert!(r.content().contains("no permission manager"));
             }
             other => panic!("expected Denied, got {other:?}"),
         }
@@ -2121,16 +2051,16 @@ mod tests {
         let (mgr, _tmp) = deny_all_bash_manager();
         match execute_tool_gated(&tool_call, None, None, None, Some(&mgr)) {
             ExecutionOutcome::Result(r) => {
-                assert!(r.is_error, "denial should mark the result as error");
+                assert!(r.is_error(), "denial should mark the result as error");
                 assert!(
-                    r.content.to_lowercase().contains("denied"),
+                    r.content().to_lowercase().contains("denied"),
                     "expected 'denied' in content, got: {}",
-                    r.content
+                    r.content()
                 );
                 assert!(
-                    !r.content.contains("SHOULD_NOT_RUN"),
+                    !r.content().contains("SHOULD_NOT_RUN"),
                     "tool body ran despite denial — gate bypassed: {}",
-                    r.content
+                    r.content()
                 );
             }
             other @ ExecutionOutcome::NeedsPrompt { .. } => {
@@ -2155,14 +2085,14 @@ mod tests {
         match execute_tool_gated(&tool_call, None, None, None, Some(&mgr)) {
             ExecutionOutcome::Result(r) => {
                 assert!(
-                    !r.is_error,
+                    !r.is_error(),
                     "allowed bash echo should not error; content={}",
-                    r.content
+                    r.content()
                 );
                 assert!(
-                    r.content.contains("HELLO_GATED"),
+                    r.content().contains("HELLO_GATED"),
                     "expected tool body to have run; got: {}",
-                    r.content
+                    r.content()
                 );
             }
             other @ ExecutionOutcome::NeedsPrompt { .. } => {
@@ -2219,11 +2149,11 @@ mod tests {
         // Direct assertion of the strict-check gate: no manager -> Denied.
         match check_tool_permission_strict(&tool_call, None) {
             PermissionOutcome::Denied(r) => {
-                assert!(r.is_error);
+                assert!(r.is_error());
                 assert!(
-                    r.content.contains("no permission manager"),
+                    r.content().contains("no permission manager"),
                     "expected strict-denial message; got {}",
-                    r.content
+                    r.content()
                 );
             }
             other => panic!("expected strict Denied for None mgr, got {other:?}"),
@@ -2236,10 +2166,10 @@ mod tests {
         let mgr = PermissionManager::unrestricted();
         let result = execute_tool_with_permission_required(&tool_call, None, None, None, &mgr);
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "unrestricted manager should pass through; got: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("strict"));
+        assert!(result.content().contains("strict"));
     }
 }

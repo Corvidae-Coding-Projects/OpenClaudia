@@ -21,7 +21,7 @@ pub use policy::{
     validate_command,
 };
 
-use crate::tools::args::{into_legacy, ToolArgError, ToolArgs as _, ToolError, ToolOutput};
+use crate::tools::args::{ToolArgError, ToolArgs as _, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1008,8 +1008,12 @@ fn is_likely_verification_command(command: &str) -> bool {
 /// credential-bearing names such as `DATABASE_URL` are dropped along with
 /// `ANTHROPIC_API_KEY`, `AWS_*`, `_TOKEN`/`_SECRET`/`_PASSWORD`).
 /// See crosslink #257 and #730.
+#[cfg(test)]
 pub fn execute_bash(args: &HashMap<String, Value>) -> (String, bool) {
-    into_legacy(try_execute_bash(args))
+    match try_execute_bash(args) {
+        Ok(output) => output.into(),
+        Err(error) => error.into(),
+    }
 }
 
 /// Process-wide test lock for `BACKGROUND_SHELLS`-touching tests.

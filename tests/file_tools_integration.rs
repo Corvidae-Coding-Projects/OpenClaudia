@@ -51,16 +51,16 @@ fn write_read_edit_read_cross_tool_flow() {
         }),
     );
     let wr = execute_tool(&write_call);
-    assert!(!wr.is_error, "write_file must succeed: {}", wr.content);
+    assert!(!wr.is_error(), "write_file must succeed: {}", wr.content());
     assert!(sub.exists(), "file created on disk");
     assert!(sub.parent().expect("parent").is_dir(), "parent dir created");
 
     // ---- Step 2: read without offset returns all lines (Behavior 1) ----------
     let read_all_call = make_call("read_file", &json!({ "path": sub.to_string_lossy() }));
     let ra = execute_tool(&read_all_call);
-    assert!(!ra.is_error, "read_file must succeed: {}", ra.content);
-    assert!(ra.content.contains("line one"), "all lines present");
-    assert!(ra.content.contains("line three"), "all lines present");
+    assert!(!ra.is_error(), "read_file must succeed: {}", ra.content());
+    assert!(ra.content().contains("line one"), "all lines present");
+    assert!(ra.content().contains("line three"), "all lines present");
 
     // ---- Step 3: read with offset + limit (Behavior 1) ----------------------
     let read_slice_call = make_call(
@@ -73,17 +73,17 @@ fn write_read_edit_read_cross_tool_flow() {
     );
     let rs = execute_tool(&read_slice_call);
     assert!(
-        !rs.is_error,
+        !rs.is_error(),
         "read with offset must succeed: {}",
-        rs.content
+        rs.content()
     );
-    assert!(rs.content.contains("line two"), "offset=2 yields line 2");
-    assert!(!rs.content.contains("line one"), "line 1 excluded");
-    assert!(!rs.content.contains("line three"), "line 3 excluded");
+    assert!(rs.content().contains("line two"), "offset=2 yields line 2");
+    assert!(!rs.content().contains("line one"), "line 1 excluded");
+    assert!(!rs.content().contains("line three"), "line 3 excluded");
     assert!(
-        rs.content.contains("showing lines 2-2 of 3 total"),
+        rs.content().contains("showing lines 2-2 of 3 total"),
         "suffix present: {}",
-        rs.content
+        rs.content()
     );
 
     // ---- Step 4: edit with matching old_string (Behavior 4 happy path) ------
@@ -96,7 +96,7 @@ fn write_read_edit_read_cross_tool_flow() {
         }),
     );
     let eo = execute_tool(&edit_ok_call);
-    assert!(!eo.is_error, "edit_file must succeed: {}", eo.content);
+    assert!(!eo.is_error(), "edit_file must succeed: {}", eo.content());
 
     // ---- Step 5: verify the edit landed on disk -----------------------------
     let disk = fs::read_to_string(&sub).expect("read after edit");
@@ -106,9 +106,9 @@ fn write_read_edit_read_cross_tool_flow() {
     // ---- Step 6: re-read and confirm the new content (Behavior 1 round-trip)
     let read_final = make_call("read_file", &json!({ "path": sub.to_string_lossy() }));
     let rf = execute_tool(&read_final);
-    assert!(!rf.is_error, "re-read must succeed: {}", rf.content);
+    assert!(!rf.is_error(), "re-read must succeed: {}", rf.content());
     assert!(
-        rf.content.contains("LINE TWO (edited)"),
+        rf.content().contains("LINE TWO (edited)"),
         "edited content visible via read"
     );
 
@@ -123,14 +123,14 @@ fn write_read_edit_read_cross_tool_flow() {
     );
     let eb = execute_tool(&edit_bad_call);
     assert!(
-        eb.is_error,
+        eb.is_error(),
         "edit with missing old_string must error: {}",
-        eb.content
+        eb.content()
     );
     assert!(
-        eb.content.contains("Could not find the specified text"),
+        eb.content().contains("Could not find the specified text"),
         "error message: {}",
-        eb.content
+        eb.content()
     );
 
     // File must be unmodified after failed edit
@@ -164,7 +164,7 @@ fn write_creates_deeply_nested_parent_directories() {
         }),
     );
     let r = execute_tool(&call);
-    assert!(!r.is_error, "deep write must succeed: {}", r.content);
+    assert!(!r.is_error(), "deep write must succeed: {}", r.content());
     assert_eq!(fs::read_to_string(&deep).expect("read"), "deep");
 }
 
@@ -189,12 +189,12 @@ fn read_offset_beyond_eof_is_non_error() {
     );
     let r = execute_tool(&call);
     assert!(
-        !r.is_error,
+        !r.is_error(),
         "offset > EOF must NOT be an error in OC: {}",
-        r.content
+        r.content()
     );
     assert!(
-        !r.content.contains("only one line"),
+        !r.content().contains("only one line"),
         "no content after skip"
     );
 }
@@ -218,14 +218,14 @@ fn read_large_file_truncated_as_non_error() {
     let call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
     let r = execute_tool(&call);
     assert!(
-        !r.is_error,
+        !r.is_error(),
         "OC large-file truncation is NOT an error (CC parity gap, Behavior 8): {}",
-        r.content
+        r.content()
     );
     assert!(
-        r.content.contains("file truncated"),
+        r.content().contains("file truncated"),
         "truncation note present: {}",
-        r.content
+        r.content()
     );
 }
 
@@ -245,14 +245,14 @@ fn read_image_extensions_dispatched_as_image() {
         let r = execute_tool(&call);
         // OC returns a plain-text block with base64 (Behavior 2 OC path)
         assert!(
-            !r.is_error,
+            !r.is_error(),
             "image read ({ext}) must succeed: {}",
-            r.content
+            r.content()
         );
         assert!(
-            r.content.contains("[Image:"),
+            r.content().contains("[Image:"),
             "image header for .{ext}: {}",
-            r.content
+            r.content()
         );
     }
 }
@@ -277,16 +277,16 @@ fn glob_tool_finds_matching_files_through_execute_tool() {
     );
     let r = execute_tool(&call);
     assert!(
-        !r.is_error,
+        !r.is_error(),
         "glob must be implemented and succeed through execute_tool: {}",
-        r.content
+        r.content()
     );
-    assert!(r.content.contains("alpha.rs"), "must include alpha.rs");
-    assert!(r.content.contains("beta.rs"), "must include beta.rs");
+    assert!(r.content().contains("alpha.rs"), "must include alpha.rs");
+    assert!(r.content().contains("beta.rs"), "must include beta.rs");
     assert!(
-        !r.content.contains("notes.txt"),
+        !r.content().contains("notes.txt"),
         "*.rs glob must not include notes.txt: {}",
-        r.content
+        r.content()
     );
 }
 
@@ -313,15 +313,15 @@ fn grep_tool_finds_matching_lines_through_execute_tool() {
     );
     let r = execute_tool(&call);
     assert!(
-        !r.is_error,
+        !r.is_error(),
         "grep must be implemented and succeed through execute_tool: {}",
-        r.content
+        r.content()
     );
-    assert!(r.content.contains("needle: important result"));
+    assert!(r.content().contains("needle: important result"));
     assert!(
-        !r.content.contains("no match here"),
+        !r.content().contains("no match here"),
         "grep output must include only matching files/lines: {}",
-        r.content
+        r.content()
     );
 }
 
@@ -353,14 +353,14 @@ fn edit_replace_all_multi_occurrence_replaces_every_match() {
     );
     let r = execute_tool(&edit_call);
     assert!(
-        !r.is_error,
+        !r.is_error(),
         "replace_all multi-occurrence edit must succeed: {}",
-        r.content
+        r.content()
     );
     assert!(
-        r.content.contains("Replaced 3 occurrences"),
+        r.content().contains("Replaced 3 occurrences"),
         "edit output should report every replacement: {}",
-        r.content
+        r.content()
     );
     let disk = fs::read_to_string(&path).expect("read back");
     assert_eq!(disk, "qux bar qux baz qux\n");

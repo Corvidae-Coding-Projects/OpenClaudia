@@ -39,23 +39,26 @@ fn private_session_temp_is_narrow_isolated_and_symlink_safe() {
 
     let own_read = call("read_file", json!({ "path": a_file }));
     assert!(
-        !own_read.is_error,
+        !own_read.is_error(),
         "session must read its own temp: {own_read:?}"
     );
-    assert!(own_read.content.contains("session-a-secret"));
+    assert!(own_read.content().contains("session-a-secret"));
 
     let sibling = tempfile::tempdir().expect("sibling OS temp");
     let sibling_file = sibling.path().join("sibling.txt");
     std::fs::write(&sibling_file, "sibling-secret").expect("write sibling");
     let sibling_read = call("read_file", json!({ "path": sibling_file }));
-    assert!(sibling_read.is_error, "shared OS temp must not be granted");
-    assert!(!sibling_read.content.contains("sibling-secret"));
+    assert!(
+        sibling_read.is_error(),
+        "shared OS temp must not be granted"
+    );
+    assert!(!sibling_read.content().contains("sibling-secret"));
 
     let link = context_a.private_temp_root().join("escape-link");
     std::os::unix::fs::symlink(&sibling_file, &link).expect("plant symlink");
     let link_read = call("read_file", json!({ "path": link }));
-    assert!(link_read.is_error, "temp symlink escape must be denied");
-    assert!(!link_read.content.contains("sibling-secret"));
+    assert!(link_read.is_error(), "temp symlink escape must be denied");
+    assert!(!link_read.content().contains("sibling-secret"));
 
     drop(session_a);
     let _session_b = SessionIdGuard::set("filesystem-private-temp-b");
@@ -67,10 +70,10 @@ fn private_session_temp_is_narrow_isolated_and_symlink_safe() {
     );
     let cross_read = call("read_file", json!({ "path": a_file }));
     assert!(
-        cross_read.is_error,
+        cross_read.is_error(),
         "session B must not read session A temp"
     );
-    assert!(!cross_read.content.contains("session-a-secret"));
+    assert!(!cross_read.content().contains("session-a-secret"));
 }
 
 #[cfg(target_os = "linux")]
@@ -154,7 +157,7 @@ fn intermediate_directory_symlink_swap_cannot_escape_reads_or_writes() {
     for index in 0..500 {
         let read = call("read_file", json!({ "path": live.join("secret.txt") }));
         assert!(
-            !read.content.contains("OUTSIDE-SENTINEL"),
+            !read.content().contains("OUTSIDE-SENTINEL"),
             "confined read returned outside content: {read:?}"
         );
 

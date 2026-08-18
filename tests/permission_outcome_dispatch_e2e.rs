@@ -16,7 +16,8 @@
 use openclaudia::permissions::{PermissionDecision, PermissionManager, PermissionRule};
 use openclaudia::tools::{
     check_tool_permission, check_tool_permission_outcome, check_tool_permission_strict,
-    FunctionCall, PermissionOutcome, ToolCall, ToolResult,
+    FunctionCall, PermissionOutcome, ToolCall, ToolFailureCode, ToolHandlerResult, ToolResult,
+    ToolRetryability,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -108,14 +109,14 @@ fn outcome_preserves_tool_call_id_into_denied_result() {
     let call = tool_call("specific-id-xyz", "bash", &json!({"command": "ls"}));
     let outcome = check_tool_permission_outcome(&call, Some(&mgr));
     if let PermissionOutcome::Denied(result) = outcome {
-        assert_eq!(result.tool_call_id, "specific-id-xyz");
-        assert!(result.is_error);
+        assert_eq!(result.tool_call_id(), "specific-id-xyz");
+        assert!(result.is_error());
         assert!(
-            result.content.contains("denied")
-                || result.content.contains("Denied")
-                || result.content.contains("DENIED"),
+            result.content().contains("denied")
+                || result.content().contains("Denied")
+                || result.content().contains("DENIED"),
             "denied content MUST mention denial; got {:?}",
-            result.content
+            result.content()
         );
     } else {
         panic!("MUST be Denied; got {outcome:?}");
@@ -139,12 +140,12 @@ fn outcome_with_malformed_arguments_json_returns_denied_error() {
     let PermissionOutcome::Denied(result) = outcome else {
         panic!("malformed arguments MUST deny with a tool error; got {outcome:?}");
     };
-    assert_eq!(result.tool_call_id, "c1");
-    assert!(result.is_error);
+    assert_eq!(result.tool_call_id(), "c1");
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Invalid tool arguments JSON"),
+        result.content().contains("Invalid tool arguments JSON"),
         "diagnostic must name malformed arguments; got {:?}",
-        result.content
+        result.content()
     );
 }
 
@@ -161,18 +162,18 @@ fn strict_with_none_manager_returns_denied_not_allowed() {
     let PermissionOutcome::Denied(result) = outcome else {
         panic!("strict + None MUST Deny; got {outcome:?}");
     };
-    assert_eq!(result.tool_call_id, "c1");
-    assert!(result.is_error);
+    assert_eq!(result.tool_call_id(), "c1");
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Permission denied"),
+        result.content().contains("Permission denied"),
         "MUST surface refusal context; got {:?}",
-        result.content
+        result.content()
     );
     // Must mention how to configure (PermissionManager::unrestricted hint).
     assert!(
-        result.content.contains("unrestricted") || result.content.contains("PermissionManager"),
+        result.content().contains("unrestricted") || result.content().contains("PermissionManager"),
         "MUST point at the fix (PermissionManager::unrestricted); got {:?}",
-        result.content
+        result.content()
     );
 }
 
@@ -236,8 +237,8 @@ fn legacy_check_returns_denied_tool_result_when_denied() {
     });
     let call = tool_call("c1", "bash", &json!({"command": "ls"}));
     let result = check_tool_permission(&call, Some(&mgr)).expect("Some");
-    assert!(result.is_error);
-    assert_eq!(result.tool_call_id, "c1");
+    assert!(result.is_error());
+    assert_eq!(result.tool_call_id(), "c1");
 }
 
 #[test]
@@ -250,12 +251,12 @@ fn legacy_check_synthesises_permission_prompt_stringly_typed_result_on_needs_pro
     let call = tool_call("c1", "bash", &json!({"command": "ls"}));
     let result = check_tool_permission(&call, Some(&mgr)).expect("Some");
     assert!(
-        result.content.contains("PERMISSION_PROMPT:"),
+        result.content().contains("PERMISSION_PROMPT:"),
         "legacy shim MUST synthesise PERMISSION_PROMPT stringly-typed marker; got {:?}",
-        result.content
+        result.content()
     );
-    assert!(result.is_error);
-    assert_eq!(result.tool_call_id, "c1");
+    assert!(result.is_error());
+    assert_eq!(result.tool_call_id(), "c1");
 }
 
 #[test]
@@ -300,25 +301,28 @@ fn function_call_serde_preserves_arguments_string_verbatim() {
 
 #[test]
 fn tool_result_carries_id_content_is_error() {
-    let r = ToolResult {
-        tool_call_id: "id-42".to_string(),
-        content: "result body".to_string(),
-        is_error: false,
-    };
-    assert_eq!(r.tool_call_id, "id-42");
-    assert_eq!(r.content, "result body");
-    assert!(!r.is_error);
+    let call = tool_call("id-42", "bash", &json!({}));
+    let r = ToolResult::bind(
+        &call,
+        "bash",
+        ToolHandlerResult::success_text("result body"),
+    );
+    assert_eq!(r.tool_call_id(), "id-42");
+    assert_eq!(r.content(), "result body");
+    assert!(!r.is_error());
 }
 
 #[test]
 fn tool_result_clone_preserves_all_fields() {
-    let original = ToolResult {
-        tool_call_id: "x".to_string(),
-        content: "y".to_string(),
-        is_error: true,
-    };
+    let call = tool_call("x", "bash", &json!({}));
+    let original = ToolResult::failure(
+        &call,
+        ToolFailureCode::External,
+        "y",
+        ToolRetryability::Unknown,
+    );
     let cloned = original.clone();
-    assert_eq!(cloned.tool_call_id, original.tool_call_id);
-    assert_eq!(cloned.content, original.content);
-    assert_eq!(cloned.is_error, original.is_error);
+    assert_eq!(cloned.tool_call_id(), original.tool_call_id());
+    assert_eq!(cloned.content(), original.content());
+    assert_eq!(cloned.is_error(), original.is_error());
 }

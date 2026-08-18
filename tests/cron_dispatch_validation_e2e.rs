@@ -53,6 +53,7 @@ fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch(name, args, &mut ctx)
         .expect("tool must be registered")
+        .into_legacy()
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

@@ -2324,8 +2324,8 @@ fn execute_local_tool_with_permission(
         },
     );
     AcpToolResult {
-        content: result.content,
-        is_error: result.is_error,
+        content: result.content().to_string(),
+        is_error: result.is_error(),
     }
 }
 
@@ -2369,11 +2369,19 @@ fn record_acp_tool_result_observation(
     tool_call_id: &str,
     result: &AcpToolResult,
 ) {
-    let tool_result = crate::tools::ToolResult {
-        tool_call_id: tool_call_id.to_string(),
-        content: result.content.clone(),
-        is_error: result.is_error,
+    let tool_call = crate::tools::ToolCall {
+        id: tool_call_id.to_string(),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: "{}".to_string(),
+        },
     };
+    let tool_result = crate::tools::ToolResult::bind(
+        &tool_call,
+        &tool_call.function.name,
+        crate::tools::ToolHandlerResult::legacy(result.content.clone(), result.is_error),
+    );
     let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
         Ok(ledger) => ledger,
         Err(err) => {

@@ -54,7 +54,6 @@ pub mod subagent;
 pub mod task_spec;
 pub mod team_memory;
 pub mod thinking;
-pub mod tool_intercept;
 pub mod tools;
 pub mod transcript;
 pub mod tui;
