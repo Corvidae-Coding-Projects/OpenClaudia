@@ -1,0 +1,6 @@
+# Crosslink trusted signers
+# Format: <principal> <key-type> <base64-key> [comment]
+# approved by human backfill at 2026-04-01
+backfill@crosslink ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHtCmOJf2exv735MdNJBcGbWNxYw/JXXulXDzUjU9OpMi+WVJ80BmyVDMznZRXeubP0Qs2YVSUFaJy0N8is4qRg= texas@dollspace
+# self-registered as workspace signing key at 2026-05-18 15:06:15 UTC
+lOrm@crosslink ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKo+flEdaJYO8NPs2cLlm7FqczNhZVbMbKNZfq5/HUnw doll@dollspace
