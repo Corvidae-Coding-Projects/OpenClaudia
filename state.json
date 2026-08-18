@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1005,
+  "next_display_id": 1006,
   "next_comment_id": 689,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -536,6 +536,7 @@
     "99a70c21-d410-40b9-b04e-ad6655f42683": 659,
     "99c40919-1140-4cd4-b304-337fc3a4c137": 685,
     "99c4e64b-8b3d-49a2-8730-5d39b0a08e99": 612,
+    "99cc9588-0963-48eb-a6f4-8c7ef4ea1832": 1005,
     "9a565812-cbfd-4445-8fe5-2b38fc858436": 349,
     "9a9484d3-e770-4ad5-aefd-218cd247b14e": 458,
     "9abd06c8-8577-4336-abee-4430c8b9bc77": 183,
@@ -12903,6 +12904,16 @@
         }
       }
     },
+    "99cc9588-0963-48eb-a6f4-8c7ef4ea1832": {
+      "uuid": "99cc9588-0963-48eb-a6f4-8c7ef4ea1832",
+      "display_id": 1005,
+      "title": "S-016: require effect classification for every tool (F-001, F-052)",
+      "status": "open",
+      "priority": "critical",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-18T22:08:13.492515592Z",
+      "updated_at": "2026-08-18T22:08:13.492515592Z"
+    },
     "9a565812-cbfd-4445-8fe5-2b38fc858436": {
       "uuid": "9a565812-cbfd-4445-8fe5-2b38fc858436",
       "display_id": 349,
@@ -21631,11 +21642,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 6,
       "timestamp": "2026-08-18T22:02:59.340123046Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 7,
+      "timestamp": "2026-08-18T22:08:13.492515592Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-18T22:02:59.340123046Z",
+    "timestamp": "2026-08-18T22:08:13.492515592Z",
     "agent_id": "6Vw9",
-    "agent_seq": 6
+    "agent_seq": 7
   }
 }
