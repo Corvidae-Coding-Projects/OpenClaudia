@@ -1,6 +1,6 @@
 {
   "next_display_id": 1006,
-  "next_comment_id": 695,
+  "next_comment_id": 696,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -12917,7 +12917,7 @@
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-18T22:08:13.492515592Z",
-      "updated_at": "2026-08-18T23:56:47.988310005Z",
+      "updated_at": "2026-08-19T00:25:58.172242812Z",
       "labels": [
         "remediation"
       ],
@@ -12966,6 +12966,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgvJGOptnvpD0+YiAyE536/yQzyT1U39O/1FwesnrG0ugQNP6DEMl7jyioMgBv05ueVK2XIV+dcnQXqRv3CuJCw=="
+        },
+        "b84f7457-7794-436a-a18b-29f1376150a8": {
+          "display_id": 695,
+          "author": "6Vw9",
+          "content": "Adversarial review of inherited S-016 work found and corrected three misleading green-test/implementation claims: (1) exit_worktree's apply and nominal clean paths were classified WorkspaceMutation even though all paths end in git worktree remove --force and argument-only classification cannot prove ignored files absent; all variants now conservatively classify Destructive. (2) hooks_permissions_e2e claimed first-match behavior but inserted deny before allow, so it passed under either policy; it now inserts the broad allow first and proves a later narrow deny wins. (3) permission_check_auto_allow_e2e asserted read-only denials were unreachable using the wrong canonical tool name; it now uses Read plus a concrete path and proves denial beats the 1.0 score. Added an independent subagent wire-schema/effect-target drift test. Focused changed binaries pass (213 tests total), permissions filter 100/100, Crosslink unit 9/9, effect unit 8/8, worktree 26/26, bash output 8/8. Full serialized gates still pending.",
+          "created_at": "2026-08-19T00:25:58.145502978Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo7pEVVNvhqX0M+dNnXXRu3Xlb0o0E+fiBrpk7eH+TpQieMnrUF6bSJJtwZe2t4zCEnIVrovHQyDX9k34+xQLBA=="
         },
         "bf2e34a4-5b56-4fce-9803-a71ea22dfbb4": {
           "display_id": 694,
@@ -21751,11 +21760,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 15,
       "timestamp": "2026-08-18T23:56:47.988310005Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 16,
+      "timestamp": "2026-08-19T00:25:58.172242812Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-18T23:56:47.988310005Z",
+    "timestamp": "2026-08-19T00:25:58.172242812Z",
     "agent_id": "6Vw9",
-    "agent_seq": 15
+    "agent_seq": 16
   }
 }
