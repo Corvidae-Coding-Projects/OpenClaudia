@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1016,
+  "next_display_id": 1017,
   "next_comment_id": 723,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -279,6 +279,7 @@
     "4cf0cc49-df34-44e1-bb89-e7661802ea85": 239,
     "4d9cdc7a-0a00-4231-bfd4-bd372fecc427": 825,
     "4daca27e-b7c9-4006-bdc9-1d6da2bd142e": 436,
+    "4db17d5d-5f29-4d40-ba17-e408b4a0a37a": 1016,
     "4df6ebfa-8eb5-46fe-b2e7-87ad55c197d0": 521,
     "4e25b12f-3207-4289-94c2-b7f495056a16": 489,
     "4e49d924-940b-46f1-b4c2-28c899f5fd61": 254,
@@ -7170,6 +7171,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABACxwJc6ozZkR5tERRW2soBbukGZgfGQyhp9iycc+2HwQeqsGZStAOzHJ/aBIPPZiCrWMbd0gfcip/CylKA803Bw=="
         }
       }
+    },
+    "4db17d5d-5f29-4d40-ba17-e408b4a0a37a": {
+      "uuid": "4db17d5d-5f29-4d40-ba17-e408b4a0a37a",
+      "display_id": 1016,
+      "title": "Make permit consumption atomic with generation and exact-denial refresh",
+      "description": "S-017 concurrency review found consume_execution_permit calls sync_generation, releases the trusted-store lock, then separately reclassifies and consumes the permit. Another live manager can rotate capability generation or write an exact denial in that interval, allowing stale authority to pass. Move persisted refresh/generation reconciliation, exact-denial recheck, expected-scope construction, and one-use permit consumption under the same in-process state lock and cross-process store lock; retain fail-closed persistence behavior and multi-manager coverage.",
+      "status": "open",
+      "priority": "critical",
+      "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T04:06:29.144974264Z",
+      "updated_at": "2026-08-19T04:06:29.144974264Z"
     },
     "4df6ebfa-8eb5-46fe-b2e7-87ad55c197d0": {
       "uuid": "4df6ebfa-8eb5-46fe-b2e7-87ad55c197d0",
@@ -22490,11 +22503,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 74,
       "timestamp": "2026-08-19T04:03:53.169216033Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 75,
+      "timestamp": "2026-08-19T04:06:29.144974264Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:03:53.169216033Z",
+    "timestamp": "2026-08-19T04:06:29.144974264Z",
     "agent_id": "6Vw9",
-    "agent_seq": 74
+    "agent_seq": 75
   }
 }
