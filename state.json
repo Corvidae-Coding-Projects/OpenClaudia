@@ -1,6 +1,6 @@
 {
   "next_display_id": 1022,
-  "next_comment_id": 741,
+  "next_comment_id": 742,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17892,7 +17892,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:28:15.880398728Z",
-      "updated_at": "2026-08-19T05:35:06.923623054Z",
+      "updated_at": "2026-08-19T06:16:14.477614361Z",
       "labels": [
         "security"
       ],
@@ -17923,6 +17923,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJQH1NGdXqWN64LH3t8r95MjLjqQQQ3cRVtxzF7FYElz7NgxyqYpthinRsb3MQSo2KVfL4ngxXSgHw2SPXl+1BA=="
+        },
+        "bb65e941-94a7-4f4f-b225-4e5b12c8c7cb": {
+          "display_id": 741,
+          "author": "6Vw9",
+          "content": "Full-suite review found a real recurrence of ACP process-tree cancellation under load: the parent sandbox was reported terminated but a daemonized descendant survived long enough to mutate the project. Recording it as a separate issue and fixing it because it blocks S-018's required full gate; the adversarial test will not be weakened.",
+          "created_at": "2026-08-19T06:16:14.474638988Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAhgdk1Cw+ObGBhmCkNQ72GSZXyvw1gHgOVBIK0tY8A43ueOBGJcB92L8+E5mn6EQKR/vQj3sPmUqpotoaVyZ7Bw=="
         },
         "c0afec5a-6d72-4c93-bbd0-ef937749ec27": {
           "display_id": 740,
@@ -22998,11 +23007,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 121,
       "timestamp": "2026-08-19T06:16:10.269155737Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 122,
+      "timestamp": "2026-08-19T06:16:14.477614361Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T06:16:10.269155737Z",
+    "timestamp": "2026-08-19T06:16:14.477614361Z",
     "agent_id": "6Vw9",
-    "agent_seq": 121
+    "agent_seq": 122
   }
 }
