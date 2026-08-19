@@ -1,6 +1,6 @@
 {
   "next_display_id": 1029,
-  "next_comment_id": 816,
+  "next_comment_id": 817,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20474,7 +20474,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T14:50:39.964999817Z",
-      "updated_at": "2026-08-19T18:44:01.126330718Z",
+      "updated_at": "2026-08-19T18:44:23.375583098Z",
       "labels": [
         "remediation"
       ],
@@ -20619,6 +20619,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAm2FuqNtDcL/8Uk8X8UkGV1TmDCxjK8jjY1n6X1WZohNzEb7eW5CozDUlF9/TnrbbGm0DXxQmcDx+QMyRy0KhAA=="
+        },
+        "f02add77-aeb2-404b-b879-226db3eb4e62": {
+          "display_id": 816,
+          "author": "6Vw9",
+          "content": "Publication verified for S019-G2: local HEAD, origin/agent/refactor-agent-system-remediation, and draft PR #66 all point to 9bc74ceb1404f0d23f44dfd0f032510617449eed. Hosted Sandbox security run 32288944565 is in progress with Linux, macOS fail-closed, and Windows fail-closed jobs started.",
+          "created_at": "2026-08-19T18:44:23.373008300Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATNyTaW7Q/sNeWfhXGYpc+QwRdwcZvQrYFRGXJSLDlEVZUclma5GjlRhpJQvTBsuZBXoct5kEgi2yJeFiOK2NCA=="
         },
         "f5da6e3f-5673-42ba-87a4-14a2e195aaa1": {
           "display_id": 812,
@@ -24386,11 +24395,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 235,
       "timestamp": "2026-08-19T18:44:01.126330718Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 236,
+      "timestamp": "2026-08-19T18:44:23.375583098Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T18:44:01.126330718Z",
+    "timestamp": "2026-08-19T18:44:23.375583098Z",
     "agent_id": "6Vw9",
-    "agent_seq": 235
+    "agent_seq": 236
   }
 }
