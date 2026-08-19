@@ -1,6 +1,6 @@
 {
   "next_display_id": 1020,
-  "next_comment_id": 738,
+  "next_comment_id": 739,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17860,7 +17860,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:28:15.880398728Z",
-      "updated_at": "2026-08-19T04:28:32.985704355Z",
+      "updated_at": "2026-08-19T04:34:40.893066500Z",
       "labels": [
         "security"
       ],
@@ -17873,6 +17873,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAE71tZ5aIxTvaIanMZosfN55s5bohwlU0zZPT3GCeDKjZr63UjjSZCC8R9q/MoRp2XYhex6huLnYbk1jUhXeXDQ=="
+        },
+        "aeb74267-24f6-4477-9aa8-1cbf3d535aff": {
+          "display_id": 738,
+          "author": "6Vw9",
+          "content": "Preflight: S-018 remains live. Hard safety is private to PermissionManager; manager-less tools wrappers and ToolExecutor allow after classification only; registry().dispatch and handler execute are public alternate dispatches. Project YAML is merged without provenance, including permissions.enabled/default_allow and web_fetch.preapproved_domains. Preferred architecture: independent non-configurable host-safety evaluator at permission and final dispatch boundaries; opaque exact dispatch authorization for registry internals; concrete PermissionManager on public execution APIs; strip project grant-like values into a visible inert proposal while preserving trusted home/env/CLI behavior. Alternative of synthesizing unrestricted managers was rejected because it preserves the coupling/bypass shape. Rules inputs confirmed zero-byte. Planned gates: focused config/permission/dispatch/frontend tests, full all-feature tests, strict Clippy, fmt/diff, Windows lib check, serial only.",
+          "created_at": "2026-08-19T04:34:40.890466304Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJQH1NGdXqWN64LH3t8r95MjLjqQQQ3cRVtxzF7FYElz7NgxyqYpthinRsb3MQSo2KVfL4ngxXSgHw2SPXl+1BA=="
         }
       }
     },
@@ -22894,11 +22903,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 112,
       "timestamp": "2026-08-19T04:28:32.985704355Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 113,
+      "timestamp": "2026-08-19T04:34:40.893066500Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:28:32.985704355Z",
+    "timestamp": "2026-08-19T04:34:40.893066500Z",
     "agent_id": "6Vw9",
-    "agent_seq": 112
+    "agent_seq": 113
   }
 }
