@@ -12,21 +12,14 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch_list(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("list_files", args, &mut ctx)
-        .expect("list_files must be registered")
-        .into_legacy()
+    support::dispatch_tool("list_files", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -54,7 +47,9 @@ fn path_arg_as_number_returns_validation_error() {
     let (msg, is_err) = dispatch_list(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'path' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'path'"),
         "non-string path MUST be rejected; got {msg:?}"
     );
 }

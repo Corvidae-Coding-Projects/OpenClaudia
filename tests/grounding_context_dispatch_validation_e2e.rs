@@ -6,22 +6,14 @@
 #![allow(clippy::expect_used)]
 
 use openclaudia::ledger::{project_session_ledger_path, ObsId};
-use openclaudia::tools::registry::{registry, ToolContext};
 use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("grounding_context", args, &mut ctx)
-        .expect("grounding_context must be registered")
-        .into_legacy()
+    support::dispatch_tool("grounding_context", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

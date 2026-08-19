@@ -1,13 +1,11 @@
-//! End-to-end tests for `tools::check_tool_permission_outcome` +
-//! `check_tool_permission_strict` + `check_tool_permission`
-//! legacy-shim dispatch path.
+//! End-to-end tests for the mandatory-manager permission outcome APIs.
 //!
 //! Sprint 83 of the verification effort. The permission-gate
 //! is the chokepoint between every model tool-call and the
 //! tool body — crosslink #460 mandated point 1 says strict
-//! check MUST fail-closed on missing manager, and mandated
-//! point 4 says the gate emits a structured tracing event at
-//! every decision. This file pins those contracts.
+//! Every callable gate now requires a concrete manager. Explicit prompt
+//! bypass is represented by `PermissionManager::unrestricted`, while hard
+//! host safety remains active.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
@@ -15,9 +13,8 @@
 
 use openclaudia::permissions::{PermissionDecision, PermissionManager, PermissionRule};
 use openclaudia::tools::{
-    check_tool_permission, check_tool_permission_outcome, check_tool_permission_strict,
-    FunctionCall, PermissionOutcome, ToolCall, ToolFailureCode, ToolHandlerResult, ToolResult,
-    ToolRetryability,
+    check_tool_permission, check_tool_permission_outcome, FunctionCall, PermissionOutcome,
+    ToolCall, ToolFailureCode, ToolHandlerResult, ToolResult, ToolRetryability,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -44,13 +41,14 @@ fn fresh_manager() -> (PermissionManager, TempDir) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — check_tool_permission_outcome with no manager (bypass)
+// Section A — explicit prompt-bypass managers
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn outcome_with_none_manager_returns_allowed_bypass() {
+fn outcome_with_explicit_unrestricted_manager_allows_safe_call() {
+    let manager = PermissionManager::unrestricted();
     let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission_outcome(&call, None);
+    let outcome = check_tool_permission_outcome(&call, &manager);
     assert!(matches!(outcome, PermissionOutcome::Allowed));
 }
 
@@ -63,7 +61,7 @@ fn outcome_with_disabled_manager_allows_classified_safe_call() {
         Vec::new(),
     );
     let call = tool_call("c1", "bash", &json!({"command": "git status"}));
-    let outcome = check_tool_permission_outcome(&call, Some(&mgr));
+    let outcome = check_tool_permission_outcome(&call, &mgr);
     assert!(
         matches!(outcome, PermissionOutcome::Allowed),
         "disabled manager should skip prompts for a classified safe call"
@@ -75,7 +73,7 @@ fn outcome_with_disabled_manager_keeps_hard_safety_denials() {
     let mgr = PermissionManager::unrestricted();
     let call = tool_call("c1", "bash", &json!({"command": "rm -rf /"}));
     assert!(matches!(
-        check_tool_permission_outcome(&call, Some(&mgr)),
+        check_tool_permission_outcome(&call, &mgr),
         PermissionOutcome::Denied(_)
     ));
 }
@@ -88,7 +86,7 @@ fn outcome_with_disabled_manager_keeps_hard_safety_denials() {
 fn outcome_enabled_manager_with_no_rules_returns_needs_prompt() {
     let (mgr, _dir) = fresh_manager();
     let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission_outcome(&call, Some(&mgr));
+    let outcome = check_tool_permission_outcome(&call, &mgr);
     let PermissionOutcome::NeedsPrompt { tool_call_id, .. } = outcome else {
         panic!("MUST be NeedsPrompt for no-rules manager + permission-target tool");
     };
@@ -99,7 +97,7 @@ fn outcome_enabled_manager_with_no_rules_returns_needs_prompt() {
 fn outcome_unrestricted_manager_returns_allowed() {
     let mgr = PermissionManager::unrestricted();
     let call = tool_call("c1", "bash", &json!({"command": "anything"}));
-    let outcome = check_tool_permission_outcome(&call, Some(&mgr));
+    let outcome = check_tool_permission_outcome(&call, &mgr);
     assert!(matches!(outcome, PermissionOutcome::Allowed));
 }
 
@@ -115,7 +113,7 @@ fn outcome_preserves_tool_call_id_into_denied_result() {
         decision: PermissionDecision::Deny,
     });
     let call = tool_call("specific-id-xyz", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission_outcome(&call, Some(&mgr));
+    let outcome = check_tool_permission_outcome(&call, &mgr);
     if let PermissionOutcome::Denied(result) = outcome {
         assert_eq!(result.tool_call_id(), "specific-id-xyz");
         assert!(result.is_error());
@@ -144,7 +142,8 @@ fn outcome_with_malformed_arguments_json_returns_denied_error() {
             arguments: "not valid json {{".to_string(),
         },
     };
-    let outcome = check_tool_permission_outcome(&call, None);
+    let manager = PermissionManager::unrestricted();
+    let outcome = check_tool_permission_outcome(&call, &manager);
     let PermissionOutcome::Denied(result) = outcome else {
         panic!("malformed arguments MUST deny with a tool error; got {outcome:?}");
     };
@@ -158,79 +157,14 @@ fn outcome_with_malformed_arguments_json_returns_denied_error() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section C — check_tool_permission_strict
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn strict_with_none_manager_returns_denied_not_allowed() {
-    // PINS CROSSLINK #460 MANDATED POINT 1: strict variant
-    // MUST refuse when no manager is configured.
-    let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission_strict(&call, None);
-    let PermissionOutcome::Denied(result) = outcome else {
-        panic!("strict + None MUST Deny; got {outcome:?}");
-    };
-    assert_eq!(result.tool_call_id(), "c1");
-    assert!(result.is_error());
-    assert!(
-        result.content().contains("Permission denied"),
-        "MUST surface refusal context; got {:?}",
-        result.content()
-    );
-    // Must mention how to configure (PermissionManager::unrestricted hint).
-    assert!(
-        result.content().contains("unrestricted") || result.content().contains("PermissionManager"),
-        "MUST point at the fix (PermissionManager::unrestricted); got {:?}",
-        result.content()
-    );
-}
-
-#[test]
-fn strict_with_unrestricted_manager_returns_allowed() {
-    let mgr = PermissionManager::unrestricted();
-    let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission_strict(&call, Some(&mgr));
-    assert!(matches!(outcome, PermissionOutcome::Allowed));
-}
-
-#[test]
-fn strict_with_disabled_manager_still_returns_allowed() {
-    // Disabled is an EXPLICIT opt-out (caller built the
-    // manager + chose disabled). Strict defers to normal
-    // outcome path which bypasses on disabled. Documented.
-    let dir = TempDir::new().expect("tempdir");
-    let mgr = PermissionManager::new(dir.path().join("p.json"), false, Vec::new());
-    let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission_strict(&call, Some(&mgr));
-    assert!(
-        matches!(outcome, PermissionOutcome::Allowed),
-        "disabled manager via strict MUST Allow (explicit opt-out)"
-    );
-}
-
-#[test]
-fn strict_propagates_denial_from_enabled_manager() {
-    let dir = TempDir::new().expect("tempdir");
-    let mut mgr = PermissionManager::new(dir.path().join("p.json"), true, Vec::new());
-    mgr.add_session_rule(PermissionRule {
-        tool: "Bash".to_string(),
-        pattern: "*".to_string(),
-        decision: PermissionDecision::Deny,
-    });
-    let call = tool_call("call-99", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission_strict(&call, Some(&mgr));
-    assert!(matches!(outcome, PermissionOutcome::Denied(_)));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section D — check_tool_permission legacy back-compat shim
+// Section C — check_tool_permission compatibility projection
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn legacy_check_returns_none_when_allowed() {
     let mgr = PermissionManager::unrestricted();
     let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission(&call, Some(&mgr));
+    let outcome = check_tool_permission(&call, &mgr);
     assert!(outcome.is_none());
 }
 
@@ -244,7 +178,7 @@ fn legacy_check_returns_denied_tool_result_when_denied() {
         decision: PermissionDecision::Deny,
     });
     let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let result = check_tool_permission(&call, Some(&mgr)).expect("Some");
+    let result = check_tool_permission(&call, &mgr).expect("Some");
     assert!(result.is_error());
     assert_eq!(result.tool_call_id(), "c1");
 }
@@ -257,7 +191,7 @@ fn legacy_check_synthesises_permission_prompt_stringly_typed_result_on_needs_pro
     // typed enum still see something.
     let (mgr, _dir) = fresh_manager();
     let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let result = check_tool_permission(&call, Some(&mgr)).expect("Some");
+    let result = check_tool_permission(&call, &mgr).expect("Some");
     assert!(
         result.content().contains("PERMISSION_PROMPT:"),
         "legacy shim MUST synthesise PERMISSION_PROMPT stringly-typed marker; got {:?}",
@@ -268,15 +202,15 @@ fn legacy_check_synthesises_permission_prompt_stringly_typed_result_on_needs_pro
 }
 
 #[test]
-fn legacy_check_returns_none_with_no_manager_no_panic() {
+fn compatibility_check_with_explicit_unrestricted_manager_allows() {
+    let manager = PermissionManager::unrestricted();
     let call = tool_call("c1", "bash", &json!({"command": "ls"}));
-    let outcome = check_tool_permission(&call, None);
-    // None manager → bypass → None.
+    let outcome = check_tool_permission(&call, &manager);
     assert!(outcome.is_none());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section E — ToolCall / ToolResult / FunctionCall serde
+// Section D — ToolCall / ToolResult / FunctionCall serde
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]

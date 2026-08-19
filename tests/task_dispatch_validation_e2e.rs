@@ -12,23 +12,16 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::session::TaskManager;
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+mod support;
 
 const NO_SESSION_MARKER: &str = "Task management not available (no session)";
 
 fn dispatch_without_session(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
-        .into_legacy()
+    support::dispatch_tool_with_tasks(name, args, None)
 }
 
 fn dispatch_with_session(
@@ -36,16 +29,7 @@ fn dispatch_with_session(
     args: &HashMap<String, Value>,
     tm: &mut TaskManager,
 ) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: Some(tm),
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
-        .into_legacy()
+    support::dispatch_tool_with_tasks(name, args, Some(tm))
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -246,7 +230,9 @@ fn task_get_non_string_task_id_arg_errors() {
     let (msg, is_err) = dispatch_with_session("task_get", &args, &mut tm);
     assert!(is_err);
     assert_ne!(msg, NO_SESSION_MARKER);
-    assert!(msg.contains("Invalid 'task_id' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'task_id'"));
 }
 
 #[test]
@@ -287,7 +273,9 @@ fn task_update_non_string_task_id_errors() {
     let (msg, is_err) = dispatch_with_session("task_update", &args, &mut tm);
     assert!(is_err);
     assert_ne!(msg, NO_SESSION_MARKER);
-    assert!(msg.contains("Invalid 'task_id' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'task_id'"));
 }
 
 #[test]

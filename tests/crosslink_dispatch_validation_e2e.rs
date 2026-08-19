@@ -15,21 +15,13 @@
 #![allow(clippy::expect_used)]
 
 use openclaudia::tools::crosslink::{classify_operation, OPERATIONS};
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("crosslink", args, &mut ctx)
-        .expect("crosslink must be registered")
-        .into_legacy()
+    support::dispatch_tool("crosslink", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

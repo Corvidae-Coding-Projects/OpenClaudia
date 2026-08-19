@@ -11,48 +11,23 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("bash_output", args, &mut ctx)
-        .expect("bash_output must be registered")
-        .into_legacy()
+    support::dispatch_tool("bash_output", args)
 }
 
 fn dispatch_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("kill_shell", args, &mut ctx)
-        .expect("kill_shell must be registered")
-        .into_legacy()
+    support::dispatch_tool("kill_shell", args)
 }
 
 fn dispatch_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("kill_shells_for_agent", args, &mut ctx)
-        .expect("kill_shells_for_agent must be registered")
-        .into_legacy()
+    support::dispatch_tool("kill_shells_for_agent", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -61,6 +36,17 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
         m.insert((*k).to_string(), v.clone());
     }
     m
+}
+
+fn assert_classification_denial(message: &str, argument: &str) {
+    assert!(message.contains("Host safety"), "got {message:?}");
+    assert!(message.contains(argument), "got {message:?}");
+    assert!(
+        message.contains("malformed")
+            || message.contains("Missing")
+            || message.contains("could not be classified"),
+        "got {message:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -96,7 +82,7 @@ fn bash_output_with_number_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", json!(42))]);
     let (msg, is_err) = dispatch_bash_output(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'shell_id' argument: expected string"));
+    assert_classification_denial(&msg, "shell_id");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -145,10 +131,7 @@ fn kill_shell_with_number_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", json!(42))]);
     let (msg, is_err) = dispatch_kill_shell(&args);
     assert!(is_err);
-    assert!(
-        msg.contains("Invalid 'shell_id' argument: expected string"),
-        "non-string shell_id MUST be rejected clearly; got {msg:?}"
-    );
+    assert_classification_denial(&msg, "shell_id");
 }
 
 #[test]
@@ -156,7 +139,7 @@ fn kill_shell_with_array_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", json!(["a"]))]);
     let (msg, is_err) = dispatch_kill_shell(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'shell_id' argument: expected string"));
+    assert_classification_denial(&msg, "shell_id");
 }
 
 #[test]
@@ -164,7 +147,7 @@ fn kill_shell_with_object_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", json!({"k": "v"}))]);
     let (msg, is_err) = dispatch_kill_shell(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'shell_id' argument: expected string"));
+    assert_classification_denial(&msg, "shell_id");
 }
 
 #[test]
@@ -172,7 +155,7 @@ fn kill_shell_with_null_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", Value::Null)]);
     let (msg, is_err) = dispatch_kill_shell(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'shell_id' argument: expected string"));
+    assert_classification_denial(&msg, "shell_id");
 }
 
 #[test]
@@ -190,10 +173,7 @@ fn kill_shells_for_agent_with_non_string_agent_id_returns_validation_error() {
     let args = args_with(&[("agent_id", json!(42))]);
     let (msg, is_err) = dispatch_kill_shells_for_agent(&args);
     assert!(is_err);
-    assert!(
-        msg.contains("Invalid 'agent_id' argument: expected string"),
-        "non-string agent_id MUST be rejected clearly; got {msg:?}"
-    );
+    assert_classification_denial(&msg, "agent_id");
 }
 
 #[test]
@@ -201,7 +181,7 @@ fn kill_shells_for_agent_with_empty_agent_id_treated_as_missing() {
     let args = args_with(&[("agent_id", json!(""))]);
     let (msg, is_err) = dispatch_kill_shells_for_agent(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'agent_id' argument"));
+    assert_classification_denial(&msg, "agent_id");
 }
 
 #[test]

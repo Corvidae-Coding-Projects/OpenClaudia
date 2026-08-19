@@ -61,7 +61,7 @@ impl ActiveSandboxProcess {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&owner);
         if cancelled {
-            crate::tools::bash::terminate_process_tree(pid);
+            crate::tools::bash::terminate_sandbox_process_tree(pid);
         }
         Self { owner, pid }
     }
@@ -94,7 +94,7 @@ pub fn cancel_session_sandbox_processes(session_id: &str) -> usize {
         .map(|pids| pids.iter().copied().collect())
         .unwrap_or_default();
     for pid in &pids {
-        crate::tools::bash::terminate_process_tree(*pid);
+        crate::tools::bash::terminate_sandbox_process_tree(*pid);
     }
     if !pids.is_empty() {
         tracing::info!(

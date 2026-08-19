@@ -787,7 +787,7 @@ impl AcpServer {
         let merged_hooks = load_effective_hooks(config.hooks.clone());
         let hook_engine = HookEngine::new(merged_hooks);
         let permission_mgr = Arc::new(crate::permissions::PermissionManager::trusted(
-            true,
+            config.permissions.enabled,
             config.permissions.default_allow.clone(),
             config.web_fetch.preapproved_domains.clone(),
         ));
@@ -2309,7 +2309,7 @@ fn execute_local_tool_with_permission(
             memory_db: None,
             app_config: None,
             task_mgr: None,
-            permission_mgr: Some(permission_mgr),
+            permission_mgr,
             authorization: None,
             session_id: Some(session_id),
             policy_enforcer,

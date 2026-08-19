@@ -11,21 +11,13 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch_notebook(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("notebook_edit", args, &mut ctx)
-        .expect("notebook_edit must be registered")
-        .into_legacy()
+    support::dispatch_tool("notebook_edit", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -56,7 +48,9 @@ fn notebook_path_as_number_returns_validation_error() {
     let args = args_with(&[("notebook_path", json!(42)), ("new_source", json!("body"))]);
     let (msg, is_err) = dispatch_notebook(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'notebook_path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'notebook_path'"));
 }
 
 #[test]
@@ -67,7 +61,8 @@ fn notebook_path_as_null_returns_validation_error() {
     ]);
     let (msg, is_err) = dispatch_notebook(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'notebook_path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("Missing 'notebook_path' argument"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

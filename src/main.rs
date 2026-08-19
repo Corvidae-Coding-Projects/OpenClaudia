@@ -719,7 +719,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     app.vdd_builder_auth = builder_vdd_auth;
     app.app_config = Some(std::sync::Arc::new(config.clone()));
     app.apply_startup_resume(resume, session_id);
-    app.set_permission_bypass(dangerously_skip_permissions);
+    app.set_permission_bypass(dangerously_skip_permissions || !config.permissions.enabled);
     app.set_analytics_sink(std::sync::Arc::new(
         openclaudia::services::analytics::TracingAnalytics,
     ));
@@ -774,9 +774,6 @@ fn tool_call_description(tool_name: &str, tool_args: &serde_json::Value) -> Stri
 /// (`bash`, `write_file`, `edit_file`, etc.) prompt the user unless the tool has been
 /// marked "always allow" for this session via a previous `a` response.
 ///
-/// Use [`check_tool_unrestricted`] instead when running in headless/non-interactive mode
-/// where all tool calls must be auto-approved (e.g. `--dangerously-skip-permissions`).
-///
 /// # Fix #284
 ///
 /// This function replaces the old `check_tool_permission_interactive(skip_permissions: bool, …)`
@@ -801,7 +798,7 @@ fn parse_interactive_permission_arguments(
 fn check_tool_permission_interactive(
     tool_call: &openclaudia::tools::ToolCall,
     session_id: &str,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
     transient_allow_rules: &[PermissionRule],
 ) -> ToolPermissionResult {
     use std::io::Write as _;
@@ -812,35 +809,20 @@ fn check_tool_permission_interactive(
         Err(reason) => return ToolPermissionResult::Denied(reason),
     };
 
-    if let Some(mgr) = permission_mgr {
-        match mgr.authorize_tool_call_with_transient_rules(
-            tool_call,
-            Some(session_id),
-            transient_allow_rules,
-        ) {
-            AuthorizationResult::Allowed(permit) => {
-                return ToolPermissionResult::Allowed {
-                    authorization: Some(permit),
-                };
-            }
-            AuthorizationResult::Denied(reason) => {
-                return ToolPermissionResult::Denied(format!("Permission denied: {reason}"));
-            }
-            AuthorizationResult::NeedsPrompt { .. } => {}
+    match permission_mgr.authorize_tool_call_with_transient_rules(
+        tool_call,
+        Some(session_id),
+        transient_allow_rules,
+    ) {
+        AuthorizationResult::Allowed(permit) => {
+            return ToolPermissionResult::Allowed {
+                authorization: Some(permit),
+            };
         }
-    } else {
-        // The compatibility path without a manager may skip a prompt only for
-        // a positively classified read-only call. Unknown/malformed calls are
-        // denied here instead of being user-approved under no known effect.
-        match openclaudia::tools::effect::resolve_for_call(tool_name, &tool_args) {
-            Ok(effect) if !effect.effect.requires_authorization() => {
-                return ToolPermissionResult::Allowed {
-                    authorization: None,
-                };
-            }
-            Ok(_) => {}
-            Err(error) => return ToolPermissionResult::Denied(error.reason()),
+        AuthorizationResult::Denied(reason) => {
+            return ToolPermissionResult::Denied(format!("Permission denied: {reason}"));
         }
+        AuthorizationResult::NeedsPrompt { .. } => {}
     }
 
     let description = tool_call_description(tool_name, &tool_args);
@@ -858,36 +840,24 @@ fn check_tool_permission_interactive(
     let response = input.trim().to_lowercase();
 
     match response.as_str() {
-        "y" | "yes" | "" => permission_mgr.map_or(
-            ToolPermissionResult::Allowed {
-                authorization: None,
-            },
-            |manager| {
-                manager
-                    .approve_tool_call_once(
-                        tool_call,
-                        Some(session_id),
-                        ApprovalProvenance::InteractiveUser,
-                    )
-                    .map_or_else(
-                        |reason| {
-                            ToolPermissionResult::Denied(format!(
-                                "Permission approval could not be issued: {reason}"
-                            ))
-                        },
-                        |permit| ToolPermissionResult::Allowed {
-                            authorization: Some(permit),
-                        },
-                    )
-            },
-        ),
+        "y" | "yes" | "" => permission_mgr
+            .approve_tool_call_once(
+                tool_call,
+                Some(session_id),
+                ApprovalProvenance::InteractiveUser,
+            )
+            .map_or_else(
+                |reason| {
+                    ToolPermissionResult::Denied(format!(
+                        "Permission approval could not be issued: {reason}"
+                    ))
+                },
+                |permit| ToolPermissionResult::Allowed {
+                    authorization: Some(permit),
+                },
+            ),
         "a" | "always" => {
-            let Some(manager) = permission_mgr else {
-                return ToolPermissionResult::Denied(
-                    "A scoped always-approval requires an active permission manager".to_string(),
-                );
-            };
-            match manager.approve_tool_call_for_session(
+            match permission_mgr.approve_tool_call_for_session(
                 tool_call,
                 session_id,
                 ApprovalProvenance::InteractiveUser,
@@ -908,31 +878,6 @@ fn check_tool_permission_interactive(
         _ => ToolPermissionResult::Denied(format!(
             "Permission denied by user for tool '{tool_name}'"
         )),
-    }
-}
-
-/// Bypass permission checks and auto-approve all tool calls.
-///
-/// This is the explicit bypass path used when `--dangerously-skip-permissions` is set.
-/// Unlike [`check_tool_permission_interactive`], this function never prompts the user and
-/// always returns `Allowed`.
-///
-/// # Fix #284
-///
-/// Replaces the old `skip_permissions: bool` boolean-flag parameter on
-/// `check_tool_permission_interactive`. The caller's intent is now expressed by calling
-/// this function, not by passing a bool.
-///
-/// # Safety
-///
-/// Calling this function grants unrestricted tool execution. Only call it when the
-/// user has explicitly opted in via `--dangerously-skip-permissions`.
-const fn check_tool_unrestricted(
-    _tool_name: &str,
-    _tool_args: &serde_json::Value,
-) -> ToolPermissionResult {
-    ToolPermissionResult::Allowed {
-        authorization: None,
     }
 }
 
@@ -1025,7 +970,7 @@ fn init_permission_manager(
         return PermissionManager::unrestricted();
     }
     PermissionManager::trusted(
-        true,
+        config.permissions.enabled,
         config.permissions.default_allow.clone(),
         config.web_fetch.preapproved_domains.clone(),
     )
@@ -2351,7 +2296,7 @@ mod tests {
     fn interactive_permission_path_does_not_bypass_read_denials() {
         let (mgr, _dir) = permission_manager_with_deny("Read", "/etc/**");
         let call = permission_test_call("read_file", &serde_json::json!({"path": "/etc/shadow"}));
-        let result = check_tool_permission_interactive(&call, "session", Some(&mgr), &[]);
+        let result = check_tool_permission_interactive(&call, "session", &mgr, &[]);
         assert!(
             matches!(result, ToolPermissionResult::Denied(_)),
             "the CLI frontend must not skip an explicit deny merely because the call is read-only"
@@ -2367,7 +2312,7 @@ mod tests {
             "lsp",
             &serde_json::json!({"action": "hover", "file_path": "src/main.rs"}),
         );
-        let result = check_tool_permission_interactive(&call, "session", Some(&mgr), &[]);
+        let result = check_tool_permission_interactive(&call, "session", &mgr, &[]);
         assert!(
             matches!(result, ToolPermissionResult::Denied(_)),
             "the CLI frontend must consult catalog policy for effectful tools"
@@ -2377,8 +2322,28 @@ mod tests {
     #[test]
     fn interactive_permission_path_denies_unknown_tool_without_prompting() {
         let call = permission_test_call("unknown_from_model", &serde_json::json!({}));
-        let result = check_tool_permission_interactive(&call, "session", None, &[]);
+        let manager = PermissionManager::unrestricted();
+        let result = check_tool_permission_interactive(&call, "session", &manager, &[]);
         assert!(matches!(result, ToolPermissionResult::Denied(_)));
+    }
+
+    #[test]
+    fn interactive_prompt_bypass_is_derived_from_the_manager_and_keeps_host_safety() {
+        let manager = PermissionManager::unrestricted();
+        let safe = permission_test_call("bash", &serde_json::json!({"command": "git status"}));
+        assert!(matches!(
+            check_tool_permission_interactive(&safe, "session", &manager, &[]),
+            ToolPermissionResult::Allowed {
+                authorization: Some(_)
+            }
+        ));
+
+        let catastrophic =
+            permission_test_call("bash", &serde_json::json!({"command": "rm -rf /"}));
+        assert!(matches!(
+            check_tool_permission_interactive(&catastrophic, "session", &manager, &[]),
+            ToolPermissionResult::Denied(reason) if reason.contains("Host safety")
+        ));
     }
 
     fn tui_options(

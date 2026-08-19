@@ -17,7 +17,7 @@
 use openclaudia::tools::{
     effect::{ToolEffect, ToolTarget},
     get_tool_definitions,
-    registry::{registry, ToolContext},
+    registry::registry,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -321,25 +321,14 @@ fn notebook_edit_effect_uses_notebook_path_arg_key() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — Dispatch invariants
+// Section D — Registration invariants
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn every_documented_tool_dispatches_to_some_result() {
+fn every_documented_tool_is_registered() {
     let reg = registry();
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    let empty_args: HashMap<String, Value> = HashMap::new();
     for name in documented_tool_names() {
-        let outcome = reg.dispatch(name, &empty_args, &mut ctx);
-        assert!(
-            outcome.is_some(),
-            "dispatch({name:?}) MUST return Some(...)"
-        );
+        assert!(reg.get(name).is_some(), "{name:?} MUST be registered");
     }
 }
 

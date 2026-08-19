@@ -13,10 +13,12 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::clear_all_todo_lists;
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+
+mod support;
 
 fn todo_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -26,16 +28,7 @@ fn todo_lock() -> MutexGuard<'static, ()> {
 }
 
 fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
-        .into_legacy()
+    support::dispatch_tool(name, args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

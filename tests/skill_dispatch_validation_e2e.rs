@@ -12,11 +12,13 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
+
+mod support;
 
 fn cwd_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -35,16 +37,7 @@ fn run_in_tempdir<R>(f: impl FnOnce() -> R) -> R {
 }
 
 fn dispatch_skill(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("skill", args, &mut ctx)
-        .expect("skill must be registered")
-        .into_legacy()
+    support::dispatch_tool("skill", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -64,7 +57,7 @@ fn missing_name_arg_returns_documented_error() {
     let (msg, is_err) = dispatch_skill(&HashMap::new());
     assert!(is_err);
     assert!(
-        msg.contains("missing required argument") && msg.contains("name"),
+        msg.contains("Host safety") && msg.contains("Missing 'name' argument"),
         "MUST surface documented missing-name; got {msg:?}"
     );
 }
@@ -75,7 +68,9 @@ fn name_arg_as_number_returns_validation_error() {
     let (msg, is_err) = dispatch_skill(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'name' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'name'"),
         "wrong-type name MUST be rejected clearly; got {msg:?}"
     );
 }
@@ -85,7 +80,9 @@ fn name_arg_as_array_returns_validation_error() {
     let args = args_with(&[("name", json!(["x"]))]);
     let (msg, is_err) = dispatch_skill(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'name' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'name'"));
 }
 
 #[test]
@@ -93,7 +90,8 @@ fn name_arg_as_null_returns_validation_error() {
     let args = args_with(&[("name", Value::Null)]);
     let (msg, is_err) = dispatch_skill(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'name' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("Missing 'name' argument"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

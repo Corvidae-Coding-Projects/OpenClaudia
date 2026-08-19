@@ -2007,19 +2007,13 @@ pub fn merge_reasoning_delta(buffer: &mut String, text: &str) -> String {
 
 /// Check whether a tool's declared ceiling reaches the authorization policy.
 ///
-/// This is a catalog helper for UI/tests. Concrete dispatch uses
-/// `call_needs_permission`, because typed-operation tools such as
-/// `bash_output`, `exit_worktree`, and Crosslink can vary by invocation.
+/// This is a catalog helper for UI/tests. Concrete dispatch resolves the
+/// invocation through the mandatory host-safety and permission policies.
 /// Unknown tools return `true`; omission is never interpreted as safe.
 #[must_use]
 pub fn tool_needs_permission(tool_name: &str) -> bool {
     crate::tools::effect::lookup(tool_name)
         .is_none_or(|(_, spec)| spec.effect.requires_authorization())
-}
-
-fn call_needs_permission(tool_name: &str, args: &Value) -> bool {
-    crate::tools::effect::resolve_for_call(tool_name, args)
-        .map_or(true, |resolved| resolved.effect.requires_authorization())
 }
 
 /// Execute tool calls and send progress events to the TUI.
@@ -2088,40 +2082,6 @@ fn policy_denied_tool_result(
     })
 }
 
-fn parse_permission_arguments_for_tui(
-    tool_name: &str,
-    tool_call_id: &str,
-    arguments: &str,
-    tx: &mpsc::Sender<AppEvent>,
-) -> Result<Value, PermissionOutcome> {
-    match serde_json::from_str::<Value>(arguments) {
-        Ok(Value::Object(map)) => Ok(Value::Object(map)),
-        Ok(value) => {
-            let msg = format!(
-                "Invalid tool arguments JSON for '{tool_name}': expected a JSON object, got {}",
-                json_value_type_name(&value)
-            );
-            Err(permission_denied_with_result(
-                tool_name,
-                tool_call_id,
-                &msg,
-                &format!("[ERROR] {msg}"),
-                tx,
-            ))
-        }
-        Err(err) => {
-            let msg = format!("Invalid tool arguments JSON for '{tool_name}': {err}");
-            Err(permission_denied_with_result(
-                tool_name,
-                tool_call_id,
-                &msg,
-                &format!("[ERROR] {msg}"),
-                tx,
-            ))
-        }
-    }
-}
-
 async fn permission_request_hook_outcome(
     tool_name: &str,
     tool_call_id: &str,
@@ -2180,7 +2140,7 @@ async fn check_tool_permission(
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
     transient_allowed_tool_rules: &[PermissionRule],
     hook_engine: Option<&crate::hooks::HookEngine>,
     session_id: Option<&str>,
@@ -2195,44 +2155,26 @@ async fn check_tool_permission(
         },
     };
 
-    if let Some(manager) = permission_mgr {
-        match manager.authorize_tool_call_with_transient_rules(
-            &tool_call,
-            session_id,
-            transient_allowed_tool_rules,
-        ) {
-            AuthorizationResult::Allowed(permit) => {
-                return PermissionOutcome::Allowed {
-                    authorization: Some(permit),
-                };
-            }
-            AuthorizationResult::Denied(reason) => {
-                return permission_denied_with_result(
-                    tool_name,
-                    tool_call_id,
-                    &format!("Permission denied: {reason}"),
-                    &format!("[DENIED] Permission denied: {reason}"),
-                    tx,
-                );
-            }
-            AuthorizationResult::NeedsPrompt { .. } => {}
+    match permission_mgr.authorize_tool_call_with_transient_rules(
+        &tool_call,
+        session_id,
+        transient_allowed_tool_rules,
+    ) {
+        AuthorizationResult::Allowed(permit) => {
+            return PermissionOutcome::Allowed {
+                authorization: Some(permit),
+            };
         }
-    } else {
-        let args = match parse_permission_arguments_for_tui(tool_name, tool_call_id, arguments, tx)
-        {
-            Ok(args) => args,
-            Err(outcome) => return outcome,
-        };
-        if let Err(error) = crate::tools::effect::resolve_for_call(tool_name, &args) {
-            let reason = error.reason();
+        AuthorizationResult::Denied(reason) => {
             return permission_denied_with_result(
                 tool_name,
                 tool_call_id,
-                &reason,
-                &format!("[DENIED] {reason}"),
+                &format!("Permission denied: {reason}"),
+                &format!("[DENIED] Permission denied: {reason}"),
                 tx,
             );
         }
+        AuthorizationResult::NeedsPrompt { .. } => {}
     }
 
     if let Some(outcome) = permission_request_hook_outcome(
@@ -2269,7 +2211,7 @@ async fn check_tool_permission(
 
 fn permission_prompt_response(
     response: &Result<PermissionResponse, tokio::sync::oneshot::error::RecvError>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
     session_id: Option<&str>,
     tool_call: &ToolCall,
     tx: &mpsc::Sender<AppEvent>,
@@ -2277,13 +2219,35 @@ fn permission_prompt_response(
     let tool_name = &tool_call.function.name;
     let tool_call_id = &tool_call.id;
     match response {
-        Ok(PermissionResponse::Allow) => permission_mgr.map_or(
-            PermissionOutcome::Allowed {
-                authorization: None,
+        Ok(PermissionResponse::Allow) => permission_mgr
+            .approve_tool_call_once(tool_call, session_id, ApprovalProvenance::InteractiveUser)
+            .map_or_else(
+                |reason| {
+                    permission_denied_with_result(
+                        tool_name,
+                        tool_call_id,
+                        &format!("Permission approval failed: {reason}"),
+                        &format!("[DENIED] Permission approval failed: {reason}"),
+                        tx,
+                    )
+                },
+                |permit| PermissionOutcome::Allowed {
+                    authorization: Some(permit),
+                },
+            ),
+        Ok(PermissionResponse::AlwaysAllow) => session_id.map_or_else(
+            || {
+                permission_denied_with_result(
+                    tool_name,
+                    tool_call_id,
+                    "A scoped reusable approval requires a permission manager and session",
+                    "[DENIED] Scoped reusable approval unavailable.",
+                    tx,
+                )
             },
-            |manager| {
-                manager
-                    .approve_tool_call_once(
+            |session_id| {
+                permission_mgr
+                    .approve_tool_call_for_session(
                         tool_call,
                         session_id,
                         ApprovalProvenance::InteractiveUser,
@@ -2304,38 +2268,9 @@ fn permission_prompt_response(
                     )
             },
         ),
-        Ok(PermissionResponse::AlwaysAllow) => match (permission_mgr, session_id) {
-            (Some(manager), Some(session_id)) => manager
-                .approve_tool_call_for_session(
-                    tool_call,
-                    session_id,
-                    ApprovalProvenance::InteractiveUser,
-                )
-                .map_or_else(
-                    |reason| {
-                        permission_denied_with_result(
-                            tool_name,
-                            tool_call_id,
-                            &format!("Permission approval failed: {reason}"),
-                            &format!("[DENIED] Permission approval failed: {reason}"),
-                            tx,
-                        )
-                    },
-                    |permit| PermissionOutcome::Allowed {
-                        authorization: Some(permit),
-                    },
-                ),
-            _ => permission_denied_with_result(
-                tool_name,
-                tool_call_id,
-                "A scoped reusable approval requires a permission manager and session",
-                "[DENIED] Scoped reusable approval unavailable.",
-                tx,
-            ),
-        },
         Ok(PermissionResponse::AlwaysDeny) => {
-            if let (Some(manager), Some(session_id)) = (permission_mgr, session_id) {
-                if let Err(error) = manager.deny_tool_call_for_session(
+            if let Some(session_id) = session_id {
+                if let Err(error) = permission_mgr.deny_tool_call_for_session(
                     tool_call,
                     session_id,
                     ApprovalProvenance::InteractiveUser,
@@ -2362,7 +2297,7 @@ fn permission_prompt_response(
 }
 
 struct ToolPermissionDispatch {
-    mgr: Option<Arc<PermissionManager>>,
+    mgr: Arc<PermissionManager>,
     authorization: Option<ExecutionPermit>,
 }
 
@@ -2394,11 +2329,11 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
         tx,
     } = p;
     let tool_name = &tool_call.function.name;
+    let perm_mgr = permission.mgr;
     let tool_call_clone = tool_call.clone();
     let panic_tool_call = tool_call.clone();
     let mem_db = memory_db;
     let app_config_for_blocking = app_config;
-    let perm_mgr = permission.mgr;
     let authorization_for_blocking = permission.authorization;
     let session_for_blocking = session_id.map(str::to_string);
     let policy_for_blocking = policy_enforcer;
@@ -2418,7 +2353,7 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
                 memory_db: mem_db.as_deref(),
                 app_config: app_config_for_blocking.as_deref(),
                 task_mgr: Some(&mut *task_guard),
-                permission_mgr: perm_mgr.as_deref(),
+                permission_mgr: perm_mgr.as_ref(),
                 authorization: authorization_for_blocking,
                 session_id: session_for_blocking.as_deref(),
                 policy_enforcer: policy_for_blocking.as_deref(),
@@ -2711,6 +2646,31 @@ async fn execute_tool_calls_for_tui(
         return (vec![], false);
     }
 
+    let Some(permission_mgr) = permission_mgr else {
+        let mut results = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            let result = tools::ToolResult::failure(
+                tool_call,
+                tools::ToolFailureCode::PermissionDenied,
+                "Permission denied: the execution frontend has no permission manager".to_string(),
+                tools::ToolRetryability::Never,
+            );
+            if tx
+                .send(AppEvent::ToolDone {
+                    name: tool_call.function.name.clone(),
+                    success: false,
+                    content: result.content().to_string(),
+                })
+                .is_err()
+            {
+                break;
+            }
+            observe_tool_result(session_id, &tool_call.function.name, &result);
+            results.push(result.openai_message());
+        }
+        return (results, true);
+    };
+
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
@@ -2788,37 +2748,28 @@ async fn execute_tool_calls_for_tui(
             }
         }
 
-        // A configured manager sees every call, including read-only calls, so
-        // explicit deny rules remain enforceable. The compatibility path with
-        // no manager skips UI prompting only for a positively classified
-        // read-only invocation.
-        let mut authorization = None;
-        if permission_mgr.is_some() || call_needs_permission(tool_name, &tool_args) {
-            match check_tool_permission(
-                tool_name,
-                &tool_call.id,
-                &tool_call.function.arguments,
-                permission_mgr.as_deref(),
-                transient_allowed_tool_rules,
-                hook_engine.as_deref(),
-                session_id,
-                tx,
-            )
-            .await
-            {
-                PermissionOutcome::Allowed {
-                    authorization: permit,
-                } => {
-                    authorization = permit;
-                }
-                PermissionOutcome::DeniedWithResult(result_json) => {
-                    observe_tool_result_json(session_id, tool_name, &result_json);
-                    results.push(result_json);
-                    continue;
-                }
-                PermissionOutcome::ChannelBroken => break,
+        // Every call, including read-only calls, reaches the concrete manager
+        // so explicit denials and host safety remain enforceable.
+        let authorization = match check_tool_permission(
+            tool_name,
+            &tool_call.id,
+            &tool_call.function.arguments,
+            permission_mgr.as_ref(),
+            transient_allowed_tool_rules,
+            hook_engine.as_deref(),
+            session_id,
+            tx,
+        )
+        .await
+        {
+            PermissionOutcome::Allowed { authorization } => authorization,
+            PermissionOutcome::DeniedWithResult(result_json) => {
+                observe_tool_result_json(session_id, tool_name, &result_json);
+                results.push(result_json);
+                continue;
             }
-        }
+            PermissionOutcome::ChannelBroken => break,
+        };
 
         let args_desc = describe_tool_call(tool_name, &tool_args);
         let hook_context = hook_engine
@@ -2837,7 +2788,7 @@ async fn execute_tool_calls_for_tui(
             memory_db: memory_db.clone(),
             app_config: app_config.clone(),
             permission: ToolPermissionDispatch {
-                mgr: permission_mgr.clone(),
+                mgr: Arc::clone(&permission_mgr),
                 authorization,
             },
             policy_enforcer: policy_enforcer.clone(),
@@ -3172,12 +3123,13 @@ mod tests {
         };
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
             &[tool_call],
             None,
             None,
-            None,
+            permission_mgr,
             &[],
             None,
             None,
@@ -3583,12 +3535,13 @@ mod tests {
         };
         let (tx, _rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
             &[tool_call],
             None,
             None,
-            None,
+            permission_mgr,
             &[],
             None,
             None,
@@ -4562,7 +4515,7 @@ mod tests {
             "read_file",
             "call_read",
             r#"{"path":"/etc/shadow"}"#,
-            Some(&mgr),
+            &mgr,
             &[],
             None,
             None,
@@ -4573,16 +4526,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tui_without_manager_denies_unclassified_call_before_prompt() {
+    async fn tui_unrestricted_manager_denies_unclassified_call_before_prompt() {
         use std::sync::mpsc as std_mpsc;
 
+        let manager = PermissionManager::unrestricted();
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
 
         let outcome = check_tool_permission(
             "unknown_from_model",
             "call_unknown",
             "{}",
-            None,
+            &manager,
             &[],
             None,
             None,
@@ -4627,7 +4581,7 @@ mod tests {
             "bash",
             "call_1",
             "{\"command\":\"ls\"}",
-            Some(&mgr),
+            &mgr,
             &[],
             None,
             Some("session-1"),
@@ -4669,7 +4623,7 @@ mod tests {
             "web_fetch",
             "call_web",
             r#"{"url":"https://docs.python.org/3/"}"#,
-            Some(&mgr),
+            &mgr,
             &[],
             None,
             None,
@@ -4709,7 +4663,7 @@ mod tests {
             "bash",
             "call_git",
             r#"{"command":"git status --short"}"#,
-            Some(&mgr),
+            &mgr,
             &transient,
             None,
             None,
@@ -4748,13 +4702,16 @@ mod tests {
             }],
         });
         let engine = HookEngine::new(hooks);
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let manager =
+            PermissionManager::new(directory.path().join("permissions.json"), true, Vec::new());
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
 
         let outcome = check_tool_permission(
             "bash",
             "call_hook",
-            r#"{"command":"rm -rf /tmp/openclaudia-hook-test"}"#,
-            None,
+            r#"{"command":"printf permission-hook-test"}"#,
+            &manager,
             &[],
             Some(&engine),
             Some("session-1"),
@@ -4833,7 +4790,7 @@ mod tests {
             "bash",
             "call_1",
             "{\"command\":\"cargo test\"}",
-            Some(&mgr),
+            &mgr,
             &[],
             None,
             Some("session-1"),

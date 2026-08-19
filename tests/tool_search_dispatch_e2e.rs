@@ -16,21 +16,13 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch_tool_search(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("tool_search", args, &mut ctx)
-        .expect("tool_search must be registered")
-        .into_legacy()
+    support::dispatch_tool("tool_search", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -50,7 +42,7 @@ fn missing_query_arg_returns_error() {
     let (msg, is_err) = dispatch_tool_search(&HashMap::new());
     assert!(is_err);
     assert!(
-        msg.contains("missing required argument") && msg.contains("query"),
+        msg.contains("Host safety") && msg.contains("Missing 'query' argument"),
         "MUST mention missing query; got {msg:?}"
     );
 }
@@ -64,15 +56,15 @@ fn query_arg_as_number_treated_as_missing() {
 }
 
 #[test]
-fn query_arg_as_array_treated_as_missing() {
+fn query_arg_as_array_is_rejected_by_classification() {
     let args = args_with(&[("query", json!(["a", "b"]))]);
     let (msg, is_err) = dispatch_tool_search(&args);
     assert!(is_err);
-    // Array-typed query MUST surface the missing-arg error
-    // pinning the documented message; not just any error.
     assert!(
-        msg.contains("missing required argument") && msg.contains("query"),
-        "array query MUST produce missing-arg message; got {msg:?}"
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'query'"),
+        "array query MUST fail before handler execution; got {msg:?}"
     );
 }
 

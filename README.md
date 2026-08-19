@@ -146,10 +146,20 @@ plan preserves the user outcome while moving authority into host enforcement.
 
 ## Configuration
 
-Configuration is project-local at `.openclaudia/config.yaml`. The current
-schema has inconsistent provenance and unknown-field behavior; use this as a
-syntax example, not a secure deployment profile. Environment keys and custom
-headers can carry secrets and must be reviewed carefully.
+Project configuration lives at `.openclaudia/config.yaml`; trusted host
+configuration may also live at `~/.openclaudia/config.yaml` or in the
+environment. The broader schema still has inconsistent provenance and
+unknown-field behavior, so use this as a syntax example rather than a complete
+secure-deployment profile. Environment keys and custom headers can carry
+secrets and must be reviewed carefully.
+
+Permission grants are an exception to ordinary project configuration. A
+project file cannot disable approval prompts, add `default_allow` entries, or
+preapprove web-fetch domains; those requests are retained as an inert,
+digest-bound proposal visible in `/permissions`. Put host-selected grants in
+`~/.openclaudia/config.yaml`, the trusted environment, or the explicit
+`--dangerously-skip-permissions` launch flag. Effect classification and hard
+host safety remain active even when prompts are disabled.
 
 ### Config File
 

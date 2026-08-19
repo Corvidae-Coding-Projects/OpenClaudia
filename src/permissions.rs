@@ -554,7 +554,7 @@ pub struct PermissionManager {
     total_denials: u32,
 }
 
-struct HardSafetyDenial {
+struct UnrestrictedSafetyDenial {
     reason: String,
     target: String,
 }
@@ -681,26 +681,12 @@ impl PermissionManager {
         tool_name: &str,
         tool_args: &serde_json::Value,
     ) -> Result<crate::tools::effect::ResolvedEffect, CheckResult> {
-        let resolved =
-            crate::tools::effect::resolve_for_call(tool_name, tool_args).map_err(|error| {
-                warn!(
-                    tool = %tool_name,
-                    "Tool call could not be classified — denying"
-                );
-                Self::log_permission_decision("denied", "unclassified_effect", tool_name, "", "");
-                CheckResult::Denied(error.reason())
-            })?;
-
-        tracing::info!(
-            target: "openclaudia::permissions",
-            event = "tool_effect_classified",
-            tool_name = %tool_name,
-            canonical_tool = %resolved.canonical,
-            effect = resolved.effect.as_str(),
-            operation = resolved.operation.as_deref().unwrap_or(""),
-            "tool effect classified before policy"
-        );
-        Ok(resolved)
+        crate::tools::host_safety::HostSafetyPolicy::enforce(tool_name, tool_args).map_err(
+            |reason| {
+                warn!(tool = %tool_name, "Host safety denied tool invocation");
+                CheckResult::Denied(format!("Host safety: {reason}"))
+            },
+        )
     }
 
     fn matching_explicit_deny<'a>(
@@ -724,11 +710,6 @@ impl PermissionManager {
         session_id: Option<&str>,
     ) -> Result<crate::tools::effect::ResolvedEffect, CheckResult> {
         let resolved = Self::classify_for_policy(tool_name, tool_args)?;
-
-        if let Some(denial) = Self::hard_safety_denial(tool_name, tool_args) {
-            Self::log_permission_decision("denied", "hard_safety", tool_name, &denial.target, "");
-            return Err(CheckResult::Denied(denial.reason));
-        }
 
         if !self.enabled {
             if let Some(denial) =
@@ -1274,119 +1255,21 @@ impl PermissionManager {
         self.session_rules.push(rule);
     }
 
-    /// Non-negotiable safety checks that survive explicit permission bypasses.
-    ///
-    /// This sits before the `enabled=false` shortcut used by
-    /// [`Self::unrestricted`], matching Claude Code's bypass mode: operators
-    /// can skip prompts, but prompt-injected sandbox escalation, hard-denylisted
-    /// shell payloads, and writes to protected control files still fail closed.
-    fn hard_safety_denial(
-        tool_name: &str,
-        tool_args: &serde_json::Value,
-    ) -> Option<HardSafetyDenial> {
-        match tool_name.to_ascii_lowercase().as_str() {
-            "bash" => Self::bash_hard_safety_denial(tool_args),
-            "edit" | "edit_file" | "write" | "write_file" => {
-                Self::write_target_hard_safety_denial(tool_args, "path")
-            }
-            "notebook_edit" => Self::write_target_hard_safety_denial(tool_args, "notebook_path"),
-            _ => None,
-        }
-    }
-
-    fn bash_hard_safety_denial(tool_args: &serde_json::Value) -> Option<HardSafetyDenial> {
-        if tool_args
-            .get("dangerously_disable_sandbox")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            let target = tool_args
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            tracing::error!(
-                target: "openclaudia::permissions",
-                event = "sandbox_escalation_attempt",
-                tool = "Bash",
-                target_digest = %digest_text(target),
-                "model attempted dangerously_disable_sandbox=true in tool \
-                 args — REJECTED. The flag is only honoured from user-level \
-                 configuration; this invocation is denied (crosslink #795)."
-            );
-            return Some(HardSafetyDenial {
-                reason: "dangerously_disable_sandbox cannot be set from tool \
-                         arguments — only from user-level configuration"
-                    .to_string(),
-                target: target.to_string(),
-            });
-        }
-
-        let command = tool_args.get("command")?.as_str()?;
-        crate::tools::validate_command(command)
-            .err()
-            .map(|reason| HardSafetyDenial {
-                reason: format!("Denied by bash hard safety check: {reason}"),
-                target: command.to_string(),
-            })
-    }
-
     fn unrestricted_bash_construct_hard_safety_denial(
         tool_name: &str,
         tool_args: &serde_json::Value,
-    ) -> Option<HardSafetyDenial> {
+    ) -> Option<UnrestrictedSafetyDenial> {
         if !tool_name.eq_ignore_ascii_case("bash") {
             return None;
         }
 
         let command = tool_args.get("command")?.as_str()?;
-        crate::tools::dangerous_shell_construct(command).map(|reason| HardSafetyDenial {
+        crate::tools::dangerous_shell_construct(command).map(|reason| UnrestrictedSafetyDenial {
             reason: format!(
                 "Denied by unrestricted bash hard safety check: dangerous shell construct: {reason}"
             ),
             target: command.to_string(),
         })
-    }
-
-    fn write_target_hard_safety_denial(
-        tool_args: &serde_json::Value,
-        path_key: &str,
-    ) -> Option<HardSafetyDenial> {
-        let path = tool_args.get(path_key)?.as_str()?;
-        Self::protected_write_target_reason(path).map(|reason| HardSafetyDenial {
-            reason: reason.to_string(),
-            target: path.to_string(),
-        })
-    }
-
-    fn protected_write_target_reason(path: &str) -> Option<&'static str> {
-        let components = Self::normalised_path_components(path);
-
-        if components.iter().any(|component| component == ".git") {
-            return Some("Denied by hard safety check: writes inside .git are protected");
-        }
-
-        components.windows(2).find_map(|window| {
-            if window[0] == ".claude" && window[1] == "settings.json" {
-                Some("Denied by hard safety check: .claude/settings.json is protected")
-            } else {
-                None
-            }
-        })
-    }
-
-    fn normalised_path_components(path: &str) -> Vec<String> {
-        let slash_path = path.replace('\\', "/");
-        let mut components = Vec::new();
-        for raw in slash_path.split('/') {
-            match raw {
-                "" | "." => {}
-                ".." => {
-                    components.pop();
-                }
-                component => components.push(component.to_ascii_lowercase()),
-            }
-        }
-        components
     }
 
     /// Emit a structured permission-decision audit event (crosslink #870).
@@ -2020,7 +1903,7 @@ mod tests {
         // processing (so the call usually surfaced as NeedsPrompt).
         // The fix denies the call outright so the escalation attempt
         // is bounded into a hard refusal AND captured in the audit log
-        // via the `sandbox_escalation_attempt` tracing event.
+        // via the generation-bound `host_safety_decision` tracing event.
         let (mgr, _dir) = make_manager(true, vec![]);
         let result = mgr.check(
             "bash",

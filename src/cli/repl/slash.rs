@@ -558,7 +558,9 @@ fn permission_status_lines(
     persisted_path: &Path,
 ) -> Vec<String> {
     let mut lines = vec![
-        format!("Enabled: {}", yes_no(config.enabled)),
+        "Host safety: always enabled (repository and approval settings cannot disable it)"
+            .to_string(),
+        format!("Approval prompts enabled: {}", yes_no(config.enabled)),
         format!(
             "Default allow: {}",
             summarize_strings(&config.default_allow, "none")
@@ -567,6 +569,29 @@ fn permission_status_lines(
             .to_string(),
         format!("Trusted approval store: {}", persisted_path.display()),
     ];
+
+    if let Some(proposal) = config.project_proposal.as_ref() {
+        lines.push(format!(
+            "Repository permission proposal: inert (schema {}, {})",
+            proposal.schema_version, proposal.proposal_digest
+        ));
+        lines.push(format!("  Source: {}", proposal.source.display()));
+        if proposal.requests_prompt_bypass {
+            lines.push("  Requested prompt bypass: ignored".to_string());
+        }
+        if !proposal.default_allow.is_empty() {
+            lines.push(format!(
+                "  Requested default allows: {} (ignored; approve exact calls instead)",
+                proposal.default_allow.len()
+            ));
+        }
+        if !proposal.web_fetch_preapproved_domains.is_empty() {
+            lines.push(format!(
+                "  Requested web preapprovals: {} (ignored; configure trusted host state)",
+                proposal.web_fetch_preapproved_domains.len()
+            ));
+        }
+    }
 
     if config.mcp.is_empty() {
         lines.push("MCP allowlists: none configured".to_string());
@@ -3994,6 +4019,7 @@ mod tests {
             enabled: true,
             default_allow: vec!["git status".to_string()],
             mcp,
+            project_proposal: None,
         };
         let persisted = openclaudia::permissions::PermissionStoreSummary {
             approval_count: 1,
@@ -4009,7 +4035,8 @@ mod tests {
         );
         let joined = lines.join("\n");
 
-        assert!(joined.contains("Enabled: yes"));
+        assert!(joined.contains("Host safety: always enabled"));
+        assert!(joined.contains("Approval prompts enabled: yes"));
         assert!(joined.contains("Default allow: git status"));
         assert!(joined.contains("MCP allowlists: 2 server(s)"));
         assert!(joined.contains("blocked: deny all tools"));
@@ -4017,6 +4044,36 @@ mod tests {
         assert!(joined.contains("Persisted exact approvals: 1 (generation 4"));
         assert!(joined.contains("Persisted explicit denials: 1"));
         assert!(joined.contains("host hard deny > explicit deny > exact approval receipt"));
+    }
+
+    #[test]
+    fn permission_status_exposes_inert_repository_grants_without_applying_them() {
+        let config = PermissionsConfig {
+            project_proposal: Some(openclaudia::config::ProjectPermissionProposal {
+                schema_version: openclaudia::config::PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION,
+                source: std::path::PathBuf::from("/project/.openclaudia/config.yaml"),
+                source_digest: "sha256:source".to_string(),
+                proposal_digest: "sha256:proposal".to_string(),
+                requests_prompt_bypass: true,
+                default_allow: vec!["Bash(git push)".to_string()],
+                web_fetch_preapproved_domains: vec!["attacker.example".to_string()],
+            }),
+            ..Default::default()
+        };
+
+        let joined = permission_status_lines(
+            &config,
+            None,
+            None,
+            std::path::Path::new("/trusted/permissions-v1.json"),
+        )
+        .join("\n");
+
+        assert!(joined.contains("Repository permission proposal: inert (schema 1"));
+        assert!(joined.contains("Requested prompt bypass: ignored"));
+        assert!(joined.contains("Requested default allows: 1 (ignored"));
+        assert!(joined.contains("Requested web preapprovals: 1 (ignored"));
+        assert!(joined.contains("Approval prompts enabled: yes"));
     }
 
     #[test]

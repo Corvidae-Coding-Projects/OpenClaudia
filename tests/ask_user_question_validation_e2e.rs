@@ -13,21 +13,13 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch_ask_user(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("ask_user_question", args, &mut ctx)
-        .expect("ask_user_question must be registered")
-        .into_legacy()
+    support::dispatch_tool("ask_user_question", args)
 }
 
 fn args_with_questions(questions: Value) -> HashMap<String, Value> {

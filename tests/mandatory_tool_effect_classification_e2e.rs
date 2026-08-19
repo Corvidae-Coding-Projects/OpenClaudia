@@ -22,9 +22,7 @@ use openclaudia::tools::effect::{
     effect_matrix, lookup, render_effect_matrix, resolve_for_call, EffectResolutionError,
     ToolEffect, ToolEffectSpec, ToolSurface, ToolTarget,
 };
-use openclaudia::tools::registry::{
-    iter_handlers, registry, validate_handlers, ToolContext, ToolHandler,
-};
+use openclaudia::tools::registry::{iter_handlers, registry, validate_handlers, ToolHandler};
 use openclaudia::tools::{execute_tool_with_permission_required, FunctionCall, ToolCall};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -875,13 +873,6 @@ impl ToolHandler for FakeHandler {
     fn typed_operations(&self) -> Vec<(&'static str, ToolEffect)> {
         self.operations.clone()
     }
-    fn execute_legacy(
-        &self,
-        _args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        (String::new(), false)
-    }
 }
 
 fn leak(handler: FakeHandler) -> &'static dyn ToolHandler {
@@ -965,14 +956,6 @@ impl ToolHandler for OptionalTargetHandler {
 
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Write", "path")
-    }
-
-    fn execute_legacy(
-        &self,
-        _args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        (String::new(), false)
     }
 }
 

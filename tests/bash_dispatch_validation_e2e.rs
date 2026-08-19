@@ -12,35 +12,18 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod support;
+
 fn dispatch_bash(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("bash", args, &mut ctx)
-        .expect("bash must be registered")
-        .into_legacy()
+    support::dispatch_tool("bash", args)
 }
 
 fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("bash_output", args, &mut ctx)
-        .expect("bash_output must be registered")
-        .into_legacy()
+    support::dispatch_tool("bash_output", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -71,7 +54,9 @@ fn command_arg_as_number_returns_validation_error() {
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'command' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'command'"),
         "non-string command MUST be rejected clearly; got {msg:?}"
     );
 }
@@ -82,7 +67,9 @@ fn command_arg_as_array_returns_validation_error() {
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'command' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'command'"),
         "array command MUST be rejected clearly; got {msg:?}"
     );
 }
@@ -92,7 +79,9 @@ fn command_arg_as_object_returns_validation_error() {
     let args = args_with(&[("command", json!({"cmd": "echo"}))]);
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'command' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'command'"));
 }
 
 #[test]
@@ -100,7 +89,8 @@ fn command_arg_as_null_returns_validation_error() {
     let args = args_with(&[("command", Value::Null)]);
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'command' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("Missing 'command' argument"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

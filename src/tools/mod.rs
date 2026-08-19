@@ -33,6 +33,8 @@ pub use cron::{execute_cron_create, execute_cron_delete, execute_cron_list};
 mod file;
 pub(crate) use file::open_capability_regular_read;
 mod grounding;
+pub(crate) mod host_safety;
+pub use host_safety::HOST_SAFETY_POLICY_GENERATION;
 pub mod security;
 /// Re-export the notebook-source-to-line-array helper so the
 /// E2E test suite (`tests/notebook_edit_e2e.rs`) can construct
@@ -190,34 +192,17 @@ pub fn get_tool_definitions() -> Value {
     )
 }
 
-/// Execute a tool call and return the result (non-stateful mode).
+/// Execute a tool call with an explicit host-owned unrestricted prompt policy.
 ///
-/// Legacy back-compat entry: no [`PermissionManager`] supplied. The permission
-/// gate is still consulted internally — it will bypass fail-open with a
-/// structured `tracing::debug!` (and a one-time `tracing::warn!` per
-/// session — see [`warn_missing_permission_manager_once`]). New call sites
-/// should migrate to [`execute_tool_with_permission_required`] which takes
-/// `&PermissionManager` by reference. See crosslink #460.
+/// This convenience entry point never means "no policy object". It constructs
+/// an explicit unrestricted [`PermissionManager`], which suppresses approval
+/// prompts while retaining mandatory effect classification, the non-bypassable
+/// host ceiling, exact dispatch authorization, and the sandbox/capability
+/// boundary.
 #[must_use]
 pub fn execute_tool(tool_call: &ToolCall) -> ToolResult {
-    execute_tool_with_memory(tool_call, None, None)
-}
-
-/// Warn exactly once per process when a dispatch entry point is called
-/// without a [`PermissionManager`]. This keeps logs from drowning while
-/// still surfacing the migration target for call sites that haven't yet
-/// threaded a manager through. See crosslink #460.
-fn warn_missing_permission_manager_once(entry_point: &'static str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            entry_point,
-            "{entry_point} called without PermissionManager. Legacy fail-open posture preserved \
-             for back-compat. New call sites should use execute_tool_with_permission_required(). \
-             See crosslink #460."
-        );
-    }
+    let permission_manager = PermissionManager::unrestricted();
+    execute_tool_with_memory(tool_call, None, &permission_manager)
 }
 
 fn invalid_tool_arguments_result(
@@ -271,48 +256,59 @@ const fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// Gate a tool call through the permission system and return either a
-/// ready-to-return [`ToolResult`] (for Denied / `NeedsPrompt` in legacy
-/// string form) or `None` to signal "continue with normal dispatch".
-///
-/// This is the internal choke point used by every `execute_tool*` dispatch
-/// entry point. Manager-backed calls mint and consume an exact execution
-/// permit before any dispatch body runs; the manager-less compatibility path
-/// retains its classified legacy posture. See crosslink #460.
-fn gate_or_legacy_result(
+fn host_safety_dispatch_permit(
     tool_call: &ToolCall,
-    permission_mgr: Option<&PermissionManager>,
-) -> Option<ToolResult> {
-    let Some(permission_mgr) = permission_mgr else {
-        return match check_tool_permission_outcome(tool_call, None) {
-            PermissionOutcome::Allowed => None,
-            PermissionOutcome::Denied(result) => Some(*result),
-            PermissionOutcome::NeedsPrompt {
-                tool_call_id: _,
-                tool,
-                target,
-            } => Some(ToolResult::failure(
+    args: &HashMap<String, Value>,
+) -> Result<registry::ToolDispatchPermit, Box<ToolResult>> {
+    let arguments = Value::Object(
+        args.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    host_safety::HostSafetyPolicy::enforce(&tool_call.function.name, &arguments).map_err(
+        |reason| {
+            Box::new(ToolResult::failure(
                 tool_call,
-                ToolFailureCode::PermissionDenied,
-                legacy_permission_prompt(&tool, &target),
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by non-bypassable host safety: {reason}"),
                 ToolRetryability::Never,
-            )),
-        };
-    };
+            ))
+        },
+    )?;
+    Ok(registry::ToolDispatchPermit::new(
+        &tool_call.function.name,
+        args,
+    ))
+}
 
-    match authorize_for_execution(tool_call, permission_mgr) {
-        Ok(permit) => consume_for_execution(tool_call, permission_mgr, &permit)
-            .err()
-            .map(|result| *result),
-        Err(PermissionOutcome::Denied(result)) => Some(*result),
-        Err(PermissionOutcome::NeedsPrompt { tool, target, .. }) => Some(ToolResult::failure(
-            tool_call,
-            ToolFailureCode::PermissionDenied,
-            legacy_permission_prompt(&tool, &target),
-            ToolRetryability::Never,
-        )),
-        Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
-    }
+fn dispatch_registered_with_permit(
+    tool_call: &ToolCall,
+    args: &HashMap<String, Value>,
+    ctx: &mut ToolContext<'_>,
+    permit: &registry::ToolDispatchPermit,
+) -> ToolResult {
+    let handler_result = registry::registry()
+        .dispatch(tool_call.function.name.as_str(), args, ctx, permit)
+        .unwrap_or_else(|| {
+            ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::Unavailable,
+                format!("Unknown tool: {}", tool_call.function.name),
+                ToolRetryability::Never,
+            ))
+        });
+    ToolResult::bind(tool_call, &tool_call.function.name, handler_result)
+}
+
+fn dispatch_registered_after_authorization(
+    tool_call: &ToolCall,
+    args: &HashMap<String, Value>,
+    ctx: &mut ToolContext<'_>,
+) -> ToolResult {
+    let permit = match host_safety_dispatch_permit(tool_call, args) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+    dispatch_registered_with_permit(tool_call, args, ctx, &permit)
 }
 
 /// Describe the effective authority behind an interactive tool permission.
@@ -345,29 +341,24 @@ fn legacy_permission_prompt(tool: &str, target: &str) -> String {
     )
 }
 
-/// Execute a tool call with optional memory and permission manager.
-///
-/// The permission gate runs BEFORE the tool body; passing `None` preserves
-/// the historical fail-open posture for back-compat and emits a one-time
-/// migration warning. New callers should prefer
-/// [`execute_tool_with_permission_required`]. See crosslink #460.
+/// Execute a tool call with optional memory and a required permission manager.
 #[must_use]
 pub fn execute_tool_with_memory(
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> ToolResult {
-    if permission_mgr.is_none() {
-        warn_missing_permission_manager_once("execute_tool_with_memory");
+    let permit = match authorization_or_legacy_prompt(tool_call, permission_mgr) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
+        return *result;
     }
-    if let Some(gated) = gate_or_legacy_result(tool_call, permission_mgr) {
-        return gated;
-    }
-
-    execute_tool_with_memory_unchecked(tool_call, memory_db)
+    execute_tool_with_memory_after_authorization(tool_call, memory_db)
 }
 
-fn execute_tool_with_memory_unchecked(
+fn execute_tool_with_memory_after_authorization(
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
 ) -> ToolResult {
@@ -397,49 +388,38 @@ fn execute_tool_with_memory_unchecked(
         app_config: None,
         task_mgr: None,
     };
-
-    let handler_result = registry::registry()
-        .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-        .unwrap_or_else(|| {
-            ToolHandlerResult::error(ToolFailure::new(
-                ToolFailureCode::Unavailable,
-                format!("Unknown tool: {}", tool_call.function.name),
-                ToolRetryability::Never,
-            ))
-        });
-
-    ToolResult::bind(tool_call, &tool_call.function.name, handler_result)
+    dispatch_registered_after_authorization(tool_call, &args, &mut ctx)
 }
 
 /// Execute a tool call with full context (memory + config for subagents).
-///
-/// The permission gate runs BEFORE the tool body. Passing `None` for
-/// `permission_mgr` preserves the historical fail-open posture and emits
-/// a one-time migration warning. See crosslink #460.
 #[must_use]
 pub fn execute_tool_full(
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> ToolResult {
-    if permission_mgr.is_none() {
-        warn_missing_permission_manager_once("execute_tool_full");
+    let permit = match authorization_or_legacy_prompt(tool_call, permission_mgr) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
+        return *result;
     }
-    if let Some(gated) = gate_or_legacy_result(tool_call, permission_mgr) {
-        return gated;
-    }
-
-    execute_tool_full_unchecked(tool_call, memory_db, app_config)
+    execute_tool_full_after_authorization(tool_call, memory_db, app_config)
 }
 
-fn execute_tool_full_unchecked(
+fn execute_tool_full_after_authorization(
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
+        Err(result) => return *result,
+    };
+    let dispatch_permit = match host_safety_dispatch_permit(tool_call, &args) {
+        Ok(permit) => permit,
         Err(result) => return *result,
     };
 
@@ -477,15 +457,7 @@ fn execute_tool_full_unchecked(
                 app_config,
                 task_mgr: None,
             };
-            registry::registry()
-                .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-                .unwrap_or_else(|| {
-                    ToolHandlerResult::error(ToolFailure::new(
-                        ToolFailureCode::Unavailable,
-                        format!("Unknown tool: {}", tool_call.function.name),
-                        ToolRetryability::Never,
-                    ))
-                })
+            return dispatch_registered_with_permit(tool_call, &args, &mut ctx, &dispatch_permit);
         }
     };
 
@@ -538,19 +510,13 @@ pub enum PermissionOutcome {
 
 /// Check permissions before executing a tool and return a structured outcome.
 ///
-/// **Legacy allow posture when `permission_mgr` is None** — known, classifiable
-/// calls remain compatible; unknown or malformed calls deny. Callers that want
-/// strict "no manager means deny" should use [`check_tool_permission_strict`].
-/// A disabled manager is still consulted so mandatory classification and hard
-/// safety run before its explicit allow policy.
-///
 /// Emits a structured tracing event at every decision point (allowed,
-/// denied, needs-prompt, bypass) so the audit trail is queryable without
-/// re-running the session. See crosslink #460 mandated point 4.
+/// denied, or needs-prompt) so the audit trail is queryable without re-running
+/// the session.
 #[must_use]
 pub fn check_tool_permission_outcome(
     tool_call: &ToolCall,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> PermissionOutcome {
     let tool_name = tool_call.function.name.as_str();
     let args = match parse_tool_arguments_value(tool_call) {
@@ -558,29 +524,7 @@ pub fn check_tool_permission_outcome(
         Err(result) => return PermissionOutcome::Denied(result),
     };
 
-    let Some(mgr) = permission_mgr else {
-        if let Err(error) = effect::resolve_for_call(tool_name, &args) {
-            let reason = error.reason();
-            tracing::warn!(
-                tool = %tool_name,
-                reason = %reason,
-                "permission DENIED: call has no effect classification"
-            );
-            return PermissionOutcome::Denied(Box::new(ToolResult::failure(
-                tool_call,
-                ToolFailureCode::PermissionDenied,
-                format!("Permission denied: {reason}"),
-                ToolRetryability::Never,
-            )));
-        }
-        tracing::debug!(
-            tool = %tool_name,
-            "permission rules bypassed after mandatory effect classification: no PermissionManager supplied"
-        );
-        return PermissionOutcome::Allowed;
-    };
-
-    match mgr.check(tool_name, &args) {
+    match permission_mgr.check(tool_name, &args) {
         CheckResult::Allowed => {
             tracing::debug!(tool = %tool_name, "permission allowed");
             PermissionOutcome::Allowed
@@ -613,43 +557,6 @@ pub fn check_tool_permission_outcome(
     }
 }
 
-/// Strict variant that fails closed when no permission manager is provided.
-///
-/// A disabled manager is treated as an **explicit** allow-all override (that's
-/// the semantic meaning of [`PermissionManager::unrestricted`]): the caller
-/// constructed a concrete manager and chose disabled-posture deliberately, so
-/// the strict check defers to the normal outcome path which returns `Allowed`
-/// on disabled.
-///
-/// Use this from new dispatch paths that want certainty that no tool call
-/// can bypass the gate due to a forgotten argument. See crosslink #460
-/// mandated point 1.
-#[must_use]
-pub fn check_tool_permission_strict(
-    tool_call: &ToolCall,
-    permission_mgr: Option<&PermissionManager>,
-) -> PermissionOutcome {
-    let tool_name = tool_call.function.name.as_str();
-    permission_mgr.map_or_else(
-        || {
-            tracing::warn!(
-                tool = %tool_name,
-                "strict permission check DENIED: no PermissionManager supplied"
-            );
-            PermissionOutcome::Denied(Box::new(ToolResult::failure(
-                tool_call,
-                ToolFailureCode::PermissionDenied,
-                format!(
-                    "Permission denied: no permission manager is configured for tool '{tool_name}'. \
-                     Construct PermissionManager::unrestricted() if you explicitly want allow-all."
-                ),
-                ToolRetryability::Never,
-            )))
-        },
-        |m| check_tool_permission_outcome(tool_call, Some(m)),
-    )
-}
-
 /// Back-compat wrapper: returns `None` on Allowed, `Some(ToolResult)` on Denied.
 ///
 /// Returns a `PERMISSION_PROMPT:` stringly-typed result on `NeedsPrompt`. New
@@ -658,7 +565,7 @@ pub fn check_tool_permission_strict(
 #[must_use]
 pub fn check_tool_permission(
     tool_call: &ToolCall,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> Option<ToolResult> {
     match check_tool_permission_outcome(tool_call, permission_mgr) {
         PermissionOutcome::Allowed => None,
@@ -680,6 +587,13 @@ fn authorize_for_execution(
     tool_call: &ToolCall,
     permission_mgr: &PermissionManager,
 ) -> Result<ExecutionPermit, PermissionOutcome> {
+    // Preserve the public executor's validation contract before asking the
+    // permission layer to classify the invocation. `PermissionManager` also
+    // parses defensively, but its string denial cannot carry the typed
+    // `InvalidArguments` outcome expected at the tool boundary.
+    if let Err(result) = parse_tool_arguments_value(tool_call) {
+        return Err(PermissionOutcome::Denied(result));
+    }
     match permission_mgr.authorize_tool_call(tool_call, None) {
         AuthorizationResult::Allowed(permit) => Ok(permit),
         AuthorizationResult::Denied(reason) => {
@@ -695,6 +609,25 @@ fn authorize_for_execution(
             tool,
             target,
         }),
+    }
+}
+
+fn authorization_or_legacy_prompt(
+    tool_call: &ToolCall,
+    permission_mgr: &PermissionManager,
+) -> Result<ExecutionPermit, Box<ToolResult>> {
+    match authorize_for_execution(tool_call, permission_mgr) {
+        Ok(permit) => Ok(permit),
+        Err(PermissionOutcome::Denied(result)) => Err(result),
+        Err(PermissionOutcome::NeedsPrompt { tool, target, .. }) => {
+            Err(Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                legacy_permission_prompt(&tool, &target),
+                ToolRetryability::Never,
+            )))
+        }
+        Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
     }
 }
 
@@ -724,52 +657,32 @@ fn consume_for_execution(
 /// - Memory tools (via `memory_db`)
 /// - All standard tools
 ///
-/// Passing `None` for `permission_mgr` preserves the historical fail-open
-/// posture and emits a one-time migration warning. See crosslink #460.
 #[must_use]
 pub fn execute_tool_with_tasks(
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
     task_mgr: Option<&mut TaskManager>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> ToolResult {
-    if permission_mgr.is_none() {
-        warn_missing_permission_manager_once("execute_tool_with_tasks");
-        if let Some(gated) = gate_or_legacy_result(tool_call, None) {
-            return gated;
-        }
-    } else if let Some(permission_mgr) = permission_mgr {
-        let permit = match authorize_for_execution(tool_call, permission_mgr) {
-            Ok(permit) => permit,
-            Err(PermissionOutcome::Denied(result)) => return *result,
-            Err(PermissionOutcome::NeedsPrompt { tool, target, .. }) => {
-                return ToolResult::failure(
-                    tool_call,
-                    ToolFailureCode::PermissionDenied,
-                    legacy_permission_prompt(&tool, &target),
-                    ToolRetryability::Never,
-                );
-            }
-            Err(PermissionOutcome::Allowed) => {
-                unreachable!("authorization cannot return bare allow")
-            }
-        };
-        if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
-            return *result;
-        }
+    let permit = match authorization_or_legacy_prompt(tool_call, permission_mgr) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
+        return *result;
     }
 
-    execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
+    execute_tool_after_authorization(tool_call, memory_db, app_config, task_mgr)
 }
 
-/// Execute a tool after the caller has already made the permission decision.
+/// Execute a tool after the caller has already made the approval decision.
 ///
-/// Interactive callers use this after a typed permission result or user
-/// prompt so a one-time approval cannot be converted into a nested legacy
-/// `PERMISSION_PROMPT` result.
+/// This is crate-visible for the shared executor only. It still applies the
+/// non-bypassable host ceiling and mints an opaque exact registry permit, so
+/// "after authorization" never means "unchecked".
 #[must_use]
-pub(crate) fn execute_tool_with_tasks_unchecked(
+pub(crate) fn execute_tool_after_authorization(
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
@@ -786,7 +699,7 @@ pub(crate) fn execute_tool_with_tasks_unchecked(
         tool_call.function.name.as_str(),
         "task" | "agent_output" | "task_stop"
     ) {
-        return execute_tool_full_unchecked(tool_call, memory_db, app_config);
+        return execute_tool_full_after_authorization(tool_call, memory_db, app_config);
     }
 
     // All other tools — including task_create/task_update/task_get/task_list —
@@ -798,17 +711,7 @@ pub(crate) fn execute_tool_with_tasks_unchecked(
         task_mgr,
     };
 
-    let handler_result = registry::registry()
-        .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-        .unwrap_or_else(|| {
-            ToolHandlerResult::error(ToolFailure::new(
-                ToolFailureCode::Unavailable,
-                format!("Unknown tool: {}", tool_call.function.name),
-                ToolRetryability::Never,
-            ))
-        });
-
-    ToolResult::bind(tool_call, &tool_call.function.name, handler_result)
+    dispatch_registered_after_authorization(tool_call, &args, &mut ctx)
 }
 
 /// New canonical dispatch: requires a [`PermissionManager`] and uses the strict fail-closed check.
@@ -841,7 +744,7 @@ pub fn execute_tool_with_permission_required(
     if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
         return *result;
     }
-    execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
+    execute_tool_after_authorization(tool_call, memory_db, app_config, task_mgr)
 }
 
 /// Typed-outcome dispatch: runs the permission gate and returns a structured [`ExecutionOutcome`].
@@ -856,50 +759,30 @@ pub fn execute_tool_gated(
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
     task_mgr: Option<&mut TaskManager>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> ExecutionOutcome {
-    if let Some(permission_mgr) = permission_mgr {
-        let permit = match authorize_for_execution(tool_call, permission_mgr) {
-            Ok(permit) => permit,
-            Err(PermissionOutcome::Denied(result)) => return ExecutionOutcome::Result(result),
-            Err(PermissionOutcome::NeedsPrompt {
+    let permit = match authorize_for_execution(tool_call, permission_mgr) {
+        Ok(permit) => permit,
+        Err(PermissionOutcome::Denied(result)) => return ExecutionOutcome::Result(result),
+        Err(PermissionOutcome::NeedsPrompt {
+            tool_call_id,
+            tool,
+            target,
+        }) => {
+            return ExecutionOutcome::NeedsPrompt {
                 tool_call_id,
                 tool,
                 target,
-            }) => {
-                return ExecutionOutcome::NeedsPrompt {
-                    tool_call_id,
-                    tool,
-                    target,
-                };
-            }
-            Err(PermissionOutcome::Allowed) => {
-                unreachable!("authorization cannot return bare allow")
-            }
-        };
-        if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
-            return ExecutionOutcome::Result(result);
+            };
         }
-        return ExecutionOutcome::Result(Box::new(execute_tool_with_tasks_unchecked(
-            tool_call, memory_db, app_config, task_mgr,
-        )));
+        Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
+    };
+    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
+        return ExecutionOutcome::Result(result);
     }
-
-    match check_tool_permission_outcome(tool_call, None) {
-        PermissionOutcome::Denied(result) => ExecutionOutcome::Result(result),
-        PermissionOutcome::NeedsPrompt {
-            tool_call_id,
-            tool,
-            target,
-        } => ExecutionOutcome::NeedsPrompt {
-            tool_call_id,
-            tool,
-            target,
-        },
-        PermissionOutcome::Allowed => ExecutionOutcome::Result(Box::new(
-            execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr),
-        )),
-    }
+    ExecutionOutcome::Result(Box::new(execute_tool_after_authorization(
+        tool_call, memory_db, app_config, task_mgr,
+    )))
 }
 
 /// Structured outcome of a gated dispatch. Either the tool ran (or was
@@ -929,6 +812,54 @@ mod tests {
     use crate::session::TaskManager;
     use base64::Engine;
     use serde_json::json;
+
+    #[test]
+    fn post_authorization_boundary_still_denies_catastrophic_bash() {
+        let tool_call = ToolCall {
+            id: "host-safety-after-authorization-bash".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "bash".to_string(),
+                arguments: json!({"command": "rm -rf /"}).to_string(),
+            },
+        };
+
+        let result = execute_tool_after_authorization(&tool_call, None, None, None);
+        assert!(result.is_error());
+        assert!(matches!(
+            result.outcome(),
+            ToolOutcome::Error { failure }
+                if failure.code == ToolFailureCode::PolicyDenied
+                    && failure.retryability == ToolRetryability::Never
+        ));
+        assert!(result.content().contains("non-bypassable host safety"));
+    }
+
+    #[test]
+    fn post_authorization_boundary_still_denies_protected_write() {
+        let tool_call = ToolCall {
+            id: "host-safety-after-authorization-write".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": ".claude/settings.json",
+                    "content": "must not be written"
+                })
+                .to_string(),
+            },
+        };
+
+        let result = execute_tool_after_authorization(&tool_call, None, None, None);
+        assert!(result.is_error());
+        assert!(matches!(
+            result.outcome(),
+            ToolOutcome::Error { failure }
+                if failure.code == ToolFailureCode::PolicyDenied
+                    && failure.retryability == ToolRetryability::Never
+        ));
+        assert!(result.content().contains("non-bypassable host safety"));
+    }
 
     /// Temporary forensic dump used to verify byte-for-byte equivalence of
     /// `get_tool_definitions()` against the pre-#463 baseline. Writes to a
@@ -1095,7 +1026,8 @@ mod tests {
                 arguments: json!({ "command": "echo hello" }).to_string(),
             },
         };
-        let result = execute_tool_full(&call, None, None, None);
+        let permission_manager = PermissionManager::unrestricted();
+        let result = execute_tool_full(&call, None, None, &permission_manager);
         assert_eq!(
             result.tool_call_id(),
             "call-#491-test",
@@ -1112,7 +1044,7 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         };
-        let agent_result = execute_tool_full(&agent_call, None, None, None);
+        let agent_result = execute_tool_full(&agent_call, None, None, &permission_manager);
         assert_eq!(
             agent_result.tool_call_id(),
             "call-#491-agent",
@@ -2025,7 +1957,7 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn test_check_tool_permission_none_manager() {
+    fn test_check_tool_permission_explicit_unrestricted_manager() {
         let tool_call = ToolCall {
             id: "call_1".to_string(),
             call_type: "function".to_string(),
@@ -2034,37 +1966,12 @@ mod tests {
                 arguments: r#"{"command": "ls"}"#.to_string(),
             },
         };
-        // No permission manager -- should return None (allow) in legacy fail-open mode
-        assert!(check_tool_permission(&tool_call, None).is_none());
-    }
-
-    // --- Regression tests for crosslink #460 ---
-
-    #[test]
-    fn strict_permission_denies_when_manager_absent() {
-        let tool_call = ToolCall {
-            id: "call_1".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "bash".to_string(),
-                arguments: r#"{"command": "ls"}"#.to_string(),
-            },
-        };
-        match check_tool_permission_strict(&tool_call, None) {
-            PermissionOutcome::Denied(r) => {
-                assert!(r.is_error());
-                assert!(r.content().contains("no permission manager"));
-            }
-            other => panic!("expected Denied, got {other:?}"),
-        }
+        let manager = PermissionManager::unrestricted();
+        assert!(check_tool_permission(&tool_call, &manager).is_none());
     }
 
     #[test]
-    fn strict_permission_allows_when_manager_is_explicitly_disabled() {
-        // Under crosslink #460's refined contract, an explicitly disabled
-        // PermissionManager is an explicit "allow all" override rather than
-        // a reason to deny. The strict helper only denies when the caller
-        // supplied NO manager at all (the true bypass risk).
+    fn outcome_permission_allows_safe_call_when_prompts_are_explicitly_disabled() {
         let tool_call = ToolCall {
             id: "call_1".to_string(),
             call_type: "function".to_string(),
@@ -2075,7 +1982,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = PermissionManager::new(tmp.path().join("p.json"), false, vec![]);
-        match check_tool_permission_strict(&tool_call, Some(&mgr)) {
+        match check_tool_permission_outcome(&tool_call, &mgr) {
             PermissionOutcome::Allowed => {}
             other => {
                 panic!("expected Allowed for explicitly-disabled (unrestricted) mgr, got {other:?}")
@@ -2096,7 +2003,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr =
             PermissionManager::new(tmp.path().join("p.json"), true, vec!["echo *".to_string()]);
-        match check_tool_permission_outcome(&tool_call, Some(&mgr)) {
+        match check_tool_permission_outcome(&tool_call, &mgr) {
             PermissionOutcome::Allowed => {}
             other => panic!("expected Allowed, got {other:?}"),
         }
@@ -2114,7 +2021,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = PermissionManager::new(tmp.path().join("p.json"), true, vec![]);
-        match check_tool_permission_outcome(&tool_call, Some(&mgr)) {
+        match check_tool_permission_outcome(&tool_call, &mgr) {
             PermissionOutcome::NeedsPrompt {
                 tool_call_id, tool, ..
             } => {
@@ -2156,7 +2063,7 @@ mod tests {
             },
         };
         let (mgr, _tmp) = deny_all_bash_manager();
-        match execute_tool_gated(&tool_call, None, None, None, Some(&mgr)) {
+        match execute_tool_gated(&tool_call, None, None, None, &mgr) {
             ExecutionOutcome::Result(r) => {
                 assert!(r.is_error(), "denial should mark the result as error");
                 assert!(
@@ -2189,7 +2096,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr =
             PermissionManager::new(tmp.path().join("p.json"), true, vec!["echo *".to_string()]);
-        match execute_tool_gated(&tool_call, None, None, None, Some(&mgr)) {
+        match execute_tool_gated(&tool_call, None, None, None, &mgr) {
             ExecutionOutcome::Result(r) => {
                 assert!(
                     !r.is_error(),
@@ -2221,7 +2128,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         // enabled manager, no matching rule -> NeedsPrompt
         let mgr = PermissionManager::new(tmp.path().join("p.json"), true, vec![]);
-        match execute_tool_gated(&tool_call, None, None, None, Some(&mgr)) {
+        match execute_tool_gated(&tool_call, None, None, None, &mgr) {
             ExecutionOutcome::NeedsPrompt {
                 tool_call_id,
                 tool,
@@ -2241,10 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_tool_gated_strict_no_mgr_is_denied() {
-        // Construct a tool call and run through the strict entry point with
-        // a PermissionManager::unrestricted — then verify the *strict*
-        // helper itself denies when None is passed.
+    fn required_manager_dispatch_accepts_explicit_unrestricted_policy() {
         let tool_call = ToolCall {
             id: "gated_strict_1".to_string(),
             call_type: "function".to_string(),
@@ -2253,23 +2157,6 @@ mod tests {
                 arguments: r#"{"command": "echo strict"}"#.to_string(),
             },
         };
-        // Direct assertion of the strict-check gate: no manager -> Denied.
-        match check_tool_permission_strict(&tool_call, None) {
-            PermissionOutcome::Denied(r) => {
-                assert!(r.is_error());
-                assert!(
-                    r.content().contains("no permission manager"),
-                    "expected strict-denial message; got {}",
-                    r.content()
-                );
-            }
-            other => panic!("expected strict Denied for None mgr, got {other:?}"),
-        }
-
-        // And the strict-dispatch entry point with an unrestricted manager
-        // should execute normally — proving the fail-closed posture only
-        // fires when there is genuinely no manager, not when the intent of
-        // the caller is an explicit "allow all".
         let mgr = PermissionManager::unrestricted();
         let result = execute_tool_with_permission_required(&tool_call, None, None, None, &mgr);
         assert!(

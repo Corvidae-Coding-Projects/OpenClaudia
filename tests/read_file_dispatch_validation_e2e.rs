@@ -12,22 +12,14 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod support;
+
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("read_file", args, &mut ctx)
-        .expect("read_file must be registered")
-        .into_legacy()
+    support::dispatch_tool("read_file", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -57,7 +49,9 @@ fn path_arg_as_number_returns_validation_error() {
     let args = args_with(&[("path", json!(42))]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'path'"));
 }
 
 #[test]
@@ -65,7 +59,9 @@ fn path_arg_as_array_returns_validation_error() {
     let args = args_with(&[("path", json!(["a", "b"]))]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'path'"));
 }
 
 #[test]
@@ -73,7 +69,8 @@ fn path_arg_as_null_returns_validation_error() {
     let args = args_with(&[("path", Value::Null)]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("Missing 'path' argument"));
 }
 
 #[test]

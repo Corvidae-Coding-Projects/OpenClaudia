@@ -19,6 +19,7 @@ const fn cfg_with_mcp(mcp: HashMap<String, Vec<String>>) -> PermissionsConfig {
         enabled: true,
         default_allow: Vec::new(),
         mcp,
+        project_proposal: None,
     }
 }
 

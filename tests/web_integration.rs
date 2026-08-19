@@ -385,6 +385,26 @@ fn execute_web_fetch_missing_url_arg_returns_error() {
 // ===========================================================================
 
 #[cfg(feature = "browser")]
+fn assert_web_search_host_safety_denial(
+    result: &openclaudia::tools::ToolResult,
+    expected_reason: &str,
+) {
+    use openclaudia::tools::{ToolFailureCode, ToolOutcome, ToolRetryability};
+
+    assert!(result.is_error(), "web-search classification must deny");
+    assert!(matches!(
+        result.outcome(),
+        ToolOutcome::Error { failure }
+            if failure.code == ToolFailureCode::PermissionDenied
+                && failure.retryability == ToolRetryability::Never
+    ));
+    assert_eq!(
+        result.content(),
+        format!("Permission denied: Host safety: {expected_reason}")
+    );
+}
+
+#[cfg(feature = "browser")]
 #[test]
 fn execute_web_search_short_query_returns_error() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
@@ -398,10 +418,9 @@ fn execute_web_search_short_query_returns_error() {
         },
     };
     let empty_result = execute_tool(&empty);
-    assert!(empty_result.is_error(), "empty query must fail closed");
-    assert_eq!(
-        empty_result.content(),
-        "Permission denied: Denied: web_search tool call has malformed arguments (expected non-empty string 'query')"
+    assert_web_search_host_safety_denial(
+        &empty_result,
+        "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
     );
 
     let one_character = ToolCall {
@@ -448,26 +467,26 @@ fn execute_web_search_missing_query_returns_error() {
 fn execute_web_search_rejects_non_string_query_before_browser_launch() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 
-    for (name, value, expected) in [
+    for (name, value, expected_reason) in [
         (
             "number",
             json!(42),
-            "Permission denied: Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
         ),
         (
             "array",
             json!(["rust", "release"]),
-            "Permission denied: Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
         ),
         (
             "object",
             json!({"q": "rust release"}),
-            "Permission denied: Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
         ),
         (
             "null",
             Value::Null,
-            "Permission denied: Denied: Missing 'query' argument required for web_search tool call",
+            "Denied: Missing 'query' argument required for web_search tool call",
         ),
     ] {
         let call = ToolCall {
@@ -482,8 +501,7 @@ fn execute_web_search_rejects_non_string_query_before_browser_launch() {
             },
         };
         let result = execute_tool(&call);
-        assert!(result.is_error(), "query case {name} should fail");
-        assert_eq!(result.content(), expected);
+        assert_web_search_host_safety_denial(&result, expected_reason);
     }
 }
 

@@ -8,7 +8,9 @@
 //! Spec: crosslink #526
 //! Phase 2 issue: crosslink #541
 
-use openclaudia::tools::{execute_tool, FunctionCall, SessionIdGuard, ToolCall};
+use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
+use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
+use openclaudia::tools::{execute_tool, FunctionCall, SessionIdGuard, ToolCall, ToolResult};
 use serde_json::{json, Value};
 
 fn make_tool_call(name: &str, args: &Value) -> ToolCall {
@@ -20,6 +22,24 @@ fn make_tool_call(name: &str, args: &Value) -> ToolCall {
             arguments: args.to_string(),
         },
     }
+}
+
+fn execute_with_exact_approval(tool_call: &ToolCall) -> ToolResult {
+    let state = tempfile::TempDir::new().expect("create permission state directory");
+    let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
+    let permit = manager
+        .approve_tool_call_once(tool_call, None, ApprovalProvenance::InteractiveUser)
+        .expect("host approval must mint an exact one-use permit");
+    ToolExecutor::execute(ToolExecutorRequest {
+        tool_call,
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+        permission_mgr: &manager,
+        authorization: Some(permit),
+        session_id: None,
+        policy_enforcer: None,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,7 +97,7 @@ fn b1a_background_spawn_returns_shell_id() {
 #[test]
 fn b1b_bash_output_no_arg_lists_shells() {
     // Start a long-running background shell
-    let spawn = execute_tool(&make_tool_call(
+    let spawn = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": "sleep 5", "run_in_background": true }),
     ));
@@ -109,7 +129,7 @@ fn b1b_bash_output_no_arg_lists_shells() {
 #[cfg(unix)]
 fn b1c_bash_output_drains_incrementally() {
     // Echo two lines then sleep so the shell stays alive for both polls
-    let spawn = execute_tool(&make_tool_call(
+    let spawn = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": "echo first; echo second; sleep 3", "run_in_background": true }),
     ));
@@ -566,7 +586,7 @@ fn b4a_env_scrub_removes_api_key_suffix_var() {
     let sentinel = "OPENCLAUDIA_SENTINEL_B4A";
     std::env::set_var(test_key, sentinel);
 
-    let result = execute_tool(&make_tool_call(
+    let result = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": format!("echo \"val=${{{}:-SCRUBBED}}\"", test_key) }),
     ));
@@ -598,7 +618,7 @@ fn b4a_env_scrub_removes_api_key_suffix_var() {
 #[test]
 #[cfg(unix)]
 fn b4b_env_scrub_preserves_path() {
-    let result = execute_tool(&make_tool_call(
+    let result = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": "echo \"path=${PATH}\"" }),
     ));
@@ -915,7 +935,7 @@ fn b6a_cd_single_quoted_path_reaches_bash() {
     let canonical = dir.path().canonicalize().expect("B6a: canonical tempdir");
     let path = canonical.to_string_lossy().into_owned();
 
-    let result = execute_tool(&make_tool_call(
+    let result = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": format!("cd '{}' && pwd", path) }),
     ));
@@ -976,7 +996,7 @@ fn b6c_cd_double_quoted_path_with_spaces_executes() {
     let canonical = dir.path().canonicalize().expect("B6c: canonical tempdir");
     let path = canonical.to_string_lossy().into_owned();
 
-    let result = execute_tool(&make_tool_call(
+    let result = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": format!("cd \"{}\" && pwd", path) }),
     ));
@@ -1155,7 +1175,7 @@ fn b7f_project_is_writable_but_control_state_is_protected() {
         .to_string_lossy()
         .into_owned();
 
-    let write = execute_tool(&make_tool_call(
+    let write = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": format!("printf sandboxed > {output_path:?}") }),
     ));
@@ -1167,7 +1187,7 @@ fn b7f_project_is_writable_but_control_state_is_protected() {
 
     let git_probe = std::path::Path::new(".git/openclaudia-sandbox-probe");
     assert!(!git_probe.exists(), "B7f: stale git probe");
-    let control_write = execute_tool(&make_tool_call(
+    let control_write = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": "touch .git/openclaudia-sandbox-probe" }),
     ));
@@ -1177,7 +1197,7 @@ fn b7f_project_is_writable_but_control_state_is_protected() {
     );
     assert!(!git_probe.exists(), "B7f: sandbox mutated .git");
 
-    let git_status = execute_tool(&make_tool_call(
+    let git_status = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": "git status --short >/dev/null" }),
     ));
@@ -1186,7 +1206,7 @@ fn b7f_project_is_writable_but_control_state_is_protected() {
         "B7f: read-only git workflow failed: {git_status:?}"
     );
 
-    let hidden_state = execute_tool(&make_tool_call(
+    let hidden_state = execute_with_exact_approval(&make_tool_call(
         "bash",
         &json!({ "command": "test ! -e .openclaudia/memory.db && test ! -e .claude/hooks" }),
     ));

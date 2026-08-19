@@ -37,12 +37,12 @@ use crate::cli::repl::vim::{self, VimState};
 use crate::cli::repl::{load_chat_session, save_chat_session, Session};
 use crate::{
     build_chat_endpoint_and_headers, build_chat_request_body, build_hook_engine, chdir_to_git_root,
-    check_tool_permission_interactive, check_tool_unrestricted, finalize_chat,
-    init_memory_with_banner, init_permission_manager, init_plugin_manager,
-    init_rustyline_with_history, init_vdd_engine_if_enabled, maybe_auto_compact,
-    maybe_resume_session, parse_initial_behavior_mode, read_multiline_continuation,
-    render_welcome_or_fallback, resolve_chat_auth, resolve_model_name, run_vdd_review, ChatAuth,
-    ChatAuthSelectionMode, ToolPermissionResult,
+    check_tool_permission_interactive, finalize_chat, init_memory_with_banner,
+    init_permission_manager, init_plugin_manager, init_rustyline_with_history,
+    init_vdd_engine_if_enabled, maybe_auto_compact, maybe_resume_session,
+    parse_initial_behavior_mode, read_multiline_continuation, render_welcome_or_fallback,
+    resolve_chat_auth, resolve_model_name, run_vdd_review, ChatAuth, ChatAuthSelectionMode,
+    ToolPermissionResult,
 };
 
 use eventsource_stream::Eventsource;
@@ -75,7 +75,7 @@ fn execute_tool_with_memory_after_permission(
             memory_db,
             app_config: None,
             task_mgr: None,
-            permission_mgr: Some(permission_mgr),
+            permission_mgr,
             authorization,
             session_id: Some(session_id),
             policy_enforcer,
@@ -464,7 +464,9 @@ impl ChatRepl {
         // A dangerous bypass is a launch-scoped choice. Apply it after resume
         // so a saved session can neither enable nor disable the current CLI's
         // explicit posture.
-        chat_session.set_permission_bypass(args.dangerously_skip_permissions);
+        chat_session.set_permission_bypass(
+            args.dangerously_skip_permissions || !config.permissions.enabled,
+        );
         let analytics_subscriber = openclaudia::services::analytics::StateAnalyticsSubscriber::new(
             chat_session.state_store(),
             std::sync::Arc::new(openclaudia::services::analytics::TracingAnalytics),
@@ -1905,16 +1907,12 @@ impl ChatRepl {
             push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
             return Err(gemini_tool_error_response(tool_call, result.content()));
         }
-        let result = if self.chat_session.permission_bypass_enabled() {
-            check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
-        } else {
-            check_tool_permission_interactive(
-                tool_call,
-                &self.chat_session.id(),
-                Some(&self.permission_mgr),
-                &self.transient_allowed_tool_rules,
-            )
-        };
+        let result = check_tool_permission_interactive(
+            tool_call,
+            &self.chat_session.id(),
+            &self.permission_mgr,
+            &self.transient_allowed_tool_rules,
+        );
         match result {
             ToolPermissionResult::Allowed { authorization } => Ok(authorization),
             ToolPermissionResult::Denied(msg) => {
@@ -2719,16 +2717,12 @@ impl ChatRepl {
             push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
             return None;
         }
-        let result = if self.chat_session.permission_bypass_enabled() {
-            check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
-        } else {
-            check_tool_permission_interactive(
-                tool_call,
-                &self.chat_session.id(),
-                Some(&self.permission_mgr),
-                &self.transient_allowed_tool_rules,
-            )
-        };
+        let result = check_tool_permission_interactive(
+            tool_call,
+            &self.chat_session.id(),
+            &self.permission_mgr,
+            &self.transient_allowed_tool_rules,
+        );
         match result {
             ToolPermissionResult::Denied(msg) => {
                 push_observed_cli_tool_result_message(

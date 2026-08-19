@@ -7,7 +7,9 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::missing_panics_doc)]
 
-use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
+use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
+use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
+use openclaudia::tools::{FunctionCall, ToolCall};
 use serde_json::json;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixListener;
@@ -31,13 +33,32 @@ fn bash(command: &str) -> openclaudia::tools::ToolResult {
 }
 
 fn bash_unlocked(command: &str) -> openclaudia::tools::ToolResult {
-    execute_tool(&ToolCall {
+    let tool_call = ToolCall {
         id: "sandbox-escape-probe".to_string(),
         call_type: "function".to_string(),
         function: FunctionCall {
             name: "bash".to_string(),
             arguments: json!({"command": command}).to_string(),
         },
+    };
+    // These probes intentionally need compound shell syntax to inspect several
+    // sandbox properties in one process. Exercise that syntax through the
+    // production exact-approval path so this suite tests capability
+    // confinement instead of relying on the retired manager-less bypass.
+    let state = tempfile::TempDir::new().expect("create permission state directory");
+    let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
+    let permit = manager
+        .approve_tool_call_once(&tool_call, None, ApprovalProvenance::InteractiveUser)
+        .expect("host approval must mint an exact one-use permit");
+    ToolExecutor::execute(ToolExecutorRequest {
+        tool_call: &tool_call,
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+        permission_mgr: &manager,
+        authorization: Some(permit),
+        session_id: None,
+        policy_enforcer: None,
     })
 }
 

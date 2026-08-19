@@ -3,7 +3,7 @@
 //! This centralizes the common "run an `OpenClaudia` tool locally" mechanics
 //! that were duplicated across TUI, legacy REPL, ACP local tools, and subagents:
 //! optional enterprise tool cap, session id guard,
-//! active ledger installation, permission checked-vs-unchecked dispatch, and
+//! active ledger installation, exact permission authorization, and
 //! task-manager-aware execution.
 
 use crate::config::AppConfig;
@@ -48,7 +48,9 @@ pub struct ToolExecutorRequest<'a> {
     /// Optional task manager for task_* tools.
     pub task_mgr: Option<&'a mut TaskManager>,
     /// Permission manager used for normal checks and permit revalidation.
-    pub permission_mgr: Option<&'a PermissionManager>,
+    /// A concrete manager is mandatory; explicit prompt bypass is represented
+    /// by [`PermissionManager::unrestricted`], never by an absent argument.
+    pub permission_mgr: &'a PermissionManager,
     /// Opaque exact-call permit minted by an outer interactive decision.
     /// Absence means the executor performs the normal permission check.
     pub authorization: Option<ExecutionPermit>,
@@ -195,6 +197,17 @@ impl ToolExecutor {
             policy_enforcer,
         } = request;
 
+        if let Err(reason) =
+            Self::parse_arguments(&tool_call.function.name, &tool_call.function.arguments)
+        {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::InvalidArguments,
+                reason,
+                ToolRetryability::Never,
+            );
+        }
+
         let tool_policy = ToolExecutionPolicy::new(policy_enforcer, session_id);
         if let Err(err) = tool_policy.check_tool(&tool_call.function.name) {
             return ToolResult::failure(
@@ -209,44 +222,19 @@ impl ToolExecutor {
         let _ledger_guard =
             session_id.and_then(crate::grounded_loop::install_active_project_ledger_for_session);
 
-        let authorization = match (authorization, permission_mgr) {
-            (Some(permit), Some(_)) => Some(permit),
-            (Some(_), None) => {
-                return ToolResult::failure(
-                    tool_call,
-                    ToolFailureCode::PermissionDenied,
-                    "Permission denied: an execution permit requires its issuing permission manager"
-                        .to_string(),
-                    ToolRetryability::Never,
-                );
-            }
-            (None, Some(permission_mgr)) => {
-                match permission_mgr.authorize_tool_call(tool_call, session_id) {
-                    AuthorizationResult::Allowed(permit) => Some(permit),
-                    AuthorizationResult::Denied(reason) => {
-                        return ToolResult::failure(
-                            tool_call,
-                            ToolFailureCode::PermissionDenied,
-                            format!("Permission denied: {reason}"),
-                            ToolRetryability::Never,
-                        );
-                    }
-                    AuthorizationResult::NeedsPrompt { tool, target } => {
-                        return ToolResult::failure(
-                            tool_call,
-                            ToolFailureCode::PermissionDenied,
-                            format!(
-                                "Permission denied: no interactive prompt is available for {tool} on '{target}'"
-                            ),
-                            ToolRetryability::Never,
-                        );
-                    }
+        let authorization = match authorization {
+            Some(permit) => permit,
+            None => match permission_mgr.authorize_tool_call(tool_call, session_id) {
+                AuthorizationResult::Allowed(permit) => permit,
+                AuthorizationResult::Denied(reason) => {
+                    return ToolResult::failure(
+                        tool_call,
+                        ToolFailureCode::PermissionDenied,
+                        format!("Permission denied: {reason}"),
+                        ToolRetryability::Never,
+                    );
                 }
-            }
-            (None, None) => match tools::check_tool_permission_outcome(tool_call, None) {
-                tools::PermissionOutcome::Allowed => None,
-                tools::PermissionOutcome::Denied(result) => return *result,
-                tools::PermissionOutcome::NeedsPrompt { tool, target, .. } => {
+                AuthorizationResult::NeedsPrompt { tool, target } => {
                     return ToolResult::failure(
                         tool_call,
                         ToolFailureCode::PermissionDenied,
@@ -259,17 +247,15 @@ impl ToolExecutor {
             },
         };
 
-        if let (Some(permit), Some(permission_mgr)) = (authorization.as_ref(), permission_mgr) {
-            if let Err(reason) =
-                permission_mgr.consume_execution_permit(permit, tool_call, session_id)
-            {
-                return ToolResult::failure(
-                    tool_call,
-                    ToolFailureCode::PermissionDenied,
-                    format!("Permission denied: execution permit rejected: {reason}"),
-                    ToolRetryability::Never,
-                );
-            }
+        if let Err(reason) =
+            permission_mgr.consume_execution_permit(&authorization, tool_call, session_id)
+        {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: execution permit rejected: {reason}"),
+                ToolRetryability::Never,
+            );
         }
 
         if let Err(err) = tool_policy.check_and_record_tool(&tool_call.function.name) {
@@ -281,7 +267,7 @@ impl ToolExecutor {
             );
         }
 
-        tools::execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
+        tools::execute_tool_after_authorization(tool_call, memory_db, app_config, task_mgr)
     }
 }
 
@@ -322,13 +308,14 @@ mod tests {
             ..Default::default()
         });
         let call = bash_call("printf tool-executor-should-not-run");
+        let permission_manager = PermissionManager::unrestricted();
 
         let result = ToolExecutor::execute(ToolExecutorRequest {
             tool_call: &call,
             memory_db: None,
             app_config: None,
             task_mgr: None,
-            permission_mgr: None,
+            permission_mgr: &permission_manager,
             authorization: None,
             session_id: Some("s1"),
             policy_enforcer: Some(&enforcer),
@@ -356,7 +343,7 @@ mod tests {
             memory_db: None,
             app_config: None,
             task_mgr: None,
-            permission_mgr: Some(&manager),
+            permission_mgr: &manager,
             authorization: Some(permit),
             session_id: Some("s2"),
             policy_enforcer: None,
@@ -383,7 +370,7 @@ mod tests {
             memory_db: None,
             app_config: None,
             task_mgr: None,
-            permission_mgr: Some(&strict),
+            permission_mgr: &strict,
             authorization: None,
             session_id: Some("cap-session"),
             policy_enforcer: Some(&enforcer),
@@ -401,7 +388,7 @@ mod tests {
             memory_db: None,
             app_config: None,
             task_mgr: None,
-            permission_mgr: Some(&unrestricted),
+            permission_mgr: &unrestricted,
             authorization: None,
             session_id: Some("cap-session"),
             policy_enforcer: Some(&enforcer),
@@ -457,7 +444,7 @@ mod tests {
             memory_db: None,
             app_config: None,
             task_mgr: None,
-            permission_mgr: Some(&manager),
+            permission_mgr: &manager,
             authorization: Some(permit),
             session_id: Some("s3"),
             policy_enforcer: None,
@@ -467,5 +454,38 @@ mod tests {
         assert!(result.content().contains("execution permit rejected"));
         assert!(!dir.path().join("approved.txt").exists());
         assert!(!dir.path().join("changed.txt").exists());
+    }
+
+    #[test]
+    fn tool_executor_preserves_typed_invalid_arguments_before_permission_classification() {
+        let call = ToolCall {
+            id: "invalid-array".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "list_files".to_string(),
+                arguments: "[]".to_string(),
+            },
+        };
+        let manager = PermissionManager::unrestricted();
+
+        let result = ToolExecutor::execute(ToolExecutorRequest {
+            tool_call: &call,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &manager,
+            authorization: None,
+            session_id: None,
+            policy_enforcer: None,
+        });
+
+        assert!(result.is_error());
+        assert!(matches!(
+            result.outcome(),
+            crate::tools::ToolOutcome::Error { failure }
+                if failure.code == ToolFailureCode::InvalidArguments
+                    && failure.retryability == ToolRetryability::Never
+        ));
+        assert!(result.content().contains("expected a JSON object"));
     }
 }

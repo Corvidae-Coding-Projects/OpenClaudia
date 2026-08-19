@@ -11,12 +11,14 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
+
+mod support;
 
 // Cron tools touch .openclaudia/schedules.json — serialize cwd
 // changes process-wide so concurrent tests don't race.
@@ -44,16 +46,7 @@ fn run_in_tempdir<R>(f: impl FnOnce() -> R) -> R {
 }
 
 fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
-        .into_legacy()
+    support::dispatch_tool(name, args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -130,7 +123,9 @@ fn cron_create_wrong_type_name_arg_errors_before_disk_write() {
         ]);
         let (msg, is_err) = dispatch("cron_create", &args);
         assert!(is_err);
-        assert_eq!(msg, "Invalid 'name' argument: expected string");
+        assert!(msg.contains("Host safety"));
+        assert!(msg.contains("malformed arguments"));
+        assert!(msg.contains("'name'"));
         assert!(!std::path::Path::new(".openclaudia/schedules.json").exists());
     });
 }

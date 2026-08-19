@@ -23,6 +23,7 @@ use crate::config::AppConfig;
 use crate::memory::MemoryDb;
 use crate::session::TaskManager;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 
 use super::effect::{ToolEffect, ToolEffectSpec, ToolTarget, TypedEffect};
 
@@ -41,6 +42,53 @@ pub struct ToolContext<'a> {
     pub app_config: Option<&'a AppConfig>,
     /// Optional mutable session task manager (task_* tools).
     pub task_mgr: Option<&'a mut TaskManager>,
+}
+
+/// Opaque proof that the canonical executor admitted one exact registry call.
+///
+/// The type is public only because it appears in the public metadata trait's
+/// execution seam. It has no public constructor, is not cloneable or
+/// deserializable, and is bound to the canonical tool name and argument map.
+/// External callers can inspect registry metadata but cannot invoke handlers
+/// without passing through the host-safety and permission lifecycle.
+pub struct ToolDispatchPermit {
+    policy_generation: u32,
+    tool_name: String,
+    arguments_digest: [u8; 32],
+}
+
+impl ToolDispatchPermit {
+    pub(super) fn new(tool_name: &str, args: &HashMap<String, Value>) -> Self {
+        Self {
+            policy_generation: super::HOST_SAFETY_POLICY_GENERATION,
+            tool_name: tool_name.to_string(),
+            arguments_digest: digest_arguments(args),
+        }
+    }
+
+    fn matches(&self, tool_name: &str, args: &HashMap<String, Value>) -> bool {
+        self.policy_generation == super::HOST_SAFETY_POLICY_GENERATION
+            && self.tool_name == tool_name
+            && self.arguments_digest == digest_arguments(args)
+    }
+}
+
+fn digest_arguments(args: &HashMap<String, Value>) -> [u8; 32] {
+    let mut keys: Vec<&String> = args.keys().collect();
+    keys.sort_unstable();
+    let mut hasher = Sha256::new();
+    for key in keys {
+        let key_bytes = key.as_bytes();
+        hasher.update(key_bytes.len().to_le_bytes());
+        hasher.update(key_bytes);
+        if let Some(value) = args.get(key) {
+            let encoded = serde_json::to_vec(value)
+                .expect("serializing a serde_json::Value to JSON cannot fail");
+            hasher.update(encoded.len().to_le_bytes());
+            hasher.update(encoded);
+        }
+    }
+    hasher.finalize().into()
 }
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
@@ -111,10 +159,11 @@ pub trait ToolHandler: Send + Sync {
     /// registry/provider/frontend callers never receive their tuple shape.
     fn execute(
         &self,
+        permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
-        let (content, is_error) = self.execute_legacy(args, ctx);
+        let (content, is_error) = self.execute_legacy(permit, args, ctx);
         ToolHandlerResult::legacy(content, is_error)
     }
 
@@ -123,6 +172,7 @@ pub trait ToolHandler: Send + Sync {
     #[doc(hidden)]
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -146,12 +196,21 @@ impl ToolRegistry {
 
     /// Dispatch `tool_name` with `args` to the registered handler, or return
     /// `None` if no handler is registered (caller handles unknown-tool path).
-    pub fn dispatch(
+    pub(crate) fn dispatch(
         &self,
         tool_name: &str,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
+        permit: &ToolDispatchPermit,
     ) -> Option<ToolHandlerResult> {
+        if !permit.matches(tool_name, args) {
+            return Some(ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::PolicyDenied,
+                "Registry dispatch authorization does not match the exact tool invocation"
+                    .to_string(),
+                ToolRetryability::Never,
+            )));
+        }
         if let Err(error) = &ctx.security {
             return Some(ToolHandlerResult::error(ToolFailure::new(
                 ToolFailureCode::Unavailable,
@@ -159,7 +218,9 @@ impl ToolRegistry {
                 ToolRetryability::Never,
             )));
         }
-        self.handlers.get(tool_name).map(|h| h.execute(args, ctx))
+        self.handlers
+            .get(tool_name)
+            .map(|h| h.execute(permit, args, ctx))
     }
 }
 
@@ -206,6 +267,7 @@ impl ToolHandler for BashHandler {
     }
     fn execute(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
@@ -247,6 +309,7 @@ impl ToolHandler for BashOutputHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -283,6 +346,7 @@ impl ToolHandler for KillShellHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -319,6 +383,7 @@ impl ToolHandler for KillShellsForAgentHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -371,6 +436,7 @@ impl ToolHandler for ReadFileHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -416,6 +482,7 @@ impl ToolHandler for GroundingContextHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -456,6 +523,7 @@ impl ToolHandler for WriteFileHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -504,6 +572,7 @@ impl ToolHandler for EditFileHandler {
     }
     fn execute(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
@@ -562,6 +631,7 @@ impl ToolHandler for NotebookEditHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -598,6 +668,7 @@ impl ToolHandler for ListFilesHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -638,6 +709,7 @@ impl ToolHandler for GlobHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -687,6 +759,7 @@ impl ToolHandler for GrepHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -734,6 +807,7 @@ impl ToolHandler for CrosslinkHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -785,6 +859,7 @@ impl ToolHandler for WebFetchHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -839,6 +914,7 @@ impl ToolHandler for WebSearchHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -882,6 +958,7 @@ impl ToolHandler for WebBrowserHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -953,6 +1030,7 @@ impl ToolHandler for LspHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1010,6 +1088,7 @@ impl ToolHandler for TodoWriteHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1041,6 +1120,7 @@ impl ToolHandler for TodoReadHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1128,6 +1208,7 @@ impl ToolHandler for AskUserQuestionHandler {
     }
     fn execute(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
@@ -1166,6 +1247,7 @@ impl ToolHandler for EnterWorktreeHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1223,6 +1305,7 @@ impl ToolHandler for ExitWorktreeHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1254,6 +1337,7 @@ impl ToolHandler for ListWorktreesHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1308,6 +1392,7 @@ impl ToolHandler for CronCreateHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1354,6 +1439,7 @@ impl ToolHandler for CronDeleteHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1389,6 +1475,7 @@ impl ToolHandler for CronListHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1428,6 +1515,7 @@ impl ToolHandler for EnterPlanModeHandler {
     }
     fn execute(
         &self,
+        _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
@@ -1478,6 +1566,7 @@ impl ToolHandler for ExitPlanModeHandler {
     }
     fn execute(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
@@ -1526,6 +1615,7 @@ impl ToolHandler for TaskCreateHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1592,6 +1682,7 @@ impl ToolHandler for TaskUpdateHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1631,6 +1722,7 @@ impl ToolHandler for TaskGetHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1665,6 +1757,7 @@ impl ToolHandler for TaskListHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1715,6 +1808,7 @@ impl ToolHandler for ListMcpResourcesHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1814,6 +1908,7 @@ impl ToolHandler for ReadMcpResourceHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1921,6 +2016,7 @@ impl ToolHandler for SkillHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -1969,6 +2065,7 @@ impl ToolHandler for ToolSearchHandler {
     }
     fn execute_legacy(
         &self,
+        _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         _ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
@@ -2245,4 +2342,61 @@ fn build_registry() -> ToolRegistry {
 pub fn registry() -> &'static ToolRegistry {
     static REGISTRY: OnceLock<ToolRegistry> = OnceLock::new();
     REGISTRY.get_or_init(build_registry)
+}
+
+#[cfg(test)]
+mod dispatch_permit_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn permit_is_bound_to_exact_tool_and_arguments_independent_of_map_order() {
+        let first = HashMap::from([
+            ("path".to_string(), json!("src/lib.rs")),
+            ("line_end".to_string(), json!(10)),
+        ]);
+        let reversed = HashMap::from([
+            ("line_end".to_string(), json!(10)),
+            ("path".to_string(), json!("src/lib.rs")),
+        ]);
+        let permit = ToolDispatchPermit::new("read_file", &first);
+
+        assert!(permit.matches("read_file", &reversed));
+        assert!(!permit.matches("write_file", &reversed));
+
+        let changed = HashMap::from([
+            ("path".to_string(), json!("src/main.rs")),
+            ("line_end".to_string(), json!(10)),
+        ]);
+        assert!(!permit.matches("read_file", &changed));
+    }
+
+    #[test]
+    fn stale_policy_generation_invalidates_a_permit() {
+        let args = HashMap::new();
+        let mut permit = ToolDispatchPermit::new("list_files", &args);
+        permit.policy_generation = permit.policy_generation.saturating_add(1);
+        assert!(!permit.matches("list_files", &args));
+    }
+
+    #[test]
+    fn registry_rejects_a_permit_for_different_arguments_before_handler_execution() {
+        let permitted_args = HashMap::from([("path".to_string(), json!("."))]);
+        let changed_args = HashMap::from([("path".to_string(), json!("src"))]);
+        let permit = ToolDispatchPermit::new("list_files", &permitted_args);
+        let mut context = ToolContext {
+            security: Err("security must not be reached for a mismatched permit".to_string()),
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+        };
+
+        let result = registry()
+            .dispatch("list_files", &changed_args, &mut context, &permit)
+            .expect("registered handler returns a typed denial");
+        let (message, is_error) = result.into_legacy();
+        assert!(is_error);
+        assert!(message.contains("does not match the exact tool invocation"));
+        assert!(!message.contains("security must not be reached"));
+    }
 }

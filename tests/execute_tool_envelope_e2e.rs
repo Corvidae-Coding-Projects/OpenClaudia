@@ -12,7 +12,9 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
+use openclaudia::tools::{
+    execute_tool, FunctionCall, ToolCall, ToolFailureCode, ToolOutcome, ToolRetryability,
+};
 use serde_json::json;
 
 fn call(id: &str, name: &str, args: &serde_json::Value) -> ToolCall {
@@ -216,6 +218,12 @@ fn execute_tool_with_non_object_json_arguments_errors() {
     let result = execute_tool(&tc);
     assert_eq!(result.tool_call_id(), "c-array");
     assert!(result.is_error());
+    assert!(matches!(
+        result.outcome(),
+        ToolOutcome::Error { failure }
+            if failure.code == ToolFailureCode::InvalidArguments
+                && failure.retryability == ToolRetryability::Never
+    ));
     assert!(
         result.content().contains("expected a JSON object"),
         "non-object arguments must be rejected; got {:?}",

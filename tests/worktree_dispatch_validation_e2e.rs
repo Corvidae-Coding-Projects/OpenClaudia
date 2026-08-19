@@ -11,23 +11,16 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use openclaudia::tools::worktree::validate_branch_name;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
+mod support;
+
 fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
-        .into_legacy()
+    support::dispatch_tool(name, args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -38,6 +31,17 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
     m
 }
 
+fn assert_host_classification_denial(message: &str, field: &str) {
+    assert!(message.contains("Host safety"), "got {message:?}");
+    assert!(message.contains(field), "got {message:?}");
+    assert!(
+        message.contains("Missing")
+            || message.contains("malformed arguments")
+            || message.contains("could not be classified"),
+        "got {message:?}"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — enter_worktree: missing / empty branch
 // ───────────────────────────────────────────────────────────────────────────
@@ -46,10 +50,7 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
 fn enter_worktree_with_no_branch_arg_returns_documented_error() {
     let (msg, is_err) = dispatch("enter_worktree", &HashMap::new());
     assert!(is_err);
-    assert!(
-        msg.contains("branch name is required"),
-        "MUST surface documented missing-branch; got {msg:?}"
-    );
+    assert_host_classification_denial(&msg, "branch");
 }
 
 #[test]
@@ -57,10 +58,7 @@ fn enter_worktree_with_empty_branch_returns_required_error() {
     let args = args_with(&[("branch", json!(""))]);
     let (msg, is_err) = dispatch("enter_worktree", &args);
     assert!(is_err);
-    assert!(
-        msg.contains("branch name is required"),
-        "empty branch MUST be required-error; got {msg:?}"
-    );
+    assert_host_classification_denial(&msg, "branch");
 }
 
 #[test]
@@ -68,10 +66,7 @@ fn enter_worktree_branch_as_number_returns_validation_error() {
     let args = args_with(&[("branch", json!(42))]);
     let (msg, is_err) = dispatch("enter_worktree", &args);
     assert!(is_err);
-    assert!(
-        msg.contains("Invalid 'branch' argument: expected string"),
-        "wrong-type branch MUST be rejected clearly; got {msg:?}"
-    );
+    assert_host_classification_denial(&msg, "branch");
 }
 
 #[test]
@@ -79,7 +74,7 @@ fn enter_worktree_branch_as_null_returns_validation_error() {
     let args = args_with(&[("branch", Value::Null)]);
     let (msg, is_err) = dispatch("enter_worktree", &args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'branch' argument: expected string"));
+    assert_host_classification_denial(&msg, "branch");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -300,10 +295,7 @@ fn exit_worktree_path_as_number_returns_validation_error() {
     let args = args_with(&[("path", json!(42))]);
     let (msg, is_err) = dispatch("exit_worktree", &args);
     assert!(is_err);
-    assert!(
-        msg.contains("Invalid 'path' argument: expected string"),
-        "wrong-type path MUST be rejected clearly; got {msg:?}"
-    );
+    assert_host_classification_denial(&msg, "path");
 }
 
 #[test]
@@ -311,7 +303,7 @@ fn exit_worktree_path_as_null_returns_validation_error() {
     let args = args_with(&[("path", Value::Null)]);
     let (msg, is_err) = dispatch("exit_worktree", &args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert_host_classification_denial(&msg, "path");
 }
 
 #[test]
@@ -329,10 +321,7 @@ fn exit_worktree_apply_changes_wrong_type_returns_validation_error() {
     ]);
     let (msg, is_err) = dispatch("exit_worktree", &args);
     assert!(is_err);
-    assert!(
-        msg.contains("Invalid 'apply_changes' argument: expected boolean"),
-        "wrong-type apply_changes MUST be rejected before git checks; got {msg:?}"
-    );
+    assert_host_classification_denial(&msg, "apply_changes");
 }
 
 #[test]
@@ -344,10 +333,7 @@ fn exit_worktree_discard_changes_wrong_type_returns_validation_error() {
     ]);
     let (msg, is_err) = dispatch("exit_worktree", &args);
     assert!(is_err);
-    assert!(
-        msg.contains("Invalid 'discard_changes' argument: expected boolean"),
-        "wrong-type discard_changes MUST be rejected before git checks; got {msg:?}"
-    );
+    assert_host_classification_denial(&msg, "discard_changes");
 }
 
 #[test]

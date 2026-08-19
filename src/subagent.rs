@@ -1487,7 +1487,7 @@ async fn run_subagent_inner(
     // `execute_tool_with_memory` call inside this subagent's tool loop.
     // Closes crosslink #505 for the subagent path.
     let permission_mgr = crate::permissions::PermissionManager::trusted(
-        true,
+        app_config.permissions.enabled,
         app_config.permissions.default_allow.clone(),
         app_config.web_fetch.preapproved_domains.clone(),
     );
@@ -1745,7 +1745,7 @@ async fn run_subagent_inner(
                     memory_db: None,
                     app_config: None,
                     task_mgr: None,
-                    permission_mgr: Some(&permission_mgr),
+                    permission_mgr: &permission_mgr,
                     authorization: None,
                     session_id: Some(&agent_id),
                     policy_enforcer: Some(&policy_enforcer),

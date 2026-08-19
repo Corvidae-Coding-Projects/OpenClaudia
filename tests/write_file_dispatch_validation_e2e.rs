@@ -12,36 +12,19 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod support;
+
 fn dispatch_write(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("write_file", args, &mut ctx)
-        .expect("write_file must be registered")
-        .into_legacy()
+    support::dispatch_tool("write_file", args)
 }
 
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("read_file", args, &mut ctx)
-        .expect("read_file must be registered")
-        .into_legacy()
+    support::dispatch_tool("read_file", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -50,6 +33,15 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
         m.insert((*k).to_string(), v.clone());
     }
     m
+}
+
+fn assert_path_classification_denial(message: &str) {
+    assert!(message.contains("Host safety"), "got {message:?}");
+    assert!(message.contains("'path'"), "got {message:?}");
+    assert!(
+        message.contains("malformed arguments") || message.contains("Missing"),
+        "got {message:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -71,10 +63,7 @@ fn path_arg_as_number_returns_validation_error() {
     let args = args_with(&[("path", json!(42)), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(
-        msg.contains("Invalid 'path' argument: expected string"),
-        "non-string path MUST surface path type validation; got {msg:?}"
-    );
+    assert_path_classification_denial(&msg);
 }
 
 #[test]
@@ -82,7 +71,7 @@ fn path_arg_as_array_returns_validation_error() {
     let args = args_with(&[("path", json!(["x"])), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert_path_classification_denial(&msg);
 }
 
 #[test]
@@ -90,7 +79,7 @@ fn path_arg_as_object_returns_validation_error() {
     let args = args_with(&[("path", json!({"k": "v"})), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert_path_classification_denial(&msg);
 }
 
 #[test]
@@ -98,7 +87,7 @@ fn path_arg_as_null_returns_validation_error() {
     let args = args_with(&[("path", Value::Null), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert_path_classification_denial(&msg);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

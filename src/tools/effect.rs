@@ -473,7 +473,7 @@ pub struct EffectMatrixRow {
 pub enum ToolSurface {
     /// A static handler in the tool registry.
     Registry,
-    /// A subagent tool dispatched by `tools::execute_tool_full_unchecked`.
+    /// A subagent tool dispatched by `tools::execute_tool_after_authorization`.
     Subagent,
     /// A dynamically named tool served by a connected MCP server.
     Mcp,
@@ -498,7 +498,7 @@ impl ToolSurface {
 
 // ─── Catalog: every tool surface the model can reach ─────────────────────────
 
-/// Subagent tools dispatched by `tools::execute_tool_full_unchecked`'s match
+/// Subagent tools dispatched by `tools::execute_tool_after_authorization`'s match
 /// arms rather than by the registry.
 ///
 /// They are advertised to the model by

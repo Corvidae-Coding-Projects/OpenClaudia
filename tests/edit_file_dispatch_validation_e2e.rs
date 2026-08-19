@@ -13,36 +13,19 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod support;
+
 fn dispatch_edit(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("edit_file", args, &mut ctx)
-        .expect("edit_file must be registered")
-        .into_legacy()
+    support::dispatch_tool("edit_file", args)
 }
 
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("read_file", args, &mut ctx)
-        .expect("read_file must be registered")
-        .into_legacy()
+    support::dispatch_tool("read_file", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -77,7 +60,9 @@ fn path_arg_as_number_returns_validation_error() {
     ]);
     let (msg, is_err) = dispatch_edit(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'path'"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

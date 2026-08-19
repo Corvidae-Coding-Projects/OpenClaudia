@@ -22,7 +22,9 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
+use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
+use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
+use openclaudia::tools::{execute_tool, FunctionCall, ToolCall, ToolResult};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -41,8 +43,26 @@ fn call(name: &str, args: &Value) -> ToolCall {
     }
 }
 
+fn execute_with_exact_approval(tool_call: &ToolCall) -> ToolResult {
+    let state = tempfile::TempDir::new().expect("create permission state directory");
+    let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
+    let permit = manager
+        .approve_tool_call_once(tool_call, None, ApprovalProvenance::InteractiveUser)
+        .expect("host approval must mint an exact one-use permit");
+    ToolExecutor::execute(ToolExecutorRequest {
+        tool_call,
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+        permission_mgr: &manager,
+        authorization: Some(permit),
+        session_id: None,
+        policy_enforcer: None,
+    })
+}
+
 fn bash_bg(command: &str) -> (String, bool) {
-    let r = execute_tool(&call(
+    let r = execute_with_exact_approval(&call(
         "bash",
         &json!({"command": command, "run_in_background": true}),
     ));

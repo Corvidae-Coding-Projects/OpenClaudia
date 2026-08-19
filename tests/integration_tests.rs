@@ -4,9 +4,11 @@
 //! against real filesystem, processes, and network operations.
 
 use openclaudia::memory::MemoryDb;
+use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
+use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
 use openclaudia::tools::{
     clear_todo_list, execute_tool, get_todo_list, reset_read_tracker, FunctionCall, TodoStatus,
-    ToolCall,
+    ToolCall, ToolResult,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -31,6 +33,31 @@ fn make_tool_call(name: &str, args: &Value) -> ToolCall {
             arguments: args.to_string(),
         },
     }
+}
+
+/// Execute shell syntax that the host has explicitly approved.
+///
+/// `execute_tool` intentionally uses `PermissionManager::unrestricted()`, whose
+/// established bypass-mode policy rejects compound shell constructs. Tests of
+/// those constructs must prove the Bash implementation remains available
+/// through a real approval path rather than relying on the retired
+/// manager-less dispatch bypass.
+fn execute_tool_with_bash_approval(tool_call: &ToolCall) -> ToolResult {
+    let state = TempDir::new().expect("create permission state directory");
+    let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
+    let permit = manager
+        .approve_tool_call_once(tool_call, None, ApprovalProvenance::InteractiveUser)
+        .expect("host approval must mint an exact one-use permit");
+    ToolExecutor::execute(ToolExecutorRequest {
+        tool_call,
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+        permission_mgr: &manager,
+        authorization: Some(permit),
+        session_id: None,
+        policy_enforcer: None,
+    })
 }
 
 /// Helper to create a temp directory with test files
@@ -888,7 +915,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
             !result.is_error(),
@@ -991,7 +1018,7 @@ mod bash_tools {
                 "run_in_background": true
             }),
         );
-        let bg_result = execute_tool(&bg_call);
+        let bg_result = execute_tool_with_bash_approval(&bg_call);
 
         // Extract shell ID from result - look for pattern like "shell_abc123"
         let shell_id = extract_shell_id(bg_result.content());
@@ -1067,7 +1094,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
             !result.is_error(),
@@ -1088,7 +1115,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
             !result.is_error(),
@@ -1110,7 +1137,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
             !result.is_error(),
@@ -1132,7 +1159,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         // Stderr output must appear in result content regardless of is_error
         assert!(
@@ -1151,7 +1178,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
             !result.is_error(),
@@ -3581,7 +3608,7 @@ mod gated_dispatch_460 {
             },
         };
         let (mgr, _tmp) = deny_bash_mgr();
-        match execute_tool_gated(&tc, None, None, None, Some(&mgr)) {
+        match execute_tool_gated(&tc, None, None, None, &mgr) {
             ExecutionOutcome::Result(r) => {
                 assert!(
                     r.is_error(),

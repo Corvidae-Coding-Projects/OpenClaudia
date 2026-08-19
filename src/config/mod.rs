@@ -35,7 +35,9 @@ pub use crate::keybindings::{
 };
 pub use memory::MemoryConfig;
 pub use path_validation::{validate_persist_path, PathValidationError, ALLOW_OUT_OF_ROOT_ENV};
-pub use permissions::PermissionsConfig;
+pub use permissions::{
+    PermissionsConfig, ProjectPermissionProposal, PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION,
+};
 pub use provider::{
     adaptive_budget_for, is_local_provider_name, validate_base_url, validate_provider_base_url,
     ProviderConfig, ThinkingConfig,
@@ -169,6 +171,7 @@ fn first_api_key_from_env(names: &[&str]) -> Option<String> {
 #[allow(clippy::too_many_lines)] // configuration source assembly is intentionally linear
 pub fn load_config() -> Result<AppConfig, ConfigError> {
     let mut builder = Config::builder();
+    let mut project_permission_proposal = None;
 
     // Set defaults
     builder = builder
@@ -243,6 +246,12 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
                 project_config.display()
             ))
         })?;
+        project_permission_proposal = permissions::take_project_permission_proposal(
+            &mut document,
+            &project_config,
+            content.as_bytes(),
+        )
+        .map_err(ConfigError::Message)?;
         if let Some(mapping) = document.as_mapping_mut() {
             mapping.remove(serde_yaml::Value::String("hooks".to_string()));
         }
@@ -362,6 +371,7 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     // previously performed post-load is redundant — the newtype simply
     // refuses to exist in an invalid state. See crosslink #256.
     let mut config: AppConfig = builder.build()?.try_deserialize()?;
+    config.permissions.project_proposal = project_permission_proposal;
 
     // Validate VDD settings that do not depend on the final runtime target.
     // Provider-pair validation runs after CLI/TUI target overrides and startup
