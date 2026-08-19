@@ -9112,7 +9112,10 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T12:46:11.407594026Z",
-      "updated_at": "2026-08-19T12:46:11.407594026Z"
+      "updated_at": "2026-08-19T12:46:15.575655020Z",
+      "labels": [
+        "remediation"
+      ]
     },
     "60d7cd9b-f642-4d77-b172-1d0857dd7807": {
       "uuid": "60d7cd9b-f642-4d77-b172-1d0857dd7807",
@@ -23894,11 +23897,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 194,
       "timestamp": "2026-08-19T12:46:11.407594026Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 195,
+      "timestamp": "2026-08-19T12:46:15.575655020Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:46:11.407594026Z",
+    "timestamp": "2026-08-19T12:46:15.575655020Z",
     "agent_id": "6Vw9",
-    "agent_seq": 194
+    "agent_seq": 195
   }
 }
