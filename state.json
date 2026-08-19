@@ -1,6 +1,6 @@
 {
   "next_display_id": 1017,
-  "next_comment_id": 727,
+  "next_comment_id": 728,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8338,7 +8338,7 @@
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T01:19:03.818814081Z",
-      "updated_at": "2026-08-19T04:18:00.425907617Z",
+      "updated_at": "2026-08-19T04:18:32.423961844Z",
       "labels": [
         "remediation"
       ],
@@ -8372,6 +8372,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPMIZZuXQPvZTZyWj+kKxN71kAGRY3Hz1TCpVByg5lwnSypQ+GNsYGBAeARwpMCMn3MpqJMbgcg8eHOEwu1SnDw=="
+        },
+        "dabb23a8-2c85-4189-84f5-cddee32ef012": {
+          "display_id": 727,
+          "author": "6Vw9",
+          "content": "Plan used for S-017: map every live permission/dispatch boundary; define canonical deny-first precedence and exact normalized receipt scope; replace Boolean and tool-wide authority with opaque one-use permits; move durable authority to bounded trusted host state; thread permits through each frontend; independently audit changed tests; validate focused, full-suite, strict-lint, and Windows paths under serialized low-RAM settings; record discovered defects as subissues and close only with evidence. Recorded immediately after commit because the hook's missing-kind reminder was delivered after Git created the commit.",
+          "created_at": "2026-08-19T04:18:32.421426589Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwvdECWBOMWFavflsBYVTQidZMx+y3yIAEU2nnZ3yedoRAEwSDcHcEYHJoguIPmiBSfyXVC7FEb8rT9Fj1SzKBA=="
         },
         "e6342e9b-5427-48eb-b038-8d9db62c9f0f": {
           "display_id": 711,
@@ -22608,11 +22617,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 86,
       "timestamp": "2026-08-19T04:18:00.425907617Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 87,
+      "timestamp": "2026-08-19T04:18:32.423961844Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:18:00.425907617Z",
+    "timestamp": "2026-08-19T04:18:32.423961844Z",
     "agent_id": "6Vw9",
-    "agent_seq": 86
+    "agent_seq": 87
   }
 }
