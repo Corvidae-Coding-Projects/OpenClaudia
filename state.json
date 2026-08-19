@@ -1,6 +1,6 @@
 {
   "next_display_id": 1015,
-  "next_comment_id": 722,
+  "next_comment_id": 723,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7828,10 +7828,21 @@
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:02:07.465322183Z",
-      "updated_at": "2026-08-19T04:02:52.953470091Z",
+      "updated_at": "2026-08-19T04:03:01.692330222Z",
       "labels": [
         "s-017"
-      ]
+      ],
+      "comments": {
+        "cceb64b9-b287-40ba-b1c3-823491e03756": {
+          "display_id": 722,
+          "author": "6Vw9",
+          "content": "Result: traced every execute_tool_via_acp match arm through acp_* normalization into execute_local_tool[_async], then execute_local_tool_with_permission and ToolExecutor::execute. ToolExecutor authorizes and consumes the exact session-bound permit before check_and_record_tool and unchecked dispatch. The apparent gap was a stale method-level comment, now corrected; focused/full tests already cover these routes. No production bypass remained.",
+          "created_at": "2026-08-19T04:03:01.689599851Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAy2PMlJZaLdooaquL6PveE/ln0ESZcPKQrncgCH7nlYAJhc4I7LLdUFgZPqIv9KfZQcEQ8hH3eYAvTN+FIm3cAQ=="
+        }
+      }
     },
     "588eade6-3433-4e57-83e4-50304fc73a46": {
       "uuid": "588eade6-3433-4e57-83e4-50304fc73a46",
@@ -22442,11 +22453,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 70,
       "timestamp": "2026-08-19T04:02:52.953470091Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 71,
+      "timestamp": "2026-08-19T04:03:01.692330222Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:02:52.953470091Z",
+    "timestamp": "2026-08-19T04:03:01.692330222Z",
     "agent_id": "6Vw9",
-    "agent_seq": 70
+    "agent_seq": 71
   }
 }
