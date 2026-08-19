@@ -1,6 +1,6 @@
 {
   "next_display_id": 1027,
-  "next_comment_id": 790,
+  "next_comment_id": 791,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15486,7 +15486,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:46:34.456625332Z",
+      "updated_at": "2026-08-19T13:02:25.041599542Z",
       "labels": [
         "remediation"
       ],
@@ -15685,6 +15685,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "c33b522d-decf-4ba6-8596-fa2db973eef4": {
+          "display_id": 790,
+          "author": "6Vw9",
+          "content": "[action] S-019 residual prompt audit: project skill execution was run-bound, but prompt metadata and slash UI still discovered through process CWD. Added run-scoped prompt APIs, migrated REPL/TUI/ACP/print composition roots, and made context-free compatibility paths global/user-only; compiling serially before focused adversarial tests.",
+          "created_at": "2026-08-19T13:02:25.038557654Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAhEH3jnbjKvM1vm8DnoC22NuSBnMPaui6x3+un2tA1E85vrKigUIaPWs02cUmWqTZ5xT/NkC+iBAgPWnUEHODCw=="
         },
         "d22ef8b7-54ae-436a-807c-03129a4bc81b": {
           "display_id": 772,
@@ -23916,11 +23925,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 196,
       "timestamp": "2026-08-19T12:46:34.456625332Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 197,
+      "timestamp": "2026-08-19T13:02:25.041599542Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:46:34.456625332Z",
+    "timestamp": "2026-08-19T13:02:25.041599542Z",
     "agent_id": "6Vw9",
-    "agent_seq": 196
+    "agent_seq": 197
   }
 }
