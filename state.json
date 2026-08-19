@@ -1,6 +1,6 @@
 {
   "next_display_id": 1020,
-  "next_comment_id": 737,
+  "next_comment_id": 738,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17860,10 +17860,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:28:15.880398728Z",
-      "updated_at": "2026-08-19T04:28:20.009557338Z",
+      "updated_at": "2026-08-19T04:28:32.985704355Z",
       "labels": [
         "security"
-      ]
+      ],
+      "comments": {
+        "136d1ef8-fc3f-482b-ab20-8e23a24c3907": {
+          "display_id": 737,
+          "author": "6Vw9",
+          "content": "Implement only S-018. Derive its host-safety ceiling from F-016/F-031 and W2/W14, trace every public dispatch/config/resume route, separate non-bypassable host policy from user/project convenience authority, add adversarial tests for unrestricted and disabled permission settings, run serial focused/full Rust gates, document artifact generations/evidence/VDD deferral, then commit/push to the existing refactor branch and verify draft PR #66.",
+          "created_at": "2026-08-19T04:28:32.983373346Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAE71tZ5aIxTvaIanMZosfN55s5bohwlU0zZPT3GCeDKjZr63UjjSZCC8R9q/MoRp2XYhex6huLnYbk1jUhXeXDQ=="
+        }
+      }
     },
     "ca7c4ab9-a985-4d34-ab6c-355009d8ac9c": {
       "uuid": "ca7c4ab9-a985-4d34-ab6c-355009d8ac9c",
@@ -22878,11 +22889,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 111,
       "timestamp": "2026-08-19T04:28:24.870103824Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 112,
+      "timestamp": "2026-08-19T04:28:32.985704355Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:28:24.870103824Z",
+    "timestamp": "2026-08-19T04:28:32.985704355Z",
     "agent_id": "6Vw9",
-    "agent_seq": 111
+    "agent_seq": 112
   }
 }
