@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 771,
+  "next_comment_id": 772,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T10:27:49.087127475Z",
+      "updated_at": "2026-08-19T11:11:12.982819574Z",
       "labels": [
         "remediation"
       ],
@@ -15547,6 +15547,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwhEVLla7E1GJ84ZQ3apxSmHntgwNqPggxTU+z6tq7BkGckjOMAT3tm4bPIdoF1hzinyJqhG9p4jXvax7MF3eBQ=="
+        },
+        "aba8ac92-da08-402c-a03e-79282c6b72bd": {
+          "display_id": 771,
+          "author": "6Vw9",
+          "content": "S-019 skeptical audit update: fixed ACP per-prompt host grant rediscovery by snapshotting startup grants once and deriving generation-bound contexts; fixed background-shell cleanup so identical labels in different sessions cannot cross-kill; replaced private optional process context with an explicit sandboxed/test-host execution enum; made MCP and Crosslink resource requirements accurately fail closed. Serial cargo check and focused ACP, process-isolation, MCP, hook, and capability suites pass. Full file-by-file production/test diff review and final serial workspace gates remain.",
+          "created_at": "2026-08-19T11:11:12.971570559Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwJ+1OeUz0kAVf6ILZWD9K5YSwsKSqlKSjy3+R0QpSvjU9H6I7dtiU+94M8RgWxPJ8I7LqY3yOqPSu5hKXFydBg=="
         },
         "c1195401-8fd0-4f52-afde-e15f0afbbc4d": {
           "display_id": 757,
@@ -23612,11 +23621,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 173,
       "timestamp": "2026-08-19T10:27:49.087127475Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 174,
+      "timestamp": "2026-08-19T11:11:12.982819574Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T10:27:49.087127475Z",
+    "timestamp": "2026-08-19T11:11:12.982819574Z",
     "agent_id": "6Vw9",
-    "agent_seq": 173
+    "agent_seq": 174
   }
 }
