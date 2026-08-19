@@ -1,6 +1,6 @@
 {
   "next_display_id": 1029,
-  "next_comment_id": 808,
+  "next_comment_id": 809,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20474,7 +20474,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T14:50:39.964999817Z",
-      "updated_at": "2026-08-19T18:19:12.547817816Z",
+      "updated_at": "2026-08-19T18:19:17.583289680Z",
       "labels": [
         "remediation"
       ],
@@ -20505,6 +20505,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABACDLLq7cAvi3boCedU+XT4MCk0SSciiC1sK5y1+eK5ovmKk84f2vdHuenF7TVj7DtMSqZLbzseX3hSWIOSs4bAA=="
+        },
+        "9000096e-0d28-45e2-9003-ec024ab12ee8": {
+          "display_id": 808,
+          "author": "6Vw9",
+          "content": "Linux CI run 32284515796 exposed a real S-019 portability/capability gap. The sandbox toolchain probe used a deterministic default PATH (passing locally only because /usr/bin/cargo existed), while Linux sandbox construction still read HOME during execution. Repair in progress binds the host-home snapshot into ToolRunContext and its manifest/derived runs; the probe now explicitly snapshots host PATH/home, requires the exact resolved Cargo path, checks credentials absent at both private and Cargo homes, and tests the actual Cargo bin mount read-only. Focused unit and integration probes pass serially.",
+          "created_at": "2026-08-19T18:19:17.580864145Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/2iuqdUL1AZz2mkM6eRvESS1RKuazLrBsr21HZaCIxU6ksRvJgMgreL2L1mRLB5xUnfUFfv9GtU5XEgzho1cCA=="
         },
         "afbccc16-e2b2-4d6d-a077-1176aba9db9a": {
           "display_id": 806,
@@ -24261,11 +24270,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 225,
       "timestamp": "2026-08-19T18:19:12.547817816Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 226,
+      "timestamp": "2026-08-19T18:19:17.583289680Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T18:19:12.547817816Z",
+    "timestamp": "2026-08-19T18:19:17.583289680Z",
     "agent_id": "6Vw9",
-    "agent_seq": 225
+    "agent_seq": 226
   }
 }
