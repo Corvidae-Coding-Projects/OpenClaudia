@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1028,
+  "next_display_id": 1029,
   "next_comment_id": 807,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -405,6 +405,7 @@
     "6b92d238-33bd-4f36-b39a-523c8b7c4fcf": 837,
     "6b9afd84-1f95-41fc-97ad-1726a2e803f0": 324,
     "6c6014fe-a279-4a93-8b61-7443aa8f3a48": 54,
+    "6c6dd5d9-fde8-4d7b-8305-d46931d946da": 1028,
     "6c98ae6f-6ce8-4cdb-b831-2932fe1493b2": 117,
     "6c9fe694-8efe-4e52-ac24-02922ceae8a9": 1010,
     "6d065d4d-a595-4386-90a8-34798a50a78e": 670,
@@ -10211,6 +10212,17 @@
       "labels": [
         "feature"
       ]
+    },
+    "6c6dd5d9-fde8-4d7b-8305-d46931d946da": {
+      "uuid": "6c6dd5d9-fde8-4d7b-8305-d46931d946da",
+      "display_id": 1028,
+      "title": "Upgrade GitHub Actions off deprecated Node 20 runtimes",
+      "description": "GitHub run 32284515796 warns that actions/checkout@v4 targets deprecated Node.js 20 and is being forced onto Node.js 24. Audit .github workflows for Node-20-based action versions, upgrade to supported pinned major/commit versions, and verify pull-request/security workflows without weakening permissions or provenance pinning. Discovered during S-019 publication verification; unrelated to the S-019 artifact.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T18:05:18.224661965Z",
+      "updated_at": "2026-08-19T18:05:18.224661965Z"
     },
     "6c98ae6f-6ce8-4cdb-b831-2932fe1493b2": {
       "uuid": "6c98ae6f-6ce8-4cdb-b831-2932fe1493b2",
@@ -24222,11 +24234,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 222,
       "timestamp": "2026-08-19T17:57:02.648116988Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 223,
+      "timestamp": "2026-08-19T18:05:18.224661965Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T17:57:02.648116988Z",
+    "timestamp": "2026-08-19T18:05:18.224661965Z",
     "agent_id": "6Vw9",
-    "agent_seq": 222
+    "agent_seq": 223
   }
 }
