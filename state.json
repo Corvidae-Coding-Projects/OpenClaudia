@@ -1,6 +1,6 @@
 {
   "next_display_id": 1027,
-  "next_comment_id": 796,
+  "next_comment_id": 797,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15486,7 +15486,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T14:48:10.752226030Z",
+      "updated_at": "2026-08-19T14:48:21.520283311Z",
       "labels": [
         "remediation"
       ],
@@ -15526,6 +15526,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALcQkL0qmcwW6Lk79ojvDZ+BajpyGP8B9Arm4lVC6xBUz6uhkdJdI0gmUOYNiXFlR4CrGBSRDeEymmozt8IHlAw=="
+        },
+        "2c6beeaf-3974-42e9-9675-bb9741e2690c": {
+          "display_id": 796,
+          "author": "6Vw9",
+          "content": "Final S-019 evidence before commit: removed ambient current_context/SessionIdGuard/global path-constraint authority; exact ToolRunContext now binds filesystem/process/network/secrets/environment/PATH/approval/plugin/prompt/lifecycle state. Added run-isolation and retirement suites, secure exact plan-file exception, and pinned host-control init/branch storage. Staged source/test digest: 642c773eb89a73bc093003cad2062c75d9d3529884190890c8323bf1e7d89fd8 (71 src, 46 tests; 11,134 insertions/5,423 deletions). PASS: fmt, diff-check, all-target/all-feature check, strict Clippy -D warnings, complete serial all-feature workspace tests (2,646 lib, 226 bin, every integration/doc target). No new ignored tests or secret signatures. #1026 retains transport-specific MCP least privilege for S-064/S-066; S-088 retrospective VDD remains queued.",
+          "created_at": "2026-08-19T14:48:21.517849979Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAiN5vSErmu+tJwuc5h2VnEwXwZCoiAKTvX6ZNp9h1e8eE/lrfnKxkq0tTO5Q/WEYZGRt7gLjHgKQKkSgILUapBg=="
         },
         "2ce1590b-30dc-4799-9435-f833f1fe098e": {
           "display_id": 787,
@@ -24000,11 +24009,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 202,
       "timestamp": "2026-08-19T14:48:10.752226030Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 203,
+      "timestamp": "2026-08-19T14:48:21.520283311Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T14:48:10.752226030Z",
+    "timestamp": "2026-08-19T14:48:21.520283311Z",
     "agent_id": "6Vw9",
-    "agent_seq": 202
+    "agent_seq": 203
   }
 }
