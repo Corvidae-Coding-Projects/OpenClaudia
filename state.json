@@ -1870,11 +1870,12 @@
       "uuid": "08490c24-ddb3-4f6d-bf71-c1859683232e",
       "display_id": 1032,
       "title": "Finalize S-020 publication closure audit",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:42:45.296518980Z",
-      "updated_at": "2026-08-19T23:53:23.410208902Z",
+      "updated_at": "2026-08-19T23:53:27.383803591Z",
+      "closed_at": "2026-08-19T23:53:27.383799187Z",
       "labels": [
         "remediation"
       ],
@@ -24894,11 +24895,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 284,
       "timestamp": "2026-08-19T23:53:23.410208902Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 285,
+      "timestamp": "2026-08-19T23:53:27.383803591Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:53:23.410208902Z",
+    "timestamp": "2026-08-19T23:53:27.383803591Z",
     "agent_id": "6Vw9",
-    "agent_seq": 284
+    "agent_seq": 285
   }
 }
