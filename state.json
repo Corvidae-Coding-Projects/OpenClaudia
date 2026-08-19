@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 777,
+  "next_comment_id": 778,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15466,7 +15466,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T11:42:07.600096455Z",
+      "updated_at": "2026-08-19T11:42:20.536574780Z",
       "labels": [
         "remediation"
       ],
@@ -15488,6 +15488,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASR61rLRdwIfWZvBPCEE458QMf2demtWEYAbYJIyDF51pIWT71fYH/XSG1RBjaoJhOeK4y9bqhl0uzMHrs+9BCA=="
+        },
+        "3c252037-1d82-44a2-8697-59bf89f6a66d": {
+          "display_id": 777,
+          "author": "6Vw9",
+          "content": "Skeptical residual audit found agent-owned subprocess helpers still resolving Bash, Poppler, Git, language servers, MCP commands, hook shells, TUI shell escapes, and quality-gate programs from mutable process PATH. Added one ToolRunContext resolver that requires Process and uses only the run-bound PATH/cwd, migrated those boundaries, and added behavioral authorization/path isolation coverage. CARGO_BUILD_JOBS=1 cargo check --workspace --all-targets --all-features passes. Full diff/test review and final gates remain.",
+          "created_at": "2026-08-19T11:42:20.534104676Z",
+          "kind": "action",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8uA6Bt6Ql67T5Pff4kbDG+Jv4j2k5Q56azvMOojFkDBuM1JeutODkxsMI/0hTjWIBcmI/OHpaS9U6F/1FYVmDQ=="
         },
         "4584f87b-7cbd-4532-af64-5dd91b14b372": {
           "display_id": 764,
@@ -23696,11 +23705,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 180,
       "timestamp": "2026-08-19T11:42:07.600096455Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 181,
+      "timestamp": "2026-08-19T11:42:20.536574780Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T11:42:07.600096455Z",
+    "timestamp": "2026-08-19T11:42:20.536574780Z",
     "agent_id": "6Vw9",
-    "agent_seq": 180
+    "agent_seq": 181
   }
 }
