@@ -7821,14 +7821,14 @@
     "585676a3-5b3e-4925-8f2c-2d4a652d2259": {
       "uuid": "585676a3-5b3e-4925-8f2c-2d4a652d2259",
       "display_id": 1014,
-      "title": "ACP delegated tools bypass exact permit enforcement after S-017 gate removal",
-      "description": "Final pre-commit trace found execute_tool_via_acp removed acp_permission_gate, while read_file/write_file/edit_file/list_files/glob/grep still dispatch through ACP-specific handlers rather than ToolExecutor. Those paths receive neither an exact ExecutionPermit nor check_and_record_tool, so effectful delegated calls can bypass permission enforcement and successful delegated calls do not consume enterprise caps. Add a single call-bound authorization path for all ACP tools, consume it exactly once at the actual direct/local dispatch boundary, record caps only after permission succeeds, and add adversarial direct-handler tests.",
+      "title": "Verify ACP exact permit enforcement after S-017 gate removal",
+      "description": "Final pre-commit trace questioned whether removing acp_permission_gate left ACP-normalized tools outside exact permission and quota enforcement. Full call-chain inspection established that read_file/write_file/edit_file/bash/bash_output/kill_shell/list_files/glob/grep all normalize into execute_local_tool or execute_local_tool_async, and internal/MCP tools use execute_local_tool directly. Every route reaches ToolExecutor::execute with the PermissionManager and PolicyEnforcer, which authorizes and consumes a call-bound permit before atomically recording quota. No bypass exists; update the stale method comment and retain the trace as review evidence.",
       "status": "open",
-      "priority": "critical",
+      "priority": "medium",
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:02:07.465322183Z",
-      "updated_at": "2026-08-19T04:02:11.414129610Z",
+      "updated_at": "2026-08-19T04:02:52.953470091Z",
       "labels": [
         "s-017"
       ]
@@ -22437,11 +22437,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 69,
       "timestamp": "2026-08-19T04:02:11.414129610Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 70,
+      "timestamp": "2026-08-19T04:02:52.953470091Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:02:11.414129610Z",
+    "timestamp": "2026-08-19T04:02:52.953470091Z",
     "agent_id": "6Vw9",
-    "agent_seq": 69
+    "agent_seq": 70
   }
 }
