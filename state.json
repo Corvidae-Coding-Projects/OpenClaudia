@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 785,
+  "next_comment_id": 786,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:18:04.384215743Z",
+      "updated_at": "2026-08-19T12:39:43.761481803Z",
       "labels": [
         "remediation"
       ],
@@ -15613,6 +15613,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAb770rnkdpZPCkRaUX+j4wQMZyCIZbuKwt3KupY70JSbgLqss5Zv2g37D8I2eOcPbBIjvt50/tsIlBPbrUUVHDQ=="
+        },
+        "8bfedfa4-6ccc-429d-89a4-986ba2480a83": {
+          "display_id": 785,
+          "author": "6Vw9",
+          "content": "Full serial gate exposed two stale sandbox fixtures: literal host and /proc paths were rejected by the new run-scoped PathConstraints before the OS sandbox assertions executed. Reworked the tests to prove lexical denial separately, reconstruct the host path only inside the sandbox for host/kernel/network isolation, and read the inherited descriptor directly. sandbox_escape_e2e now passes 11/11 without weakening either boundary.",
+          "created_at": "2026-08-19T12:39:43.731345796Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1Ntw9dQHKv1rRIJ5FlAi4UZk+HxJkAzOTMyOxqkOczX7LMOG05+eyyR9JdU/iUHArkCalwXNEfDXel5Q86XsCw=="
         },
         "8fa1671d-957b-4323-b0e9-6520416f77d2": {
           "display_id": 758,
@@ -23821,11 +23830,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 189,
       "timestamp": "2026-08-19T12:18:04.384215743Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 190,
+      "timestamp": "2026-08-19T12:39:43.761481803Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:18:04.384215743Z",
+    "timestamp": "2026-08-19T12:39:43.761481803Z",
     "agent_id": "6Vw9",
-    "agent_seq": 189
+    "agent_seq": 190
   }
 }
