@@ -7189,12 +7189,13 @@
       "display_id": 1016,
       "title": "Make permit consumption atomic with generation and exact-denial refresh",
       "description": "S-017 concurrency review found consume_execution_permit calls sync_generation, releases the trusted-store lock, then separately reclassifies and consumes the permit. Another live manager can rotate capability generation or write an exact denial in that interval, allowing stale authority to pass. Move persisted refresh/generation reconciliation, exact-denial recheck, expected-scope construction, and one-use permit consumption under the same in-process state lock and cross-process store lock; retain fail-closed persistence behavior and multi-manager coverage.",
-      "status": "open",
+      "status": "closed",
       "priority": "critical",
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:06:29.144974264Z",
-      "updated_at": "2026-08-19T04:16:00.269550145Z",
+      "updated_at": "2026-08-19T04:16:06.581365625Z",
+      "closed_at": "2026-08-19T04:16:06.581364073Z",
       "labels": [
         "s-017"
       ],
@@ -22554,11 +22555,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 79,
       "timestamp": "2026-08-19T04:16:00.269550145Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 80,
+      "timestamp": "2026-08-19T04:16:06.581365625Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:16:00.269550145Z",
+    "timestamp": "2026-08-19T04:16:06.581365625Z",
     "agent_id": "6Vw9",
-    "agent_seq": 79
+    "agent_seq": 80
   }
 }
