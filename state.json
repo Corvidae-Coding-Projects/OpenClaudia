@@ -1,6 +1,6 @@
 {
   "next_display_id": 1021,
-  "next_comment_id": 740,
+  "next_comment_id": 741,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17876,7 +17876,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:28:15.880398728Z",
-      "updated_at": "2026-08-19T04:48:17.177505469Z",
+      "updated_at": "2026-08-19T05:35:06.923623054Z",
       "labels": [
         "security"
       ],
@@ -17907,6 +17907,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJQH1NGdXqWN64LH3t8r95MjLjqQQQ3cRVtxzF7FYElz7NgxyqYpthinRsb3MQSo2KVfL4ngxXSgHw2SPXl+1BA=="
+        },
+        "c0afec5a-6d72-4c93-bbd0-ef937749ec27": {
+          "display_id": 740,
+          "author": "6Vw9",
+          "content": "[progress] Implemented generation-1 non-bypassable HostSafetyPolicy at both permission admission and post-authorization dispatch; registry execution now requires an opaque exact tool/argument/policy-generation permit and public executable wrappers require concrete PermissionManager values. Project grant-like permissions are extracted before merge into a digest-bound inert proposal while monotonic project restrictions remain effective; trusted home/env/CLI sources retain prompt-bypass authority. Resume paths cannot set the manager, CLI duplicate unrestricted branch was removed, and /permissions reports the host ceiling/proposal. Adversarial coverage exercises all seven public dispatch APIs under disabled and unrestricted managers, both protected resources, sandbox escalation, redacted generation-bound traces, and the internal after-authorization boundary. Focused config (31), host-safety E2E (4), and post-authorization unit (2) tests pass serially. Skeptical shell-suite review found the migrated no-manager semantics correctly exposed approval-dependent shell tests; they now use an explicit Bash approval. It also exposed an unrelated 1s Bash timeout taking ~60s under a weak passing assertion; filed separately as #1020 rather than expanding S-018.",
+          "created_at": "2026-08-19T05:35:06.920677576Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAR4UxG6O5KKaaS6dOAeXjJX/0muSnDIwZczGWwnGCMG0hefktVj/KhQq2rXHgU5surCBhaKfGjP7KA4AGdDTRBw=="
         }
       }
     },
@@ -22953,11 +22962,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 117,
       "timestamp": "2026-08-19T05:27:29.766073090Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 118,
+      "timestamp": "2026-08-19T05:35:06.923623054Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T05:27:29.766073090Z",
+    "timestamp": "2026-08-19T05:35:06.923623054Z",
     "agent_id": "6Vw9",
-    "agent_seq": 117
+    "agent_seq": 118
   }
 }
