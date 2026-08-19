@@ -1,6 +1,6 @@
 {
   "next_display_id": 1028,
-  "next_comment_id": 806,
+  "next_comment_id": 807,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20459,7 +20459,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T14:50:39.964999817Z",
-      "updated_at": "2026-08-19T14:53:15.248809728Z",
+      "updated_at": "2026-08-19T17:57:02.648116988Z",
       "labels": [
         "remediation"
       ],
@@ -20490,6 +20490,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABACDLLq7cAvi3boCedU+XT4MCk0SSciiC1sK5y1+eK5ovmKk84f2vdHuenF7TVj7DtMSqZLbzseX3hSWIOSs4bAA=="
+        },
+        "afbccc16-e2b2-4d6d-a077-1176aba9db9a": {
+          "display_id": 806,
+          "author": "6Vw9",
+          "content": "Publication is now verified: local HEAD, origin/agent/refactor-agent-system-remediation, and draft PR #66 all resolve/include 0316e0f6f8fe725bdcc6c8432b675b465a212f5a. Worktree is clean and PR remains OPEN/DRAFT. Final Linux/macOS/Windows sandbox-security checks are in progress on the pushed commit; awaiting their terminal results before closing delivery verification.",
+          "created_at": "2026-08-19T17:57:02.644752342Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAuH1h3IAKHYzMwOYxY/QpymtxP4+ziSxALte0HSfZOFrC7r778ccoKy1UWwwJc4Bx60EmlphDOrTsy9/mH4PPDw=="
         },
         "b9ab43a9-89e9-441b-80ea-50e22625e09c": {
           "display_id": 803,
@@ -24208,11 +24217,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 221,
       "timestamp": "2026-08-19T17:56:21.276203868Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 222,
+      "timestamp": "2026-08-19T17:57:02.648116988Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T17:56:21.276203868Z",
+    "timestamp": "2026-08-19T17:57:02.648116988Z",
     "agent_id": "6Vw9",
-    "agent_seq": 221
+    "agent_seq": 222
   }
 }
