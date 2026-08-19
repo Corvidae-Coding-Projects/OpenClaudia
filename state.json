@@ -1,6 +1,6 @@
 {
   "next_display_id": 1017,
-  "next_comment_id": 725,
+  "next_comment_id": 726,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8338,7 +8338,7 @@
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T01:19:03.818814081Z",
-      "updated_at": "2026-08-19T01:28:38.900460767Z",
+      "updated_at": "2026-08-19T04:17:01.489128802Z",
       "labels": [
         "remediation"
       ],
@@ -8346,6 +8346,15 @@
         "99cc9588-0963-48eb-a6f4-8c7ef4ea1832"
       ],
       "comments": {
+        "8ddab77f-2d97-44d7-9adc-25b7f31f4a50": {
+          "display_id": 725,
+          "author": "6Vw9",
+          "content": "Result: implemented S-017 exact, actor/workspace/generation/session/tool/effect/operation/target/argument-bound approval receipts; deny-first deterministic precedence; opaque one-use executor permits; trusted bounded persistence; session-authority omission; exact frontend/coordinator caches; atomic post-authorization tool caps; redacted traces; and reliable ACP cancellation. Final adversarial review additionally enforced persisted 64-use/30-day/not-before bounds, fail-closed generation exhaustion, and atomic cross-manager generation/denial refresh with permit consumption. Verification: full all-feature suite passed (2,615 lib; 218 bin; 131/133 principal integration with two intentional ignores; every remaining target/doc test), focused receipt suite 23/23, all-feature/all-target Clippy with -D warnings, Windows GNU all-feature lib check, fmt, diff check, and security scan. Canonical alternate-model VDD remains intentionally queued for S-088; provider PostToolUse timeout remains separately open as #1008.",
+          "created_at": "2026-08-19T04:17:01.486524781Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAh1cxtcyssFkjiu+MjhUQw5ccB+Fi6FHdC3l/TDR4YkFTP6Aq1bWAT40RtQQ5hmKOqYZ+y6rYMGbSKJPpMhXSBQ=="
+        },
         "b333f51b-f9c5-434a-a034-2f8b19376ad7": {
           "display_id": 710,
           "author": "6Vw9",
@@ -22560,11 +22569,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 80,
       "timestamp": "2026-08-19T04:16:06.581365625Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 81,
+      "timestamp": "2026-08-19T04:17:01.489128802Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:16:06.581365625Z",
+    "timestamp": "2026-08-19T04:17:01.489128802Z",
     "agent_id": "6Vw9",
-    "agent_seq": 80
+    "agent_seq": 81
   }
 }
