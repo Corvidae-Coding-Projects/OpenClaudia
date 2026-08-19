@@ -1,6 +1,6 @@
 {
   "next_display_id": 1030,
-  "next_comment_id": 818,
+  "next_comment_id": 819,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11384,10 +11384,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T22:55:50.010022472Z",
-      "updated_at": "2026-08-19T22:55:54.532091200Z",
+      "updated_at": "2026-08-19T22:57:25.551670476Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "838261f2-202f-40f8-82d1-2a32f35181ae": {
+          "display_id": 818,
+          "author": "6Vw9",
+          "content": "[action] S-020 preflight: split oversized search into bounded reads; inspect unrelated CHANGELOG residue before classifier mapping",
+          "created_at": "2026-08-19T22:57:25.549164785Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUaxELHldGf1IJmR275KPPFj+PznR+GnpVtiGGrDLQl60dwyQEvnYuqk81wE28LWoNsvR6boZik7/p5rntaI0Bg=="
+        }
+      }
     },
     "7d148701-7b49-4a1d-bd5f-516b03bce5d5": {
       "uuid": "7d148701-7b49-4a1d-bd5f-516b03bce5d5",
@@ -24454,11 +24465,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 242,
       "timestamp": "2026-08-19T22:55:59.430935485Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 243,
+      "timestamp": "2026-08-19T22:57:25.551670476Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T22:55:59.430935485Z",
+    "timestamp": "2026-08-19T22:57:25.551670476Z",
     "agent_id": "6Vw9",
-    "agent_seq": 242
+    "agent_seq": 243
   }
 }
