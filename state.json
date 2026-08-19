@@ -9822,12 +9822,13 @@
       "display_id": 1010,
       "title": "Tool caps count denied calls and race past configured limits",
       "description": "S-017 authorization audit found ToolExecutor calls check_and_record_tool before permission authorization, so permission-denied calls consume enterprise quota. PolicyEnforcer also performs check and increment under separate mutex acquisitions, allowing concurrent calls to exceed a cap. Move recording after successful exact authorization, keep an early dry-run check, and make capped increment atomic. ACP must pass policy into the shared executor instead of recording before its normalized authorization.",
-      "status": "open",
+      "status": "closed",
       "priority": "critical",
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T02:56:15.116591634Z",
-      "updated_at": "2026-08-19T03:56:40.529538284Z",
+      "updated_at": "2026-08-19T03:56:44.386464880Z",
+      "closed_at": "2026-08-19T03:56:44.386460267Z",
       "comments": {
         "d17b3b17-73a6-4ea9-ac17-d8f223fa6110": {
           "display_id": 713,
@@ -22249,11 +22250,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 54,
       "timestamp": "2026-08-19T03:56:40.529538284Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 55,
+      "timestamp": "2026-08-19T03:56:44.386464880Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T03:56:40.529538284Z",
+    "timestamp": "2026-08-19T03:56:44.386464880Z",
     "agent_id": "6Vw9",
-    "agent_seq": 54
+    "agent_seq": 55
   }
 }
