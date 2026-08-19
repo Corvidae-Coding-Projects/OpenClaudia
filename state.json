@@ -1,6 +1,6 @@
 {
   "next_display_id": 1008,
-  "next_comment_id": 711,
+  "next_comment_id": 712,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8182,7 +8182,7 @@
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T01:19:03.818814081Z",
-      "updated_at": "2026-08-19T01:28:34.829223120Z",
+      "updated_at": "2026-08-19T01:28:38.900460767Z",
       "labels": [
         "remediation"
       ],
@@ -8198,6 +8198,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPMIZZuXQPvZTZyWj+kKxN71kAGRY3Hz1TCpVByg5lwnSypQ+GNsYGBAeARwpMCMn3MpqJMbgcg8eHOEwu1SnDw=="
+        },
+        "e6342e9b-5427-48eb-b038-8d9db62c9f0f": {
+          "display_id": 711,
+          "author": "6Vw9",
+          "content": "Preflight mapped all live authority paths. Implementing exact normalized receipts bound to actor/workspace/capability generation, expiry/use/provenance; opaque one-use execution permits replace permission_already_checked; production store moves out of repo; resumed session documents cannot restore permission authority. Cargo gates remain serialized (jobs=1, test threads=1).",
+          "created_at": "2026-08-19T01:28:38.897328862Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtvrRymc0CGwVkBKc2g5cYwu/WzArN2pQBs/r7lIQhTeSJV/zMgeCA/cqVjeAI/TH45jjkyMJkW8T5PbEgHteBQ=="
         }
       }
     },
@@ -22090,11 +22099,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 44,
       "timestamp": "2026-08-19T01:28:34.829223120Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 45,
+      "timestamp": "2026-08-19T01:28:38.900460767Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T01:28:34.829223120Z",
+    "timestamp": "2026-08-19T01:28:38.900460767Z",
     "agent_id": "6Vw9",
-    "agent_seq": 44
+    "agent_seq": 45
   }
 }
