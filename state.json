@@ -1,6 +1,6 @@
 {
   "next_display_id": 1029,
-  "next_comment_id": 815,
+  "next_comment_id": 816,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20474,7 +20474,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T14:50:39.964999817Z",
-      "updated_at": "2026-08-19T18:31:53.037326347Z",
+      "updated_at": "2026-08-19T18:44:01.126330718Z",
       "labels": [
         "remediation"
       ],
@@ -20514,6 +20514,18 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA4I35R2sKr0O7tLdUrdB5VpXKCYCa8Unm3ueIZb1f4VdT/vq+dQZLMyeglS1LgT2ggSZlxOUrATVHa4B8W3L7DQ=="
+        },
+        "6452c2bf-c225-41de-9b9a-25219015f1eb": {
+          "display_id": 815,
+          "author": "6Vw9",
+          "content": "Blocked: no active issue",
+          "created_at": "2026-08-19T18:44:01.123768039Z",
+          "kind": "intervention",
+          "trigger_type": "tool_blocked",
+          "intervention_context": "Resuming S-019 G2 publication verification after the user pushed commit 9bc74ceb; activate issue #1027 before remote/PR/CI checks.",
+          "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
         },
         "699ddb25-b3c8-47bb-8420-038761a8aedc": {
           "display_id": 801,
@@ -24369,11 +24381,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 234,
       "timestamp": "2026-08-19T18:43:55.164762602Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 235,
+      "timestamp": "2026-08-19T18:44:01.126330718Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T18:43:55.164762602Z",
+    "timestamp": "2026-08-19T18:44:01.126330718Z",
     "agent_id": "6Vw9",
-    "agent_seq": 234
+    "agent_seq": 235
   }
 }
