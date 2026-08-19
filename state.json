@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1034,
+  "next_display_id": 1035,
   "next_comment_id": 836,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -85,6 +85,7 @@
     "152ff7ef-baba-4d49-ad3a-73d1593503b4": 407,
     "155d5090-07c6-44bc-9227-14d65082ac14": 960,
     "15607fb5-8ab0-4aa9-a2b1-ad9e9deeb984": 494,
+    "15a123cf-4c84-44a2-8f2c-936821bfa789": 1034,
     "15b5e459-b5e5-48ba-8cdc-1c88e38f1732": 443,
     "15d38070-a65e-44c4-ac22-7de434a0d003": 899,
     "166e094c-3e88-497f-8e4f-b01198d17e05": 199,
@@ -2949,6 +2950,16 @@
         "qa-seam-tools",
         "refactor"
       ]
+    },
+    "15a123cf-4c84-44a2-8f2c-936821bfa789": {
+      "uuid": "15a123cf-4c84-44a2-8f2c-936821bfa789",
+      "display_id": 1034,
+      "title": "Restore changelog to Crosslink close-event output",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T23:59:48.372882571Z",
+      "updated_at": "2026-08-19T23:59:48.372882571Z"
     },
     "15b5e459-b5e5-48ba-8cdc-1c88e38f1732": {
       "uuid": "15b5e459-b5e5-48ba-8cdc-1c88e38f1732",
@@ -24905,11 +24916,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 286,
       "timestamp": "2026-08-19T23:53:33.380115258Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 287,
+      "timestamp": "2026-08-19T23:59:48.372882571Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:53:33.380115258Z",
+    "timestamp": "2026-08-19T23:59:48.372882571Z",
     "agent_id": "6Vw9",
-    "agent_seq": 286
+    "agent_seq": 287
   }
 }
