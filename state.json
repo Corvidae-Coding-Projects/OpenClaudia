@@ -15302,12 +15302,12 @@
       "uuid": "a9bac245-2de4-4778-86c0-be96b847eb08",
       "display_id": 1031,
       "title": "Remove the Windows-only SecureDirectory dead-code warning",
-      "description": "S-020 cross-target verification () succeeds but reports src/tools/file/secure_fs.rs:176 SecureDirectory.context as unread on Windows. The warning is outside Bash effect/path classification and should be repaired in the secure-files portability boundary without weakening lint settings or deleting the run capability needed on other targets.",
+      "description": "S-020 cross-target verification with CARGO_BUILD_JOBS=1 cargo check --target x86_64-pc-windows-gnu --all-features --lib succeeds but reports src/tools/file/secure_fs.rs:176 SecureDirectory.context as unread on Windows. The warning is outside Bash effect/path classification and should be repaired in the secure-files portability boundary without weakening lint settings or deleting the run capability needed on other targets.",
       "status": "open",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:21:51.642430836Z",
-      "updated_at": "2026-08-19T23:21:55.673544231Z",
+      "updated_at": "2026-08-19T23:23:54.621682849Z",
       "labels": [
         "maintenance"
       ]
@@ -24562,11 +24562,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 250,
       "timestamp": "2026-08-19T23:21:55.673544231Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 251,
+      "timestamp": "2026-08-19T23:23:54.621682849Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:21:55.673544231Z",
+    "timestamp": "2026-08-19T23:23:54.621682849Z",
     "agent_id": "6Vw9",
-    "agent_seq": 250
+    "agent_seq": 251
   }
 }
