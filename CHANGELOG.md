@@ -22,6 +22,23 @@ the original record.
 
 ### Changed
 
+- Enforce deny-first permission precedence and replace broad ambient approvals
+  with exact, expiring, generation-bound execution receipts (#1007).
+- Validate one-use permits atomically with generation and exact-denial refresh
+  across live managers (#1016).
+- Enforce persisted receipt use/time bounds and fail closed at capability
+  generation exhaustion (#1015).
+- Align web-search integration expectations with mandatory effect
+  classification and downstream argument validation (#1013).
+- Terminate ACP sandbox process groups reliably during cancellation, including
+  daemonized descendants (#1012).
+- Keep the all-feature Windows library build free of unreachable and dead-code
+  warnings (#1011).
+- Record enterprise tool caps only after authorization and reserve concurrent
+  capped calls atomically (#1010).
+- Use platform-aware atomic receipt replacement and apply parent-directory
+  durability where the host supports it (#1009).
+
 - Relocate neutral file-extension recognition to `src/file_types.rs` for
   auto-learning filters and lifecycle-hook metadata without instruction
   loading behavior.

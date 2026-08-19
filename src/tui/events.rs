@@ -177,7 +177,7 @@ pub enum AppEvent {
         model_hint: String,
     },
     /// A `/provider <name>` background resolution completed successfully.
-    ProviderSwitchReady(ProviderSwitch),
+    ProviderSwitchReady(Box<ProviderSwitch>),
     /// A `/provider <name>` background resolution failed.
     ProviderSwitchError(String),
     /// A `/model list` background fetch completed.

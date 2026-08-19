@@ -1486,10 +1486,10 @@ async fn run_subagent_inner(
     // Library-layer permission gate — consulted by every
     // `execute_tool_with_memory` call inside this subagent's tool loop.
     // Closes crosslink #505 for the subagent path.
-    let permission_mgr = crate::permissions::PermissionManager::new(
-        std::path::PathBuf::from(".openclaudia/permissions.json"),
+    let permission_mgr = crate::permissions::PermissionManager::trusted(
         true,
         app_config.permissions.default_allow.clone(),
+        app_config.web_fetch.preapproved_domains.clone(),
     );
     let policy_enforcer = crate::services::policy::PolicyEnforcer::new(app_config.policy.clone());
 
@@ -1746,7 +1746,7 @@ async fn run_subagent_inner(
                     app_config: None,
                     task_mgr: None,
                     permission_mgr: Some(&permission_mgr),
-                    permission_already_checked: false,
+                    authorization: None,
                     session_id: Some(&agent_id),
                     policy_enforcer: Some(&policy_enforcer),
                 },

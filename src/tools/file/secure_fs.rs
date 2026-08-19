@@ -9,7 +9,9 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// Open an existing regular file for reading without following any symlink
 /// during the authoritative kernel lookup.
@@ -69,6 +71,7 @@ pub(super) struct SecureDirEntry {
 pub(super) enum SecureFileType {
     Directory,
     Regular,
+    #[cfg(unix)]
     Other,
 }
 
@@ -203,6 +206,7 @@ fn require_regular(file: &File, path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn require_directory(file: &File, path: &Path) -> Result<(), String> {
     let metadata = file
         .metadata()
@@ -608,41 +612,7 @@ fn create_parent_directories(_path: &Path) -> Result<(), String> {
     )
 }
 
-#[cfg(not(unix))]
-fn capability_root(path: &Path, write: bool) -> Result<PathBuf, String> {
-    let context = crate::tools::security::current_context()?;
-    let roots = if write {
-        context.read_write_roots()
-    } else {
-        // A read may use either kind. Build a small owned list so longest-root
-        // selection remains deterministic for nested capabilities.
-        return context
-            .read_write_roots()
-            .iter()
-            .chain(context.read_only_roots())
-            .filter(|root| path == root.as_path() || path.starts_with(root))
-            .max_by_key(|root| root.components().count())
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "Path '{}' is outside the session's readable capability roots",
-                    path.display()
-                )
-            });
-    };
-    roots
-        .iter()
-        .filter(|root| path == root.as_path() || path.starts_with(root))
-        .max_by_key(|root| root.components().count())
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "Path '{}' is outside the session's writable capability roots",
-                path.display()
-            )
-        })
-}
-
+#[cfg(unix)]
 fn relative_to_root(path: &Path, root: &Path) -> Result<PathBuf, String> {
     let relative = path.strip_prefix(root).map_err(|error| {
         format!(
@@ -683,7 +653,6 @@ mod libc_flags {
     pub(super) const O_RDWR: i32 = 0;
     pub(super) const O_CREAT: i32 = 0;
     pub(super) const O_EXCL: i32 = 0;
-    pub(super) const O_DIRECTORY: i32 = 0;
 }
 
 #[cfg(test)]

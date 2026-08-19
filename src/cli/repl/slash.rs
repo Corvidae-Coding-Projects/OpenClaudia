@@ -2,7 +2,7 @@ use super::models::get_available_models;
 use super::{get_data_dir, get_history_path, get_sessions_dir, list_chat_sessions};
 use openclaudia::config::{Hook, HookEntry, HooksConfig, PermissionsConfig, SandboxMode};
 use openclaudia::memory;
-use openclaudia::permissions::{PermissionDecision, PermissionRule};
+use openclaudia::permissions::PermissionStoreSummary;
 use openclaudia::plugins;
 use openclaudia::skills;
 use openclaudia::tools::file_index::FileIndex;
@@ -344,15 +344,19 @@ pub fn slash_permissions() -> SlashCommandResult {
     println!("\nPermissions:\n");
     match openclaudia::config::load_config() {
         Ok(cfg) => {
-            let persisted_path = Path::new(".openclaudia/permissions.json");
-            match load_persisted_permission_rules(persisted_path) {
-                Ok(rules) => {
-                    for line in permission_status_lines(&cfg.permissions, rules.as_deref(), None) {
+            let persisted_path = openclaudia::permissions::trusted_permission_store_path();
+            match openclaudia::permissions::inspect_permission_store(&persisted_path) {
+                Ok(summary) => {
+                    for line in
+                        permission_status_lines(&cfg.permissions, summary, None, &persisted_path)
+                    {
                         println!("  {line}");
                     }
                 }
                 Err(err) => {
-                    for line in permission_status_lines(&cfg.permissions, None, Some(&err)) {
+                    for line in
+                        permission_status_lines(&cfg.permissions, None, Some(&err), &persisted_path)
+                    {
                         println!("  {line}");
                     }
                 }
@@ -547,22 +551,11 @@ fn project_mcp_server_count_from_str(content: &str) -> Result<usize, String> {
     Ok(servers.len())
 }
 
-fn load_persisted_permission_rules(path: &Path) -> Result<Option<Vec<PermissionRule>>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let rules = serde_json::from_str::<Vec<PermissionRule>>(&content)
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-    Ok(Some(rules))
-}
-
 fn permission_status_lines(
     config: &PermissionsConfig,
-    persisted_rules: Option<&[PermissionRule]>,
+    persisted: Option<PermissionStoreSummary>,
     persisted_error: Option<&str>,
+    persisted_path: &Path,
 ) -> Vec<String> {
     let mut lines = vec![
         format!("Enabled: {}", yes_no(config.enabled)),
@@ -570,6 +563,9 @@ fn permission_status_lines(
             "Default allow: {}",
             summarize_strings(&config.default_allow, "none")
         ),
+        "Precedence: host hard deny > explicit deny > exact approval receipt > policy default"
+            .to_string(),
+        format!("Trusted approval store: {}", persisted_path.display()),
     ];
 
     if config.mcp.is_empty() {
@@ -596,44 +592,22 @@ fn permission_status_lines(
         }
     }
 
-    match (persisted_rules, persisted_error) {
-        (Some(rules), _) => {
-            let always_allow = rules
-                .iter()
-                .filter(|rule| rule.decision == PermissionDecision::AlwaysAllow)
-                .count();
-            let deny = rules
-                .iter()
-                .filter(|rule| rule.decision == PermissionDecision::Deny)
-                .count();
+    match (persisted, persisted_error) {
+        (Some(summary), _) => {
             lines.push(format!(
-                "Persisted rules: {} total ({} always allow, {} deny)",
-                rules.len(),
-                always_allow,
-                deny
+                "Persisted exact approvals: {} (generation {}, expiring/use-limited)",
+                summary.approval_count, summary.capability_generation
             ));
-            for rule in rules.iter().take(STATUS_ITEM_LIMIT) {
-                lines.push(format!(
-                    "  {} {} -> {}",
-                    rule.tool,
-                    rule.pattern,
-                    permission_decision_label(&rule.decision)
-                ));
-            }
-            if rules.len() > STATUS_ITEM_LIMIT {
-                lines.push(format!(
-                    "  ... {} more rule(s)",
-                    rules.len() - STATUS_ITEM_LIMIT
-                ));
-            }
+            lines.push(format!(
+                "Persisted explicit denials: {}",
+                summary.denial_count
+            ));
         }
         (None, Some(err)) => {
             lines.push(format!("Persisted rules: unavailable ({err})"));
         }
         (None, None) => {
-            lines.push(
-                "Persisted rules: none (.openclaudia/permissions.json not found)".to_string(),
-            );
+            lines.push("Persisted approvals/denials: none".to_string());
         }
     }
 
@@ -783,14 +757,6 @@ fn summarize_string_refs(items: &[&String], empty_label: &str) -> String {
         )
     } else {
         shown.join(", ")
-    }
-}
-
-const fn permission_decision_label(decision: &PermissionDecision) -> &'static str {
-    match decision {
-        PermissionDecision::Allow => "allow",
-        PermissionDecision::Deny => "deny",
-        PermissionDecision::AlwaysAllow => "always allow",
     }
 }
 
@@ -3065,7 +3031,6 @@ mod tests {
         PinnedGitSourceError, PluginAction, SlashCommandResult,
     };
     use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, PermissionsConfig};
-    use openclaudia::permissions::{PermissionDecision, PermissionRule};
     use openclaudia::plugins::PluginCommand;
     use std::collections::{HashMap, HashSet};
 
@@ -4030,20 +3995,18 @@ mod tests {
             default_allow: vec!["git status".to_string()],
             mcp,
         };
-        let persisted = vec![
-            PermissionRule {
-                tool: "Bash".to_string(),
-                pattern: "cargo test *".to_string(),
-                decision: PermissionDecision::AlwaysAllow,
-            },
-            PermissionRule {
-                tool: "Write".to_string(),
-                pattern: ".claude/settings.json".to_string(),
-                decision: PermissionDecision::Deny,
-            },
-        ];
+        let persisted = openclaudia::permissions::PermissionStoreSummary {
+            approval_count: 1,
+            denial_count: 1,
+            capability_generation: 4,
+        };
 
-        let lines = permission_status_lines(&config, Some(&persisted), None);
+        let lines = permission_status_lines(
+            &config,
+            Some(persisted),
+            None,
+            std::path::Path::new("/trusted/permissions-v1.json"),
+        );
         let joined = lines.join("\n");
 
         assert!(joined.contains("Enabled: yes"));
@@ -4051,7 +4014,9 @@ mod tests {
         assert!(joined.contains("MCP allowlists: 2 server(s)"));
         assert!(joined.contains("blocked: deny all tools"));
         assert!(joined.contains("github: search, fetch"));
-        assert!(joined.contains("2 total (1 always allow, 1 deny)"));
+        assert!(joined.contains("Persisted exact approvals: 1 (generation 4"));
+        assert!(joined.contains("Persisted explicit denials: 1"));
+        assert!(joined.contains("host hard deny > explicit deny > exact approval receipt"));
     }
 
     #[test]

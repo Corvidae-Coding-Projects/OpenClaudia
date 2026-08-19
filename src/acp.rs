@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::hooks::{load_effective_hooks, HookEngine};
-use crate::permissions::{CheckResult, PermissionContext, PermissionManager};
+use crate::permissions::PermissionManager;
 use crate::providers::get_adapter;
 use crate::session::{SessionManager, SessionMode};
 use crate::tools::args::ToolArgs as _;
@@ -148,6 +148,56 @@ pub struct AcpServer {
     /// Canonical per-session snapshot. IDE notifications update its `ide`
     /// category and prompt construction reads a detached clone from it.
     state: crate::state::StateStore,
+}
+
+/// Observe ACP cancellation independently of the async runtime.
+///
+/// A foreground local tool runs on Tokio's blocking pool. Under heavy output
+/// or executor load, relying only on an async timer to notice `cancel_flag`
+/// can leave a sandboxed child alive long enough to perform another effect.
+/// This watcher owns no authority beyond its exact session id and exits as
+/// soon as either cancellation or tool completion is observed.
+struct SandboxCancellationWatcher {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl SandboxCancellationWatcher {
+    fn spawn(cancellation: Arc<AtomicBool>, session_id: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || loop {
+            if cancellation.load(Ordering::SeqCst) {
+                return crate::tools::cancel_session_sandbox_processes(&session_id);
+            }
+            if watcher_stop.load(Ordering::Acquire) {
+                return 0;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop_and_join(mut self) -> usize {
+        self.stop.store(true, Ordering::Release);
+        self.handle.take().map_or(0, |handle| {
+            handle.thread().unpark();
+            handle.join().unwrap_or(0)
+        })
+    }
+}
+
+impl Drop for SandboxCancellationWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Cap on [`IdeState::recent_files`] — older entries are pushed out.
@@ -386,64 +436,6 @@ async fn pre_tool_use_gate(
         content: blocked.content,
         is_error: true,
     })
-}
-
-/// Run the ACP dispatch through the same permission manager used by
-/// local tool execution, but project unmatched permission rules as a headless deny
-/// instead of an interactive prompt.
-fn acp_permission_gate(
-    permission_mgr: &PermissionManager,
-    tool_name: &str,
-    tool_input: &Value,
-) -> Option<AcpToolResult> {
-    let permission_input = normalize_acp_permission_input(tool_name, tool_input);
-    match permission_mgr.check_with_context(
-        tool_name,
-        &permission_input,
-        PermissionContext::Coordinator,
-    ) {
-        CheckResult::Allowed => None,
-        CheckResult::Denied(reason) => {
-            warn!(
-                tool = %tool_name,
-                reason = %reason,
-                "ACP permission gate denied tool dispatch"
-            );
-            Some(AcpToolResult {
-                content: format!("Permission denied: {reason}"),
-                is_error: true,
-            })
-        }
-        CheckResult::NeedsPrompt { tool, target } => {
-            warn!(
-                tool = %tool,
-                target = %target,
-                "ACP permission gate refused interactive prompt"
-            );
-            Some(AcpToolResult {
-                content: format!(
-                    "Permission denied: ACP mode cannot prompt for {tool} on '{target}'"
-                ),
-                is_error: true,
-            })
-        }
-    }
-}
-
-fn normalize_acp_permission_input(tool_name: &str, tool_input: &Value) -> Value {
-    if !matches!(tool_name, "write_file" | "edit_file") {
-        return tool_input.clone();
-    }
-
-    let mut normalized = tool_input.clone();
-    if let Value::Object(map) = &mut normalized {
-        if !map.contains_key("path") {
-            if let Some(file_path) = map.get("file_path").cloned() {
-                map.insert("path".to_string(), file_path);
-            }
-        }
-    }
-    normalized
 }
 
 fn parse_acp_tool_arguments(
@@ -794,10 +786,10 @@ impl AcpServer {
 
         let merged_hooks = load_effective_hooks(config.hooks.clone());
         let hook_engine = HookEngine::new(merged_hooks);
-        let permission_mgr = Arc::new(crate::permissions::PermissionManager::new(
-            std::path::PathBuf::from(".openclaudia/permissions.json"),
+        let permission_mgr = Arc::new(crate::permissions::PermissionManager::trusted(
             true,
             config.permissions.default_allow.clone(),
+            config.web_fetch.preapproved_domains.clone(),
         ));
         let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             config.policy.clone(),
@@ -1926,17 +1918,17 @@ impl AcpServer {
     // Tool execution via ACP client methods
     // ========================================================================
 
-    /// Execute a tool by delegating to ACP client methods.
+    /// Execute an ACP-requested tool through `OpenClaudia`'s local handlers.
     ///
     /// Mirrors `proxy.rs::prepare_request_context`'s gate sequence
     /// (crosslink #694):
     /// 1. Run `PreToolUse` hooks. On denial, surface the block reason as
     ///    the tool result instead of dispatching — no ACP fs/terminal
     ///    call is made and no `execute_tool_with_memory` runs.
-    /// 2. Run a non-interactive permission check. ACP stdio cannot show
-    ///    the TUI prompt, so unmatched write/bash/web-fetch decisions
-    ///    become default-deny results.
-    /// 3. Dispatch to the appropriate ACP / local handler.
+    /// 2. Dispatch through the local executor, which mints and consumes an
+    ///    exact permission permit. ACP stdio cannot show the TUI prompt, so
+    ///    unmatched effectful decisions become default-deny results.
+    /// 3. Execute the appropriate normalized local handler.
     /// 4. Fire `PostToolUse` (or `PostToolUseFailure`) after dispatch so
     ///    post-tool side effects (logging, audit, learn hooks) observe
     ///    ACP-driven calls the same way they observe proxy-driven calls.
@@ -1966,18 +1958,6 @@ impl AcpServer {
         // ── PreToolUse gate ─────────────────────────────────────────────
         if let Some(blocked) = pre_tool_use_gate(&self.hook_engine, tool_name, &tool_input).await {
             return blocked;
-        }
-
-        // ── Headless permission gate ───────────────────────────────────
-        if let Some(blocked) = acp_permission_gate(&self.permission_mgr, tool_name, &tool_input) {
-            return blocked;
-        }
-
-        if let Err(e) = tool_policy.check_and_record_tool(tool_name) {
-            return AcpToolResult {
-                content: format!("Blocked by policy: {e}"),
-                is_error: true,
-            };
         }
 
         let result = match tool_name {
@@ -2040,13 +2020,14 @@ impl AcpServer {
             session_id,
             tool_name,
             arguments_json,
+            Some(self.policy_enforcer.as_ref()),
         )
     }
 
     /// Execute a synchronous local tool on Tokio's blocking pool so a
     /// foreground command or large file operation cannot stall ACP message
-    /// routing. The permission manager is shared read-only here; the outer ACP
-    /// gate already made and recorded the mutable permission decision.
+    /// routing. The permission manager is shared read-only here; the worker
+    /// performs the exact authorization and permit consumption itself.
     async fn execute_local_tool_async(
         &self,
         session_id: &str,
@@ -2054,22 +2035,32 @@ impl AcpServer {
         arguments_json: &str,
     ) -> AcpToolResult {
         let permission_mgr = Arc::clone(&self.permission_mgr);
+        let policy_enforcer = Arc::clone(&self.policy_enforcer);
         let session_id = session_id.to_string();
         let tool_name = tool_name.to_string();
         let arguments_json = arguments_json.to_string();
         let cancellation = Arc::clone(&self.cancel_flag);
         let cancellation_session = session_id.clone();
+        let mut cancellation_watcher = Some(SandboxCancellationWatcher::spawn(
+            Arc::clone(&cancellation),
+            cancellation_session.clone(),
+        ));
         let mut worker = tokio::task::spawn_blocking(move || {
             execute_local_tool_with_permission(
                 &permission_mgr,
                 &session_id,
                 &tool_name,
                 &arguments_json,
+                Some(policy_enforcer.as_ref()),
             )
         });
         loop {
             tokio::select! {
                 outcome = &mut worker => {
+                    cancellation_watcher
+                        .take()
+                        .expect("cancellation watcher exists until tool completion")
+                        .stop_and_join();
                     return match outcome {
                         Ok(result) => result,
                         Err(error) => AcpToolResult {
@@ -2080,8 +2071,10 @@ impl AcpServer {
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
                     if cancellation.load(Ordering::SeqCst) {
-                        let cancelled_processes =
-                            crate::tools::cancel_session_sandbox_processes(&cancellation_session);
+                        let cancelled_processes = cancellation_watcher
+                            .take()
+                            .expect("cancellation watcher exists until cancellation")
+                            .stop_and_join();
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
                             &mut worker,
@@ -2297,6 +2290,7 @@ fn execute_local_tool_with_permission(
     session_id: &str,
     tool_name: &str,
     arguments_json: &str,
+    policy_enforcer: Option<&crate::services::policy::PolicyEnforcer>,
 ) -> AcpToolResult {
     use crate::tools::{FunctionCall, ToolCall};
 
@@ -2316,11 +2310,9 @@ fn execute_local_tool_with_permission(
             app_config: None,
             task_mgr: None,
             permission_mgr: Some(permission_mgr),
-            // `execute_tool_via_acp` performs the headless permission gate
-            // before dispatch, so this worker must not make a second decision.
-            permission_already_checked: true,
+            authorization: None,
             session_id: Some(session_id),
-            policy_enforcer: None,
+            policy_enforcer,
         },
     );
     AcpToolResult {
@@ -3640,6 +3632,8 @@ mod session_mode_tests {
     use crate::session::{SessionManager, SessionMode};
     use serde_json::{json, Value};
     use std::collections::{HashMap, VecDeque};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -4133,11 +4127,22 @@ providers:
                 .expect("cancellation marker must be UTF-8"),
         )
         .expect("quote cancellation marker");
+        let descendant_script = fixture.path().join("spawn-descendant.sh");
+        std::fs::write(
+            &descendant_script,
+            format!("#!/bin/sh\n(sleep 1; echo escaped > {marker}) &\nsleep 30\n"),
+        )
+        .expect("write cancellation fixture");
+        std::fs::set_permissions(&descendant_script, std::fs::Permissions::from_mode(0o700))
+            .expect("make cancellation fixture executable");
+        let command = shlex::try_quote(
+            descendant_script
+                .to_str()
+                .expect("cancellation script must be UTF-8"),
+        )
+        .expect("quote cancellation script");
         let args = HashMap::from([
-            (
-                "command".to_string(),
-                json!(format!("(sleep 1; echo escaped > {marker}) & sleep 30")),
-            ),
+            ("command".to_string(), json!(command)),
             ("run_in_background".to_string(), json!(false)),
         ]);
         let cancel = Arc::clone(&server.cancel_flag);
@@ -4643,17 +4648,12 @@ providers:
 
 #[cfg(test)]
 mod acp_permission_gate_tests {
-    use super::{acp_list_files_command, acp_permission_gate};
+    use super::{acp_list_files_command, execute_local_tool_with_permission};
     use crate::permissions::PermissionManager;
-    use serde_json::json;
 
-    fn enabled(default_allow: Vec<&str>) -> (PermissionManager, tempfile::TempDir) {
+    fn enabled(default_allow: Vec<String>) -> (PermissionManager, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mgr = PermissionManager::new(
-            tmp.path().join("permissions.json"),
-            true,
-            default_allow.into_iter().map(str::to_string).collect(),
-        );
+        let mgr = PermissionManager::new(tmp.path().join("permissions.json"), true, default_allow);
         (mgr, tmp)
     }
 
@@ -4661,8 +4661,13 @@ mod acp_permission_gate_tests {
     fn headless_gate_denies_unmatched_bash_instead_of_prompting() {
         let (mgr, _tmp) = enabled(vec![]);
 
-        let blocked = acp_permission_gate(&mgr, "bash", &json!({"command": "cargo test"}))
-            .expect("unmatched ACP bash must default-deny");
+        let blocked = execute_local_tool_with_permission(
+            &mgr,
+            "session-1",
+            "bash",
+            r#"{"command":"cargo test"}"#,
+            None,
+        );
 
         assert!(blocked.is_error);
         assert!(
@@ -4671,7 +4676,7 @@ mod acp_permission_gate_tests {
             blocked.content
         );
         assert!(
-            blocked.content.contains("Default-deny"),
+            blocked.content.contains("no interactive prompt"),
             "denial should come from the headless permission context: {}",
             blocked.content
         );
@@ -4679,31 +4684,47 @@ mod acp_permission_gate_tests {
 
     #[test]
     fn headless_gate_allows_matching_default_allow_rule() {
-        let (mgr, _tmp) = enabled(vec!["git status *"]);
+        let (mgr, _tmp) = enabled(vec!["git status *".to_string()]);
 
-        let outcome = acp_permission_gate(&mgr, "bash", &json!({"command": "git status --short"}));
+        let outcome = execute_local_tool_with_permission(
+            &mgr,
+            "session-1",
+            "bash",
+            r#"{"command":"git status --short"}"#,
+            None,
+        );
 
         assert!(
-            outcome.is_none(),
+            !outcome.is_error,
             "explicit default_allow rule must still allow ACP bash; got {outcome:?}"
         );
     }
 
     #[test]
-    fn headless_gate_normalizes_file_path_alias_for_write_rules() {
-        let allowed_path = "/tmp/openclaudia-acp-allowed.txt";
-        let (mgr, _tmp) = enabled(vec![allowed_path]);
+    fn headless_gate_applies_tool_scoped_write_rule_to_normalized_acp_call() {
+        let allowed_path = std::path::PathBuf::from(format!(
+            "target/acp-permission-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let (mgr, _store_tmp) = enabled(vec![format!("Write({})", allowed_path.display())]);
 
-        let outcome = acp_permission_gate(
+        let outcome = execute_local_tool_with_permission(
             &mgr,
+            "session-1",
             "write_file",
-            &json!({"file_path": allowed_path, "content": "ok"}),
+            &serde_json::json!({"path": allowed_path, "content": "ok"}).to_string(),
+            None,
         );
 
         assert!(
-            outcome.is_none(),
-            "ACP write_file file_path alias must be checked as the registry path target; got {outcome:?}"
+            !outcome.is_error,
+            "ACP's normalized write call must match only its explicit Write scope; got {outcome:?}"
         );
+        assert_eq!(
+            std::fs::read_to_string(&allowed_path).expect("written file"),
+            "ok"
+        );
+        std::fs::remove_file(allowed_path).expect("remove test output");
     }
 
     #[test]

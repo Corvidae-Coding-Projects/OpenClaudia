@@ -1432,7 +1432,7 @@ impl App {
                 self.handle_overload_fallback(&model_hint);
             }
             Ok(AppEvent::ProviderSwitchReady(switch)) => {
-                self.apply_provider_switch(switch);
+                self.apply_provider_switch(*switch);
             }
             Ok(AppEvent::ProviderSwitchError(msg)) => {
                 self.messages.add(DisplayMessage::error(format!(
@@ -2492,7 +2492,7 @@ impl App {
         )));
         handle.spawn(async move {
             let event = match resolve_provider_switch(requested, prompt_blocks).await {
-                Ok(switch) => AppEvent::ProviderSwitchReady(switch),
+                Ok(switch) => AppEvent::ProviderSwitchReady(Box::new(switch)),
                 Err(err) => AppEvent::ProviderSwitchError(err),
             };
             let _ = tx.send(event);

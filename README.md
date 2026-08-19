@@ -214,8 +214,9 @@ session:
 # permissions:
 #   enabled: true
 #   default_allow:
-#     - "git status"
-#     - "src/**"
+#     - "Bash(git status)"
+#     - "Write(src/**)"
+#     - "Edit(src/**)"
 #   mcp:
 #     filesystem: ["read_file", "list_directory"]
 ```

@@ -305,13 +305,18 @@ mod tests {
 
     #[test]
     fn encoded_payload_carries_version_tag() {
-        let state = SessionState::default();
+        let mut state = SessionState::default();
+        state.permissions.bypass_mode = true;
         let encoded = encode(&state).unwrap();
         assert!(
             encoded.contains("\"version\""),
             "encoded payload should include the version tag: {encoded}"
         );
         assert!(encoded.contains("\"version\": 1"));
+        assert!(
+            !encoded.contains("\"permissions\""),
+            "persisted state must omit live permission authority: {encoded}"
+        );
     }
 
     #[test]
@@ -329,6 +334,25 @@ mod tests {
         assert!(decoded.ide.recent_files.is_empty());
         assert!(decoded.ide.selection.is_none());
         assert!(decoded.ide.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn legacy_permission_fields_cannot_restore_authority() {
+        let state = SessionState::new(PathBuf::from("/tmp/legacy-authority"));
+        let mut payload = serde_json::to_value(SessionStateV1::wrap(state)).unwrap();
+        payload.as_object_mut().unwrap().insert(
+            "permissions".to_string(),
+            serde_json::json!({
+                "bypass_mode": true,
+                "trust_accepted": true,
+                "persistence_disabled": false
+            }),
+        );
+
+        let decoded = decode(&payload.to_string()).unwrap();
+        assert!(!decoded.permissions.bypass_mode);
+        assert!(!decoded.permissions.trust_accepted);
+        assert!(!decoded.permissions.persistence_disabled);
     }
 
     #[test]

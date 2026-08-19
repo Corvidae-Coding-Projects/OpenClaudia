@@ -389,26 +389,36 @@ fn execute_web_fetch_missing_url_arg_returns_error() {
 fn execute_web_search_short_query_returns_error() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 
-    for bad_query in &["", "x"] {
-        let call = ToolCall {
-            id: "shortq".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "web_search".to_string(),
-                arguments: format!(r#"{{"query": "{bad_query}"}}"#),
-            },
-        };
-        let result = execute_tool(&call);
-        assert!(
-            result.is_error(),
-            "expected error for short query {bad_query:?}"
-        );
-        assert!(
-            result.content().contains("at least 2 characters"),
-            "expected min-length message, got: {}",
-            result.content()
-        );
-    }
+    let empty = ToolCall {
+        id: "empty-query".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "web_search".to_string(),
+            arguments: r#"{"query": ""}"#.to_string(),
+        },
+    };
+    let empty_result = execute_tool(&empty);
+    assert!(empty_result.is_error(), "empty query must fail closed");
+    assert_eq!(
+        empty_result.content(),
+        "Permission denied: Denied: web_search tool call has malformed arguments (expected non-empty string 'query')"
+    );
+
+    let one_character = ToolCall {
+        id: "one-character-query".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "web_search".to_string(),
+            arguments: r#"{"query": "x"}"#.to_string(),
+        },
+    };
+    let short_result = execute_tool(&one_character);
+    assert!(short_result.is_error(), "one-character query must fail");
+    assert!(
+        short_result.content().contains("at least 2 characters"),
+        "expected min-length message, got: {}",
+        short_result.content()
+    );
 }
 
 #[cfg(feature = "browser")]
@@ -438,11 +448,27 @@ fn execute_web_search_missing_query_returns_error() {
 fn execute_web_search_rejects_non_string_query_before_browser_launch() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 
-    for (name, value) in [
-        ("number", json!(42)),
-        ("array", json!(["rust", "release"])),
-        ("object", json!({"q": "rust release"})),
-        ("null", Value::Null),
+    for (name, value, expected) in [
+        (
+            "number",
+            json!(42),
+            "Permission denied: Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "array",
+            json!(["rust", "release"]),
+            "Permission denied: Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "object",
+            json!({"q": "rust release"}),
+            "Permission denied: Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "null",
+            Value::Null,
+            "Permission denied: Denied: Missing 'query' argument required for web_search tool call",
+        ),
     ] {
         let call = ToolCall {
             id: format!("badquery-{name}"),
@@ -457,10 +483,7 @@ fn execute_web_search_rejects_non_string_query_before_browser_launch() {
         };
         let result = execute_tool(&call);
         assert!(result.is_error(), "query case {name} should fail");
-        assert_eq!(
-            result.content(),
-            "Invalid 'query' argument: expected string"
-        );
+        assert_eq!(result.content(), expected);
     }
 }
 

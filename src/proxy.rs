@@ -1546,12 +1546,20 @@ pub async fn handle_mcp_tool_call(
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, ProxyError> {
-    match permission_mgr.check(tool_name, &arguments) {
-        crate::permissions::CheckResult::Allowed => {}
-        crate::permissions::CheckResult::Denied(reason) => {
+    let tool_call = crate::tools::ToolCall {
+        id: uuid::Uuid::new_v4().to_string(),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    };
+    let permit = match permission_mgr.authorize_tool_call(&tool_call, None) {
+        crate::permissions::AuthorizationResult::Allowed(permit) => permit,
+        crate::permissions::AuthorizationResult::Denied(reason) => {
             return Err(ProxyError::InvalidBody(reason));
         }
-        crate::permissions::CheckResult::NeedsPrompt { tool, target } => {
+        crate::permissions::AuthorizationResult::NeedsPrompt { tool, target } => {
             // The proxy has no interactive channel, so an unapproved call
             // fails closed rather than executing.
             return Err(ProxyError::InvalidBody(format!(
@@ -1559,7 +1567,7 @@ pub async fn handle_mcp_tool_call(
                  cannot prompt; add an explicit permission rule to allow it"
             )));
         }
-    }
+    };
 
     let mcp = mcp_manager.read().await;
 
@@ -1573,6 +1581,14 @@ pub async fn handle_mcp_tool_call(
             )));
         }
     }
+
+    permission_mgr
+        .consume_execution_permit(&permit, &tool_call, None)
+        .map_err(|reason| {
+            ProxyError::InvalidBody(format!(
+                "MCP execution authorization was invalidated before dispatch: {reason}"
+            ))
+        })?;
 
     // Call the tool
     match mcp.call_tool(tool_name, arguments).await {

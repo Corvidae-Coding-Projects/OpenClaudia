@@ -37,9 +37,10 @@ pub struct PermissionsConfig {
     /// is required. See crosslink #282.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Glob patterns that are pre-allowed without prompting.
-    /// Patterns are matched against the tool's primary argument
-    /// (command string for Bash, `file_path` for Edit/Write).
+    /// Tool-scoped glob patterns that are pre-allowed without prompting.
+    /// Use `Tool(pattern)` (for example `Bash(git status *)` or
+    /// `Write(src/**)`). Legacy unqualified entries remain Bash-only so a
+    /// command pattern can never authorize a file or network target.
     #[serde(default)]
     pub default_allow: Vec<String>,
     /// Per-server MCP tool allow-list (crosslink #619).
@@ -105,7 +106,8 @@ impl PermissionsConfig {
     /// pattern fails validation. The caller (`config::load_config`)
     /// surfaces this as `ConfigError::Message`.
     pub fn validate(&self) -> Result<(), String> {
-        for (idx, pat) in self.default_allow.iter().enumerate() {
+        for (idx, configured) in self.default_allow.iter().enumerate() {
+            let (scope, pat) = split_scoped_default_allow(configured);
             if pat.is_empty() {
                 return Err(format!(
                     "permissions.default_allow[{idx}]: empty pattern is invalid \
@@ -114,12 +116,13 @@ impl PermissionsConfig {
             }
             if pat == "*" || pat == "**" {
                 return Err(format!(
-                    "permissions.default_allow[{idx}] = '{pat}': unbounded patterns \
-                     would pre-allow every tool argument and effectively disable the \
-                     permission system. Use a scoped glob (e.g. '/project/**' or 'git *')."
+                    "permissions.default_allow[{idx}] = '{configured}': unbounded pattern \
+                     '{pat}' would pre-allow every target in {}. Use a narrower glob \
+                     (for example 'Bash(git *)' or 'Write(src/**)').",
+                    scope.map_or("the legacy Bash scope", |_| "the named tool scope")
                 ));
             }
-            if pat
+            if configured
                 .chars()
                 .any(|c| c == '\0' || (c.is_control() && c != '\t'))
             {
@@ -163,6 +166,30 @@ impl PermissionsConfig {
     }
 }
 
+/// Split the explicit `Tool(pattern)` form used by `default_allow`.
+/// Parenthesized shell commands remain legacy Bash patterns unless the prefix
+/// is a plausible tool identifier, avoiding accidental reinterpretation.
+fn split_scoped_default_allow(configured: &str) -> (Option<&str>, &str) {
+    let Some(open) = configured.find('(') else {
+        return (None, configured);
+    };
+    if !configured.ends_with(')') || open == 0 {
+        return (None, configured);
+    }
+    let tool = configured[..open].trim();
+    if tool.is_empty()
+        || !tool
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return (None, configured);
+    }
+    (
+        Some(tool),
+        configured[open + 1..configured.len() - 1].trim(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,7 +198,11 @@ mod tests {
     fn validate_accepts_scoped_globs() {
         let cfg = PermissionsConfig {
             enabled: true,
-            default_allow: vec!["/project/**".into(), "git *".into(), "*.rs".into()],
+            default_allow: vec![
+                "Write(/project/**)".into(),
+                "Bash(git *)".into(),
+                "Bash(*.rs)".into(),
+            ],
             mcp: HashMap::new(),
         };
         assert!(cfg.validate().is_ok());
@@ -194,7 +225,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_unbounded_glob() {
-        for unbounded in ["*", "**"] {
+        for unbounded in ["*", "**", "Bash(*)", "Write(**)"] {
             let cfg = PermissionsConfig {
                 enabled: true,
                 default_allow: vec![unbounded.into()],

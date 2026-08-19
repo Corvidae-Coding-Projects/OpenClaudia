@@ -130,7 +130,7 @@ impl RunSnapshot {
             });
         }
         Ok(Self {
-            descriptor: descriptor.clone(),
+            descriptor: descriptor.as_ref().clone(),
             next_sequence: 1,
             trace_bytes,
             calls: BTreeMap::new(),
@@ -415,7 +415,7 @@ impl RuntimeKernel {
             context.descriptor.actor.clone(),
             EventScope::Run,
             RuntimeEventKind::RunStarted {
-                descriptor: context.descriptor.clone(),
+                descriptor: Box::new(context.descriptor.clone()),
             },
         );
         let snapshot = RunSnapshot::replay(std::slice::from_ref(&event))?;

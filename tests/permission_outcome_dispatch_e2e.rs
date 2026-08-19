@@ -55,19 +55,29 @@ fn outcome_with_none_manager_returns_allowed_bypass() {
 }
 
 #[test]
-fn outcome_with_disabled_manager_returns_allowed_bypass() {
+fn outcome_with_disabled_manager_allows_classified_safe_call() {
     let dir = TempDir::new().expect("tempdir");
     let mgr = PermissionManager::new(
         dir.path().join("permissions.json"),
         false, // disabled
         Vec::new(),
     );
-    let call = tool_call("c1", "bash", &json!({"command": "rm -rf /"}));
+    let call = tool_call("c1", "bash", &json!({"command": "git status"}));
     let outcome = check_tool_permission_outcome(&call, Some(&mgr));
     assert!(
         matches!(outcome, PermissionOutcome::Allowed),
-        "disabled manager MUST bypass to Allowed regardless of command danger"
+        "disabled manager should skip prompts for a classified safe call"
     );
+}
+
+#[test]
+fn outcome_with_disabled_manager_keeps_hard_safety_denials() {
+    let mgr = PermissionManager::unrestricted();
+    let call = tool_call("c1", "bash", &json!({"command": "rm -rf /"}));
+    assert!(matches!(
+        check_tool_permission_outcome(&call, Some(&mgr)),
+        PermissionOutcome::Denied(_)
+    ));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -96,9 +106,7 @@ fn outcome_unrestricted_manager_returns_allowed() {
 #[test]
 fn outcome_preserves_tool_call_id_into_denied_result() {
     // Construct a manager that explicitly denies bash via a
-    // session rule (tui_remember_always_denied targets a
-    // different cache layer that doesn't gate the main
-    // check() path — discovered during sprint 83 authoring).
+    // canonical session rule.
     let dir = TempDir::new().expect("tempdir");
     let mut mgr = PermissionManager::new(dir.path().join("p.json"), true, Vec::new());
     mgr.add_session_rule(PermissionRule {

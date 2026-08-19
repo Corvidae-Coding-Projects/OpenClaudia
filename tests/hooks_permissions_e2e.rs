@@ -23,8 +23,8 @@
 //!   - `DenialTracker` escalation — consecutive + total denial counters
 //!     cross [`MAX_CONSECUTIVE_DENIALS`] / [`MAX_TOTAL_DENIALS`]
 //!     thresholds and `escalation_state` flips to `ShouldAbort`.
-//!   - Always-allow persistence — `add_always_allow` registers
-//!     a rule that subsequent `check` calls honour.
+//!   - Exact approval persistence — a bounded receipt authorizes only the
+//!     normalized invocation it records.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
@@ -33,16 +33,17 @@
 use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, SandboxMode};
 use openclaudia::hooks::{HookEngine, HookEvent, HookInput};
 use openclaudia::permissions::{
-    CheckResult, EscalationState, PermissionDecision, PermissionManager, PermissionRule,
-    MAX_CONSECUTIVE_DENIALS, MAX_TOTAL_DENIALS,
+    ApprovalProvenance, AuthorizationResult, CheckResult, EscalationState, PermissionDecision,
+    PermissionManager, PermissionRule, MAX_CONSECUTIVE_DENIALS, MAX_TOTAL_DENIALS,
 };
+use openclaudia::tools::{FunctionCall, ToolCall};
 use serde_json::json;
 use std::time::Instant;
 use tempfile::tempdir;
 
 /// Build a `PermissionManager` with a tempdir-backed persistence path
-/// so `add_always_allow` writes don't leak into the user's real rule
-/// store. `enabled=true` so the manager actually evaluates rules;
+/// so approval writes don't leak into the user's real rule store.
+/// `enabled=true` so the manager actually evaluates rules;
 /// `default_allow=[]` so we never get an unwanted `Allowed` result that
 /// masks a regression.
 fn fresh_manager() -> (PermissionManager, tempfile::TempDir) {
@@ -503,31 +504,33 @@ fn permission_check_write_pattern_matches_path_arg() {
 }
 
 #[test]
-fn always_allow_persists_for_subsequent_checks() {
-    let (mut mgr, _td) = fresh_manager();
-    // Initial state: NeedsPrompt.
+fn persisted_exact_approval_authorizes_a_matching_later_call() {
+    let (mgr, _td) = fresh_manager();
+    let approved = ToolCall {
+        id: "first".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "bash".to_string(),
+            arguments: json!({"command": "git status"}).to_string(),
+        },
+    };
+    let permit = mgr
+        .approve_tool_call_persisted(
+            &approved,
+            Some("session"),
+            ApprovalProvenance::HostAdministrator,
+        )
+        .unwrap();
+    mgr.consume_execution_permit(&permit, &approved, Some("session"))
+        .unwrap();
+
+    let mut repeated = approved;
+    repeated.id = "second".to_string();
     assert!(matches!(
-        mgr.check("bash", &json!({"command": "git status"})),
-        CheckResult::NeedsPrompt { .. }
+        mgr.authorize_tool_call(&repeated, Some("session")),
+        AuthorizationResult::Allowed(_)
     ));
-    // Add an always-allow rule. The pattern must match exactly the
-    // canonical target ("git status") since glob `*` doesn't cross
-    // `/` and we have no slashes here anyway.
-    mgr.add_always_allow("Bash", "git status");
-    // Now: Allowed.
-    assert_eq!(
-        mgr.check("bash", &json!({"command": "git status"})),
-        CheckResult::Allowed,
-        "always-allow must persist for subsequent checks"
-    );
-    // And the rule shows up in persisted_rules.
-    assert!(
-        mgr.persisted_rules()
-            .iter()
-            .any(|r| r.tool.eq_ignore_ascii_case("Bash") && r.pattern == "git status"),
-        "persisted_rules must include the new always-allow rule; got {:?}",
-        mgr.persisted_rules()
-    );
+    assert!(mgr.persisted_rules().is_empty());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -607,25 +610,42 @@ fn record_denial_eventually_reaches_should_abort_via_total() {
 }
 
 #[test]
-fn clear_session_rules_does_not_clear_persisted() {
+fn clearing_compatibility_session_rules_does_not_clear_exact_receipts() {
     let (mut mgr, _td) = fresh_manager();
-    mgr.add_always_allow("Bash", "git status");
+    let approved = ToolCall {
+        id: "persisted".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "bash".to_string(),
+            arguments: json!({"command": "git status"}).to_string(),
+        },
+    };
+    let first = mgr
+        .approve_tool_call_persisted(
+            &approved,
+            Some("session"),
+            ApprovalProvenance::HostAdministrator,
+        )
+        .unwrap();
+    mgr.consume_execution_permit(&first, &approved, Some("session"))
+        .unwrap();
     mgr.add_session_rule(PermissionRule {
         tool: "Bash".to_string(),
         pattern: "ls*".to_string(),
         decision: PermissionDecision::Allow,
     });
     assert_eq!(mgr.session_rules().len(), 1);
-    assert_eq!(mgr.persisted_rules().len(), 1);
+    assert!(mgr.persisted_rules().is_empty());
 
     mgr.clear_session_rules();
     assert!(
         mgr.session_rules().is_empty(),
         "session rules must be cleared"
     );
-    assert_eq!(
-        mgr.persisted_rules().len(),
-        1,
-        "persisted rules must SURVIVE session clear"
-    );
+    let mut repeated = approved;
+    repeated.id = "after-clear".to_string();
+    assert!(matches!(
+        mgr.authorize_tool_call(&repeated, Some("session")),
+        AuthorizationResult::Allowed(_)
+    ));
 }

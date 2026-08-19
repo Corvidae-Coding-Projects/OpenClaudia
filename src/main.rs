@@ -14,7 +14,9 @@ mod cli;
 
 use openclaudia::{
     config, guardrails, memory,
-    permissions::{CheckResult, PermissionManager, PermissionRule},
+    permissions::{
+        ApprovalProvenance, AuthorizationResult, ExecutionPermit, PermissionManager, PermissionRule,
+    },
     plugins, prompt,
     proxy::normalize_base_url,
     tools::safe_truncate,
@@ -729,7 +731,9 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
 /// Result of an interactive permission prompt for a tool call.
 enum ToolPermissionResult {
     /// User allowed execution (or tool doesn't need permission).
-    Allowed { checked: bool },
+    Allowed {
+        authorization: Option<ExecutionPermit>,
+    },
     /// User denied execution.
     Denied(String),
 }
@@ -779,44 +783,67 @@ fn tool_call_description(tool_name: &str, tool_args: &serde_json::Value) -> Stri
 /// boolean-flag anti-pattern. The two distinct behaviors are now two distinct functions.
 ///
 /// Returns `Allowed` to proceed, or `Denied(message)` to send back to the model.
+fn parse_interactive_permission_arguments(
+    tool_call: &openclaudia::tools::ToolCall,
+) -> Result<serde_json::Value, String> {
+    let tool_name = &tool_call.function.name;
+    match serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments) {
+        Ok(value @ serde_json::Value::Object(_)) => Ok(value),
+        Ok(_) => Err(format!(
+            "Permission denied: invalid non-object arguments for tool '{tool_name}'"
+        )),
+        Err(error) => Err(format!(
+            "Permission denied: invalid arguments for tool '{tool_name}': {error}"
+        )),
+    }
+}
+
 fn check_tool_permission_interactive(
-    tool_name: &str,
-    tool_args: &serde_json::Value,
-    always_allowed: &mut std::collections::HashSet<String>,
+    tool_call: &openclaudia::tools::ToolCall,
+    session_id: &str,
     permission_mgr: Option<&PermissionManager>,
     transient_allow_rules: &[PermissionRule],
 ) -> ToolPermissionResult {
     use std::io::Write as _;
 
+    let tool_name = &tool_call.function.name;
+    let tool_args = match parse_interactive_permission_arguments(tool_call) {
+        Ok(arguments) => arguments,
+        Err(reason) => return ToolPermissionResult::Denied(reason),
+    };
+
     if let Some(mgr) = permission_mgr {
-        match mgr.check_with_transient_allow_rules(tool_name, tool_args, transient_allow_rules) {
-            CheckResult::Allowed => return ToolPermissionResult::Allowed { checked: true },
-            CheckResult::Denied(reason) => {
+        match mgr.authorize_tool_call_with_transient_rules(
+            tool_call,
+            Some(session_id),
+            transient_allow_rules,
+        ) {
+            AuthorizationResult::Allowed(permit) => {
+                return ToolPermissionResult::Allowed {
+                    authorization: Some(permit),
+                };
+            }
+            AuthorizationResult::Denied(reason) => {
                 return ToolPermissionResult::Denied(format!("Permission denied: {reason}"));
             }
-            CheckResult::NeedsPrompt { .. } => {}
+            AuthorizationResult::NeedsPrompt { .. } => {}
         }
     } else {
         // The compatibility path without a manager may skip a prompt only for
         // a positively classified read-only call. Unknown/malformed calls are
         // denied here instead of being user-approved under no known effect.
-        match openclaudia::tools::effect::resolve_for_call(tool_name, tool_args) {
+        match openclaudia::tools::effect::resolve_for_call(tool_name, &tool_args) {
             Ok(effect) if !effect.effect.requires_authorization() => {
-                return ToolPermissionResult::Allowed { checked: false };
+                return ToolPermissionResult::Allowed {
+                    authorization: None,
+                };
             }
             Ok(_) => {}
             Err(error) => return ToolPermissionResult::Denied(error.reason()),
         }
     }
 
-    // Check session-level "always allow" cache after hard-safety/config rules.
-    if always_allowed.contains(tool_name) {
-        return ToolPermissionResult::Allowed {
-            checked: permission_mgr.is_some(),
-        };
-    }
-
-    let description = tool_call_description(tool_name, tool_args);
+    let description = tool_call_description(tool_name, &tool_args);
 
     eprint!("\x1b[33m⚠ {description}\x1b[0m [y/n/a(lways)] ");
     std::io::stderr().flush().ok();
@@ -831,16 +858,51 @@ fn check_tool_permission_interactive(
     let response = input.trim().to_lowercase();
 
     match response.as_str() {
-        "y" | "yes" | "" => ToolPermissionResult::Allowed {
-            checked: permission_mgr.is_some(),
-        },
-        "a" | "always" => {
-            always_allowed.insert(tool_name.to_string());
-            eprintln!(
-                "\x1b[32m✓ Will auto-allow '{tool_name}' for the rest of this session.\x1b[0m"
-            );
+        "y" | "yes" | "" => permission_mgr.map_or(
             ToolPermissionResult::Allowed {
-                checked: permission_mgr.is_some(),
+                authorization: None,
+            },
+            |manager| {
+                manager
+                    .approve_tool_call_once(
+                        tool_call,
+                        Some(session_id),
+                        ApprovalProvenance::InteractiveUser,
+                    )
+                    .map_or_else(
+                        |reason| {
+                            ToolPermissionResult::Denied(format!(
+                                "Permission approval could not be issued: {reason}"
+                            ))
+                        },
+                        |permit| ToolPermissionResult::Allowed {
+                            authorization: Some(permit),
+                        },
+                    )
+            },
+        ),
+        "a" | "always" => {
+            let Some(manager) = permission_mgr else {
+                return ToolPermissionResult::Denied(
+                    "A scoped always-approval requires an active permission manager".to_string(),
+                );
+            };
+            match manager.approve_tool_call_for_session(
+                tool_call,
+                session_id,
+                ApprovalProvenance::InteractiveUser,
+            ) {
+                Ok(permit) => {
+                    eprintln!(
+                        "\x1b[32m✓ Will auto-allow this exact '{tool_name}' invocation for the bounded session receipt.\x1b[0m"
+                    );
+                    ToolPermissionResult::Allowed {
+                        authorization: Some(permit),
+                    }
+                }
+                Err(reason) => ToolPermissionResult::Denied(format!(
+                    "Permission approval could not be issued: {reason}"
+                )),
             }
         }
         _ => ToolPermissionResult::Denied(format!(
@@ -869,7 +931,9 @@ const fn check_tool_unrestricted(
     _tool_name: &str,
     _tool_args: &serde_json::Value,
 ) -> ToolPermissionResult {
-    ToolPermissionResult::Allowed { checked: false }
+    ToolPermissionResult::Allowed {
+        authorization: None,
+    }
 }
 
 /// Interactive chat mode (default command)
@@ -960,8 +1024,7 @@ fn init_permission_manager(
     if dangerously_skip_permissions {
         return PermissionManager::unrestricted();
     }
-    PermissionManager::new_with_web_fetch_preapproved(
-        std::path::PathBuf::from(".openclaudia/permissions.json"),
+    PermissionManager::trusted(
         true,
         config.permissions.default_allow.clone(),
         config.web_fetch.preapproved_domains.clone(),
@@ -2256,6 +2319,20 @@ async fn cmd_chat(
 mod tests {
     use super::*;
 
+    fn permission_test_call(
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> openclaudia::tools::ToolCall {
+        openclaudia::tools::ToolCall {
+            id: "permission-test-call".to_string(),
+            call_type: "function".to_string(),
+            function: openclaudia::tools::FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
     fn permission_manager_with_deny(
         canonical_tool: &str,
         pattern: &str,
@@ -2273,13 +2350,8 @@ mod tests {
     #[test]
     fn interactive_permission_path_does_not_bypass_read_denials() {
         let (mgr, _dir) = permission_manager_with_deny("Read", "/etc/**");
-        let result = check_tool_permission_interactive(
-            "read_file",
-            &serde_json::json!({"path": "/etc/shadow"}),
-            &mut std::collections::HashSet::new(),
-            Some(&mgr),
-            &[],
-        );
+        let call = permission_test_call("read_file", &serde_json::json!({"path": "/etc/shadow"}));
+        let result = check_tool_permission_interactive(&call, "session", Some(&mgr), &[]);
         assert!(
             matches!(result, ToolPermissionResult::Denied(_)),
             "the CLI frontend must not skip an explicit deny merely because the call is read-only"
@@ -2291,13 +2363,11 @@ mod tests {
         // `lsp` was in this frontend's former hard-coded safe list even though
         // it starts and mutates a long-lived language-server process.
         let (mgr, _dir) = permission_manager_with_deny("Lsp", "**");
-        let result = check_tool_permission_interactive(
+        let call = permission_test_call(
             "lsp",
             &serde_json::json!({"action": "hover", "file_path": "src/main.rs"}),
-            &mut std::collections::HashSet::new(),
-            Some(&mgr),
-            &[],
         );
+        let result = check_tool_permission_interactive(&call, "session", Some(&mgr), &[]);
         assert!(
             matches!(result, ToolPermissionResult::Denied(_)),
             "the CLI frontend must consult catalog policy for effectful tools"
@@ -2306,13 +2376,8 @@ mod tests {
 
     #[test]
     fn interactive_permission_path_denies_unknown_tool_without_prompting() {
-        let result = check_tool_permission_interactive(
-            "unknown_from_model",
-            &serde_json::json!({}),
-            &mut std::collections::HashSet::new(),
-            None,
-            &[],
-        );
+        let call = permission_test_call("unknown_from_model", &serde_json::json!({}));
+        let result = check_tool_permission_interactive(&call, "session", None, &[]);
         assert!(matches!(result, ToolPermissionResult::Denied(_)));
     }
 
@@ -2822,7 +2887,7 @@ mod tests {
     }
 
     #[test]
-    fn repl_session_document_round_trips_through_tui_without_state_loss() {
+    fn repl_session_document_round_trips_through_tui_with_non_authority_state_intact() {
         let repl_session = Session::new_with_behavior_mode(
             "gpt-5.5",
             "openai",
@@ -2892,9 +2957,18 @@ mod tests {
         assert!(state.ui.plan_mode.needs_exit_attachment);
         assert!(state.ui.plan_mode.needs_auto_exit_attachment);
         assert!(state.ui.lsp_recommendation_shown_this_session);
-        assert!(state.permissions.bypass_mode);
-        assert!(state.permissions.trust_accepted);
-        assert!(state.permissions.persistence_disabled);
+        assert!(
+            !state.permissions.bypass_mode,
+            "conversation documents must not restore permission bypass authority"
+        );
+        assert!(
+            !state.permissions.trust_accepted,
+            "conversation documents must not restore trust authority"
+        );
+        assert!(
+            !state.permissions.persistence_disabled,
+            "conversation documents must not restore invocation-local persistence policy"
+        );
         assert_eq!(state.transcript.watermark, 17);
         assert_eq!(
             state.transcript.transcript_cwd,

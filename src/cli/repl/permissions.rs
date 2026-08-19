@@ -2,18 +2,12 @@
 pub fn prompt_permission(
     operation: &str,
     details: &str,
-    always_allowed: &mut std::collections::HashSet<String>,
+    approvals: &mut openclaudia::permissions::LocalApprovalCache,
 ) -> bool {
     use std::io::{self, Write};
 
-    let key = format!("{operation}:{details}");
-
-    if always_allowed.contains(&key) {
-        return true;
-    }
-
-    if always_allowed.contains(&format!("!{key}")) {
-        return false;
+    if let Some(decision) = approvals.decision(operation, details) {
+        return decision == openclaudia::permissions::LocalApprovalDecision::Allowed;
     }
 
     println!("\n=== Permission Required ===");
@@ -35,13 +29,21 @@ pub fn prompt_permission(
     match input.trim().to_lowercase().as_str() {
         "y" | "yes" => true,
         "a" | "always" => {
-            always_allowed.insert(key);
-            println!("(Will always allow this operation)\n");
+            approvals.remember_allowed(
+                operation,
+                details,
+                openclaudia::permissions::ApprovalProvenance::InteractiveUser,
+            );
+            println!("(Will allow this exact operation for a bounded session receipt)\n");
             true
         }
         "d" => {
-            always_allowed.insert(format!("!{key}"));
-            println!("(Will always deny this operation)\n");
+            approvals.remember_denied(
+                operation,
+                details,
+                openclaudia::permissions::ApprovalProvenance::InteractiveUser,
+            );
+            println!("(Will deny this exact operation for the session)\n");
             false
         }
         _ => {
@@ -63,7 +65,7 @@ pub struct ShellCommandExecution {
 /// Execute a shell command and print output (with permission check)
 pub fn execute_shell_command_with_permission(
     cmd: &str,
-    permissions: &mut std::collections::HashSet<String>,
+    permissions: &mut openclaudia::permissions::LocalApprovalCache,
 ) -> Option<ShellCommandExecution> {
     let dangerous_patterns = [
         // Destructive file operations

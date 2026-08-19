@@ -143,7 +143,10 @@ impl Session {
         self.updated_at = loaded.updated_at;
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
-        self.state.replace(loaded.state_snapshot());
+        let live_permissions = self.state.inspect(|state| state.permissions.clone());
+        let mut loaded_state = loaded.state_snapshot();
+        loaded_state.permissions = live_permissions;
+        self.state.replace(loaded_state);
     }
 
     #[must_use]
@@ -493,6 +496,34 @@ mod tests {
         ] {
             assert!(value.get(legacy).is_none(), "legacy duplicate {legacy}");
         }
+        assert!(
+            value["session_state"]["state"].get("permissions").is_none(),
+            "conversation documents must not serialize live permission authority"
+        );
+    }
+
+    #[test]
+    fn applying_loaded_session_preserves_current_invocation_permissions() {
+        let mut active = Session::new("active-model", "active-provider");
+        active.update_state(|state, _| {
+            state.permissions.bypass_mode = false;
+            state.permissions.trust_accepted = false;
+            state.permissions.persistence_disabled = true;
+        });
+
+        let loaded = Session::new("loaded-model", "loaded-provider");
+        loaded.update_state(|state, _| {
+            state.permissions.bypass_mode = true;
+            state.permissions.trust_accepted = true;
+            state.permissions.persistence_disabled = false;
+        });
+
+        active.apply_loaded(&loaded);
+        active.inspect_state(|state| {
+            assert!(!state.permissions.bypass_mode);
+            assert!(!state.permissions.trust_accepted);
+            assert!(state.permissions.persistence_disabled);
+        });
     }
 
     #[test]

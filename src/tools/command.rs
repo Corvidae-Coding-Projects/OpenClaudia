@@ -307,6 +307,16 @@ fn run_prepared_with_timeout(
     stdin_input: Option<&[u8]>,
     terminate_tree: bool,
 ) -> Result<Output, CommandError> {
+    #[cfg(unix)]
+    if terminate_tree {
+        use std::os::unix::process::CommandExt as _;
+
+        // `terminate_process_tree` signals `-pid` so the spawned wrapper must
+        // lead its own process group.  Foreground callers historically omitted
+        // this even though the teardown helper documented the requirement,
+        // leaving cancellation dependent on racy `/proc` descendant scans.
+        cmd.process_group(0);
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin_input.is_some() {
         cmd.stdin(Stdio::piped());

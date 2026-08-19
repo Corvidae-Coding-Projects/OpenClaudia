@@ -127,7 +127,7 @@ pub use worktree::cwd_cache_generation;
 
 use crate::config::AppConfig;
 use crate::memory::MemoryDb;
-use crate::permissions::{CheckResult, PermissionManager};
+use crate::permissions::{AuthorizationResult, CheckResult, ExecutionPermit, PermissionManager};
 use crate::session::TaskManager;
 use crate::subagent;
 use serde::{Deserialize, Serialize};
@@ -276,25 +276,42 @@ const fn value_type_name(value: &Value) -> &'static str {
 /// string form) or `None` to signal "continue with normal dispatch".
 ///
 /// This is the internal choke point used by every `execute_tool*` dispatch
-/// entry point. It guarantees that no dispatch body runs without the
-/// permission check having been consulted first. See crosslink #460.
+/// entry point. Manager-backed calls mint and consume an exact execution
+/// permit before any dispatch body runs; the manager-less compatibility path
+/// retains its classified legacy posture. See crosslink #460.
 fn gate_or_legacy_result(
     tool_call: &ToolCall,
     permission_mgr: Option<&PermissionManager>,
 ) -> Option<ToolResult> {
-    match check_tool_permission_outcome(tool_call, permission_mgr) {
-        PermissionOutcome::Allowed => None,
-        PermissionOutcome::Denied(result) => Some(result),
-        PermissionOutcome::NeedsPrompt {
-            tool_call_id: _,
-            tool,
-            target,
-        } => Some(ToolResult::failure(
+    let Some(permission_mgr) = permission_mgr else {
+        return match check_tool_permission_outcome(tool_call, None) {
+            PermissionOutcome::Allowed => None,
+            PermissionOutcome::Denied(result) => Some(*result),
+            PermissionOutcome::NeedsPrompt {
+                tool_call_id: _,
+                tool,
+                target,
+            } => Some(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                legacy_permission_prompt(&tool, &target),
+                ToolRetryability::Never,
+            )),
+        };
+    };
+
+    match authorize_for_execution(tool_call, permission_mgr) {
+        Ok(permit) => consume_for_execution(tool_call, permission_mgr, &permit)
+            .err()
+            .map(|result| *result),
+        Err(PermissionOutcome::Denied(result)) => Some(*result),
+        Err(PermissionOutcome::NeedsPrompt { tool, target, .. }) => Some(ToolResult::failure(
             tool_call,
             ToolFailureCode::PermissionDenied,
             legacy_permission_prompt(&tool, &target),
             ToolRetryability::Never,
         )),
+        Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
     }
 }
 
@@ -508,7 +525,7 @@ pub enum PermissionOutcome {
     /// Tool may proceed.
     Allowed,
     /// Tool is denied; `ToolResult` is ready to return to the model.
-    Denied(ToolResult),
+    Denied(Box<ToolResult>),
     /// Caller must interactively prompt the user before proceeding.
     /// `tool_call_id` is preserved so the final result can be stitched back
     /// onto the originating call.
@@ -538,7 +555,7 @@ pub fn check_tool_permission_outcome(
     let tool_name = tool_call.function.name.as_str();
     let args = match parse_tool_arguments_value(tool_call) {
         Ok(args) => args,
-        Err(result) => return PermissionOutcome::Denied(*result),
+        Err(result) => return PermissionOutcome::Denied(result),
     };
 
     let Some(mgr) = permission_mgr else {
@@ -549,12 +566,12 @@ pub fn check_tool_permission_outcome(
                 reason = %reason,
                 "permission DENIED: call has no effect classification"
             );
-            return PermissionOutcome::Denied(ToolResult::failure(
+            return PermissionOutcome::Denied(Box::new(ToolResult::failure(
                 tool_call,
                 ToolFailureCode::PermissionDenied,
                 format!("Permission denied: {reason}"),
                 ToolRetryability::Never,
-            ));
+            )));
         }
         tracing::debug!(
             tool = %tool_name,
@@ -574,12 +591,12 @@ pub fn check_tool_permission_outcome(
                 reason = %reason,
                 "permission DENIED"
             );
-            PermissionOutcome::Denied(ToolResult::failure(
+            PermissionOutcome::Denied(Box::new(ToolResult::failure(
                 tool_call,
                 ToolFailureCode::PermissionDenied,
                 format!("Permission denied: {reason}"),
                 ToolRetryability::Never,
-            ))
+            )))
         }
         CheckResult::NeedsPrompt { tool, target } => {
             tracing::info!(
@@ -619,7 +636,7 @@ pub fn check_tool_permission_strict(
                 tool = %tool_name,
                 "strict permission check DENIED: no PermissionManager supplied"
             );
-            PermissionOutcome::Denied(ToolResult::failure(
+            PermissionOutcome::Denied(Box::new(ToolResult::failure(
                 tool_call,
                 ToolFailureCode::PermissionDenied,
                 format!(
@@ -627,7 +644,7 @@ pub fn check_tool_permission_strict(
                      Construct PermissionManager::unrestricted() if you explicitly want allow-all."
                 ),
                 ToolRetryability::Never,
-            ))
+            )))
         },
         |m| check_tool_permission_outcome(tool_call, Some(m)),
     )
@@ -645,7 +662,7 @@ pub fn check_tool_permission(
 ) -> Option<ToolResult> {
     match check_tool_permission_outcome(tool_call, permission_mgr) {
         PermissionOutcome::Allowed => None,
-        PermissionOutcome::Denied(result) => Some(result),
+        PermissionOutcome::Denied(result) => Some(*result),
         PermissionOutcome::NeedsPrompt {
             tool_call_id: _,
             tool,
@@ -657,6 +674,45 @@ pub fn check_tool_permission(
             ToolRetryability::Never,
         )),
     }
+}
+
+fn authorize_for_execution(
+    tool_call: &ToolCall,
+    permission_mgr: &PermissionManager,
+) -> Result<ExecutionPermit, PermissionOutcome> {
+    match permission_mgr.authorize_tool_call(tool_call, None) {
+        AuthorizationResult::Allowed(permit) => Ok(permit),
+        AuthorizationResult::Denied(reason) => {
+            Err(PermissionOutcome::Denied(Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: {reason}"),
+                ToolRetryability::Never,
+            ))))
+        }
+        AuthorizationResult::NeedsPrompt { tool, target } => Err(PermissionOutcome::NeedsPrompt {
+            tool_call_id: tool_call.id.clone(),
+            tool,
+            target,
+        }),
+    }
+}
+
+fn consume_for_execution(
+    tool_call: &ToolCall,
+    permission_mgr: &PermissionManager,
+    permit: &ExecutionPermit,
+) -> Result<(), Box<ToolResult>> {
+    permission_mgr
+        .consume_execution_permit(permit, tool_call, None)
+        .map_err(|reason| {
+            Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: execution permit rejected: {reason}"),
+                ToolRetryability::Never,
+            ))
+        })
 }
 
 /// Execute a tool call with task manager support.
@@ -680,9 +736,28 @@ pub fn execute_tool_with_tasks(
 ) -> ToolResult {
     if permission_mgr.is_none() {
         warn_missing_permission_manager_once("execute_tool_with_tasks");
-    }
-    if let Some(gated) = gate_or_legacy_result(tool_call, permission_mgr) {
-        return gated;
+        if let Some(gated) = gate_or_legacy_result(tool_call, None) {
+            return gated;
+        }
+    } else if let Some(permission_mgr) = permission_mgr {
+        let permit = match authorize_for_execution(tool_call, permission_mgr) {
+            Ok(permit) => permit,
+            Err(PermissionOutcome::Denied(result)) => return *result,
+            Err(PermissionOutcome::NeedsPrompt { tool, target, .. }) => {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::PermissionDenied,
+                    legacy_permission_prompt(&tool, &target),
+                    ToolRetryability::Never,
+                );
+            }
+            Err(PermissionOutcome::Allowed) => {
+                unreachable!("authorization cannot return bare allow")
+            }
+        };
+        if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
+            return *result;
+        }
     }
 
     execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
@@ -750,15 +825,9 @@ pub fn execute_tool_with_permission_required(
     task_mgr: Option<&mut TaskManager>,
     permission_mgr: &PermissionManager,
 ) -> ToolResult {
-    // Strict gate: no Option, no bypass path.
-    match check_tool_permission_strict(tool_call, Some(permission_mgr)) {
-        PermissionOutcome::Denied(result) => return result,
-        PermissionOutcome::NeedsPrompt {
-            tool_call_id,
-            tool,
-            target,
-        } => {
-            let _ = tool_call_id;
+    let permit = match authorize_for_execution(tool_call, permission_mgr) {
+        Err(PermissionOutcome::Denied(result)) => return *result,
+        Err(PermissionOutcome::NeedsPrompt { tool, target, .. }) => {
             return ToolResult::failure(
                 tool_call,
                 ToolFailureCode::PermissionDenied,
@@ -766,7 +835,11 @@ pub fn execute_tool_with_permission_required(
                 ToolRetryability::Never,
             );
         }
-        PermissionOutcome::Allowed => {}
+        Ok(permit) => permit,
+        Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
+    };
+    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
+        return *result;
     }
     execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
 }
@@ -785,7 +858,34 @@ pub fn execute_tool_gated(
     task_mgr: Option<&mut TaskManager>,
     permission_mgr: Option<&PermissionManager>,
 ) -> ExecutionOutcome {
-    match check_tool_permission_outcome(tool_call, permission_mgr) {
+    if let Some(permission_mgr) = permission_mgr {
+        let permit = match authorize_for_execution(tool_call, permission_mgr) {
+            Ok(permit) => permit,
+            Err(PermissionOutcome::Denied(result)) => return ExecutionOutcome::Result(result),
+            Err(PermissionOutcome::NeedsPrompt {
+                tool_call_id,
+                tool,
+                target,
+            }) => {
+                return ExecutionOutcome::NeedsPrompt {
+                    tool_call_id,
+                    tool,
+                    target,
+                };
+            }
+            Err(PermissionOutcome::Allowed) => {
+                unreachable!("authorization cannot return bare allow")
+            }
+        };
+        if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
+            return ExecutionOutcome::Result(result);
+        }
+        return ExecutionOutcome::Result(Box::new(execute_tool_with_tasks_unchecked(
+            tool_call, memory_db, app_config, task_mgr,
+        )));
+    }
+
+    match check_tool_permission_outcome(tool_call, None) {
         PermissionOutcome::Denied(result) => ExecutionOutcome::Result(result),
         PermissionOutcome::NeedsPrompt {
             tool_call_id,
@@ -796,11 +896,9 @@ pub fn execute_tool_gated(
             tool,
             target,
         },
-        PermissionOutcome::Allowed => {
-            let result =
-                execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr);
-            ExecutionOutcome::Result(result)
-        }
+        PermissionOutcome::Allowed => ExecutionOutcome::Result(Box::new(
+            execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr),
+        )),
     }
 }
 
@@ -814,7 +912,7 @@ pub fn execute_tool_gated(
 pub enum ExecutionOutcome {
     /// Tool completed (allowed path) or was denied (rule-denied path).
     /// In both cases the `ToolResult` is ready to hand back to the model.
-    Result(ToolResult),
+    Result(Box<ToolResult>),
     /// No rule matched; the caller must interactively prompt the user and
     /// then retry the dispatch (typically after recording the user's
     /// decision on the `PermissionManager`).

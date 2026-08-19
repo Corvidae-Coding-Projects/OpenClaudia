@@ -256,39 +256,55 @@ struct ToolCounters {
 }
 
 impl ToolCounters {
-    fn guard(
-        &self,
-        operation: &'static str,
-    ) -> Option<MutexGuard<'_, HashMap<(String, String), usize>>> {
+    fn guard(&self, operation: &'static str) -> MutexGuard<'_, HashMap<(String, String), usize>> {
         match self.inner.lock() {
-            Ok(guard) => Some(guard),
+            Ok(guard) => guard,
             Err(err) => {
                 error!(operation, error = %err, "Policy tool counter lock poisoned");
-                None
+                err.into_inner()
             }
         }
     }
 
     fn count(&self, session_id: &str, tool: &str) -> usize {
-        let Some(g) = self.guard("count") else {
-            return 0;
-        };
+        let g = self.guard("count");
         g.get(&(session_id.to_string(), tool.to_string()))
             .copied()
             .unwrap_or(0)
     }
 
     fn increment(&self, session_id: &str, tool: &str) {
-        if let Some(mut g) = self.guard("increment") {
-            *g.entry((session_id.to_string(), tool.to_string()))
-                .or_insert(0) += 1;
-        }
+        let mut g = self.guard("increment");
+        let count = g
+            .entry((session_id.to_string(), tool.to_string()))
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        drop(g);
+    }
+
+    fn try_increment_capped(
+        &self,
+        session_id: &str,
+        tool: &str,
+        cap: Option<usize>,
+    ) -> Result<(), (usize, usize)> {
+        let mut g = self.guard("try_increment_capped");
+        let count = g
+            .entry((session_id.to_string(), tool.to_string()))
+            .or_insert(0);
+        let outcome = if let Some(cap) = cap.filter(|cap| *count >= *cap) {
+            Err((cap, *count))
+        } else {
+            *count = count.saturating_add(1);
+            Ok(())
+        };
+        drop(g);
+        outcome
     }
 
     fn reset_session(&self, session_id: &str) {
-        if let Some(mut g) = self.guard("reset_session") {
-            g.retain(|(sid, _), _| sid != session_id);
-        }
+        let mut g = self.guard("reset_session");
+        g.retain(|(sid, _), _| sid != session_id);
     }
 }
 
@@ -423,9 +439,14 @@ impl PolicyEnforcer {
     ///
     /// Returns [`PolicyError::ToolCapExceeded`] when the cap is hit.
     pub fn check_and_record_tool(&self, session_id: &str, tool: &str) -> Result<(), PolicyError> {
-        self.check_tool(session_id, tool)?;
-        self.counters.increment(session_id, tool);
-        Ok(())
+        let cap = self.policy.tool_caps.get(tool).copied();
+        self.counters
+            .try_increment_capped(session_id, tool, cap)
+            .map_err(|(cap, consumed)| PolicyError::ToolCapExceeded {
+                tool: tool.to_string(),
+                cap,
+                consumed,
+            })
     }
 
     /// Reset every counter associated with `session_id`. Called when a
@@ -676,5 +697,32 @@ model_allowlist:
         assert!(gate.check_and_record_tool("bash").is_ok());
         let err = gate.check_tool("bash").unwrap_err();
         assert!(matches!(err, PolicyError::ToolCapExceeded { .. }));
+    }
+
+    #[test]
+    fn concurrent_tool_cap_reservation_is_atomic() {
+        let mut caps = ToolCaps::new();
+        caps.insert("bash".to_string(), 1);
+        let enforcer = std::sync::Arc::new(PolicyEnforcer::new(EnterprisePolicy {
+            tool_caps: caps,
+            ..Default::default()
+        }));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let enforcer = std::sync::Arc::clone(&enforcer);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                enforcer.check_and_record_tool("shared", "bash").is_ok()
+            }));
+        }
+
+        let allowed = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("policy worker"))
+            .filter(|allowed| *allowed)
+            .count();
+        assert_eq!(allowed, 1, "exactly one caller may reserve a cap of one");
     }
 }

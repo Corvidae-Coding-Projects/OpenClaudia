@@ -447,6 +447,7 @@ fn oauth_session_lock_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("json.lock")
 }
 
+#[cfg(unix)]
 fn oauth_session_tmp_path(path: &std::path::Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -700,6 +701,7 @@ impl OAuthStore {
         }
     }
 
+    #[cfg(unix)]
     fn replace_sessions_in_memory(&self, sessions: HashMap<String, OAuthSession>) {
         let mut guard = self
             .sessions
@@ -862,6 +864,7 @@ impl OAuthStore {
         #[cfg(not(unix))]
         {
             let _ = json; // suppress unused-variable warning on non-unix
+            let _ = merged_sessions;
             error!(
                 "Refusing to persist OAuth sessions on non-Unix target: no portable way to \
                  atomically create the file with owner-only permissions. OAuth sessions will \
@@ -873,8 +876,11 @@ impl OAuthStore {
             );
         }
 
-        self.replace_sessions_in_memory(merged_sessions);
-        Ok(())
+        #[cfg(unix)]
+        {
+            self.replace_sessions_in_memory(merged_sessions);
+            Ok(())
+        }
     }
 }
 

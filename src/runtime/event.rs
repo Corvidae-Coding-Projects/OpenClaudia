@@ -127,7 +127,7 @@ pub enum TerminalOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuntimeEventKind {
-    RunStarted { descriptor: RunDescriptor },
+    RunStarted { descriptor: Box<RunDescriptor> },
     CallStarted { kind: CallKind },
     CallFinished { outcome: CallOutcome },
     StateProposed { proposal: StateProposal },
