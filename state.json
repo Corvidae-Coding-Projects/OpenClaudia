@@ -11439,12 +11439,11 @@
       "uuid": "7cdee68d-c0ad-4a28-801b-c445d018254e",
       "display_id": 1029,
       "title": "Implement and fully verify remediation slice S-020",
-      "status": "closed",
+      "status": "open",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T22:55:50.010022472Z",
-      "updated_at": "2026-08-19T23:42:13.845467841Z",
-      "closed_at": "2026-08-19T23:42:13.845465975Z",
+      "updated_at": "2026-08-19T23:53:06.835579595Z",
       "labels": [
         "remediation"
       ],
@@ -24870,11 +24869,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 279,
       "timestamp": "2026-08-19T23:52:55.167456689Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 280,
+      "timestamp": "2026-08-19T23:53:06.835579595Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:52:55.167456689Z",
+    "timestamp": "2026-08-19T23:53:06.835579595Z",
     "agent_id": "6Vw9",
-    "agent_seq": 279
+    "agent_seq": 280
   }
 }
