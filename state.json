@@ -1,6 +1,6 @@
 {
   "next_display_id": 1019,
-  "next_comment_id": 735,
+  "next_comment_id": 736,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20510,10 +20510,21 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:23:31.925253643Z",
-      "updated_at": "2026-08-19T04:23:36.248360603Z",
+      "updated_at": "2026-08-19T04:23:51.628158862Z",
       "labels": [
         "audit"
-      ]
+      ],
+      "comments": {
+        "43bc3273-d7c1-4af7-b82e-0acee1817438": {
+          "display_id": 735,
+          "author": "6Vw9",
+          "content": "Count every remediation slice from its canonical Markdown status; reconcile implemented/completed slices against remaining planned/blocked/deferred work; report the exact remainder without changing product code or beginning a slice.",
+          "created_at": "2026-08-19T04:23:51.625640031Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEwzhv4O8rnbFvz7xrGaA9dmL8PB+pimsD7a48ZgD6Pk74P3hG7D1ot9DfWrXweR0mB/Sh2JroEeADBmrhAFUAg=="
+        }
+      }
     },
     "edf12fe4-ddd0-4dcd-8f8f-7fad7beeb82e": {
       "uuid": "edf12fe4-ddd0-4dcd-8f8f-7fad7beeb82e",
@@ -22808,11 +22819,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 104,
       "timestamp": "2026-08-19T04:23:42.355551847Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 105,
+      "timestamp": "2026-08-19T04:23:51.628158862Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:23:42.355551847Z",
+    "timestamp": "2026-08-19T04:23:51.628158862Z",
     "agent_id": "6Vw9",
-    "agent_seq": 104
+    "agent_seq": 105
   }
 }
