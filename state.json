@@ -1,6 +1,6 @@
 {
   "next_display_id": 1023,
-  "next_comment_id": 742,
+  "next_comment_id": 743,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -12653,11 +12653,22 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T06:16:01.622580114Z",
-      "updated_at": "2026-08-19T06:16:10.269155737Z",
+      "updated_at": "2026-08-19T07:04:22.808168705Z",
       "labels": [
         "bug",
         "security"
-      ]
+      ],
+      "comments": {
+        "5b554bd7-0cf9-4751-b4a4-873da69b0f0c": {
+          "display_id": 742,
+          "author": "6Vw9",
+          "content": "[result pending commit] Reproduced under the serial all-features suite without weakening the existing assertion. Cancellation-only sandbox cleanup now freezes the Linux wrapper/process group, repeatedly discovers and freezes procfs descendants to stability, then SIGKILLs the frozen set; ordinary user-requested background termination remains graceful. Added a TERM-trap fixture that attempts to launch a setsid replacement. Focused kill tests pass 10/10, the ACP descendant test passes, the ACP session-mode module passed 20 consecutive repetitions, and the final uninterrupted all-feature suite passes. Staged diff digest: sha256:edf509826e8423338a622fb5640314d4350dd7c832437b4c20a63239c2efc401.",
+          "created_at": "2026-08-19T07:04:22.804018919Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAnRunNLKBwYJpu/quamZpQ1UIX8cLLrrf3moheoo65VZ+2GrNPuaG2GfB47ie3t3E8VhVqBmUWQZDoo7/3tdJAw=="
+        }
+      }
     },
     "90ccf966-61b6-4f94-9cb8-bb4394ffe719": {
       "uuid": "90ccf966-61b6-4f94-9cb8-bb4394ffe719",
@@ -23043,11 +23054,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 125,
       "timestamp": "2026-08-19T06:55:10.265114840Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 126,
+      "timestamp": "2026-08-19T07:04:22.808168705Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T06:55:10.265114840Z",
+    "timestamp": "2026-08-19T07:04:22.808168705Z",
     "agent_id": "6Vw9",
-    "agent_seq": 125
+    "agent_seq": 126
   }
 }
