@@ -1,6 +1,6 @@
 {
   "next_display_id": 1007,
-  "next_comment_id": 701,
+  "next_comment_id": 702,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11000,10 +11000,24 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T01:08:30.005580869Z",
-      "updated_at": "2026-08-19T01:08:34.291854564Z",
+      "updated_at": "2026-08-19T01:08:55.030264318Z",
       "labels": [
         "workflow"
-      ]
+      ],
+      "comments": {
+        "0fb9af42-bfa1-4e0d-bd8f-e4581166f7ac": {
+          "display_id": 701,
+          "author": "6Vw9",
+          "content": "Blocked: no active issue",
+          "created_at": "2026-08-19T01:08:55.027374483Z",
+          "kind": "intervention",
+          "trigger_type": "tool_blocked",
+          "intervention_context": "Adding Python bytecode ignores and cleaning obsolete migration ignores before committing the user-approved Crosslink and agent integration configuration.",
+          "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        }
+      }
     },
     "7eb7c495-1118-45a5-ab69-608363630624": {
       "uuid": "7eb7c495-1118-45a5-ab69-608363630624",
@@ -21872,11 +21886,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 25,
       "timestamp": "2026-08-19T01:08:39.411873900Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 26,
+      "timestamp": "2026-08-19T01:08:55.030264318Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T01:08:39.411873900Z",
+    "timestamp": "2026-08-19T01:08:55.030264318Z",
     "agent_id": "6Vw9",
-    "agent_seq": 25
+    "agent_seq": 26
   }
 }
