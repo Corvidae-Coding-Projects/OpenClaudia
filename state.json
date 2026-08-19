@@ -1,6 +1,6 @@
 {
   "next_display_id": 1023,
-  "next_comment_id": 743,
+  "next_comment_id": 744,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -2491,11 +2491,22 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T06:55:01.892682555Z",
-      "updated_at": "2026-08-19T06:55:10.265114840Z",
+      "updated_at": "2026-08-19T07:04:26.865695111Z",
       "labels": [
         "bug",
         "security"
-      ]
+      ],
+      "comments": {
+        "34a146af-a61c-4f7f-a51a-a2bfeab2805d": {
+          "display_id": 743,
+          "author": "6Vw9",
+          "content": "[result pending commit] Both public process-tree termination helpers now reject PID 0 before platform-specific dispatch, preventing Unix kill(2) process-group sentinel semantics. Added a regression test covering graceful and cancellation-only helpers. Focused kill tests pass 10/10 and the final uninterrupted all-feature suite passes. Staged diff digest: sha256:edf509826e8423338a622fb5640314d4350dd7c832437b4c20a63239c2efc401.",
+          "created_at": "2026-08-19T07:04:26.863251627Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOVN4SXSI719VWEkPqHP+BBbStwnbmY89OEQTz//qRkk0b8g21I8tFJ0pjtnaSUhFTD5fObZEJde2IdLGyU6iCQ=="
+        }
+      }
     },
     "109d20eb-bfd8-409f-926d-dc4bb5da4719": {
       "uuid": "109d20eb-bfd8-409f-926d-dc4bb5da4719",
@@ -23059,11 +23070,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 126,
       "timestamp": "2026-08-19T07:04:22.808168705Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 127,
+      "timestamp": "2026-08-19T07:04:26.865695111Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T07:04:22.808168705Z",
+    "timestamp": "2026-08-19T07:04:26.865695111Z",
     "agent_id": "6Vw9",
-    "agent_seq": 126
+    "agent_seq": 127
   }
 }
