@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 786,
+  "next_comment_id": 787,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:39:43.761481803Z",
+      "updated_at": "2026-08-19T12:39:47.892978559Z",
       "labels": [
         "remediation"
       ],
@@ -15742,6 +15742,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8vw6fiLJnTBx3C3QGlnhGgKYxVSKSUKJDYvcKfNC+p13/EDLj+7+SJZ++JPUZZ3A7ASZ2G+QLP9gDZ2uh6ZnBA=="
+        },
+        "fa27bb05-a28d-456f-9cd2-c0253c6b7f2c": {
+          "display_id": 786,
+          "author": "6Vw9",
+          "content": "[action] Repaired sandbox escape tests so run-capability path denial and runtime sandbox confinement are independently exercised; focused binary passes 11/11. Restarting complete serial workspace suite.",
+          "created_at": "2026-08-19T12:39:47.890557379Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAn/GfIChTnUKjX4Mclyb4IctMmnfeQ6yGTR5IwRXvqwLC7aFhamf76RaZRwNg2mtaV2pncG0YWyKj8x8+W4ZaBw=="
         }
       }
     },
@@ -23835,11 +23844,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 190,
       "timestamp": "2026-08-19T12:39:43.761481803Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 191,
+      "timestamp": "2026-08-19T12:39:47.892978559Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:39:43.761481803Z",
+    "timestamp": "2026-08-19T12:39:47.892978559Z",
     "agent_id": "6Vw9",
-    "agent_seq": 190
+    "agent_seq": 191
   }
 }
