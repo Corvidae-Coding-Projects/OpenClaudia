@@ -1,6 +1,6 @@
 {
   "next_display_id": 1030,
-  "next_comment_id": 820,
+  "next_comment_id": 821,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11384,11 +11384,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T22:55:50.010022472Z",
-      "updated_at": "2026-08-19T23:00:03.083577621Z",
+      "updated_at": "2026-08-19T23:14:17.765836589Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "23e2b3fb-5dfc-4862-8085-6f332378ce46": {
+          "display_id": 820,
+          "author": "6Vw9",
+          "content": "Implemented S-020 root cause: auto_allow_score is now binary typed-effect classification (ReadOnly=1, every effectful/unknown/malformed call=0); Bash remains Destructive and explicit policy still authorizes it. Deleted first-program/path-prefix heuristics. Replaced public rejecting PathConstraints with private run-scoped non-authoritative path telemetry; literal out-of-root paths now reach the OS sandbox. Focused tests pass, including 7-case adversarial public-dispatch suite, real 11-test Linux sandbox escape suite, mandatory effect matrix, policy and denial suites. All-target/all-feature check and strict Clippy pass serially. No newly discovered out-of-scope defect so far.",
+          "created_at": "2026-08-19T23:14:17.763252801Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7zxkjHNuFw/xqIsM7rzJXxwYSPlCA6IZt68FlYZviVyVbmE2JEtK5Pkx23i3DZhtaG7QYa2wV3DBemdUGw9eDg=="
+        },
         "838261f2-202f-40f8-82d1-2a32f35181ae": {
           "display_id": 818,
           "author": "6Vw9",
@@ -24484,11 +24493,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 244,
       "timestamp": "2026-08-19T23:00:03.083577621Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 245,
+      "timestamp": "2026-08-19T23:14:17.765836589Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:00:03.083577621Z",
+    "timestamp": "2026-08-19T23:14:17.765836589Z",
     "agent_id": "6Vw9",
-    "agent_seq": 244
+    "agent_seq": 245
   }
 }
