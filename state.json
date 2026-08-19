@@ -1,6 +1,6 @@
 {
   "next_display_id": 1029,
-  "next_comment_id": 807,
+  "next_comment_id": 808,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20474,7 +20474,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T14:50:39.964999817Z",
-      "updated_at": "2026-08-19T17:57:02.648116988Z",
+      "updated_at": "2026-08-19T18:19:12.547817816Z",
       "labels": [
         "remediation"
       ],
@@ -20514,6 +20514,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAuH1h3IAKHYzMwOYxY/QpymtxP4+ziSxALte0HSfZOFrC7r778ccoKy1UWwwJc4Bx60EmlphDOrTsy9/mH4PPDw=="
+        },
+        "b5ad83c5-61f8-4a6a-ab77-1089e4faeb56": {
+          "display_id": 807,
+          "author": "6Vw9",
+          "content": "[action] Diagnosed Linux CI S-019 failure: deterministic test run omitted host PATH while sandbox still rediscovered HOME at execution. Bound host-home snapshot into ToolRunContext manifest/derivation and strengthened resolved-Cargo confinement probe; focused tests pass.",
+          "created_at": "2026-08-19T18:19:12.545254873Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArTsAkTmo6eWLmy52egPiviT8g2nhlyQ4rVV/08pGczwfgDK3RGFNWfgFs+5IV5D0HqB7jw+T0bMbL+Npolh+Bw=="
         },
         "b9ab43a9-89e9-441b-80ea-50e22625e09c": {
           "display_id": 803,
@@ -24247,11 +24256,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 224,
       "timestamp": "2026-08-19T18:05:23.822770527Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 225,
+      "timestamp": "2026-08-19T18:19:12.547817816Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T18:05:23.822770527Z",
+    "timestamp": "2026-08-19T18:19:12.547817816Z",
     "agent_id": "6Vw9",
-    "agent_seq": 224
+    "agent_seq": 225
   }
 }
