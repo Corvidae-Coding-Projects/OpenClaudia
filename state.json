@@ -1,6 +1,6 @@
 {
   "next_display_id": 1027,
-  "next_comment_id": 789,
+  "next_comment_id": 790,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15486,7 +15486,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:43:12.747376721Z",
+      "updated_at": "2026-08-19T12:46:34.456625332Z",
       "labels": [
         "remediation"
       ],
@@ -15739,6 +15739,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6ZNeDo+5uHfsIP58xbJMWqBVx5U93xXwtQECKmiZiOVrLoepIQh8OoRi5EOG0HpW5VCgIEyt2EQ1qe56uNLXDw=="
+        },
+        "e6ec8349-6c81-4d03-997e-a8c53b7b05f8": {
+          "display_id": 789,
+          "author": "6Vw9",
+          "content": "Filed follow-up #1026 for transport-specific MCP resource capability admission (Process for stdio, Network for HTTP), owned by S-064/S-066; S-019 remains conservative and fail-closed.",
+          "created_at": "2026-08-19T12:46:34.454091410Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAhjga/TQuQey7cSdqRu01y0YyCb/mb6r1pNI2J/qbw0iMUn+QUKBcqUN/DbBLdN+zFoDV0og80z7Lk7a+QxDrAw=="
         },
         "e85163ca-9576-4727-b4ee-55ea9c4a83ab": {
           "display_id": 781,
@@ -23902,11 +23911,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 195,
       "timestamp": "2026-08-19T12:46:15.575655020Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 196,
+      "timestamp": "2026-08-19T12:46:34.456625332Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:46:15.575655020Z",
+    "timestamp": "2026-08-19T12:46:34.456625332Z",
     "agent_id": "6Vw9",
-    "agent_seq": 195
+    "agent_seq": 196
   }
 }
