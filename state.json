@@ -1,6 +1,6 @@
 {
   "next_display_id": 1027,
-  "next_comment_id": 794,
+  "next_comment_id": 795,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15486,11 +15486,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T14:26:52.779984627Z",
+      "updated_at": "2026-08-19T14:26:57.839205733Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "1b33800b-083d-4b8d-8e69-8ad6b454ea1b": {
+          "display_id": 794,
+          "author": "6Vw9",
+          "content": "Further audit found compile-green runtime gaps and repaired them: agent-visible file helpers could not reach masked .openclaudia/plans, so each ToolRunContext now carries exactly one manifest-bound plan-file exception while sibling plans/config remain masked. Host init and branch snapshots use a separate pinned host-control descriptor path. Legacy /init, /branch, /teleport, and relative /add-dir no longer use process CWD. execute_tool now uses unrestricted_for_run, and exact retirement coverage proves run B survives run A teardown. Focused tests pass: main binary 226/226; session capability isolation 11/11; plan/init controls pass.",
+          "created_at": "2026-08-19T14:26:57.836762347Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAefT8OjnFCQXFiP1LstRajssvQ5bYgxr71i86FD3k7hhKDA28D7ZHEy2uwVXTFSTNbQYD6Hlk6xAKiwC9ONGeBg=="
+        },
         "1fa1973f-2d94-4a42-ba6b-c3ed516f2571": {
           "display_id": 780,
           "author": "6Vw9",
@@ -23972,11 +23981,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 200,
       "timestamp": "2026-08-19T14:26:52.779984627Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 201,
+      "timestamp": "2026-08-19T14:26:57.839205733Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T14:26:52.779984627Z",
+    "timestamp": "2026-08-19T14:26:57.839205733Z",
     "agent_id": "6Vw9",
-    "agent_seq": 200
+    "agent_seq": 201
   }
 }
