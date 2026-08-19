@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1013,
+  "next_display_id": 1014,
   "next_comment_id": 712,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -127,6 +127,7 @@
     "23299649-8a87-4b89-86b4-1bf7e9f4bb42": 752,
     "2342dd72-0232-4da0-814f-3f4fb8c002bc": 59,
     "2393b05d-3938-418d-aaee-e70475fd2880": 104,
+    "24115a93-7e63-4811-a326-7a2cab8c7271": 1013,
     "24c0bc1c-c63f-48c6-ac5f-ccaac2d81cd3": 629,
     "25098b1d-1641-4788-bdf1-ec9c2774a768": 370,
     "25417327-769a-42a5-83c3-8c2e9eb80cda": 984,
@@ -3790,6 +3791,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "24115a93-7e63-4811-a326-7a2cab8c7271": {
+      "uuid": "24115a93-7e63-4811-a326-7a2cab8c7271",
+      "display_id": 1013,
+      "title": "Web-search integration tests expect validation after mandatory classification denial",
+      "description": "The all-feature suite reaches two stale web_search assertions: empty/non-string query arguments are now intentionally rejected by mandatory effect classification before any tool body or browser launch, but tests still require the old handler-validation text. Preserve the one-character handler validation case and explicitly pin fail-closed malformed-call denials.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T03:37:01.888506992Z",
+      "updated_at": "2026-08-19T03:37:01.888506992Z"
     },
     "24c0bc1c-c63f-48c6-ac5f-ccaac2d81cd3": {
       "uuid": "24c0bc1c-c63f-48c6-ac5f-ccaac2d81cd3",
@@ -22193,11 +22206,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 50,
       "timestamp": "2026-08-19T03:27:59.048005058Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 51,
+      "timestamp": "2026-08-19T03:37:01.888506992Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T03:27:59.048005058Z",
+    "timestamp": "2026-08-19T03:37:01.888506992Z",
     "agent_id": "6Vw9",
-    "agent_seq": 50
+    "agent_seq": 51
   }
 }
