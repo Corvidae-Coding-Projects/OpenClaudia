@@ -1,6 +1,6 @@
 {
   "next_display_id": 1027,
-  "next_comment_id": 792,
+  "next_comment_id": 793,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15486,7 +15486,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T14:03:03.923268485Z",
+      "updated_at": "2026-08-19T14:03:08.205549341Z",
       "labels": [
         "remediation"
       ],
@@ -15607,6 +15607,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQjtwowfbiACiolow/A0yzB1dLXaUlBtmpyKvE6HIDxbe7JNSVfclsfSCYm/utGVxUQNohnkxlUuEtJtK16WqBg=="
+        },
+        "7b707ccc-eb59-4e65-a627-e9aedafb9824": {
+          "display_id": 792,
+          "author": "6Vw9",
+          "content": "Residual root-cause repairs after the prompt audit: legacy @file reads now use descriptor-relative capability traversal; /find, /doctor, /mcp, shell escapes, external editors, and plan mode are bound to the exact run; plugin project paths and MCP env interpolation no longer rediscover CWD/process env; approval caches/managers rotate with run generation; session transitions retire exact processes/shells/agents. Added secure non-overwriting plan-file creation and automatic TUI permission-manager rebinding when bypass posture changes. Serial all-target/all-feature check passes. Skeptical diff review, focused lifecycle tests, and final full gates remain.",
+          "created_at": "2026-08-19T14:03:08.203126993Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAD+Ta1KZqA1YXWQwjvm5tTCbTvbsMwJEyVd3QFz8xTvn0tQgmoIcwQKKoZ5f3th20zNyVKKMoiOkNfoT4vQbvCQ=="
         },
         "7d553c50-29d7-4f96-967e-65b82afd2006": {
           "display_id": 779,
@@ -23944,11 +23953,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 198,
       "timestamp": "2026-08-19T14:03:03.923268485Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 199,
+      "timestamp": "2026-08-19T14:03:08.205549341Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T14:03:03.923268485Z",
+    "timestamp": "2026-08-19T14:03:08.205549341Z",
     "agent_id": "6Vw9",
-    "agent_seq": 198
+    "agent_seq": 199
   }
 }
