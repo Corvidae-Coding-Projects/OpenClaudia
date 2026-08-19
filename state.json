@@ -1,6 +1,6 @@
 {
   "next_display_id": 1017,
-  "next_comment_id": 728,
+  "next_comment_id": 729,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8338,7 +8338,7 @@
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T01:19:03.818814081Z",
-      "updated_at": "2026-08-19T04:18:32.423961844Z",
+      "updated_at": "2026-08-19T04:18:42.032379276Z",
       "labels": [
         "remediation"
       ],
@@ -8346,6 +8346,15 @@
         "99cc9588-0963-48eb-a6f4-8c7ef4ea1832"
       ],
       "comments": {
+        "5a73fb0a-0862-4a38-9669-1296e3c09a3c": {
+          "display_id": 728,
+          "author": "6Vw9",
+          "content": "Delivered commit b52874b (fix(permissions): enforce exact approval receipts). Final staged diff SHA-256: 48fa29e6d8985146f9f41a9e7c60efb1edee145b624727a5872d7a3297d650dd. Verification: cargo test --quiet --all-features -- --test-threads=1 passed completely; focused receipt suite 23/23; cargo clippy --all-features --all-targets -- -D warnings passed; x86_64-pc-windows-gnu all-feature library check passed; fmt and diff checks passed. All S-017 review subissues #1009-#1016 are closed; VDD remains S-088 and provider timeout remains #1008.",
+          "created_at": "2026-08-19T04:18:42.029844187Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAraiBKwQJ0XbS9xKFF6UXyxLqfXy7CiwPeL9aQ78AyzqqLHS/Xt2DSMKa9wFV8/O+0h02xBMYoDSfuCJETC3bAA=="
+        },
         "6e8944ae-d0de-4ad7-96f1-9970bae87560": {
           "display_id": 726,
           "author": "6Vw9",
@@ -22622,11 +22631,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 87,
       "timestamp": "2026-08-19T04:18:32.423961844Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 88,
+      "timestamp": "2026-08-19T04:18:42.032379276Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:18:32.423961844Z",
+    "timestamp": "2026-08-19T04:18:42.032379276Z",
     "agent_id": "6Vw9",
-    "agent_seq": 87
+    "agent_seq": 88
   }
 }
