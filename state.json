@@ -1,6 +1,6 @@
 {
   "next_display_id": 1034,
-  "next_comment_id": 834,
+  "next_comment_id": 835,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19155,10 +19155,21 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:43:56.056034237Z",
-      "updated_at": "2026-08-19T23:43:59.914029896Z",
+      "updated_at": "2026-08-19T23:52:43.066803350Z",
       "labels": [
         "workflow"
-      ]
+      ],
+      "comments": {
+        "8bc7d687-34d2-42d7-b2d9-6b5d8b65c8a8": {
+          "display_id": 834,
+          "author": "6Vw9",
+          "content": "Correction: the automatic CHANGELOG.md update on issue close is intentional project behavior, not a workflow defect. My manual removal of generated closure entries was wrong. Preserve generated entries and do not override this automation.",
+          "created_at": "2026-08-19T23:52:43.064388261Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtXM2VLyqHpP6ZpVTHyPN+E3F/LBSUjhLNGouW9TMunUPPF0mfhx1w7a8d7ae2ChFzRQLgUdLuy5QQBC5iO/2Ag=="
+        }
+      }
     },
     "d1fd1bce-ca2e-4824-9682-27b5ffbf1030": {
       "uuid": "d1fd1bce-ca2e-4824-9682-27b5ffbf1030",
@@ -24834,11 +24845,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 275,
       "timestamp": "2026-08-19T23:52:33.153237284Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 276,
+      "timestamp": "2026-08-19T23:52:43.066803350Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:52:33.153237284Z",
+    "timestamp": "2026-08-19T23:52:43.066803350Z",
     "agent_id": "6Vw9",
-    "agent_seq": 275
+    "agent_seq": 276
   }
 }
