@@ -1,6 +1,6 @@
 {
   "next_display_id": 1017,
-  "next_comment_id": 723,
+  "next_comment_id": 724,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -5979,10 +5979,21 @@
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:03:49.140886166Z",
-      "updated_at": "2026-08-19T04:03:53.169216033Z",
+      "updated_at": "2026-08-19T04:15:45.272494843Z",
       "labels": [
         "s-017"
-      ]
+      ],
+      "comments": {
+        "6a49833e-3874-4a9e-bd73-be046b5515b3": {
+          "display_id": 723,
+          "author": "6Vw9",
+          "content": "Result: persisted ApprovalRecord validation now rejects remaining_uses above the 64-use schema bound, validity intervals longer than 30 days, and not-yet-issued records. Capability generation uses checked fetch_update and returns a fail-closed exhaustion error without wrapping. Added adversarial persisted-state and generation-exhaustion tests; focused receipt suite passes 23/23, strict all-target Clippy passes, Windows cross-check passes, and the complete all-feature suite passes.",
+          "created_at": "2026-08-19T04:15:45.268027610Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVvf7DHqmvkgDZCnnFokLxP26ok/qlwQUU9P5GHCSQF9oXqJb049FjG6XJXex6MQh6IHBJ6ZVIafghqLvLgKqBg=="
+        }
+      }
     },
     "3b61ba85-3cf3-4932-8309-c9220f1a6f60": {
       "uuid": "3b61ba85-3cf3-4932-8309-c9220f1a6f60",
@@ -22516,11 +22527,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 76,
       "timestamp": "2026-08-19T04:06:33.210923672Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 77,
+      "timestamp": "2026-08-19T04:15:45.272494843Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:06:33.210923672Z",
+    "timestamp": "2026-08-19T04:15:45.272494843Z",
     "agent_id": "6Vw9",
-    "agent_seq": 76
+    "agent_seq": 77
   }
 }
