@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1030,
+  "next_display_id": 1031,
   "next_comment_id": 822,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -69,6 +69,7 @@
     "0ff708eb-bd2d-4060-8d1e-6d181bc7084c": 383,
     "105b2370-e9f2-4b9e-8be3-b3ad5daae403": 1022,
     "109d20eb-bfd8-409f-926d-dc4bb5da4719": 40,
+    "10bde404-e0eb-4408-9f05-d82b016e520c": 1030,
     "10c2bf7d-b5c3-4907-83b1-41c194fbd771": 622,
     "10e36fa2-7ca9-4b75-a487-0f43e7da228a": 205,
     "10f1dbcf-e640-47fb-9ab7-a6a5e911f3c9": 461,
@@ -2538,6 +2539,17 @@
       "labels": [
         "refactor"
       ]
+    },
+    "10bde404-e0eb-4408-9f05-d82b016e520c": {
+      "uuid": "10bde404-e0eb-4408-9f05-d82b016e520c",
+      "display_id": 1030,
+      "title": "Retire or product-wire the dormant threshold auto-allow API",
+      "description": "S-020 source-wide caller search found permissions::auto_allow_score and PermissionManager::check_auto_allow have no production caller or configuration surface; only tests invoke them. Production dispatch already derives typed ReadOnly admission through PermissionManager::check. S-020 makes the compatibility API fail closed for every effectful call, but a later bounded change should either remove the dead public threshold surface with migration notes or define and wire a real host-owned auto-mode product contract without reintroducing heuristic authority.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T23:15:17.233833202Z",
+      "updated_at": "2026-08-19T23:15:17.233833202Z"
     },
     "10c2bf7d-b5c3-4907-83b1-41c194fbd771": {
       "uuid": "10c2bf7d-b5c3-4907-83b1-41c194fbd771",
@@ -24512,11 +24524,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 246,
       "timestamp": "2026-08-19T23:14:22.801025058Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 247,
+      "timestamp": "2026-08-19T23:15:17.233833202Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:14:22.801025058Z",
+    "timestamp": "2026-08-19T23:15:17.233833202Z",
     "agent_id": "6Vw9",
-    "agent_seq": 246
+    "agent_seq": 247
   }
 }
