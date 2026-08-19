@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1009,
+  "next_display_id": 1010,
   "next_comment_id": 712,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -916,6 +916,7 @@
     "fae8b6da-9beb-4a7e-83dd-c03eb286de8c": 694,
     "fb063649-dd17-40b4-9d3f-6fe20afdafc4": 963,
     "fb1560f3-c16f-4da2-959b-a528a54ace46": 577,
+    "fb1e430f-9423-4e10-9e49-02882a457227": 1009,
     "fb1e9842-2b78-47cf-8320-a029850342c1": 673,
     "fb8198cd-98ae-43a4-b351-b7e3e9de3004": 29,
     "fbad4f79-3807-444c-8c0f-96a8eaca9403": 858,
@@ -21482,6 +21483,18 @@
         }
       }
     },
+    "fb1e430f-9423-4e10-9e49-02882a457227": {
+      "uuid": "fb1e430f-9423-4e10-9e49-02882a457227",
+      "display_id": 1009,
+      "title": "Permission receipt store directory sync is not portable to Windows",
+      "description": "S-017 review found save_state unconditionally opens and syncs the parent directory. std::fs::File::open(directory) is not portable to Windows, so an otherwise successful trusted approval write can report failure there. Guard directory fsync to supported Unix targets and add a regression-level source/platform contract.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T02:54:41.968975539Z",
+      "updated_at": "2026-08-19T02:54:41.968975539Z"
+    },
     "fb1e9842-2b78-47cf-8320-a029850342c1": {
       "uuid": "fb1e9842-2b78-47cf-8320-a029850342c1",
       "display_id": 673,
@@ -22121,11 +22134,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 46,
       "timestamp": "2026-08-19T02:28:35.724435440Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 47,
+      "timestamp": "2026-08-19T02:54:41.968975539Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T02:28:35.724435440Z",
+    "timestamp": "2026-08-19T02:54:41.968975539Z",
     "agent_id": "6Vw9",
-    "agent_seq": 46
+    "agent_seq": 47
   }
 }
