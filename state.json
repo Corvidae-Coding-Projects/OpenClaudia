@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 784,
+  "next_comment_id": 785,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:18:00.091681963Z",
+      "updated_at": "2026-08-19T12:18:04.384215743Z",
       "labels": [
         "remediation"
       ],
@@ -15715,6 +15715,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArOd5mDz84ikUbLRA8QU5ZMcousKSY6c+rMssECcwFKXKP+wwoYwnEozjCACAZ029OzPlWx/yuJPoaXKmjuERDw=="
+        },
+        "ea166a5d-cb69-497e-8fc8-cbfe1a3f2266": {
+          "display_id": 784,
+          "author": "6Vw9",
+          "content": "Fixed pre-existing false-positive plan-mode isolation: production subagents were not setting the thread-local AgentContextGuard, so enter_plan_mode was actually allowed. The handler now checks the exact run descriptor actor role and only admits Frontend. Tests now exercise real registry dispatch and concurrent frontend/worker runs.",
+          "created_at": "2026-08-19T12:18:04.381702154Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPudUY+VNJY6UvF+sRXZiOUerzQ6Tmsp4IuHfxljbe2Uu4lmfEZZ2z5G7xLINIM8sOj7S2ArRDMrHYCPsHfShCw=="
         },
         "f8478f73-aca3-4884-a3c6-f7fcc388157d": {
           "display_id": 761,
@@ -23807,11 +23816,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 188,
       "timestamp": "2026-08-19T12:18:00.091681963Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 189,
+      "timestamp": "2026-08-19T12:18:04.384215743Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:18:00.091681963Z",
+    "timestamp": "2026-08-19T12:18:04.384215743Z",
     "agent_id": "6Vw9",
-    "agent_seq": 188
+    "agent_seq": 189
   }
 }
