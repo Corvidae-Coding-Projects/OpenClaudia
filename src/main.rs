@@ -734,33 +734,6 @@ enum ToolPermissionResult {
     Denied(String),
 }
 
-/// Returns `true` for tools that require an explicit permission decision before execution.
-///
-/// Read-only / informational tools (e.g. `read_file`, `grep`) return `false`
-/// and are always executed without prompting. Write / destructive tools (`bash`,
-/// `write_file`, `edit_file`) and network fetches that are not preapproved return `true`.
-fn tool_needs_permission(tool_name: &str) -> bool {
-    !matches!(
-        tool_name,
-        "read_file"
-            | "grounding_context"
-            | "list_files"
-            | "grep"
-            | "glob"
-            | "web_search"
-            | "ask_user_question"
-            | "task_create"
-            | "task_update"
-            | "task_get"
-            | "task_list"
-            | "enter_plan_mode"
-            | "exit_plan_mode"
-            | "lsp"
-            | "memory_search"
-            | "core_memory_get"
-    )
-}
-
 /// Build a human-readable description of a tool call for the permission prompt.
 fn tool_call_description(tool_name: &str, tool_args: &serde_json::Value) -> String {
     match tool_name {
@@ -815,10 +788,6 @@ fn check_tool_permission_interactive(
 ) -> ToolPermissionResult {
     use std::io::Write as _;
 
-    if !tool_needs_permission(tool_name) {
-        return ToolPermissionResult::Allowed { checked: false };
-    }
-
     if let Some(mgr) = permission_mgr {
         match mgr.check_with_transient_allow_rules(tool_name, tool_args, transient_allow_rules) {
             CheckResult::Allowed => return ToolPermissionResult::Allowed { checked: true },
@@ -826,6 +795,17 @@ fn check_tool_permission_interactive(
                 return ToolPermissionResult::Denied(format!("Permission denied: {reason}"));
             }
             CheckResult::NeedsPrompt { .. } => {}
+        }
+    } else {
+        // The compatibility path without a manager may skip a prompt only for
+        // a positively classified read-only call. Unknown/malformed calls are
+        // denied here instead of being user-approved under no known effect.
+        match openclaudia::tools::effect::resolve_for_call(tool_name, tool_args) {
+            Ok(effect) if !effect.effect.requires_authorization() => {
+                return ToolPermissionResult::Allowed { checked: false };
+            }
+            Ok(_) => {}
+            Err(error) => return ToolPermissionResult::Denied(error.reason()),
         }
     }
 
@@ -2275,6 +2255,66 @@ async fn cmd_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn permission_manager_with_deny(
+        canonical_tool: &str,
+        pattern: &str,
+    ) -> (PermissionManager, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        mgr.add_session_rule(PermissionRule {
+            tool: canonical_tool.to_string(),
+            pattern: pattern.to_string(),
+            decision: openclaudia::permissions::PermissionDecision::Deny,
+        });
+        (mgr, dir)
+    }
+
+    #[test]
+    fn interactive_permission_path_does_not_bypass_read_denials() {
+        let (mgr, _dir) = permission_manager_with_deny("Read", "/etc/**");
+        let result = check_tool_permission_interactive(
+            "read_file",
+            &serde_json::json!({"path": "/etc/shadow"}),
+            &mut std::collections::HashSet::new(),
+            Some(&mgr),
+            &[],
+        );
+        assert!(
+            matches!(result, ToolPermissionResult::Denied(_)),
+            "the CLI frontend must not skip an explicit deny merely because the call is read-only"
+        );
+    }
+
+    #[test]
+    fn interactive_permission_path_does_not_bypass_effectful_tool_denials() {
+        // `lsp` was in this frontend's former hard-coded safe list even though
+        // it starts and mutates a long-lived language-server process.
+        let (mgr, _dir) = permission_manager_with_deny("Lsp", "**");
+        let result = check_tool_permission_interactive(
+            "lsp",
+            &serde_json::json!({"action": "hover", "file_path": "src/main.rs"}),
+            &mut std::collections::HashSet::new(),
+            Some(&mgr),
+            &[],
+        );
+        assert!(
+            matches!(result, ToolPermissionResult::Denied(_)),
+            "the CLI frontend must consult catalog policy for effectful tools"
+        );
+    }
+
+    #[test]
+    fn interactive_permission_path_denies_unknown_tool_without_prompting() {
+        let result = check_tool_permission_interactive(
+            "unknown_from_model",
+            &serde_json::json!({}),
+            &mut std::collections::HashSet::new(),
+            None,
+            &[],
+        );
+        assert!(matches!(result, ToolPermissionResult::Denied(_)));
+    }
 
     fn tui_options(
         model_override: Option<&str>,

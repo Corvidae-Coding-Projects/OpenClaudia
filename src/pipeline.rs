@@ -2003,31 +2003,21 @@ pub fn merge_reasoning_delta(buffer: &mut String, text: &str) -> String {
     }
 }
 
-/// Tools that are safe to execute without permission (read-only / informational).
-const SAFE_TOOLS: &[&str] = &[
-    "read_file",
-    "grounding_context",
-    "list_files",
-    "grep",
-    "glob",
-    "web_search",
-    "ask_user_question",
-    "todo_read",
-    "task",
-    "agent_output",
-    "task_stop",
-    "enter_plan_mode",
-    "exit_plan_mode",
-    "lsp",
-    "memory_search",
-    "core_memory_get",
-    "crosslink",
-];
-
-/// Check if a tool needs permission before execution.
+/// Check whether a tool's declared ceiling reaches the authorization policy.
+///
+/// This is a catalog helper for UI/tests. Concrete dispatch uses
+/// `call_needs_permission`, because typed-operation tools such as
+/// `bash_output`, `exit_worktree`, and Crosslink can vary by invocation.
+/// Unknown tools return `true`; omission is never interpreted as safe.
 #[must_use]
 pub fn tool_needs_permission(tool_name: &str) -> bool {
-    !SAFE_TOOLS.contains(&tool_name)
+    crate::tools::effect::lookup(tool_name)
+        .is_none_or(|(_, spec)| spec.effect.requires_authorization())
+}
+
+fn call_needs_permission(tool_name: &str, args: &Value) -> bool {
+    crate::tools::effect::resolve_for_call(tool_name, args)
+        .map_or(true, |resolved| resolved.effect.requires_authorization())
 }
 
 /// Execute tool calls and send progress events to the TUI.
@@ -2232,6 +2222,28 @@ async fn check_tool_permission(
             "[DENIED] User denied permission for this tool.",
             tx,
         );
+    }
+
+    // The compatibility path without a manager may still ask the user about
+    // known effectful calls, but an unknown/malformed call is unavailable and
+    // must not become executable merely because the user accepted a generic
+    // prompt. Do this before the tool-wide allow cache for the same reason.
+    if permission_mgr.is_none() {
+        let args = match parse_permission_arguments_for_tui(tool_name, tool_call_id, arguments, tx)
+        {
+            Ok(args) => args,
+            Err(outcome) => return outcome,
+        };
+        if let Err(error) = crate::tools::effect::resolve_for_call(tool_name, &args) {
+            let reason = error.reason();
+            return permission_denied_with_result(
+                tool_name,
+                tool_call_id,
+                &reason,
+                &format!("[DENIED] {reason}"),
+                tx,
+            );
+        }
     }
     if always_allowed.contains(tool_name) && permission_mgr.is_none() {
         return PermissionOutcome::Allowed { checked: false };
@@ -2471,9 +2483,9 @@ fn describe_tool_call(tool_name: &str, args: &Value) -> String {
             .get("url")
             .and_then(|v| v.as_str())
             .map_or_else(|| "Fetching URL".to_string(), |u| format!("Fetching {u}")),
-        "crosslink" => args.get("args").and_then(|v| v.as_str()).map_or_else(
+        "crosslink" => args.get("operation").and_then(|v| v.as_str()).map_or_else(
             || "Running crosslink".to_string(),
-            |a| format!("crosslink {a}"),
+            |operation| format!("crosslink {operation}"),
         ),
         _ => format!("Running {tool_name}"),
     }
@@ -2765,9 +2777,12 @@ async fn execute_tool_calls_for_tui(
             }
         }
 
-        // Permission check for write/destructive tools
+        // A configured manager sees every call, including read-only calls, so
+        // explicit deny rules remain enforceable. The compatibility path with
+        // no manager skips UI prompting only for a positively classified
+        // read-only invocation.
         let mut permission_already_checked = false;
-        if tool_needs_permission(tool_name) {
+        if permission_mgr.is_some() || call_needs_permission(tool_name, &tool_args) {
             match check_tool_permission(
                 tool_name,
                 &tool_call.id,
@@ -4487,9 +4502,9 @@ mod tests {
         );
     }
 
-    /// B3 — `tool_needs_permission` classifies read-only tools as safe.
+    /// B3 — `tool_needs_permission` follows mandatory catalog metadata.
     #[test]
-    fn b3_tool_needs_permission_safe_list() {
+    fn b3_tool_needs_permission_uses_effect_catalog() {
         assert!(!tool_needs_permission("read_file"), "read_file is safe");
         assert!(
             !tool_needs_permission("grounding_context"),
@@ -4505,6 +4520,65 @@ mod tests {
         assert!(
             tool_needs_permission("edit_file"),
             "edit_file needs permission"
+        );
+    }
+
+    #[test]
+    fn tui_permission_manager_applies_explicit_deny_to_read_only_call() {
+        use crate::permissions::{PermissionDecision, PermissionRule};
+        use std::sync::mpsc as std_mpsc;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        mgr.add_session_rule(PermissionRule {
+            tool: "Read".to_string(),
+            pattern: "/etc/**".to_string(),
+            decision: PermissionDecision::Deny,
+        });
+        let (tx, _rx) = std_mpsc::channel::<AppEvent>();
+
+        let outcome = permission_manager_outcome_for_tui(
+            "read_file",
+            "call_read",
+            r#"{"path":"/etc/shadow"}"#,
+            &mgr,
+            &[],
+            &tx,
+        );
+        assert!(matches!(
+            outcome,
+            Some(PermissionOutcome::DeniedWithResult(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn tui_without_manager_denies_unclassified_call_before_prompt() {
+        use std::sync::mpsc as std_mpsc;
+
+        let mut always_allowed =
+            std::collections::HashSet::from(["unknown_from_model".to_string()]);
+        let mut always_denied = std::collections::HashSet::new();
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+
+        let outcome = check_tool_permission(
+            "unknown_from_model",
+            "call_unknown",
+            "{}",
+            &mut always_allowed,
+            &mut always_denied,
+            None,
+            &[],
+            None,
+            None,
+            &tx,
+        )
+        .await;
+
+        assert!(matches!(outcome, PermissionOutcome::DeniedWithResult(_)));
+        assert!(
+            rx.try_iter()
+                .all(|event| !matches!(event, AppEvent::PermissionRequest { .. })),
+            "an unclassified call must not be converted into a user-approvable prompt"
         );
     }
 

@@ -24,6 +24,8 @@ use crate::memory::MemoryDb;
 use crate::session::TaskManager;
 use serde_json::{json, Value};
 
+use super::effect::{ToolEffect, ToolEffectSpec, ToolTarget, TypedEffect};
+
 // ─── Context ─────────────────────────────────────────────────────────────────
 
 /// Everything a [`ToolHandler`] may need at dispatch time.
@@ -43,35 +45,6 @@ pub struct ToolContext<'a> {
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
-/// Permission-checking metadata for a tool (crosslink #782).
-///
-/// Each tool that can mutate user state must declare a [`PermissionTarget`]
-/// from its [`ToolHandler::permission_target`] method. The
-/// `PermissionManager` consults this metadata at dispatch time instead of
-/// pattern-matching on a hard-coded list of tool names. Tools that return
-/// `None` from `permission_target` are treated as read-only / safe and
-/// bypass permission checks.
-///
-/// Why this exists: prior to #782, `PermissionManager::extract_target` held
-/// an `_ => None` catch-all `match` over three tool names. Any new tool
-/// added to the registry — `delete_file`, `chmod`, `run_subprocess`, an MCP
-/// write tool — would silently fail-open. Inverting the dependency closes
-/// that gap: a new mutating tool must either declare its target or
-/// explicitly opt out by returning `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PermissionTarget {
-    /// Canonical capability name used in `PermissionRule::tool` — e.g.
-    /// `"Bash"`, `"Edit"`, `"Write"`. Multiple wire-level tool names may
-    /// share a canonical capability (e.g. a future `bash_persistent` could
-    /// canonicalise to `"Bash"` so existing rules continue to cover it).
-    pub canonical: &'static str,
-    /// JSON argument key whose string value is the pattern-match target.
-    /// For `bash` this is `"command"`; for file tools it is the path arg
-    /// (`"path"` for `edit_file`/`write_file`, `"notebook_path"` for
-    /// `notebook_edit`).
-    pub arg_key: &'static str,
-}
-
 /// A single tool that the agent can invoke.
 ///
 /// Implementations are unit structs stored as `&'static dyn ToolHandler`
@@ -88,19 +61,48 @@ pub trait ToolHandler: Send + Sync {
     /// keeps the schema next to the execute logic that interprets it.
     fn definition(&self) -> Value;
 
-    /// Declare this tool's permission-check target (crosslink #782).
+    /// Declare this tool's effect on the world (S-016; F-001).
     ///
-    /// Return `Some(PermissionTarget { canonical, arg_key })` if the tool
-    /// mutates user state and should be gated by the permission system. The
-    /// permission manager will look up `arg_key` in the tool's arguments
-    /// and match its string value against rules keyed by `canonical`.
+    /// There is deliberately **no default body**. A handler that does not
+    /// classify itself does not compile, which is what makes the missing
+    /// classification unrepresentable rather than silently safe. The previous
+    /// `permission_target() -> Option<_> { None }` default is exactly the
+    /// fail-open shape F-001 records: twenty-eight of thirty-three handlers
+    /// inherited "read-only / safe" by omission.
     ///
-    /// The default returns `None`, which treats the tool as read-only /
-    /// safe and lets it bypass permission checks. Override this method on
-    /// every new mutating tool — leaving the default in place on a
-    /// destructive tool is the bug class #782 closed.
-    fn permission_target(&self) -> Option<PermissionTarget> {
+    /// Declaring [`ToolEffect::ReadOnly`] is a positive claim that the tool
+    /// changes no state and performs no egress. Everything else reaches an
+    /// authorization decision.
+    fn effect_spec(&self) -> ToolEffectSpec;
+
+    /// Resolve the effect of one concrete invocation for handlers that
+    /// multiplex several operations behind a single wire-level tool.
+    ///
+    /// Required when [`Self::effect_spec`] declares
+    /// [`ToolTarget::TypedOperation`]; the registry rejects a handler that
+    /// declares one without implementing the other. Returning `Err` denies
+    /// the call — an invocation whose effect cannot be established before
+    /// policy evaluation is never executed.
+    ///
+    /// The default returns `None`, which is only correct for the
+    /// non-`TypedOperation` specs that never consult it.
+    fn resolve_typed_effect(&self, _args: &Value) -> Option<Result<TypedEffect, String>> {
         None
+    }
+
+    /// Enumerate every operation a [`ToolTarget::TypedOperation`] handler can
+    /// resolve to, for the generated effect matrix.
+    ///
+    /// The matrix asks each handler for its own operations instead of
+    /// switching on tool names. A name-matching `match` with a `_ => {}` arm
+    /// would let a future multiplexing handler contribute a row with no
+    /// operations and no test failure, which is the hand-maintained shape the
+    /// slice's third acceptance criterion rules out.
+    ///
+    /// The registry requires this to be non-empty exactly when the handler
+    /// declares `TypedOperation`.
+    fn typed_operations(&self) -> Vec<(&'static str, ToolEffect)> {
+        Vec::new()
     }
 
     /// Execute the tool through the canonical typed result boundary.
@@ -176,6 +178,9 @@ impl ToolHandler for BashHandler {
     fn name(&self) -> &'static str {
         "bash"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::Destructive, "Bash", "command")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -199,13 +204,6 @@ impl ToolHandler for BashHandler {
             }
         })
     }
-    fn permission_target(&self) -> Option<PermissionTarget> {
-        // #782: Bash is the canonical "run-anything" capability — gated.
-        Some(PermissionTarget {
-            canonical: "Bash",
-            arg_key: "command",
-        })
-    }
     fn execute(
         &self,
         args: &HashMap<String, Value>,
@@ -219,6 +217,15 @@ struct BashOutputHandler;
 impl ToolHandler for BashOutputHandler {
     fn name(&self) -> &'static str {
         "bash_output"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::typed_operation(ToolEffect::SessionMutation, "BashOutput")
+    }
+    fn resolve_typed_effect(&self, args: &Value) -> Option<Result<TypedEffect, String>> {
+        Some(bash::classify_bash_output(args))
+    }
+    fn typed_operations(&self) -> Vec<(&'static str, ToolEffect)> {
+        bash::bash_output_operations()
     }
     fn definition(&self) -> Value {
         json!({
@@ -252,6 +259,9 @@ impl ToolHandler for KillShellHandler {
     fn name(&self) -> &'static str {
         "kill_shell"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "KillShell", "shell_id")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -284,6 +294,9 @@ struct KillShellsForAgentHandler;
 impl ToolHandler for KillShellsForAgentHandler {
     fn name(&self) -> &'static str {
         "kill_shells_for_agent"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "KillShell", "agent_id")
     }
     fn definition(&self) -> Value {
         json!({
@@ -319,6 +332,9 @@ struct ReadFileHandler;
 impl ToolHandler for ReadFileHandler {
     fn name(&self) -> &'static str {
         "read_file"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only_arg("Read", "path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -367,6 +383,9 @@ impl ToolHandler for GroundingContextHandler {
     fn name(&self) -> &'static str {
         "grounding_context"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only("GroundingContext")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -409,6 +428,9 @@ impl ToolHandler for WriteFileHandler {
     fn name(&self) -> &'static str {
         "write_file"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Write", "path")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -432,13 +454,6 @@ impl ToolHandler for WriteFileHandler {
             }
         })
     }
-    fn permission_target(&self) -> Option<PermissionTarget> {
-        // #782: file-write capability — gated on the destination path.
-        Some(PermissionTarget {
-            canonical: "Write",
-            arg_key: "path",
-        })
-    }
     fn execute_legacy(
         &self,
         args: &HashMap<String, Value>,
@@ -452,6 +467,9 @@ struct EditFileHandler;
 impl ToolHandler for EditFileHandler {
     fn name(&self) -> &'static str {
         "edit_file"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Edit", "path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -484,13 +502,6 @@ impl ToolHandler for EditFileHandler {
             }
         })
     }
-    fn permission_target(&self) -> Option<PermissionTarget> {
-        // #782: file-edit capability — gated on the path being edited.
-        Some(PermissionTarget {
-            canonical: "Edit",
-            arg_key: "path",
-        })
-    }
     fn execute(
         &self,
         args: &HashMap<String, Value>,
@@ -504,6 +515,9 @@ struct NotebookEditHandler;
 impl ToolHandler for NotebookEditHandler {
     fn name(&self) -> &'static str {
         "notebook_edit"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Edit", "notebook_path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -546,16 +560,6 @@ impl ToolHandler for NotebookEditHandler {
             }
         })
     }
-    fn permission_target(&self) -> Option<PermissionTarget> {
-        // #782: notebook_edit mutates .ipynb files on disk — the pre-#782
-        // hardcoded match in `extract_target` silently fail-opened this
-        // handler. Canonicalising as "Edit" lets existing Edit session
-        // rules (e.g. "src/**") naturally cover notebook edits.
-        Some(PermissionTarget {
-            canonical: "Edit",
-            arg_key: "notebook_path",
-        })
-    }
     fn execute_legacy(
         &self,
         args: &HashMap<String, Value>,
@@ -569,6 +573,9 @@ struct ListFilesHandler;
 impl ToolHandler for ListFilesHandler {
     fn name(&self) -> &'static str {
         "list_files"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only_arg_or_default("Read", "path", ".")
     }
     fn definition(&self) -> Value {
         json!({
@@ -602,6 +609,9 @@ struct GlobHandler;
 impl ToolHandler for GlobHandler {
     fn name(&self) -> &'static str {
         "glob"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only_arg_or_default("Read", "path", ".")
     }
     fn definition(&self) -> Value {
         json!({
@@ -639,6 +649,9 @@ struct GrepHandler;
 impl ToolHandler for GrepHandler {
     fn name(&self) -> &'static str {
         "grep"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only_arg_or_default("Read", "path", ".")
     }
     fn definition(&self) -> Value {
         json!({
@@ -683,31 +696,39 @@ impl ToolHandler for GrepHandler {
 
 // ── crosslink ─────────────────────────────────────────────────────────────────
 //
-// Deep library-backed replacement for the legacy `chainlink` tool. Same
-// argv-string contract for prompt compatibility, but the underlying calls
+// Deep library-backed replacement for the legacy `chainlink` tool: the calls
 // go through `crosslink::db::Database::*` instead of forking a subprocess.
+//
+// S-016/F-052 replaced the original argv-string contract with a closed
+// `operation` enum, so the effect of a call is known before policy runs
+// instead of being discovered by a private tokenizer afterwards.
 
 struct CrosslinkHandler;
 impl ToolHandler for CrosslinkHandler {
     fn name(&self) -> &'static str {
         "crosslink"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::typed_operation(ToolEffect::WorkspaceMutation, "Crosslink")
+    }
+    /// Classification happens by parsing the typed `operation` argument, which
+    /// is a closed enum — not by re-parsing a shell-like string (F-052).
+    fn resolve_typed_effect(&self, args: &Value) -> Option<Result<TypedEffect, String>> {
+        Some(crosslink_tool::classify_operation(args))
+    }
+    fn typed_operations(&self) -> Vec<(&'static str, ToolEffect)> {
+        crosslink_tool::OPERATIONS
+            .iter()
+            .map(|op| (op.name, op.effect))
+            .collect()
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
             "function": {
                 "name": "crosslink",
-                "description": "Persistent issue tracker + session memory backed by the crosslink library (local SQLite, no subprocess). Subcommands: 'create \"<title>\" [-p priority] [-l label] [-d desc]', 'close <id>', 'reopen <id>', 'comment <id> \"<text>\"', 'label <id> <label>' / 'unlabel <id> <label>', 'list [-s status] [-l label] [-p priority]', 'show <id>', 'search \"<query>\"', 'subissue <parent_id> \"<title>\" [-p priority]', 'relate <id1> <id2>', 'block <blocker_id> <blocked_id>' / 'unblock ...', 'session start | end [--notes \"...\"] | work <id> | action \"...\" | status', 'next' (suggest highest-priority ready issue), 'tree [<root_id>]', 'update <id> [-t title] [-d desc] [-p priority]'. Use this for cross-session memory: track open work, leave handoff notes, mark dependencies. Survives context compression and session restarts.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "args": {
-                            "type": "string",
-                            "description": "The crosslink subcommand + arguments (e.g. 'create \"Fix auth bug\" -p high -l bug' or 'session end --notes \"PR ready for review\"')."
-                        }
-                    },
-                    "required": ["args"]
-                }
+                "description": "Persistent issue tracker + session memory backed by the crosslink library (local SQLite, no subprocess). Select an operation with the `operation` field and pass typed fields alongside it — there is no command string to compose. Static documentation: help, --help, -h. Store queries: list, show, search, tree, next, ready, session_status. Mutations: create, close, reopen, comment, label, unlabel, subissue, relate, block, unblock, update, session_start, session_end, session_work, session_action. Use this for cross-session memory: track open work, leave handoff notes, mark dependencies. Survives context compression and session restarts.",
+                "parameters": crosslink_tool::tool_parameters()
             }
         })
     }
@@ -736,6 +757,9 @@ impl ToolHandler for WebFetchHandler {
     fn name(&self) -> &'static str {
         "web_fetch"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::NetworkRead, "WebFetch", "url")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -759,12 +783,6 @@ impl ToolHandler for WebFetchHandler {
             }
         })
     }
-    fn permission_target(&self) -> Option<PermissionTarget> {
-        Some(PermissionTarget {
-            canonical: "WebFetch",
-            arg_key: "url",
-        })
-    }
     fn execute_legacy(
         &self,
         args: &HashMap<String, Value>,
@@ -780,6 +798,9 @@ struct WebSearchHandler;
 impl ToolHandler for WebSearchHandler {
     fn name(&self) -> &'static str {
         "web_search"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::NetworkRead, "WebSearch", "query")
     }
     fn definition(&self) -> Value {
         json!({
@@ -835,6 +856,11 @@ impl ToolHandler for WebBrowserHandler {
     fn name(&self) -> &'static str {
         "web_browser"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        // Launches a headless Chromium process, so it is an external effect
+        // rather than pure egress — the same rule that puts `lsp` here.
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "WebBrowser", "url")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -869,6 +895,9 @@ struct LspHandler;
 impl ToolHandler for LspHandler {
     fn name(&self) -> &'static str {
         "lsp"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "Lsp", "file_path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -938,6 +967,9 @@ impl ToolHandler for TodoWriteHandler {
     fn name(&self) -> &'static str {
         "todo_write"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::SessionMutation, "TodoWrite")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -990,6 +1022,9 @@ impl ToolHandler for TodoReadHandler {
     fn name(&self) -> &'static str {
         "todo_read"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only("TodoRead")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1019,6 +1054,13 @@ struct AskUserQuestionHandler;
 impl ToolHandler for AskUserQuestionHandler {
     fn name(&self) -> &'static str {
         "ask_user_question"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        // The handler emits a trusted pending follow-up that suspends the
+        // agent loop and transfers control to the user. That is a session
+        // control mutation, not an observation, even though it performs no
+        // durable write or network egress.
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::SessionMutation, "AskUserQuestion")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1100,6 +1142,9 @@ impl ToolHandler for EnterWorktreeHandler {
     fn name(&self) -> &'static str {
         "enter_worktree"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Worktree", "branch")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1132,6 +1177,22 @@ struct ExitWorktreeHandler;
 impl ToolHandler for ExitWorktreeHandler {
     fn name(&self) -> &'static str {
         "exit_worktree"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::typed_operation(ToolEffect::Destructive, "Worktree")
+    }
+    /// `exit_worktree` is two different operations behind one name.
+    ///
+    /// F-001 calls this out by name: every path ultimately removes a worktree,
+    /// yet the handler declared no target at all. The operation label remains
+    /// typed for auditability, while every variant uses the destructive
+    /// ceiling because `git worktree remove --force` can delete ignored files
+    /// that argument-only classification cannot prove absent.
+    fn resolve_typed_effect(&self, args: &Value) -> Option<Result<TypedEffect, String>> {
+        Some(worktree::classify_exit_worktree(args))
+    }
+    fn typed_operations(&self) -> Vec<(&'static str, ToolEffect)> {
+        worktree::exit_worktree_operations()
     }
     fn definition(&self) -> Value {
         json!({
@@ -1174,6 +1235,9 @@ impl ToolHandler for ListWorktreesHandler {
     fn name(&self) -> &'static str {
         "list_worktrees"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only("Worktree")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1203,6 +1267,9 @@ struct CronCreateHandler;
 impl ToolHandler for CronCreateHandler {
     fn name(&self) -> &'static str {
         "cron_create"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Cron", "name")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1253,6 +1320,9 @@ impl ToolHandler for CronDeleteHandler {
     fn name(&self) -> &'static str {
         "cron_delete"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::WorkspaceMutation, "Cron")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1296,6 +1366,13 @@ impl ToolHandler for CronListHandler {
     fn name(&self) -> &'static str {
         "cron_list"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        // Listing acquires an exclusive advisory lock by creating
+        // `.openclaudia/schedules.json.lock` (and its parent directory). It
+        // therefore changes durable workspace state even when no schedule
+        // file exists.
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::WorkspaceMutation, "Cron")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1332,6 +1409,9 @@ impl ToolHandler for EnterPlanModeHandler {
     fn name(&self) -> &'static str {
         "enter_plan_mode"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::SessionMutation, "PlanMode")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1359,6 +1439,9 @@ struct ExitPlanModeHandler;
 impl ToolHandler for ExitPlanModeHandler {
     fn name(&self) -> &'static str {
         "exit_plan_mode"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::SessionMutation, "PlanMode")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1411,6 +1494,9 @@ impl ToolHandler for TaskCreateHandler {
     fn name(&self) -> &'static str {
         "task_create"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::SessionMutation, "TaskWrite")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1454,6 +1540,9 @@ struct TaskUpdateHandler;
 impl ToolHandler for TaskUpdateHandler {
     fn name(&self) -> &'static str {
         "task_update"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::SessionMutation, "TaskWrite", "task_id")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1518,6 +1607,9 @@ impl ToolHandler for TaskGetHandler {
     fn name(&self) -> &'static str {
         "task_get"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only_arg("TaskRead", "task_id")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1553,6 +1645,9 @@ struct TaskListHandler;
 impl ToolHandler for TaskListHandler {
     fn name(&self) -> &'static str {
         "task_list"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only("TaskRead")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1591,6 +1686,13 @@ struct ListMcpResourcesHandler;
 impl ToolHandler for ListMcpResourcesHandler {
     fn name(&self) -> &'static str {
         "list_mcp_resources"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        // A resource read can reconnect a disconnected MCP server, spawning
+        // or re-establishing a long-lived external service connection, and
+        // marks failed transports disconnected. That session/service mutation
+        // is above a pure network read.
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::ExternalMutation, "McpRead")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1683,6 +1785,9 @@ struct ReadMcpResourceHandler;
 impl ToolHandler for ReadMcpResourceHandler {
     fn name(&self) -> &'static str {
         "read_mcp_resource"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "McpRead", "uri")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1792,6 +1897,9 @@ impl ToolHandler for SkillHandler {
     fn name(&self) -> &'static str {
         "skill"
     }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only_arg("Skill", "name")
+    }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
@@ -1830,6 +1938,9 @@ struct ToolSearchHandler;
 impl ToolHandler for ToolSearchHandler {
     fn name(&self) -> &'static str {
         "tool_search"
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only_arg("ToolSearch", "query")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1933,11 +2044,195 @@ static HANDLERS: &[&dyn ToolHandler] = &[
 /// Iterate every registered handler in JSON-output order. The public
 /// `tools::get_tool_definitions` calls this to build the API-facing schema
 /// list without duplicating the order or the schema bodies.
-pub(crate) fn iter_handlers() -> impl Iterator<Item = &'static dyn ToolHandler> {
+pub fn iter_handlers() -> impl Iterator<Item = &'static dyn ToolHandler> {
     HANDLERS.iter().copied()
 }
 
+fn validate_handler_schema(
+    handler: &'static dyn ToolHandler,
+    name: &str,
+    spec: ToolEffectSpec,
+    problems: &mut Vec<String>,
+) {
+    // A declared argument target must be an actual string field in the
+    // model-facing schema. Checking only that the Rust string is nonempty
+    // would still allow a typo such as `file` vs `file_path`: every call
+    // would then deny at runtime even though registry construction claimed
+    // the handler was usable.
+    let definition = handler.definition();
+    match definition
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+    {
+        Some(schema_name) if schema_name == name => {}
+        Some(schema_name) => problems.push(format!(
+            "tool '{name}' publishes schema name '{schema_name}'; dispatch and schema identities differ"
+        )),
+        None => problems.push(format!(
+            "tool '{name}' has no string function.name in its published schema"
+        )),
+    }
+    if let ToolTarget::Arg(key) | ToolTarget::ArgOrDefault { key, .. } = spec.target {
+        match definition
+            .pointer("/function/parameters/properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(key))
+        {
+            Some(schema) if schema.get("type").and_then(Value::as_str) == Some("string") => {}
+            Some(_) => problems.push(format!(
+                "tool '{name}' declares target argument '{key}', but its schema does not declare that field as a string"
+            )),
+            None => problems.push(format!(
+                "tool '{name}' declares target argument '{key}', but its schema has no such property"
+            )),
+        }
+    }
+    if let ToolTarget::Arg(key) = spec.target {
+        let required = definition
+            .pointer("/function/parameters/required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|value| value.as_str() == Some(key)));
+        if !required {
+            problems.push(format!(
+                "tool '{name}' requires target argument '{key}' for classification, but its schema does not require that field"
+            ));
+        }
+    }
+}
+
+fn validate_handler_typed_operations(
+    handler: &'static dyn ToolHandler,
+    name: &str,
+    spec: ToolEffectSpec,
+    problems: &mut Vec<String>,
+) {
+    // Classifiers are pure: probing null distinguishes the default `None`
+    // implementation from a resolver returning a typed error. No handler
+    // execution body runs.
+    let declares_typed = matches!(spec.target, ToolTarget::TypedOperation);
+    let resolver_probe = handler.resolve_typed_effect(&Value::Null);
+    let has_resolver = resolver_probe.is_some();
+    if declares_typed && !has_resolver {
+        problems.push(format!(
+            "tool '{name}' declares ToolTarget::TypedOperation but does not implement \
+             resolve_typed_effect"
+        ));
+    }
+    if !declares_typed && has_resolver {
+        problems.push(format!(
+            "tool '{name}' implements resolve_typed_effect but does not declare \
+             ToolTarget::TypedOperation; the resolver would never be consulted"
+        ));
+    }
+
+    let operations = handler.typed_operations();
+    if declares_typed && operations.is_empty() {
+        problems.push(format!(
+            "tool '{name}' declares ToolTarget::TypedOperation but enumerates no \
+             operations; the generated matrix could not describe it"
+        ));
+    }
+    if !declares_typed && !operations.is_empty() {
+        problems.push(format!(
+            "tool '{name}' enumerates typed operations but does not declare \
+             ToolTarget::TypedOperation"
+        ));
+    }
+    let mut seen_operations = std::collections::HashSet::with_capacity(operations.len());
+    for (operation, effect) in &operations {
+        if operation.trim().is_empty() {
+            problems.push(format!("tool '{name}' declares an unnamed operation"));
+        }
+        if !seen_operations.insert(*operation) {
+            problems.push(format!(
+                "tool '{name}' declares typed operation '{operation}' more than once"
+            ));
+        }
+        if *effect > spec.effect {
+            problems.push(format!(
+                "tool '{name}' declares operation '{operation}' at effect {} above its {} ceiling",
+                effect.as_str(),
+                spec.effect.as_str()
+            ));
+        }
+    }
+    if let Some(Ok(resolved)) = resolver_probe {
+        match operations
+            .iter()
+            .find(|(operation, _)| *operation == resolved.operation)
+        {
+            Some((_, effect)) if *effect == resolved.effect => {}
+            Some((_, effect)) => problems.push(format!(
+                "tool '{name}' resolver probe returned {} for operation '{}', but its table declares {}",
+                resolved.effect.as_str(),
+                resolved.operation,
+                effect.as_str()
+            )),
+            None => problems.push(format!(
+                "tool '{name}' resolver probe returned undeclared operation '{}'",
+                resolved.operation
+            )),
+        }
+    }
+}
+
+/// Validate every declaration before the registry becomes usable (S-016).
+///
+/// A structurally invalid or contradictory classification must stop the
+/// registry from existing at all. If construction succeeded and enforcement
+/// merely logged, the failure mode would be the one F-001 describes: dispatch
+/// continues while the classification is silently absent.
+///
+/// This is `pub` so the acceptance suite can drive it with deliberately
+/// broken handler sets. Every branch below is reachable from a test; an
+/// untested `panic!` on the construction path would be an assurance claim
+/// rather than evidence.
+///
+/// # Errors
+///
+/// Returns every problem found, so a broken declaration set is reported once
+/// rather than one panic per rebuild.
+pub fn validate_handlers(handlers: &[&'static dyn ToolHandler]) -> Result<(), Vec<String>> {
+    let mut problems = Vec::new();
+    let mut seen: HashMap<&'static str, usize> = HashMap::with_capacity(handlers.len());
+
+    for (index, &handler) in handlers.iter().enumerate() {
+        let name = handler.name();
+        if name.trim().is_empty() {
+            problems.push(format!("handler at index {index} has an empty name"));
+            continue;
+        }
+        if let Some(previous) = seen.insert(name, index) {
+            problems.push(format!(
+                "tool name '{name}' is registered twice (indexes {previous} and {index}); \
+                 dispatch would be ambiguous"
+            ));
+        }
+
+        let spec = handler.effect_spec();
+        if let Err(problem) = spec.validate(name) {
+            problems.push(problem);
+        }
+        validate_handler_schema(handler, name, spec, &mut problems);
+        validate_handler_typed_operations(handler, name, spec, &mut problems);
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
+}
+
 fn build_registry() -> ToolRegistry {
+    if let Err(problems) = validate_handlers(HANDLERS) {
+        panic!(
+            "tool registry construction failed: every handler must carry a valid effect \
+             classification (S-016/F-001).\n  - {}",
+            problems.join("\n  - ")
+        );
+    }
+
     let mut handlers: HashMap<&'static str, &'static dyn ToolHandler> =
         HashMap::with_capacity(HANDLERS.len());
     for &handler in HANDLERS {

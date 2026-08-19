@@ -23,7 +23,8 @@ pub(crate) use bash::sandbox::{sandboxed_hook_command, sandboxed_process_command
 pub(crate) mod command;
 mod continuation;
 mod cron;
-pub(crate) mod crosslink;
+pub mod crosslink;
+pub mod effect;
 /// Re-export the cron command entry points so the E2E test suite
 /// (`tests/cron_e2e.rs`) can drive create/list/delete + the
 /// validator perimeter directly. Internal call sites continue to
@@ -105,7 +106,7 @@ pub use continuation::{
 /// (crosslink #620). Subagent runners construct one of these for the
 /// duration of a `task` tool invocation; tests construct one directly.
 pub use plan_mode::{in_agent_task, AgentContextGuard};
-pub use registry::{PermissionTarget, ToolContext, ToolHandler, ToolRegistry};
+pub use registry::{ToolContext, ToolHandler, ToolRegistry};
 pub use result::{
     ToolAllowedPrompt, ToolArtifact, ToolAttachment, ToolCompleteness, ToolContent, ToolDiff,
     ToolDisplay, ToolExecutionResult, ToolFailure, ToolFailureCode, ToolFollowUp,
@@ -520,10 +521,11 @@ pub enum PermissionOutcome {
 
 /// Check permissions before executing a tool and return a structured outcome.
 ///
-/// **Fail-open posture when `permission_mgr` is None** — matches the library
-/// contract today; callers that want strict "no manager means deny" should
-/// use [`check_tool_permission_strict`]. A disabled manager (`is_enabled()`
-/// returns false) is also allowed — operators opted out explicitly.
+/// **Legacy allow posture when `permission_mgr` is None** — known, classifiable
+/// calls remain compatible; unknown or malformed calls deny. Callers that want
+/// strict "no manager means deny" should use [`check_tool_permission_strict`].
+/// A disabled manager is still consulted so mandatory classification and hard
+/// safety run before its explicit allow policy.
 ///
 /// Emits a structured tracing event at every decision point (allowed,
 /// denied, needs-prompt, bypass) so the audit trail is queryable without
@@ -540,19 +542,26 @@ pub fn check_tool_permission_outcome(
     };
 
     let Some(mgr) = permission_mgr else {
+        if let Err(error) = effect::resolve_for_call(tool_name, &args) {
+            let reason = error.reason();
+            tracing::warn!(
+                tool = %tool_name,
+                reason = %reason,
+                "permission DENIED: call has no effect classification"
+            );
+            return PermissionOutcome::Denied(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: {reason}"),
+                ToolRetryability::Never,
+            ));
+        }
         tracing::debug!(
             tool = %tool_name,
-            "permission check bypassed: no PermissionManager supplied by caller"
+            "permission rules bypassed after mandatory effect classification: no PermissionManager supplied"
         );
         return PermissionOutcome::Allowed;
     };
-    if !mgr.is_enabled() {
-        tracing::debug!(
-            tool = %tool_name,
-            "permission check bypassed: PermissionManager is disabled"
-        );
-        return PermissionOutcome::Allowed;
-    }
 
     match mgr.check(tool_name, &args) {
         CheckResult::Allowed => {

@@ -1524,15 +1524,43 @@ async fn proxy_chat_completions(
 
 /// Handle MCP tool calls from the model response.
 ///
+/// # Effect classification (S-016)
+///
+/// MCP-served tools are dynamically named and their behaviour is defined by a
+/// third-party server, so they are classified at a conservative ceiling by
+/// [`crate::tools::effect::resolve_for_call`] and must clear the caller's
+/// [`PermissionManager`] before dispatch. Adversarial review found this
+/// entrypoint executing `call_tool` with no classification and no permission
+/// check at all; it had no in-tree callers, but it is `pub` and it dispatches
+/// the exact surface this slice claims to have gated, so the manager is now a
+/// required argument rather than an optional courtesy.
+///
 /// # Errors
 ///
-/// Returns `ProxyError::InvalidBody` if the MCP server is not connected or
-/// the tool call fails.
+/// Returns `ProxyError::InvalidBody` if the tool is not classified, if
+/// permission is refused, if the MCP server is not connected, or if the tool
+/// call fails.
 pub async fn handle_mcp_tool_call(
     mcp_manager: &Arc<RwLock<McpManager>>,
+    permission_mgr: &crate::permissions::PermissionManager,
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, ProxyError> {
+    match permission_mgr.check(tool_name, &arguments) {
+        crate::permissions::CheckResult::Allowed => {}
+        crate::permissions::CheckResult::Denied(reason) => {
+            return Err(ProxyError::InvalidBody(reason));
+        }
+        crate::permissions::CheckResult::NeedsPrompt { tool, target } => {
+            // The proxy has no interactive channel, so an unapproved call
+            // fails closed rather than executing.
+            return Err(ProxyError::InvalidBody(format!(
+                "MCP tool '{target}' requires approval for capability '{tool}' and the proxy \
+                 cannot prompt; add an explicit permission rule to allow it"
+            )));
+        }
+    }
+
     let mcp = mcp_manager.read().await;
 
     // Check if the MCP server is connected (format: mcp__servername__toolname)
@@ -2704,6 +2732,67 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp_permission_manager(
+        allow_target: Option<&str>,
+    ) -> (crate::permissions::PermissionManager, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut mgr = crate::permissions::PermissionManager::new_with_web_fetch_preapproved(
+            dir.path().join("permissions.json"),
+            true,
+            Vec::new(),
+            Vec::new(),
+        );
+        if let Some(target) = allow_target {
+            mgr.add_session_rule(crate::permissions::PermissionRule {
+                tool: "Mcp".to_string(),
+                pattern: target.to_string(),
+                decision: crate::permissions::PermissionDecision::Allow,
+            });
+        }
+        (mgr, dir)
+    }
+
+    #[tokio::test]
+    async fn dynamic_mcp_dispatch_denies_malformed_name_before_manager_access() {
+        let mcp = Arc::new(RwLock::new(McpManager::new()));
+        let permissions = crate::permissions::PermissionManager::unrestricted();
+        let error = handle_mcp_tool_call(&mcp, &permissions, "mcp__", serde_json::json!({}))
+            .await
+            .expect_err("malformed dynamic name must deny");
+        assert!(error.to_string().contains("no effect classification"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_mcp_dispatch_requires_explicit_noninteractive_approval() {
+        let mcp = Arc::new(RwLock::new(McpManager::new()));
+        let (permissions, _dir) = mcp_permission_manager(None);
+        let error = handle_mcp_tool_call(
+            &mcp,
+            &permissions,
+            "mcp__server__delete",
+            serde_json::json!({"id": 1}),
+        )
+        .await
+        .expect_err("proxy cannot prompt for an unapproved MCP mutation");
+        let rendered = error.to_string();
+        assert!(rendered.contains("requires approval"), "{rendered}");
+        assert!(
+            !rendered.contains("not connected"),
+            "permission must deny before connection state is inspected: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_mcp_dispatch_reaches_connection_only_after_scoped_allow() {
+        let mcp = Arc::new(RwLock::new(McpManager::new()));
+        let target = "mcp__server__delete";
+        let (permissions, _dir) = mcp_permission_manager(Some(target));
+        let error = handle_mcp_tool_call(&mcp, &permissions, target, serde_json::json!({"id": 1}))
+            .await
+            .expect_err("test manager has no connected server");
+        assert!(error.to_string().contains("not connected"));
+    }
 
     /// Build a minimal `AppConfig` suitable for unit tests.
     /// `AppConfig` does not implement `Default`; we deserialise from a

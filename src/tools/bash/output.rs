@@ -5,6 +5,42 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+/// Classify one `bash_output` call before authorization.
+///
+/// Listing background shells is observational. Polling a concrete shell is
+/// not: `get_output` drains its stdout/stderr buffers and marks the slot as
+/// retrieved so it can be garbage-collected. That is a session-local mutation,
+/// even though the tool's user-facing purpose is to read output.
+pub fn classify_bash_output(args: &Value) -> Result<crate::tools::effect::TypedEffect, String> {
+    use crate::tools::effect::{ToolEffect, TypedEffect};
+
+    match args.get("shell_id") {
+        None | Some(Value::Null) => Ok(TypedEffect::new(
+            ToolEffect::ReadOnly,
+            "list",
+            "bash_output",
+        )),
+        Some(Value::String(shell_id)) if !shell_id.is_empty() => Ok(TypedEffect::new(
+            ToolEffect::SessionMutation,
+            "poll",
+            shell_id,
+        )),
+        Some(Value::String(_)) => Err("'shell_id' must be a non-empty string".to_string()),
+        Some(_) => Err("'shell_id' must be a string".to_string()),
+    }
+}
+
+/// Every operation `bash_output` can resolve to, for registry validation and
+/// the generated effect matrix.
+#[must_use]
+pub fn bash_output_operations() -> Vec<(&'static str, crate::tools::effect::ToolEffect)> {
+    use crate::tools::effect::ToolEffect;
+    vec![
+        ("list", ToolEffect::ReadOnly),
+        ("poll", ToolEffect::SessionMutation),
+    ]
+}
+
 /// Retrieve output from a background shell
 pub fn execute_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
     // If no shell_id provided, list all background shells

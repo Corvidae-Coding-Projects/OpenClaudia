@@ -11,7 +11,7 @@ pub mod sandbox;
 pub mod policy;
 
 pub use kill::{execute_kill_shell, execute_kill_shells_for_agent, terminate_process_tree};
-pub use output::execute_bash_output;
+pub use output::{bash_output_operations, classify_bash_output, execute_bash_output};
 pub use path_constraints::{
     check_command_against_global, clear_global as clear_global_path_constraints,
     install_global as install_global_path_constraints, PathConstraints,

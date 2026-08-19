@@ -23,26 +23,49 @@ use serde_json::json;
 
 #[test]
 fn read_only_tool_scores_unconditionally_safe() {
-    // Tools with no permission target are read-only by
-    // design (read_file, list_files, glob, grep, etc.).
-    for read_only in &["read_file", "list_files", "glob", "grep"] {
-        let score = auto_allow_score(read_only, &json!({}));
+    // S-016: read-only is now a declared effect rather than the absence of a
+    // permission target, and the score follows the declaration.
+    for (read_only, args) in [
+        ("read_file", json!({"path": "/tmp/a"})),
+        ("list_files", json!({})),
+        ("glob", json!({"pattern": "*.rs"})),
+        ("grep", json!({"pattern": "fn main"})),
+    ] {
+        let score = auto_allow_score(read_only, &args);
         assert!(
             (score - 1.0).abs() < f32::EPSILON,
-            "{read_only} MUST score 1.0 (read-only); got {score}"
+            "{read_only} MUST score 1.0 (declared ReadOnly); got {score}"
         );
     }
 }
 
 #[test]
-fn unknown_tool_scores_safe_no_permission_target() {
-    // An unknown tool name has no registered permission
-    // target so the function falls through the "no target →
-    // 1.0" branch.
+fn unknown_tool_scores_zero_not_safe() {
+    // S-016/F-001 inversion. This test previously asserted that an unknown
+    // tool scores 1.0, because `auto_allow_score` fell through a "no
+    // permission target → unconditionally safe" branch. F-001 records that
+    // exact behaviour as a critical fail-open: an unregistered name, or any
+    // handler that had simply not classified itself, was scored as safe to
+    // auto-allow. An unclassifiable call now scores 0.0.
     let score = auto_allow_score("totally-unknown-tool", &json!({}));
     assert!(
-        (score - 1.0).abs() < f32::EPSILON,
-        "unknown tool MUST score 1.0; got {score}"
+        score < f32::EPSILON,
+        "unknown tool MUST score 0.0 (unclassifiable); got {score}"
+    );
+}
+
+#[test]
+fn read_only_tool_with_malformed_target_argument_scores_zero() {
+    // The declared target argument is what a rule matches against. If it is
+    // absent or the wrong type the call cannot be scoped, so it is not
+    // auto-allowable even though the tool's effect is read-only.
+    assert!(
+        auto_allow_score("read_file", &json!({})) < f32::EPSILON,
+        "read_file without its declared `path` argument must not auto-allow"
+    );
+    assert!(
+        auto_allow_score("read_file", &json!({"path": 42})) < f32::EPSILON,
+        "read_file with a non-string `path` must not auto-allow"
     );
 }
 

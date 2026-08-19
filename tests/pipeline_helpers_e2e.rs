@@ -102,24 +102,17 @@ fn safe_read_only_tools_do_not_need_permission() {
         "list_files",
         "grep",
         "glob",
-        "ask_user_question",
         "todo_read",
-        "task",
-        "agent_output",
-        "task_stop",
-        "enter_plan_mode",
-        "exit_plan_mode",
+        "task_get",
+        "task_list",
+        "skill",
+        "tool_search",
     ] {
         assert!(
             !tool_needs_permission(t),
             "safe tool {t:?} MUST NOT need permission"
         );
     }
-    #[cfg(feature = "browser")]
-    assert!(
-        !tool_needs_permission("web_search"),
-        "registered browser-backed web_search MUST NOT need permission"
-    );
 }
 
 #[test]
@@ -130,17 +123,29 @@ fn write_edit_and_non_preapproved_network_tools_need_permission() {
         "bash",
         "notebook_edit",
         "web_fetch",
+        "ask_user_question",
+        "task",
+        "agent_output",
+        "task_stop",
+        "enter_plan_mode",
+        "exit_plan_mode",
+        "crosslink",
     ] {
         assert!(
             tool_needs_permission(t),
             "gated tool {t:?} MUST need permission"
         );
     }
+    #[cfg(feature = "browser")]
+    assert!(
+        tool_needs_permission("web_search"),
+        "browser-backed web_search leaves the host and needs policy"
+    );
 }
 
 #[test]
 fn unknown_tool_name_needs_permission_by_default() {
-    // Default-deny: anything not in SAFE_TOOLS needs permission.
+    // Default-deny: anything absent from the mandatory catalog needs policy.
     assert!(tool_needs_permission("totally-unknown-tool"));
     assert!(tool_needs_permission(""));
 }

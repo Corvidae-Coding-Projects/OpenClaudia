@@ -3305,6 +3305,7 @@ impl ChatRepl {
                     args.get("path")
                         .or_else(|| args.get("file_path"))
                         .or_else(|| args.get("command"))
+                        .or_else(|| args.get("operation"))
                         .and_then(|v| v.as_str())
                         .unwrap_or(&tool_call.function.name)
                         .to_string()
@@ -3724,18 +3725,13 @@ fn openai_activity_type(tool_call: &tools::ToolCall) -> &'static str {
         "bash" => "bash_command",
         "crosslink" => serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
             .map_or("crosslink", |args| {
-                args.get("command")
+                args.get("operation")
                     .and_then(|v| v.as_str())
-                    .map_or("crosslink", |cmd| {
-                        if cmd.starts_with("create") {
-                            "issue_created"
-                        } else if cmd.starts_with("close") {
-                            "issue_closed"
-                        } else if cmd.starts_with("comment") {
-                            "issue_comment"
-                        } else {
-                            "crosslink"
-                        }
+                    .map_or("crosslink", |operation| match operation {
+                        "create" | "subissue" => "issue_created",
+                        "close" => "issue_closed",
+                        "comment" => "issue_comment",
+                        _ => "crosslink",
                     })
             }),
         // SAFETY: tool-call names are static-ish strings; we don't get to choose them

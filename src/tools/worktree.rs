@@ -985,6 +985,92 @@ fn get_current_branch_at(cwd: &Path) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Classify one `exit_worktree` invocation before authorization (S-016).
+///
+/// `exit_worktree` multiplexes three operations with materially different
+/// blast radii behind one wire-level name, and F-001 records that it declared
+/// no permission target at all:
+///
+/// * `discard_changes: true` knowingly throws away uncommitted work;
+/// * `apply_changes: true` commits and merges non-ignored work first;
+/// * neither flag refuses when ordinary `git status --porcelain` reports a
+///   dirty worktree.
+///
+/// All three are classified [`ToolEffect::Destructive`]. Execution ultimately
+/// calls `git worktree remove --force`, and classification is deliberately
+/// argument-only: it cannot inspect the filesystem to prove that the worktree
+/// contains no ignored files that `git status --porcelain` omitted. Such files
+/// can be irreversibly deleted even on the nominally clean or apply paths, so a
+/// lower pre-authorization effect would be an optimistic lie. S-073 owns
+/// replacing that executor behavior with a transactional, ignored-file-aware
+/// workflow; until then the honest ceiling is destructive.
+///
+/// Classification reads only the typed argument shape, so it completes before
+/// the handler runs and before any filesystem access.
+///
+/// # Errors
+///
+/// Returns `Err` when a flag is present but is not a boolean. An invocation
+/// whose effect cannot be established is denied rather than executed under an
+/// assumed-safe default.
+pub fn classify_exit_worktree(
+    args: &serde_json::Value,
+) -> Result<crate::tools::effect::TypedEffect, String> {
+    use crate::tools::effect::{ToolEffect, TypedEffect};
+
+    let flag = |key: &str| -> Result<bool, String> {
+        match args.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(serde_json::Value::Bool(value)) => Ok(*value),
+            Some(other) => Err(format!(
+                "'{key}' must be a boolean, got {}",
+                match other {
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::Bool(_) | serde_json::Value::Null => unreachable!(),
+                }
+            )),
+        }
+    };
+
+    // The path is the resource the user is authorizing against. It is
+    // required by the schema; a missing or non-string path cannot be
+    // classified, so it denies rather than matching an empty pattern.
+    let path = match args.get("path") {
+        Some(serde_json::Value::String(path)) if !path.is_empty() => path.clone(),
+        _ => return Err("'path' must be a non-empty string".to_string()),
+    };
+
+    let discard = flag("discard_changes")?;
+    let apply = flag("apply_changes")?;
+
+    // Execution gives apply_changes precedence and explicitly ignores
+    // discard_changes on that path. Classification must mirror that order: a
+    // call with both flags set commits/merges, it does not discard.
+    let operation = if apply {
+        "apply"
+    } else if discard {
+        "discard"
+    } else {
+        "remove_clean"
+    };
+
+    Ok(TypedEffect::new(ToolEffect::Destructive, operation, path))
+}
+
+/// Every operation `exit_worktree` can resolve to, for the generated matrix.
+#[must_use]
+pub fn exit_worktree_operations() -> Vec<(&'static str, crate::tools::effect::ToolEffect)> {
+    use crate::tools::effect::ToolEffect;
+    vec![
+        ("discard", ToolEffect::Destructive),
+        ("apply", ToolEffect::Destructive),
+        ("remove_clean", ToolEffect::Destructive),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

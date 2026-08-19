@@ -184,18 +184,19 @@ fn explicit_deny_rule_overrides_high_score() {
 #[test]
 fn explicit_deny_rule_overrides_read_only_tool_score_1_0() {
     let (mut mgr, _dir) = fresh_manager();
-    // Note: read-only tools have no permission_target, so a Deny
-    // rule probably doesn't match. This test verifies the contract.
+    // Read-only is now a positive effect declaration with a concrete `Read`
+    // capability and path target. The deny must be evaluated before the 1.0
+    // score/default-read allowance.
     mgr.add_session_rule(PermissionRule {
-        tool: "list_files".to_string(),
-        pattern: "*".to_string(),
+        tool: "Read".to_string(),
+        pattern: "/secret/**".to_string(),
         decision: PermissionDecision::Deny,
     });
-    let outcome = mgr.check_auto_allow("list_files", &json!({}), 0.5);
-    // For read-only tools without permission_target, check() returns
-    // Allowed before reaching session rules, so this falls into score
-    // path → 1.0 >= 0.5 → Allowed.
-    assert_eq!(outcome, CheckResult::Allowed);
+    let outcome = mgr.check_auto_allow("list_files", &json!({"path": "/secret/data"}), 0.5);
+    assert!(
+        matches!(outcome, CheckResult::Denied(_)),
+        "a declared read-only effect must not make an explicit path denial unreachable"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -250,9 +251,7 @@ fn check_auto_allow_with_threshold_above_1_0_never_allows_via_classifier() {
     // score is 1.0 → no score meets the bar.
     let (mgr, _dir) = fresh_manager();
     let outcome = mgr.check_auto_allow("list_files", &json!({}), 1.5);
-    // list_files is a read-only tool (no permission_target),
-    // so check() short-circuits to Allowed independently of the
-    // classifier — the auto-allow path falls through to check()
-    // which yields Allowed.
+    // list_files positively declares ReadOnly, so the underlying policy allows
+    // it independently of whether the classifier threshold was attainable.
     assert_eq!(outcome, CheckResult::Allowed);
 }

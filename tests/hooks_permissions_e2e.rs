@@ -367,11 +367,11 @@ async fn multiple_hooks_in_same_slot_all_run() {
 // Notes on the registry layer:
 // - `check()` keys into `tools::registry()` by the *registered* tool
 //   name, which is lowercase snake_case ("bash", "write_file"). The
-//   registry's PermissionTarget then yields the *canonical* tool
-//   label ("Bash", "Write") that PermissionRule.tool matches against
-//   (case-insensitive, see `rule_matches`).
-// - `PermissionTarget.arg_key` for Bash is `"command"`; for
-//   write_file it is `"path"` (NOT `"file_path"`, per crosslink #782).
+//   registry's mandatory effect spec then yields the *canonical* tool
+//   label ("Bash", "Write") and concrete target that PermissionRule
+//   matches (case-insensitive tool label; see `rule_matches`).
+// - The declared target key for Bash is `"command"`; for write_file it
+//   is `"path"` (NOT `"file_path"`, per crosslink #782).
 // - Glob `*` matches one path segment (no `/`); use `**` to span
 //   path separators.
 
@@ -419,27 +419,25 @@ fn permission_check_explicit_deny_rule_returns_denied() {
 
 #[test]
 fn permission_check_deny_outranks_allow_for_same_tool() {
-    // When both an allow and a deny match, the first matching rule
-    // wins. Session rules are evaluated in insertion order — so for
-    // a security-conservative outcome, the deny must be inserted
-    // BEFORE the allow. This pins the documented evaluation order;
-    // a future change to "deny always wins regardless of order"
-    // would surface here.
+    // A later, narrower deny must revoke an earlier broad allow. This order is
+    // deliberate: the old test inserted the deny first and therefore stayed
+    // green under both first-match and deny-first implementations, so it did
+    // not actually prove the security property its name claimed.
     let (mut mgr, _td) = fresh_manager();
-    mgr.add_session_rule(PermissionRule {
-        tool: "Bash".to_string(),
-        pattern: "rm**".to_string(),
-        decision: PermissionDecision::Deny,
-    });
     mgr.add_session_rule(PermissionRule {
         tool: "Bash".to_string(),
         pattern: "**".to_string(),
         decision: PermissionDecision::Allow,
     });
+    mgr.add_session_rule(PermissionRule {
+        tool: "Bash".to_string(),
+        pattern: "rm**".to_string(),
+        decision: PermissionDecision::Deny,
+    });
     let r = mgr.check("bash", &json!({"command": "rm -rf /"}));
     assert!(
         matches!(r, CheckResult::Denied(_)),
-        "deny inserted first must catch 'rm -rf /'; got {r:?}"
+        "later specific deny must catch 'rm -rf /' despite the earlier broad allow; got {r:?}"
     );
     // Counter-case: a non-rm command falls through deny and hits allow.
     let r2 = mgr.check("bash", &json!({"command": "echo hello"}));
@@ -485,8 +483,8 @@ fn permission_check_unrestricted_still_denies_hard_safety_commands() {
 
 #[test]
 fn permission_check_write_pattern_matches_path_arg() {
-    // For write_file, the registry's PermissionTarget extracts from
-    // the `path` arg (NOT `file_path`) and uses canonical "Write".
+    // For write_file, the mandatory effect declaration extracts from the
+    // `path` arg (NOT `file_path`) and uses canonical "Write".
     // `/etc/**` matches across `/` boundaries.
     let (mut mgr, _td) = fresh_manager();
     mgr.add_session_rule(PermissionRule {
