@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1031,
+  "next_display_id": 1032,
   "next_comment_id": 822,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -624,6 +624,7 @@
     "a962240b-0eb5-41ef-bca4-0ebcc1d735b7": 679,
     "a97cce6f-2710-47db-9133-b016655fcba9": 1012,
     "a9aa50b8-c9f5-4f2a-86e0-b5c322367b45": 681,
+    "a9bac245-2de4-4778-86c0-be96b847eb08": 1031,
     "a9f719b7-4b6c-4b50-bb2d-735a32642c48": 376,
     "a9f82755-47d3-49ac-a877-089c10975789": 975,
     "aa53dd75-6079-4a5a-96b4-97accbf7e72b": 587,
@@ -15297,6 +15298,17 @@
         }
       }
     },
+    "a9bac245-2de4-4778-86c0-be96b847eb08": {
+      "uuid": "a9bac245-2de4-4778-86c0-be96b847eb08",
+      "display_id": 1031,
+      "title": "Remove the Windows-only SecureDirectory dead-code warning",
+      "description": "S-020 cross-target verification () succeeds but reports src/tools/file/secure_fs.rs:176 SecureDirectory.context as unread on Windows. The warning is outside Bash effect/path classification and should be repaired in the secure-files portability boundary without weakening lint settings or deleting the run capability needed on other targets.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T23:21:51.642430836Z",
+      "updated_at": "2026-08-19T23:21:51.642430836Z"
+    },
     "a9f719b7-4b6c-4b50-bb2d-735a32642c48": {
       "uuid": "a9f719b7-4b6c-4b50-bb2d-735a32642c48",
       "display_id": 376,
@@ -24537,11 +24549,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 248,
       "timestamp": "2026-08-19T23:15:21.518084517Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 249,
+      "timestamp": "2026-08-19T23:21:51.642430836Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:15:21.518084517Z",
+    "timestamp": "2026-08-19T23:21:51.642430836Z",
     "agent_id": "6Vw9",
-    "agent_seq": 248
+    "agent_seq": 249
   }
 }
