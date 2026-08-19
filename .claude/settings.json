@@ -1,40 +1,59 @@
 {
+  "allowedTools": [
+    "Bash(tmux *)",
+    "Bash(git worktree *)"
+  ],
+  "enableAllProjectMcpServers": true,
   "hooks": {
     "PostToolUse": [
       {
         "hooks": [
           {
-            "command": "python3 .claude/hooks/post-edit-check.py",
+            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.crosslink/integrations/hooks/post-edit-check.py\"; if [ -f \"$HOOK\" ]; then CROSSLINK_HOOK_PROVIDER=claude python3 \"$HOOK\"; else exit 0; fi",
+            "commandWindows": "powershell -NoProfile -Command \"$root=(git rev-parse --show-toplevel 2>$null); if($LASTEXITCODE -ne 0){exit 0}; $hook=Join-Path $root '.crosslink\\integrations\\hooks\\post-edit-check.py'; if(Test-Path $hook){$env:CROSSLINK_HOOK_PROVIDER='claude'; py -3 $hook}\"",
             "timeout": 5,
             "type": "command"
           }
         ],
-        "matcher": "^(Write|Edit|write_file|edit_file)$"
+        "matcher": "Write|Edit"
+      },
+      {
+        "hooks": [
+          {
+            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.crosslink/integrations/hooks/heartbeat.py\"; if [ -f \"$HOOK\" ]; then CROSSLINK_HOOK_PROVIDER=claude python3 \"$HOOK\"; else exit 0; fi",
+            "commandWindows": "powershell -NoProfile -Command \"$root=(git rev-parse --show-toplevel 2>$null); if($LASTEXITCODE -ne 0){exit 0}; $hook=Join-Path $root '.crosslink\\integrations\\hooks\\heartbeat.py'; if(Test-Path $hook){$env:CROSSLINK_HOOK_PROVIDER='claude'; py -3 $hook}\"",
+            "timeout": 3,
+            "type": "command"
+          }
+        ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
           {
-            "command": "python3 .claude/hooks/work-check.py",
+            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.crosslink/integrations/hooks/work-check.py\"; if [ -f \"$HOOK\" ]; then CROSSLINK_HOOK_PROVIDER=claude python3 \"$HOOK\"; else exit 0; fi",
+            "commandWindows": "powershell -NoProfile -Command \"$root=(git rev-parse --show-toplevel 2>$null); if($LASTEXITCODE -ne 0){exit 0}; $hook=Join-Path $root '.crosslink\\integrations\\hooks\\work-check.py'; if(Test-Path $hook){$env:CROSSLINK_HOOK_PROVIDER='claude'; py -3 $hook}\"",
             "timeout": 3,
             "type": "command"
           }
         ],
-        "matcher": "^(Write|Edit|Bash|write_file|edit_file|bash)$"
+        "matcher": "Write|Edit|Bash"
       }
     ],
     "SessionStart": [
       {
         "hooks": [
           {
-            "command": "python3 .claude/hooks/session-start.py",
+            "command": "HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null)/.crosslink/integrations/hooks/session-start.py\"; if [ -f \"$HOOK\" ]; then CROSSLINK_HOOK_PROVIDER=claude python3 \"$HOOK\"; else exit 0; fi",
+            "commandWindows": "powershell -NoProfile -Command \"$root=(git rev-parse --show-toplevel 2>$null); if($LASTEXITCODE -ne 0){exit 0}; $hook=Join-Path $root '.crosslink\\integrations\\hooks\\session-start.py'; if(Test-Path $hook){$env:CROSSLINK_HOOK_PROVIDER='claude'; py -3 $hook}\"",
             "timeout": 10,
             "type": "command"
           }
         ],
-        "matcher": "^(startup|resume|session_start)$"
+        "matcher": "startup|resume|clear|compact"
       }
-    ]
+    ],
+    "_note": "crosslink init re-activates rules-injecting UserPromptSubmit/SubagentStart hooks from its generated integrations. Those hooks read managed Markdown rule inputs and emit them as prompt context, which is the filesystem rule injector S-007 removed; tests/legacy_rule_injector_removed_e2e.rs enforces its absence. Those two hook entries were removed here. Re-running crosslink init restores them; remove them again."
   }
 }
