@@ -1,6 +1,6 @@
 {
   "next_display_id": 1014,
-  "next_comment_id": 716,
+  "next_comment_id": 717,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14709,7 +14709,18 @@
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T03:27:59.048005058Z",
-      "updated_at": "2026-08-19T03:27:59.048005058Z"
+      "updated_at": "2026-08-19T03:56:59.718471561Z",
+      "comments": {
+        "5aa2ecef-eaef-45b7-8033-d1238c3443e3": {
+          "display_id": 716,
+          "author": "6Vw9",
+          "content": "Fixed in the S-017 working diff: every tree-managed Unix subprocess is spawned as a process-group leader, and ACP observes cancellation from an exact-session watcher independent of async-runtime polling. The daemonized descendant test passed ten consecutive all-feature repetitions and inside the complete all-feature suite; the safety assertion was retained.",
+          "created_at": "2026-08-19T03:56:59.715872330Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAWTZC2nEyNZRkXxxmX85Umk6owPHjyI8Gn3ard/OXEVQpo7sC+dxaNAYIvWBg54Xp9kdj+T+ALKPbXjkomhxUAQ=="
+        }
+      }
     },
     "a9aa50b8-c9f5-4f2a-86e0-b5c322367b45": {
       "uuid": "a9aa50b8-c9f5-4f2a-86e0-b5c322367b45",
@@ -22291,11 +22302,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 58,
       "timestamp": "2026-08-19T03:56:55.738277440Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 59,
+      "timestamp": "2026-08-19T03:56:59.718471561Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T03:56:55.738277440Z",
+    "timestamp": "2026-08-19T03:56:59.718471561Z",
     "agent_id": "6Vw9",
-    "agent_seq": 58
+    "agent_seq": 59
   }
 }
