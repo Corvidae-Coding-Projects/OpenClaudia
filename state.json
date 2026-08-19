@@ -1,6 +1,6 @@
 {
   "next_display_id": 1014,
-  "next_comment_id": 713,
+  "next_comment_id": 714,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9827,7 +9827,18 @@
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T02:56:15.116591634Z",
-      "updated_at": "2026-08-19T02:56:15.116591634Z"
+      "updated_at": "2026-08-19T03:56:40.529538284Z",
+      "comments": {
+        "d17b3b17-73a6-4ea9-ac17-d8f223fa6110": {
+          "display_id": 713,
+          "author": "6Vw9",
+          "content": "Fixed in the S-017 working diff: ToolExecutor dry-checks caps before prompts, establishes and consumes exact authorization, then performs one lock-held capped increment immediately before dispatch. Permission denials no longer consume quota; a barrier-based concurrent cap=1 test proves exactly one caller wins. Full all-feature suite and strict Clippy pass.",
+          "created_at": "2026-08-19T03:56:40.526980769Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAY6Xx/NEJmH7j6Y5YDkYDK1MHpho08HVwrzDjrZXQCHImJQ4ezLm7wTaBQ4mBOcjkSZ2eTgW22PTxQsoUOdXSDQ=="
+        }
+      }
     },
     "6d065d4d-a595-4386-90a8-34798a50a78e": {
       "uuid": "6d065d4d-a595-4386-90a8-34798a50a78e",
@@ -22233,11 +22244,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 53,
       "timestamp": "2026-08-19T03:56:36.415208834Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 54,
+      "timestamp": "2026-08-19T03:56:40.529538284Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T03:56:36.415208834Z",
+    "timestamp": "2026-08-19T03:56:40.529538284Z",
     "agent_id": "6Vw9",
-    "agent_seq": 53
+    "agent_seq": 54
   }
 }
