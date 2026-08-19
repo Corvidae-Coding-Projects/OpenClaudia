@@ -19151,11 +19151,12 @@
       "display_id": 1033,
       "title": "Stop closed issue titles from polluting the curated changelog",
       "description": "Closing Crosslink issue #1029 automatically inserted its raw title under CHANGELOG.md Changed, duplicating the existing user-visible S-020 Security entry and violating the changelog header's explicit policy against issue-title dumps. Diagnose the close/export integration and prevent automatic non-user-facing issue titles from modifying the curated product changelog.",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:43:56.056034237Z",
-      "updated_at": "2026-08-19T23:52:47.166894122Z",
+      "updated_at": "2026-08-19T23:52:51.136964768Z",
+      "closed_at": "2026-08-19T23:52:51.136962307Z",
       "labels": [
         "workflow"
       ],
@@ -24864,11 +24865,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 277,
       "timestamp": "2026-08-19T23:52:47.166894122Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 278,
+      "timestamp": "2026-08-19T23:52:51.136964768Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:52:47.166894122Z",
+    "timestamp": "2026-08-19T23:52:51.136964768Z",
     "agent_id": "6Vw9",
-    "agent_seq": 277
+    "agent_seq": 278
   }
 }
