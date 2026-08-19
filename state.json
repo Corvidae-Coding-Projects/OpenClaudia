@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 781,
+  "next_comment_id": 782,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T11:54:58.698762499Z",
+      "updated_at": "2026-08-19T12:13:05.422061724Z",
       "labels": [
         "remediation"
       ],
@@ -15688,6 +15688,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6ZNeDo+5uHfsIP58xbJMWqBVx5U93xXwtQECKmiZiOVrLoepIQh8OoRi5EOG0HpW5VCgIEyt2EQ1qe56uNLXDw=="
+        },
+        "e85163ca-9576-4727-b4ee-55ea9c4a83ab": {
+          "display_id": 781,
+          "author": "6Vw9",
+          "content": "[action] S-019 residual audit found and repaired two ambient-authority paths: MCP child secret environment now validates exact generation-bound names/values from ToolRunContext, and model-dispatched project skills now resolve only from the run working directory up to its immutable project root. Serial all-target compile and focused MCP/skill/adversarial suites pass.",
+          "created_at": "2026-08-19T12:13:05.419456203Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArOd5mDz84ikUbLRA8QU5ZMcousKSY6c+rMssECcwFKXKP+wwoYwnEozjCACAZ029OzPlWx/yuJPoaXKmjuERDw=="
         },
         "f8478f73-aca3-4884-a3c6-f7fcc388157d": {
           "display_id": 761,
@@ -23765,11 +23774,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 185,
       "timestamp": "2026-08-19T11:54:58.698762499Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 186,
+      "timestamp": "2026-08-19T12:13:05.422061724Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T11:54:58.698762499Z",
+    "timestamp": "2026-08-19T12:13:05.422061724Z",
     "agent_id": "6Vw9",
-    "agent_seq": 185
+    "agent_seq": 186
   }
 }
