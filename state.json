@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 782,
+  "next_comment_id": 783,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:13:05.422061724Z",
+      "updated_at": "2026-08-19T12:13:09.689968311Z",
       "labels": [
         "remediation"
       ],
@@ -15661,6 +15661,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAWNB+8+dfS/475pDqOSGm/2MVVc5O7Jr4wbmnyU3kKNyRxe0EvmYWNGdv7ctKEmfwoS1bII9tQyLxgTVhdhOKCQ=="
+        },
+        "e2030bae-31e6-43d4-88d4-a4d2a0445a50": {
+          "display_id": 782,
+          "author": "6Vw9",
+          "content": "Residual root-cause repairs: Stdio MCP reconnects no longer reread OPENCLAUDIA_MCP_ENV_GRANTS; exact secret environment values are included in the immutable run manifest and copied to derived MCP/ACP/subagent runs. Skill tool dispatch no longer uses process CWD; project skill discovery is bounded to each run root, with two-root adversarial coverage. Focused serial verification passed.",
+          "created_at": "2026-08-19T12:13:09.687531516Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAySfpW9GQqwRJfkcIFJy9vTS3nU4m0FVusURN3mFFICdHRLBtn9iSCjdLyBlf1+Zjj6Rj2y/AS/DiiWBC0FGeCA=="
         },
         "e2ac7d6c-f80c-4164-b035-99fbb02d4088": {
           "display_id": 770,
@@ -23779,11 +23788,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 186,
       "timestamp": "2026-08-19T12:13:05.422061724Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 187,
+      "timestamp": "2026-08-19T12:13:09.689968311Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:13:05.422061724Z",
+    "timestamp": "2026-08-19T12:13:09.689968311Z",
     "agent_id": "6Vw9",
-    "agent_seq": 186
+    "agent_seq": 187
   }
 }
