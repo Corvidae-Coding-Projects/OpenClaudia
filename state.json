@@ -1,6 +1,6 @@
 {
   "next_display_id": 1032,
-  "next_comment_id": 828,
+  "next_comment_id": 829,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11395,7 +11395,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T22:55:50.010022472Z",
-      "updated_at": "2026-08-19T23:26:49.973531243Z",
+      "updated_at": "2026-08-19T23:26:58.665051531Z",
       "labels": [
         "remediation"
       ],
@@ -11492,6 +11492,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA3PUqPmvTRN2BZTQXdPg9+VznCi1gIXmXhS/nFSQ9QkoNiV4xb8Mu82Sf9D9Y5WspnHvsIgGt06oN55ug7WYNAA=="
+        },
+        "df80642f-d080-469e-81a8-537917265fdb": {
+          "display_id": 828,
+          "author": "6Vw9",
+          "content": "S-020 implementation, local verification, evidence, QA, and commit 4591ce1 are complete. Publication is blocked by the repository's human-only Git write policy after three audits. Remote/draft PR #66 remain at 9bc74ceb. Resume #1029 after the human runs: git push origin agent/refactor-agent-system-remediation; then monitor hosted CI, close #1029, and complete the goal. Follow-ups #1030 and #1031 remain open.",
+          "created_at": "2026-08-19T23:26:58.653254753Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAIHhuUA5i6nQPSAayQ3IoOMaEUbPJJ1xNTg2NLTf7TX++ywKWW/J9HmKegj/lv/aOZ9sg6gmMOKDAg4V0cT/KDA=="
         }
       }
     },
@@ -24654,11 +24663,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 258,
       "timestamp": "2026-08-19T23:26:54.504017010Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 259,
+      "timestamp": "2026-08-19T23:26:58.665051531Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:26:54.504017010Z",
+    "timestamp": "2026-08-19T23:26:58.665051531Z",
     "agent_id": "6Vw9",
-    "agent_seq": 258
+    "agent_seq": 259
   }
 }
