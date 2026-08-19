@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1015,
+  "next_display_id": 1016,
   "next_comment_id": 723,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -220,6 +220,7 @@
     "39eb52db-a257-4d1f-b1b1-63a198eeec51": 530,
     "3a19f48b-e04b-4b40-bb5d-6489e8265850": 460,
     "3af1e512-5870-4bbe-a22a-8a561869a713": 235,
+    "3b06ddda-4fca-4090-b239-ea203c607079": 1015,
     "3b61ba85-3cf3-4932-8309-c9220f1a6f60": 593,
     "3b829f02-7116-4a6d-8e25-0ee0625f8b26": 554,
     "3c303dc7-f87a-49a9-b45d-87f2132da140": 487,
@@ -5966,6 +5967,18 @@
           "signature": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEe0KY4l/Z7G/vfkx00kFwZtY3FjD8lde6VcPNSNT06kyL5ZUnzQGbJUMzOdlFd65s/RCzZhVJQVonLQ3yKzipGAAAABFjcm9zc2xpbmstY29tbWVudAAAAAAAAAAGc2hhNTEyAAAAZAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASQAAACAHTDmnN5WieoKk458kONMveEkU6s/ZnznXTWYD8ySlEQAAACEA3COR2y119FCMT0XEMpJ6KXNa10jcfRbYx3h6MiOKcCI="
         }
       }
+    },
+    "3b06ddda-4fca-4090-b239-ea203c607079": {
+      "uuid": "3b06ddda-4fca-4090-b239-ea203c607079",
+      "display_id": 1015,
+      "title": "Reject over-broad persisted approval bounds and generation exhaustion",
+      "description": "S-017 review found load_state validates approval uses as merely nonzero and expiry as merely after issuance, despite the schema contract limiting persisted receipts to 64 total uses and 30 days. A trusted-state edit can therefore widen a persisted record beyond its declared bounds. Approval generation increment also uses fetch_add, whose underlying atomic can wrap at u64::MAX. Enforce maximum use/duration and not-before semantics on load, fail closed when generation is exhausted, and add tamper tests.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T04:03:49.140886166Z",
+      "updated_at": "2026-08-19T04:03:49.140886166Z"
     },
     "3b61ba85-3cf3-4932-8309-c9220f1a6f60": {
       "uuid": "3b61ba85-3cf3-4932-8309-c9220f1a6f60",
@@ -22464,11 +22477,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 72,
       "timestamp": "2026-08-19T04:03:08.839539692Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 73,
+      "timestamp": "2026-08-19T04:03:49.140886166Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:03:08.839539692Z",
+    "timestamp": "2026-08-19T04:03:49.140886166Z",
     "agent_id": "6Vw9",
-    "agent_seq": 72
+    "agent_seq": 73
   }
 }
