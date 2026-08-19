@@ -11,6 +11,9 @@ the original record.
 ## [Unreleased]
 
 ### Security
+
+- Replace Bash string/path auto-approval with mandatory typed effects and
+  sandbox-enforced filesystem capabilities (#1029).
 - S-018: Make host safety non-bypassable (#1019)
 
 ### Fixed
@@ -29,6 +32,7 @@ the original record.
 
 ### Changed
 
+- Verify S-019 commit publication and draft PR state (#1027)
 - Enforce deny-first permission precedence and replace broad ambient approvals
   with exact, expiring, generation-bound execution receipts (#1007).
 - Validate one-use permits atomically with generation and exact-denial refresh
@@ -65,6 +69,8 @@ the original record.
 
 ### Cleanup
 
+- Stop tracking generated CPython hook bytecode already covered by
+  `__pycache__/` ignore rules.
 - Run Cargo cleanup for the root and fuzz workspaces, removing approximately
   82 GiB and 1.3 GiB of build artifacts respectively.
 

@@ -262,23 +262,15 @@ pub enum EscalationState {
     ShouldAbort,
 }
 
-/// Bayesian-style auto-allow score for `(tool_name, args)` (crosslink #571).
+/// Typed auto-allow score for `(tool_name, args)` (S-020; F-045).
 ///
-/// Pure function — no manager state required, no I/O. Exposed at the
-/// module level so callers (auto-mode glue, tests, future telemetry)
-/// can read the score without going through a manager instance.
-///
-/// Returns a number in `[0.0, 1.0]`:
-///   * `1.0` — definitely safe (read-only tool category).
-///   * `≥ 0.9` — high confidence (read-only `bash` verbs like `ls`,
-///     `pwd`, `cat`, `git status`).
-///   * `~0.6` — moderate (edits to files inside the project tree).
-///   * `0.3` — default; caller should not auto-allow.
-///   * `0.0` — explicit unsafety (destructive bash tokens or dangerous
-///     shell constructs).
-///
-/// Heuristic only — pairs with `check_auto_allow` which gates on a
-/// caller-supplied threshold and also consults explicit deny rules.
+/// This compatibility API deliberately has only two outcomes. A concrete
+/// invocation that resolves through the mandatory tool registry to
+/// [`crate::tools::effect::ToolEffect::ReadOnly`] scores `1.0`; every
+/// effectful, malformed, or unknown invocation scores `0.0`. In particular,
+/// arbitrary Bash text is never parsed or guessed into a read-only effect.
+/// Callers that need filesystem inspection should use the typed `read_file`,
+/// `list_files`, `glob`, or `grep` tools instead of a shell string.
 #[must_use]
 pub fn auto_allow_score(tool_name: &str, tool_args: &serde_json::Value) -> f32 {
     // S-016/F-001: an unclassifiable call scores 0.0, not 1.0. Previously an
@@ -289,85 +281,11 @@ pub fn auto_allow_score(tool_name: &str, tool_args: &serde_json::Value) -> f32 {
         return 0.0;
     };
 
-    // Only a declared read-only effect is unconditionally safe.
-    if !resolved.effect.requires_authorization() {
-        return 1.0;
+    if resolved.effect.requires_authorization() {
+        0.0
+    } else {
+        1.0
     }
-
-    match resolved.canonical.as_str() {
-        "Bash" => bash_auto_allow_score(&resolved.target),
-        "Edit" | "Write" => edit_auto_allow_score(&resolved.target),
-        _ => 0.3,
-    }
-}
-
-fn bash_auto_allow_score(cmd: &str) -> f32 {
-    // Destructive tokens veto first.
-    const DESTRUCTIVE: &[&str] = &[
-        "rm -rf",
-        "rm -fr",
-        "chmod 777",
-        "sudo ",
-        "dd ",
-        "mkfs",
-        ":>",
-        ">/dev/",
-        "> /dev/",
-        "curl ",
-        "wget ",
-        "shutdown",
-        "reboot",
-    ];
-    const SAFE_PREFIXES: &[&str] = &[
-        "ls",
-        "pwd",
-        "cat ",
-        "echo ",
-        "head ",
-        "tail ",
-        "wc ",
-        "git status",
-        "git diff",
-        "git log",
-        "git branch",
-        "git remote",
-        "git show",
-    ];
-    let lower = cmd.trim_start();
-    if crate::tools::dangerous_shell_construct(lower).is_some() {
-        return 0.0;
-    }
-    for tok in DESTRUCTIVE {
-        if lower.contains(tok) {
-            return 0.0;
-        }
-    }
-    for prefix in SAFE_PREFIXES {
-        if lower.starts_with(prefix) {
-            return 0.95;
-        }
-    }
-    0.3
-}
-
-fn edit_auto_allow_score(path: &str) -> f32 {
-    // System-path edits are clearly unsafe.
-    const UNSAFE_PREFIXES: &[&str] = &["/etc/", "/usr/", "/bin/", "/boot/", "/dev/", "/proc/"];
-    for p in UNSAFE_PREFIXES {
-        if path.starts_with(p) {
-            return 0.0;
-        }
-    }
-    // Project-tree edits get moderate confidence.
-    if path.starts_with("src/")
-        || path.starts_with("tests/")
-        || path.starts_with("examples/")
-        || path.starts_with("./")
-        || !path.starts_with('/')
-    {
-        return 0.6;
-    }
-    0.3
 }
 
 /// Denial-tracking newtype — crosslink #577.
@@ -1221,31 +1139,14 @@ impl PermissionManager {
         }
     }
 
-    /// Classifier-based auto-allow check (crosslink #571).
+    /// Typed-effect auto-allow check (crosslink #571; S-020).
     ///
-    /// Computes a confidence score in `[0.0, 1.0]` that the tool call is
-    /// safe to auto-approve, based on the (`tool_name`, `target_shape`)
-    /// pair. If the score clears `threshold` AND no explicit deny rule
-    /// matches, returns [`CheckResult::Allowed`]; otherwise falls
-    /// through to the normal [`Self::check_with_context`] pipeline.
-    ///
-    /// The classifier is a small Bayesian-style scorer:
-    /// * Tools declaring [`crate::tools::effect::ToolEffect::ReadOnly`] →
-    ///   score 1.0 (always auto-allow).
-    /// * Tools whose call cannot be classified at all, including unknown
-    ///   names → score 0.0 (never auto-allow). This is the F-001 inversion:
-    ///   an absent classification used to score 1.0.
-    /// * `Bash` commands matching a known-safe verb prefix (`ls`, `cat`,
-    ///   `pwd`, `echo`, `git status`, `git diff`, `git log`) → 0.95.
-    /// * `Bash` commands containing destructive tokens (`rm -rf`,
-    ///   `chmod 777`, `sudo`, `dd `, `mkfs`, `:>`, `>/dev/`) → 0.0.
-    /// * `Bash` commands containing dangerous shell constructs → 0.0.
-    /// * `Edit` / `Write` to paths under `src/` or `tests/` → 0.6.
-    /// * Everything else → 0.3.
-    ///
-    /// An explicit `Deny` session rule short-circuits to 0.0 regardless
-    /// of the heuristic score. Mirrors CC `classifyYoloAction` in
-    /// `utils/permissions/yoloClassifier.ts`.
+    /// Only a successfully parsed invocation whose mandatory declaration is
+    /// `ReadOnly` can be auto-approved. Bash, edits, writes, and every other
+    /// effectful operation always fall through to explicit policy, regardless
+    /// of lexical appearance or `threshold`. Explicit denials are evaluated
+    /// first and remain authoritative. Non-finite or out-of-range thresholds
+    /// disable this compatibility shortcut rather than weakening it.
     pub fn check_auto_allow(
         &self,
         tool_name: &str,
@@ -1257,13 +1158,15 @@ impl PermissionManager {
             return CheckResult::Denied(reason);
         }
         let score = auto_allow_score(tool_name, tool_args);
+        let valid_threshold = threshold.is_finite() && (0.0..=1.0).contains(&threshold);
         debug!(
             tool = %tool_name,
             score,
             threshold,
-            "auto-allow classifier score"
+            valid_threshold,
+            "typed auto-allow classification"
         );
-        if score > 0.0 && score >= threshold {
+        if valid_threshold && score > 0.0 && score >= threshold {
             return CheckResult::Allowed;
         }
         // Fall through to the normal pipeline (with interactive context
@@ -2989,56 +2892,41 @@ mod phase2_spec_pins {
         assert!(matches!(r, CheckResult::Denied(_)));
     }
 
-    // ── Crosslink #571: classifier auto-allow tests ────────────────────────
+    // ── Crosslink #571 / S-020: typed auto-allow tests ─────────────────────
 
     /// Pin: read-only tools (e.g. `read_file`, `list_files`) score 1.0.
     #[test]
     fn auto_allow_score_read_only_is_one() {
         assert!(
             (auto_allow_score("read_file", &json!({"path": "/x"})) - 1.0).abs() < f32::EPSILON,
-            "#571: read_file (no permission target) must score 1.0"
+            "read_file's declared ReadOnly effect must score 1.0"
         );
         assert!((auto_allow_score("list_files", &json!({})) - 1.0).abs() < f32::EPSILON);
     }
 
-    /// Pin: safe `bash` verb prefixes score high (>=0.9).
+    /// Bash remains effectful regardless of how benign its text appears.
     #[test]
-    fn auto_allow_score_safe_bash_prefixes_high() {
-        assert!(auto_allow_score("bash", &json!({"command": "ls -la"})) >= 0.9);
-        assert!(auto_allow_score("bash", &json!({"command": "git status"})) >= 0.9);
-        assert!(auto_allow_score("bash", &json!({"command": "git diff HEAD"})) >= 0.9);
+    fn auto_allow_score_every_bash_shape_is_zero() {
+        for command in [
+            "ls -la",
+            "git status",
+            "git push origin HEAD",
+            "python3 -c 'print(1)'",
+            "cat input | rm -f output",
+        ] {
+            assert!(auto_allow_score("bash", &json!({"command": command})) < f32::EPSILON);
+        }
     }
 
-    /// Pin: destructive bash tokens score 0.0 (hard veto).
+    /// A benign-looking Bash command falls through to explicit policy.
     #[test]
-    fn auto_allow_score_destructive_bash_is_zero() {
-        assert!(auto_allow_score("bash", &json!({"command": "rm -rf /"})) < f32::EPSILON);
-        assert!(auto_allow_score("bash", &json!({"command": "sudo apt update"})) < f32::EPSILON);
-        assert!(auto_allow_score("bash", &json!({"command": "chmod 777 /etc"})) < f32::EPSILON);
-    }
-
-    /// Pin: dangerous shell constructs score 0.0 even when the outer
-    /// command starts with a normally safe verb.
-    #[test]
-    fn auto_allow_score_dangerous_shell_constructs_are_zero() {
-        assert!(auto_allow_score("bash", &json!({"command": "echo hi | sh"})) < f32::EPSILON);
-        assert!(auto_allow_score("bash", &json!({"command": "cat <(printf hi)"})) < f32::EPSILON);
-    }
-
-    /// Pin: `check_auto_allow` allows safe bash above threshold.
-    #[test]
-    fn check_auto_allow_safe_bash_passes() {
+    fn check_auto_allow_bash_requires_policy() {
         let (mgr, _dir) = enabled(vec![]);
-        let r = mgr.check_auto_allow("bash", &json!({"command": "ls"}), 0.8);
-        assert_eq!(
-            r,
-            CheckResult::Allowed,
-            "#571: safe bash above threshold must auto-allow"
-        );
+        let r = mgr.check_auto_allow("bash", &json!({"command": "ls"}), 0.0);
+        assert!(matches!(r, CheckResult::NeedsPrompt { .. }));
     }
 
-    /// Pin: `check_auto_allow` respects explicit deny rules even when
-    /// the classifier would allow.
+    /// Explicit denials remain authoritative before typed auto-approval.
     #[test]
     fn check_auto_allow_explicit_deny_overrides_classifier() {
         let (mut mgr, _dir) = enabled(vec![]);
@@ -3050,23 +2938,18 @@ mod phase2_spec_pins {
         let r = mgr.check_auto_allow("bash", &json!({"command": "ls"}), 0.8);
         assert!(
             matches!(r, CheckResult::Denied(_)),
-            "#571: explicit Deny must beat classifier auto-allow, got: {r:?}"
+            "explicit Deny must beat typed auto-approval, got: {r:?}"
         );
     }
 
-    /// Pin: low-confidence calls fall through to the normal pipeline
-    /// (`NeedsPrompt` under interactive context).
+    /// Invalid thresholds cannot create auto-approval authority.
     #[test]
-    fn check_auto_allow_low_score_falls_through() {
+    fn check_auto_allow_invalid_threshold_falls_through() {
         let (mgr, _dir) = enabled(vec![]);
-        // `wget` is in the destructive list — score 0.0, threshold 0.5
-        // is never met. Without an explicit Deny rule, the fall-through
-        // is NeedsPrompt.
-        let r = mgr.check_auto_allow("bash", &json!({"command": "echo ok && wget x"}), 0.5);
-        assert!(
-            matches!(r, CheckResult::NeedsPrompt { .. }),
-            "#571: low score must fall through to NeedsPrompt, got: {r:?}"
-        );
+        for threshold in [f32::NAN, -0.1, 1.1] {
+            let r = mgr.check_auto_allow("bash", &json!({"command": "ls"}), threshold);
+            assert!(matches!(r, CheckResult::NeedsPrompt { .. }));
+        }
     }
 
     // ── Crosslink #577: DenialTracker tests ────────────────────────────────

@@ -75,20 +75,14 @@ pub use accumulator::{
 /// Credential-sensitivity classifier re-exported for use outside the tools
 /// module (e.g. `hooks::mod` env-scrub logic). Avoids making `bash` public.
 pub(crate) use bash::is_sensitive_env;
-/// Bash command-policy gates re-exported for the security E2E test suite
-/// (`tests/tools_security_e2e.rs`). Exposed at this layer so attack-catalog
-/// tests can drive the gates directly without spawning the attacker
-/// payloads — the alternative (calling `execute_tool`) would actually
-/// execute any payload that slipped past the policy, hanging the runner
-/// (e.g. `find / -name '*.key' -exec cat {} +`). Keeping the bash
-/// submodule itself private avoids pedantic-lint churn on its other
-/// pub-fns.
+/// Bash command-policy gates re-exported for the security E2E test suite.
+/// Attack-catalog tests drive the deny-only defence-in-depth checks without
+/// spawning the payloads. Effect classification and auto-approval come only
+/// from the typed registry, never from these string scanners.
 pub use bash::policy::{
-    dangerous_shell_construct, is_safe_for_auto_allow, is_sensitive_env as is_sensitive_env_pub,
-    validate_command, MAX_COMMAND_LEN,
+    dangerous_shell_construct, is_sensitive_env as is_sensitive_env_pub, validate_command,
+    MAX_COMMAND_LEN,
 };
-/// Explicit run-derived Bash path allowlist (crosslink #594, S-019).
-pub use bash::PathConstraints;
 /// Process-wide background shell registry, re-exported so the
 /// coordinator's [`crate::coordinator::tasks::LocalShellTask`]
 /// (crosslink #611) can query running shells without taking a

@@ -8,6 +8,12 @@ Depends on: [S-010](./010-canonical-run-context-and-events.md), [S-018](./018-no
 
 Canonical sources: [full audit](../full-codebase-audit-2026-08-16.md) and [remediation design](../production-remediation-design.md).
 
+> Superseded path-boundary note: the `PathConstraints` and
+> `path_constraints_run_scoped_e2e` references below are historical evidence
+> for the exact S-019 generation. S-020 subsequently removed that lexical
+> allow/deny surface, retained only non-authoritative telemetry, and moved the
+> live proof to OS-sandbox enforcement.
+
 ## Outcome
 
 Require explicit workspace, filesystem, process, network, and secret capabilities instead of granting ambient CWD access when context is missing.

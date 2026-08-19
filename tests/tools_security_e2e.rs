@@ -9,16 +9,12 @@
 //! rather than the leaf modules in isolation.
 //!
 //! Coverage shape:
-//!   - **bash command injection catalog** — hostile strings spanning
+//!   - **bash defence-in-depth catalog** — hostile strings spanning
 //!     command substitution, process substitution, pipe-to-interpreter,
 //!     eval/source/dot, find-exec, tokenization bypass, and environment
-//!     exfiltration. Every one must be caught by `validate_command` or
-//!     `dangerous_shell_construct`. Includes a counter-test of 10 benign
-//!     commands that must NOT be flagged.
-//!   - **path constraints** — install a `PathConstraints` rooted on a
-//!     tempdir, verify the `allows()` predicate accepts paths inside
-//!     and refuses traversal-via-dotdot and absolute paths to
-//!     `/etc/passwd`.
+//!     exfiltration. Every one must be caught by `validate_command` or the
+//!     deny-only `dangerous_shell_construct` diagnostic. Includes a
+//!     counter-test of benign commands that must not be denied.
 //!   - **atomic file write** — 4 concurrent writer threads racing on
 //!     the same target file via `write_file`. The final file must
 //!     exactly equal ONE writer's payload — never a torn splice.
@@ -32,12 +28,10 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::{
-    dangerous_shell_construct, execute_tool, is_safe_for_auto_allow,
-    is_sensitive_env_pub as is_sensitive_env, validate_command, FunctionCall, PathConstraints,
-    ToolCall, MAX_COMMAND_LEN,
+    dangerous_shell_construct, execute_tool, is_sensitive_env_pub as is_sensitive_env,
+    validate_command, FunctionCall, ToolCall, MAX_COMMAND_LEN,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
@@ -106,22 +100,18 @@ const ATTACK_STRINGS: &[&str] = &[
 /// bug surface we're testing, and we don't want the test runner to
 /// hang or scan the entire filesystem if the bug ever returns.
 ///
-/// The contract is two-sided: at least one of `validate_command`
-/// or `dangerous_shell_construct` MUST catch every attack, AND
-/// `is_safe_for_auto_allow` MUST be false for every one (otherwise
-/// the permission layer would silently auto-approve the attack).
+/// The contract here is deliberately one-sided: at least one of
+/// `validate_command` or `dangerous_shell_construct` must catch every attack.
+/// S-020 tests auto-approval separately through typed effect resolution; this
+/// lexical catalog is not permitted to make positive authority claims.
 #[test]
 fn bash_attack_catalog_is_caught_by_policy_gates() {
     let mut leaked = Vec::new();
     for cmd in ATTACK_STRINGS {
         let validated = validate_command(cmd).is_err();
         let danger = dangerous_shell_construct(cmd).is_some();
-        let auto_allowed = is_safe_for_auto_allow(cmd);
         if !validated && !danger {
             leaked.push(format!("PASSED ALL GATES: {cmd:?}"));
-        }
-        if auto_allowed {
-            leaked.push(format!("FALSELY AUTO-ALLOWED: {cmd:?}"));
         }
     }
     assert!(
@@ -196,94 +186,6 @@ fn sensitive_env_keys_classified_correctly() {
     for k in &["HOME", "PATH", "USER", "LANG", "TERM", "PWD", "SHELL", "TZ"] {
         assert!(!is_sensitive_env(k), "{k:?} must NOT be sensitive");
     }
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — PathConstraints (re-exported public type)
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn path_constraints_allow_paths_inside_root() {
-    let dir = tempdir().expect("tempdir");
-    let inside = dir.path().join("inside.txt");
-    std::fs::write(&inside, "ok").expect("write");
-    let pc = PathConstraints::new([dir.path().to_path_buf()]);
-    assert!(
-        pc.allows(&inside),
-        "path inside root must be allowed: {inside:?}"
-    );
-}
-
-#[test]
-fn path_constraints_refuse_paths_outside_root() {
-    let dir = tempdir().expect("tempdir");
-    let outside_file = dir
-        .path()
-        .parent()
-        .expect("parent")
-        .join(format!("outside-{}.tmp", std::process::id()));
-    std::fs::write(&outside_file, "evil").expect("write outside");
-    let pc = PathConstraints::new([dir.path().to_path_buf()]);
-    let refused = !pc.allows(&outside_file);
-    // Always clean up the planted file before the assertion so a
-    // failure doesn't leave debris in the parent directory.
-    let _ = std::fs::remove_file(&outside_file);
-    assert!(
-        refused,
-        "path outside root must be refused: {outside_file:?}"
-    );
-}
-
-#[test]
-fn path_constraints_reject_dotdot_traversal() {
-    let dir = tempdir().expect("tempdir");
-    let inside = dir.path().join("inside");
-    std::fs::create_dir(&inside).expect("mkdir");
-    let outside_file = dir
-        .path()
-        .parent()
-        .expect("parent")
-        .join(format!("escape-{}.tmp", std::process::id()));
-    std::fs::write(&outside_file, "evil").expect("write outside");
-
-    let pc = PathConstraints::new([dir.path().to_path_buf()]);
-    // inside/../../escape-PID.tmp resolves OUTSIDE root.
-    let traversal: PathBuf = inside
-        .join("..")
-        .join("..")
-        .join(outside_file.file_name().expect("filename"));
-    let refused = !pc.allows(&traversal);
-    let _ = std::fs::remove_file(&outside_file);
-    assert!(
-        refused,
-        "..-traversal escaping root must be refused: {traversal:?}"
-    );
-}
-
-#[test]
-fn path_constraints_empty_is_unrestricted() {
-    // Empty constraints = no policy active. The proxy installs
-    // constraints only conditionally; absent install means
-    // everything passes. Use an empty iterator since `Default` is
-    // not impl'd on this type.
-    let pc = PathConstraints::new(std::iter::empty::<PathBuf>());
-    assert!(pc.is_empty());
-    assert!(
-        pc.allows(std::path::Path::new("/etc/passwd")),
-        "empty constraints must allow everything (no policy installed)"
-    );
-}
-
-#[test]
-fn path_constraints_check_command_refuses_absolute_outside_root() {
-    let dir = tempdir().expect("tempdir");
-    let pc = PathConstraints::new([dir.path().to_path_buf()]);
-    // `cat /etc/passwd` touches a path outside the tempdir root.
-    let outcome = pc.check_command("cat /etc/passwd");
-    assert!(
-        outcome.is_err(),
-        "command touching /etc/passwd must be refused, got {outcome:?}"
-    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

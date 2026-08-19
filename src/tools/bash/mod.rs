@@ -1,11 +1,10 @@
 mod kill;
 mod output;
-pub mod path_constraints;
+mod path_lint;
 pub mod sandbox;
 // `policy` is exposed so the security E2E test suite
 // (`tests/tools_security_e2e.rs`) can drive `validate_command`,
-// `is_safe_for_auto_allow`, `dangerous_shell_construct`, and
-// `is_sensitive_env` against the documented attack catalog
+// `dangerous_shell_construct`, and `is_sensitive_env` against the attack catalog
 // without actually executing the attack payloads. Internal call
 // sites use the same path.
 pub mod policy;
@@ -13,11 +12,7 @@ pub mod policy;
 pub use kill::terminate_sandbox_process_tree;
 pub use kill::{execute_kill_shell, execute_kill_shells_for_agent, terminate_process_tree};
 pub use output::{bash_output_operations, classify_bash_output, execute_bash_output};
-pub use path_constraints::PathConstraints;
-pub use policy::{
-    apply_env_scrub, dangerous_shell_construct, is_safe_for_auto_allow, is_sensitive_env,
-    validate_command,
-};
+pub use policy::{apply_env_scrub, dangerous_shell_construct, is_sensitive_env, validate_command};
 
 use crate::tools::args::{ToolArgError, ToolArgs as _, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
@@ -823,29 +818,27 @@ pub fn try_execute_bash(
         return Err(ToolError::InvalidInput(msg));
     }
 
-    // Crosslink #594: derive the path gate from this exact run. Composition
-    // roots cannot disable or replace another run's constraints through
-    // ambient process state.
-    if let Err(msg) = PathConstraints::from_run(run).check_command(command) {
-        return Err(ToolError::PermissionDenied(msg));
+    // S-020/F-050: this deliberately shallow lexical scan is telemetry only.
+    // It cannot grant or deny access; immutable capabilities and the OS
+    // sandbox enforce the actual filesystem boundary.
+    let outside_root_tokens = path_lint::outside_run_root_count(run, command);
+    if outside_root_tokens > 0 {
+        tracing::warn!(
+            target: "openclaudia::bash",
+            event = "non_authoritative_path_lint",
+            run_id = %run.run_id(),
+            outside_root_tokens,
+            "Bash text contains literal paths outside declared roots; the lexical lint is non-authoritative and sandbox containment remains decisive"
+        );
     }
 
-    // Diagnostic: log whether the command would qualify for auto-allow under
-    // the CC-parity safety check (`bashCommandIsSafe_DEPRECATED`). This does
-    // NOT gate execution — the permissions layer owns the actual prompt
-    // decision — but exposes a structured signal for the permissions wire-up
-    // (crosslink #589) and for ops-side audit of which commands the model is
-    // running unprompted.
-    if is_safe_for_auto_allow(command) {
+    if let Some(reason) = dangerous_shell_construct(command) {
         tracing::debug!(
-            command = %command,
-            "#589: bash command eligible for safety auto-allow (read-only + no dangerous constructs)"
-        );
-    } else if let Some(reason) = dangerous_shell_construct(command) {
-        tracing::debug!(
-            command = %command,
+            target: "openclaudia::bash",
+            event = "bash_structural_lint",
+            run_id = %run.run_id(),
             reason = reason,
-            "#589: bash command contains dangerous shell construct — auto-allow refused"
+            "Bash text contains a defence-in-depth structural finding; typed policy remains authoritative"
         );
     }
 

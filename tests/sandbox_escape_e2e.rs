@@ -11,7 +11,6 @@ use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
 use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
 use openclaudia::tools::{FunctionCall, ToolCall};
 use serde_json::json;
-use std::fmt::Write as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -92,29 +91,24 @@ fn host_file_network_and_kernel_trees_are_absent() {
     std::fs::write(&sentinel, "host-secret").expect("host sentinel");
     let quoted = shlex::try_quote(sentinel.to_str().expect("UTF-8 sentinel")).expect("quote");
 
-    // A literal out-of-root path must be rejected by the run capability
-    // before a process starts. Keep this assertion separate from the runtime
-    // sandbox probe below so one defence does not masquerade as the other.
-    let lexical_denial = bash_unlocked(&format!("test -e {quoted}"));
-    assert!(lexical_denial.is_error());
-    assert!(lexical_denial
-        .content()
-        .contains("outside the bash tool's allowed roots"));
+    // S-020: keep the host path literal. The lexical path scan may report a
+    // diagnostic, but it cannot reject or authorize this command. A successful
+    // probe that observes the path as absent proves the OS sandbox is the
+    // enforcement boundary.
+    let literal_probe = bash_unlocked(&format!(
+        "if test -e {quoted}; then printf host_file_blocked=false; else printf host_file_blocked=true; fi"
+    ));
+    assert!(
+        !literal_probe.is_error(),
+        "literal path must reach the sandbox: {}",
+        literal_probe.content()
+    );
+    assert!(literal_probe.content().contains("host_file_blocked=true"));
+    assert!(!literal_probe.content().contains("host-secret"));
 
-    // Encode the path so the deliberately shallow shell-token path gate does
-    // not see a literal absolute path. The child reconstructs it only after
-    // entering the OS sandbox, which directly proves the host mount is absent.
-    let sentinel_bytes = sentinel.as_os_str().as_encoded_bytes();
-    let mut sentinel_hex = String::with_capacity(sentinel_bytes.len() * 2);
-    for byte in sentinel_bytes {
-        write!(&mut sentinel_hex, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    let python = format!(
-        r#"
+    let python = r#"
 import errno, os, socket
-host_path = bytes.fromhex("{sentinel_hex}").decode()
 kernel_path = os.path.join(os.sep, "sys", "kernel")
-print("host_file_blocked=" + str(not os.path.exists(host_path)).lower())
 print("sys_blocked=" + str(not os.path.exists(kernel_path)).lower())
 blocked = []
 for family, kind in [(socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET6, socket.SOCK_DGRAM), (socket.AF_UNIX, socket.SOCK_STREAM)]:
@@ -124,15 +118,12 @@ for family, kind in [(socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET6, soc
     except OSError as error:
         blocked.append(error.errno in (errno.EPERM, errno.EACCES))
 print("network_blocked=" + str(all(blocked)).lower())
-"#
-    );
-    let python = shlex::try_quote(&python).expect("quote Python");
+"#;
+    let python = shlex::try_quote(python).expect("quote Python");
     let result = bash_unlocked(&format!("python3 -c {python}"));
     assert!(!result.is_error(), "probe failed: {}", result.content());
-    assert!(result.content().contains("host_file_blocked=true"));
     assert!(result.content().contains("sys_blocked=true"));
     assert!(result.content().contains("network_blocked=true"));
-    assert!(!result.content().contains("host-secret"));
 }
 
 #[test]
@@ -213,8 +204,7 @@ fn inherited_host_file_descriptor_is_closed() {
     let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
     assert!(raw >= 0, "open inherited descriptor");
     let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
-    // Read the inherited descriptor directly so the run-scoped path gate does
-    // not reject a literal /proc path before the sandbox gets to close it.
+    // Read the inherited descriptor directly so the sandbox must close it.
     let python = format!(
         r#"
 import os
