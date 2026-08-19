@@ -7823,12 +7823,13 @@
       "display_id": 1014,
       "title": "Verify ACP exact permit enforcement after S-017 gate removal",
       "description": "Final pre-commit trace questioned whether removing acp_permission_gate left ACP-normalized tools outside exact permission and quota enforcement. Full call-chain inspection established that read_file/write_file/edit_file/bash/bash_output/kill_shell/list_files/glob/grep all normalize into execute_local_tool or execute_local_tool_async, and internal/MCP tools use execute_local_tool directly. Every route reaches ToolExecutor::execute with the PermissionManager and PolicyEnforcer, which authorizes and consumes a call-bound permit before atomically recording quota. No bypass exists; update the stale method comment and retain the trace as review evidence.",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:02:07.465322183Z",
-      "updated_at": "2026-08-19T04:03:01.692330222Z",
+      "updated_at": "2026-08-19T04:03:08.839539692Z",
+      "closed_at": "2026-08-19T04:03:08.839538242Z",
       "labels": [
         "s-017"
       ],
@@ -22458,11 +22459,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 71,
       "timestamp": "2026-08-19T04:03:01.692330222Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 72,
+      "timestamp": "2026-08-19T04:03:08.839539692Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:03:01.692330222Z",
+    "timestamp": "2026-08-19T04:03:08.839539692Z",
     "agent_id": "6Vw9",
-    "agent_seq": 71
+    "agent_seq": 72
   }
 }
