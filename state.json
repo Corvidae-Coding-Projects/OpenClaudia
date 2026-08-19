@@ -1,6 +1,6 @@
 {
   "next_display_id": 1030,
-  "next_comment_id": 819,
+  "next_comment_id": 820,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11384,7 +11384,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T22:55:50.010022472Z",
-      "updated_at": "2026-08-19T22:57:25.551670476Z",
+      "updated_at": "2026-08-19T23:00:03.083577621Z",
       "labels": [
         "remediation"
       ],
@@ -11397,6 +11397,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUaxELHldGf1IJmR275KPPFj+PznR+GnpVtiGGrDLQl60dwyQEvnYuqk81wE28LWoNsvR6boZik7/p5rntaI0Bg=="
+        },
+        "953b4c1a-a2c6-4ca8-835b-a6a5e36beee3": {
+          "display_id": 819,
+          "author": "6Vw9",
+          "content": "S-020 design: make PermissionManager auto-mode derive eligibility solely from mandatory typed effect resolution (only ToolEffect::ReadOnly scores 1.0; Bash and all mutations score 0 and require explicit policy). Remove first-program/string/path scoring. Replace the public rejecting PathConstraints authority surface with an internal run-scoped lexical diagnostic that only emits a structured warning; the OS sandbox and immutable ToolRunContext roots remain enforcement. Replace legacy tests with adversarial authorization tests covering aliases, interpreters, quoting, substitutions, redirection, scripts, VCS/package commands, and mixed pipelines; update Linux escape proof so a literal external path reaches the sandbox and is hidden there.",
+          "created_at": "2026-08-19T23:00:03.080968356Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALOnK+jjcTXdYsmr+RFpiPVWJuczNX/pK6HPdy0rMuOLO7go1ui8P/ZUb6uCp7+oglW8tJpunYpH3b2+XTY1FBQ=="
         }
       }
     },
@@ -24470,11 +24479,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 243,
       "timestamp": "2026-08-19T22:57:25.551670476Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 244,
+      "timestamp": "2026-08-19T23:00:03.083577621Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T22:57:25.551670476Z",
+    "timestamp": "2026-08-19T23:00:03.083577621Z",
     "agent_id": "6Vw9",
-    "agent_seq": 243
+    "agent_seq": 244
   }
 }
