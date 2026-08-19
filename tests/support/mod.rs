@@ -53,6 +53,31 @@ pub fn shared_run_context() -> &'static Arc<ToolRunContext> {
     RUN.get_or_init(|| test_run_context(Path::new(env!("CARGO_MANIFEST_DIR"))))
 }
 
+/// Build a run that explicitly snapshots the host process toolchain inputs.
+///
+/// Most integration tests intentionally use the deterministic default PATH.
+/// Sandbox toolchain probes use this variant because production frontends
+/// capture host startup grants and must support user-local Cargo installs.
+pub fn host_toolchain_run_context(root: &Path) -> Arc<ToolRunContext> {
+    ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .working_directory(root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .executable_search_path(
+            std::env::var_os("PATH")
+                .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin")),
+        )
+        .host_home(dirs::home_dir().and_then(|path| path.canonicalize().ok()))
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("host-toolchain-test")
+        .build()
+        .expect("host toolchain test run must produce an explicit capability")
+}
+
 pub fn dispatch_tool_result_in(
     root: &Path,
     name: &str,

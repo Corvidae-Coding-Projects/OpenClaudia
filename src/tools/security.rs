@@ -80,6 +80,7 @@ pub struct ToolRunContextBuilder {
     environment_grants: Option<HashMap<String, String>>,
     mcp_environment_grants: Option<HashMap<String, String>>,
     executable_search_path: Option<OsString>,
+    host_home: Option<PathBuf>,
     inherit_host_startup_grants: bool,
     workspace_access: Option<WorkspaceAccess>,
     process: Option<bool>,
@@ -103,6 +104,7 @@ impl ToolRunContextBuilder {
             environment_grants: None,
             mcp_environment_grants: None,
             executable_search_path: None,
+            host_home: None,
             inherit_host_startup_grants: false,
             workspace_access: None,
             process: None,
@@ -198,6 +200,18 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Supply the host-home snapshot associated with a captured toolchain.
+    ///
+    /// Linux sandbox construction uses this exact path only to expose
+    /// conventional Cargo and Rustup trees read-only. Derived runs must copy
+    /// their parent's value; top-level composition roots normally capture it
+    /// through [`Self::host_startup_grants`].
+    #[must_use]
+    pub fn host_home(mut self, path: Option<PathBuf>) -> Self {
+        self.host_home = path;
+        self
+    }
+
     #[must_use]
     pub const fn process(mut self, available: bool) -> Self {
         self.process = Some(available);
@@ -265,6 +279,7 @@ pub struct ToolRunContext {
     environment_grants: HashMap<String, String>,
     mcp_environment_grants: HashMap<String, String>,
     executable_search_path: OsString,
+    host_home: Option<PathBuf>,
     network_policy: AgentNetworkPolicy,
     process_available: bool,
     network_available: bool,
@@ -297,6 +312,7 @@ impl std::fmt::Debug for ToolRunContext {
                 &self.mcp_environment_grants.len(),
             )
             .field("executable_search_path", &"<redacted>")
+            .field("host_home_bound", &self.host_home.is_some())
             .field("process_available", &self.process_available)
             .field("network_available", &self.network_available)
             .field("secrets_available", &self.secrets_available)
@@ -357,6 +373,7 @@ impl ToolRunContext {
             environment_grants,
             mcp_environment_grants,
             executable_search_path,
+            host_home,
             inherit_host_startup_grants,
             workspace_access,
             process,
@@ -484,6 +501,13 @@ impl ToolRunContext {
             }
             None => default_executable_search_path(),
         };
+        let host_home = match host_home {
+            Some(path) => Some(canonical_directory(&path, "host home")?),
+            None if inherit_host_startup_grants => {
+                dirs::home_dir().and_then(|path| path.canonicalize().ok())
+            }
+            None => None,
+        };
         if !secrets {
             if let Some(name) = environment_grants
                 .keys()
@@ -541,6 +565,7 @@ impl ToolRunContext {
             &environment_grants,
             &mcp_environment_grants,
             &executable_search_path,
+            host_home.as_deref(),
             network_policy,
             &grants,
             &process_owner,
@@ -595,6 +620,7 @@ impl ToolRunContext {
             environment_grants,
             mcp_environment_grants,
             executable_search_path,
+            host_home,
             network_policy,
             process_available: process,
             network_available: network,
@@ -749,6 +775,7 @@ impl ToolRunContext {
             &self.environment_grants,
             &self.mcp_environment_grants,
             &self.executable_search_path,
+            self.host_home.as_deref(),
             self.network_policy,
             grants,
             &self.process_owner,
@@ -850,6 +877,7 @@ impl ToolRunContext {
             .environment_grants(self.environment_grants.clone())
             .mcp_environment_grants(self.mcp_environment_grants.clone())
             .executable_search_path(&self.executable_search_path)
+            .host_home(self.host_home.clone())
             .workspace_access(workspace_access)
             .process(self.grants_resource(ToolResource::Process))
             .network(self.grants_resource(ToolResource::Network))
@@ -932,6 +960,15 @@ impl ToolRunContext {
     #[must_use]
     pub fn executable_search_path(&self) -> &OsStr {
         &self.executable_search_path
+    }
+
+    /// Host-home path captured at composition time for local toolchain mounts.
+    ///
+    /// The sandbox never exposes this directory wholesale. It may bind only
+    /// conventional Cargo binary/registry and Rustup subtrees read-only.
+    #[must_use]
+    pub fn host_home(&self) -> Option<&Path> {
+        self.host_home.as_deref()
     }
 
     /// Resolve an executable using only the immutable search path captured by
@@ -1110,6 +1147,7 @@ fn capability_manifest_digest(
     environment_grants: &HashMap<String, String>,
     mcp_environment_grants: &HashMap<String, String>,
     executable_search_path: &OsStr,
+    host_home: Option<&Path>,
     network_policy: AgentNetworkPolicy,
     grants: &BTreeSet<CapabilityKind>,
     process_owner: &str,
@@ -1163,6 +1201,11 @@ fn capability_manifest_digest(
     manifest.push_str("executable_search_path=");
     manifest
         .push_str(&ContentDigest::sha256(executable_search_path.as_encoded_bytes()).to_string());
+    manifest.push('\n');
+    manifest.push_str("host_home=");
+    if let Some(path) = host_home {
+        manifest.push_str(&path.to_string_lossy());
+    }
     manifest.push('\n');
     manifest.push_str("network_policy=");
     let _ = write!(manifest, "{network_policy:?}");
@@ -1821,6 +1864,7 @@ mod tests {
         let child_root = root.path().join("child");
         std::fs::create_dir(&child_root).expect("child project root");
         let foreign = tempfile::tempdir().expect("foreign project root");
+        let host_home = tempfile::tempdir().expect("host-home snapshot");
         let parent = ToolRunContext::builder(SessionId::new(), root.path())
             .read_only_roots(Vec::new())
             .read_write_roots(Vec::new())
@@ -1828,6 +1872,7 @@ mod tests {
                 "S019_DERIVED_ENV".to_string(),
                 "immutable".to_string(),
             )]))
+            .host_home(Some(host_home.path().to_path_buf()))
             .workspace_access(WorkspaceAccess::ReadWrite)
             .process(true)
             .network(false)
@@ -1855,6 +1900,11 @@ mod tests {
                 .get("S019_DERIVED_ENV")
                 .map(String::as_str),
             Some("immutable")
+        );
+        assert_eq!(child.host_home(), parent.host_home());
+        assert_eq!(
+            child.host_home(),
+            Some(host_home.path().canonicalize().unwrap().as_path())
         );
         assert!(child.require(ToolResource::Process).is_ok());
         assert!(matches!(
@@ -2089,6 +2139,7 @@ mod tests {
             &HashMap::from([("S019_MARKER".to_string(), "first".to_string())]),
             &HashMap::new(),
             OsStr::new("/usr/bin"),
+            None,
             AgentNetworkPolicy::Denied,
             &grants,
             "owner",
@@ -2106,6 +2157,7 @@ mod tests {
             &HashMap::from([("S019_MARKER".to_string(), "second".to_string())]),
             &HashMap::new(),
             OsStr::new("/usr/bin"),
+            None,
             AgentNetworkPolicy::Denied,
             &grants,
             "owner",

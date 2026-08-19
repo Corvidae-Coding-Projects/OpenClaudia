@@ -426,14 +426,12 @@ fn linux_bubblewrap_command(
         ));
     }
     let project_root = security.project_root();
-    let host_home = dirs::home_dir().and_then(|path| path.canonicalize().ok());
+    let host_home = security.host_home();
 
     // A writable bind of HOME (or an ancestor of it) would make the nominal
     // "project" mount expose credentials and host configuration.
     if is_unsafe_broad_project_root(project_root)
-        || host_home
-            .as_ref()
-            .is_some_and(|home| home == project_root || home.starts_with(project_root))
+        || host_home.is_some_and(|home| home == project_root || home.starts_with(project_root))
     {
         return Err(format!(
             "Refusing to sandbox Bash with working directory '{}': choose a dedicated \
@@ -454,9 +452,8 @@ fn linux_bubblewrap_command(
         "Building agent subprocess sandbox from immutable session capabilities"
     );
 
-    let sandbox_home = host_home
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/home/openclaudia"));
+    let sandbox_home =
+        host_home.map_or_else(|| PathBuf::from("/home/openclaudia"), Path::to_path_buf);
     let pinned_bind_roots = security.duplicate_linux_bind_roots()?;
     let mut metadata_bind_fds = Vec::new();
     let mut cmd = Command::new(&backend.path);
@@ -498,7 +495,7 @@ fn linux_bubblewrap_command(
     // metadata; binaries and the registry cache are nested read-only binds.
     let sandbox_cargo = sandbox_home.join(".cargo");
     add_directory(&mut cmd, &mut made_dirs, &sandbox_cargo);
-    if let Some(home) = &host_home {
+    if let Some(home) = host_home {
         add_read_only_tree_if_present(&mut cmd, &home.join(".cargo/bin"));
         add_read_only_tree_if_present(&mut cmd, &home.join(".cargo/registry"));
         add_read_only_tree_if_present(&mut cmd, &home.join(".rustup"));
@@ -559,7 +556,7 @@ fn linux_bubblewrap_command(
 
     let safe_path = sandbox_path(
         project_root,
-        host_home.as_deref(),
+        host_home,
         profile.permits_project_path(),
         security.executable_search_path(),
     );

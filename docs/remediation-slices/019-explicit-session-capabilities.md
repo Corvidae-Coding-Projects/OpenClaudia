@@ -96,6 +96,25 @@ Record changed artifact generations, commands/tests run, typed evidence receipts
   `tests/path_constraints_run_scoped_e2e.rs`; the new cross-subsystem adversarial
   suite is `tests/session_capability_isolation_e2e.rs`.
 
+### S019-G2 hosted-runner portability repair
+
+- Baseline commit: `0316e0f6f8fe725bdcc6c8432b675b465a212f5a` (`S019-G1`).
+- Source/test artifact digest: SHA-256
+  `ea8e1aefafdbcc7012937b470c06184853dc0ae8ca414571ae8484588a5bf077`
+  over `git diff --binary 0316e0f6f8fe725bdcc6c8432b675b465a212f5a -- src tests`
+  after formatting and the complete local verification record below.
+- Scope: four source files and two test files; 117 insertions and 15
+  deletions. `ToolRunContext` now binds the composition-time host-home
+  snapshot into its manifest and carries it into frontend, subagent, and MCP
+  child generations. Linux sandbox construction uses that immutable snapshot
+  for its narrow read-only Cargo/Rustup mounts instead of rediscovering the
+  process home during tool execution.
+- The integration fixture now distinguishes deterministic test runs from a
+  deliberately host-toolchain-bound run. Its probe requires the exact Cargo
+  executable resolved by the immutable run PATH, verifies credentials are
+  absent both from private `HOME` and the mounted Cargo home, and tests the
+  actual resolved binary directory for read-only confinement.
+
 ## Acceptance evidence
 
 | Receipt | Evidence | Result |
@@ -112,6 +131,7 @@ Record changed artifact generations, commands/tests run, typed evidence receipts
 | `S019-E10` | Legacy attachment and shell tests prove `@file` reads, child CWD, environment, and executable lookup use the exact run. Plugin MCP snapshot and approval-binding tests prove later ambient CWD/environment/cache changes cannot alter an existing generation. | Pass |
 | `S019-E11` | `entering_plan_mode_creates_only_the_exact_session_plan_capability` and `project_initialization_is_exact_run_scoped_and_control_state_stays_masked` prove the one-file plan exception, sibling/control-file masking, secure non-overwrite, and exact-root host initialization. Branch snapshot cross-root tests cover the same host-control boundary. | Pass |
 | `S019-E12` | `retiring_one_run_cancels_only_its_owned_lifecycle_resources`, frontend transition tests, and TUI provider-switch tests prove replacement generations retire exact owned state while sibling runs remain live. | Pass |
+| `S019-E13` | `derived_frontend_session_narrows_roots_and_never_rediscovers_host_grants` proves the host-home/toolchain snapshot survives derivation. `toolchain_mounts_are_read_only_and_exclude_user_credentials` resolves Cargo through the run-bound PATH, requires the sandbox to use that exact executable, checks both credential locations are absent, and attempts a write in the resolved Cargo binary directory. | Pass |
 
 ## Verification record
 
@@ -147,13 +167,38 @@ headless prompt. Its configuration now explicitly disables prompts for local
 routing/cancellation tests, while hard host-safety and exact-run binding remain
 active and separate permission-gate tests retain deny-by-default coverage.
 
+The first hosted `S019-G1` run (`32284515796`) passed formatting, strict
+Clippy, and the macOS and Windows fail-closed jobs, then exposed a Linux-only
+false portability assumption in the Cargo toolchain probe: its explicit test
+run used the deterministic system PATH, so it passed locally only because
+`/usr/bin/cargo` existed and failed where GitHub installed Cargo under the
+runner home. Investigation also found that Linux sandbox construction still
+read the ambient home at execution time even though PATH was generation-bound.
+`S019-G2` fixes both causes rather than weakening the probe.
+
+The `S019-G2` gates, all constrained with `CARGO_BUILD_JOBS=1` and one test
+thread where applicable, passed:
+
+- `cargo test --lib tools::security::tests::derived_frontend_session_narrows_roots_and_never_rediscovers_host_grants -- --exact --test-threads=1`;
+- the exact Cargo toolchain confinement probe and all 11
+  `sandbox_escape_e2e` tests;
+- `cargo check --workspace --all-targets --all-features`;
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
+- `cargo test --workspace --all-features -- --test-threads=1`, covering all
+  library, binary, integration, and doc-test targets with only the repository's
+  explicitly ignored external-network/browser cases remaining ignored; and
+- `cargo fmt --all -- --check` plus `git diff --check`.
+
+Hosted confirmation of `S019-G2` is intentionally recorded on Crosslink issue
+`#1027` after publication rather than predicted in this artifact receipt.
+
 ## Unresolved risks and queues
 
 - S-088 is still planned, so an artifact-bound alternate-model VDD receipt
   cannot yet be produced without pretending that today's VDD path has the
-  required verifier identity and authority. Queue `S019-G1` and the source/test
-  digest above for retrospective VDD as soon as S-088 is operational; any
-  artifact change invalidates that queued generation.
+  required verifier identity and authority. Queue `S019-G2` and its
+  source/test digest above for retrospective VDD as soon as S-088 is
+  operational; any artifact change invalidates that queued generation.
 - Crosslink issue #1026 records a least-privilege follow-up for S-064/S-066:
   MCP resource handlers conservatively require both Process and Network before
   the selected server transport is known. Transport-specific admission should

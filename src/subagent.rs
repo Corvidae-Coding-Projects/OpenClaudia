@@ -1608,6 +1608,7 @@ async fn run_subagent_inner(
         .environment_grants(parent_run.environment_grants().clone())
         .mcp_environment_grants(parent_run.mcp_environment_grants().clone())
         .executable_search_path(parent_run.executable_search_path())
+        .host_home(parent_run.host_home().map(Path::to_path_buf))
         .workspace_access(workspace_access)
         .process(parent_run.grants_resource(crate::tools::ToolResource::Process))
         .network(parent_run.grants_resource(crate::tools::ToolResource::Network))

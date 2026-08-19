@@ -34,6 +34,13 @@ fn bash(command: &str) -> openclaudia::tools::ToolResult {
 }
 
 fn bash_unlocked(command: &str) -> openclaudia::tools::ToolResult {
+    bash_unlocked_for_run(support::shared_run_context(), command)
+}
+
+fn bash_unlocked_for_run(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    command: &str,
+) -> openclaudia::tools::ToolResult {
     let tool_call = ToolCall {
         id: "sandbox-escape-probe".to_string(),
         call_type: "function".to_string(),
@@ -48,7 +55,6 @@ fn bash_unlocked(command: &str) -> openclaudia::tools::ToolResult {
     // confinement instead of relying on the retired manager-less bypass.
     let state = tempfile::TempDir::new().expect("create permission state directory");
     let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
-    let run = support::shared_run_context();
     let permit = manager
         .approve_tool_call_once(
             &tool_call,
@@ -349,20 +355,40 @@ fn git_inspection_works_without_repository_execution_configuration() {
 
 #[test]
 fn toolchain_mounts_are_read_only_and_exclude_user_credentials() {
-    let result = bash(
-        "cargo --version >/dev/null && \
+    let _probe = sandbox_probe_lock();
+    let run = support::host_toolchain_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let expected_cargo = run
+        .resolve_executable("cargo")
+        .expect("host-bound test run must resolve Cargo");
+    let result = bash_unlocked_for_run(
+        &run,
+        "cargo_path=\"$(command -v cargo)\" && \
+         test -n \"$cargo_path\" && echo \"cargo_path=$cargo_path\" && \
+         cargo --version >/dev/null && \
          test ! -e \"$HOME/.cargo/credentials\" && \
          test ! -e \"$HOME/.cargo/credentials.toml\" && \
-         if touch \"$HOME/.cargo/bin/openclaudia-write-probe\" 2>/dev/null; then \
-           echo cache_writable; else echo toolchain_confined; fi",
+         cargo_bin=\"${cargo_path%/*}\" && cargo_home=\"${cargo_bin%/bin}\" && \
+         test ! -e \"$cargo_home/credentials\" && \
+         test ! -e \"$cargo_home/credentials.toml\" && \
+         probe=\"$cargo_bin/.openclaudia-write-probe-$$\" && \
+         if touch \"$probe\" 2>/dev/null; then \
+           rm -f \"$probe\"; echo toolchain_writable; \
+         else echo toolchain_confined; fi",
     );
     assert!(
         !result.is_error(),
         "read-only Cargo toolchain probe failed: {}",
         result.content()
     );
+    assert!(
+        result
+            .content()
+            .contains(&format!("cargo_path={}", expected_cargo.display())),
+        "sandbox resolved a different Cargo binary than the run capability: {}",
+        result.content()
+    );
     assert!(result.content().contains("toolchain_confined"));
-    assert!(!result.content().contains("cache_writable"));
+    assert!(!result.content().contains("toolchain_writable"));
 }
 
 #[test]

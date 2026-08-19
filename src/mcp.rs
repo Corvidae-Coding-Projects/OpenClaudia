@@ -556,6 +556,7 @@ fn derive_mcp_stdio_run(
         .environment_grants(environment_grants)
         .mcp_environment_grants(parent.mcp_environment_grants().clone())
         .executable_search_path(parent.executable_search_path())
+        .host_home(parent.host_home().map(Path::to_path_buf))
         .workspace_access(workspace_access)
         .process(true)
         .network(false)
