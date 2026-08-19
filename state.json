@@ -8329,12 +8329,11 @@
       "display_id": 1007,
       "title": "S-017: fix deny precedence and approval scope (F-012, F-030, F-068)",
       "description": "Implement docs/remediation-slices/017-deny-precedence-and-approval-receipts.md. Define deterministic precedence with non-bypassable host hard deny and explicit deny ahead of approvals. Replace broad first-match and tool-wide caches with normalized receipts bound to actor, workspace, tool, exact target/arguments, capability generation, expiry, use count, and provenance in trusted state. Prove old broad allows cannot override later or more-specific denials after resume, and that one Bash/path/network approval cannot authorize another invocation, target, workspace, or generation. Depends on completed S-016 / Crosslink #1005. Preserve the slice boundary, use serialized low-RAM Cargo gates, audit changed tests independently, and queue artifact-bound VDD under S-088.",
-      "status": "closed",
+      "status": "open",
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T01:19:03.818814081Z",
-      "updated_at": "2026-08-19T04:17:09.008475188Z",
-      "closed_at": "2026-08-19T04:17:09.008470759Z",
+      "updated_at": "2026-08-19T04:17:50.605069150Z",
       "labels": [
         "remediation"
       ],
@@ -22580,11 +22579,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 83,
       "timestamp": "2026-08-19T04:17:13.004715286Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 84,
+      "timestamp": "2026-08-19T04:17:50.605069150Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:17:13.004715286Z",
+    "timestamp": "2026-08-19T04:17:50.605069150Z",
     "agent_id": "6Vw9",
-    "agent_seq": 83
+    "agent_seq": 84
   }
 }
