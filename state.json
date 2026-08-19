@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1010,
+  "next_display_id": 1011,
   "next_comment_id": 712,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -396,6 +396,7 @@
     "6b9afd84-1f95-41fc-97ad-1726a2e803f0": 324,
     "6c6014fe-a279-4a93-8b61-7443aa8f3a48": 54,
     "6c98ae6f-6ce8-4cdb-b831-2932fe1493b2": 117,
+    "6c9fe694-8efe-4e52-ac24-02922ceae8a9": 1010,
     "6d065d4d-a595-4386-90a8-34798a50a78e": 670,
     "6daa694e-eab3-44b2-84b9-d72edfebe45d": 231,
     "6dd808c9-43b5-4d4b-a367-b8476d826c3b": 547,
@@ -9788,6 +9789,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "6c9fe694-8efe-4e52-ac24-02922ceae8a9": {
+      "uuid": "6c9fe694-8efe-4e52-ac24-02922ceae8a9",
+      "display_id": 1010,
+      "title": "Tool caps count denied calls and race past configured limits",
+      "description": "S-017 authorization audit found ToolExecutor calls check_and_record_tool before permission authorization, so permission-denied calls consume enterprise quota. PolicyEnforcer also performs check and increment under separate mutex acquisitions, allowing concurrent calls to exceed a cap. Move recording after successful exact authorization, keep an early dry-run check, and make capped increment atomic. ACP must pass policy into the shared executor instead of recording before its normalized authorization.",
+      "status": "open",
+      "priority": "critical",
+      "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T02:56:15.116591634Z",
+      "updated_at": "2026-08-19T02:56:15.116591634Z"
     },
     "6d065d4d-a595-4386-90a8-34798a50a78e": {
       "uuid": "6d065d4d-a595-4386-90a8-34798a50a78e",
@@ -22139,11 +22152,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 47,
       "timestamp": "2026-08-19T02:54:41.968975539Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 48,
+      "timestamp": "2026-08-19T02:56:15.116591634Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T02:54:41.968975539Z",
+    "timestamp": "2026-08-19T02:56:15.116591634Z",
     "agent_id": "6Vw9",
-    "agent_seq": 47
+    "agent_seq": 48
   }
 }
