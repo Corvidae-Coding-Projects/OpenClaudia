@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 762,
+  "next_comment_id": 763,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,11 +15471,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T08:07:12.800115Z",
+      "updated_at": "2026-08-19T08:33:34.190045515Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "6dbdf2f5-5f21-484d-a17c-6e92f786601e": {
+          "display_id": 762,
+          "author": "6Vw9",
+          "content": "[action] S-019 resumed after context compaction: production library compiles with explicit ToolRunContext propagation; test-target migration and adversarial isolation evidence remain. Global ambient path-constraint state was removed rather than restored.",
+          "created_at": "2026-08-19T08:33:34.187346168Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQjtwowfbiACiolow/A0yzB1dLXaUlBtmpyKvE6HIDxbe7JNSVfclsfSCYm/utGVxUQNohnkxlUuEtJtK16WqBg=="
+        },
         "8413f1e6-cc6b-4404-8ffe-04ba2a9e7111": {
           "display_id": 759,
           "author": "6Vw9",
@@ -23486,11 +23495,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 164,
       "timestamp": "2026-08-19T08:07:12.800115Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 165,
+      "timestamp": "2026-08-19T08:33:34.190045515Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T08:07:12.800115Z",
+    "timestamp": "2026-08-19T08:33:34.190045515Z",
     "agent_id": "6Vw9",
-    "agent_seq": 164
+    "agent_seq": 165
   }
 }
