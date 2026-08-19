@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 788,
+  "next_comment_id": 789,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:43:08.312170191Z",
+      "updated_at": "2026-08-19T12:43:12.747376721Z",
       "labels": [
         "remediation"
       ],
@@ -15742,6 +15742,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPudUY+VNJY6UvF+sRXZiOUerzQ6Tmsp4IuHfxljbe2Uu4lmfEZZ2z5G7xLINIM8sOj7S2ArRDMrHYCPsHfShCw=="
+        },
+        "f25ee2fa-520d-4e9c-a113-41ac77523107": {
+          "display_id": 788,
+          "author": "6Vw9",
+          "content": "[action] Fixed stale todo dispatch fixture to reuse one explicit frontend run; focused persistence and isolation suites pass. Restarting full serial suite.",
+          "created_at": "2026-08-19T12:43:12.744876155Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABANNopCU1z9Gcy2wRPPjoTbw1aq14z3BQWpsfRmg+pNeHu+VlTONpJ0/XX8q+0b4DnxBKIM2Ip8/qj3uvTq353BA=="
         },
         "f8478f73-aca3-4884-a3c6-f7fcc388157d": {
           "display_id": 761,
@@ -23863,11 +23872,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 192,
       "timestamp": "2026-08-19T12:43:08.312170191Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 193,
+      "timestamp": "2026-08-19T12:43:12.747376721Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:43:08.312170191Z",
+    "timestamp": "2026-08-19T12:43:12.747376721Z",
     "agent_id": "6Vw9",
-    "agent_seq": 192
+    "agent_seq": 193
   }
 }
