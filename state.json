@@ -6839,11 +6839,12 @@
       "uuid": "47f54649-e961-4ac3-ae74-495497587913",
       "display_id": 1017,
       "title": "Verify S-017 remote delivery and draft PR state",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T04:20:09.794845213Z",
-      "updated_at": "2026-08-19T04:22:06.392124208Z",
+      "updated_at": "2026-08-19T04:22:10.650604327Z",
+      "closed_at": "2026-08-19T04:22:10.650602824Z",
       "labels": [
         "s-017"
       ],
@@ -22768,11 +22769,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 99,
       "timestamp": "2026-08-19T04:22:06.392124208Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 100,
+      "timestamp": "2026-08-19T04:22:10.650604327Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:22:06.392124208Z",
+    "timestamp": "2026-08-19T04:22:10.650604327Z",
     "agent_id": "6Vw9",
-    "agent_seq": 99
+    "agent_seq": 100
   }
 }
