@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 765,
+  "next_comment_id": 766,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T09:02:07.364709826Z",
+      "updated_at": "2026-08-19T09:02:11.965103375Z",
       "labels": [
         "remediation"
       ],
@@ -15520,6 +15520,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGRNrp3vWaEZryuoV+wN6n3gslzGFXqxR/oMq7WzYlIc6lK3556tILZ/8Mp/XtD99o0fhKkR39whOW/QZtTclBQ=="
+        },
+        "921b7302-9862-4025-a7b1-fb6949ab2a94": {
+          "display_id": 765,
+          "author": "6Vw9",
+          "content": "Progress: explicit ToolRunContext propagation compiles in production; global ambient path-constraint state remains removed. Unit-test migration fell from hundreds of failures to pipeline-only call sites. Read tracking is now rooted and cleared by exact run identity, with cross-run isolation tests. Next: finish pipeline calls, compile all targets, then add adversarial process/env/file/cancellation evidence.",
+          "created_at": "2026-08-19T09:02:11.962636985Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwhEVLla7E1GJ84ZQ3apxSmHntgwNqPggxTU+z6tq7BkGckjOMAT3tm4bPIdoF1hzinyJqhG9p4jXvax7MF3eBQ=="
         },
         "c1195401-8fd0-4f52-afde-e15f0afbbc4d": {
           "display_id": 757,
@@ -23528,11 +23537,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 167,
       "timestamp": "2026-08-19T09:02:07.364709826Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 168,
+      "timestamp": "2026-08-19T09:02:11.965103375Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T09:02:07.364709826Z",
+    "timestamp": "2026-08-19T09:02:11.965103375Z",
     "agent_id": "6Vw9",
-    "agent_seq": 167
+    "agent_seq": 168
   }
 }
