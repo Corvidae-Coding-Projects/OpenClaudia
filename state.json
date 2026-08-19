@@ -1,6 +1,6 @@
 {
   "next_display_id": 1034,
-  "next_comment_id": 835,
+  "next_comment_id": 836,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19155,7 +19155,7 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:43:56.056034237Z",
-      "updated_at": "2026-08-19T23:52:43.066803350Z",
+      "updated_at": "2026-08-19T23:52:47.166894122Z",
       "labels": [
         "workflow"
       ],
@@ -19168,6 +19168,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtXM2VLyqHpP6ZpVTHyPN+E3F/LBSUjhLNGouW9TMunUPPF0mfhx1w7a8d7ae2ChFzRQLgUdLuy5QQBC5iO/2Ag=="
+        },
+        "dd66cbfd-8bb9-4f6a-86bb-71a64ed24740": {
+          "display_id": 835,
+          "author": "6Vw9",
+          "content": "Closed as an invalid finding after user correction; no Crosslink implementation change is needed.",
+          "created_at": "2026-08-19T23:52:47.164492004Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAytSJ15vfPWEdSEglYNl2yupB2+D8TNJo3XABhh3cpRTTnxE6H1Rd6UO86117AIAci+HIjfjJJmFdE2XFdSoeCA=="
         }
       }
     },
@@ -24850,11 +24859,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 276,
       "timestamp": "2026-08-19T23:52:43.066803350Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 277,
+      "timestamp": "2026-08-19T23:52:47.166894122Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:52:43.066803350Z",
+    "timestamp": "2026-08-19T23:52:47.166894122Z",
     "agent_id": "6Vw9",
-    "agent_seq": 276
+    "agent_seq": 277
   }
 }
