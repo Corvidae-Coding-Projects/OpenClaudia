@@ -53,8 +53,11 @@ fn count_physical_lines(s: &str) -> u32 {
 /// Canonicalise the user-supplied edit path. Thin wrapper around the
 /// shared [`canonicalize_or_walk_up`] helper (crosslink #969) that
 /// resolves the user-supplied path through `resolve_path` first.
-fn canonicalise_edit_path(path: &str) -> Result<String, String> {
-    let p = resolve_path(path)?;
+fn canonicalise_edit_path(
+    run: &crate::tools::security::ToolRunContext,
+    path: &str,
+) -> Result<String, String> {
+    let p = resolve_path(run, path)?;
     let canonical = canonicalize_or_walk_up(&p, path)?;
     Ok(canonical.to_string_lossy().to_string())
 }
@@ -69,6 +72,7 @@ fn canonicalise_edit_path(path: &str) -> Result<String, String> {
 /// (log sinks, observability tooling) and frontends consume the diff without
 /// parsing an in-band string protocol (crosslinks #670 and #971).
 fn format_edit_success(
+    run: &crate::tools::ToolRunContext,
     path: &str,
     old_string: &str,
     new_string: &str,
@@ -102,7 +106,7 @@ fn format_edit_success(
             new_string.len(),
         )
     };
-    if let Some(warning) = crate::guardrails::check_diff_thresholds() {
+    if let Some(warning) = crate::guardrails::check_diff_thresholds(run) {
         let _ = write!(summary, "\n\nWarning: {}", warning.message);
     }
     let diff = ToolDiff {
@@ -148,7 +152,10 @@ fn edit_error(message: String) -> ToolHandlerResult {
 /// or absent, multi-occurrence inputs are rejected so callers must provide
 /// a uniquely-matching `old_string`.
 #[allow(clippy::too_many_lines)]
-pub fn execute_edit_file(args: &HashMap<String, Value>) -> ToolHandlerResult {
+pub fn execute_edit_file(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> ToolHandlerResult {
     // crosslink #675: typed accessor.
     let user_path = match args.arg_str_strict("path") {
         Ok(p) => p,
@@ -157,13 +164,13 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> ToolHandlerResult {
 
     // Path passed to `open(2)`: canonical parent + original leaf so that
     // `O_NOFOLLOW` on the leaf can catch a symlink-swap. See crosslink #417.
-    let open_path = match resolve_open_path(user_path) {
+    let open_path = match resolve_open_path(run, user_path) {
         Ok(p) => p,
         Err(e) => return edit_error(e),
     };
 
     // Resolve symlinks to prevent symlink-based path traversal.
-    let path = match canonicalise_edit_path(user_path) {
+    let path = match canonicalise_edit_path(run, user_path) {
         Ok(p) => p,
         Err(e) => return edit_error(e),
     };
@@ -171,19 +178,19 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> ToolHandlerResult {
 
     // ENFORCE: Must read file before editing
     // This prevents the model from making edits based on hallucinated file contents
-    if !READ_TRACKER.has_been_read(Path::new(path)) {
+    if !READ_TRACKER.has_been_read(run, Path::new(path)) {
         return edit_error(format!(
             "You must read '{path}' before editing it. Use read_file first to see the actual contents."
         ));
     }
     if let Err(msg) =
-        super::require_fresh_file_observation_if_ledger_active(Path::new(path), "editing it")
+        super::require_fresh_file_observation_if_ledger_active(run, Path::new(path), "editing it")
     {
         return edit_error(msg);
     }
 
     // Blast radius check
-    if let Err(msg) = crate::guardrails::check_file_access(path) {
+    if let Err(msg) = crate::guardrails::check_file_access(run, path) {
         return edit_error(msg);
     }
 
@@ -220,7 +227,7 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> ToolHandlerResult {
 
     // Open ONCE with O_NOFOLLOW against the LEAF-PRESERVING path; all
     // I/O goes through this FD. See crosslink #417 (dup #428).
-    let mut file = match secure_fs::open_regular_edit(&open_path) {
+    let mut file = match secure_fs::open_regular_edit(run, &open_path) {
         Ok(f) => f,
         Err(error) => return edit_error(format!("Failed to securely open file '{path}': {error}")),
     };
@@ -276,9 +283,9 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> ToolHandlerResult {
 
     match rewrite_in_place(&mut file, &new_content) {
         Ok(()) => {
-            crate::guardrails::record_file_modification(path, lines_added, lines_removed);
-            super::record_active_diff_observation(path, &content, &new_content);
-            format_edit_success(path, old_string, new_string, count, replace_all)
+            crate::guardrails::record_file_modification(run, path, lines_added, lines_removed);
+            super::record_active_diff_observation(run, path, &content, &new_content);
+            format_edit_success(run, path, old_string, new_string, count, replace_all)
         }
         Err(e) => edit_error(format!("Failed to write file '{path}': {e}")),
     }
@@ -290,6 +297,10 @@ mod tests {
     use std::io::Write as _;
     use std::path::Path;
     use tempfile::NamedTempFile;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     /// crosslink #988: `count_physical_lines` reports physical lines as the
     /// diff sees them (newline bytes plus a trailing non-newline-terminated
@@ -318,7 +329,7 @@ mod tests {
         let mut f = NamedTempFile::new_in(".").expect("tempfile");
         f.write_all(content.as_bytes()).expect("write");
         let canon = f.path().canonicalize().expect("canonicalize");
-        READ_TRACKER.mark_read(&canon);
+        READ_TRACKER.mark_read(test_run(), &canon);
         let path = canon.to_string_lossy().to_string();
         (f, path)
     }
@@ -344,7 +355,7 @@ mod tests {
         // Behavior 4: absent old_string must produce an error result.
         let (_f, path) = tmp_readable("hello world\n");
         let args = make_args(&path, "DOES NOT EXIST", "replacement");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(is_err, "missing old_string must be an error: {msg}");
         assert!(
             msg.contains("Could not find the specified text"),
@@ -358,7 +369,7 @@ mod tests {
         let original = "unchanged content\n";
         let (_f, path) = tmp_readable(original);
         let args = make_args(&path, "ABSENT", "whatever");
-        let _ = super::execute_edit_file(&args);
+        let _ = super::execute_edit_file(test_run(), &args);
         let after = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(
             after, original,
@@ -378,7 +389,7 @@ mod tests {
         let (_f, path) = tmp_readable("it's fine\n");
         // Search with a straight apostrophe when file has a curly one
         let args = make_args(&path, "it's fine", "ok");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         // OC will return error (cannot find with straight quote); CC would find it.
         // We pin whichever OC currently does — the key assertion is the file is intact.
         let after = std::fs::read_to_string(&path).expect("read back");
@@ -410,7 +421,7 @@ mod tests {
             .expect("mtime before");
 
         let args = make_args(&path, "foo bar", "foo bar");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
 
         assert!(is_err, "old==new must produce is_error=true; got: {msg}");
         assert!(
@@ -441,7 +452,7 @@ mod tests {
         // Behavior 5: single occurrence with no replace_all flag → success
         let (_f, path) = tmp_readable("alpha beta gamma\n");
         let args = make_args(&path, "beta", "BETA");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(!is_err, "single occurrence replace must succeed: {msg}");
         let after = std::fs::read_to_string(&path).expect("read back");
         assert!(after.contains("BETA"), "replacement applied");
@@ -453,11 +464,11 @@ mod tests {
         let _lock = super::super::shared_tracker_lock();
         let (_f, path) = tmp_readable("first\nsecond\n");
         let args = make_args(&path, "first", "one");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(!is_err, "first edit must succeed: {msg}");
 
         let args2 = make_args(&path, "second", "two");
-        let (msg2, is_err2) = super::execute_edit_file(&args2).into_legacy();
+        let (msg2, is_err2) = super::execute_edit_file(test_run(), &args2).into_legacy();
         assert!(
             is_err2,
             "second edit without a fresh read must be rejected: {msg2}"
@@ -472,15 +483,15 @@ mod tests {
     fn active_ledger_edit_requires_fresh_file_read_observation() {
         let _lock = super::super::shared_tracker_lock();
         READ_TRACKER.clear_all();
-        let _session_guard = crate::tools::SessionIdGuard::set("edit-ledger-read-required");
+        let run = test_run();
         let ledger =
             std::sync::Arc::new(std::sync::Mutex::new(crate::ledger::RealityLedger::new()));
         let _ledger_guard =
-            crate::ledger::install_active_ledger_for_session("edit-ledger-read-required", ledger);
+            crate::ledger::install_active_ledger_for_session(run.session_id(), ledger);
         let (_f, path) = tmp_readable("before\n");
 
         let args = make_args(&path, "before", "after");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(run, &args).into_legacy();
 
         assert!(is_err, "ledger-less edit must be denied: {msg}");
         assert!(
@@ -498,7 +509,7 @@ mod tests {
         // Behavior 5: N>1 occurrences without replace_all → error in both CC and OC
         let (_f, path) = tmp_readable("dog cat dog\n");
         let args = make_args(&path, "dog", "bird");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(is_err, "multi-occurrence must error: {msg}");
         assert!(
             msg.contains('2'),
@@ -513,7 +524,7 @@ mod tests {
         let (_f, path) = tmp_readable("x y x z x\n");
         let mut args = make_args(&path, "x", "Z");
         args.insert("replace_all".to_string(), serde_json::json!(true));
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(
             !is_err,
             "replace_all=true must succeed on multi-occurrence: {msg}"
@@ -533,7 +544,7 @@ mod tests {
         let (_f, path) = tmp_readable("dog cat dog\n");
         let mut args = make_args(&path, "dog", "bird");
         args.insert("replace_all".to_string(), serde_json::json!(false));
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(
             is_err,
             "replace_all=false on multi-occurrence must still error: {msg}"
@@ -555,7 +566,7 @@ mod tests {
         // crosslink #687: when replace_all is absent, behaviour matches replace_all=false.
         let (_f, path) = tmp_readable("dup dup dup\n");
         let args = make_args(&path, "dup", "X");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(is_err, "default (absent flag) must reject multi: {msg}");
         let after = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(after, "dup dup dup\n", "file unmodified");
@@ -568,7 +579,7 @@ mod tests {
         let (_f, path) = tmp_readable("only once\n");
         let mut args = make_args(&path, "only once", "exactly once");
         args.insert("replace_all".to_string(), serde_json::json!(true));
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(
             !is_err,
             "single occurrence with replace_all succeeds: {msg}"
@@ -583,7 +594,7 @@ mod tests {
         let mut args = make_args(&path, "alpha", "omega");
         args.insert("replace_all".to_string(), serde_json::json!("true"));
 
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
 
         assert!(is_err, "non-boolean replace_all must error: {msg}");
         assert!(
@@ -607,14 +618,14 @@ mod tests {
         let mut f = NamedTempFile::new_in(".").expect("tempfile");
         f.write_all(b"some content\n").expect("write");
         let path = f.path().canonicalize().expect("canon");
-        // Deliberately do NOT call READ_TRACKER.mark_read() for this file
+        // Deliberately do NOT call READ_TRACKER.mark_read(test_run(), ) for this file
         let path_str = path.to_string_lossy().to_string();
         // Use a path that was never marked read; ensure it's unique so unrelated tests
         // don't accidentally mark it.
         let fresh_path = format!("{path_str}_never_read");
         std::fs::copy(&path, Path::new(&fresh_path)).ok(); // best-effort copy
         let args = make_args(&fresh_path, "some content", "other");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(is_err, "edit without prior read must error: {msg}");
         assert!(
             msg.contains("read") || msg.contains("Read"),
@@ -638,7 +649,7 @@ mod tests {
         let (_f, path) = tmp_readable("foo and foo and foo end\n");
         let mut args = make_args(&path, "foo", "BAR");
         args.insert("replace_all".to_string(), serde_json::json!(true));
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(
             !is_err,
             "replace_all=true with 3 matches must succeed: {msg}"
@@ -664,7 +675,7 @@ mod tests {
         let (_f, path) = tmp_readable("unique_token here\nother line\n");
         let args = make_args(&path, "unique_token", "REPLACED");
         // Deliberately do NOT insert `replace_all`; rely on the default.
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(
             !is_err,
             "default (no replace_all) single-match edit must succeed: {msg}"
@@ -695,9 +706,9 @@ mod tests {
         let leaf = dir.path().join("leaf.txt");
         std::os::unix::fs::symlink(&target, &leaf).expect("symlink");
         let leaf_canon = leaf.canonicalize().expect("canonicalize leaf");
-        READ_TRACKER.mark_read(&leaf_canon);
+        READ_TRACKER.mark_read(test_run(), &leaf_canon);
         let args = make_args(&leaf.to_string_lossy(), "PROTECTED", "PWNED");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(
             is_err,
             "edit through a symlink leaf must fail (O_NOFOLLOW): {msg}"
@@ -713,7 +724,7 @@ mod tests {
     fn fix417_edit_legitimate_regular_file_still_works() {
         let (_f, path) = tmp_readable("alpha beta gamma\n");
         let args = make_args(&path, "beta", "BETA");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(!is_err, "regular-file edit must succeed: {msg}");
         let after = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(after, "alpha BETA gamma\n");
@@ -727,7 +738,7 @@ mod tests {
         // still handle the [single] arm without an off-by-one.
         let (_f, path) = tmp_readable("one two three\n");
         let args = make_args(&path, "two", "TWO");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(!is_err, "unique match must succeed: {msg}");
         let after = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(after, "one TWO three\n");
@@ -739,7 +750,7 @@ mod tests {
         // not silently fall through to the multi-match arm.
         let (_f, path) = tmp_readable("alpha beta\n");
         let args = make_args(&path, "gamma", "GAMMA");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(is_err, "absent old_string must error: {msg}");
         assert!(
             msg.contains("Could not find the specified text"),
@@ -755,7 +766,7 @@ mod tests {
         // the exact occurrence count from the collected match_indices slice.
         let (_f, path) = tmp_readable("abc abc abc abc\n");
         let args = make_args(&path, "abc", "XYZ");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(is_err, "multi-match without replace_all must error: {msg}");
         assert!(
             msg.contains("Found 4 occurrences"),
@@ -769,7 +780,7 @@ mod tests {
     fn fix417_edit_shrinking_replacement_truncates_correctly() {
         let (_f, path) = tmp_readable("XXXXXXXXXX\n");
         let args = make_args(&path, "XXXXXXXXXX", "Y");
-        let (msg, is_err) = super::execute_edit_file(&args).into_legacy();
+        let (msg, is_err) = super::execute_edit_file(test_run(), &args).into_legacy();
         assert!(!is_err, "shrinking edit must succeed: {msg}");
         let after = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(after, "Y\n", "no stale tail bytes after shrinking write");

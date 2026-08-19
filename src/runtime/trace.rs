@@ -19,6 +19,32 @@ pub trait TraceSink: Send + Sync {
     async fn append(&self, event: &RuntimeEvent) -> Result<(), TraceSinkError>;
 }
 
+/// Structured production trace sink.
+///
+/// Durable trace persistence is owned by S-031/S-037. Until that store exists,
+/// production composition roots still need an explicit sink rather than a
+/// silent no-op or the test-only in-memory sink. This implementation records
+/// the immutable event identity through the configured `tracing` subscriber.
+/// A successful macro invocation is this sink's current acknowledgement
+/// contract; it does not claim durable formatting or persistence.
+#[derive(Debug, Default)]
+pub struct TracingTraceSink;
+
+#[async_trait]
+impl TraceSink for TracingTraceSink {
+    async fn append(&self, event: &RuntimeEvent) -> Result<(), TraceSinkError> {
+        tracing::info!(
+            target: "openclaudia::runtime",
+            run_id = %event.run_id(),
+            sequence = event.sequence(),
+            scope = ?event.scope(),
+            kind = ?event.kind(),
+            "Accepted canonical runtime event"
+        );
+        Ok(())
+    }
+}
+
 /// Trace append failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("trace sink rejected runtime event: {detail}")]

@@ -54,7 +54,10 @@ const SKIP_DIRS: &[&str] = &[
 ///
 /// Returns `(stdout, is_error)`. Errors include: missing pattern, invalid
 /// pattern (uncompilable as regex), invalid `path` (jail violation).
-pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_glob(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let pattern = match args.arg_str_strict("pattern") {
         Ok(p) => p,
         Err(e) => return e.into_tool_error(),
@@ -64,7 +67,7 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
         Ok(path) => path,
         Err(e) => return e.into_tool_error(),
     };
-    let root = match resolve_path(raw_path) {
+    let root = match resolve_path(run, raw_path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };
@@ -85,7 +88,7 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
     let mut visited: usize = 0;
     let mut truncated = false;
 
-    let directory = match secure_fs::open_directory(&root) {
+    let directory = match secure_fs::open_directory(run, &root) {
         Ok(directory) => directory,
         Err(error) => {
             return (
@@ -260,6 +263,10 @@ mod tests {
     use std::io::Write as _;
     use tempfile::TempDir;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     fn write_file(dir: &Path, rel: &str, body: &str) {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() {
@@ -284,7 +291,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
         assert!(!err, "got error: {out}");
         assert!(out.contains("lib.rs"), "lib.rs missing in: {out}");
         assert!(out.contains("main.rs"), "main.rs missing in: {out}");
@@ -306,7 +313,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
         assert!(!err, "got error: {out}");
         assert!(out.contains("a.rs"), "deep .rs missing in: {out}");
         assert!(!out.contains("b.txt"), "non-rs leaked into matches: {out}");
@@ -316,7 +323,7 @@ mod tests {
     #[test]
     fn glob_missing_pattern_errors() {
         let args = HashMap::new();
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
         assert!(err, "missing pattern must be an error: {out}");
         assert!(out.contains("pattern"), "error must name the arg: {out}");
     }
@@ -326,7 +333,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("pattern".to_string(), json!(42));
 
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
 
         assert!(err, "non-string pattern must be an error: {out}");
         assert_eq!(out, "Invalid 'pattern' argument: expected string");
@@ -338,7 +345,7 @@ mod tests {
         args.insert("pattern".to_string(), json!("*.rs"));
         args.insert("path".to_string(), json!(42));
 
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
 
         assert!(err, "non-string path must be an error: {out}");
         assert!(
@@ -365,7 +372,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
         assert!(!err, "literal-bracket pattern must not error: {out}");
         assert!(
             out.contains("weird[name].txt"),

@@ -11,6 +11,7 @@ use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
 use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
 use openclaudia::tools::{FunctionCall, ToolCall};
 use serde_json::json;
+use std::fmt::Write as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -47,10 +48,16 @@ fn bash_unlocked(command: &str) -> openclaudia::tools::ToolResult {
     // confinement instead of relying on the retired manager-less bypass.
     let state = tempfile::TempDir::new().expect("create permission state directory");
     let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
+    let run = support::shared_run_context();
     let permit = manager
-        .approve_tool_call_once(&tool_call, None, ApprovalProvenance::InteractiveUser)
+        .approve_tool_call_once(
+            &tool_call,
+            Some(run.session_id()),
+            ApprovalProvenance::InteractiveUser,
+        )
         .expect("host approval must mint an exact one-use permit");
     ToolExecutor::execute(ToolExecutorRequest {
+        run_context: run,
         tool_call: &tool_call,
         memory_db: None,
         app_config: None,
@@ -62,6 +69,8 @@ fn bash_unlocked(command: &str) -> openclaudia::tools::ToolResult {
     })
 }
 
+mod support;
+
 fn project_fixture(prefix: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix(prefix)
@@ -71,12 +80,36 @@ fn project_fixture(prefix: &str) -> tempfile::TempDir {
 
 #[test]
 fn host_file_network_and_kernel_trees_are_absent() {
+    let _probe = sandbox_probe_lock();
     let outside = tempfile::tempdir().expect("host sentinel dir");
     let sentinel = outside.path().join("sentinel");
     std::fs::write(&sentinel, "host-secret").expect("host sentinel");
     let quoted = shlex::try_quote(sentinel.to_str().expect("UTF-8 sentinel")).expect("quote");
-    let python = r#"
-import errno, socket
+
+    // A literal out-of-root path must be rejected by the run capability
+    // before a process starts. Keep this assertion separate from the runtime
+    // sandbox probe below so one defence does not masquerade as the other.
+    let lexical_denial = bash_unlocked(&format!("test -e {quoted}"));
+    assert!(lexical_denial.is_error());
+    assert!(lexical_denial
+        .content()
+        .contains("outside the bash tool's allowed roots"));
+
+    // Encode the path so the deliberately shallow shell-token path gate does
+    // not see a literal absolute path. The child reconstructs it only after
+    // entering the OS sandbox, which directly proves the host mount is absent.
+    let sentinel_bytes = sentinel.as_os_str().as_encoded_bytes();
+    let mut sentinel_hex = String::with_capacity(sentinel_bytes.len() * 2);
+    for byte in sentinel_bytes {
+        write!(&mut sentinel_hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    let python = format!(
+        r#"
+import errno, os, socket
+host_path = bytes.fromhex("{sentinel_hex}").decode()
+kernel_path = os.path.join(os.sep, "sys", "kernel")
+print("host_file_blocked=" + str(not os.path.exists(host_path)).lower())
+print("sys_blocked=" + str(not os.path.exists(kernel_path)).lower())
 blocked = []
 for family, kind in [(socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET6, socket.SOCK_DGRAM), (socket.AF_UNIX, socket.SOCK_STREAM)]:
     try:
@@ -85,16 +118,13 @@ for family, kind in [(socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET6, soc
     except OSError as error:
         blocked.append(error.errno in (errno.EPERM, errno.EACCES))
 print("network_blocked=" + str(all(blocked)).lower())
-"#;
-    let python = shlex::try_quote(python).expect("quote Python");
-    let result = bash(&format!(
-        "if test -e {quoted}; then echo host_file_visible; else echo host_file_blocked; fi; \
-         if test -e /sys/kernel; then echo sys_visible; else echo sys_blocked; fi; \
-         python3 -c {python}"
-    ));
+"#
+    );
+    let python = shlex::try_quote(&python).expect("quote Python");
+    let result = bash_unlocked(&format!("python3 -c {python}"));
     assert!(!result.is_error(), "probe failed: {}", result.content());
-    assert!(result.content().contains("host_file_blocked"));
-    assert!(result.content().contains("sys_blocked"));
+    assert!(result.content().contains("host_file_blocked=true"));
+    assert!(result.content().contains("sys_blocked=true"));
     assert!(result.content().contains("network_blocked=true"));
     assert!(!result.content().contains("host-secret"));
 }
@@ -177,16 +207,33 @@ fn inherited_host_file_descriptor_is_closed() {
     let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
     assert!(raw >= 0, "open inherited descriptor");
     let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
-    let result = bash_unlocked(&format!(
-        "cat /proc/self/fd/{} 2>/dev/null || echo fd_blocked",
+    // Read the inherited descriptor directly so the run-scoped path gate does
+    // not reject a literal /proc path before the sandbox gets to close it.
+    let python = format!(
+        r#"
+import os
+try:
+    contents = os.read({}, 64)
+except OSError:
+    print("fd_blocked")
+else:
+    print("fd_visible=" + contents.decode(errors="replace"))
+"#,
         inherited.as_raw_fd()
-    ));
+    );
+    let python = shlex::try_quote(&python).expect("quote Python");
+    let result = bash_unlocked(&format!("python3 -c {python}"));
+    assert!(!result.is_error(), "FD probe failed: {}", result.content());
     assert!(
         !result.content().contains("fd-secret"),
         "host FD leaked: {}",
         result.content()
     );
-    assert!(result.content().contains("fd_blocked"));
+    assert!(
+        result.content().contains("fd_blocked"),
+        "inherited FD was not reported closed: {}",
+        result.content()
+    );
 }
 
 #[test]

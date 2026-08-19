@@ -1,291 +1,231 @@
-//! End-to-end tests for `subagent::BackgroundAgentManager`
-//! lifecycle — `register` / `get` / `finish` / `fail` /
-//! `increment_turns` / `list` / `remove` / `gc` /
-//! `cleanup_finished`, plus `BackgroundAgent` field
-//! accessibility.
+//! End-to-end tests for the run-scoped `BackgroundAgentManager` lifecycle.
 //!
-//! Sprint 126 of the verification effort. Sprint 60
-//! covered `AgentType` parsing; sprint 125 covered the
-//! tool-definition wire shape; this file pins the
-//! in-memory background-agent registry used to track
-//! `run_in_background: true` task invocations.
+//! The manager is process-global in production, so every operation that can
+//! observe or mutate an agent must carry the exact owning run generation.
 
-#![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
+#![allow(clippy::missing_panics_doc)]
 #![allow(clippy::unwrap_used)]
 
+use openclaudia::state::SessionId;
 use openclaudia::subagent::{AgentType, BackgroundAgentManager};
-use std::sync::atomic::Ordering;
+use openclaudia::tools::{ToolRunContext, WorkspaceAccess};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{atomic::Ordering, Arc};
 
-// ───────────────────────────────────────────────────────────────────────────
-// Section A — Constructor + empty state
-// ───────────────────────────────────────────────────────────────────────────
+fn test_run(provider: &str) -> Arc<ToolRunContext> {
+    ToolRunContext::builder(SessionId::new(), Path::new(env!("CARGO_MANIFEST_DIR")))
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(WorkspaceAccess::ReadOnly)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider(provider)
+        .build()
+        .expect("build explicit test run")
+}
 
-#[test]
-fn manager_new_starts_with_empty_agent_list() {
-    let mgr = BackgroundAgentManager::new();
-    assert!(mgr.list().is_empty());
+fn register(
+    manager: &BackgroundAgentManager,
+    owner: &ToolRunContext,
+    agent_type: AgentType,
+    task: &str,
+) -> String {
+    manager
+        .register(owner, agent_type, task)
+        .expect("register agent")
 }
 
 #[test]
-fn manager_get_on_unknown_id_returns_none() {
-    let mgr = BackgroundAgentManager::new();
-    assert!(mgr.get("nonexistent-id").is_none());
+fn manager_new_starts_empty_for_run() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("empty");
+    assert!(manager.list_for_run(&owner).is_empty());
+    assert!(manager.get_for_run(&owner, "missing").is_none());
+    assert!(manager.remove_for_run(&owner, "missing").is_none());
+    assert_eq!(manager.gc(), 0);
+    assert_eq!(manager.cleanup_finished_for_run(&owner), 0);
 }
 
 #[test]
-fn manager_remove_on_unknown_id_returns_none() {
-    let mgr = BackgroundAgentManager::new();
-    assert!(mgr.remove("nonexistent-id").is_none());
-}
+fn register_returns_distinct_run_visible_agents() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("register");
+    let first = register(&manager, &owner, AgentType::Explore, "find files");
+    let second = register(&manager, &owner, AgentType::Plan, "design API");
 
-#[test]
-fn manager_gc_on_empty_returns_zero_evicted() {
-    let mgr = BackgroundAgentManager::new();
-    let evicted = mgr.gc();
-    assert_eq!(evicted, 0);
-}
-
-#[test]
-fn manager_cleanup_finished_on_empty_returns_zero() {
-    let mgr = BackgroundAgentManager::new();
-    let removed = mgr.cleanup_finished();
-    assert_eq!(removed, 0);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — register lifecycle
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn register_returns_non_empty_id_string() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Explore, "find files");
-    assert!(!id.is_empty());
-}
-
-#[test]
-fn register_two_agents_yields_distinct_ids() {
-    let mgr = BackgroundAgentManager::new();
-    let id_a = mgr.register(AgentType::Explore, "a");
-    let id_b = mgr.register(AgentType::Plan, "b");
-    assert_ne!(id_a, id_b);
-}
-
-#[test]
-fn register_then_get_returns_arc_with_documented_fields() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Plan, "design an API");
-    let agent = mgr.get(&id).expect("present");
-    assert_eq!(agent.id, id);
+    assert!(!first.is_empty());
+    assert_ne!(first, second);
+    let agent = manager
+        .get_for_run(&owner, &second)
+        .expect("owner sees agent");
+    assert_eq!(agent.id, second);
     assert_eq!(agent.agent_type, AgentType::Plan);
-    assert_eq!(agent.task, "design an API");
+    assert_eq!(agent.task, "design API");
     assert!(!agent.finished.load(Ordering::SeqCst));
     assert_eq!(agent.turns.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn register_with_id_inserts_entry_when_id_is_fresh() {
-    let mgr = BackgroundAgentManager::new();
-    let was_new = mgr.register_with_id(AgentType::Guide, "task", "fresh-id-123");
-    assert!(was_new);
-    let agent = mgr.get("fresh-id-123").expect("present");
-    assert_eq!(agent.id, "fresh-id-123");
+fn register_with_id_reattaches_only_within_same_run() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("resume-owner");
+    let foreign = test_run("resume-foreign");
+
+    assert!(manager
+        .register_with_id(&owner, AgentType::Explore, "first", "shared-id")
+        .expect("fresh registration"));
+    assert!(!manager
+        .register_with_id(&owner, AgentType::Plan, "replacement", "shared-id")
+        .expect("same-run reattach"));
+    assert_eq!(
+        manager.register_with_id(&foreign, AgentType::Plan, "steal", "shared-id"),
+        Err("Agent 'shared-id' not found".to_string())
+    );
+
+    let original = manager
+        .get_for_run(&owner, "shared-id")
+        .expect("original preserved");
+    assert_eq!(original.agent_type, AgentType::Explore);
+    assert_eq!(original.task, "first");
+    assert!(manager.get_for_run(&foreign, "shared-id").is_none());
 }
 
 #[test]
-fn register_with_id_returns_false_when_id_already_exists() {
-    // PINS RESUME CONTRACT #582: duplicate-id register is
-    // a no-op (NOT a replace) — used by the resume path.
-    let mgr = BackgroundAgentManager::new();
-    let was_new = mgr.register_with_id(AgentType::Explore, "first", "shared-id");
-    assert!(was_new);
-    let was_new_again = mgr.register_with_id(AgentType::Plan, "second", "shared-id");
-    assert!(!was_new_again, "duplicate id MUST return false");
-    // Original entry preserved.
-    let agent = mgr.get("shared-id").expect("present");
-    assert_eq!(agent.task, "first", "original task MUST be preserved");
+fn finish_and_fail_store_terminal_state_for_owner() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("terminal");
+    let finished_id = register(&manager, &owner, AgentType::Explore, "finish");
+    let failed_id = register(&manager, &owner, AgentType::Plan, "fail");
+
+    manager.finish(&owner, &finished_id, "result body".to_string());
+    manager.fail(&owner, &failed_id, "execution error".to_string());
+
+    let finished = manager
+        .get_for_run(&owner, &finished_id)
+        .expect("finished agent retained");
+    assert!(finished.finished.load(Ordering::SeqCst));
     assert_eq!(
-        agent.agent_type,
-        AgentType::Explore,
-        "original agent_type MUST be preserved"
+        finished.result.lock().unwrap().as_deref(),
+        Some("result body")
+    );
+    let failed = manager
+        .get_for_run(&owner, &failed_id)
+        .expect("failed agent retained");
+    assert!(failed.finished.load(Ordering::SeqCst));
+    assert_eq!(
+        failed.error.lock().unwrap().as_deref(),
+        Some("execution error")
     );
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Section C — finish + fail
-// ───────────────────────────────────────────────────────────────────────────
-
 #[test]
-fn finish_sets_finished_flag_and_stores_result() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Explore, "task");
-    mgr.finish(&id, "result body".to_string());
-    let agent = mgr.get(&id).expect("present");
-    assert!(agent.finished.load(Ordering::SeqCst));
-    let observed = {
-        let result = agent.result.lock().unwrap();
-        result.clone()
-    };
-    assert_eq!(observed.as_deref(), Some("result body"));
+fn foreign_terminal_mutations_fail_closed() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("terminal-owner");
+    let foreign = test_run("terminal-foreign");
+    let id = register(&manager, &owner, AgentType::Explore, "owned");
+
+    manager.finish(&foreign, &id, "stolen result".to_string());
+    manager.fail(&foreign, &id, "stolen failure".to_string());
+    assert_eq!(manager.increment_turns(&foreign, &id), 0);
+    assert!(manager.remove_for_run(&foreign, &id).is_none());
+    assert!(manager.list_for_run(&foreign).is_empty());
+
+    let agent = manager
+        .get_for_run(&owner, &id)
+        .expect("foreign run could not remove owner state");
+    assert!(!agent.finished.load(Ordering::SeqCst));
+    assert!(agent.result.lock().unwrap().is_none());
+    assert!(agent.error.lock().unwrap().is_none());
+    assert_eq!(agent.turns.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn fail_sets_finished_flag_and_stores_error() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Explore, "task");
-    mgr.fail(&id, "execution error".to_string());
-    let agent = mgr.get(&id).expect("present");
-    assert!(agent.finished.load(Ordering::SeqCst));
-    let observed = {
-        let error = agent.error.lock().unwrap();
-        error.clone()
-    };
-    assert_eq!(observed.as_deref(), Some("execution error"));
+fn unknown_terminal_mutations_are_noops() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("unknown");
+    manager.finish(&owner, "missing", "result".to_string());
+    manager.fail(&owner, "missing", "error".to_string());
+    assert_eq!(manager.increment_turns(&owner, "missing"), 0);
 }
 
 #[test]
-fn finish_on_unknown_id_is_silent_no_op() {
-    let mgr = BackgroundAgentManager::new();
-    // No panic on unknown id.
-    mgr.finish("nonexistent", "result".to_string());
+fn increment_turns_is_monotonic_and_visible() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("turns");
+    let id = register(&manager, &owner, AgentType::Explore, "task");
+    assert_eq!(manager.increment_turns(&owner, &id), 1);
+    assert_eq!(manager.increment_turns(&owner, &id), 2);
+    assert_eq!(manager.increment_turns(&owner, &id), 3);
+    assert_eq!(
+        manager
+            .get_for_run(&owner, &id)
+            .expect("agent retained")
+            .turns
+            .load(Ordering::SeqCst),
+        3
+    );
 }
 
 #[test]
-fn fail_on_unknown_id_is_silent_no_op() {
-    let mgr = BackgroundAgentManager::new();
-    mgr.fail("nonexistent", "error".to_string());
-}
+fn list_reports_only_owner_agents_and_terminal_status() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("list-owner");
+    let foreign = test_run("list-foreign");
+    let running = register(&manager, &owner, AgentType::Explore, "running");
+    let done = register(&manager, &owner, AgentType::Plan, "done");
+    let _foreign_id = register(&manager, &foreign, AgentType::Guide, "foreign");
+    manager.finish(&owner, &done, "result".to_string());
 
-// ───────────────────────────────────────────────────────────────────────────
-// Section D — increment_turns
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn increment_turns_returns_new_value_starting_at_1() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Explore, "task");
-    let n = mgr.increment_turns(&id);
-    assert_eq!(n, 1);
-}
-
-#[test]
-fn increment_turns_is_monotonic_across_calls() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Explore, "task");
-    let n1 = mgr.increment_turns(&id);
-    let n2 = mgr.increment_turns(&id);
-    let n3 = mgr.increment_turns(&id);
-    assert_eq!(n1, 1);
-    assert_eq!(n2, 2);
-    assert_eq!(n3, 3);
+    let listed = manager.list_for_run(&owner);
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().any(|entry| entry.0 == running && !entry.3));
+    assert!(listed.iter().any(|entry| entry.0 == done && entry.3));
+    assert_eq!(manager.list_for_run(&foreign).len(), 1);
 }
 
 #[test]
-fn increment_turns_visible_via_get_atomic_counter() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Explore, "task");
-    mgr.increment_turns(&id);
-    mgr.increment_turns(&id);
-    let agent = mgr.get(&id).expect("present");
-    assert_eq!(agent.turns.load(Ordering::SeqCst), 2);
+fn remove_is_exactly_run_scoped() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("remove-owner");
+    let foreign = test_run("remove-foreign");
+    let id = register(&manager, &owner, AgentType::Explore, "task");
+
+    assert!(manager.remove_for_run(&foreign, &id).is_none());
+    assert!(manager.get_for_run(&owner, &id).is_some());
+    assert!(manager.remove_for_run(&owner, &id).is_some());
+    assert!(manager.get_for_run(&owner, &id).is_none());
 }
 
 #[test]
-fn increment_turns_on_unknown_id_returns_zero() {
-    let mgr = BackgroundAgentManager::new();
-    let n = mgr.increment_turns("nonexistent");
-    // No-op: agent doesn't exist, no turn recorded.
-    assert_eq!(n, 0);
-}
+fn cleanup_finished_removes_only_owner_finished_agents() {
+    let manager = BackgroundAgentManager::new();
+    let owner = test_run("cleanup-owner");
+    let foreign = test_run("cleanup-foreign");
+    let owner_running = register(&manager, &owner, AgentType::Explore, "running");
+    let owner_done = register(&manager, &owner, AgentType::Plan, "done");
+    let foreign_done = register(&manager, &foreign, AgentType::Guide, "foreign done");
+    manager.finish(&owner, &owner_done, "done".to_string());
+    manager.finish(&foreign, &foreign_done, "done".to_string());
 
-// ───────────────────────────────────────────────────────────────────────────
-// Section E — list + remove
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn list_after_3_registers_returns_3_tuples() {
-    let mgr = BackgroundAgentManager::new();
-    mgr.register(AgentType::Explore, "a");
-    mgr.register(AgentType::Plan, "b");
-    mgr.register(AgentType::Guide, "c");
-    let listed = mgr.list();
-    assert_eq!(listed.len(), 3);
+    assert_eq!(manager.cleanup_finished_for_run(&owner), 1);
+    assert!(manager.get_for_run(&owner, &owner_running).is_some());
+    assert!(manager.get_for_run(&owner, &owner_done).is_none());
+    assert!(manager.get_for_run(&foreign, &foreign_done).is_some());
+    assert_eq!(manager.cleanup_finished_for_run(&foreign), 1);
 }
 
 #[test]
-fn list_tuple_carries_id_type_task_finished() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Plan, "design");
-    let listed = mgr.list();
-    assert_eq!(listed.len(), 1);
-    let (got_id, got_type, got_task, got_finished) = &listed[0];
-    assert_eq!(got_id, &id);
-    assert_eq!(*got_type, AgentType::Plan);
-    assert_eq!(got_task, "design");
-    assert!(!*got_finished);
-}
-
-#[test]
-fn list_reflects_finished_status_after_finish() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Explore, "task");
-    mgr.finish(&id, "done".to_string());
-    let listed = mgr.list();
-    let (_, _, _, finished) = &listed[0];
-    assert!(*finished);
-}
-
-#[test]
-fn remove_returns_some_arc_for_existing_id() {
-    let mgr = BackgroundAgentManager::new();
-    let id = mgr.register(AgentType::Explore, "task");
-    let removed = mgr.remove(&id);
-    assert!(removed.is_some());
-    // After remove, get returns None.
-    assert!(mgr.get(&id).is_none());
-}
-
-#[test]
-fn remove_returns_none_for_unknown_id() {
-    let mgr = BackgroundAgentManager::new();
-    let outcome = mgr.remove("nonexistent");
-    assert!(outcome.is_none());
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section F — cleanup_finished
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn cleanup_finished_removes_only_finished_agents() {
-    let mgr = BackgroundAgentManager::new();
-    let id_running = mgr.register(AgentType::Explore, "running");
-    let id_done = mgr.register(AgentType::Plan, "done");
-    mgr.finish(&id_done, "result".to_string());
-    let removed = mgr.cleanup_finished();
-    assert_eq!(removed, 1);
-    // Running agent still present, done one gone.
-    assert!(mgr.get(&id_running).is_some());
-    assert!(mgr.get(&id_done).is_none());
-}
-
-#[test]
-fn cleanup_finished_with_only_running_agents_removes_nothing() {
-    let mgr = BackgroundAgentManager::new();
-    mgr.register(AgentType::Explore, "a");
-    mgr.register(AgentType::Plan, "b");
-    let removed = mgr.cleanup_finished();
-    assert_eq!(removed, 0);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section G — Default impl
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn manager_default_equals_new_for_empty_state() {
-    let default_mgr = BackgroundAgentManager::default();
-    let new_mgr = BackgroundAgentManager::new();
-    assert_eq!(default_mgr.list().len(), new_mgr.list().len());
+fn default_and_new_both_start_empty() {
+    let owner = test_run("default");
+    assert!(BackgroundAgentManager::default()
+        .list_for_run(&owner)
+        .is_empty());
+    assert!(BackgroundAgentManager::new()
+        .list_for_run(&owner)
+        .is_empty());
 }

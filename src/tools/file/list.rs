@@ -10,19 +10,22 @@ use std::collections::HashMap;
 /// `read_dir().flatten()`, which discarded any `DirEntry` that errored — the
 /// caller saw a clean listing with no signal that entries were hidden, and
 /// the model then acted on incomplete information.
-pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_list_files(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     // crosslink #675: typed accessor (default-with-fallback variant).
     let raw_path = match args.arg_str_or_strict("path", ".") {
         Ok(path) => path,
         Err(e) => return e.into_tool_error(),
     };
 
-    let path = match resolve_path(raw_path) {
+    let path = match resolve_path(run, raw_path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };
 
-    match secure_fs::open_directory(&path).and_then(|directory| directory.entries()) {
+    match secure_fs::open_directory(run, &path).and_then(|directory| directory.entries()) {
         Ok(entries) => {
             // (is_dir, name) tuples — sort puts every dir before every
             // file (false < true under default Ord, so `is_dir`'s
@@ -64,6 +67,10 @@ mod tests {
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     /// Process-wide lock so concurrent tests don't interleave their captures
     /// of the global tracing dispatcher state.
@@ -134,7 +141,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
         let mut args = HashMap::new();
         args.insert("path".to_string(), json!(tmp.path().to_str().unwrap()));
-        let (out, is_err) = execute_list_files(&args);
+        let (out, is_err) = execute_list_files(test_run(), &args);
         assert!(!is_err);
         assert!(out.contains("a.txt"));
 

@@ -81,6 +81,7 @@ fn build_print_chat_request(
     adapter: &dyn ProviderAdapter,
     model: &str,
     prompt: String,
+    run: &openclaudia::tools::ToolRunContext,
 ) -> openclaudia::proxy::ChatCompletionRequest {
     let user_messages = vec![openclaudia::proxy::ChatMessage {
         role: "user".to_string(),
@@ -90,13 +91,10 @@ fn build_print_chat_request(
         tool_calls: None,
         extra: std::collections::HashMap::new(),
     }];
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned());
-    let prompt_context = openclaudia::prompt::build_prompt_context(
+    let prompt_context = openclaudia::prompt::build_prompt_context_for_run(
         &openclaudia::modes::BehaviorMode::default(),
         None,
-        cwd.as_deref(),
+        run,
     );
     openclaudia::proxy::ChatCompletionRequest {
         model: model.to_string(),
@@ -258,6 +256,23 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         options.model_override.as_deref(),
         options.target_override.as_deref(),
     )?;
+    let print_root = std::env::current_dir()
+        .map_err(|error| anyhow::anyhow!("could not resolve print-mode project root: {error}"))?;
+    let print_run = openclaudia::tools::ToolRunContext::builder(
+        openclaudia::state::SessionId::new(),
+        &print_root,
+    )
+    .working_directory(&print_root)
+    .read_only_roots(Vec::new())
+    .read_write_roots(Vec::new())
+    .environment_grants(std::collections::HashMap::new())
+    .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+    .process(false)
+    .network(true)
+    .secrets(true)
+    .provider(config.proxy.target.clone())
+    .build()
+    .map_err(anyhow::Error::msg)?;
     let provider = config.active_provider().ok_or_else(|| {
         anyhow::anyhow!(
             "no provider configured for target '{}'",
@@ -291,7 +306,7 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         &config.proxy.target,
     );
     let adapter = openclaudia::providers::get_adapter(&config.proxy.target)?;
-    let chat_request = build_print_chat_request(adapter, &model, options.prompt);
+    let chat_request = build_print_chat_request(adapter, &model, options.prompt, &print_run);
     enforce_print_request_policy(&config, &chat_request)?;
     let request_body = build_print_request(
         adapter,
@@ -338,6 +353,27 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, OnceLock};
+
+    fn print_test_run() -> &'static openclaudia::tools::ToolRunContext {
+        static RUN: OnceLock<Arc<openclaudia::tools::ToolRunContext>> = OnceLock::new();
+        RUN.get_or_init(|| {
+            openclaudia::tools::ToolRunContext::builder(
+                openclaudia::state::SessionId::new(),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(true)
+            .secrets(true)
+            .provider("print-test")
+            .build()
+            .expect("print test run")
+        })
+    }
 
     fn test_config_with_policy(
         policy: openclaudia::services::policy::EnterprisePolicy,
@@ -427,6 +463,7 @@ mod tests {
             openclaudia::providers::get_adapter("openai").expect("adapter"),
             "blocked-model",
             "hello".to_string(),
+            print_test_run(),
         );
 
         let err = enforce_print_request_policy(&config, &request).unwrap_err();
@@ -444,6 +481,7 @@ mod tests {
             openclaudia::providers::get_adapter("openai").expect("adapter"),
             "any-model",
             "this prompt is intentionally longer than one estimated token".to_string(),
+            print_test_run(),
         );
 
         let err = enforce_print_request_policy(&config, &request).unwrap_err();
@@ -454,7 +492,8 @@ mod tests {
     #[test]
     fn print_request_has_no_tools_and_streams_non_google() {
         let adapter = openclaudia::providers::get_adapter("openai").unwrap();
-        let request = build_print_chat_request(adapter, "gpt-5.5", "hi".to_string());
+        let request =
+            build_print_chat_request(adapter, "gpt-5.5", "hi".to_string(), print_test_run());
         let body = build_print_request(
             adapter,
             &request,
@@ -474,7 +513,8 @@ mod tests {
             ..Default::default()
         };
 
-        let request = build_print_chat_request(adapter, "gpt-5.5", "hi".to_string());
+        let request =
+            build_print_chat_request(adapter, "gpt-5.5", "hi".to_string(), print_test_run());
         let body = build_print_request(adapter, &request, &thinking, None).unwrap();
 
         assert_eq!(body["reasoning_effort"], "xhigh");
@@ -488,7 +528,12 @@ mod tests {
             ..openclaudia::config::ThinkingConfig::default()
         };
 
-        let request = build_print_chat_request(adapter, "gemini-3.5-flash", "hi".to_string());
+        let request = build_print_chat_request(
+            adapter,
+            "gemini-3.5-flash",
+            "hi".to_string(),
+            print_test_run(),
+        );
         let body = build_print_request(adapter, &request, &thinking, None).unwrap();
 
         assert_eq!(

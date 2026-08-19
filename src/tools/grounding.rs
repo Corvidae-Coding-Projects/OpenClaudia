@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 const MAX_GROUNDING_OBSERVATION_IDS: usize = 16;
 const MAX_GROUNDING_TEXT_BYTES: usize = 12 * 1024;
 
-pub fn execute_grounding_context(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_grounding_context(
+    session_key: &str,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let ids = match parse_obs_ids(args) {
         Ok(ids) => ids,
         Err(err) => return (err, true),
@@ -15,16 +18,15 @@ pub fn execute_grounding_context(args: &HashMap<String, Value>) -> (String, bool
         Err(err) => return (err, true),
     };
 
-    let session_key = super::todo::current_session_key();
-    let ledger = if let Some(shared) = crate::ledger::active_ledger_for_session(&session_key) {
+    let ledger = if let Some(shared) = crate::ledger::active_ledger_for_session(session_key) {
         let ledger = shared.lock().unwrap_or_else(|err| {
             tracing::error!("active reality ledger lock poisoned; recovering inner state");
             err.into_inner()
         });
-        hydrate_from_ledger(&session_key, &ledger, &ids, include_stale)
+        hydrate_from_ledger(session_key, &ledger, &ids, include_stale)
     } else {
-        match RealityLedger::open_existing_project_session(&session_key) {
-            Ok(ledger) => hydrate_from_ledger(&session_key, &ledger, &ids, include_stale),
+        match RealityLedger::open_existing_project_session(session_key) {
+            Ok(ledger) => hydrate_from_ledger(session_key, &ledger, &ids, include_stale),
             Err(
                 crate::ledger::LedgerError::InvalidSessionKey { .. }
                 | crate::ledger::LedgerError::MissingSessionLedger { .. },
@@ -241,10 +243,9 @@ mod tests {
             .expect("file read");
         let shared = Arc::new(Mutex::new(ledger));
         let _ledger_guard = crate::ledger::install_active_ledger_for_session(session_id, shared);
-        let _session_guard = crate::tools::SessionIdGuard::set(session_id);
 
         let args = HashMap::from([("ids".to_string(), json!([read.to_string()]))]);
-        let (content, is_error) = execute_grounding_context(&args);
+        let (content, is_error) = execute_grounding_context(session_id, &args);
 
         assert!(!is_error, "{content}");
         let response: Value = serde_json::from_str(&content).expect("json");
@@ -268,10 +269,9 @@ mod tests {
             .expect("diff");
         let shared = Arc::new(Mutex::new(ledger));
         let _ledger_guard = crate::ledger::install_active_ledger_for_session(session_id, shared);
-        let _session_guard = crate::tools::SessionIdGuard::set(session_id);
 
         let args = HashMap::from([("ids".to_string(), json!([read.to_string()]))]);
-        let (content, is_error) = execute_grounding_context(&args);
+        let (content, is_error) = execute_grounding_context(session_id, &args);
         assert!(!is_error, "{content}");
         let response: Value = serde_json::from_str(&content).expect("json");
         assert!(response["observations"]
@@ -284,7 +284,7 @@ mod tests {
             ("ids".to_string(), json!([read.to_string()])),
             ("include_stale".to_string(), json!(true)),
         ]);
-        let (content, is_error) = execute_grounding_context(&args);
+        let (content, is_error) = execute_grounding_context(session_id, &args);
         assert!(!is_error, "{content}");
         let response: Value = serde_json::from_str(&content).expect("json");
         assert_eq!(response["observations"][0]["stale"], true);
@@ -306,10 +306,9 @@ mod tests {
             .expect("summary");
         let shared = Arc::new(Mutex::new(ledger));
         let _ledger_guard = crate::ledger::install_active_ledger_for_session(session_id, shared);
-        let _session_guard = crate::tools::SessionIdGuard::set(session_id);
 
         let args = HashMap::from([("ids".to_string(), json!([summary.to_string()]))]);
-        let (content, is_error) = execute_grounding_context(&args);
+        let (content, is_error) = execute_grounding_context(session_id, &args);
 
         assert!(!is_error, "{content}");
         let response: Value = serde_json::from_str(&content).expect("json");
@@ -327,9 +326,8 @@ mod tests {
             crate::ledger::project_session_ledger_path(&session_id).expect("ledger path");
         assert!(!ledger_path.exists(), "test session ledger must be absent");
 
-        let _session_guard = crate::tools::SessionIdGuard::set(&session_id);
         let args = HashMap::from([("ids".to_string(), json!([ObsId::new().to_string()]))]);
-        let (content, is_error) = execute_grounding_context(&args);
+        let (content, is_error) = execute_grounding_context(&session_id, &args);
 
         assert!(is_error, "{content}");
         assert!(
@@ -344,11 +342,12 @@ mod tests {
 
     #[test]
     fn grounding_context_rejects_non_boolean_include_stale() {
+        let session_id = "grounding-context-invalid-include-stale";
         let args = HashMap::from([
             ("ids".to_string(), json!([ObsId::new().to_string()])),
             ("include_stale".to_string(), json!("true")),
         ]);
-        let (content, is_error) = execute_grounding_context(&args);
+        let (content, is_error) = execute_grounding_context(session_id, &args);
 
         assert!(is_error, "{content}");
         assert_eq!(

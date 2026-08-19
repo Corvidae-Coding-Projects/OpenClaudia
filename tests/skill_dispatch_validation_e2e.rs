@@ -15,29 +15,16 @@
 use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
 mod support;
 
-fn cwd_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn run_in_tempdir<R>(f: impl FnOnce() -> R) -> R {
-    let prev = std::env::current_dir().expect("cwd");
-    let tmp = TempDir::new().expect("tempdir");
-    std::env::set_current_dir(tmp.path()).expect("set cwd");
-    let outcome = f();
-    std::env::set_current_dir(&prev).expect("restore cwd");
-    outcome
-}
-
 fn dispatch_skill(args: &HashMap<String, Value>) -> (String, bool) {
     support::dispatch_tool("skill", args)
+}
+
+fn dispatch_skill_in(root: &std::path::Path, args: &HashMap<String, Value>) -> (String, bool) {
+    support::legacy(&support::dispatch_tool_result_in(root, "skill", args))
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -175,11 +162,11 @@ fn name_with_leading_whitespace_trimmed_before_lookup() {
 
 #[test]
 fn skill_installed_in_project_dir_loads_and_returns_envelope() {
-    let _l = cwd_lock();
-    run_in_tempdir(|| {
+    let tmp = TempDir::new().expect("tempdir");
+    {
         // Write a skill at .openclaudia/skills/<name>/SKILL.md.
-        let skills_dir = std::path::Path::new(".openclaudia/skills/round_trip_154");
-        std::fs::create_dir_all(skills_dir).expect("mkdir skills");
+        let skills_dir = tmp.path().join(".openclaudia/skills/round_trip_154");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir skills");
         std::fs::write(
             skills_dir.join("SKILL.md"),
             "---\nname: round_trip_154\ndescription: test\n---\nBody marker: HELLO_FROM_154\n",
@@ -187,7 +174,7 @@ fn skill_installed_in_project_dir_loads_and_returns_envelope() {
         .expect("write SKILL.md");
 
         let args = args_with(&[("name", json!("round_trip_154"))]);
-        let (text, is_err) = dispatch_skill(&args);
+        let (text, is_err) = dispatch_skill_in(tmp.path(), &args);
         assert!(!is_err, "installed skill MUST load; got error {text:?}");
 
         // PINS ENVELOPE: opens with <skill name="...">, ends with </skill>.
@@ -208,15 +195,15 @@ fn skill_installed_in_project_dir_loads_and_returns_envelope() {
             text.contains("HELLO_FROM_154"),
             "body MUST be present; got {text:?}"
         );
-    });
+    }
 }
 
 #[test]
 fn skill_envelope_normalises_trailing_newline_before_close_tag() {
-    let _l = cwd_lock();
-    run_in_tempdir(|| {
-        let skills_dir = std::path::Path::new(".openclaudia/skills/trailing_newline_154");
-        std::fs::create_dir_all(skills_dir).expect("mkdir");
+    let tmp = TempDir::new().expect("tempdir");
+    {
+        let skills_dir = tmp.path().join(".openclaudia/skills/trailing_newline_154");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir");
         // Body ends WITHOUT trailing newline.
         std::fs::write(
             skills_dir.join("SKILL.md"),
@@ -225,14 +212,14 @@ fn skill_envelope_normalises_trailing_newline_before_close_tag() {
         .expect("write");
 
         let args = args_with(&[("name", json!("trailing_newline_154"))]);
-        let (text, is_err) = dispatch_skill(&args);
+        let (text, is_err) = dispatch_skill_in(tmp.path(), &args);
         assert!(!is_err);
         // PINS: render_envelope adds a newline so close-tag is on its own line.
         assert!(
             text.contains("Last line no NL\n</skill>"),
             "MUST insert trailing newline before </skill>; got {text:?}"
         );
-    });
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

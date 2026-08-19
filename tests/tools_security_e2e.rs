@@ -22,8 +22,8 @@
 //!   - **atomic file write** — 4 concurrent writer threads racing on
 //!     the same target file via `write_file`. The final file must
 //!     exactly equal ONE writer's payload — never a torn splice.
-//!   - **read tracker isolation** — distinct `SessionIdGuard` scopes
-//!     do not share the read-before-write gate, so an `edit_file`
+//!   - **read tracker isolation** — distinct immutable run identities do not
+//!     share the read-before-write gate, so an `edit_file`
 //!     issued under session B fails even if session A read the file
 //!     first.
 
@@ -34,7 +34,7 @@
 use openclaudia::tools::{
     dangerous_shell_construct, execute_tool, is_safe_for_auto_allow,
     is_sensitive_env_pub as is_sensitive_env, validate_command, FunctionCall, PathConstraints,
-    SessionIdGuard, ToolCall, MAX_COMMAND_LEN,
+    ToolCall, MAX_COMMAND_LEN,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -342,74 +342,57 @@ fn concurrent_atomic_writers_never_produce_torn_reads() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — SessionIdGuard read-tracker isolation
+// Section D — exact-run read-tracker isolation
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn session_id_guards_are_stack_scoped_and_restore_on_drop() {
-    // The guard restores the prior session id on Drop, so nested
-    // scopes don't leak. We can't observe the thread-local state
-    // directly from outside the tools crate, but we CAN observe its
-    // effect: an `edit_file` issued AFTER the read-marking guard
-    // drops still sees the same file as "not read in this session"
-    // because each `SessionIdGuard::set` overwrites the slot.
-
+fn exact_run_identity_partitions_read_before_edit_state() {
     let dir = tempfile::tempdir_in(".").expect("tempdir");
     let path = dir.path().join("scoped.txt");
     std::fs::write(&path, "v1").expect("write");
+    let run_a = support::test_run_context(dir.path());
+    let run_b = support::test_run_context(dir.path());
 
-    // Session A: read the file (write-read sequence to mark it).
-    {
-        let _guard_a = SessionIdGuard::set("session-A");
-        let read = execute_tool(&call(
+    let read = execute_tool(
+        &run_a,
+        &call(
             "read_file",
             &json!({"path": path.to_string_lossy().to_string()}),
-        ));
-        assert!(
-            !read.is_error(),
-            "session A: read must succeed, got {read:?}"
-        );
-    }
+        ),
+    );
+    assert!(!read.is_error(), "run A read must succeed, got {read:?}");
 
-    // Session B: try to edit without reading first. The read-before-
-    // edit gate must refuse because session B never read the file.
-    {
-        let _guard_b = SessionIdGuard::set("session-B");
-        let edit = execute_tool(&call(
+    let edit = execute_tool(
+        &run_b,
+        &call(
             "edit_file",
             &json!({
                 "path": path.to_string_lossy().to_string(),
                 "old_string": "v1",
                 "new_string": "v2",
             }),
-        ));
-        // Either is_error or a message naming the read-before-edit
-        // requirement is acceptable; what we will NOT tolerate is
-        // the edit succeeding (which would mean the gate leaked
-        // across session boundaries).
-        let permitted = edit.is_error()
-            || edit.content().to_lowercase().contains("read")
-            || edit.content().to_lowercase().contains("before");
-        assert!(
-            permitted,
-            "session B: edit without prior read must be refused; got {edit:?}"
-        );
-    }
+        ),
+    );
+    assert!(
+        edit.is_error(),
+        "run B edit without its own read must be refused; got {edit:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("unchanged"), "v1");
 
-    // Back in session A (the file was read), the edit must succeed.
-    {
-        let _guard_a = SessionIdGuard::set("session-A");
-        let edit = execute_tool(&call(
+    let edit = execute_tool(
+        &run_a,
+        &call(
             "edit_file",
             &json!({
                 "path": path.to_string_lossy().to_string(),
                 "old_string": "v1",
                 "new_string": "v2",
             }),
-        ));
-        assert!(
-            !edit.is_error(),
-            "session A re-entry: edit must succeed (file was read in this session), got {edit:?}"
-        );
-    }
+        ),
+    );
+    assert!(
+        !edit.is_error(),
+        "run A edit must succeed because that exact run read the file: {edit:?}"
+    );
 }
+mod support;

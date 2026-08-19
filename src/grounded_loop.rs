@@ -254,13 +254,11 @@ pub struct QualityGateObservationIds {
 ///
 /// Returns [`LedgerError`] when either observation cannot be persisted.
 pub fn append_quality_gate_observations(
+    run: &crate::tools::ToolRunContext,
     ledger: &mut RealityLedger,
     gate: &crate::guardrails::QualityCheckResult,
 ) -> Result<QualityGateObservationIds, LedgerError> {
-    let cwd = std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let cwd = run.working_directory().to_string_lossy().to_string();
     let command = ledger.observe_command_run(
         cwd,
         quality_gate_argv(&gate.command),

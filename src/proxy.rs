@@ -57,6 +57,8 @@ pub struct ProxyState {
     pub config: Arc<AppConfig>,
     pub client: Client,
     pub hook_engine: HookEngine,
+    /// Immutable host capabilities for this proxy session generation.
+    pub run_context: Arc<crate::tools::ToolRunContext>,
     /// Operator-supplied overrides for compaction behavior.
     ///
     /// Stored as overrides — *not* a fully realized [`ContextCompactor`] —
@@ -559,6 +561,7 @@ async fn list_models(State(state): State<ProxyState>) -> impl IntoResponse {
 
 /// Run `PreToolUse` hooks for tool calls in the response
 async fn run_pre_tool_use_hooks(
+    run: &Arc<crate::tools::ToolRunContext>,
     hook_engine: &HookEngine,
     session_id: Option<&str>,
     tool_name: &str,
@@ -570,7 +573,7 @@ async fn run_pre_tool_use_hooks(
     let extensions = extensions_from_tool_input(tool_name, tool_input);
 
     let mut hook_input =
-        HookInput::new(HookEvent::PreToolUse).with_tool(tool_name, tool_input.clone());
+        HookInput::for_run(run, HookEvent::PreToolUse).with_tool(tool_name, tool_input.clone());
 
     if let Some(sid) = session_id {
         hook_input = hook_input.with_session_id(sid);
@@ -627,7 +630,7 @@ async fn prepare_request_context(
                 .join("\n"),
         });
 
-    let hook_input = HookInput::new(HookEvent::UserPromptSubmit)
+    let hook_input = HookInput::for_run(&state.run_context, HookEvent::UserPromptSubmit)
         .with_prompt(last_user_message.unwrap_or_default());
 
     let hook_result = state
@@ -735,6 +738,7 @@ async fn prepare_request_context(
                         sm.get_session().map(|s| s.id.clone())
                     };
                     let hook_result = run_pre_tool_use_hooks(
+                        &state.run_context,
                         &state.hook_engine,
                         session_id.as_deref(),
                         name,
@@ -902,6 +906,7 @@ async fn record_turn_estimate(
         state
             .hook_engine
             .fire_notification(
+                &state.run_context,
                 "token_warning",
                 serde_json::json!({ "usage_pct": usage_pct_f64 }),
             )
@@ -921,6 +926,7 @@ async fn record_turn_estimate(
 /// 50 MiB) caps the buffered body; over-limit and other read errors
 /// log at `warn!` and return an empty passthrough rather than feeding
 /// an empty buffer to the VDD engine.
+#[allow(clippy::too_many_lines)] // Keep one auditable response-body/VDD/reassembly transaction.
 async fn apply_vdd_review(
     response_value: Response,
     state: &ProxyState,
@@ -953,6 +959,7 @@ async fn apply_vdd_review(
     };
 
     fire_vdd_hook_event(
+        &state.run_context,
         &state.hook_engine,
         HookEvent::PreAdversaryReview,
         provider_name,
@@ -968,16 +975,24 @@ async fn apply_vdd_review(
         let engine = vdd_engine.lock().await;
         let builder = crate::vdd::BuilderProvider::new(provider_name, api_key);
         engine
-            .process_response(&response_json, request, builder)
+            .process_response(&state.run_context, &response_json, request, builder)
             .await
     };
 
     match &vdd_result {
         Ok(result) => {
-            fire_vdd_result_hooks(&state.hook_engine, provider_name, &request.model, result).await;
+            fire_vdd_result_hooks(
+                &state.run_context,
+                &state.hook_engine,
+                provider_name,
+                &request.model,
+                result,
+            )
+            .await;
         }
         Err(error) => {
             fire_vdd_hook_event(
+                &state.run_context,
                 &state.hook_engine,
                 HookEvent::PostAdversaryReview,
                 provider_name,
@@ -1035,13 +1050,14 @@ async fn apply_vdd_review(
 }
 
 async fn fire_vdd_result_hooks(
+    run: &Arc<crate::tools::ToolRunContext>,
     hook_engine: &HookEngine,
     provider_name: &str,
     model: &str,
     result: &VddResult,
 ) {
     for (event, payload) in vdd_result_hook_plan(result) {
-        fire_vdd_hook_event(hook_engine, event, provider_name, model, payload).await;
+        fire_vdd_hook_event(run, hook_engine, event, provider_name, model, payload).await;
     }
 }
 
@@ -1125,13 +1141,14 @@ fn vdd_result_hook_plan(result: &VddResult) -> Vec<(HookEvent, Value)> {
 }
 
 async fn fire_vdd_hook_event(
+    run: &Arc<crate::tools::ToolRunContext>,
     hook_engine: &HookEngine,
     event: HookEvent,
     provider_name: &str,
     model: &str,
     payload: Value,
 ) {
-    let input = HookInput::new(event)
+    let input = HookInput::for_run(run, event)
         .with_extra("provider", serde_json::json!(provider_name))
         .with_extra("model", serde_json::json!(model))
         .with_extra("payload", payload);
@@ -1181,6 +1198,7 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
         .compact_with_hint(
             request,
             Some(&state.hook_engine),
+            &state.run_context,
             None,
             actual_token_hint,
             None,
@@ -1200,6 +1218,7 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
             state
                 .hook_engine
                 .fire_notification(
+                    &state.run_context,
                     "compaction",
                     serde_json::json!({ "summary_length": summary_len }),
                 )
@@ -1225,8 +1244,8 @@ async fn complete_loop_iteration(state: &ProxyState) {
         let sm = state.session_manager.read().await;
         sm.get_session().map(|session| session.id.clone())
     };
-    let mut stop_input =
-        HookInput::new(HookEvent::Stop).with_extra("iteration", serde_json::json!(iteration));
+    let mut stop_input = HookInput::for_run(&state.run_context, HookEvent::Stop)
+        .with_extra("iteration", serde_json::json!(iteration));
     if let Some(session_id) = session_id {
         stop_input = stop_input.with_session_id(session_id);
     }
@@ -1602,12 +1621,14 @@ pub async fn handle_mcp_tool_call(
 /// Fire a `tool_error` notification when a tool execution fails.
 /// This should be called by any code path that executes tools and gets an error.
 pub async fn fire_tool_error_notification(
+    run: &Arc<crate::tools::ToolRunContext>,
     hook_engine: &HookEngine,
     tool_name: &str,
     error_msg: &str,
 ) {
     hook_engine
         .fire_notification(
+            run,
             "tool_error",
             serde_json::json!({
                 "tool": tool_name,
@@ -2352,19 +2373,37 @@ async fn build_proxy_state_with_loop_control(
     // these as a delta on top of the model defaults (crosslink #489).
     let compactor_overrides = CompactionOverrides::default();
 
-    // Initialize session manager
-    let session_manager = Arc::new(RwLock::new(SessionManager::new(
-        &config.session.persist_path,
-    )));
+    // Resolve launch authority once at the composition root. No tool/helper
+    // is allowed to rediscover process cwd later as an ambient fallback.
+    let launch_root = std::env::current_dir()
+        .map_err(|error| anyhow::anyhow!("Cannot resolve proxy workspace: {error}"))?;
+
+    // Initialize the canonical session before binding capabilities so the
+    // descriptor and persisted session share the same identity.
+    let mut session_manager_value = SessionManager::new(&config.session.persist_path);
+    let session_id = session_manager_value.get_or_create_session().id.clone();
+    let typed_session_id = crate::state::SessionId::from_raw(&session_id)
+        .map_err(|error| anyhow::anyhow!("Invalid proxy session id: {error}"))?;
+    let run_context = crate::tools::ToolRunContext::builder(typed_session_id, &launch_root)
+        .working_directory(&launch_root)
+        .host_startup_grants()
+        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(true)
+        .secrets(true)
+        .provider(config.proxy.target.clone())
+        .build()
+        .map_err(|error| anyhow::anyhow!("Cannot create proxy run capabilities: {error}"))?;
+    let session_manager = Arc::new(RwLock::new(session_manager_value));
 
     // Initialize plugin manager and discover plugins.
     // crosslink #893: try_new surfaces missing-$HOME as a warning rather
     // than degrading silently to a project-only manager.
-    let mut plugin_manager = match PluginManager::try_new() {
+    let mut plugin_manager = match PluginManager::try_new_for_project(run_context.project_root()) {
         Ok(pm) => pm,
         Err(e) => {
             warn!(error = %e, "PluginManager: falling back to project-only search");
-            PluginManager::new()
+            PluginManager::new_for_project(run_context.project_root())
         }
     };
     let plugin_errors = plugin_manager.discover();
@@ -2374,8 +2413,10 @@ async fn build_proxy_state_with_loop_control(
     let plugin_manager = Arc::new(plugin_manager);
 
     // Initialize MCP manager and connect to configured servers
-    let mcp_manager = Arc::new(RwLock::new(McpManager::new()));
+    let mcp_manager = Arc::new(RwLock::new(McpManager::new(Arc::clone(&run_context))));
     connect_mcp_servers(&mcp_manager, &plugin_manager).await;
+    let _ = crate::mcp::install_manager(&run_context, &mcp_manager);
+    crate::guardrails::configure(&run_context, &config.guardrails);
 
     // Initialize OAuth store for Claude Max authentication
     let oauth_store = Arc::new(OAuthStore::new());
@@ -2406,6 +2447,7 @@ async fn build_proxy_state_with_loop_control(
         config: Arc::new(config),
         client,
         hook_engine,
+        run_context,
         compactor_overrides,
         session_manager,
         plugin_manager,
@@ -2425,7 +2467,7 @@ async fn build_proxy_state_with_loop_control(
 pub async fn connect_mcp_servers(
     mcp_manager: &Arc<RwLock<McpManager>>,
     plugin_manager: &Arc<PluginManager>,
-) {
+) -> std::collections::HashSet<String> {
     let trusted = match mcp_trust_grants_from_startup() {
         Ok(trusted) => trusted,
         Err(error) => {
@@ -2434,10 +2476,11 @@ pub async fn connect_mcp_servers(
                 %error,
                 "MCP startup is blocked because the host trust grant is invalid"
             );
-            return;
+            return std::collections::HashSet::new();
         }
     };
     connect_mcp_servers_with_trust(mcp_manager, plugin_manager, &trusted).await;
+    trusted
 }
 
 /// Connect only MCP servers covered by an explicit host trust grant.
@@ -2452,7 +2495,7 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
     trusted: &std::collections::HashSet<String, S>,
 ) {
     let mcp = mcp_manager.write().await;
-    for (plugin, server) in plugin_manager.all_mcp_servers() {
+    for (plugin, server) in plugin_manager.all_mcp_servers_for_run(mcp.run_context()) {
         let trust_id = format!("{}/{}", plugin.id, server.name);
         if !trusted.contains(&trust_id) {
             if let Err(error) = mcp.disconnect(&server.name).await {
@@ -2597,7 +2640,8 @@ async fn fire_session_start(state: &ProxyState) -> String {
         id
     };
 
-    let start_input = HookInput::new(HookEvent::SessionStart).with_session_id(&session_id);
+    let start_input = HookInput::for_run(&state.run_context, HookEvent::SessionStart)
+        .with_session_id(&session_id);
     let start_result = state
         .hook_engine
         .run(HookEvent::SessionStart, &start_input)
@@ -2612,6 +2656,33 @@ async fn fire_session_start(state: &ProxyState) -> String {
     session_id
 }
 
+async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) {
+    let session_id = {
+        let sm = state.session_manager.read().await;
+        sm.get_session().map(|session| session.id.clone())
+    };
+    if let Some(session_id) = session_id.as_deref() {
+        let input = HookInput::for_run(&state.run_context, HookEvent::SessionEnd)
+            .with_session_id(session_id);
+        let _ = state.hook_engine.run(HookEvent::SessionEnd, &input).await;
+    }
+    if let Err(error) = state.mcp_manager.write().await.disconnect_all().await {
+        warn!(%error, "Failed to disconnect MCP servers during proxy shutdown");
+    }
+    if let Some(session_id) = session_id {
+        let mut sm = state.session_manager.write().await;
+        if sm
+            .get_session()
+            .is_some_and(|session| session.id == session_id)
+        {
+            if let Err(error) = sm.end_session(handoff) {
+                warn!(%error, "Failed to persist session during proxy shutdown");
+            }
+        }
+    }
+    crate::tools::retire_run(&state.run_context);
+}
+
 /// Start the proxy server.
 ///
 /// # Errors
@@ -2622,14 +2693,18 @@ pub async fn start_server(config: AppConfig) -> anyhow::Result<()> {
     let state = build_proxy_state(config).await?;
     fire_session_start(&state).await;
 
-    let app = create_router(state);
+    let app = create_router(state.clone());
 
     info!(address = %addr, "Starting OpenClaudia proxy server");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    let result = async {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+    .await;
+    finish_proxy_runtime(&state, None).await;
+    result
 }
 
 /// Start the proxy server with graceful shutdown support.
@@ -2654,26 +2729,30 @@ pub async fn start_server_with_shutdown(
     let state = build_proxy_state(config).await?;
     fire_session_start(&state).await;
 
-    let app = create_router(state);
+    let app = create_router(state.clone());
 
     info!(address = %addr, "Starting OpenClaudia proxy server (with shutdown support)");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let result = async {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // Use axum's graceful shutdown
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            // Wait for shutdown signal
-            loop {
-                if shutdown_rx.changed().await.is_err() || *shutdown_rx.borrow() {
-                    info!("Shutdown signal received, stopping server...");
-                    break;
+        // Use axum's graceful shutdown
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                // Wait for shutdown signal
+                loop {
+                    if shutdown_rx.changed().await.is_err() || *shutdown_rx.borrow() {
+                        info!("Shutdown signal received, stopping server...");
+                        break;
+                    }
                 }
-            }
-        })
-        .await?;
-
-    Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
+    finish_proxy_runtime(&state, None).await;
+    result
 }
 
 /// Start the proxy server in loop mode.
@@ -2693,9 +2772,7 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
     let control = Arc::new(LoopControl::new(max_iterations, shutdown_tx.clone()));
     let state = build_proxy_state_with_loop_control(config, Some(control.clone())).await?;
     let session_id = fire_session_start(&state).await;
-    let session_manager = Arc::clone(&state.session_manager);
-
-    let app = create_router(state);
+    let app = create_router(state.clone());
 
     info!(
         address = %addr,
@@ -2715,39 +2792,40 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            loop {
-                if shutdown_rx.changed().await.is_err() || *shutdown_rx.borrow() {
-                    info!("Loop shutdown signal received, stopping server...");
-                    break;
+    let serve_result: anyhow::Result<()> = async {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                loop {
+                    if shutdown_rx.changed().await.is_err() || *shutdown_rx.borrow() {
+                        info!("Loop shutdown signal received, stopping server...");
+                        break;
+                    }
                 }
-            }
-        })
-        .await?;
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
 
     let completed = control.completed_iterations();
     let handoff = format!(
         "Loop mode completed after {completed} iteration(s).\nSession ended after {completed} iteration(s)."
     );
-    let mut sm = session_manager.write().await;
-    let active_session_matches = sm
-        .get_session()
-        .is_some_and(|session| session.id == session_id);
-    if active_session_matches {
-        if let Err(e) = sm.end_session(Some(&handoff)) {
-            warn!(error = %e, "Failed to persist session at end of loop mode");
-        }
-    }
+    finish_proxy_runtime(&state, Some(&handoff)).await;
+    serve_result?;
 
-    info!(completed, "Loop mode ended");
+    info!(completed, session_id, "Loop mode ended");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_run() -> &'static Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     fn mcp_permission_manager(
         allow_target: Option<&str>,
@@ -2771,7 +2849,7 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_mcp_dispatch_denies_malformed_name_before_manager_access() {
-        let mcp = Arc::new(RwLock::new(McpManager::new()));
+        let mcp = Arc::new(RwLock::new(McpManager::new(Arc::clone(test_run()))));
         let permissions = crate::permissions::PermissionManager::unrestricted();
         let error = handle_mcp_tool_call(&mcp, &permissions, "mcp__", serde_json::json!({}))
             .await
@@ -2781,7 +2859,7 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_mcp_dispatch_requires_explicit_noninteractive_approval() {
-        let mcp = Arc::new(RwLock::new(McpManager::new()));
+        let mcp = Arc::new(RwLock::new(McpManager::new(Arc::clone(test_run()))));
         let (permissions, _dir) = mcp_permission_manager(None);
         let error = handle_mcp_tool_call(
             &mcp,
@@ -2801,7 +2879,7 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_mcp_dispatch_reaches_connection_only_after_scoped_allow() {
-        let mcp = Arc::new(RwLock::new(McpManager::new()));
+        let mcp = Arc::new(RwLock::new(McpManager::new(Arc::clone(test_run()))));
         let target = "mcp__server__delete";
         let (permissions, _dir) = mcp_permission_manager(Some(target));
         let error = handle_mcp_tool_call(&mcp, &permissions, target, serde_json::json!({"id": 1}))
@@ -2834,13 +2912,14 @@ mod tests {
     fn test_proxy_state(config: crate::config::AppConfig) -> ProxyState {
         let session_path = config.session.persist_path.clone();
         ProxyState {
+            run_context: Arc::clone(test_run()),
             config: Arc::new(config),
             client: Client::new(),
             hook_engine: HookEngine::new(crate::config::HooksConfig::default()),
             compactor_overrides: CompactionOverrides::default(),
             session_manager: Arc::new(RwLock::new(SessionManager::new(&session_path))),
             plugin_manager: Arc::new(PluginManager::with_paths(vec![])),
-            mcp_manager: Arc::new(RwLock::new(McpManager::new())),
+            mcp_manager: Arc::new(RwLock::new(McpManager::new(Arc::clone(test_run())))),
             oauth_store: Arc::new(OAuthStore::new()),
             vdd_engine: None,
             loop_control: None,

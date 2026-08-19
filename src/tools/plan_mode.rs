@@ -1,5 +1,4 @@
 use serde_json::Value;
-use std::cell::Cell;
 use std::collections::HashMap;
 
 use super::{
@@ -7,74 +6,14 @@ use super::{
     ToolHandlerResult, ToolRetryability,
 };
 
-thread_local! {
-    /// Thread-local flag set by the subagent runner while a `task` tool
-    /// invocation is in flight. Plan-mode is a top-level operator concept and
-    /// is not allowed to be entered from inside an agent task — Claude Code
-    /// rejects `enter_plan_mode` whenever `context.agentId` is set. The
-    /// harness mirrors that by toggling [`AgentContextGuard`] for the duration
-    /// of any subagent task (crosslink #620).
-    static IN_AGENT_TASK: Cell<bool> = const { Cell::new(false) };
-}
-
-/// RAII guard that marks the current thread as executing inside a subagent
-/// task (crosslink #620).
-///
-/// While alive, [`execute_enter_plan_mode`] returns the
-/// "cannot be entered from inside an agent task" error instead of producing
-/// the activation marker. Nested guards are reference-counted-by-bool: only
-/// the outermost guard clears the flag on drop, which matches the harness's
-/// behaviour of strictly serialising agent-task execution.
-///
-/// The subagent runtime is the intended user of this guard; tests construct
-/// it directly to exercise the gate without spinning up a full subagent.
-pub struct AgentContextGuard {
-    /// True iff *this* guard was the one that flipped the flag from
-    /// `false` -> `true`. Only that guard clears on drop, making nested
-    /// `AgentContextGuard` instances no-ops with respect to the outer
-    /// guard's lifetime.
-    owns: bool,
-}
-
-impl AgentContextGuard {
-    /// Mark this thread as being inside a subagent task. The flag is cleared
-    /// when the returned guard is dropped.
-    #[must_use]
-    pub fn enter() -> Self {
-        let owns = IN_AGENT_TASK.with(|f| {
-            if f.get() {
-                false
-            } else {
-                f.set(true);
-                true
-            }
-        });
-        Self { owns }
-    }
-}
-
-impl Drop for AgentContextGuard {
-    fn drop(&mut self) {
-        if self.owns {
-            IN_AGENT_TASK.with(|f| f.set(false));
-        }
-    }
-}
-
-/// True iff the current thread is executing inside an agent task — used by
-/// [`execute_enter_plan_mode`] to refuse activation (crosslink #620).
-#[must_use]
-pub fn in_agent_task() -> bool {
-    IN_AGENT_TASK.with(Cell::get)
-}
-
 /// Execute the `enter_plan_mode` tool.
 ///
-/// Returns a trusted typed follow-up requesting activation, unless the current
-/// thread is inside a subagent task. That case returns a typed failure per
-/// crosslink #620 (Claude Code rejects when `context.agentId` is set).
-pub fn execute_enter_plan_mode() -> ToolHandlerResult {
-    if in_agent_task() {
+/// Returns a trusted typed follow-up requesting activation only for a
+/// top-level frontend run. Worker and other non-frontend actors receive a
+/// typed failure. The decision comes from the immutable run descriptor rather
+/// than thread-local execution state (crosslink #620, S-019).
+pub fn execute_enter_plan_mode(run: &crate::tools::security::ToolRunContext) -> ToolHandlerResult {
+    if run.runtime().descriptor().actor.role != crate::runtime::ActorRole::Frontend {
         return ToolHandlerResult::error(ToolFailure::new(
             ToolFailureCode::InvalidInput,
             "plan mode cannot be entered from inside an agent task".to_string(),
@@ -162,12 +101,39 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn frontend_run() -> &'static crate::tools::security::ToolRunContext {
+        crate::tools::security::test_run_context().as_ref()
+    }
+
+    fn worker_run() -> &'static crate::tools::security::ToolRunContext {
+        static RUN: std::sync::OnceLock<std::sync::Arc<crate::tools::security::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            crate::tools::security::ToolRunContext::builder(
+                crate::state::SessionId::new(),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .actor_role(crate::runtime::ActorRole::Worker)
+            .provider("plan-mode-worker-test")
+            .build()
+            .expect("worker test run")
+        })
+        .as_ref()
+    }
+
     // ─── Spec §1: Plan-mode enforcement — entering blocks write/edit/bash ──────
 
     /// Contract: `enter_plan_mode` returns trusted typed follow-up state.
     #[test]
     fn enter_plan_mode_returns_typed_follow_up() {
-        let result = execute_enter_plan_mode();
+        let result = execute_enter_plan_mode(frontend_run());
         assert!(matches!(
             result.follow_up,
             ToolFollowUp::EnterPlanMode {
@@ -181,8 +147,8 @@ mod tests {
     /// the no-op-if-already-in-plan-mode behaviour.
     #[test]
     fn enter_plan_mode_is_idempotent_at_tool_level() {
-        let first = execute_enter_plan_mode();
-        let second = execute_enter_plan_mode();
+        let first = execute_enter_plan_mode(frontend_run());
+        let second = execute_enter_plan_mode(frontend_run());
         assert_eq!(first.follow_up, second.follow_up);
     }
 
@@ -306,16 +272,14 @@ mod tests {
         );
     }
 
-    // ─── #620: agent-context guard for enter_plan_mode ─────────────────────────
+    // ─── #620 / S-019: immutable actor-role gate for enter_plan_mode ───────────
 
     /// Outside a subagent task `enter_plan_mode` succeeds. Sanity test so a
     /// regression in the gate is observable as the *positive* case flipping
     /// to an error (crosslink #620).
     #[test]
     fn enter_plan_mode_outside_agent_task_succeeds_620() {
-        // Defensive: ensure no other test on this thread left the flag set.
-        IN_AGENT_TASK.with(|f| f.set(false));
-        let result = execute_enter_plan_mode();
+        let result = execute_enter_plan_mode(frontend_run());
         assert!(matches!(
             result.follow_up,
             ToolFollowUp::EnterPlanMode {
@@ -324,13 +288,10 @@ mod tests {
         ));
     }
 
-    /// Inside a subagent task `enter_plan_mode` returns an error matching the
-    /// CC message family (crosslink #620). The guard is RAII so we exercise
-    /// it via [`AgentContextGuard::enter`].
+    /// A worker descriptor returns an error matching the CC message family.
     #[test]
     fn enter_plan_mode_inside_agent_task_is_refused_620() {
-        let _guard = AgentContextGuard::enter();
-        let (msg, is_err) = execute_enter_plan_mode().into_legacy();
+        let (msg, is_err) = execute_enter_plan_mode(worker_run()).into_legacy();
         assert!(is_err, "must produce is_error=true inside an agent task");
         assert!(
             msg.contains("plan mode cannot be entered from inside an agent task"),
@@ -338,39 +299,12 @@ mod tests {
         );
     }
 
-    /// The guard is RAII: after it drops, `enter_plan_mode` succeeds again.
-    /// Pins the lifecycle so a future change can't silently turn the gate
-    /// into a one-way flip (crosslink #620).
+    /// Interleaving a worker decision cannot contaminate a frontend run.
     #[test]
-    fn enter_plan_mode_recovers_after_agent_guard_drops_620() {
-        IN_AGENT_TASK.with(|f| f.set(false));
-        {
-            let _g = AgentContextGuard::enter();
-            let (_, is_err) = execute_enter_plan_mode().into_legacy();
-            assert!(is_err, "must refuse while guard alive");
-        }
-        let (_, is_err) = execute_enter_plan_mode().into_legacy();
-        assert!(!is_err, "must succeed after guard drops");
-    }
-
-    /// Nested guards: only the *outermost* clears the flag on drop, so the
-    /// inner drop must NOT prematurely unlock enter (crosslink #620).
-    #[test]
-    fn enter_plan_mode_nested_agent_guard_does_not_leak_620() {
-        IN_AGENT_TASK.with(|f| f.set(false));
-        let outer = AgentContextGuard::enter();
-        {
-            let _inner = AgentContextGuard::enter();
-            assert!(in_agent_task(), "nested guard must still see flag set");
-        }
-        // Inner dropped, but outer is still alive: flag must stay set.
-        assert!(
-            in_agent_task(),
-            "inner-guard drop must not clear the flag while outer is alive"
-        );
-        let (_, is_err) = execute_enter_plan_mode().into_legacy();
-        assert!(is_err, "outer guard still alive: enter must remain refused");
-        drop(outer);
-        assert!(!in_agent_task(), "outer drop must clear the flag");
+    fn enter_plan_mode_actor_decisions_do_not_cross_runs_620() {
+        let (_, worker_error) = execute_enter_plan_mode(worker_run()).into_legacy();
+        let (_, frontend_error) = execute_enter_plan_mode(frontend_run()).into_legacy();
+        assert!(worker_error);
+        assert!(!frontend_error);
     }
 }

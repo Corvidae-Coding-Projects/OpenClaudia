@@ -1,7 +1,6 @@
 use super::input::{handle_user_questions, run_external_editor};
 use super::{AgentMode, Session};
 use openclaudia::tools;
-use std::fs;
 
 /// Restore the agent mode captured at plan-mode entry (crosslink #618).
 ///
@@ -25,30 +24,12 @@ fn plan_mode_allowed_tools_display() -> String {
 }
 
 /// Handle entering plan mode. Creates plan file and sets up state.
-pub fn handle_enter_plan_mode(chat_session: &Session) -> String {
-    let plans_dir = std::path::PathBuf::from(".openclaudia/plans");
-    if let Err(e) = fs::create_dir_all(&plans_dir) {
-        return format!("Failed to create plans directory: {e}");
+pub fn handle_enter_plan_mode(run: &tools::ToolRunContext, chat_session: &Session) -> String {
+    if let Err(error) = run.require(tools::ToolResource::WorkspaceWrite) {
+        return format!("Failed to enter plan mode: {error}");
     }
-
-    let plans_dir = std::fs::canonicalize(&plans_dir).unwrap_or(plans_dir);
-
-    // Sanitize session ID to prevent path traversal (e.g. "../../etc/evil")
     let session_id = chat_session.id();
-    let safe_id: String = session_id
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if safe_id.is_empty() {
-        return "Invalid session ID for plan file".to_string();
-    }
-    let plan_file = plans_dir.join(format!("{safe_id}.md"));
+    let plan_file = run.agent_plan_file().to_path_buf();
 
     if !plan_file.exists() {
         let header = format!(
@@ -56,8 +37,9 @@ pub fn handle_enter_plan_mode(chat_session: &Session) -> String {
             session_id,
             chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
         );
-        if let Err(e) = fs::write(&plan_file, &header) {
-            return format!("Failed to create plan file: {e}");
+        match tools::create_capability_text_file(run, &plan_file.to_string_lossy(), &header) {
+            Ok(_) => {}
+            Err(error) => return format!("Failed to create plan file: {error}"),
         }
     }
 
@@ -110,17 +92,30 @@ pub fn handle_enter_plan_mode(chat_session: &Session) -> String {
 }
 
 fn handle_plan_edit(
+    run: &tools::ToolRunContext,
     chat_session: &Session,
     plan_state: &openclaudia::session::PlanModeState,
     allowed_prompts: &[tools::ToolAllowedPrompt],
 ) -> (String, bool) {
     use std::io::{self, Write};
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let editor = run
+        .environment_grants()
+        .get("EDITOR")
+        .cloned()
+        .unwrap_or_else(|| "vi".to_string());
     println!("\n\x1b[90mOpening plan in {editor}...\x1b[0m");
-    let edit_result = run_external_editor(&editor, &plan_state.plan_file);
+    let edit_result = run_external_editor(run, &editor, &plan_state.plan_file);
     match edit_result {
         Ok(status) if status.success() => {
-            let edited_content = fs::read_to_string(&plan_state.plan_file).unwrap_or_default();
+            let edited_content = match tools::read_capability_text_attachment(
+                run,
+                &plan_state.plan_file.to_string_lossy(),
+            ) {
+                Ok((_, content)) => content,
+                Err(error) => {
+                    return (format!("Failed to read the edited plan: {error}"), false);
+                }
+            };
             println!("\n\x1b[1;36m## Edited Plan\x1b[0m\n");
             println!("{edited_content}");
             println!();
@@ -183,6 +178,7 @@ fn handle_plan_edit(
 /// Handle exiting plan mode. Reads plan file, shows to user for approval.
 /// Returns (`result_text`, `should_exit_plan_mode`).
 pub fn handle_exit_plan_mode(
+    run: &tools::ToolRunContext,
     chat_session: &Session,
     allowed_prompts: &[tools::ToolAllowedPrompt],
 ) -> (String, bool) {
@@ -196,14 +192,17 @@ pub fn handle_exit_plan_mode(
         }
     };
 
-    let plan_content = match fs::read_to_string(&plan_state.plan_file) {
-        Ok(content) => content,
-        Err(e) => {
+    let plan_content = match tools::read_capability_text_attachment(
+        run,
+        &plan_state.plan_file.to_string_lossy(),
+    ) {
+        Ok((_, content)) => content,
+        Err(error) => {
             return (
                 format!(
                     "Failed to read plan file {}: {}",
                     plan_state.plan_file.display(),
-                    e
+                    error
                 ),
                 false,
             );
@@ -282,7 +281,7 @@ pub fn handle_exit_plan_mode(
                 false,
             )
         }
-        "edit" | "e" => handle_plan_edit(chat_session, &plan_state, allowed_prompts),
+        "edit" | "e" => handle_plan_edit(run, chat_session, &plan_state, allowed_prompts),
         _ => {
             println!("\x1b[90mUnrecognized input. Staying in plan mode.\x1b[0m");
             (
@@ -361,6 +360,7 @@ const fn json_value_type_name(value: &serde_json::Value) -> &'static str {
 /// Process a trusted typed follow-up and retain its resolved state in the
 /// result passed to provider continuation. Ordinary text is never inspected.
 pub fn process_tool_follow_up(
+    run: &tools::ToolRunContext,
     chat_session: &Session,
     result: &tools::ToolResult,
 ) -> tools::ToolResult {
@@ -377,13 +377,13 @@ pub fn process_tool_follow_up(
             (answers, response)
         }
         tools::ToolFollowUp::EnterPlanMode { .. } => {
-            let message = handle_enter_plan_mode(chat_session);
+            let message = handle_enter_plan_mode(run, chat_session);
             (message.clone(), serde_json::Value::String(message))
         }
         tools::ToolFollowUp::ExitPlanMode {
             allowed_prompts, ..
         } => {
-            let (message, approved) = handle_exit_plan_mode(chat_session, allowed_prompts);
+            let (message, approved) = handle_exit_plan_mode(run, chat_session, allowed_prompts);
             (
                 message.clone(),
                 serde_json::json!({"message": message, "approved": approved}),
@@ -399,7 +399,39 @@ pub fn process_tool_follow_up(
 mod tests {
     use super::*;
     use openclaudia::session::PlanModeState;
+    use std::collections::HashMap;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn entering_plan_mode_creates_only_the_exact_session_plan_capability() {
+        let project = tempfile::tempdir().expect("plan project");
+        let session = Session::new("model", "provider");
+        let session_id = openclaudia::state::SessionId::from_raw(session.id())
+            .expect("session id must be UUID-shaped");
+        let run = tools::ToolRunContext::builder(session_id, project.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(tools::WorkspaceAccess::ReadWrite)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("plan-test")
+            .build()
+            .expect("plan run");
+
+        let result = handle_enter_plan_mode(&run, &session);
+        assert!(result.contains("Plan mode activated"), "{result}");
+        assert!(run.agent_plan_file().is_file());
+        assert!(run.permits_write(run.agent_plan_file()));
+        assert!(run.is_denied_path(&project.path().join(".openclaudia/config.yaml")));
+        assert!(run.is_denied_path(&project.path().join(".openclaudia/plans/foreign-session.md")));
+        let stored = session
+            .inspect_state(|state| state.conversation.plan_mode.clone())
+            .expect("plan state");
+        assert_eq!(stored.plan_realpath, run.agent_plan_file());
+    }
 
     fn make_plan_state(prev: Option<&str>) -> PlanModeState {
         let dir = TempDir::new().expect("tempdir");

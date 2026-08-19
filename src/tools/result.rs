@@ -427,6 +427,9 @@ impl ToolHandlerResult {
                     super::args::ToolError::InvalidInput(_) => {
                         (ToolFailureCode::InvalidInput, ToolRetryability::Never)
                     }
+                    super::args::ToolError::Unavailable(_) => {
+                        (ToolFailureCode::Unavailable, ToolRetryability::Never)
+                    }
                     super::args::ToolError::PermissionDenied(_) => {
                         (ToolFailureCode::PermissionDenied, ToolRetryability::Never)
                     }

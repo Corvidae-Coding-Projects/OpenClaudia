@@ -261,7 +261,8 @@ fn enter_worktree_branch_with_null_byte_rejected() {
 #[test]
 fn canonical_branch_passes_validation_without_creating_a_worktree() {
     // PINS DOC: "feature/foo" is documented as valid.
-    validate_branch_name("feature/foo").expect("canonical branch must pass validation");
+    validate_branch_name(support::shared_run_context(), "feature/foo")
+        .expect("canonical branch must pass validation");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

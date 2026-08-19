@@ -17,9 +17,11 @@ use std::ffi::OsString;
 use std::hash::BuildHasher;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -35,15 +37,11 @@ const LSP_READINESS_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const LSP_SHUTDOWN_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const LSP_GITIGNORE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Absolute, PATH-independent location of `git` for LSP gitignore filtering.
-static GIT_BIN: LazyLock<Result<PathBuf, String>> =
-    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
-
-fn git_bin() -> Result<&'static Path, String> {
-    match &*GIT_BIN {
-        Ok(path) => Ok(path.as_path()),
-        Err(msg) => Err(msg.clone()),
-    }
+/// Resolve `git` only from the immutable executable search path captured for
+/// this run. The returned absolute path is then handed to the sandbox.
+fn git_bin(run: &crate::tools::ToolRunContext) -> Result<PathBuf, String> {
+    run.resolve_executable("git")
+        .map_err(|error| error.to_string())
 }
 
 /// Process-wide registry of open files per LSP server binary.
@@ -54,17 +52,28 @@ fn git_bin() -> Result<&'static Path, String> {
 /// server *is* reused (e.g. tests, future pooled mode) and (b) keeps the public
 /// surface ready for #647's eventual move to a long-lived server pool.
 ///
-/// The key is the server binary name (`server_cmd`), the value is the set of
-/// canonicalised file paths the server has been told about.
+/// The key is the exact `(run_id, generation, server_cmd)` binding, and the
+/// value is the set of canonicalised file paths that server instance has been
+/// told about. Different runs must never suppress each other's notifications.
 ///
 /// `mark_opened` is the only call site that should mutate the map; it returns
 /// `true` iff the caller is the first to claim the slot and must therefore
 /// send the `didOpen` notification.  `mark_closed` flips the flag back when
 /// the corresponding `textDocument/didClose` notification is sent (or the
 /// session shuts down).
-fn open_files_registry() -> &'static Mutex<HashMap<String, HashSet<PathBuf>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, HashSet<PathBuf>>>> = OnceLock::new();
+type OpenFileRegistry = HashMap<(String, u64, String), HashSet<PathBuf>>;
+
+fn open_files_registry() -> &'static Mutex<OpenFileRegistry> {
+    static REGISTRY: OnceLock<Mutex<OpenFileRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn open_file_key(run: &crate::tools::ToolRunContext, server_cmd: &str) -> (String, u64, String) {
+    (
+        run.run_id().to_string(),
+        run.generation().get(),
+        server_cmd.to_string(),
+    )
 }
 
 /// Record that `server_cmd` has been informed about `path`.
@@ -73,12 +82,12 @@ fn open_files_registry() -> &'static Mutex<HashMap<String, HashSet<PathBuf>>> {
 /// caller MUST send `textDocument/didOpen`); returns `false` when the file is
 /// already recorded as open (so the caller MUST skip the notification).
 #[must_use]
-pub fn mark_opened(server_cmd: &str, path: &Path) -> bool {
+pub fn mark_opened(run: &crate::tools::ToolRunContext, server_cmd: &str, path: &Path) -> bool {
     let mut guard = open_files_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
-        .entry(server_cmd.to_string())
+        .entry(open_file_key(run, server_cmd))
         .or_default()
         .insert(path.to_path_buf())
 }
@@ -88,12 +97,12 @@ pub fn mark_opened(server_cmd: &str, path: &Path) -> bool {
 /// Returns `true` if the entry was present (and thus removed), `false` if the
 /// caller was attempting to close a file that was never opened — useful for
 /// asserting protocol invariants in tests.
-pub fn mark_closed(server_cmd: &str, path: &Path) -> bool {
+pub fn mark_closed(run: &crate::tools::ToolRunContext, server_cmd: &str, path: &Path) -> bool {
     let mut guard = open_files_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
-        .get_mut(server_cmd)
+        .get_mut(&open_file_key(run, server_cmd))
         .is_some_and(|set| set.remove(path))
 }
 
@@ -109,6 +118,7 @@ pub fn mark_closed(server_cmd: &str, path: &Path) -> bool {
 /// matching `textDocument/didClose` was sent; on the error path Drop
 /// performs the same rollback so the registry never leaks a stale slot.
 struct OpenFileGuard<'a> {
+    run: &'a crate::tools::ToolRunContext,
     server_cmd: &'a str,
     path: &'a Path,
     owns_slot: bool,
@@ -120,8 +130,14 @@ impl<'a> OpenFileGuard<'a> {
     /// `we_opened_it` reflects the return value of `mark_opened`: when
     /// `false`, the slot was already held by a concurrent caller and this
     /// guard is a no-op (it must not release a slot it doesn't own).
-    const fn new(server_cmd: &'a str, path: &'a Path, we_opened_it: bool) -> Self {
+    const fn new(
+        run: &'a crate::tools::ToolRunContext,
+        server_cmd: &'a str,
+        path: &'a Path,
+        we_opened_it: bool,
+    ) -> Self {
         Self {
+            run,
             server_cmd,
             path,
             owns_slot: we_opened_it,
@@ -133,7 +149,7 @@ impl<'a> OpenFileGuard<'a> {
     /// rollback.  Calling `commit` twice is harmless.
     fn commit(&mut self) {
         if self.owns_slot {
-            let _ = mark_closed(self.server_cmd, self.path);
+            let _ = mark_closed(self.run, self.server_cmd, self.path);
             self.owns_slot = false;
         }
     }
@@ -142,7 +158,7 @@ impl<'a> OpenFileGuard<'a> {
 impl Drop for OpenFileGuard<'_> {
     fn drop(&mut self) {
         if self.owns_slot {
-            let _ = mark_closed(self.server_cmd, self.path);
+            let _ = mark_closed(self.run, self.server_cmd, self.path);
         }
     }
 }
@@ -151,11 +167,13 @@ impl Drop for OpenFileGuard<'_> {
 /// open.  Used by the unit tests to verify dedup state transitions without
 /// reaching into the registry directly.
 #[cfg(test)]
-fn is_marked_open(server_cmd: &str, path: &Path) -> bool {
+fn is_marked_open(run: &crate::tools::ToolRunContext, server_cmd: &str, path: &Path) -> bool {
     let guard = open_files_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.get(server_cmd).is_some_and(|set| set.contains(path))
+    guard
+        .get(&open_file_key(run, server_cmd))
+        .is_some_and(|set| set.contains(path))
 }
 
 /// Returns `true` when the language server for `language_or_ext` is reachable
@@ -169,11 +187,11 @@ fn is_marked_open(server_cmd: &str, path: &Path) -> bool {
 /// OC checks with the `which` crate since it has no long-lived server pool yet;
 /// once one exists this function should query the pool's liveness map.
 #[must_use]
-pub fn is_lsp_connected(language_or_ext: &str) -> bool {
+pub fn is_lsp_connected(run: &crate::tools::ToolRunContext, language_or_ext: &str) -> bool {
     let Some((server_cmd, _)) = resolve_language_server(language_or_ext) else {
         return false;
     };
-    which::which(server_cmd).is_ok()
+    run.resolve_executable(server_cmd).is_ok()
 }
 
 /// Resolve a bare language name OR a file extension to a server command.
@@ -212,8 +230,9 @@ struct ChildGuard {
 }
 
 impl ChildGuard {
-    fn new(child: Child) -> Self {
+    fn new(run: &crate::tools::security::ToolRunContext, child: Child) -> Self {
         let registration = Some(crate::tools::command::ActiveSandboxProcess::register(
+            run,
             child.id(),
         ));
         Self {
@@ -570,70 +589,21 @@ pub struct LspSymbol {
     pub children: Vec<Self>,
 }
 
-/// Safe-env allowlist applied to every spawned language server.
-///
-/// crosslink #869: previously the LSP child process inherited the proxy's
-/// entire environment, including credential variables (`ANTHROPIC_API_KEY`,
-/// `OPENAI_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, …). Language servers commonly
-/// emit telemetry or write debug logs to disk and have no business seeing
-/// API keys, so we [`Command::env_clear`] the inherited env and re-inject
-/// only this small, hand-curated set of variables required for the server
-/// to function at all (locate its binaries, find its config files, render
-/// diagnostics in the right locale).
-///
-/// Exact, case-insensitive matches:
-/// - `PATH` — server needs to locate sub-tools (e.g. rust-analyzer shells
-///   out to `cargo`, typescript-language-server to `node`).
-/// - `HOME` — config discovery (`~/.config/...`, `~/.cargo/...`).
-/// - `USER`, `LOGNAME` — diagnostic identifiers in some servers' logs.
-/// - `LANG`, `LC_ALL` — UTF-8 locale, otherwise the server may mangle
-///   non-ASCII identifiers in completions/hover output.
-/// - `TMPDIR` — workspace-cache directories some servers create.
-/// - `SHELL` — read by a few servers (gopls) for environment introspection.
-/// - `TZ` — timestamp rendering in diagnostics.
-///
-/// Prefix matches (case-insensitive):
-/// - `LC_*` — locale family (`LC_CTYPE`, `LC_NUMERIC`, …).
-/// - `XDG_*` — freedesktop base-dir spec (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, …).
-///
-/// Anything not on this list is dropped. In particular: every `*_TOKEN`,
-/// `*_API_KEY`, `*_SECRET`, `AWS_*`, `OPENAI_*`, `ANTHROPIC_*`, `GH_*`,
-/// `GITHUB_*` is dropped by construction because it is simply absent from
-/// both the exact and prefix tables.
-const LSP_SAFE_ENV_EXACT: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SHELL", "TZ",
-];
-
-const LSP_SAFE_ENV_PREFIXES: &[&str] = &["LC_", "XDG_"];
-
-/// Apply env scrubbing to a `Command` before spawn (issue #869).
-///
-/// 1. Clear the entire inherited environment.
-/// 2. Re-inject only variables whose names are on
-///    [`LSP_SAFE_ENV_EXACT`] or start with a prefix in
-///    [`LSP_SAFE_ENV_PREFIXES`].
-fn apply_lsp_env_scrub(cmd: &mut Command) {
-    cmd.env_clear();
-    for (key, value) in std::env::vars() {
-        if is_lsp_env_allowed(&key) {
-            cmd.env(key, value);
-        }
-    }
-}
-
 /// Spawn a language server with stdin/stdout/stderr piped and the
-/// scrubbed env from [`apply_lsp_env_scrub`].
+/// exact environment already installed by the run-bound sandbox builder.
 ///
-/// Extracted from `run_lsp_request` (crosslink #869) so the credential-
-/// stripping path lives in one place and `run_lsp_request` stays under
-/// the project's per-function line budget.
+/// Extracted from `run_lsp_request` (crosslink #869). Environment clearing and
+/// exact grant injection deliberately live in the shared sandbox builder so a
+/// language-server-specific allowlist cannot drift back to ambient state.
 fn spawn_language_server(
+    run: &crate::tools::security::ToolRunContext,
     server_cmd: &str,
     server_args: &[&str],
     project_root: &Path,
 ) -> Result<Child, String> {
     let args: Vec<OsString> = server_args.iter().map(OsString::from).collect();
     let mut cmd = crate::tools::sandboxed_process_command(
+        run,
         crate::tools::SandboxProfile::LanguageServer,
         std::ffi::OsStr::new(server_cmd),
         &args,
@@ -643,22 +613,8 @@ fn spawn_language_server(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_lsp_env_scrub(&mut cmd);
     cmd.spawn()
         .map_err(|e| format!("Failed to start {server_cmd}: {e}"))
-}
-
-fn is_lsp_env_allowed(key: &str) -> bool {
-    if LSP_SAFE_ENV_EXACT
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(key))
-    {
-        return true;
-    }
-    let upper = key.to_ascii_uppercase();
-    LSP_SAFE_ENV_PREFIXES
-        .iter()
-        .any(|prefix| upper.starts_with(prefix))
 }
 
 /// Known language servers by file extension
@@ -678,7 +634,10 @@ fn detect_language_server(file_path: &str) -> Option<(&'static str, Vec<&'static
 
 /// Execute an LSP action
 #[must_use]
-pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
+pub fn execute_lsp<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
     let file_path = match parse_lsp_file_path_arg(args.get("file_path")) {
         Ok(file_path) => file_path,
         Err(msg) => return (msg, true),
@@ -721,10 +680,10 @@ pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String,
     // the `which` crate (in-process PATH walk, crosslink #955) so we
     // never fork+exec a `which(1)` subprocess.
     let language = detect_language_id(file_path);
-    if !is_lsp_connected(language) {
+    if !is_lsp_connected(run, language) {
         return (
             format!(
-                "LSP server unavailable for {language}: '{server_cmd}' not found on PATH. \
+                "LSP server unavailable for {language}: '{server_cmd}' not found on the run-bound PATH. \
                  Start or install the language server (e.g. `cargo install {server_cmd}` \
                  or your distro's package) before retrying."
             ),
@@ -743,6 +702,7 @@ pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String,
 
     // Run the server, send initialize + request, get response
     match run_lsp_request(
+        run,
         server_cmd,
         &server_args,
         file_path,
@@ -916,7 +876,9 @@ fn build_action_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // LSP request fields remain explicit at the process boundary.
 fn run_lsp_request(
+    run: &crate::tools::security::ToolRunContext,
     server_cmd: &str,
     server_args: &[&str],
     file_path: &str,
@@ -930,7 +892,7 @@ fn run_lsp_request(
     // stringify only at this boundary because `run_lsp_request` returns
     // `Result<_, String>` to its caller; the rendered message now always
     // names the offending file.
-    let (abs_path, file) = crate::tools::open_capability_regular_read(file_path)?;
+    let (abs_path, file) = crate::tools::open_capability_regular_read(run, file_path)?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("Cannot inspect confined LSP input '{file_path}': {error}"))?;
@@ -941,8 +903,7 @@ fn run_lsp_request(
             LSP_MAX_FILE_SIZE
         ));
     }
-    let security = crate::tools::security::current_context()?;
-    let root_uri = format!("file://{}", security.project_root().display());
+    let root_uri = format!("file://{}", run.project_root().display());
     let file_uri = format!("file://{}", abs_path.display());
 
     // Read from the already-confined descriptor. Reopening `abs_path` here
@@ -960,7 +921,7 @@ fn run_lsp_request(
         .strip_prefix("file://")
         .map(Path::new)
         .ok_or_else(|| format!("Invalid LSP root URI: {root_uri}"))?;
-    let mut raw_child = spawn_language_server(server_cmd, server_args, project_root)?;
+    let mut raw_child = spawn_language_server(run, server_cmd, server_args, project_root)?;
 
     // Take pipes before handing the child to the guard.
     let mut stdin = raw_child.stdin.take().ok_or("Failed to get stdin")?;
@@ -971,7 +932,7 @@ fn run_lsp_request(
     // The guard now owns the child.  Any early return via `?` — including the
     // original zombie-leak paths (former lines 174 and 224) — will trigger Drop
     // which kills and reaps the process (fix #355 point 3).
-    let mut guard = ChildGuard::new(raw_child);
+    let mut guard = ChildGuard::new(run, raw_child);
     let (stdout, stdout_timeout) = LspDeadlineReader::spawn(stdout, LSP_RESPONSE_READ_TIMEOUT);
     let mut reader = BufReader::new(stdout);
 
@@ -1007,8 +968,8 @@ fn run_lsp_request(
     // run cannot leak a "this file is open" claim into the registry — the
     // child is killed by `ChildGuard::drop`, so the server can no longer
     // honour any didOpen we did send.
-    let needs_did_open = mark_opened(server_cmd, &abs_path);
-    let mut open_guard = OpenFileGuard::new(server_cmd, &abs_path, needs_did_open);
+    let needs_did_open = mark_opened(run, server_cmd, &abs_path);
+    let mut open_guard = OpenFileGuard::new(run, server_cmd, &abs_path, needs_did_open);
     if needs_did_open {
         let did_open = json!({
             "textDocument": {
@@ -1090,7 +1051,17 @@ fn run_lsp_request(
     wait_with_timeout(guard.child_mut()?, std::time::Duration::from_secs(2));
 
     // Parse response into our types
-    Ok(parse_lsp_response(action, file_path, &response))
+    let mut parsed = parse_lsp_response(action, file_path, &response);
+    if matches!(
+        action,
+        LspAction::GoToDefinition
+            | LspAction::FindReferences
+            | LspAction::GoToImplementation
+            | LspAction::WorkspaceSymbol
+    ) {
+        parsed.results = filter_gitignored(run, parsed.results);
+    }
+    Ok(parsed)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1380,7 +1351,7 @@ fn parse_lsp_response(action: LspAction, file_path: &str, response: &Value) -> L
             // share the same parsing path.
             // crosslink #644: drop hits inside gitignored files (build
             // artefacts, vendored deps) — they pollute jump-to-def results.
-            let locations = filter_gitignored(parse_locations(result_data));
+            let locations = parse_locations(result_data);
             LspResult {
                 action: format!("{action:?}"),
                 file_path: file_path.to_string(),
@@ -1583,7 +1554,10 @@ fn uri_to_local_path(uri: &str) -> Option<std::path::PathBuf> {
 /// `check-ignore` errors, the input list passes through unchanged — we
 /// must never silently drop a hit because the gitignore probe failed,
 /// since the model relies on the locations to navigate the codebase.
-fn filter_gitignored(locations: Vec<LspLocation>) -> Vec<LspLocation> {
+fn filter_gitignored(
+    run: &crate::tools::security::ToolRunContext,
+    locations: Vec<LspLocation>,
+) -> Vec<LspLocation> {
     use std::collections::HashSet;
 
     if locations.is_empty() {
@@ -1611,14 +1585,12 @@ fn filter_gitignored(locations: Vec<LspLocation>) -> Vec<LspLocation> {
     // prints back only the ones that ARE ignored. Exit status 0 = at least one
     // ignored; 1 = none ignored; 128 = error (not a repo etc).
     let input = format!("{}\n", path_strings.join("\n"));
-    let output = match git_bin().and_then(|git| {
-        let project_root = crate::tools::security::current_context()?
-            .working_directory()
-            .to_path_buf();
+    let output = match git_bin(run).and_then(|git| {
         crate::tools::command::run_sandboxed_with_timeout_with_input(
-            git,
+            run,
+            &git,
             &["check-ignore", "--stdin"],
-            &project_root,
+            run.working_directory(),
             LSP_GITIGNORE_TIMEOUT,
             input.as_bytes(),
         )
@@ -1826,9 +1798,30 @@ fn symbol_kind_name(kind: u64) -> String {
 mod tests {
     use super::*;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
+    fn test_run_with_environment(
+        root: &Path,
+        grants: HashMap<String, String>,
+    ) -> std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(grants)
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("lsp-environment-test")
+            .build()
+            .expect("explicit LSP test run")
+    }
+
     #[test]
     fn production_external_probes_use_resolved_helpers() {
-        let git = git_bin().expect("lsp tests require git on PATH");
+        let git = git_bin(test_run()).expect("lsp tests require git on the run-bound PATH");
         assert!(
             git.is_absolute(),
             "git_bin must resolve git to an absolute path, got {}",
@@ -2043,7 +2036,7 @@ mod tests {
     #[test]
     fn test_execute_lsp_missing_file_path() {
         let args = HashMap::new();
-        let (msg, is_err) = execute_lsp(&args);
+        let (msg, is_err) = execute_lsp(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("file_path is required"));
     }
@@ -2056,7 +2049,7 @@ mod tests {
             Value::String("readme.md".to_string()),
         );
         args.insert("action".to_string(), Value::String("hover".to_string()));
-        let (msg, is_err) = execute_lsp(&args);
+        let (msg, is_err) = execute_lsp(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("No language server known"));
     }
@@ -2070,7 +2063,7 @@ mod tests {
         );
         args.insert("action".to_string(), Value::String("badAction".to_string()));
         // This will either fail on unknown action or missing server; both are valid error paths
-        let (msg, is_err) = execute_lsp(&args);
+        let (msg, is_err) = execute_lsp(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("Unknown LSP action") || msg.contains("not found"));
     }
@@ -2441,7 +2434,7 @@ mod tests {
             "action".to_string(),
             Value::String("definitely_not_a_real_action".to_string()),
         );
-        let (msg, is_err) = execute_lsp(&args);
+        let (msg, is_err) = execute_lsp(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Unknown LSP action"),
@@ -2486,7 +2479,7 @@ mod tests {
                 Value::String("test.rs".to_string()),
             );
             args.insert("action".to_string(), Value::String(op.to_string()));
-            let (msg, _is_err) = execute_lsp(&args);
+            let (msg, _is_err) = execute_lsp(test_run(), &args);
             // The action MUST be recognised now (crosslink #645). The call
             // may still fail downstream when rust-analyzer is missing, but
             // the failure mode MUST NOT be "Unknown LSP action".
@@ -2780,7 +2773,7 @@ mod tests {
         let pid = child.id();
 
         {
-            let _guard = ChildGuard::new(child);
+            let _guard = ChildGuard::new(test_run(), child);
             // Child is alive inside the guard scope.
             // /proc/<pid> exists on Linux while the process lives.
             assert!(
@@ -2922,37 +2915,75 @@ mod tests {
         // Defensive cleanup so a previously aborted run can't poison this one.
         // We use process-unique (server, path) so we never need a global
         // registry reset (which would race with other parallel tests).
-        let _ = mark_closed(server, &path);
+        let _ = mark_closed(test_run(), server, &path);
 
-        assert!(!is_marked_open(server, &path), "starts empty");
+        assert!(!is_marked_open(test_run(), server, &path), "starts empty");
         assert!(
-            mark_opened(server, &path),
+            mark_opened(test_run(), server, &path),
             "first mark_opened should claim the slot"
         );
         assert!(
-            is_marked_open(server, &path),
+            is_marked_open(test_run(), server, &path),
             "registry should report the file as open"
         );
         assert!(
-            !mark_opened(server, &path),
+            !mark_opened(test_run(), server, &path),
             "second mark_opened should report already-open (skip didOpen)"
         );
 
         // didClose flips the flag back.
-        assert!(mark_closed(server, &path), "first close removes the entry");
-        assert!(!is_marked_open(server, &path), "registry now clear");
         assert!(
-            !mark_closed(server, &path),
+            mark_closed(test_run(), server, &path),
+            "first close removes the entry"
+        );
+        assert!(
+            !is_marked_open(test_run(), server, &path),
+            "registry now clear"
+        );
+        assert!(
+            !mark_closed(test_run(), server, &path),
             "closing an already-closed file is a no-op"
         );
 
         // After close, mark_opened claims a fresh slot again.
         assert!(
-            mark_opened(server, &path),
+            mark_opened(test_run(), server, &path),
             "post-close mark_opened claims a fresh slot"
         );
         // Final cleanup so re-runs start clean.
-        let _ = mark_closed(server, &path);
+        let _ = mark_closed(test_run(), server, &path);
+    }
+
+    #[test]
+    fn open_file_dedup_does_not_cross_run_generations() {
+        let root = tempfile::tempdir_in(".").expect("foreign LSP run root");
+        let foreign =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .working_directory(root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .provider("lsp-open-file-isolation-test")
+                .build()
+                .expect("explicit foreign LSP run");
+        let server = "rust-analyzer-s019-run-isolation";
+        let path = PathBuf::from("/tmp/openclaudia-s019-shared.rs");
+
+        assert!(mark_opened(test_run(), server, &path));
+        assert!(
+            mark_opened(&foreign, server, &path),
+            "a second run owns a different server/file dedup namespace"
+        );
+        assert!(mark_closed(test_run(), server, &path));
+        assert!(
+            is_marked_open(&foreign, server, &path),
+            "closing the first run must not clear the second run's slot"
+        );
+        assert!(mark_closed(&foreign, server, &path));
     }
 
     /// #647-b — `OpenFileGuard::drop` rolls back the dedup entry when commit
@@ -2962,20 +2993,20 @@ mod tests {
     fn fix647_open_file_guard_drop_rolls_back_uncommitted_slot() {
         let server = "rust-analyzer-test-647b-unique";
         let path = PathBuf::from("/tmp/openclaudia-647b-unique.rs");
-        let _ = mark_closed(server, &path);
+        let _ = mark_closed(test_run(), server, &path);
 
         // Simulate the prologue inside run_lsp_request.
-        let we_opened = mark_opened(server, &path);
+        let we_opened = mark_opened(test_run(), server, &path);
         assert!(we_opened);
-        assert!(is_marked_open(server, &path));
+        assert!(is_marked_open(test_run(), server, &path));
 
         {
-            let _guard = OpenFileGuard::new(server, &path, we_opened);
+            let _guard = OpenFileGuard::new(test_run(), server, &path, we_opened);
             // …imagine `?` returns here without commit…
         }
 
         assert!(
-            !is_marked_open(server, &path),
+            !is_marked_open(test_run(), server, &path),
             "Drop must release the slot when commit() was never called (fix #647)"
         );
     }
@@ -2987,22 +3018,25 @@ mod tests {
     fn fix647_open_file_guard_commit_is_idempotent() {
         let server = "rust-analyzer-test-647c-unique";
         let path = PathBuf::from("/tmp/openclaudia-647c-unique.rs");
-        let _ = mark_closed(server, &path);
+        let _ = mark_closed(test_run(), server, &path);
 
-        let we_opened = mark_opened(server, &path);
+        let we_opened = mark_opened(test_run(), server, &path);
         assert!(we_opened);
-        let mut guard = OpenFileGuard::new(server, &path, we_opened);
+        let mut guard = OpenFileGuard::new(test_run(), server, &path, we_opened);
 
-        guard.commit();
-        assert!(!is_marked_open(server, &path), "first commit releases");
         guard.commit();
         assert!(
-            !is_marked_open(server, &path),
+            !is_marked_open(test_run(), server, &path),
+            "first commit releases"
+        );
+        guard.commit();
+        assert!(
+            !is_marked_open(test_run(), server, &path),
             "second commit is a no-op (no panic, no resurrection)"
         );
         // Drop on `guard` after this point must also be a no-op.
         drop(guard);
-        assert!(!is_marked_open(server, &path));
+        assert!(!is_marked_open(test_run(), server, &path));
     }
 
     // ── Fix #648: 10 MiB file-size guard before LSP analysis ─────────────────
@@ -3031,7 +3065,7 @@ mod tests {
         );
         args.insert("action".to_string(), Value::String("hover".to_string()));
 
-        let (msg, is_err) = execute_lsp(&args);
+        let (msg, is_err) = execute_lsp(test_run(), &args);
         assert!(is_err, "oversized file must produce an error");
         // The error must be the size-guard message, not a server-not-found
         // or unknown-action message, regardless of whether rust-analyzer is
@@ -3078,7 +3112,7 @@ mod tests {
         );
         args.insert("action".to_string(), Value::String("hover".to_string()));
 
-        let (msg, _is_err) = execute_lsp(&args);
+        let (msg, _is_err) = execute_lsp(test_run(), &args);
         // The size-guard message must NOT appear for a file at the limit.
         assert!(
             !msg.contains("File too large for LSP analysis"),
@@ -3094,9 +3128,9 @@ mod tests {
     #[test]
     fn fix650_is_lsp_connected_false_for_unknown_language() {
         // An identifier that maps to no known server must report disconnected.
-        assert!(!is_lsp_connected("brainfuck"));
-        assert!(!is_lsp_connected(""));
-        assert!(!is_lsp_connected("xyz"));
+        assert!(!is_lsp_connected(test_run(), "brainfuck"));
+        assert!(!is_lsp_connected(test_run(), ""));
+        assert!(!is_lsp_connected(test_run(), "xyz"));
     }
 
     /// #650-b — When a real server is genuinely absent, `execute_lsp`
@@ -3110,9 +3144,9 @@ mod tests {
     fn fix650_execute_lsp_gates_on_missing_server_with_language_hint() {
         // Probe whether jdtls is installed on this host.  If yes, skip the
         // strict assertion (the gate doesn't fire); we still cover the
-        // happy "gate fires" path via is_lsp_connected("brainfuck") in
+        // happy "gate fires" path via is_lsp_connected(test_run(), "brainfuck") in
         // fix650_is_lsp_connected_false_for_unknown_language.
-        if is_lsp_connected("java") {
+        if is_lsp_connected(test_run(), "java") {
             return;
         }
 
@@ -3123,7 +3157,7 @@ mod tests {
         );
         args.insert("action".to_string(), Value::String("hover".to_string()));
 
-        let (msg, is_err) = execute_lsp(&args);
+        let (msg, is_err) = execute_lsp(test_run(), &args);
         assert!(is_err, "missing server must produce an error");
         assert!(
             msg.contains("LSP server unavailable for java"),
@@ -3134,8 +3168,8 @@ mod tests {
             "error should name the server binary; got: {msg}"
         );
         assert!(
-            msg.contains("not found on PATH"),
-            "error should hint at PATH; got: {msg}"
+            msg.contains("not found on the run-bound PATH"),
+            "error should identify the immutable executable search path; got: {msg}"
         );
     }
 
@@ -3154,32 +3188,6 @@ mod tests {
             "typescript-language-server"
         );
         assert!(resolve_language_server("nonsense").is_none());
-    }
-
-    // ── crosslink #869: env-scrub allowlist for LSP child process ────────────
-
-    /// #869 — Safe env variables required for the language server are admitted.
-    #[test]
-    fn fix869_safe_env_keys_are_allowed() {
-        for key in [
-            "PATH",
-            "HOME",
-            "USER",
-            "LOGNAME",
-            "LANG",
-            "LC_ALL",
-            "LC_CTYPE",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "TMPDIR",
-            "SHELL",
-            "TZ",
-        ] {
-            assert!(
-                is_lsp_env_allowed(key),
-                "#869: {key} must be on the LSP env allowlist"
-            );
-        }
     }
 
     #[test]
@@ -3205,10 +3213,14 @@ marker.write_text("confined" if file_blocked and network_blocked else "escaped")
             outside = outside.path().to_string_lossy(),
             marker = marker.to_string_lossy(),
         );
-        let security = crate::tools::security::current_context().expect("security context");
-        let mut child =
-            spawn_language_server("python3", &["-c", &script], security.working_directory())
-                .expect("sandboxed language server");
+        let security = test_run();
+        let mut child = spawn_language_server(
+            security,
+            "python3",
+            &["-c", &script],
+            security.working_directory(),
+        )
+        .expect("sandboxed language server");
         let status = child.wait().expect("language server probe");
         assert!(status.success());
         assert_eq!(
@@ -3217,88 +3229,37 @@ marker.write_text("confined" if file_blocked and network_blocked else "escaped")
         );
     }
 
-    /// #869 — Sensitive credentials never reach the language server.
     #[test]
-    fn fix869_credential_env_keys_are_dropped() {
-        for key in [
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_SESSION_TOKEN",
-            "GITHUB_TOKEN",
-            "GH_TOKEN",
-            "GOOGLE_API_KEY",
-            "GEMINI_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "QWEN_API_KEY",
-            "DASHSCOPE_API_KEY",
-            "ALIYUN_API_KEY",
-            "ZAI_API_KEY",
-            "KIMI_API_KEY",
-            "MOONSHOT_API_KEY",
-            "MINIMAX_API_KEY",
-            "OPENROUTER_API_KEY",
-            "OPEN_ROUTER_API_KEY",
-            "OPENCODE_API_KEY",
-            "OPENCODE_GO_API_KEY",
-            "OPENAI_COMPATIBLE_API_KEY",
-            "API_KEY",
-            "DATABASE_URL",
-            "STRIPE_SECRET_KEY",
-            "PRIVATE_KEY",
-            "MY_CUSTOM_TOKEN",
-            // Mixed-case variations must also be rejected — env keys are
-            // case-sensitive on Unix but the allowlist is case-insensitive.
-            "Anthropic_Api_Key",
-        ] {
-            assert!(
-                !is_lsp_env_allowed(key),
-                "#869: {key} must NOT reach the LSP child"
-            );
-        }
-    }
-
-    /// #869 — `apply_lsp_env_scrub` clears the inherited environment and only
-    /// re-injects allowlisted variables. We seed a fake credential into the
-    /// process env, scrub a `Command`, and inspect its env directives.
-    #[test]
-    fn fix869_apply_lsp_env_scrub_clears_credentials() {
-        // SAFETY note for the reader: this test mutates process-global env.
-        // We restore it before returning to avoid polluting sibling tests.
-        const SENTINEL_KEY: &str = "OPENCLAUDIA_TEST_FAKE_API_KEY_869";
-        const SENTINEL_VAL: &str = "should-never-reach-the-child";
-        // SAFETY: setting an env var on a process we own; no readers race.
-        unsafe {
-            std::env::set_var(SENTINEL_KEY, SENTINEL_VAL);
-        }
-
-        let mut cmd = Command::new("true");
-        apply_lsp_env_scrub(&mut cmd);
-
-        // `Command::get_envs` reports the directives that will be applied
-        // on top of the (cleared) child environment.  After `env_clear`,
-        // these are the *only* variables the child will ever see.
-        let mut seen_credential = false;
-        for (k, _v) in cmd.get_envs() {
-            let key = k.to_string_lossy().to_string();
-            if key == SENTINEL_KEY {
-                seen_credential = true;
-            }
-            assert!(
-                is_lsp_env_allowed(&key),
-                "#869: {key} leaked past the allowlist"
-            );
-        }
-        assert!(
-            !seen_credential,
-            "#869: sentinel credential survived env_clear+allowlist"
+    #[cfg(target_os = "linux")]
+    fn language_server_receives_exact_run_environment_grant() {
+        let root = tempfile::tempdir_in(".").expect("LSP environment root");
+        let marker = root.path().join("environment-result");
+        let run = test_run_with_environment(
+            root.path(),
+            HashMap::from([("S019_LSP_ENV".to_string(), "exact".to_string())]),
+        );
+        let script = format!(
+            r#"
+import os, pathlib
+pathlib.Path({marker:?}).write_text(
+    os.environ.get("S019_LSP_ENV", "missing")
+    + "|"
+    + os.environ.get("S019_LSP_UNGRANTED", "missing")
+)
+"#,
+            marker = marker.to_string_lossy(),
         );
 
-        // SAFETY: unsetting the same var we set above.
-        unsafe {
-            std::env::remove_var(SENTINEL_KEY);
-        }
+        let mut child =
+            spawn_language_server(&run, "python3", &["-c", &script], run.working_directory())
+                .expect("sandboxed language server");
+        let status = child.wait().expect("language server environment probe");
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("environment marker"),
+            "exact|missing"
+        );
     }
 
     // ── #651: workspace/configuration + reverse-request handler ────────────

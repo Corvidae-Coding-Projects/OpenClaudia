@@ -180,9 +180,13 @@ pub fn format_fetch_output(title: Option<&str>, url: &str, content: &str) -> Str
 /// the model's answer is returned instead of raw markdown. Without enabled
 /// distillation the prompt is ignored and raw markdown is returned.
 pub fn execute_web_fetch_with_config(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
     args: &HashMap<String, Value>,
     app_config: Option<&AppConfig>,
 ) -> (String, bool) {
+    if let Err(error) = run.require(crate::tools::security::ToolResource::Network) {
+        return (error.to_string(), true);
+    }
     // crosslink #675: typed accessor.
     let url = match args.arg_str_strict("url") {
         Ok(u) => u,
@@ -206,7 +210,8 @@ pub fn execute_web_fetch_with_config(
     // The spawned future is `'static` — capture an owned `String` so
     // the future doesn't borrow `url` across thread boundaries.
     let url_owned = url.to_string();
-    let result = match run_blocking(async move { web::fetch_url(&url_owned).await }) {
+    let fetch_run = std::sync::Arc::clone(run);
+    let result = match run_blocking(async move { web::fetch_url(&url_owned, fetch_run).await }) {
         Ok(result) => result,
         Err(e) => return (format!("Failed to fetch URL: {e}"), true),
     };
@@ -504,8 +509,22 @@ fn parse_domain_list(args: &HashMap<String, Value>, key: &str) -> Result<Vec<Str
 /// that list are kept. Blocked list takes precedence when both lists
 /// name the same domain.
 #[cfg_attr(not(feature = "browser"), allow(dead_code))]
-pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
-    execute_web_search_with_backend(args, |query, limit| web::search_web(&query, limit))
+pub fn execute_web_search(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
+    for resource in [
+        crate::tools::security::ToolResource::Network,
+        crate::tools::security::ToolResource::Process,
+    ] {
+        if let Err(error) = run.require(resource) {
+            return (error.to_string(), true);
+        }
+    }
+    let browser_scratch_root = run.private_temp_root().to_path_buf();
+    execute_web_search_with_backend(args, move |query, limit| {
+        web::search_web(&browser_scratch_root, &query, limit)
+    })
 }
 
 fn execute_web_search_with_backend<F>(args: &HashMap<String, Value>, backend: F) -> (String, bool)
@@ -610,7 +629,18 @@ fn parse_web_search_limit(value: Option<&Value>) -> Result<usize, String> {
 /// fetches prefer `web_fetch`, which uses the browser only as a
 /// fallback after the cheaper direct HTTP path.
 #[cfg(feature = "browser")]
-pub fn execute_web_browser(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_web_browser(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
+    for resource in [
+        crate::tools::security::ToolResource::Network,
+        crate::tools::security::ToolResource::Process,
+    ] {
+        if let Err(error) = run.require(resource) {
+            return (error.to_string(), true);
+        }
+    }
     // crosslink #675: typed accessor.
     let url = match args.arg_str_strict("url") {
         Ok(u) => u,
@@ -626,8 +656,11 @@ pub fn execute_web_browser(args: &HashMap<String, Value>) -> (String, bool) {
     }
 
     let url_owned = url.to_string();
+    let browser_scratch_root = run.private_temp_root().to_path_buf();
     let result = match run_blocking(async move {
-        let task = tokio::task::spawn_blocking(move || web::fetch_with_browser(&url_owned));
+        let task = tokio::task::spawn_blocking(move || {
+            web::fetch_with_browser(&url_owned, &browser_scratch_root)
+        });
         match tokio::time::timeout(WEB_BROWSER_TOOL_TIMEOUT, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(join_err)) => Err(format!("browser fetch task panicked: {join_err}")),
@@ -669,6 +702,10 @@ mod tests {
     use tokio::runtime::Handle;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     fn distillation_test_config(base_url: &str) -> AppConfig {
         let mut providers = HashMap::new();
@@ -923,7 +960,7 @@ mod tests {
         // without making a network call.
         args.insert("url".to_string(), Value::String("not-a-url".into()));
         for _ in 0..10 {
-            let (msg, is_err) = execute_web_fetch_with_config(&args, None);
+            let (msg, is_err) = execute_web_fetch_with_config(test_run(), &args, None);
             assert!(is_err);
             assert!(msg.contains("http://") && msg.contains("https://"));
         }
@@ -957,7 +994,7 @@ mod tests {
         );
         args.insert("prompt".to_string(), Value::String("   ".to_string()));
 
-        let (msg, is_err) = execute_web_fetch_with_config(&args, None);
+        let (msg, is_err) = execute_web_fetch_with_config(test_run(), &args, None);
 
         assert!(is_err);
         assert!(msg.contains("prompt must not be empty"));
@@ -972,7 +1009,7 @@ mod tests {
         );
         args.insert("prompt".to_string(), json!(["Summarize"]));
 
-        let (msg, is_err) = execute_web_fetch_with_config(&args, None);
+        let (msg, is_err) = execute_web_fetch_with_config(test_run(), &args, None);
 
         assert!(is_err);
         assert_eq!(msg, "Invalid 'prompt' argument: expected string");

@@ -51,7 +51,10 @@ const SKIP_DIRS: &[&str] = &[
 /// Execute the `grep` tool.
 ///
 /// Returns `(stdout, is_error)`.
-pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_grep(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let pattern = match args.arg_str_strict("pattern") {
         Ok(p) => p.to_string(),
         Err(e) => return e.into_tool_error(),
@@ -61,7 +64,7 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         Ok(path) => path,
         Err(e) => return e.into_tool_error(),
     };
-    let root = match resolve_path(raw_path) {
+    let root = match resolve_path(run, raw_path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };
@@ -86,7 +89,7 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (format!("Invalid regex '{pattern}': {e}"), true),
     };
 
-    let directory = match secure_fs::open_directory(&root) {
+    let directory = match secure_fs::open_directory(run, &root) {
         Ok(directory) => directory,
         Err(error) => {
             return (
@@ -326,6 +329,10 @@ mod tests {
     use std::io::Write as _;
     use tempfile::TempDir;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     fn write_file(dir: &Path, rel: &str, body: &str) {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() {
@@ -354,7 +361,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(!err, "got error: {out}");
         assert!(out.contains("a.rs:2:"), "expected a.rs:2: in: {out}");
         assert!(out.contains("hello world"), "match body lost: {out}");
@@ -377,7 +384,7 @@ mod tests {
             json!(dir.path().to_string_lossy().to_string()),
         );
         args.insert("context_lines".to_string(), json!(1));
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(!err, "got error: {out}");
         // Before-context emitted with `-1-` delimiter style
         assert!(out.contains("ctx.txt-1-line one"), "before-ctx: {out}");
@@ -395,7 +402,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(err, "expected error, got: {out}");
         assert!(out.contains("Invalid regex"), "msg was: {out}");
     }
@@ -404,7 +411,7 @@ mod tests {
     #[test]
     fn grep_missing_pattern_errors() {
         let args = HashMap::new();
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(err, "missing pattern must be an error: {out}");
         assert!(out.contains("pattern"), "error must name the arg: {out}");
     }
@@ -414,7 +421,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("pattern".to_string(), json!(["hello"]));
 
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
 
         assert!(err, "non-string pattern must be an error: {out}");
         assert_eq!(out, "Invalid 'pattern' argument: expected string");
@@ -426,7 +433,7 @@ mod tests {
         args.insert("pattern".to_string(), json!("hello"));
         args.insert("path".to_string(), json!(["not", "a", "path"]));
 
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
 
         assert!(err, "non-string path must be an error: {out}");
         assert!(
@@ -447,7 +454,7 @@ mod tests {
             json!(dir.path().to_string_lossy().to_string()),
         );
         args.insert("case_insensitive".to_string(), json!(true));
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(!err);
         assert!(out.contains("x.txt:1:"), "case-insensitive miss: {out}");
     }
@@ -464,7 +471,7 @@ mod tests {
         );
         args.insert("case_insensitive".to_string(), json!("true"));
 
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
 
         assert!(err, "non-boolean case_insensitive must error: {out}");
         assert!(

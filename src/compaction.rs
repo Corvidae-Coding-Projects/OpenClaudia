@@ -1002,9 +1002,10 @@ impl ContextCompactor {
         &self,
         request: &mut ChatCompletionRequest,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
     ) -> Result<CompactionResult, CompactionError> {
-        self.compact_with_hint(request, hook_engine, session_id, None, None)
+        self.compact_with_hint(request, hook_engine, run_context, session_id, None, None)
             .await
     }
 
@@ -1029,6 +1030,7 @@ impl ContextCompactor {
         &self,
         request: &mut ChatCompletionRequest,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         actual_input_tokens: Option<usize>,
         memory_db: Option<Arc<MemoryDb>>,
@@ -1054,7 +1056,7 @@ impl ContextCompactor {
 
         // Run PreCompact hooks if engine provided
         if let Some(engine) = hook_engine {
-            let mut hook_input = HookInput::new(HookEvent::PreCompact)
+            let mut hook_input = HookInput::for_run(run_context, HookEvent::PreCompact)
                 .with_extra("current_tokens", serde_json::json!(analysis.current_tokens))
                 .with_extra("max_tokens", serde_json::json!(analysis.max_tokens));
 
@@ -1344,6 +1346,7 @@ impl ContextCompactor {
         request: &mut ChatCompletionRequest,
         target_tokens: usize,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<CompactionResult, CompactionError> {
@@ -1402,8 +1405,15 @@ impl ContextCompactor {
         // just driven by the trimmed analysis. We inline only what is
         // needed because `compact_with_hint` re-runs `analyze_with_hint`
         // internally and would discard our truncation.
-        self.apply_analysis(request, &analysis, hook_engine, session_id, memory_db)
-            .await
+        self.apply_analysis(
+            request,
+            &analysis,
+            hook_engine,
+            run_context,
+            session_id,
+            memory_db,
+        )
+        .await
     }
 
     /// Shared "apply a prepared `CompactionAnalysis` to a request" path used
@@ -1418,11 +1428,12 @@ impl ContextCompactor {
         request: &mut ChatCompletionRequest,
         analysis: &CompactionAnalysis,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<CompactionResult, CompactionError> {
         if let Some(engine) = hook_engine {
-            let mut hook_input = HookInput::new(HookEvent::PreCompact)
+            let mut hook_input = HookInput::for_run(run_context, HookEvent::PreCompact)
                 .with_extra("current_tokens", serde_json::json!(analysis.current_tokens))
                 .with_extra("max_tokens", serde_json::json!(analysis.max_tokens))
                 .with_extra("partial", serde_json::json!(true));
@@ -1862,6 +1873,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     fn create_test_message(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
@@ -2136,7 +2151,10 @@ mod tests {
         let mut request = create_test_request(messages);
         let compactor = ContextCompactor::new(CompactionConfig::default());
 
-        let result = compactor.compact(&mut request, None, None).await.unwrap();
+        let result = compactor
+            .compact(&mut request, None, test_run(), None)
+            .await
+            .unwrap();
 
         assert!(!result.compacted);
         assert_eq!(result.messages_summarized, 0);
@@ -2167,7 +2185,10 @@ mod tests {
         };
 
         let compactor = ContextCompactor::new(config);
-        let result = compactor.compact(&mut request, None, None).await.unwrap();
+        let result = compactor
+            .compact(&mut request, None, test_run(), None)
+            .await
+            .unwrap();
 
         assert!(result.compacted);
         assert!(result.messages_summarized > 0);
@@ -2954,7 +2975,7 @@ mod tests {
         // threshold_tokens_for(10000,0.85)=8500, effective=4404; hint=5000 > 4404
         // But both messages are system → messages_to_summarize is empty → compacted:false.
         let result = compactor
-            .compact_with_hint(&mut request, None, None, Some(5_000), None)
+            .compact_with_hint(&mut request, None, test_run(), None, Some(5_000), None)
             .await
             .unwrap();
 
@@ -3208,7 +3229,10 @@ mod tests {
         // estimate_request_tokens([]) = 0 + 0 + 100 = 100 (overhead only)
         // threshold_tokens = 8_500, effective_threshold = 4_404
         // 100 < 4_404 → needs_compaction: false → early return
-        let result = compactor.compact(&mut request, None, None).await.unwrap();
+        let result = compactor
+            .compact(&mut request, None, test_run(), None)
+            .await
+            .unwrap();
         assert!(
             !result.compacted,
             "empty messages must return compacted:false"
@@ -3255,7 +3279,7 @@ mod tests {
 
         let original_msgs = request.messages.clone();
         let result = compactor
-            .compact_with_hint(&mut request, None, None, Some(9_000), None)
+            .compact_with_hint(&mut request, None, test_run(), None, Some(9_000), None)
             .await
             .expect("all-preserved must not error");
         assert!(
@@ -3288,7 +3312,7 @@ mod tests {
 
         // With hint above effective_threshold, but no summarizable messages.
         let result = compactor
-            .compact_with_hint(&mut request, None, None, Some(5_000), None)
+            .compact_with_hint(&mut request, None, test_run(), None, Some(5_000), None)
             .await
             .unwrap();
         assert!(
@@ -3741,7 +3765,7 @@ mod tests {
 
         let compactor = ContextCompactor::for_model_with_overrides("gpt-4", &overrides);
         let result = compactor
-            .compact(&mut request, None, None)
+            .compact(&mut request, None, test_run(), None)
             .await
             .expect("compaction should succeed on oversized request");
 

@@ -12,7 +12,7 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::registry::registry;
-use openclaudia::tools::SessionIdGuard;
+use openclaudia::tools::{execute_tool, FunctionCall, ToolCall, ToolRunContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -28,6 +28,36 @@ fn dispatch_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
 
 fn dispatch_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, bool) {
     support::dispatch_tool("kill_shells_for_agent", args)
+}
+
+fn dispatch_kill_shells_as(owner: &str, args: &HashMap<String, Value>) -> (String, bool) {
+    let run = ToolRunContext::builder(
+        openclaudia::state::SessionId::new(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .read_only_roots(Vec::new())
+    .read_write_roots(Vec::new())
+    .environment_grants(HashMap::new())
+    .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+    .process(true)
+    .network(false)
+    .secrets(false)
+    .process_owner(owner)
+    .provider("bash-output-kill-test")
+    .build()
+    .expect("explicit owner run");
+    let result = execute_tool(
+        &run,
+        &ToolCall {
+            id: "kill-shells-owner-test".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "kill_shells_for_agent".to_string(),
+                arguments: serde_json::to_string(args).expect("arguments serialize"),
+            },
+        },
+    );
+    (result.content().to_string(), result.is_error())
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -187,9 +217,8 @@ fn kill_shells_for_agent_with_empty_agent_id_treated_as_missing() {
 #[test]
 fn kill_shells_for_agent_with_unknown_agent_id_is_idempotent_success() {
     let owner = "no-shells-for-this-agent";
-    let _guard = SessionIdGuard::set(owner);
     let args = args_with(&[("agent_id", json!(owner))]);
-    let (msg, is_err) = dispatch_kill_shells_for_agent(&args);
+    let (msg, is_err) = dispatch_kill_shells_as(owner, &args);
     assert!(!is_err);
     assert!(
         msg.contains("No background shells found"),
@@ -199,9 +228,8 @@ fn kill_shells_for_agent_with_unknown_agent_id_is_idempotent_success() {
 
 #[test]
 fn kill_shells_for_agent_rejects_cross_session_cleanup() {
-    let _guard = SessionIdGuard::set("caller-session");
     let args = args_with(&[("agent_id", json!("different-session"))]);
-    let (msg, is_err) = dispatch_kill_shells_for_agent(&args);
+    let (msg, is_err) = dispatch_kill_shells_as("caller-session", &args);
     assert!(is_err);
     assert!(msg.contains("another session"));
 }

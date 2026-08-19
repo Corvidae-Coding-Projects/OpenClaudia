@@ -28,18 +28,18 @@ const MAX_SUBAGENT_TURNS: usize = 50;
 /// Maximum tokens for subagent responses
 const SUBAGENT_MAX_TOKENS: u32 = 8192;
 
-/// Absolute, PATH-independent location of `git` for subagent worktree isolation.
-static GIT_BIN: LazyLock<Result<PathBuf, String>> =
-    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
-
-fn git_bin() -> Result<&'static Path, String> {
-    match &*GIT_BIN {
-        Ok(path) => Ok(path.as_path()),
-        Err(msg) => Err(msg.clone()),
-    }
+/// Resolve `git` through the immutable executable search path captured for the
+/// exact parent or child run that owns the worktree operation.
+fn git_bin(run: &crate::tools::ToolRunContext) -> Result<PathBuf, String> {
+    run.resolve_executable("git")
+        .map_err(|error| error.to_string())
 }
 
-fn sandboxed_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+fn sandboxed_git(
+    run: &crate::tools::ToolRunContext,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     let mut hardened = vec![
         "-c",
         "core.hooksPath=/dev/null",
@@ -63,8 +63,9 @@ fn sandboxed_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, Stri
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
     ]);
     crate::tools::run_sandboxed_with_timeout_with_env(
+        run,
         crate::tools::SandboxProfile::GitWorktree,
-        git_bin()?,
+        &git_bin(run)?,
         &hardened,
         cwd,
         Duration::from_secs(30),
@@ -388,6 +389,8 @@ pub const FINISHED_AGENT_TTL_SECS: u64 = 60 * 60;
 pub struct BackgroundAgent {
     /// Unique agent ID
     pub id: String,
+    /// Exact parent run generation allowed to observe or cancel this agent.
+    owner_run: crate::runtime::RunId,
     /// Agent type
     pub agent_type: AgentType,
     /// Task description
@@ -446,10 +449,24 @@ impl BackgroundAgentManager {
     ///
     /// Also opportunistically sweeps expired finished agents
     /// (see [`Self::gc`]) so the map cannot grow unbounded across a session.
-    pub fn register(&self, agent_type: AgentType, task: &str) -> String {
-        let id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
-        self.register_with_id(agent_type, task, &id);
-        id
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry is unavailable or no unique agent
+    /// identifier can be allocated after the bounded retry budget.
+    pub fn register(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        agent_type: AgentType,
+        task: &str,
+    ) -> Result<String, String> {
+        for _ in 0..16 {
+            let id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
+            if self.register_with_id(owner, agent_type, task, &id)? {
+                return Ok(id);
+            }
+        }
+        Err("Could not allocate a unique background agent id".to_string())
     }
 
     /// Register (or reattach to) a background agent under a caller-chosen id.
@@ -469,19 +486,41 @@ impl BackgroundAgentManager {
     /// Returns `true` iff a new entry was inserted (i.e. the id was
     /// fresh). Callers can ignore the return value when they only need
     /// "ensure tracked".
-    pub fn register_with_id(&self, agent_type: AgentType, task: &str, id: &str) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry is unavailable, `id` is invalid,
+    /// or the same identifier is already owned by a different run.
+    pub fn register_with_id(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        agent_type: AgentType,
+        task: &str,
+        id: &str,
+    ) -> Result<bool, String> {
         // Sweep before insert so the cost of growth is amortized against
         // the spawn that causes it (crosslink #422).
         self.gc();
 
         let Some(mut agents) = self.agents_guard("register_with_id") else {
-            return false;
+            return Err("Background agent registry is unavailable".to_string());
         };
-        if agents.contains_key(id) {
-            return false;
+        if let Some(existing) = agents.get(id) {
+            if existing.owner_run == owner.run_id() {
+                return Ok(false);
+            }
+            tracing::warn!(
+                target: "openclaudia::subagent",
+                event = "cross_run_agent_resume_denied",
+                caller_run = %owner.run_id(),
+                agent_id = id,
+                "Denied background-agent id reuse outside the owning run"
+            );
+            return Err(format!("Agent '{id}' not found"));
         }
         let agent = Arc::new(BackgroundAgent {
             id: id.to_string(),
+            owner_run: owner.run_id(),
             agent_type,
             task: task.to_string(),
             finished: AtomicBool::new(false),
@@ -493,33 +532,44 @@ impl BackgroundAgentManager {
             terminal_lock: Mutex::new(()),
         });
         agents.insert(id.to_string(), agent);
-        true
+        Ok(true)
     }
 
-    /// Get an agent by ID
-    pub fn get(&self, id: &str) -> Option<Arc<BackgroundAgent>> {
+    /// Trusted lifecycle lookup by globally unique id.
+    fn get(&self, id: &str) -> Option<Arc<BackgroundAgent>> {
         let agents = self.agents_guard("get")?;
         agents.get(id).cloned()
     }
 
+    /// Resolve an agent only for its exact parent run generation.
+    pub fn get_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+    ) -> Option<Arc<BackgroundAgent>> {
+        let agent = self.get(id)?;
+        (agent.owner_run == owner.run_id()).then_some(agent)
+    }
+
     /// Mark an agent as finished with a result
-    pub fn finish(&self, id: &str, result: String) {
-        self.mark_terminal(id, Some(result), None, "finish");
+    pub fn finish(&self, owner: &crate::tools::ToolRunContext, id: &str, result: String) {
+        self.mark_terminal(owner, id, Some(result), None, "finish");
     }
 
     /// Mark an agent as failed with an error
-    pub fn fail(&self, id: &str, error: String) {
-        self.mark_terminal(id, None, Some(error), "fail");
+    pub fn fail(&self, owner: &crate::tools::ToolRunContext, id: &str, error: String) {
+        self.mark_terminal(owner, id, None, Some(error), "fail");
     }
 
     fn mark_terminal(
         &self,
+        owner: &crate::tools::ToolRunContext,
         id: &str,
         result: Option<String>,
         error: Option<String>,
         operation: &'static str,
     ) -> bool {
-        if let Some(agent) = self.get(id) {
+        if let Some(agent) = self.get_for_run(owner, id) {
             let Ok(_terminal) = agent.terminal_lock.lock() else {
                 tracing::error!(
                     operation,
@@ -564,11 +614,12 @@ impl BackgroundAgentManager {
     /// lock is poisoned.
     pub fn attach_abort_handle(
         &self,
+        owner: &crate::tools::ToolRunContext,
         id: &str,
         abort_handle: tokio::task::AbortHandle,
     ) -> Result<(), String> {
         let agent = self
-            .get(id)
+            .get_for_run(owner, id)
             .ok_or_else(|| format!("Agent '{id}' not found"))?;
         if agent.finished.load(Ordering::SeqCst) {
             abort_handle.abort();
@@ -592,9 +643,14 @@ impl BackgroundAgentManager {
     ///
     /// Returns an error if the agent id is unknown or required agent metadata
     /// locks are poisoned.
-    pub fn stop(&self, id: &str, reason: &str) -> Result<String, String> {
+    pub fn stop(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+        reason: &str,
+    ) -> Result<String, String> {
         let agent = self
-            .get(id)
+            .get_for_run(owner, id)
             .ok_or_else(|| format!("Agent '{id}' not found"))?;
         let turns = agent.turns.load(Ordering::SeqCst);
         let task = agent.task.clone();
@@ -627,15 +683,15 @@ impl BackgroundAgentManager {
         if let Some(handle) = abort_handle {
             handle.abort();
         }
-        let shell_cleanup = crate::tools::BACKGROUND_SHELLS.kill_for_agent(id);
+        let shell_cleanup = crate::tools::BACKGROUND_SHELLS.kill_for_process_owner(owner, id);
         Ok(format!(
             "Agent '{id}' stopped after {turns} turns.\nTask: {task}\nReason: {reason}\n{shell_cleanup}"
         ))
     }
 
     /// Increment turn counter for an agent
-    pub fn increment_turns(&self, id: &str) -> u64 {
-        self.get(id)
+    pub fn increment_turns(&self, owner: &crate::tools::ToolRunContext, id: &str) -> u64 {
+        self.get_for_run(owner, id)
             .map_or(0, |agent| agent.turns.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
@@ -643,13 +699,17 @@ impl BackgroundAgentManager {
     ///
     /// Sweeps expired finished agents first (see [`Self::gc`]) so callers
     /// — including the TUI agent list — never observe leaked stale entries.
-    pub fn list(&self) -> Vec<(String, AgentType, String, bool)> {
+    pub fn list_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+    ) -> Vec<(String, AgentType, String, bool)> {
         self.gc();
         let Some(agents) = self.agents_guard("list") else {
             return Vec::new();
         };
         agents
             .iter()
+            .filter(|(_, agent)| agent.owner_run == owner.run_id())
             .map(|(id, agent)| {
                 (
                     id.clone(),
@@ -661,10 +721,20 @@ impl BackgroundAgentManager {
             .collect()
     }
 
-    /// Remove an agent unconditionally
-    pub fn remove(&self, id: &str) -> Option<Arc<BackgroundAgent>> {
-        let mut agents = self.agents_guard("remove")?;
-        agents.remove(id)
+    pub fn remove_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+    ) -> Option<Arc<BackgroundAgent>> {
+        let mut agents = self.agents_guard("remove_for_run")?;
+        if agents
+            .get(id)
+            .is_some_and(|agent| agent.owner_run == owner.run_id())
+        {
+            agents.remove(id)
+        } else {
+            None
+        }
     }
 
     /// Garbage-collect finished agents older than [`FINISHED_AGENT_TTL_SECS`].
@@ -699,16 +769,38 @@ impl BackgroundAgentManager {
         before.saturating_sub(agents.len())
     }
 
-    /// Public hook for shutdown paths (e.g. `tui.rs`) that want to drop
-    /// every finished agent up-front rather than wait for TTL expiry.
+    /// Drop finished agents owned by one exact run generation rather than
+    /// allowing one frontend to clean up another run's lifecycle state.
     /// Returns the number of agents removed.
-    pub fn cleanup_finished(&self) -> usize {
-        let Some(mut agents) = self.agents_guard("cleanup_finished") else {
+    pub fn cleanup_finished_for_run(&self, owner: &crate::tools::ToolRunContext) -> usize {
+        let Some(mut agents) = self.agents_guard("cleanup_finished_for_run") else {
             return 0;
         };
         let before = agents.len();
-        agents.retain(|_, agent| !agent.finished.load(Ordering::SeqCst));
+        agents.retain(|_, agent| {
+            agent.owner_run != owner.run_id() || !agent.finished.load(Ordering::SeqCst)
+        });
         before.saturating_sub(agents.len())
+    }
+
+    /// Abort and remove every background agent owned by one retiring run.
+    pub(crate) fn stop_all_for_run(&self, owner: &crate::tools::ToolRunContext) -> usize {
+        let agent_ids = self
+            .list_for_run(owner)
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect::<Vec<_>>();
+        let mut stopped = 0;
+        for agent_id in agent_ids {
+            if self
+                .stop(owner, &agent_id, "owning frontend run retired")
+                .is_ok()
+            {
+                stopped += 1;
+            }
+            let _ = self.remove_for_run(owner, &agent_id);
+        }
+        stopped
     }
 }
 
@@ -726,6 +818,7 @@ pub static BACKGROUND_AGENTS: LazyLock<BackgroundAgentManager> =
 
 /// Stored transcript for a completed agent, enabling resume
 pub(crate) struct StoredTranscript {
+    owner_run: crate::runtime::RunId,
     messages: Vec<Value>,
     agent_type: AgentType,
     created_at: Instant,
@@ -944,7 +1037,12 @@ pub(crate) fn spawn_transcript_sweeper() -> bool {
 /// by retaining the most recent messages; warns when truncation occurs.
 /// Also ensures the background sweeper has been spawned so TTL
 /// eviction does not depend on insert traffic.
-fn store_transcript(agent_id: &str, mut messages: Vec<Value>, agent_type: AgentType) {
+fn store_transcript(
+    owner: &crate::tools::ToolRunContext,
+    agent_id: &str,
+    mut messages: Vec<Value>,
+    agent_type: AgentType,
+) {
     // Make sure the background TTL sweep is running. Idempotent.
     let _ = spawn_transcript_sweeper();
 
@@ -968,6 +1066,7 @@ fn store_transcript(agent_id: &str, mut messages: Vec<Value>, agent_type: AgentT
         store.insert(
             agent_id.to_string(),
             StoredTranscript {
+                owner_run: owner.run_id(),
                 messages,
                 agent_type,
                 created_at: Instant::now(),
@@ -982,7 +1081,10 @@ fn store_transcript(agent_id: &str, mut messages: Vec<Value>, agent_type: AgentT
 /// — the background sweep (see [`spawn_transcript_sweeper`]) handles
 /// that. Per-call eviction is also unnecessary because every read
 /// path verifies the entry's own age in O(1).
-fn load_transcript(agent_id: &str) -> Option<(Vec<Value>, AgentType)> {
+fn load_transcript(
+    owner: &crate::tools::ToolRunContext,
+    agent_id: &str,
+) -> Option<(Vec<Value>, AgentType)> {
     // Tighten lock scope: read out what we need, then release before
     // the rest of the function body. The clippy
     // `significant_drop_tightening` lint flags holding a `MutexGuard`
@@ -990,6 +1092,7 @@ fn load_transcript(agent_id: &str) -> Option<(Vec<Value>, AgentType)> {
     let snapshot = transcript_store_guard("load_transcript").and_then(|store| {
         store
             .get(agent_id)
+            .filter(|entry| entry.owner_run == owner.run_id())
             .map(|entry| (entry.messages.clone(), entry.agent_type, entry.created_at))
     });
     let (messages, agent_type, created_at) = snapshot?;
@@ -1038,14 +1141,15 @@ impl WorktreeIsolation {
     ///
     /// Returns `Err` if git is not available, the current directory is not
     /// a git repository, or the worktree/branch creation fails.
-    pub fn create(agent_id: &str) -> Result<Self, String> {
+    pub fn create(run: &crate::tools::ToolRunContext, agent_id: &str) -> Result<Self, String> {
         validate_worktree_agent_id(agent_id)?;
+        run.require(crate::tools::ToolResource::WorkspaceWrite)
+            .map_err(|error| error.to_string())?;
         let branch_name = format!("agent/{agent_id}");
 
         // Find the git root
-        let security = crate::tools::security::current_context()?;
-        let cwd = security.working_directory();
-        let git_root = sandboxed_git(cwd, &["rev-parse", "--show-toplevel"])
+        let cwd = run.working_directory();
+        let git_root = sandboxed_git(run, cwd, &["rev-parse", "--show-toplevel"])
             .map_err(|e| format!("git not available: {e}"))?;
 
         if !git_root.status.success() {
@@ -1065,8 +1169,12 @@ impl WorktreeIsolation {
         let worktree_arg = worktree_path
             .to_str()
             .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
-        let result = sandboxed_git(cwd, &["worktree", "add", worktree_arg, "-b", &branch_name])
-            .map_err(|e| format!("Failed to create worktree: {e}"))?;
+        let result = sandboxed_git(
+            run,
+            cwd,
+            &["worktree", "add", worktree_arg, "-b", &branch_name],
+        )
+        .map_err(|e| format!("Failed to create worktree: {e}"))?;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -1081,17 +1189,18 @@ impl WorktreeIsolation {
 
     /// Check if the worktree has uncommitted changes
     #[must_use]
-    pub fn has_changes(&self) -> bool {
-        let result = crate::tools::security::current_context().and_then(|security| {
-            let worktree = self
-                .worktree_path
-                .to_str()
-                .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
-            sandboxed_git(
-                security.working_directory(),
-                &["-C", worktree, "diff", "--stat"],
-            )
-        });
+    pub fn has_changes(&self, run: &crate::tools::ToolRunContext) -> bool {
+        let result = self
+            .worktree_path
+            .to_str()
+            .ok_or_else(|| "worktree path must be valid UTF-8".to_string())
+            .and_then(|worktree| {
+                sandboxed_git(
+                    run,
+                    run.working_directory(),
+                    &["-C", worktree, "diff", "--stat"],
+                )
+            });
 
         match result {
             Ok(output) => !output.stdout.is_empty(),
@@ -1105,8 +1214,8 @@ impl WorktreeIsolation {
     ///
     /// Returns `Err` if the worktree has uncommitted changes or if the
     /// git worktree remove command fails.
-    pub fn cleanup(&self) -> Result<(), String> {
-        if self.has_changes() {
+    pub fn cleanup(&self, run: &crate::tools::ToolRunContext) -> Result<(), String> {
+        if self.has_changes(run) {
             return Err(format!(
                 "Worktree has changes \u{2014} keeping at {} on branch {}",
                 self.worktree_path.display(),
@@ -1114,13 +1223,13 @@ impl WorktreeIsolation {
             ));
         }
 
-        let security = crate::tools::security::current_context()?;
         let worktree = self
             .worktree_path
             .to_str()
             .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
         let result = sandboxed_git(
-            security.working_directory(),
+            run,
+            run.working_directory(),
             &["worktree", "remove", worktree, "--force"],
         )
         .map_err(|e| format!("Failed to remove worktree: {e}"))?;
@@ -1132,7 +1241,8 @@ impl WorktreeIsolation {
 
         // Also delete the branch
         let _ = sandboxed_git(
-            security.working_directory(),
+            run,
+            run.working_directory(),
             &["branch", "-D", &self.branch_name],
         );
 
@@ -1294,11 +1404,12 @@ pub struct SubagentResult {
 /// Run a subagent synchronously, returning the final result
 #[allow(clippy::too_many_lines)]
 pub async fn run_subagent(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
 ) -> SubagentResult {
-    run_subagent_inner(config, app_config, client, None).await
+    run_subagent_inner(parent_run, config, app_config, client, None).await
 }
 
 fn validate_and_render_subagent_final_response(
@@ -1313,6 +1424,7 @@ fn validate_and_render_subagent_final_response(
 
 #[allow(clippy::too_many_lines)]
 async fn run_subagent_inner(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
@@ -1333,16 +1445,44 @@ async fn run_subagent_inner(
     // (e.g. a previous turn of the same resume chain), `register_with_id`
     // is a no-op and preserves the existing turn counter / state.
     let (agent_id, mut messages) = if let Some(preallocated_id) = preallocated_agent_id {
-        BACKGROUND_AGENTS.register_with_id(config.agent_type, &config.task, preallocated_id);
+        if let Err(error) = BACKGROUND_AGENTS.register_with_id(
+            parent_run,
+            config.agent_type,
+            &config.task,
+            preallocated_id,
+        ) {
+            return SubagentResult {
+                agent_id: preallocated_id.to_string(),
+                success: false,
+                output: error,
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree: None,
+            };
+        }
         let msgs = vec![json!({
             "role": "user",
             "content": format!("Task: {}\n\n{}", config.task, config.prompt)
         })];
         (preallocated_id.to_string(), msgs)
     } else if let Some(ref resume_id) = config.resume_agent_id {
-        match load_transcript(resume_id) {
+        match load_transcript(parent_run, resume_id) {
             Some((prev_messages, _prev_type)) => {
-                BACKGROUND_AGENTS.register_with_id(config.agent_type, &config.task, resume_id);
+                if let Err(error) = BACKGROUND_AGENTS.register_with_id(
+                    parent_run,
+                    config.agent_type,
+                    &config.task,
+                    resume_id,
+                ) {
+                    return SubagentResult {
+                        agent_id: resume_id.clone(),
+                        success: false,
+                        output: error,
+                        turns_used: 0,
+                        is_background: config.run_in_background,
+                        worktree: None,
+                    };
+                }
                 let mut msgs = prev_messages;
                 // Append the new prompt as a continuation
                 msgs.push(json!({
@@ -1363,7 +1503,19 @@ async fn run_subagent_inner(
             }
         }
     } else {
-        let id = BACKGROUND_AGENTS.register(config.agent_type, &config.task);
+        let id = match BACKGROUND_AGENTS.register(parent_run, config.agent_type, &config.task) {
+            Ok(id) => id,
+            Err(error) => {
+                return SubagentResult {
+                    agent_id: String::new(),
+                    success: false,
+                    output: error,
+                    turns_used: 0,
+                    is_background: config.run_in_background,
+                    worktree: None,
+                }
+            }
+        };
         let msgs = vec![json!({
             "role": "user",
             "content": format!("Task: {}\n\n{}", config.task, config.prompt)
@@ -1377,7 +1529,7 @@ async fn run_subagent_inner(
 
     // Set up worktree isolation if requested
     let worktree = if config.isolation.as_deref() == Some("worktree") {
-        match WorktreeIsolation::create(&agent_id) {
+        match WorktreeIsolation::create(parent_run, &agent_id) {
             Ok(wt) => Some(wt),
             Err(e) => {
                 return SubagentResult {
@@ -1392,6 +1544,90 @@ async fn run_subagent_inner(
         }
     } else {
         None
+    };
+
+    let child_root = worktree.as_ref().map_or_else(
+        || parent_run.project_root().to_path_buf(),
+        |isolation| isolation.worktree_path.clone(),
+    );
+    let child_cwd = worktree.as_ref().map_or_else(
+        || parent_run.working_directory().to_path_buf(),
+        |isolation| isolation.worktree_path.clone(),
+    );
+    let session_id = match crate::state::SessionId::from_raw(parent_run.session_id()) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot bind subagent session capabilities: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree,
+            };
+        }
+    };
+    let workspace_access = if config.agent_type == AgentType::GeneralPurpose {
+        crate::tools::WorkspaceAccess::ReadWrite
+    } else {
+        crate::tools::WorkspaceAccess::ReadOnly
+    };
+    let is_parent_intrinsic_root = |root: &&PathBuf| {
+        root.as_path() == parent_run.project_root()
+            || root.as_path() == parent_run.private_temp_root()
+    };
+    let mut child_read_only_roots: Vec<PathBuf> = parent_run
+        .read_only_roots()
+        .iter()
+        .filter(|root| !is_parent_intrinsic_root(root))
+        .cloned()
+        .collect();
+    let mut child_read_write_roots = Vec::new();
+    if workspace_access == crate::tools::WorkspaceAccess::ReadWrite {
+        child_read_write_roots.extend(
+            parent_run
+                .read_write_roots()
+                .iter()
+                .filter(|root| !is_parent_intrinsic_root(root))
+                .cloned(),
+        );
+    } else {
+        child_read_only_roots.extend(
+            parent_run
+                .read_write_roots()
+                .iter()
+                .filter(|root| !is_parent_intrinsic_root(root))
+                .cloned(),
+        );
+    }
+    let subagent_run = match crate::tools::ToolRunContext::builder(session_id, child_root)
+        .working_directory(child_cwd)
+        .read_only_roots(child_read_only_roots)
+        .read_write_roots(child_read_write_roots)
+        .project_secret_masks(parent_run.project_secret_masks().to_vec())
+        .environment_grants(parent_run.environment_grants().clone())
+        .mcp_environment_grants(parent_run.mcp_environment_grants().clone())
+        .executable_search_path(parent_run.executable_search_path())
+        .workspace_access(workspace_access)
+        .process(parent_run.grants_resource(crate::tools::ToolResource::Process))
+        .network(parent_run.grants_resource(crate::tools::ToolResource::Network))
+        .secrets(parent_run.grants_resource(crate::tools::ToolResource::Secrets))
+        .process_owner(&agent_id)
+        .actor_role(crate::runtime::ActorRole::Worker)
+        .provider(app_config.proxy.target.clone())
+        .build()
+    {
+        Ok(run) => run,
+        Err(error) => {
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot create subagent run capabilities: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree,
+            };
+        }
     };
 
     let mut subagent_context = vec![crate::context::ContextItem::host_instruction(
@@ -1486,7 +1722,8 @@ async fn run_subagent_inner(
     // Library-layer permission gate — consulted by every
     // `execute_tool_with_memory` call inside this subagent's tool loop.
     // Closes crosslink #505 for the subagent path.
-    let permission_mgr = crate::permissions::PermissionManager::trusted(
+    let permission_mgr = crate::permissions::PermissionManager::trusted_for_run(
+        &subagent_run,
         app_config.permissions.enabled,
         app_config.permissions.default_allow.clone(),
         app_config.web_fetch.preapproved_domains.clone(),
@@ -1494,13 +1731,13 @@ async fn run_subagent_inner(
     let policy_enforcer = crate::services::policy::PolicyEnforcer::new(app_config.policy.clone());
 
     loop {
-        turns = BACKGROUND_AGENTS.increment_turns(&agent_id);
-        if let Some(agent) = BACKGROUND_AGENTS.get(&agent_id) {
+        turns = BACKGROUND_AGENTS.increment_turns(parent_run, &agent_id);
+        if let Some(agent) = BACKGROUND_AGENTS.get_for_run(parent_run, &agent_id) {
             if agent.finished.load(Ordering::SeqCst) {
                 let error = agent_field_guard(&agent.error, "run_subagent", &agent_id, "error")
                     .and_then(|e| e.clone())
                     .unwrap_or_else(|| "Agent stopped before the next turn".to_string());
-                store_transcript(&agent_id, messages, config.agent_type);
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1514,11 +1751,12 @@ async fn run_subagent_inner(
 
         if turns > MAX_SUBAGENT_TURNS as u64 {
             BACKGROUND_AGENTS.fail(
+                parent_run,
                 &agent_id,
                 format!("Agent exceeded maximum turns ({MAX_SUBAGENT_TURNS})"),
             );
             // Store transcript even on failure for potential resume
-            store_transcript(&agent_id, messages, config.agent_type);
+            store_transcript(parent_run, &agent_id, messages, config.agent_type);
             return SubagentResult {
                 agent_id,
                 success: false,
@@ -1537,8 +1775,8 @@ async fn run_subagent_inner(
         ) {
             Ok(messages) => messages,
             Err(e) => {
-                BACKGROUND_AGENTS.fail(&agent_id, e.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1560,8 +1798,8 @@ async fn run_subagent_inner(
         let typed_request = match build_chat_completion_request(&request_body) {
             Ok(request) => request,
             Err(e) => {
-                BACKGROUND_AGENTS.fail(&agent_id, e.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1574,8 +1812,8 @@ async fn run_subagent_inner(
         };
         if let Err(e) = check_provider_request_policy(app_config, &typed_request) {
             let message = format!("Blocked by policy: {e}");
-            BACKGROUND_AGENTS.fail(&agent_id, message.clone());
-            store_transcript(&agent_id, messages, config.agent_type);
+            BACKGROUND_AGENTS.fail(parent_run, &agent_id, message.clone());
+            store_transcript(parent_run, &agent_id, messages, config.agent_type);
             return SubagentResult {
                 agent_id,
                 success: false,
@@ -1601,8 +1839,8 @@ async fn run_subagent_inner(
         {
             Ok(r) => r,
             Err(e) => {
-                BACKGROUND_AGENTS.fail(&agent_id, e.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1618,8 +1856,8 @@ async fn run_subagent_inner(
         let assistant_message = match parse_response(&response) {
             Ok(msg) => msg,
             Err(e) => {
-                BACKGROUND_AGENTS.fail(&agent_id, e.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1664,8 +1902,8 @@ async fn run_subagent_inner(
                     final_output = rendered;
                 }
                 Err(reason) => {
-                    BACKGROUND_AGENTS.fail(&agent_id, reason.clone());
-                    store_transcript(&agent_id, messages, config.agent_type);
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, reason.clone());
+                    store_transcript(parent_run, &agent_id, messages, config.agent_type);
                     return SubagentResult {
                         agent_id,
                         success: false,
@@ -1741,6 +1979,7 @@ async fn run_subagent_inner(
             // present. Closes crosslink #518 for subagents.
             let result = crate::services::tool_executor::ToolExecutor::execute(
                 crate::services::tool_executor::ToolExecutorRequest {
+                    run_context: &subagent_run,
                     tool_call: &executable_tc,
                     memory_db: None,
                     app_config: None,
@@ -1762,15 +2001,15 @@ async fn run_subagent_inner(
     }
 
     // Mark as finished and store transcript for future resume
-    BACKGROUND_AGENTS.finish(&agent_id, final_output.clone());
-    store_transcript(&agent_id, messages, config.agent_type);
+    BACKGROUND_AGENTS.finish(parent_run, &agent_id, final_output.clone());
+    store_transcript(parent_run, &agent_id, messages, config.agent_type);
 
     // Handle worktree cleanup: remove if no changes, keep if changes exist
     let final_worktree = worktree.and_then(|wt| {
-        if wt.has_changes() {
+        if wt.has_changes(parent_run) {
             Some(wt) // Keep -- return path and branch to caller
         } else {
-            let _ = wt.cleanup(); // No changes, clean up silently
+            let _ = wt.cleanup(parent_run); // No changes, clean up silently
             None
         }
     });
@@ -2266,6 +2505,7 @@ fn observe_subagent_tool_result(
 /// Execute the Task tool
 #[allow(clippy::too_many_lines)]
 pub fn execute_task_tool<S: BuildHasher>(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
     args: &HashMap<String, Value, S>,
     app_config: &AppConfig,
 ) -> (String, bool) {
@@ -2339,18 +2579,24 @@ pub fn execute_task_tool<S: BuildHasher>(
         //   (b) the spawned task's call to `run_subagent` reattaches to
         //       that tracking entry rather than minting a new id.
         // For fresh spawns we mint a new id as before.
-        let agent_id = config.resume_agent_id.as_ref().map_or_else(
-            || BACKGROUND_AGENTS.register(agent_type, description),
-            |rid| {
-                BACKGROUND_AGENTS.register_with_id(agent_type, description, rid);
-                rid.clone()
-            },
-        );
+        let agent_id = if let Some(resume_id) = config.resume_agent_id.as_ref() {
+            match BACKGROUND_AGENTS.register_with_id(parent_run, agent_type, description, resume_id)
+            {
+                Ok(_) => resume_id.clone(),
+                Err(error) => return (error, true),
+            }
+        } else {
+            match BACKGROUND_AGENTS.register(parent_run, agent_type, description) {
+                Ok(id) => id,
+                Err(error) => return (error, true),
+            }
+        };
 
         // Spawn the background task
         let config_bg = config;
         let app_config_bg = app_config.clone();
         let client_bg = client;
+        let parent_run_bg = Arc::clone(parent_run);
         let agent_id_bg = agent_id.clone();
         let preallocated_agent_id_bg = config_bg
             .resume_agent_id
@@ -2360,6 +2606,7 @@ pub fn execute_task_tool<S: BuildHasher>(
         // Use tokio runtime to spawn the background task
         let Ok(handle) = Handle::try_current() else {
             BACKGROUND_AGENTS.fail(
+                parent_run,
                 &agent_id,
                 "Background task requires an active tokio runtime".to_string(),
             );
@@ -2370,6 +2617,7 @@ pub fn execute_task_tool<S: BuildHasher>(
         };
         let join_handle = handle.spawn(async move {
             let result = run_subagent_inner(
+                &parent_run_bg,
                 &config_bg,
                 &app_config_bg,
                 &client_bg,
@@ -2378,11 +2626,11 @@ pub fn execute_task_tool<S: BuildHasher>(
             .await;
 
             if !result.success {
-                BACKGROUND_AGENTS.fail(&agent_id_bg, result.output);
+                BACKGROUND_AGENTS.fail(&parent_run_bg, &agent_id_bg, result.output);
             }
         });
         if let Err(err) =
-            BACKGROUND_AGENTS.attach_abort_handle(&agent_id, join_handle.abort_handle())
+            BACKGROUND_AGENTS.attach_abort_handle(parent_run, &agent_id, join_handle.abort_handle())
         {
             tracing::warn!(
                 agent_id,
@@ -2398,7 +2646,7 @@ pub fn execute_task_tool<S: BuildHasher>(
         (message, false)
     } else {
         // Run synchronously via defensive runtime dispatch (#719).
-        dispatch_subagent_sync(&config, app_config, &client)
+        dispatch_subagent_sync(parent_run, &config, app_config, &client)
     }
 }
 
@@ -2420,6 +2668,7 @@ pub fn execute_task_tool<S: BuildHasher>(
 ///     `block_in_place` (panics) and cannot `block_on` (deadlocks the
 ///     single worker). The caller must dispatch through the async path.
 fn dispatch_subagent_sync(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
@@ -2427,7 +2676,7 @@ fn dispatch_subagent_sync(
     let result = match Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
-                handle.block_on(run_subagent(config, app_config, client))
+                handle.block_on(run_subagent(parent_run, config, app_config, client))
             }),
             _ => {
                 return (
@@ -2440,7 +2689,7 @@ fn dispatch_subagent_sync(
             }
         },
         Err(_) => match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(run_subagent(config, app_config, client)),
+            Ok(rt) => rt.block_on(run_subagent(parent_run, config, app_config, client)),
             Err(e) => {
                 return (format!("Failed to create runtime: {e}"), true);
             }
@@ -2468,13 +2717,14 @@ fn dispatch_subagent_sync(
 
 /// Execute the `AgentOutput` tool
 pub fn execute_agent_output_tool<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
     args: &HashMap<String, Value, S>,
 ) -> (String, bool) {
     let agent_id = match args.arg_str_opt_strict("agent_id") {
         Ok(Some(agent_id)) => agent_id,
         Ok(None) => {
             // List all agents if no ID provided
-            let agents = BACKGROUND_AGENTS.list();
+            let agents = BACKGROUND_AGENTS.list_for_run(owner);
             if agents.is_empty() {
                 return ("No background agents running.".to_string(), false);
             }
@@ -2498,7 +2748,7 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
         Err(err) => return err.into_tool_error(),
     };
 
-    let Some(agent) = BACKGROUND_AGENTS.get(agent_id) else {
+    let Some(agent) = BACKGROUND_AGENTS.get_for_run(owner, agent_id) else {
         return (format!("Agent '{agent_id}' not found"), true);
     };
 
@@ -2560,7 +2810,7 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
         // Drop the local `Arc` clone first so `remove` returns the last
         // strong reference and the heap allocation can actually be freed.
         drop(agent);
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(owner, agent_id);
 
         error.map_or_else(
             || {
@@ -2598,7 +2848,10 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
 }
 
 /// Execute the `TaskStop` tool.
-pub fn execute_task_stop_tool<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
+pub fn execute_task_stop_tool<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
     let agent_id = match args.arg_str_strict("agent_id") {
         Ok(agent_id) => agent_id,
         Err(err) => return err.into_tool_error(),
@@ -2609,7 +2862,7 @@ pub fn execute_task_stop_tool<S: BuildHasher>(args: &HashMap<String, Value, S>) 
     };
 
     BACKGROUND_AGENTS
-        .stop(agent_id, reason)
+        .stop(owner, agent_id, reason)
         .map_or_else(|err| (err, true), |msg| (msg, false))
 }
 
@@ -2620,9 +2873,96 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    fn test_run() -> &'static Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
+    fn isolated_test_run(provider: &str) -> Arc<crate::tools::ToolRunContext> {
+        crate::tools::ToolRunContext::builder(
+            crate::state::SessionId::new(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider(provider)
+        .build()
+        .expect("explicit isolated subagent test run")
+    }
+
+    /// Keeps older lifecycle-focused tests compact while exercising the new
+    /// exact-run API. Cross-run behavior is covered independently below and
+    /// in `background_agent_manager_e2e`.
+    struct TestBackgroundAgentManager {
+        inner: BackgroundAgentManager,
+        owner: Arc<crate::tools::ToolRunContext>,
+    }
+
+    impl TestBackgroundAgentManager {
+        fn new() -> Self {
+            Self {
+                inner: BackgroundAgentManager::new(),
+                owner: Arc::clone(test_run()),
+            }
+        }
+
+        fn register(&self, agent_type: AgentType, task: &str) -> String {
+            self.inner
+                .register(&self.owner, agent_type, task)
+                .expect("test agent registration")
+        }
+
+        fn register_with_id(&self, agent_type: AgentType, task: &str, id: &str) -> bool {
+            self.inner
+                .register_with_id(&self.owner, agent_type, task, id)
+                .expect("test agent registration with id")
+        }
+
+        fn get(&self, id: &str) -> Option<Arc<BackgroundAgent>> {
+            self.inner.get_for_run(&self.owner, id)
+        }
+
+        fn increment_turns(&self, id: &str) -> u64 {
+            self.inner.increment_turns(&self.owner, id)
+        }
+
+        fn finish(&self, id: &str, result: String) {
+            self.inner.finish(&self.owner, id, result);
+        }
+
+        fn fail(&self, id: &str, error: String) {
+            self.inner.fail(&self.owner, id, error);
+        }
+
+        fn attach_abort_handle(
+            &self,
+            id: &str,
+            abort_handle: tokio::task::AbortHandle,
+        ) -> Result<(), String> {
+            self.inner
+                .attach_abort_handle(&self.owner, id, abort_handle)
+        }
+
+        fn stop(&self, id: &str, reason: &str) -> Result<String, String> {
+            self.inner.stop(&self.owner, id, reason)
+        }
+
+        fn gc(&self) -> usize {
+            self.inner.gc()
+        }
+
+        fn cleanup_finished(&self) -> usize {
+            self.inner.cleanup_finished_for_run(&self.owner)
+        }
+    }
+
     #[test]
     fn worktree_git_helpers_use_resolved_binary_path() {
-        let git = git_bin().expect("subagent tests require git on PATH");
+        let git = git_bin(test_run()).expect("subagent tests require git on the run-bound PATH");
         assert!(
             git.is_absolute(),
             "git_bin must resolve git to an absolute path, got {}",
@@ -2813,7 +3153,7 @@ mod tests {
         let ledger_path =
             crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
         let _ = std::fs::remove_file(&ledger_path);
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
 
         let final_content = "Verified with cargo check.";
         let (server, base_url) = spawn_openai_no_tool_final_server(final_content);
@@ -2829,7 +3169,8 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = run_subagent_inner(&config, &app_config, &client, Some(agent_id)).await;
+        let result =
+            run_subagent_inner(test_run(), &config, &app_config, &client, Some(agent_id)).await;
         let server_result = server.join().expect("mock provider thread joined");
 
         assert!(
@@ -2844,7 +3185,7 @@ mod tests {
         );
         assert_eq!(result.output, final_content);
 
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
         let _ = std::fs::remove_file(ledger_path);
     }
 
@@ -2854,7 +3195,7 @@ mod tests {
         let ledger_path =
             crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
         let _ = std::fs::remove_file(&ledger_path);
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
 
         let (server, base_url) = spawn_openai_no_tool_final_server("Good morning!");
         let app_config = local_subagent_app_config(base_url);
@@ -2869,7 +3210,8 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = run_subagent_inner(&config, &app_config, &client, Some(agent_id)).await;
+        let result =
+            run_subagent_inner(test_run(), &config, &app_config, &client, Some(agent_id)).await;
         let server_result = server.join().expect("mock provider thread joined");
 
         assert!(
@@ -2884,7 +3226,7 @@ mod tests {
         );
         assert_eq!(result.output, "Good morning!");
 
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
         let _ = std::fs::remove_file(ledger_path);
     }
 
@@ -3266,7 +3608,7 @@ mod tests {
 
     #[test]
     fn test_background_agent_manager() {
-        let manager = BackgroundAgentManager::new();
+        let manager = TestBackgroundAgentManager::new();
 
         // Register an agent
         let id = manager.register(AgentType::Explore, "Test task");
@@ -3510,7 +3852,7 @@ mod tests {
     /// opaque 8-char UUID prefix — format differs, behavior is pinned as-is.
     #[test]
     fn spec1_run_in_background_registers_agent_returns_id() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let id = mgr.register(AgentType::Explore, "scan codebase for dead code");
         assert_eq!(id.len(), 8, "OC uses 8-char UUID prefix (safe_truncate)");
 
@@ -3525,7 +3867,7 @@ mod tests {
     /// the `agent_id`, task description, and a hint to use `agent_output`.
     #[test]
     fn spec1_background_message_format() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let id = mgr.register(AgentType::Plan, "design the auth layer");
 
         // Simulate the format string from execute_task_tool (line ~1333).
@@ -3544,7 +3886,7 @@ mod tests {
     /// has no result. `is_error` is `false` for a background spawn.
     #[test]
     fn spec1_is_error_false_and_not_finished_at_spawn() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let id = mgr.register(AgentType::GeneralPurpose, "refactor module");
         let agent = mgr.get(&id).expect("must exist after register");
 
@@ -3563,7 +3905,7 @@ mod tests {
             ("run_in_background".to_string(), json!("true")),
         ]);
 
-        let (msg, is_err) = execute_task_tool(&args, &app_config);
+        let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
 
         assert!(is_err, "non-boolean run_in_background must error: {msg}");
         assert!(
@@ -3594,7 +3936,7 @@ mod tests {
             ]);
             args.insert(field.to_string(), json!(42));
 
-            let (msg, is_err) = execute_task_tool(&args, &app_config);
+            let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
 
             assert!(is_err, "{field} must reject non-string values: {msg}");
             assert!(msg.contains(expected), "unexpected error: {msg}");
@@ -3617,7 +3959,7 @@ mod tests {
             ]);
             args.insert(field.to_string(), json!(42));
 
-            let (msg, is_err) = execute_task_tool(&args, &app_config);
+            let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
 
             assert!(is_err, "{field} must reject non-string values: {msg}");
             assert!(msg.contains(expected), "unexpected error: {msg}");
@@ -3631,7 +3973,7 @@ mod tests {
             ("block".to_string(), json!("true")),
         ]);
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
 
         assert!(is_err, "non-boolean block must error: {msg}");
         assert!(
@@ -3644,7 +3986,7 @@ mod tests {
     fn agent_output_rejects_non_string_agent_id_when_present() {
         let args = HashMap::from([("agent_id".to_string(), json!(42))]);
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
 
         assert!(is_err, "non-string agent_id must error: {msg}");
         assert!(
@@ -3660,7 +4002,7 @@ mod tests {
     /// `success=false` with the "No transcript found" message.
     #[test]
     fn spec2_resume_miss_returns_not_found_error() {
-        let missing = load_transcript("00000000-dead-beef-0000-000000000000");
+        let missing = load_transcript(test_run(), "00000000-dead-beef-0000-000000000000");
         assert!(
             missing.is_none(),
             "unknown agent_id must return None from transcript store"
@@ -3677,13 +4019,34 @@ mod tests {
             json!({"role": "assistant", "content": "Done."}),
         ];
         let fake_id = format!("tt-{}", Uuid::new_v4());
-        store_transcript(&fake_id, msgs.clone(), AgentType::Explore);
+        store_transcript(test_run(), &fake_id, msgs.clone(), AgentType::Explore);
 
-        let loaded = load_transcript(&fake_id).expect("stored transcript must be loadable");
+        let loaded =
+            load_transcript(test_run(), &fake_id).expect("stored transcript must be loadable");
         assert_eq!(loaded.0.len(), msgs.len());
         assert_eq!(loaded.1, AgentType::Explore);
         assert_eq!(loaded.0[0]["role"].as_str(), Some("system"));
         assert_eq!(loaded.0[2]["content"].as_str(), Some("Done."));
+    }
+
+    #[test]
+    fn transcript_resume_is_bound_to_exact_owner_run() {
+        let owner = isolated_test_run("transcript-owner");
+        let foreign = isolated_test_run("transcript-foreign");
+        let id = format!("s019-transcript-{}", Uuid::new_v4());
+        let messages = vec![json!({"role": "assistant", "content": "owner-only"})];
+
+        store_transcript(&owner, &id, messages.clone(), AgentType::Explore);
+
+        assert!(
+            load_transcript(&foreign, &id).is_none(),
+            "foreign run must observe the transcript as absent"
+        );
+        assert_eq!(
+            load_transcript(&owner, &id),
+            Some((messages, AgentType::Explore)),
+            "foreign lookup must not consume or alter the owner's transcript"
+        );
     }
 
     // ── Crosslink #582: subagent resume reuses original agent_id ──
@@ -3703,12 +4066,13 @@ mod tests {
     fn fix582_task_dispatch_with_resume_id_reuses_id() {
         let original_id = format!("582-reuse-{}", Uuid::new_v4());
         store_transcript(
+            test_run(),
             &original_id,
             vec![json!({"role": "user", "content": "Original turn"})],
             AgentType::Plan,
         );
         assert!(
-            load_transcript(&original_id).is_some(),
+            load_transcript(test_run(), &original_id).is_some(),
             "precondition: transcript must exist"
         );
 
@@ -3717,9 +4081,15 @@ mod tests {
         // code path that now must keep the original id.
         let resume_id_opt: Option<String> = Some(original_id.clone());
         let agent_id = resume_id_opt.as_ref().map_or_else(
-            || BACKGROUND_AGENTS.register(AgentType::Plan, "resume task"),
+            || {
+                BACKGROUND_AGENTS
+                    .register(test_run(), AgentType::Plan, "resume task")
+                    .expect("register fresh test agent")
+            },
             |rid| {
-                BACKGROUND_AGENTS.register_with_id(AgentType::Plan, "resume task", rid);
+                BACKGROUND_AGENTS
+                    .register_with_id(test_run(), AgentType::Plan, "resume task", rid)
+                    .expect("reattach test agent");
                 rid.clone()
             },
         );
@@ -3729,11 +4099,13 @@ mod tests {
             "#582: resume must reuse the original id, not mint a new one"
         );
         assert!(
-            BACKGROUND_AGENTS.get(&agent_id).is_some(),
+            BACKGROUND_AGENTS
+                .get_for_run(test_run(), &agent_id)
+                .is_some(),
             "tracking entry must exist under the reused id"
         );
         assert!(
-            load_transcript(&original_id).is_some(),
+            load_transcript(test_run(), &original_id).is_some(),
             "TRANSCRIPT_STORE entry under the original id must still be reachable"
         );
     }
@@ -3745,16 +4117,24 @@ mod tests {
     fn fix582_task_dispatch_without_resume_generates_fresh_id() {
         let resume_id_opt: Option<String> = None;
         let agent_id = resume_id_opt.as_ref().map_or_else(
-            || BACKGROUND_AGENTS.register(AgentType::Plan, "fresh task"),
+            || {
+                BACKGROUND_AGENTS
+                    .register(test_run(), AgentType::Plan, "fresh task")
+                    .expect("register fresh test agent")
+            },
             |rid| {
-                BACKGROUND_AGENTS.register_with_id(AgentType::Plan, "fresh task", rid);
+                BACKGROUND_AGENTS
+                    .register_with_id(test_run(), AgentType::Plan, "fresh task", rid)
+                    .expect("reattach test agent");
                 rid.clone()
             },
         );
 
         assert_eq!(agent_id.len(), 8, "fresh ids are 8-char UUID prefixes");
         assert!(
-            BACKGROUND_AGENTS.get(&agent_id).is_some(),
+            BACKGROUND_AGENTS
+                .get_for_run(test_run(), &agent_id)
+                .is_some(),
             "fresh-spawn tracking entry must exist"
         );
     }
@@ -3769,11 +4149,11 @@ mod tests {
     fn fix582_resume_unknown_id_errors_does_not_silently_create() {
         let unknown_id = format!("582-unknown-{}", Uuid::new_v4());
         // Precondition: nothing in the store under this id.
-        assert!(load_transcript(&unknown_id).is_none());
+        assert!(load_transcript(test_run(), &unknown_id).is_none());
 
         // Mirror run_subagent's resume branch decision: `load_transcript`
         // returns None → error path produces "No transcript found".
-        let load_result = load_transcript(&unknown_id);
+        let load_result = load_transcript(test_run(), &unknown_id);
         assert!(
             load_result.is_none(),
             "unknown id must miss the transcript store"
@@ -3789,7 +4169,7 @@ mod tests {
 
         // And we deliberately did NOT create a transcript under the id.
         assert!(
-            load_transcript(&unknown_id).is_none(),
+            load_transcript(test_run(), &unknown_id).is_none(),
             "resume miss must not silently materialize a transcript"
         );
     }
@@ -3809,13 +4189,16 @@ mod tests {
             json!({"role": "user", "content": "first prompt"}),
             json!({"role": "assistant", "content": "first reply"}),
         ];
-        store_transcript(&chain_id, turn1.clone(), AgentType::Explore);
+        store_transcript(test_run(), &chain_id, turn1.clone(), AgentType::Explore);
 
         // First resume dispatch: register_with_id is a no-op on the
         // tracking side because we already registered, but the resume
         // path's load+append+re-store cycle must round-trip on the same key.
-        BACKGROUND_AGENTS.register_with_id(AgentType::Explore, "chain task", &chain_id);
-        let (loaded1, t1) = load_transcript(&chain_id).expect("turn-1 transcript must be loadable");
+        BACKGROUND_AGENTS
+            .register_with_id(test_run(), AgentType::Explore, "chain task", &chain_id)
+            .expect("register chain agent");
+        let (loaded1, t1) =
+            load_transcript(test_run(), &chain_id).expect("turn-1 transcript must be loadable");
         assert_eq!(loaded1.len(), turn1.len());
         assert_eq!(t1, AgentType::Explore);
 
@@ -3824,13 +4207,15 @@ mod tests {
         let mut turn2 = loaded1;
         turn2.push(json!({"role": "user", "content": "Continuing from where you left off.\n\nsecond prompt"}));
         turn2.push(json!({"role": "assistant", "content": "second reply"}));
-        store_transcript(&chain_id, turn2.clone(), AgentType::Explore);
+        store_transcript(test_run(), &chain_id, turn2.clone(), AgentType::Explore);
 
         // Second resume dispatch: must see the *combined* history under
         // the same id — proof of transcript / prompt-cache continuity.
-        BACKGROUND_AGENTS.register_with_id(AgentType::Explore, "chain task", &chain_id);
-        let (loaded2, _) =
-            load_transcript(&chain_id).expect("turn-2 transcript must still be at same key");
+        BACKGROUND_AGENTS
+            .register_with_id(test_run(), AgentType::Explore, "chain task", &chain_id)
+            .expect("reattach chain agent");
+        let (loaded2, _) = load_transcript(test_run(), &chain_id)
+            .expect("turn-2 transcript must still be at same key");
         assert_eq!(
             loaded2.len(),
             turn1.len() + 2,
@@ -3844,7 +4229,9 @@ mod tests {
 
         // And only one tracking entry exists under chain_id (no
         // duplicates from the multiple register_with_id calls).
-        assert!(BACKGROUND_AGENTS.get(&chain_id).is_some());
+        assert!(BACKGROUND_AGENTS
+            .get_for_run(test_run(), &chain_id)
+            .is_some());
     }
 
     /// #582 — `register_with_id` is idempotent: a second call with the
@@ -3852,7 +4239,7 @@ mod tests {
     /// `finished` / `turns` / `result`).
     #[test]
     fn fix582_register_with_id_is_idempotent() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let id = format!("582-idem-{}", Uuid::new_v4());
 
         let inserted_first = mgr.register_with_id(AgentType::Plan, "task v1", &id);
@@ -3900,7 +4287,7 @@ mod tests {
             .build()
             .expect("runtime must build");
         rt.block_on(async {
-            let mgr = BackgroundAgentManager::new();
+            let mgr = TestBackgroundAgentManager::new();
             let id = mgr.register(AgentType::GeneralPurpose, "long running task");
             let join = tokio::spawn(async {
                 tokio::time::sleep(std::time::Duration::from_mins(1)).await;
@@ -3957,12 +4344,14 @@ mod tests {
 
     #[test]
     fn spec5_execute_task_stop_tool_marks_agent_failed() {
-        let id = BACKGROUND_AGENTS.register(AgentType::Plan, "stoppable task");
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Plan, "stoppable task")
+            .expect("register stoppable test agent");
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!(id));
         args.insert("reason".to_string(), json!("user cancelled"));
 
-        let (msg, is_err) = execute_task_stop_tool(&args);
+        let (msg, is_err) = execute_task_stop_tool(test_run(), &args);
 
         assert!(!is_err, "task_stop must succeed for running agent: {msg}");
         assert!(
@@ -3970,21 +4359,21 @@ mod tests {
             "reason must be surfaced: {msg}"
         );
         let agent = BACKGROUND_AGENTS
-            .get(&id)
+            .get_for_run(test_run(), &id)
             .expect("stopped agent remains tracked");
         assert!(agent.finished.load(Ordering::SeqCst));
         assert_eq!(
             agent.error.lock().unwrap().as_deref(),
             Some("user cancelled")
         );
-        let _ = BACKGROUND_AGENTS.remove(&id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &id);
     }
 
     #[test]
     fn task_stop_rejects_non_string_agent_id() {
         let args = HashMap::from([("agent_id".to_string(), json!(42))]);
 
-        let (msg, is_err) = execute_task_stop_tool(&args);
+        let (msg, is_err) = execute_task_stop_tool(test_run(), &args);
 
         assert!(is_err, "non-string agent_id must error: {msg}");
         assert!(
@@ -3995,20 +4384,22 @@ mod tests {
 
     #[test]
     fn task_stop_rejects_non_string_reason() {
-        let id = BACKGROUND_AGENTS.register(AgentType::Plan, "reason type check");
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Plan, "reason type check")
+            .expect("register reason test agent");
         let args = HashMap::from([
             ("agent_id".to_string(), json!(id)),
             ("reason".to_string(), json!(42)),
         ]);
 
-        let (msg, is_err) = execute_task_stop_tool(&args);
+        let (msg, is_err) = execute_task_stop_tool(test_run(), &args);
 
         assert!(is_err, "non-string reason must error: {msg}");
         assert!(
             msg.contains("Invalid 'reason' argument: expected string"),
             "unexpected error: {msg}"
         );
-        let _ = BACKGROUND_AGENTS.remove(&id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &id);
     }
 
     #[test]
@@ -4027,7 +4418,7 @@ mod tests {
             args.insert("subagent_type".to_string(), json!("general-purpose"));
             args.insert("run_in_background".to_string(), json!(true));
 
-            let (msg, is_err) = execute_task_tool(&args, &app_config);
+            let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
             assert!(!is_err, "background task should start: {msg}");
             let agent_id = msg
                 .lines()
@@ -4038,7 +4429,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 loop {
                     if BACKGROUND_AGENTS
-                        .get(&agent_id)
+                        .get_for_run(test_run(), &agent_id)
                         .is_some_and(|agent| agent.finished.load(Ordering::SeqCst))
                     {
                         break;
@@ -4050,7 +4441,7 @@ mod tests {
             .expect("returned agent id must reach a terminal state");
 
             let agent = BACKGROUND_AGENTS
-                .get(&agent_id)
+                .get_for_run(test_run(), &agent_id)
                 .expect("returned id must remain the tracked agent");
             assert!(
                 agent.finished.load(Ordering::SeqCst),
@@ -4060,7 +4451,7 @@ mod tests {
                 agent.error.lock().unwrap().is_some(),
                 "invalid test provider should fail the returned id, not a hidden id"
             );
-            let _ = BACKGROUND_AGENTS.remove(&agent_id);
+            let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &agent_id);
         });
     }
 
@@ -4073,7 +4464,7 @@ mod tests {
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!("00000000-not-registered"));
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
         assert!(is_err, "unknown agent_id must be an error");
         assert!(
             msg.contains("not found"),
@@ -4081,17 +4472,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_output_and_task_stop_reject_foreign_run_ids() {
+        let owner = isolated_test_run("agent-lifecycle-owner");
+        let foreign = isolated_test_run("agent-lifecycle-foreign");
+
+        let finished_id = BACKGROUND_AGENTS
+            .register(&owner, AgentType::Explore, "owner output")
+            .expect("register output agent");
+        BACKGROUND_AGENTS.finish(&owner, &finished_id, "owner-only output".to_string());
+        let output_args = HashMap::from([("agent_id".to_string(), json!(finished_id))]);
+
+        let (foreign_output, foreign_output_error) =
+            execute_agent_output_tool(&foreign, &output_args);
+        assert!(foreign_output_error);
+        assert!(foreign_output.contains("not found"));
+        assert!(BACKGROUND_AGENTS
+            .get_for_run(&owner, &finished_id)
+            .is_some());
+
+        let (owner_output, owner_output_error) = execute_agent_output_tool(&owner, &output_args);
+        assert!(!owner_output_error);
+        assert!(owner_output.contains("owner-only output"));
+
+        let running_id = BACKGROUND_AGENTS
+            .register(&owner, AgentType::Plan, "owner cancellation")
+            .expect("register stoppable agent");
+        let stop_args = HashMap::from([("agent_id".to_string(), json!(running_id))]);
+        let (foreign_stop, foreign_stop_error) = execute_task_stop_tool(&foreign, &stop_args);
+        assert!(foreign_stop_error);
+        assert!(foreign_stop.contains("not found"));
+        assert!(BACKGROUND_AGENTS
+            .get_for_run(&owner, &running_id)
+            .is_some_and(|agent| !agent.finished.load(Ordering::SeqCst)));
+
+        let (owner_stop, owner_stop_error) = execute_task_stop_tool(&owner, &stop_args);
+        assert!(!owner_stop_error, "owner stop failed: {owner_stop}");
+        assert!(owner_stop.contains("stopped"));
+        let _ = BACKGROUND_AGENTS.remove_for_run(&owner, &running_id);
+    }
+
     /// Spec #527 §1 — `agent_output` for a finished agent returns the output text
     /// and `is_error = false`.
     #[test]
     fn spec1_agent_output_finished_agent_returns_result() {
-        let id = BACKGROUND_AGENTS.register(AgentType::Explore, "search task");
-        BACKGROUND_AGENTS.finish(&id, "Found 3 matches.".to_string());
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Explore, "search task")
+            .expect("register successful output test agent");
+        BACKGROUND_AGENTS.finish(test_run(), &id, "Found 3 matches.".to_string());
 
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!(id));
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
         assert!(!is_err, "finished agent must not be an error: {msg}");
         assert!(
             msg.contains("Found 3 matches."),
@@ -4104,13 +4537,15 @@ mod tests {
     /// and the error text.
     #[test]
     fn spec1_agent_output_failed_agent_returns_error() {
-        let id = BACKGROUND_AGENTS.register(AgentType::Plan, "failing task");
-        BACKGROUND_AGENTS.fail(&id, "tool denied".to_string());
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Plan, "failing task")
+            .expect("register failing output test agent");
+        BACKGROUND_AGENTS.fail(test_run(), &id, "tool denied".to_string());
 
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!(id));
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
         assert!(is_err, "failed agent must return is_error=true");
         assert!(msg.contains("tool denied"), "must include error: {msg}");
     }
@@ -4122,7 +4557,7 @@ mod tests {
     /// without sleeping in the test.
     #[test]
     fn issue422_gc_removes_finished_agents_past_ttl() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let stale_id = mgr.register(AgentType::Explore, "stale finished task");
         mgr.finish(&stale_id, "output".to_string());
 
@@ -4148,7 +4583,7 @@ mod tests {
     /// aggressive and drops live work.
     #[test]
     fn issue422_gc_keeps_in_progress_and_recently_finished_agents() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
 
         let running_id = mgr.register(AgentType::Plan, "still running");
         let recent_id = mgr.register(AgentType::Explore, "recently finished");
@@ -4183,39 +4618,43 @@ mod tests {
     #[test]
     fn issue422_agent_output_returns_result_then_removes_finished_entry() {
         // Success path: result text is returned, then the entry vanishes.
-        let ok_id = BACKGROUND_AGENTS.register(AgentType::Explore, "consume-on-read ok");
-        BACKGROUND_AGENTS.finish(&ok_id, "the answer is 42".to_string());
+        let ok_id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Explore, "consume-on-read ok")
+            .expect("register consume-on-read success agent");
+        BACKGROUND_AGENTS.finish(test_run(), &ok_id, "the answer is 42".to_string());
         assert!(
-            BACKGROUND_AGENTS.get(&ok_id).is_some(),
+            BACKGROUND_AGENTS.get_for_run(test_run(), &ok_id).is_some(),
             "agent must exist before retrieval"
         );
 
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!(ok_id));
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
         assert!(!is_err, "finished agent must not be an error: {msg}");
         assert!(
             msg.contains("the answer is 42"),
             "result must be returned to caller BEFORE removal: {msg}"
         );
         assert!(
-            BACKGROUND_AGENTS.get(&ok_id).is_none(),
+            BACKGROUND_AGENTS.get_for_run(test_run(), &ok_id).is_none(),
             "finished agent must be removed from the manager after agent_output reads it"
         );
 
         // Failure path: error text is returned, then the entry vanishes.
-        let err_id = BACKGROUND_AGENTS.register(AgentType::Plan, "consume-on-read fail");
-        BACKGROUND_AGENTS.fail(&err_id, "synthetic failure".to_string());
+        let err_id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Plan, "consume-on-read fail")
+            .expect("register consume-on-read failure agent");
+        BACKGROUND_AGENTS.fail(test_run(), &err_id, "synthetic failure".to_string());
         let mut args2: HashMap<String, Value> = HashMap::new();
         args2.insert("agent_id".to_string(), json!(err_id));
-        let (msg2, is_err2) = execute_agent_output_tool(&args2);
+        let (msg2, is_err2) = execute_agent_output_tool(test_run(), &args2);
         assert!(is_err2, "failed agent must return is_error=true");
         assert!(
             msg2.contains("synthetic failure"),
             "error text must be returned BEFORE removal: {msg2}"
         );
         assert!(
-            BACKGROUND_AGENTS.get(&err_id).is_none(),
+            BACKGROUND_AGENTS.get_for_run(test_run(), &err_id).is_none(),
             "failed agent must be removed from the manager after agent_output reads it"
         );
     }
@@ -4225,7 +4664,7 @@ mod tests {
     /// preserves any still-running ones.
     #[test]
     fn issue422_cleanup_finished_drops_finished_keeps_running() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let done_a = mgr.register(AgentType::Explore, "done a");
         let done_b = mgr.register(AgentType::Plan, "done b");
         let live = mgr.register(AgentType::GeneralPurpose, "still working");
@@ -4326,7 +4765,7 @@ mod tests {
         let mut args = issue719_args();
         args.insert("subagent_type".to_string(), json!("coordinator"));
 
-        let (msg, is_err) = execute_task_tool(&args, &app_config);
+        let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
         assert!(is_err, "coordinator must not be task-spawnable: {msg}");
         assert!(
             msg.contains("Unsupported task subagent_type 'coordinator'"),
@@ -4354,7 +4793,7 @@ mod tests {
             // shape that used to panic via `block_in_place`.
             let app_config = issue719_app_config();
             let args = issue719_args();
-            execute_task_tool(&args, &app_config)
+            execute_task_tool(test_run(), &args, &app_config)
         });
 
         assert!(
@@ -4386,7 +4825,7 @@ mod tests {
         let (msg, is_err) = rt.block_on(async {
             let app_config = issue719_app_config();
             let args = issue719_args();
-            execute_task_tool(&args, &app_config)
+            execute_task_tool(test_run(), &args, &app_config)
         });
 
         assert!(
@@ -4413,7 +4852,7 @@ mod tests {
         // hitting the `Runtime::new()` fallback.
         let app_config = issue719_app_config();
         let args = issue719_args();
-        let (msg, is_err) = execute_task_tool(&args, &app_config);
+        let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
 
         assert!(
             is_err,
@@ -4459,6 +4898,7 @@ mod tests {
             store.insert(
                 id,
                 StoredTranscript {
+                    owner_run: test_run().run_id(),
                     messages: vec![json!({"role": "user", "content": "x"})],
                     agent_type: AgentType::Explore,
                     // Stagger timestamps so #0 is unambiguously oldest.
@@ -4498,6 +4938,7 @@ mod tests {
             store.insert(
                 format!("agent-{i:03}"),
                 StoredTranscript {
+                    owner_run: test_run().run_id(),
                     messages: vec![json!({"role": "user", "content": "x"})],
                     agent_type: AgentType::Explore,
                     created_at: base + Duration::from_micros(i_u64),
@@ -4516,6 +4957,7 @@ mod tests {
         store.insert(
             "agent-new".to_string(),
             StoredTranscript {
+                owner_run: test_run().run_id(),
                 messages: vec![json!({"role": "assistant", "content": "new"})],
                 agent_type: AgentType::Plan,
                 created_at: base
@@ -4556,9 +4998,10 @@ mod tests {
             .map(|i| json!({"role": "user", "content": format!("msg {i}")}))
             .collect();
 
-        store_transcript(&id, big, AgentType::Plan);
+        store_transcript(test_run(), &id, big, AgentType::Plan);
 
-        let loaded = load_transcript(&id).expect("just-stored transcript must be loadable");
+        let loaded =
+            load_transcript(test_run(), &id).expect("just-stored transcript must be loadable");
         assert_eq!(
             loaded.0.len(),
             MAX_MESSAGES_PER_TRANSCRIPT,
@@ -4606,6 +5049,7 @@ mod tests {
         store.insert(
             "stale-a".to_string(),
             StoredTranscript {
+                owner_run: test_run().run_id(),
                 messages: vec![],
                 agent_type: AgentType::Explore,
                 created_at: past,
@@ -4614,6 +5058,7 @@ mod tests {
         store.insert(
             "stale-b".to_string(),
             StoredTranscript {
+                owner_run: test_run().run_id(),
                 messages: vec![],
                 agent_type: AgentType::Plan,
                 // Slightly older still; ordering breakup needs unique keys.
@@ -4625,6 +5070,7 @@ mod tests {
         store.insert(
             "fresh".to_string(),
             StoredTranscript {
+                owner_run: test_run().run_id(),
                 messages: vec![],
                 agent_type: AgentType::GeneralPurpose,
                 created_at: now,

@@ -274,6 +274,7 @@ pub trait McpTransport: Send + Sync {
 
 /// Stdio transport - communicates with MCP server via stdin/stdout
 pub struct StdioTransport {
+    run_context: Arc<crate::tools::ToolRunContext>,
     child: Arc<Mutex<Child>>,
     _process_registration: crate::tools::command::ActiveSandboxProcess,
     reader: Mutex<BufReader<tokio::process::ChildStdout>>,
@@ -343,8 +344,12 @@ impl StdioTransport {
     ///
     /// Returns `McpError::Transport` if the process cannot be spawned, or if
     /// stdout/stderr cannot be taken from the child.
-    pub fn spawn(command: &str, args: &[&str]) -> Result<Self, McpError> {
-        Self::spawn_with_env(command, args, &HashMap::new())
+    pub fn spawn(
+        run: &Arc<crate::tools::ToolRunContext>,
+        command: &str,
+        args: &[&str],
+    ) -> Result<Self, McpError> {
+        Self::spawn_with_env(run, command, args, &HashMap::new())
     }
 
     /// Spawn a new MCP server process with extra environment variables.
@@ -354,33 +359,21 @@ impl StdioTransport {
     /// Returns `McpError::Transport` if the process cannot be spawned, or if
     /// stdout/stderr cannot be taken from the child.
     pub fn spawn_with_env(
+        run: &Arc<crate::tools::ToolRunContext>,
         command: &str,
         args: &[&str],
         env: &HashMap<String, String>,
     ) -> Result<Self, McpError> {
-        let resolved_command = resolve_trusted_mcp_executable(command)?;
-        let sensitive_grants = mcp_sensitive_environment_grants()?;
-        for key in env.keys() {
-            if is_host_loader_environment(key) {
-                return Err(McpError::Transport(format!(
-                    "Refusing MCP environment variable '{key}' because it can alter the host \
-                     sandbox launcher's dynamic loader"
-                )));
-            }
-            if crate::tools::is_sensitive_env(key) && !sensitive_grants.contains(key) {
-                return Err(McpError::Transport(format!(
-                    "Refusing undeclared-sensitive MCP environment grant '{key}'. \
-                     The host operator must name it in OPENCLAUDIA_MCP_ENV_GRANTS."
-                )));
-            }
-        }
-        let security = crate::tools::security::current_context().map_err(McpError::Transport)?;
+        let resolved_command = resolve_trusted_mcp_executable(run, command)?;
+        validate_mcp_child_environment(run, env)?;
+        let process_run = derive_mcp_stdio_run(run, env)?;
         let sandbox_args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let command = crate::tools::sandboxed_process_command(
+            &process_run,
             crate::tools::SandboxProfile::McpStdio,
             resolved_command.as_os_str(),
             &sandbox_args,
-            security.working_directory(),
+            process_run.working_directory(),
         )
         .map_err(|error| {
             McpError::Transport(format!("MCP stdio sandbox is unavailable: {error}"))
@@ -395,21 +388,19 @@ impl StdioTransport {
         );
 
         let mut cmd = Command::from(command);
-        cmd.envs(
-            env.iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let mut child = cmd
             .spawn()
             .map_err(|e| McpError::Transport(format!("Failed to spawn process: {e}")))?;
-        let process_registration =
-            crate::tools::command::ActiveSandboxProcess::register(child.id().ok_or_else(|| {
+        let process_registration = crate::tools::command::ActiveSandboxProcess::register(
+            &process_run,
+            child.id().ok_or_else(|| {
                 McpError::Transport("Sandboxed MCP process has no process id".to_string())
-            })?);
+            })?,
+        );
 
         // Take stdout from the child once and wrap in a persistent BufReader
         let stdout = child
@@ -430,6 +421,7 @@ impl StdioTransport {
         let drain = spawn_stderr_drain(stderr, Arc::clone(&stderr_buf));
 
         Ok(Self {
+            run_context: process_run,
             child: Arc::new(Mutex::new(child)),
             _process_registration: process_registration,
             reader: Mutex::new(reader),
@@ -511,7 +503,7 @@ impl StdioTransport {
         };
 
         if let Some(id) = value.get("id").and_then(Value::as_u64) {
-            let response = build_client_feature_response(id, method);
+            let response = build_client_feature_response(&self.run_context, id, method);
             self.write_json_line(&response).await?;
         } else {
             debug!(method = %method, "Ignoring MCP server notification while awaiting response");
@@ -519,6 +511,62 @@ impl StdioTransport {
 
         Ok(true)
     }
+}
+
+fn derive_mcp_stdio_run(
+    parent: &Arc<crate::tools::ToolRunContext>,
+    extra_environment: &HashMap<String, String>,
+) -> Result<Arc<crate::tools::ToolRunContext>, McpError> {
+    parent
+        .require(crate::tools::ToolResource::Process)
+        .map_err(|error| McpError::Transport(error.to_string()))?;
+    let session_id = crate::state::SessionId::from_raw(parent.session_id()).map_err(|error| {
+        McpError::Transport(format!(
+            "Cannot bind MCP process to parent session: {error}"
+        ))
+    })?;
+    let is_parent_intrinsic_root = |root: &&PathBuf| {
+        root.as_path() == parent.project_root() || root.as_path() == parent.private_temp_root()
+    };
+    let read_only_roots = parent
+        .read_only_roots()
+        .iter()
+        .filter(|root| !is_parent_intrinsic_root(root))
+        .cloned()
+        .collect();
+    let read_write_roots = parent
+        .read_write_roots()
+        .iter()
+        .filter(|root| !is_parent_intrinsic_root(root))
+        .cloned()
+        .collect();
+    let mut environment_grants = parent.environment_grants().clone();
+    environment_grants.extend(extra_environment.clone());
+    let workspace_access = if parent.grants_resource(crate::tools::ToolResource::WorkspaceWrite) {
+        crate::tools::WorkspaceAccess::ReadWrite
+    } else {
+        crate::tools::WorkspaceAccess::ReadOnly
+    };
+
+    crate::tools::ToolRunContext::builder(session_id, parent.project_root())
+        .working_directory(parent.working_directory())
+        .read_only_roots(read_only_roots)
+        .read_write_roots(read_write_roots)
+        .project_secret_masks(parent.project_secret_masks().to_vec())
+        .environment_grants(environment_grants)
+        .mcp_environment_grants(parent.mcp_environment_grants().clone())
+        .executable_search_path(parent.executable_search_path())
+        .workspace_access(workspace_access)
+        .process(true)
+        .network(false)
+        .secrets(parent.grants_resource(crate::tools::ToolResource::Secrets))
+        .process_owner(parent.process_owner())
+        .actor_role(crate::runtime::ActorRole::Worker)
+        .provider("mcp-stdio")
+        .build()
+        .map_err(|error| {
+            McpError::Transport(format!("Cannot bind MCP stdio capabilities: {error}"))
+        })
 }
 
 fn is_host_loader_environment(key: &str) -> bool {
@@ -531,42 +579,56 @@ fn is_host_loader_environment(key: &str) -> bool {
         )
 }
 
-fn mcp_sensitive_environment_grants() -> Result<std::collections::HashSet<String>, McpError> {
-    let Some(raw) = std::env::var_os("OPENCLAUDIA_MCP_ENV_GRANTS") else {
-        return Ok(std::collections::HashSet::new());
-    };
-    let raw = raw.to_str().ok_or_else(|| {
-        McpError::Transport(
-            "OPENCLAUDIA_MCP_ENV_GRANTS contains non-Unicode data; MCP launch is blocked"
-                .to_string(),
-        )
-    })?;
-    raw.split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .try_fold(std::collections::HashSet::new(), |mut grants, name| {
-            let mut chars = name.chars();
-            let valid = chars
-                .next()
-                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
-            if !valid {
-                return Err(McpError::Transport(format!(
-                    "Invalid environment variable name in OPENCLAUDIA_MCP_ENV_GRANTS: '{name}'"
-                )));
+fn validate_mcp_child_environment(
+    run: &crate::tools::ToolRunContext,
+    environment: &HashMap<String, String>,
+) -> Result<(), McpError> {
+    for (key, value) in environment {
+        if is_host_loader_environment(key) {
+            return Err(McpError::Transport(format!(
+                "Refusing MCP environment variable '{key}' because it can alter the host \
+                 sandbox launcher's dynamic loader"
+            )));
+        }
+        if crate::tools::is_sensitive_env(key) {
+            run.require(crate::tools::ToolResource::Secrets)
+                .map_err(|error| {
+                    McpError::Transport(format!(
+                        "MCP secret environment grant '{key}' is unavailable: {error}"
+                    ))
+                })?;
+            match run.mcp_environment_grants().get(key) {
+                Some(granted) if granted == value => {}
+                Some(_) => {
+                    return Err(McpError::Transport(format!(
+                        "Refusing MCP secret environment grant '{key}' because its value does not \
+                         match the immutable run capability snapshot"
+                    )));
+                }
+                None => {
+                    return Err(McpError::Transport(format!(
+                        "Refusing undeclared-sensitive MCP environment grant '{key}'. The host \
+                         operator must name it in OPENCLAUDIA_MCP_ENV_GRANTS before the run starts."
+                    )));
+                }
             }
-            grants.insert(name.to_string());
-            Ok(grants)
-        })
+        }
+    }
+    Ok(())
 }
 
-fn resolve_trusted_mcp_executable(command: &str) -> Result<PathBuf, McpError> {
+fn resolve_trusted_mcp_executable(
+    run: &crate::tools::ToolRunContext,
+    command: &str,
+) -> Result<PathBuf, McpError> {
+    run.require(crate::tools::ToolResource::Process)
+        .map_err(|error| McpError::Transport(error.to_string()))?;
     let candidate = if Path::new(command).is_absolute() {
         PathBuf::from(command)
     } else {
-        which::which(command).map_err(|error| {
+        run.resolve_executable(command).map_err(|error| {
             McpError::Transport(format!(
-                "Cannot resolve MCP executable '{command}' from the host startup PATH: {error}"
+                "Cannot resolve MCP executable '{command}' from the run-bound startup PATH: {error}"
             ))
         })?
     };
@@ -588,8 +650,7 @@ fn resolve_trusted_mcp_executable(command: &str) -> Result<PathBuf, McpError> {
             resolved.display()
         )));
     }
-    let security = crate::tools::security::current_context().map_err(McpError::Transport)?;
-    if security
+    if run
         .read_write_roots()
         .iter()
         .any(|root| resolved == *root || resolved.starts_with(root))
@@ -633,13 +694,17 @@ fn verify_trusted_executable_ancestry(_path: &Path) -> Result<(), McpError> {
     ))
 }
 
-fn build_client_feature_response(id: u64, method: &str) -> Value {
+fn build_client_feature_response(
+    run: &crate::tools::ToolRunContext,
+    id: u64,
+    method: &str,
+) -> Value {
     match method {
         "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
         "roots/list" => json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": current_roots_result(),
+            "result": current_roots_result(run),
         }),
         "elicitation/create" => json!({
             "jsonrpc": "2.0",
@@ -657,10 +722,9 @@ fn build_client_feature_response(id: u64, method: &str) -> Value {
     }
 }
 
-fn current_roots_result() -> Value {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let root = cwd.canonicalize().unwrap_or(cwd);
-    let uri = url::Url::from_directory_path(&root).map_or_else(
+fn current_roots_result(run: &crate::tools::ToolRunContext) -> Value {
+    let root = run.project_root();
+    let uri = url::Url::from_directory_path(root).map_or_else(
         |()| format!("file://{}", root.display()),
         |url| url.to_string(),
     );
@@ -1804,12 +1868,15 @@ enum ConnectionSpec {
 }
 
 impl ConnectionSpec {
-    fn build_transport(&self) -> Result<Box<dyn McpTransport>, McpError> {
+    fn build_transport(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) -> Result<Box<dyn McpTransport>, McpError> {
         match self {
             Self::Stdio { command, args, env } => {
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
                 Ok(Box::new(StdioTransport::spawn_with_env(
-                    command, &argv, env,
+                    run, command, &argv, env,
                 )?))
             }
             Self::Http {
@@ -1818,8 +1885,13 @@ impl ConnectionSpec {
                 headers_helper,
                 server_name,
             } => {
-                let headers =
-                    resolve_http_headers(server_name, url, headers, headers_helper.as_deref())?;
+                let headers = resolve_http_headers(
+                    run,
+                    server_name,
+                    url,
+                    headers,
+                    headers_helper.as_deref(),
+                )?;
                 Ok(Box::new(HttpTransport::new_with_headers(url, &headers)?))
             }
         }
@@ -1827,6 +1899,7 @@ impl ConnectionSpec {
 }
 
 fn resolve_http_headers(
+    run: &Arc<crate::tools::ToolRunContext>,
     server_name: &str,
     url: &str,
     static_headers: &HashMap<String, String>,
@@ -1834,7 +1907,7 @@ fn resolve_http_headers(
 ) -> Result<HashMap<String, String>, McpError> {
     let mut headers = static_headers.clone();
     if let Some(helper) = headers_helper {
-        let dynamic = run_headers_helper(helper, server_name, url)?;
+        let dynamic = run_headers_helper(run, helper, server_name, url)?;
         merge_dynamic_headers(&mut headers, dynamic);
     }
     Ok(headers)
@@ -1854,6 +1927,7 @@ fn merge_dynamic_headers(headers: &mut HashMap<String, String>, dynamic: HashMap
 }
 
 fn run_headers_helper(
+    run: &Arc<crate::tools::ToolRunContext>,
     command: &str,
     server_name: &str,
     url: &str,
@@ -1872,14 +1946,14 @@ fn run_headers_helper(
     env.insert("CLAUDE_CODE_MCP_SERVER_URL".to_string(), url.to_string());
 
     let (program, args) = shell_command(command);
-    let program = resolve_trusted_mcp_executable(program)?;
+    let program = resolve_trusted_mcp_executable(run, program)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let security = crate::tools::security::current_context().map_err(McpError::Transport)?;
     let output = crate::tools::command::run_sandboxed_with_timeout_with_env(
+        run,
         crate::tools::SandboxProfile::McpStdio,
         &program,
         &arg_refs,
-        security.working_directory(),
+        run.working_directory(),
         HEADERS_HELPER_TIMEOUT,
         &env,
     )
@@ -2005,51 +2079,82 @@ impl ServerEntry {
 
 /// Manages multiple MCP server connections with self-healing reconnection (fix #629).
 pub struct McpManager {
+    run_context: Arc<crate::tools::ToolRunContext>,
     servers: Mutex<HashMap<String, ServerEntry>>,
 }
 
-/// Process-wide registry slot for the active MCP manager.
-///
-/// The full-screen TUI / proxy / acp entry points install a shared
-/// `Arc<RwLock<McpManager>>` here at startup; synchronous tool
-/// handlers (`list_mcp_resources`, `read_mcp_resource`, …) consult
-/// the slot via [`registered_manager`] and dispatch into the async
-/// manager by `Handle::current().block_on(...)`. That `block_on`
-/// only fires from inside a `spawn_blocking` thread (the runtime's
-/// dedicated blocking pool), so it does not deadlock the
-/// `flavor = "current_thread"` runtime.
-///
-/// Stored as `Option` so non-MCP entry points (CLI subcommands that
-/// never load MCP servers) can leave it unset; handlers report
-/// "no MCP servers connected" rather than panicking.
-static REGISTERED_MANAGER: std::sync::OnceLock<std::sync::Arc<tokio::sync::RwLock<McpManager>>> =
-    std::sync::OnceLock::new();
+/// Exact run-keyed index used by synchronous registry handlers to find the
+/// async manager composed for their own run. Weak values keep this index from
+/// extending a manager or its child-process lifetime after its frontend exits.
+type RegisteredMcpManagers =
+    HashMap<(String, u64), std::sync::Weak<tokio::sync::RwLock<McpManager>>>;
 
-/// Install the process-wide MCP manager.
-///
-/// Idempotent — the first installer wins, subsequent calls are
-/// silently ignored. Returns `true` on the install-this-call path,
-/// `false` otherwise, so callers can log a one-time warning if they
-/// are racing for the slot.
-pub fn install_manager(mgr: std::sync::Arc<tokio::sync::RwLock<McpManager>>) -> bool {
-    REGISTERED_MANAGER.set(mgr).is_ok()
+static REGISTERED_MANAGERS: LazyLock<std::sync::Mutex<RegisteredMcpManagers>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn manager_key(run: &crate::tools::ToolRunContext) -> (String, u64) {
+    (run.run_id().to_string(), run.generation().get())
 }
 
-/// Fetch the process-wide MCP manager, if one has been installed via
-/// [`install_manager`]. Returns `None` from contexts that never
-/// initialised MCP (the docs / config / read-only subcommands).
+/// Install a manager for one exact run generation. A live manager already
+/// registered for the same run wins; unrelated runs occupy independent slots.
+pub fn install_manager(
+    run: &crate::tools::ToolRunContext,
+    manager: &Arc<tokio::sync::RwLock<McpManager>>,
+) -> bool {
+    let mut registry = REGISTERED_MANAGERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.retain(|_, manager| manager.strong_count() > 0);
+    let key = manager_key(run);
+    if registry
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade)
+        .is_some()
+    {
+        return false;
+    }
+    registry.insert(key, Arc::downgrade(manager));
+    true
+}
+
+/// Fetch only the manager bound to `run`'s exact identity and generation.
 #[must_use]
-pub fn registered_manager() -> Option<&'static std::sync::Arc<tokio::sync::RwLock<McpManager>>> {
-    REGISTERED_MANAGER.get()
+pub fn registered_manager(
+    run: &crate::tools::ToolRunContext,
+) -> Option<Arc<tokio::sync::RwLock<McpManager>>> {
+    let mut registry = REGISTERED_MANAGERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = manager_key(run);
+    let manager = registry.get(&key).and_then(std::sync::Weak::upgrade);
+    if manager.is_none() {
+        registry.remove(&key);
+    }
+    manager
 }
 
 impl McpManager {
     /// Create a new MCP manager
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(run_context: Arc<crate::tools::ToolRunContext>) -> Self {
         Self {
+            run_context,
             servers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether this manager is bound to the exact caller run generation.
+    #[must_use]
+    pub fn matches_run(&self, run: &crate::tools::ToolRunContext) -> bool {
+        self.run_context.run_id() == run.run_id()
+            && self.run_context.generation() == run.generation()
+    }
+
+    /// Exact immutable run that owns this manager and its transports.
+    #[must_use]
+    pub fn run_context(&self) -> &crate::tools::ToolRunContext {
+        &self.run_context
     }
 
     /// Connect to an MCP server via stdio.
@@ -2102,7 +2207,7 @@ impl McpManager {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             env: env.clone(),
         };
-        let transport = spec.build_transport()?;
+        let transport = spec.build_transport(&self.run_context)?;
         let server = McpServer::new(name, transport).await?;
         let entry = ServerEntry::new_with_tool_timeout(spec, server, tool_timeout);
         self.servers.lock().await.insert(name.to_string(), entry);
@@ -2168,13 +2273,16 @@ impl McpManager {
         headers_helper: Option<&str>,
         tool_timeout: Option<Duration>,
     ) -> Result<(), McpError> {
+        self.run_context
+            .require(crate::tools::ToolResource::Network)
+            .map_err(|error| McpError::Transport(error.to_string()))?;
         let spec = ConnectionSpec::Http {
             url: url.to_string(),
             headers: headers.clone(),
             headers_helper: headers_helper.map(str::to_string),
             server_name: name.to_string(),
         };
-        let transport = spec.build_transport()?;
+        let transport = spec.build_transport(&self.run_context)?;
         let server = McpServer::new(name, transport).await?;
         let entry = ServerEntry::new_with_tool_timeout(spec, server, tool_timeout);
         self.servers.lock().await.insert(name.to_string(), entry);
@@ -2249,7 +2357,11 @@ impl McpManager {
 
     /// Attempt to reconnect a disconnected entry in-place (fix #629).
     /// Caller holds the manager mutex.
-    async fn ensure_connected(entry: &mut ServerEntry, name: &str) -> Result<(), McpError> {
+    async fn ensure_connected(
+        run: &Arc<crate::tools::ToolRunContext>,
+        entry: &mut ServerEntry,
+        name: &str,
+    ) -> Result<(), McpError> {
         if entry.server.is_some() {
             return Ok(());
         }
@@ -2267,7 +2379,7 @@ impl McpManager {
             "Attempting MCP server reconnect"
         );
 
-        let attempt_result = match entry.spec.build_transport() {
+        let attempt_result = match entry.spec.build_transport(run) {
             Ok(transport) => McpServer::new(name, transport).await,
             Err(e) => Err(e),
         };
@@ -2331,7 +2443,7 @@ impl McpManager {
             .get_mut(server_name)
             .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
 
-        Self::ensure_connected(entry, server_name).await?;
+        Self::ensure_connected(&self.run_context, entry, server_name).await?;
         // `ensure_connected` returned Ok ⇒ `entry.server` is Some. Use
         // a `let-else` rather than `.expect(_)` so this function does
         // not advertise a `# Panics` contract; the unreachable arm
@@ -2414,7 +2526,7 @@ impl McpManager {
             let entry = guard
                 .get_mut(name)
                 .ok_or_else(|| McpError::NotConnected(name.to_string()))?;
-            Self::ensure_connected(entry, name).await?;
+            Self::ensure_connected(&self.run_context, entry, name).await?;
             // `let-else` rather than `.expect(_)` — the unreachable
             // arm collapses to `ServerUnreachable`, matching the
             // budget-exhausted error surface.
@@ -2441,7 +2553,10 @@ impl McpManager {
                 let Some(entry) = guard.get_mut(&n) else {
                     continue;
                 };
-                if Self::ensure_connected(entry, &n).await.is_err() {
+                if Self::ensure_connected(&self.run_context, entry, &n)
+                    .await
+                    .is_err()
+                {
                     continue;
                 }
                 let Some(server) = entry.server.as_ref() else {
@@ -2479,7 +2594,7 @@ impl McpManager {
         let entry = guard
             .get_mut(server_name)
             .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
-        Self::ensure_connected(entry, server_name).await?;
+        Self::ensure_connected(&self.run_context, entry, server_name).await?;
         // `let-else` rather than `.expect(_)` — the unreachable arm
         // collapses to `ServerUnreachable`, matching the budget-
         // exhausted error surface.
@@ -2546,15 +2661,13 @@ impl McpManager {
     }
 }
 
-impl Default for McpManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_run() -> &'static Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     #[test]
     fn test_mcp_tool_serialization() {
@@ -2577,14 +2690,117 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_new() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         assert_eq!(manager.server_count().await, 0);
+    }
+
+    #[test]
+    fn registered_managers_are_exact_run_scoped_and_do_not_extend_lifetime() {
+        let first_root = tempfile::tempdir_in(".").expect("first MCP registry root");
+        let second_root = tempfile::tempdir_in(".").expect("second MCP registry root");
+        let first = crate::tools::security::test_run_context_for(first_root.path());
+        let second = crate::tools::security::test_run_context_for(second_root.path());
+        let first_manager = Arc::new(tokio::sync::RwLock::new(McpManager::new(Arc::clone(
+            &first,
+        ))));
+        let second_manager = Arc::new(tokio::sync::RwLock::new(McpManager::new(Arc::clone(
+            &second,
+        ))));
+
+        assert!(registered_manager(&first).is_none());
+        assert!(registered_manager(&second).is_none());
+        assert!(install_manager(&first, &first_manager));
+        assert!(!install_manager(&first, &first_manager));
+        assert!(
+            Arc::ptr_eq(
+                &registered_manager(&first).expect("first exact manager"),
+                &first_manager,
+            ),
+            "the first run must resolve only its own manager"
+        );
+        assert!(registered_manager(&second).is_none());
+        assert!(install_manager(&second, &second_manager));
+        assert!(Arc::ptr_eq(
+            &registered_manager(&second).expect("second exact manager"),
+            &second_manager,
+        ));
+
+        drop(first_manager);
+        assert!(
+            registered_manager(&first).is_none(),
+            "the run index must not retain a manager after its frontend exits"
+        );
+        assert!(registered_manager(&second).is_some());
+    }
+
+    #[test]
+    fn mcp_stdio_environment_is_bound_to_a_derived_run_generation() {
+        let parent = test_run();
+        let child = derive_mcp_stdio_run(
+            parent,
+            &HashMap::from([("S019_MCP_ENV".to_string(), "exact".to_string())]),
+        )
+        .expect("derive MCP stdio run");
+
+        assert_ne!(child.run_id(), parent.run_id());
+        assert_ne!(child.generation(), parent.generation());
+        assert_eq!(child.session_id(), parent.session_id());
+        assert_eq!(child.project_root(), parent.project_root());
+        assert_eq!(
+            child.environment_grants().get("S019_MCP_ENV"),
+            Some(&"exact".to_string())
+        );
+        assert!(!parent.environment_grants().contains_key("S019_MCP_ENV"));
+        assert_ne!(
+            child.runtime().descriptor().capabilities.manifest_digest,
+            parent.runtime().descriptor().capabilities.manifest_digest
+        );
+        assert!(child.require(crate::tools::ToolResource::Process).is_ok());
+        assert!(child.require(crate::tools::ToolResource::Network).is_err());
+    }
+
+    #[test]
+    fn mcp_secret_environment_validation_uses_only_the_run_snapshot() {
+        let root = tempfile::tempdir_in(".").expect("MCP secret root");
+        let key = "SERVICE_API_KEY";
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .mcp_environment_grants(HashMap::from([(key.to_string(), "captured".to_string())]))
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .process(true)
+                .network(false)
+                .secrets(true)
+                .provider("mcp-secret-snapshot-test")
+                .build()
+                .expect("secret-authorized MCP run");
+
+        validate_mcp_child_environment(
+            &run,
+            &HashMap::from([(key.to_string(), "captured".to_string())]),
+        )
+        .expect("exact captured value is authorized");
+        let mismatch = validate_mcp_child_environment(
+            &run,
+            &HashMap::from([(key.to_string(), "changed".to_string())]),
+        )
+        .expect_err("a later value cannot replace the run snapshot");
+        assert!(mismatch.to_string().contains("immutable run capability"));
+
+        let missing = validate_mcp_child_environment(
+            test_run(),
+            &HashMap::from([(key.to_string(), "captured".to_string())]),
+        )
+        .expect_err("an unrelated run cannot borrow the secret grant");
+        assert!(missing.to_string().contains("before the run starts"));
     }
 
     #[tokio::test]
     async fn test_tools_as_openai_functions() {
         // This would require a mock server, so just test the format
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         let functions = manager.tools_as_openai_functions().await;
         assert!(functions.is_empty());
     }
@@ -2650,8 +2866,13 @@ mod tests {
             "printf '{\"X-Server\":\"%s\",\"X-Url\":\"%s\"}' ",
             "\"$CLAUDE_CODE_MCP_SERVER_NAME\" \"$CLAUDE_CODE_MCP_SERVER_URL\""
         );
-        let headers =
-            run_headers_helper(command, "internal-api", "https://mcp.example.test/mcp").unwrap();
+        let headers = run_headers_helper(
+            test_run(),
+            command,
+            "internal-api",
+            "https://mcp.example.test/mcp",
+        )
+        .unwrap();
 
         assert_eq!(
             headers.get("X-Server").map(String::as_str),
@@ -2673,6 +2894,7 @@ mod tests {
         let command = "printf '{\"authorization\":\"Bearer dynamic\",\"X-Helper\":\"added\"}'";
 
         let headers = resolve_http_headers(
+            test_run(),
             "internal-api",
             "https://mcp.example.test/mcp",
             &static_headers,
@@ -2767,7 +2989,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_call_tool_invalid_format() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
 
         // Test with no delimiters
         let result = manager.call_tool("invalidtool", json!({})).await;
@@ -2784,7 +3006,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_call_tool_not_connected() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
 
         // Test with valid mcp__server__tool format but server not connected
         let result = manager.call_tool("mcp__server__tool", json!({})).await;
@@ -2793,7 +3015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_call_tool_underscored_server_name() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
 
         // Server names with underscores should parse correctly
         let result = manager
@@ -2808,7 +3030,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_call_tool_with_timeout() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
 
         // Test timeout (will fail because no server, but exercises the code path)
         let result = manager
@@ -2820,19 +3042,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_is_connected() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         assert!(!manager.is_connected("nonexistent").await);
     }
 
     #[tokio::test]
     async fn test_mcp_manager_get_server_info() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         assert!(manager.get_server_info("nonexistent").await.is_none());
     }
 
     #[tokio::test]
     async fn test_mcp_manager_disconnect_nonexistent() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         // Should not error when disconnecting non-existent server
         let result = manager.disconnect("nonexistent").await;
         assert!(result.is_ok());
@@ -2840,7 +3062,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_disconnect_all_empty() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         let result = manager.disconnect_all().await;
         assert!(result.is_ok());
     }
@@ -2884,21 +3106,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_list_resources_empty() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         let resources = manager.list_resources(None).await.unwrap();
         assert!(resources.is_empty());
     }
 
     #[tokio::test]
     async fn test_mcp_manager_list_resources_server_not_connected() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         let result = manager.list_resources(Some("nonexistent")).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_mcp_manager_read_resource_not_connected() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         let result = manager.read_resource("nonexistent", "file:///test").await;
         assert!(result.is_err());
     }
@@ -2915,11 +3137,11 @@ mod tests {
     // on `write(2)`. Both scenarios now complete deterministically.
 
     fn spawn_sh(script: &str) -> Result<StdioTransport, McpError> {
-        StdioTransport::spawn("sh", &["-c", script])
+        StdioTransport::spawn(test_run(), "sh", &["-c", script])
     }
 
     fn spawn_python(script: &str) -> Result<StdioTransport, McpError> {
-        StdioTransport::spawn("python3", &["-u", "-c", script])
+        StdioTransport::spawn(test_run(), "python3", &["-u", "-c", script])
     }
 
     /// Fix #445 point 1: a server that writes >64 KiB to stderr does NOT
@@ -3583,7 +3805,7 @@ sys.stdout.flush()
     /// inside the transport in isolation.
     #[tokio::test]
     async fn fix677_connect_http_propagates_ssrf_rejection() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         let result = manager.connect_http("evil", "http://127.0.0.1:1/").await;
         let Err(err) = result else {
             panic!("connect_http with loopback must be rejected by SSRF guard");
@@ -3667,7 +3889,7 @@ sys.stdout.flush()
     /// stayed live forever; post-fix `is_live` flips to false.
     #[tokio::test]
     async fn fix629_transport_error_marks_disconnected() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         // Manually plant a ServerEntry whose underlying transport
         // returns Ok for the handshake then a Transport error on the
         // tools/call. We bypass connect_stdio/connect_http because
@@ -3717,7 +3939,7 @@ sys.stdout.flush()
     /// schedule). The state machine is the load-bearing piece.
     #[tokio::test]
     async fn fix629_max_retries_returns_server_unreachable() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         // Plant an entry already in the exhausted state.
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
@@ -3756,7 +3978,7 @@ sys.stdout.flush()
     /// without bumping `failed_attempts` (it's not an attempt yet).
     #[tokio::test]
     async fn fix629_backoff_window_blocks_reconnect_before_elapsed() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
             args: vec![],
@@ -3816,7 +4038,7 @@ sys.stdout.flush()
     /// post-reconnect state machine resumes operation.
     #[tokio::test]
     async fn fix629_reconnect_attempts_then_resumes() {
-        let manager = McpManager::new();
+        let manager = McpManager::new(Arc::clone(test_run()));
 
         // Phase 1: drive three reconnect failures. We use a stdio
         // ConnectionSpec pointing at a definitely-missing command;
@@ -3846,17 +4068,17 @@ sys.stdout.flush()
         // failure (not yet ServerUnreachable).
         let mut guard = manager.servers.lock().await;
         let entry = guard.get_mut("flaky").expect("present");
-        let r1 = McpManager::ensure_connected(entry, "flaky").await;
+        let r1 = McpManager::ensure_connected(test_run(), entry, "flaky").await;
         assert!(r1.is_err(), "reconnect #1 must fail");
         assert_eq!(entry.failed_attempts, 1);
         // Manually reset last_failure so the next ensure_connected
         // sees the backoff as elapsed without sleeping 1 s.
         entry.last_failure = None;
-        let r2 = McpManager::ensure_connected(entry, "flaky").await;
+        let r2 = McpManager::ensure_connected(test_run(), entry, "flaky").await;
         assert!(r2.is_err(), "reconnect #2 must fail");
         assert_eq!(entry.failed_attempts, 2);
         entry.last_failure = None;
-        let r3 = McpManager::ensure_connected(entry, "flaky").await;
+        let r3 = McpManager::ensure_connected(test_run(), entry, "flaky").await;
         // Third failure exhausts the budget.
         assert!(
             matches!(r3, Err(McpError::ServerUnreachable(ref n)) if n == "flaky"),
@@ -4220,6 +4442,7 @@ sys.stdout.flush()
     async fn fix732_concurrent_out_of_order_server_replies_correlate() {
         let transport = Arc::new(
             StdioTransport::spawn(
+                test_run(),
                 "bash",
                 &[
                     "-c",

@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 /// Hard cap on file size accepted by all read functions.  Prevents OOM via
 /// `/dev/zero` and similar unbounded sources.  10 MiB is generous for any
@@ -16,27 +15,22 @@ pub(super) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 /// at the next line boundary kicks in. crosslink #939.
 const READ_TEXT_BUDGET: usize = 100_000;
 
-static PDFTOTEXT_BIN: LazyLock<Result<PathBuf, String>> = LazyLock::new(|| {
-    which::which("pdftotext").map_err(|_| {
-        "pdftotext is not installed. Install it with:\n  \
-         Ubuntu/Debian: sudo apt install poppler-utils\n  \
-         macOS: brew install poppler\n  \
-         Fedora: sudo dnf install poppler-utils"
-            .to_string()
-    })
-});
-
-static PDFINFO_BIN: LazyLock<Option<PathBuf>> = LazyLock::new(|| which::which("pdfinfo").ok());
-
-fn pdftotext_bin() -> Result<&'static Path, String> {
-    match &*PDFTOTEXT_BIN {
-        Ok(path) => Ok(path.as_path()),
-        Err(msg) => Err(msg.clone()),
-    }
+fn pdftotext_bin(run: &super::super::security::ToolRunContext) -> Result<PathBuf, String> {
+    run.resolve_executable("pdftotext")
+        .map_err(|error| match error {
+            capability @ crate::tools::ToolExecutableError::Capability(_) => capability.to_string(),
+            crate::tools::ToolExecutableError::Resolve { .. } => {
+                "pdftotext is not installed on the run-bound PATH. Install it with:\n  \
+                 Ubuntu/Debian: sudo apt install poppler-utils\n  \
+                 macOS: brew install poppler\n  \
+                 Fedora: sudo dnf install poppler-utils"
+                    .to_string()
+            }
+        })
 }
 
-fn pdfinfo_bin() -> Option<&'static Path> {
-    (*PDFINFO_BIN).as_deref()
+fn pdfinfo_bin(run: &super::super::security::ToolRunContext) -> Option<PathBuf> {
+    run.resolve_executable("pdfinfo").ok()
 }
 
 /// Return `(error_message, is_error=true)` if an already-confined open handle
@@ -73,8 +67,11 @@ fn check_file_safety(file: &std::fs::File, path: &str) -> Option<(String, bool)>
     None
 }
 
-fn open_safe_read(path: &str) -> Result<std::fs::File, (String, bool)> {
-    let file = super::secure_fs::open_regular_read(Path::new(path)).map_err(|error| {
+fn open_safe_read(
+    run: &super::super::security::ToolRunContext,
+    path: &str,
+) -> Result<std::fs::File, (String, bool)> {
+    let file = super::secure_fs::open_regular_read(run, Path::new(path)).map_err(|error| {
         (
             format!("Failed to securely open file '{path}': {error}"),
             true,
@@ -86,8 +83,11 @@ fn open_safe_read(path: &str) -> Result<std::fs::File, (String, bool)> {
     Ok(file)
 }
 
-fn read_safe_bytes(path: &str) -> Result<Vec<u8>, (String, bool)> {
-    let file = open_safe_read(path)?;
+fn read_safe_bytes(
+    run: &super::super::security::ToolRunContext,
+    path: &str,
+) -> Result<Vec<u8>, (String, bool)> {
+    let file = open_safe_read(run, path)?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE_SIZE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -182,8 +182,12 @@ pub fn detect_file_type(path: &str) -> FileType {
 /// The image kind is carried by the typed [`ImageKind`] enum (crosslink #966)
 /// rather than as a raw MIME-type `&str`, so callers can no longer fabricate a
 /// nonsense MIME like `"image/whatever"` at the call site.
-pub fn read_image_file(path: &str, kind: ImageKind) -> (String, bool) {
-    let bytes = match read_safe_bytes(path) {
+pub fn read_image_file(
+    run: &super::super::security::ToolRunContext,
+    path: &str,
+    kind: ImageKind,
+) -> (String, bool) {
+    let bytes = match read_safe_bytes(run, path) {
         Ok(bytes) => bytes,
         Err(error) => return error,
     };
@@ -292,30 +296,32 @@ const PDF_TIMEOUT_SECS: u64 = 30;
 ///
 /// # Locale dependency
 ///
-/// `pdftotext` honours the inherited `LANG` / `LC_*` environment when
-/// guessing the default text encoding. A user-facing surprise is that
-/// running `OpenClaudia` under `LC_ALL=C` yields ASCII-only output even
-/// for UTF-8 PDFs; setting `LC_ALL=en_US.UTF-8` (or any UTF-8 locale)
-/// restores fidelity. This is documented here so callers can mention
-/// it in PDF-related troubleshooting.
-pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
+/// `pdftotext` sees only locale variables explicitly captured in the run's
+/// environment grants. It never inherits the process environment at spawn.
+/// Operators that need a specific encoding should grant the corresponding
+/// `LANG`/`LC_*` value when constructing the top-level run.
+pub fn read_pdf_file(
+    run: &super::super::security::ToolRunContext,
+    path: &str,
+    pages: Option<&str>,
+) -> (String, bool) {
     // Reject any path the subprocess would parse as a flag BEFORE we spawn.
     if let Some(err) = reject_flag_prefix(path) {
         return (err, true);
     }
 
-    let pdftotext = match pdftotext_bin() {
+    let pdftotext = match pdftotext_bin(run) {
         Ok(path) => path,
         Err(msg) => return (msg, true),
     };
-    let project_root = match super::project_root() {
+    let project_root = match super::project_root(run) {
         Ok(root) => root,
         Err(message) => return (message, true),
     };
     // Feed the parser bytes read from the already-confined descriptor. Passing
     // the original pathname would let a concurrent rename swap the parser's
     // input after authorization.
-    let pdf_bytes = match read_safe_bytes(path) {
+    let pdf_bytes = match read_safe_bytes(run, path) {
         Ok(bytes) => bytes,
         Err(error) => return error,
     };
@@ -327,9 +333,10 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
         // `--` terminates options so a hostile filename cannot be parsed as a flag
         // (defence-in-depth alongside reject_flag_prefix above).
         let info_args = ["--", "-"];
-        if let Some(pdfinfo) = pdfinfo_bin() {
+        if let Some(pdfinfo) = pdfinfo_bin(run) {
             if let Ok(info) = crate::tools::command::run_sandboxed_with_timeout_with_input(
-                pdfinfo,
+                run,
+                &pdfinfo,
                 &info_args,
                 &project_root,
                 timeout,
@@ -382,7 +389,8 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
 
     match crate::tools::command::run_sandboxed_with_timeout_with_input(
-        pdftotext,
+        run,
+        &pdftotext,
         &argv_refs,
         &project_root,
         timeout,
@@ -505,8 +513,11 @@ fn render_cell_outputs(output: &mut String, outputs: &[Value]) {
 }
 
 /// Read a Jupyter notebook (.ipynb) and format cells for display
-pub fn read_notebook_file(path: &str) -> (String, bool) {
-    let mut file = match open_safe_read(path) {
+pub fn read_notebook_file(
+    run: &super::super::security::ToolRunContext,
+    path: &str,
+) -> (String, bool) {
+    let mut file = match open_safe_read(run, path) {
         Ok(file) => file,
         Err(error) => return error,
     };
@@ -559,7 +570,11 @@ pub fn read_notebook_file(path: &str) -> (String, bool) {
     (output, false)
 }
 /// Read a plain text file with optional offset/limit
-pub fn read_text_file(path: &str, args: &HashMap<String, Value>) -> (String, bool) {
+pub fn read_text_file(
+    run: &super::super::security::ToolRunContext,
+    path: &str,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     // Get optional offset (1-indexed line number to start from)
     let offset = match parse_read_offset_arg(args.get("offset")) {
         Ok(offset) => offset,
@@ -572,7 +587,7 @@ pub fn read_text_file(path: &str, args: &HashMap<String, Value>) -> (String, boo
         Err(msg) => return (msg, true),
     };
 
-    let mut file = match open_safe_read(path) {
+    let mut file = match open_safe_read(run, path) {
         Ok(file) => file,
         Err(error) => return error,
     };
@@ -681,6 +696,10 @@ mod tests {
     use std::io::Write as _;
     use tempfile::NamedTempFile;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     // =========================================================================
     // Behavior 1: read_text_file offset + limit — 1-indexed line slice
     // =========================================================================
@@ -712,8 +731,8 @@ mod tests {
             "production PDF reader must pass resolved Poppler binary paths to run_with_timeout"
         );
         assert!(
-            production.contains("which::which(\"pdftotext\")"),
-            "pdftotext availability must use the Rust resolver"
+            production.contains("run.resolve_executable(\"pdftotext\")"),
+            "pdftotext availability must use the run-bound resolver"
         );
     }
 
@@ -722,7 +741,7 @@ mod tests {
         // Behavior 1: without offset/limit every line is returned
         let (_f, path) = tmp_text("alpha\nbeta\ngamma\n");
         let args = HashMap::new();
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(!is_err);
         assert!(output.contains("alpha"));
         assert!(output.contains("beta"));
@@ -740,7 +759,7 @@ mod tests {
         let (_f, path) = tmp_text("first\nsecond\nthird\n");
         let mut args = HashMap::new();
         args.insert("offset".to_string(), serde_json::json!(1u64));
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(!is_err);
         assert!(output.contains("first"), "offset=1 must include line 1");
     }
@@ -752,7 +771,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("offset".to_string(), serde_json::json!(2u64));
         args.insert("limit".to_string(), serde_json::json!(1u64));
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(!is_err);
         assert!(output.contains("line2"), "must include line 2");
         assert!(!output.contains("line1"), "must not include line 1");
@@ -768,7 +787,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("offset".to_string(), serde_json::json!(2u64));
         args.insert("limit".to_string(), serde_json::json!(2u64));
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(!is_err);
         // Line 2 ("bbb") must be labeled with "2|" and line 3 with "3|"
         assert!(output.contains("2|"), "line 2 label present: {output}");
@@ -784,7 +803,7 @@ mod tests {
         let (_f, path) = tmp_text("alpha\nbeta\n");
         let mut args = HashMap::new();
         args.insert("offset".to_string(), serde_json::json!(0u64));
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(is_err);
         assert!(
             output.contains("offset") && output.contains("1-indexed"),
@@ -798,7 +817,7 @@ mod tests {
         let (_f, path) = tmp_text("one\ntwo\n");
         let mut args = HashMap::new();
         args.insert("offset".to_string(), serde_json::json!(99u64));
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(!is_err, "not an error — just empty content");
         // The body before the suffix is empty; suffix shows 0 selected lines.
         // OC does NOT emit a "file has fewer lines" warning here (CC does).
@@ -815,7 +834,7 @@ mod tests {
         let (_f, path) = tmp_text("data\n");
         let mut args = HashMap::new();
         args.insert("limit".to_string(), serde_json::json!(0u64));
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(is_err);
         assert!(
             output.contains("limit") && output.contains("positive"),
@@ -831,7 +850,7 @@ mod tests {
             .expect("cwd")
             .join("__oc_test_does_not_exist_xyz.txt");
         let args = HashMap::new();
-        let (output, is_err) = read_text_file(&path.to_string_lossy(), &args);
+        let (output, is_err) = read_text_file(test_run(), &path.to_string_lossy(), &args);
         assert!(is_err);
         assert!(
             output.contains("does not exist") || output.contains("securely open"),
@@ -862,7 +881,7 @@ mod tests {
         ];
         f.write_all(minimal_png).expect("write png");
         let path = f.path().to_string_lossy().to_string();
-        let (output, is_err) = read_image_file(&path, ImageKind::Png);
+        let (output, is_err) = read_image_file(test_run(), &path, ImageKind::Png);
         assert!(!is_err);
         assert!(output.contains("[Image:"), "header line present: {output}");
         assert!(output.contains("image/png"), "mime type present");
@@ -879,7 +898,7 @@ mod tests {
         let f = NamedTempFile::new_in(".").expect("tempfile");
         // Write nothing — file is 0 bytes
         let path = f.path().to_string_lossy().to_string();
-        let (output, is_err) = read_image_file(&path, ImageKind::Png);
+        let (output, is_err) = read_image_file(test_run(), &path, ImageKind::Png);
         assert!(is_err, "0-byte image must be a structured error: {output}");
         assert!(
             output.contains("empty") && output.contains("0 bytes"),
@@ -892,7 +911,7 @@ mod tests {
         let path = std::env::current_dir()
             .expect("cwd")
             .join("__oc_no_such_image.png");
-        let (output, is_err) = read_image_file(&path.to_string_lossy(), ImageKind::Png);
+        let (output, is_err) = read_image_file(test_run(), &path.to_string_lossy(), ImageKind::Png);
         assert!(is_err);
         assert!(
             output.contains("does not exist") || output.contains("securely open"),
@@ -963,7 +982,7 @@ mod tests {
         f.write_all(content.as_bytes()).expect("write");
         let path = f.path().to_string_lossy().to_string();
         let args = HashMap::new();
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(
             !is_err,
             "truncation is not an error — the sentinel signals it: {output}"
@@ -990,7 +1009,7 @@ mod tests {
         // Behavior 8: files under the 100 000-char cap are returned in full
         let (_f, path) = tmp_text("short line\n");
         let args = HashMap::new();
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(!is_err);
         assert!(
             !output.contains("file truncated"),
@@ -1018,7 +1037,7 @@ mod tests {
         let size = (10 * 1024 * 1024) + 1; // 1 byte over the cap
         let (_f, path) = tmp_sized(size);
         let args = HashMap::new();
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(is_err, "oversized file must be an error: {output}");
         assert!(
             output.contains("too large"),
@@ -1032,7 +1051,7 @@ mod tests {
         // without any error or spurious truncation note.
         let (_f, path) = tmp_text("hello world\n");
         let args = HashMap::new();
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(!is_err, "small file must succeed: {output}");
         assert!(output.contains("hello world"), "content present: {output}");
     }
@@ -1044,7 +1063,7 @@ mod tests {
         let f = NamedTempFile::new_in(".").expect("tempfile");
         let path = f.path().to_string_lossy().to_string();
         let args = HashMap::new();
-        let (output, is_err) = read_text_file(&path, &args);
+        let (output, is_err) = read_text_file(test_run(), &path, &args);
         assert!(!is_err, "empty file must not be an error: {output}");
     }
 
@@ -1054,7 +1073,7 @@ mod tests {
         // Devices are never session file capabilities. The outer capability
         // check should reject /dev before the implementation can open it.
         let args = HashMap::new();
-        let (output, is_err) = read_text_file("/dev/null", &args);
+        let (output, is_err) = read_text_file(test_run(), "/dev/null", &args);
         assert!(is_err, "/dev/null (char device) must be rejected: {output}");
         assert!(
             output.contains("outside the session") || output.contains("not a regular file"),
@@ -1135,7 +1154,7 @@ mod tests {
         // Layer 1 end-to-end: read_pdf_file must surface the rejection BEFORE
         // any subprocess is spawned (so the test does not depend on poppler
         // being installed). A leading-hyphen path is returned as is_error=true.
-        let (output, is_err) = read_pdf_file("-help", None);
+        let (output, is_err) = read_pdf_file(test_run(), "-help", None);
         assert!(is_err, "leading-hyphen path must be an error: {output}");
         assert!(
             output.contains("leading '-'") || output.contains("interpreted as a flag"),
@@ -1147,7 +1166,7 @@ mod tests {
     fn read_pdf_file_rejects_password_flag_filename_with_pages() {
         // Layer 1 end-to-end: rejection must happen on the page-range path too,
         // not only on the no-pages branch. '-opw' is the highest-risk shape.
-        let (output, is_err) = read_pdf_file("-opw", Some("1-3"));
+        let (output, is_err) = read_pdf_file(test_run(), "-opw", Some("1-3"));
         assert!(is_err, "must reject '-opw' even with pages: {output}");
         assert!(
             output.contains("leading '-'") || output.contains("interpreted as a flag"),

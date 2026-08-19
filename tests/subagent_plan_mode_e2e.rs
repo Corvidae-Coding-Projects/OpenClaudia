@@ -1,5 +1,5 @@
 //! End-to-end tests for the plan-mode tool gate and the
-//! `AgentContextGuard` RAII drop semantics.
+//! immutable run-role semantics.
 //!
 //! Sprint 10 of the verification effort. `src/tools/plan_mode.rs`
 //! has 13 unit tests and `src/subagent.rs` has 40, but no
@@ -24,22 +24,52 @@
 //!   - **`PlanModeState::enter` perimeter** — missing files,
 //!     symlinks, directories all refused with the matching
 //!     `PlanModeEntryError` variant.
-//!   - **`AgentContextGuard` RAII drop** — nested guards don't
-//!     prematurely release the in-agent-task flag; the outer
-//!     guard is the sole authority for clearing.
+//!   - **Run-bound subagent identity** — worker runs are denied
+//!     `enter_plan_mode` while frontend runs remain independent.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+use openclaudia::runtime::ActorRole;
 use openclaudia::session::{
     is_tool_allowed_in_plan_mode, is_tool_allowed_in_plan_mode_with_policy, PlanModePolicy,
     PlanModeState, PLAN_MODE_ALLOWED_TOOLS,
 };
-use openclaudia::tools::{in_agent_task, AgentContextGuard};
+use openclaudia::tools::{
+    execute_tool, FunctionCall, ToolCall, ToolFollowUp, ToolRunContext, WorkspaceAccess,
+};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
+
+fn actor_run(root: &std::path::Path, role: ActorRole) -> Arc<ToolRunContext> {
+    ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(WorkspaceAccess::ReadOnly)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .actor_role(role)
+        .provider("subagent-plan-mode-test")
+        .build()
+        .expect("actor test run")
+}
+
+fn enter_plan_mode_call() -> ToolCall {
+    ToolCall {
+        id: "subagent-plan-mode".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "enter_plan_mode".to_string(),
+            arguments: "{}".to_string(),
+        },
+    }
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — plan-mode allow-list / deny-list discipline
@@ -309,56 +339,43 @@ fn enter_succeeds_with_real_file_and_pins_canonical_path() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — AgentContextGuard RAII drop semantics
+// Section D — immutable actor-role dispatch semantics
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn agent_context_guard_sets_flag_only_for_its_lifetime() {
-    assert!(!in_agent_task(), "test must start outside any agent task");
-    {
-        let _guard = AgentContextGuard::enter();
-        assert!(in_agent_task(), "flag must be set inside guard scope");
-    }
-    assert!(
-        !in_agent_task(),
-        "flag must be cleared when the guard drops"
-    );
+fn frontend_run_can_request_plan_mode_through_registry() {
+    let root = tempdir().expect("frontend root");
+    let frontend = actor_run(root.path(), ActorRole::Frontend);
+    let result = execute_tool(&frontend, &enter_plan_mode_call());
+    assert!(!result.is_error(), "frontend request failed: {result:?}");
+    assert!(matches!(
+        result.follow_up(),
+        ToolFollowUp::EnterPlanMode { .. }
+    ));
 }
 
 #[test]
-fn nested_guards_share_the_outermost_lifetime() {
-    // Only the outermost guard owns the flag. An inner guard's drop
-    // MUST NOT clear the flag while the outer guard is still alive.
-    assert!(!in_agent_task());
-    let outer = AgentContextGuard::enter();
-    assert!(in_agent_task(), "outer guard must set flag");
-    {
-        let inner = AgentContextGuard::enter();
-        assert!(in_agent_task(), "inner guard must observe flag still set");
-        drop(inner);
-        assert!(
-            in_agent_task(),
-            "dropping the INNER guard MUST NOT clear the flag while outer lives"
-        );
-    }
-    drop(outer);
+fn worker_run_is_denied_plan_mode_through_registry() {
+    let root = tempdir().expect("worker root");
+    let worker = actor_run(root.path(), ActorRole::Worker);
+    let result = execute_tool(&worker, &enter_plan_mode_call());
     assert!(
-        !in_agent_task(),
-        "dropping the outer guard MUST clear the flag"
+        result.is_error(),
+        "worker unexpectedly entered plan mode: {result:?}"
     );
+    assert!(result
+        .content()
+        .contains("plan mode cannot be entered from inside an agent task"));
 }
 
 #[test]
-fn agent_context_guard_does_not_leak_across_threads() {
-    // The IN_AGENT_TASK flag is a thread-local. A guard on the main
-    // thread MUST NOT make in_agent_task() return true on another
-    // thread.
-    let _main_guard = AgentContextGuard::enter();
-    assert!(in_agent_task(), "main thread: flag set");
-
-    let other_thread_observation = std::thread::spawn(in_agent_task).join().expect("join");
-    assert!(
-        !other_thread_observation,
-        "spawned thread must see in_agent_task()=false (thread-local isolation)"
-    );
+fn concurrent_actor_roles_cannot_cross() {
+    let root = tempdir().expect("shared root");
+    let frontend = actor_run(root.path(), ActorRole::Frontend);
+    let worker = actor_run(root.path(), ActorRole::Worker);
+    let frontend_result =
+        std::thread::spawn(move || execute_tool(&frontend, &enter_plan_mode_call()));
+    let worker_result = std::thread::spawn(move || execute_tool(&worker, &enter_plan_mode_call()));
+    assert!(!frontend_result.join().expect("frontend thread").is_error());
+    assert!(worker_result.join().expect("worker thread").is_error());
 }

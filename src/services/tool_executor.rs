@@ -39,6 +39,9 @@ impl ToolExecutionBlock {
 
 /// Inputs for one local tool execution.
 pub struct ToolExecutorRequest<'a> {
+    /// Mandatory immutable run capability. This is the only source of host
+    /// workspace, process, network, secret, cancellation, and session identity.
+    pub run_context: &'a std::sync::Arc<tools::ToolRunContext>,
     /// Tool call to execute.
     pub tool_call: &'a ToolCall,
     /// Optional memory database for memory tools.
@@ -121,6 +124,7 @@ impl ToolExecutor {
     ///
     /// Returns [`ToolExecutionBlock`] when a deny-intent hook blocks dispatch.
     pub async fn run_pre_tool_use(
+        run_context: &std::sync::Arc<tools::ToolRunContext>,
         hook_engine: &HookEngine,
         session_id: Option<&str>,
         tool_name: &str,
@@ -128,8 +132,8 @@ impl ToolExecutor {
     ) -> Result<(), ToolExecutionBlock> {
         let extensions = extensions_from_tool_input(tool_name, tool_input);
 
-        let mut hook_input =
-            HookInput::new(HookEvent::PreToolUse).with_tool(tool_name, tool_input.clone());
+        let mut hook_input = HookInput::for_run(run_context, HookEvent::PreToolUse)
+            .with_tool(tool_name, tool_input.clone());
         if let Some(session_id) = session_id {
             hook_input = hook_input.with_session_id(session_id);
         }
@@ -159,6 +163,7 @@ impl ToolExecutor {
 
     /// Fire the shared post-tool hook lifecycle event.
     pub async fn fire_post_tool(
+        run_context: &std::sync::Arc<tools::ToolRunContext>,
         hook_engine: &HookEngine,
         success: bool,
         tool_name: &str,
@@ -167,7 +172,14 @@ impl ToolExecutor {
         session_id: Option<&str>,
     ) {
         hook_engine
-            .fire_post_tool(success, tool_name, tool_input, tool_output, session_id)
+            .fire_post_tool(
+                run_context,
+                success,
+                tool_name,
+                tool_input,
+                tool_output,
+                session_id,
+            )
             .await;
     }
 
@@ -187,6 +199,7 @@ impl ToolExecutor {
     #[must_use]
     pub fn execute(request: ToolExecutorRequest<'_>) -> ToolResult {
         let ToolExecutorRequest {
+            run_context,
             tool_call,
             memory_db,
             app_config,
@@ -196,6 +209,11 @@ impl ToolExecutor {
             session_id,
             policy_enforcer,
         } = request;
+
+        // `session_id` is a logical state/ledger bucket (subagents use their
+        // stable agent id). Host authority comes only from `run_context` and
+        // must never be inferred from this caller-controlled label.
+        let session_id = session_id.or_else(|| Some(run_context.session_id()));
 
         if let Err(reason) =
             Self::parse_arguments(&tool_call.function.name, &tool_call.function.arguments)
@@ -218,7 +236,6 @@ impl ToolExecutor {
             );
         }
 
-        let _session_guard = session_id.map(tools::SessionIdGuard::set);
         let _ledger_guard =
             session_id.and_then(crate::grounded_loop::install_active_project_ledger_for_session);
 
@@ -267,7 +284,20 @@ impl ToolExecutor {
             );
         }
 
-        tools::execute_tool_after_authorization(tool_call, memory_db, app_config, task_mgr)
+        tools::execute_tool_after_authorization(
+            run_context,
+            tool_call,
+            memory_db,
+            app_config,
+            task_mgr,
+        )
+    }
+
+    /// Convert a missing run binding into a typed unavailable result without
+    /// evaluating permission policy or dispatching any handler.
+    #[must_use]
+    pub fn execute_unbound(tool_call: &ToolCall) -> ToolResult {
+        tools::execute_tool_without_context(tool_call)
     }
 }
 
@@ -287,6 +317,10 @@ mod tests {
     use super::*;
     use crate::services::policy::{EnterprisePolicy, PolicyEnforcer, ToolCaps};
     use crate::tools::{FunctionCall, ToolCall};
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     fn bash_call(command: &str) -> ToolCall {
         ToolCall {
@@ -311,6 +345,7 @@ mod tests {
         let permission_manager = PermissionManager::unrestricted();
 
         let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: test_run(),
             tool_call: &call,
             memory_db: None,
             app_config: None,
@@ -339,6 +374,7 @@ mod tests {
             .expect("mint permit");
 
         let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: test_run(),
             tool_call: &call,
             memory_db: None,
             app_config: None,
@@ -366,6 +402,7 @@ mod tests {
         let call = bash_call("printf permission-cap-order");
 
         let denied = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: test_run(),
             tool_call: &call,
             memory_db: None,
             app_config: None,
@@ -384,6 +421,7 @@ mod tests {
 
         let unrestricted = PermissionManager::unrestricted();
         let allowed = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: test_run(),
             tool_call: &call,
             memory_db: None,
             app_config: None,
@@ -440,6 +478,7 @@ mod tests {
             .expect("mint permit");
 
         let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: test_run(),
             tool_call: &changed,
             memory_db: None,
             app_config: None,
@@ -469,6 +508,7 @@ mod tests {
         let manager = PermissionManager::unrestricted();
 
         let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: test_run(),
             tool_call: &call,
             memory_db: None,
             app_config: None,

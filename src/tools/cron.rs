@@ -208,30 +208,16 @@ impl ScheduleStore {
     }
 }
 
-/// Resolve the schedules path to an absolute location.
+/// Resolve the schedules path against the exact immutable run directory.
 ///
-/// Crosslink #877: the prior implementation returned a bare relative
-/// `PathBuf::from(SCHEDULES_FILE)`, so every cron operation resolved
-/// against whatever the process cwd happened to be at call time. When
-/// the worktree adapter mutated cwd between operations, schedule
-/// load/save silently targeted different files. We now anchor the
-/// path against `std::env::current_dir()` once, producing an absolute
-/// path the caller can rely on for the duration of one tool call.
-///
-/// If `current_dir` itself fails (deleted cwd, FUSE EIO, …) we fall
-/// back to the original relative path rather than panic — surfacing
-/// a `warn!` so the operator can see what happened.
-fn schedules_path() -> PathBuf {
-    match crate::tools::security::current_context() {
-        Ok(context) => context.working_directory().join(SCHEDULES_FILE),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "schedules_path: session context unavailable; using an invalid fail-closed path"
-            );
-            PathBuf::from("/__openclaudia_unavailable__/schedules.json")
-        }
-    }
+/// Crosslink #877 previously resolved a bare relative path against mutable
+/// process CWD. S-019 makes the run capability the sole workspace anchor and
+/// returns a typed denial before any path is materialized when writes are not
+/// granted.
+fn schedules_path(run: &crate::tools::security::ToolRunContext) -> Result<PathBuf, String> {
+    run.require(crate::tools::security::ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    Ok(run.working_directory().join(SCHEDULES_FILE))
 }
 
 /// One cron field's display name and accepted value range.
@@ -425,8 +411,14 @@ fn optional_one_based_index_arg<S: BuildHasher>(
 }
 
 #[must_use]
-pub fn execute_cron_create<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
-    execute_cron_create_at(args, &schedules_path())
+pub fn execute_cron_create<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    match schedules_path(run) {
+        Ok(path) => execute_cron_create_at(args, &path),
+        Err(error) => (error, true),
+    }
 }
 
 /// Path-explicit variant of [`execute_cron_create`].
@@ -555,8 +547,14 @@ fn execute_cron_create_at<S: BuildHasher>(
 }
 
 #[must_use]
-pub fn execute_cron_delete<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
-    execute_cron_delete_at(args, &schedules_path())
+pub fn execute_cron_delete<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    match schedules_path(run) {
+        Ok(path) => execute_cron_delete_at(args, &path),
+        Err(error) => (error, true),
+    }
 }
 
 /// Path-explicit variant of [`execute_cron_delete`] — see
@@ -642,8 +640,14 @@ fn execute_cron_delete_at<S: BuildHasher>(
 }
 
 #[must_use]
-pub fn execute_cron_list<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
-    execute_cron_list_at(args, &schedules_path())
+pub fn execute_cron_list<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    match schedules_path(run) {
+        Ok(path) => execute_cron_list_at(args, &path),
+        Err(error) => (error, true),
+    }
 }
 
 /// Path-explicit variant of [`execute_cron_list`] — see
@@ -693,6 +697,10 @@ fn execute_cron_list_at<S: BuildHasher>(
 mod tests {
     use super::*;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     // crosslink #984: tests no longer mutate the process cwd — they
     // thread an explicit `schedules.json` path through the `*_at`
     // helpers in this module. The previous `cwd_lock()` shim is gone
@@ -728,7 +736,7 @@ mod tests {
             Value::String("* * * * *".to_string()),
         );
         args.insert("prompt".to_string(), Value::String("test".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("Missing 'name'"));
     }
@@ -739,7 +747,7 @@ mod tests {
         args.insert("name".to_string(), Value::String("test".to_string()));
         args.insert("schedule".to_string(), Value::String("bad".to_string()));
         args.insert("prompt".to_string(), Value::String("test".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("Invalid cron"));
     }
@@ -778,7 +786,7 @@ mod tests {
             Value::String("0 * * * *".to_string()),
         );
         args.insert("prompt".to_string(), Value::String("ping".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Missing 'name'"),
@@ -792,7 +800,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("name".to_string(), Value::String("myjob".to_string()));
         args.insert("prompt".to_string(), Value::String("ping".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Missing 'schedule'"),
@@ -809,7 +817,7 @@ mod tests {
             "schedule".to_string(),
             Value::String("0 * * * *".to_string()),
         );
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Missing 'prompt'"),
@@ -1074,7 +1082,7 @@ mod tests {
             Value::String("0 0 * *".to_string()), // only 4 fields
         );
         args.insert("prompt".to_string(), Value::String("test".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Invalid cron"),

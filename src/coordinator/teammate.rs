@@ -165,9 +165,8 @@ pub struct Teammate {
     pub agent_type: AgentType,
     pub color: AgentColor,
     pub state: TeammateState,
-    /// Subagent session id — feeds through to
-    /// `tools::SessionIdGuard` (crosslink #518) so this teammate's
-    /// task-list bucket stays isolated from other teammates.
+    /// Explicit subagent session id used to select this teammate's task-list
+    /// and ledger buckets without thread-local fallback identity.
     pub session_id: String,
     /// Absolute path to this teammate's JSONL transcript —
     /// leverages `crate::transcript` (crosslink #516) so it's

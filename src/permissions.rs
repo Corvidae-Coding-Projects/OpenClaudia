@@ -647,6 +647,23 @@ impl PermissionManager {
         )
     }
 
+    /// Construct a production manager bound to one exact run generation.
+    #[must_use]
+    pub fn trusted_for_run(
+        run: &crate::tools::ToolRunContext,
+        enabled: bool,
+        default_allow: Vec<String>,
+        web_fetch_preapproved_domains: Vec<String>,
+    ) -> Self {
+        Self::new_with_binding_and_web_fetch_preapproved(
+            trusted_permission_store_path(),
+            enabled,
+            default_allow,
+            web_fetch_preapproved_domains,
+            ApprovalBinding::for_run(run),
+        )
+    }
+
     /// Build an explicitly unrestricted manager that skips prompts and rules.
     ///
     /// Classification and hard safety checks still apply: unknown tools,
@@ -671,6 +688,22 @@ impl PermissionManager {
             default_allow: Vec::new(),
             web_fetch_preapproved_domains: Vec::new(),
             approval_store: ApprovalStore::empty(ApprovalBinding::current()),
+            enabled: false,
+            consecutive_denials: 0,
+            total_denials: 0,
+        }
+    }
+
+    /// Build an unrestricted manager whose receipt identity is still bound to
+    /// one exact run. Mandatory host-safety gates remain active.
+    #[must_use]
+    pub fn unrestricted_for_run(run: &crate::tools::ToolRunContext) -> Self {
+        Self {
+            persisted_rules: Vec::new(),
+            session_rules: Vec::new(),
+            default_allow: Vec::new(),
+            web_fetch_preapproved_domains: Vec::new(),
+            approval_store: ApprovalStore::empty(ApprovalBinding::for_run(run)),
             enabled: false,
             consecutive_denials: 0,
             total_denials: 0,

@@ -12,6 +12,8 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use openclaudia::hooks::{HookEngine, HookError, HookEvent, HookInput, HookOutput, HookResult};
 use serde_json::json;
 
@@ -176,11 +178,15 @@ fn deny_intent_events_are_pre_tool_use_and_permission_request_only() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn hook_input_new_initializes_cwd_and_default_fields() {
-    let input = HookInput::new(HookEvent::SessionStart);
+fn hook_input_for_run_initializes_bound_cwd_and_default_fields() {
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
     assert_eq!(input.event, HookEvent::SessionStart);
-    // cwd: current process directory — non-empty.
-    assert!(!input.cwd.is_empty(), "cwd MUST be populated");
+    assert_eq!(
+        input.cwd,
+        support::shared_run_context()
+            .working_directory()
+            .to_string_lossy()
+    );
     // Optional fields: None by default.
     assert!(input.session_id.is_none());
     assert!(input.tool_name.is_none());
@@ -191,26 +197,29 @@ fn hook_input_new_initializes_cwd_and_default_fields() {
 
 #[test]
 fn hook_input_with_session_id_sets_session() {
-    let input = HookInput::new(HookEvent::SessionStart).with_session_id("sess-123");
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart)
+        .with_session_id("sess-123");
     assert_eq!(input.session_id.as_deref(), Some("sess-123"));
 }
 
 #[test]
 fn hook_input_with_tool_sets_both_name_and_input() {
-    let input = HookInput::new(HookEvent::PreToolUse).with_tool("bash", json!({"command": "ls"}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("bash", json!({"command": "ls"}));
     assert_eq!(input.tool_name.as_deref(), Some("bash"));
     assert_eq!(input.tool_input, Some(json!({"command": "ls"})));
 }
 
 #[test]
 fn hook_input_with_prompt_sets_prompt_field() {
-    let input = HookInput::new(HookEvent::UserPromptSubmit).with_prompt("hello world");
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::UserPromptSubmit)
+        .with_prompt("hello world");
     assert_eq!(input.prompt.as_deref(), Some("hello world"));
 }
 
 #[test]
 fn hook_input_with_extra_accumulates_into_extra_map() {
-    let input = HookInput::new(HookEvent::Notification)
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::Notification)
         .with_extra("type", json!("status"))
         .with_extra("level", json!("info"));
     assert_eq!(input.extra.get("type"), Some(&json!("status")));
@@ -220,7 +229,7 @@ fn hook_input_with_extra_accumulates_into_extra_map() {
 
 #[test]
 fn hook_input_builder_methods_are_chainable() {
-    let input = HookInput::new(HookEvent::PreToolUse)
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
         .with_session_id("s")
         .with_tool("bash", json!({}))
         .with_extra("k", json!("v"));
@@ -235,25 +244,27 @@ fn hook_input_builder_methods_are_chainable() {
 
 #[test]
 fn match_tool_returns_tool_name_when_set() {
-    let input = HookInput::new(HookEvent::PreToolUse).with_tool("bash", json!({}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("bash", json!({}));
     assert_eq!(input.match_tool(), Some("bash"));
 }
 
 #[test]
 fn match_tool_returns_none_when_unset() {
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
     assert!(input.match_tool().is_none());
 }
 
 #[test]
 fn match_prompt_returns_prompt_when_set() {
-    let input = HookInput::new(HookEvent::UserPromptSubmit).with_prompt("hello");
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::UserPromptSubmit)
+        .with_prompt("hello");
     assert_eq!(input.match_prompt(), Some("hello"));
 }
 
 #[test]
 fn match_event_always_returns_event_config_key() {
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
     assert_eq!(input.match_event(), Some("session_start"));
 }
 

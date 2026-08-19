@@ -18,7 +18,9 @@ pub(crate) mod args;
 mod ask_user;
 mod bash;
 pub(crate) use bash::record_command_observation_for_session;
-pub use bash::sandbox::{sandbox_diagnostics, sandbox_preflight, SandboxDiagnostics};
+pub use bash::sandbox::{
+    sandbox_diagnostics, sandbox_diagnostics_for_run, sandbox_preflight, SandboxDiagnostics,
+};
 pub(crate) use bash::sandbox::{sandboxed_hook_command, sandboxed_process_command, SandboxProfile};
 pub(crate) mod command;
 mod continuation;
@@ -32,6 +34,11 @@ pub mod effect;
 pub use cron::{execute_cron_create, execute_cron_delete, execute_cron_list};
 mod file;
 pub(crate) use file::open_capability_regular_read;
+pub use file::{
+    create_capability_text_file, create_run_control_directory, create_run_control_text_file,
+    initialize_project_for_run, read_capability_text_attachment, read_run_control_text,
+    ProjectInitOutcome,
+};
 mod grounding;
 pub(crate) mod host_safety;
 pub use host_safety::HOST_SAFETY_POLICY_GENERATION;
@@ -80,34 +87,22 @@ pub use bash::policy::{
     dangerous_shell_construct, is_safe_for_auto_allow, is_sensitive_env as is_sensitive_env_pub,
     validate_command, MAX_COMMAND_LEN,
 };
+/// Explicit run-derived Bash path allowlist (crosslink #594, S-019).
+pub use bash::PathConstraints;
 /// Process-wide background shell registry, re-exported so the
 /// coordinator's [`crate::coordinator::tasks::LocalShellTask`]
 /// (crosslink #611) can query running shells without taking a
 /// dependency on the private `bash` submodule.
 pub(crate) use bash::BACKGROUND_SHELLS;
-/// Bash path-allowlist gate (crosslink #594). Re-exported so the permission
-/// layer and proxy startup can install a process-wide constraint set
-/// derived from `additionalWorkingDirectories` without making the entire
-/// `bash` module public.
-pub use bash::{
-    check_command_against_global as check_bash_path_against_global, clear_global_path_constraints,
-    install_global_path_constraints, PathConstraints,
-};
 pub(crate) use bash::{terminate_process_tree, terminate_session_background_jobs};
 pub(crate) use command::run_sandboxed_with_timeout_with_env;
 pub(crate) use command::{
-    cancel_all_sandbox_processes, cancel_session_sandbox_processes,
-    clear_session_process_cancellation,
+    cancel_all_sandbox_processes, cancel_run_sandbox_processes, cancel_session_sandbox_processes,
 };
 pub(crate) use command::{run_prepared_sandboxed_with_timeout, CommandError};
 pub use continuation::{
     ToolContinuation, ToolContinuationError, ToolExchange, TOOL_CONTINUATION_SCHEMA_VERSION,
 };
-/// RAII guard that marks the current thread as executing inside a subagent
-/// task, so `execute_enter_plan_mode` refuses with the CC-parity error
-/// (crosslink #620). Subagent runners construct one of these for the
-/// duration of a `task` tool invocation; tests construct one directly.
-pub use plan_mode::{in_agent_task, AgentContextGuard};
 pub use registry::{ToolContext, ToolHandler, ToolRegistry};
 pub use result::{
     ToolAllowedPrompt, ToolArtifact, ToolAttachment, ToolCompleteness, ToolContent, ToolDiff,
@@ -116,9 +111,11 @@ pub use result::{
     ToolQuestion, ToolQuestionOption, ToolResult, ToolResultError, ToolRetryability,
     ToolSensitivity, ToolUsage, TOOL_RESULT_SCHEMA_VERSION,
 };
-pub use todo::{
-    clear_all_todo_lists, clear_todo_list, get_todo_list, SessionIdGuard, TodoItem, TodoStatus,
+pub use security::{
+    ToolCapabilityError, ToolExecutableError, ToolResource, ToolRunContext, ToolRunContextBuilder,
+    WorkspaceAccess,
 };
+pub use todo::{clear_all_todo_lists, clear_todo_list, get_todo_list, TodoItem, TodoStatus};
 /// Web-fetch output formatter + cap constant. Curated re-export so the
 /// content-extraction E2E tests (`tests/web_content_extraction_e2e.rs`,
 /// sprint 41) can drive `format_fetch_output` directly without spawning
@@ -152,12 +149,35 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 
 /// Reset the read tracker. Used by tests and at session-start.
 ///
-/// Clears every per-session bucket so legacy callers that do not
-/// activate a `SessionIdGuard` get a clean slate the same way they
-/// did before crosslink #440.
+/// Clears only the exact run bucket; no ambient session identity participates.
 #[doc(hidden)]
-pub fn reset_read_tracker() {
-    file::READ_TRACKER.clear_all();
+pub fn reset_read_tracker(run: &ToolRunContext) {
+    file::READ_TRACKER.clear_run(run);
+}
+
+/// Retire one exact frontend run before replacing its session generation.
+///
+/// This host lifecycle boundary cancels the run tree and terminates only the
+/// synchronous processes, background shells, and background agents owned by
+/// that run. Concurrent runs and later generations are unaffected.
+pub fn retire_run(run: &ToolRunContext) {
+    let _ = run
+        .runtime()
+        .cancellation()
+        .cancel(crate::runtime::CancellationReason::FrontendDisconnected);
+    let sandbox_processes = cancel_run_sandbox_processes(run);
+    let background_shells = BACKGROUND_SHELLS.kill_for_run(run);
+    let background_agents = crate::subagent::BACKGROUND_AGENTS.stop_all_for_run(run);
+    tracing::info!(
+        target: "openclaudia::capabilities",
+        event = "run_retired",
+        run_id = %run.run_id(),
+        generation = %run.generation(),
+        sandbox_processes,
+        background_agents,
+        background_shells,
+        "Retired exact frontend run resources"
+    );
 }
 
 /// Tool call from the model
@@ -200,9 +220,24 @@ pub fn get_tool_definitions() -> Value {
 /// host ceiling, exact dispatch authorization, and the sandbox/capability
 /// boundary.
 #[must_use]
-pub fn execute_tool(tool_call: &ToolCall) -> ToolResult {
-    let permission_manager = PermissionManager::unrestricted();
-    execute_tool_with_memory(tool_call, None, &permission_manager)
+pub fn execute_tool(run: &std::sync::Arc<ToolRunContext>, tool_call: &ToolCall) -> ToolResult {
+    let permission_manager = PermissionManager::unrestricted_for_run(run);
+    execute_tool_with_memory(run, tool_call, None, &permission_manager)
+}
+
+/// Fail-closed compatibility probe for callers that have no run capability.
+///
+/// This function never dispatches a handler. It exists so adapters can turn a
+/// missing composition-root binding into a typed tool result without deriving
+/// authority from process CWD or thread-local state.
+#[must_use]
+pub fn execute_tool_without_context(tool_call: &ToolCall) -> ToolResult {
+    ToolResult::failure(
+        tool_call,
+        ToolFailureCode::Unavailable,
+        "Tool execution is unavailable because no explicit run capability was supplied".to_string(),
+        ToolRetryability::Never,
+    )
 }
 
 fn invalid_tool_arguments_result(
@@ -344,6 +379,7 @@ fn legacy_permission_prompt(tool: &str, target: &str) -> String {
 /// Execute a tool call with optional memory and a required permission manager.
 #[must_use]
 pub fn execute_tool_with_memory(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     permission_mgr: &PermissionManager,
@@ -355,10 +391,11 @@ pub fn execute_tool_with_memory(
     if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
         return *result;
     }
-    execute_tool_with_memory_after_authorization(tool_call, memory_db)
+    execute_tool_with_memory_after_authorization(run, tool_call, memory_db)
 }
 
 fn execute_tool_with_memory_after_authorization(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
 ) -> ToolResult {
@@ -383,7 +420,7 @@ fn execute_tool_with_memory_after_authorization(
     }
 
     let mut ctx = ToolContext {
-        security: security::current_context(),
+        run,
         memory_db,
         app_config: None,
         task_mgr: None,
@@ -394,6 +431,7 @@ fn execute_tool_with_memory_after_authorization(
 /// Execute a tool call with full context (memory + config for subagents).
 #[must_use]
 pub fn execute_tool_full(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
@@ -406,10 +444,11 @@ pub fn execute_tool_full(
     if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
         return *result;
     }
-    execute_tool_full_after_authorization(tool_call, memory_db, app_config)
+    execute_tool_full_after_authorization(run, tool_call, memory_db, app_config)
 }
 
 fn execute_tool_full_after_authorization(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
@@ -429,30 +468,45 @@ fn execute_tool_full_after_authorization(
     // (crosslink #491 — previously the default arm returned mid-match,
     // bypassing the wrapper and creating asymmetric control flow).
     let handler_result = match tool_call.function.name.as_str() {
-        "task" => app_config.map_or_else(
-            || {
-                ToolHandlerResult::error(ToolFailure::new(
-                    ToolFailureCode::Unavailable,
-                    "Task tool requires application configuration".to_string(),
-                    ToolRetryability::Never,
-                ))
-            },
-            |config| {
-                let (content, is_error) = subagent::execute_task_tool(&args, config);
-                ToolHandlerResult::legacy(content, is_error)
-            },
-        ),
+        "task" => run
+            .require(ToolResource::Network)
+            .and_then(|()| run.require(ToolResource::Secrets))
+            .map_or_else(
+                |error| {
+                    ToolHandlerResult::error(ToolFailure::new(
+                        ToolFailureCode::Unavailable,
+                        format!("Task execution is unavailable: {error}"),
+                        ToolRetryability::Never,
+                    ))
+                },
+                |()| {
+                    app_config.map_or_else(
+                        || {
+                            ToolHandlerResult::error(ToolFailure::new(
+                                ToolFailureCode::Unavailable,
+                                "Task tool requires application configuration".to_string(),
+                                ToolRetryability::Never,
+                            ))
+                        },
+                        |config| {
+                            let (content, is_error) =
+                                subagent::execute_task_tool(run, &args, config);
+                            ToolHandlerResult::legacy(content, is_error)
+                        },
+                    )
+                },
+            ),
         "agent_output" => {
-            let (content, is_error) = subagent::execute_agent_output_tool(&args);
+            let (content, is_error) = subagent::execute_agent_output_tool(run, &args);
             ToolHandlerResult::legacy(content, is_error)
         }
         "task_stop" => {
-            let (content, is_error) = subagent::execute_task_stop_tool(&args);
+            let (content, is_error) = subagent::execute_task_stop_tool(run, &args);
             ToolHandlerResult::legacy(content, is_error)
         }
         _ => {
             let mut ctx = ToolContext {
-                security: security::current_context(),
+                run,
                 memory_db,
                 app_config,
                 task_mgr: None,
@@ -659,6 +713,7 @@ fn consume_for_execution(
 ///
 #[must_use]
 pub fn execute_tool_with_tasks(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
@@ -673,7 +728,7 @@ pub fn execute_tool_with_tasks(
         return *result;
     }
 
-    execute_tool_after_authorization(tool_call, memory_db, app_config, task_mgr)
+    execute_tool_after_authorization(run, tool_call, memory_db, app_config, task_mgr)
 }
 
 /// Execute a tool after the caller has already made the approval decision.
@@ -683,6 +738,7 @@ pub fn execute_tool_with_tasks(
 /// "after authorization" never means "unchecked".
 #[must_use]
 pub(crate) fn execute_tool_after_authorization(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
@@ -699,13 +755,13 @@ pub(crate) fn execute_tool_after_authorization(
         tool_call.function.name.as_str(),
         "task" | "agent_output" | "task_stop"
     ) {
-        return execute_tool_full_after_authorization(tool_call, memory_db, app_config);
+        return execute_tool_full_after_authorization(run, tool_call, memory_db, app_config);
     }
 
     // All other tools — including task_create/task_update/task_get/task_list —
     // go through the registry with the full context bundle.
     let mut ctx = ToolContext {
-        security: security::current_context(),
+        run,
         memory_db,
         app_config,
         task_mgr,
@@ -722,6 +778,7 @@ pub(crate) fn execute_tool_after_authorization(
 /// crosslink #460 mandated point 1.
 #[must_use]
 pub fn execute_tool_with_permission_required(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
@@ -744,7 +801,7 @@ pub fn execute_tool_with_permission_required(
     if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
         return *result;
     }
-    execute_tool_after_authorization(tool_call, memory_db, app_config, task_mgr)
+    execute_tool_after_authorization(run, tool_call, memory_db, app_config, task_mgr)
 }
 
 /// Typed-outcome dispatch: runs the permission gate and returns a structured [`ExecutionOutcome`].
@@ -755,6 +812,7 @@ pub fn execute_tool_with_permission_required(
 /// #460 mandated point 3.
 #[must_use]
 pub fn execute_tool_gated(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
@@ -781,7 +839,7 @@ pub fn execute_tool_gated(
         return ExecutionOutcome::Result(result);
     }
     ExecutionOutcome::Result(Box::new(execute_tool_after_authorization(
-        tool_call, memory_db, app_config, task_mgr,
+        run, tool_call, memory_db, app_config, task_mgr,
     )))
 }
 
@@ -813,6 +871,10 @@ mod tests {
     use base64::Engine;
     use serde_json::json;
 
+    fn test_run() -> &'static std::sync::Arc<ToolRunContext> {
+        security::test_run_context()
+    }
+
     #[test]
     fn post_authorization_boundary_still_denies_catastrophic_bash() {
         let tool_call = ToolCall {
@@ -824,7 +886,7 @@ mod tests {
             },
         };
 
-        let result = execute_tool_after_authorization(&tool_call, None, None, None);
+        let result = execute_tool_after_authorization(test_run(), &tool_call, None, None, None);
         assert!(result.is_error());
         assert!(matches!(
             result.outcome(),
@@ -850,7 +912,7 @@ mod tests {
             },
         };
 
-        let result = execute_tool_after_authorization(&tool_call, None, None, None);
+        let result = execute_tool_after_authorization(test_run(), &tool_call, None, None, None);
         assert!(result.is_error());
         assert!(matches!(
             result.outcome(),
@@ -999,7 +1061,7 @@ mod tests {
     fn test_bash_execution() {
         let mut args = HashMap::new();
         args.insert("command".to_string(), json!("echo hello"));
-        let (output, is_error) = bash::execute_bash(&args);
+        let (output, is_error) = bash::execute_bash(test_run(), &args);
         assert!(!is_error);
         assert!(output.contains("hello"));
     }
@@ -1027,7 +1089,7 @@ mod tests {
             },
         };
         let permission_manager = PermissionManager::unrestricted();
-        let result = execute_tool_full(&call, None, None, &permission_manager);
+        let result = execute_tool_full(test_run(), &call, None, None, &permission_manager);
         assert_eq!(
             result.tool_call_id(),
             "call-#491-test",
@@ -1044,7 +1106,8 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         };
-        let agent_result = execute_tool_full(&agent_call, None, None, &permission_manager);
+        let agent_result =
+            execute_tool_full(test_run(), &agent_call, None, None, &permission_manager);
         assert_eq!(
             agent_result.tool_call_id(),
             "call-#491-agent",
@@ -1064,7 +1127,7 @@ mod tests {
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), json!(dir.path().to_str().unwrap()));
-        let (output, is_error) = file::execute_list_files(&args);
+        let (output, is_error) = file::execute_list_files(test_run(), &args);
         assert!(!is_error, "list_files should succeed for temp fixture");
         assert!(!output.is_empty(), "temp fixture should contain files");
         assert!(
@@ -1414,7 +1477,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        let (output, is_error) = read_notebook_file(nb_path.to_str().unwrap());
+        let (output, is_error) = read_notebook_file(test_run(), nb_path.to_str().unwrap());
         assert!(!is_error, "read_notebook_file should succeed: {output}");
         assert!(output.contains("Cell 0 (markdown)"));
         assert!(output.contains("# Title"));
@@ -1447,7 +1510,7 @@ mod tests {
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
         // Mark as read first
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1457,7 +1520,7 @@ mod tests {
         args.insert("cell_number".to_string(), json!(0));
         args.insert("new_source".to_string(), json!("new code\nline 2"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit replace should succeed: {output}");
         assert!(output.contains("Replaced cell 0"));
 
@@ -1489,7 +1552,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1501,7 +1564,7 @@ mod tests {
         args.insert("cell_type".to_string(), json!("markdown"));
         args.insert("edit_mode".to_string(), json!("insert"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit insert should succeed: {output}");
         assert!(output.contains("Inserted new markdown cell"));
 
@@ -1541,7 +1604,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1552,7 +1615,7 @@ mod tests {
         args.insert("new_source".to_string(), json!(""));
         args.insert("edit_mode".to_string(), json!("delete"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit delete should succeed: {output}");
         assert!(output.contains("Deleted cell 0"));
 
@@ -1576,7 +1639,7 @@ mod tests {
         args.insert("cell_number".to_string(), json!(0));
         args.insert("new_source".to_string(), json!("test"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error, "Should fail without reading first");
         assert!(output.contains("must read"));
     }
@@ -1601,7 +1664,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1611,7 +1674,7 @@ mod tests {
         args.insert("cell_number".to_string(), json!(5));
         args.insert("new_source".to_string(), json!("test"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error, "Should fail for out-of-bounds cell");
         assert!(output.contains("out of bounds"));
     }
@@ -1628,7 +1691,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1640,7 +1703,7 @@ mod tests {
         args.insert("edit_mode".to_string(), json!("insert"));
         // No cell_type provided
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error, "Should fail without cell_type for insert");
         assert!(output.contains("cell_type is required"));
     }
@@ -1655,8 +1718,11 @@ mod tests {
         let fake_png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         fs::write(&img_path, &fake_png).unwrap();
 
-        let (output, is_error) =
-            read_image_file(img_path.to_str().unwrap(), super::file::ImageKind::Png);
+        let (output, is_error) = read_image_file(
+            test_run(),
+            img_path.to_str().unwrap(),
+            super::file::ImageKind::Png,
+        );
         assert!(!is_error, "read_image_file should succeed");
         assert!(output.contains("[Image: test.png"));
         assert!(output.contains("image/png"));
@@ -1680,7 +1746,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1692,7 +1758,7 @@ mod tests {
         args.insert("cell_type".to_string(), json!("code"));
         args.insert("edit_mode".to_string(), json!("insert"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "insert code cell should succeed: {output}");
 
         let content = fs::read_to_string(&nb_path).unwrap();
@@ -1724,7 +1790,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         // Replace by cell_id — no cell_number supplied.
         let mut args = HashMap::new();
@@ -1734,7 +1800,7 @@ mod tests {
         );
         args.insert("cell_id".to_string(), json!("cell-b"));
         args.insert("new_source".to_string(), json!("replaced-b"));
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "replace by cell_id should succeed: {output}");
 
         let updated: Value = serde_json::from_str(&fs::read_to_string(&nb_path).unwrap()).unwrap();
@@ -1755,7 +1821,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         // Insert AFTER "one" — should land at position 1, pushing "two" to position 2.
         let mut args = HashMap::new();
@@ -1767,7 +1833,7 @@ mod tests {
         args.insert("edit_mode".to_string(), json!("insert"));
         args.insert("cell_type".to_string(), json!("markdown"));
         args.insert("new_source".to_string(), json!("inserted"));
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "insert after cell_id should succeed: {output}");
 
         let updated: Value = serde_json::from_str(&fs::read_to_string(&nb_path).unwrap()).unwrap();
@@ -1790,7 +1856,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1799,7 +1865,7 @@ mod tests {
         );
         args.insert("cell_id".to_string(), json!("does-not-exist"));
         args.insert("new_source".to_string(), json!("x"));
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error);
         assert!(output.contains("does-not-exist"));
     }
@@ -2063,7 +2129,7 @@ mod tests {
             },
         };
         let (mgr, _tmp) = deny_all_bash_manager();
-        match execute_tool_gated(&tool_call, None, None, None, &mgr) {
+        match execute_tool_gated(test_run(), &tool_call, None, None, None, &mgr) {
             ExecutionOutcome::Result(r) => {
                 assert!(r.is_error(), "denial should mark the result as error");
                 assert!(
@@ -2096,7 +2162,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr =
             PermissionManager::new(tmp.path().join("p.json"), true, vec!["echo *".to_string()]);
-        match execute_tool_gated(&tool_call, None, None, None, &mgr) {
+        match execute_tool_gated(test_run(), &tool_call, None, None, None, &mgr) {
             ExecutionOutcome::Result(r) => {
                 assert!(
                     !r.is_error(),
@@ -2128,7 +2194,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         // enabled manager, no matching rule -> NeedsPrompt
         let mgr = PermissionManager::new(tmp.path().join("p.json"), true, vec![]);
-        match execute_tool_gated(&tool_call, None, None, None, &mgr) {
+        match execute_tool_gated(test_run(), &tool_call, None, None, None, &mgr) {
             ExecutionOutcome::NeedsPrompt {
                 tool_call_id,
                 tool,
@@ -2158,7 +2224,8 @@ mod tests {
             },
         };
         let mgr = PermissionManager::unrestricted();
-        let result = execute_tool_with_permission_required(&tool_call, None, None, None, &mgr);
+        let result =
+            execute_tool_with_permission_required(test_run(), &tool_call, None, None, None, &mgr);
         assert!(
             !result.is_error(),
             "unrestricted manager should pass through; got: {}",

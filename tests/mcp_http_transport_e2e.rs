@@ -208,7 +208,7 @@ async fn handshake_and_tools_list_round_trip_against_wiremock() {
     let mock = MockServer::start().await;
     mount_handshake(&mock).await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked("test-server", &mock.uri())
         .await
         .expect("connect must succeed");
@@ -251,7 +251,7 @@ async fn http_connect_sends_static_headers_on_handshake_requests() {
         ("Authorization".to_string(), "Bearer test-token".to_string()),
         ("X-Mcp-Team".to_string(), "openclaudia".to_string()),
     ]);
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked_with_headers("hdr", &mock.uri(), &headers)
         .await
         .expect("connect with headers");
@@ -273,7 +273,7 @@ async fn call_tool_returns_server_result_through_transport() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -303,7 +303,7 @@ async fn call_tool_accepts_streamable_http_sse_response_body() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -336,7 +336,7 @@ async fn call_tool_propagates_jsonrpc_error_response() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -363,7 +363,7 @@ async fn call_tool_with_unknown_tool_name_returns_error_without_http_call() {
     // fail with a transport error rather than the
     // "tool not found" error we expect.
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -387,7 +387,7 @@ async fn call_tool_with_unknown_tool_name_returns_error_without_http_call() {
 
 #[tokio::test]
 async fn call_tool_with_unknown_server_returns_error() {
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let outcome = mgr
         .call_tool("mcp__nonexistent-server__tool", json!({}))
         .await;
@@ -408,7 +408,7 @@ async fn disconnect_removes_server_from_manager() {
     let mock = MockServer::start().await;
     mount_handshake(&mock).await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -433,7 +433,7 @@ async fn http_5xx_during_initialize_propagates_as_mcp_error() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let outcome = mgr.__test_connect_http_unchecked("srv", &mock.uri()).await;
     assert!(
         outcome.is_err(),
@@ -448,7 +448,7 @@ async fn http_404_during_initialize_propagates_as_mcp_error() {
         .respond_with(ResponseTemplate::new(404))
         .mount(&mock)
         .await;
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let outcome = mgr.__test_connect_http_unchecked("srv", &mock.uri()).await;
     assert!(outcome.is_err(), "HTTP 404 MUST surface as McpError");
 }
@@ -464,10 +464,11 @@ async fn non_json_response_body_during_handshake_errors() {
         .respond_with(ResponseTemplate::new(200).set_body_string("not json at all"))
         .mount(&mock)
         .await;
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let outcome = mgr.__test_connect_http_unchecked("srv", &mock.uri()).await;
     assert!(
         outcome.is_err(),
         "non-JSON body MUST error (not silently parse to default)"
     );
 }
+mod support;

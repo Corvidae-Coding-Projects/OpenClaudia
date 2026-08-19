@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::process::Command;
 
 /// Kill a background shell
-pub fn execute_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_kill_shell(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let shell_id = match args.get("shell_id") {
         None => return ("Missing 'shell_id' argument".to_string(), true),
         Some(Value::String(shell_id)) => shell_id.as_str(),
@@ -19,14 +22,17 @@ pub fn execute_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
         }
     };
 
-    match BACKGROUND_SHELLS.kill(shell_id) {
+    match BACKGROUND_SHELLS.kill(run, shell_id) {
         Ok(msg) => (msg, false),
         Err(e) => (e, true),
     }
 }
 
 /// Kill every background shell owned by an agent/session id.
-pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_kill_shells_for_agent(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let agent_id = match args.get("agent_id") {
         None => return ("Missing 'agent_id' argument".to_string(), true),
         Some(Value::String(agent_id)) => agent_id.as_str(),
@@ -41,7 +47,7 @@ pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, 
     if agent_id.is_empty() {
         return ("Missing 'agent_id' argument".to_string(), true);
     }
-    let caller = crate::tools::todo::current_session_key();
+    let caller = run.process_owner();
     if agent_id != caller {
         tracing::warn!(
             target: "openclaudia::bash",
@@ -56,7 +62,7 @@ pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, 
         );
     }
 
-    (BACKGROUND_SHELLS.kill_for_agent(agent_id), false)
+    (BACKGROUND_SHELLS.kill_for_run(run), false)
 }
 
 /// Terminate a process and its entire process group.
@@ -345,6 +351,10 @@ fn terminate_linux_process_tree(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
     use std::collections::HashMap;
 
     #[test]
@@ -454,7 +464,7 @@ mod tests {
     #[test]
     fn b2_kill_missing_shell_id_arg() {
         let args: HashMap<String, serde_json::Value> = HashMap::new();
-        let (msg, is_error) = execute_kill_shell(&args);
+        let (msg, is_error) = execute_kill_shell(test_run(), &args);
         assert!(is_error, "b2_kill_missing_arg: must be is_error=true");
         assert!(
             msg.contains("Missing"),
@@ -466,7 +476,7 @@ mod tests {
     fn b2_kill_rejects_non_string_shell_id_arg() {
         let mut args = HashMap::new();
         args.insert("shell_id".to_string(), serde_json::json!(42));
-        let (msg, is_error) = execute_kill_shell(&args);
+        let (msg, is_error) = execute_kill_shell(test_run(), &args);
         assert!(is_error, "non-string shell_id must be rejected: {msg}");
         assert!(
             msg.contains("Invalid 'shell_id' argument: expected string"),
@@ -478,7 +488,7 @@ mod tests {
     fn kill_shells_for_agent_rejects_non_string_agent_id_arg() {
         let mut args = HashMap::new();
         args.insert("agent_id".to_string(), serde_json::json!(42));
-        let (msg, is_error) = execute_kill_shells_for_agent(&args);
+        let (msg, is_error) = execute_kill_shells_for_agent(test_run(), &args);
         assert!(is_error, "non-string agent_id must be rejected: {msg}");
         assert!(
             msg.contains("Invalid 'agent_id' argument: expected string"),
@@ -496,7 +506,7 @@ mod tests {
             "shell_id".to_string(),
             serde_json::Value::String("deadbeef".to_string()),
         );
-        let (msg, is_error) = execute_kill_shell(&args);
+        let (msg, is_error) = execute_kill_shell(test_run(), &args);
         assert!(is_error, "b2_kill_unknown_id: must be is_error=true");
         assert!(
             msg.contains("not found"),
@@ -514,7 +524,7 @@ mod tests {
     fn b2_kill_running_shell_returns_terminated_message() {
         // Spawn a long-running background shell via the manager
         let shell_id = super::super::BACKGROUND_SHELLS
-            .spawn("sleep 30")
+            .spawn(test_run(), "sleep 30")
             .expect("b2_kill_running: spawn must succeed");
 
         let mut args = HashMap::new();
@@ -522,7 +532,7 @@ mod tests {
             "shell_id".to_string(),
             serde_json::Value::String(shell_id.clone()),
         );
-        let (msg, is_error) = execute_kill_shell(&args);
+        let (msg, is_error) = execute_kill_shell(test_run(), &args);
 
         assert!(
             !is_error,
@@ -546,7 +556,7 @@ mod tests {
     #[cfg(unix)]
     fn b2_kill_same_shell_twice_second_is_not_found() {
         let shell_id = super::super::BACKGROUND_SHELLS
-            .spawn("sleep 30")
+            .spawn(test_run(), "sleep 30")
             .expect("b2_kill_twice: spawn must succeed");
 
         let make_args = |id: &str| {
@@ -558,10 +568,10 @@ mod tests {
             args
         };
 
-        let (_, first_err) = execute_kill_shell(&make_args(&shell_id));
+        let (_, first_err) = execute_kill_shell(test_run(), &make_args(&shell_id));
         assert!(!first_err, "b2_kill_twice: first kill must succeed");
 
-        let (msg2, second_err) = execute_kill_shell(&make_args(&shell_id));
+        let (msg2, second_err) = execute_kill_shell(test_run(), &make_args(&shell_id));
         assert!(
             second_err,
             "b2_kill_twice: second kill must be is_error=true (entry removed)"

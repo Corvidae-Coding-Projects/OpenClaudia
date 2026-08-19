@@ -80,26 +80,50 @@ fn assert_host_denial(label: &str, result: &ToolResult) {
 
 fn exercise_public_dispatch_paths(tool_call: &ToolCall, manager: &PermissionManager) {
     let results = [
-        ("execute_tool", execute_tool(tool_call)),
+        (
+            "execute_tool",
+            execute_tool(support::shared_run_context(), tool_call),
+        ),
         (
             "execute_tool_with_memory",
-            execute_tool_with_memory(tool_call, None, manager),
+            execute_tool_with_memory(support::shared_run_context(), tool_call, None, manager),
         ),
         (
             "execute_tool_full",
-            execute_tool_full(tool_call, None, None, manager),
+            execute_tool_full(
+                support::shared_run_context(),
+                tool_call,
+                None,
+                None,
+                manager,
+            ),
         ),
         (
             "execute_tool_with_tasks",
-            execute_tool_with_tasks(tool_call, None, None, None, manager),
+            execute_tool_with_tasks(
+                support::shared_run_context(),
+                tool_call,
+                None,
+                None,
+                None,
+                manager,
+            ),
         ),
         (
             "execute_tool_with_permission_required",
-            execute_tool_with_permission_required(tool_call, None, None, None, manager),
+            execute_tool_with_permission_required(
+                support::shared_run_context(),
+                tool_call,
+                None,
+                None,
+                None,
+                manager,
+            ),
         ),
         (
             "ToolExecutor::execute",
             ToolExecutor::execute(ToolExecutorRequest {
+                run_context: support::shared_run_context(),
                 tool_call,
                 memory_db: None,
                 app_config: None,
@@ -116,7 +140,14 @@ fn exercise_public_dispatch_paths(tool_call: &ToolCall, manager: &PermissionMana
         assert_host_denial(label, result);
     }
 
-    match execute_tool_gated(tool_call, None, None, None, manager) {
+    match execute_tool_gated(
+        support::shared_run_context(),
+        tool_call,
+        None,
+        None,
+        None,
+        manager,
+    ) {
         ExecutionOutcome::Result(result) => assert_host_denial("execute_tool_gated", &result),
         ExecutionOutcome::NeedsPrompt { .. } => {
             panic!("host safety must deny before a user-approvable prompt")
@@ -250,3 +281,4 @@ fn host_safety_trace_is_generation_bound_and_does_not_expose_raw_target() {
     }
     assert!(!decision.contains(secret_target));
 }
+mod support;

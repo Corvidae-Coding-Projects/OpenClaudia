@@ -12,19 +12,48 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::tools::security::{ToolResource, ToolRunContext};
+
+#[derive(Clone, Copy)]
+enum CapabilityDomain {
+    Agent,
+    HostControl,
+}
 
 /// Open an existing regular file for reading without following any symlink
 /// during the authoritative kernel lookup.
-pub(super) fn open_regular_read(path: &Path) -> Result<File, String> {
-    let file = open_beneath(path, false, libc_flags::O_RDONLY, 0)?;
+pub(super) fn open_regular_read(context: &ToolRunContext, path: &Path) -> Result<File, String> {
+    context
+        .require(ToolResource::WorkspaceRead)
+        .map_err(|error| error.to_string())?;
+    let file = open_beneath(
+        context,
+        path,
+        false,
+        libc_flags::O_RDONLY,
+        0,
+        CapabilityDomain::Agent,
+    )?;
     require_regular(&file, path)?;
     reject_readable_hardlink(&file, path)?;
     Ok(file)
 }
 
 /// Open a regular file for an in-place edit.
-pub(super) fn open_regular_edit(path: &Path) -> Result<File, String> {
-    let file = open_beneath(path, true, libc_flags::O_RDWR, 0)?;
+pub(super) fn open_regular_edit(context: &ToolRunContext, path: &Path) -> Result<File, String> {
+    context
+        .require(ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    let file = open_beneath(
+        context,
+        path,
+        true,
+        libc_flags::O_RDWR,
+        0,
+        CapabilityDomain::Agent,
+    )?;
     require_regular(&file, path)?;
     reject_writable_hardlink(&file, path)?;
     Ok(file)
@@ -32,20 +61,35 @@ pub(super) fn open_regular_edit(path: &Path) -> Result<File, String> {
 
 /// Open an existing file for update, or securely create it and any missing
 /// parent directories. Returns `(file, existed_before_open)`.
-pub(super) fn open_regular_update_or_create(path: &Path) -> Result<(File, bool), String> {
-    match open_beneath(path, true, libc_flags::O_RDWR, 0) {
+pub(super) fn open_regular_update_or_create(
+    context: &ToolRunContext,
+    path: &Path,
+) -> Result<(File, bool), String> {
+    context
+        .require(ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    match open_beneath(
+        context,
+        path,
+        true,
+        libc_flags::O_RDWR,
+        0,
+        CapabilityDomain::Agent,
+    ) {
         Ok(file) => {
             require_regular(&file, path)?;
             reject_writable_hardlink(&file, path)?;
             Ok((file, true))
         }
         Err(error) if is_not_found_message(&error) => {
-            create_parent_directories(path)?;
+            create_parent_directories(context, path, CapabilityDomain::Agent)?;
             let file = open_beneath(
+                context,
                 path,
                 true,
                 libc_flags::O_RDWR | libc_flags::O_CREAT | libc_flags::O_EXCL,
                 0o666,
+                CapabilityDomain::Agent,
             )?;
             require_regular(&file, path)?;
             Ok((file, false))
@@ -54,8 +98,82 @@ pub(super) fn open_regular_update_or_create(path: &Path) -> Result<(File, bool),
     }
 }
 
+/// Open host-owned control state below the exact run project for reading.
+pub(super) fn open_host_control_regular_read(
+    context: &ToolRunContext,
+    path: &Path,
+) -> Result<File, String> {
+    context
+        .require(ToolResource::WorkspaceRead)
+        .map_err(|error| error.to_string())?;
+    let file = open_beneath(
+        context,
+        path,
+        false,
+        libc_flags::O_RDONLY,
+        0,
+        CapabilityDomain::HostControl,
+    )?;
+    require_regular(&file, path)?;
+    reject_readable_hardlink(&file, path)?;
+    Ok(file)
+}
+
+/// Open or securely create host-owned control state below the run project.
+pub(super) fn open_host_control_regular_update_or_create(
+    context: &ToolRunContext,
+    path: &Path,
+) -> Result<(File, bool), String> {
+    context
+        .require(ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    match open_beneath(
+        context,
+        path,
+        true,
+        libc_flags::O_RDWR,
+        0,
+        CapabilityDomain::HostControl,
+    ) {
+        Ok(file) => {
+            require_regular(&file, path)?;
+            reject_writable_hardlink(&file, path)?;
+            Ok((file, true))
+        }
+        Err(error) if is_not_found_message(&error) => {
+            create_parent_directories(context, path, CapabilityDomain::HostControl)?;
+            let file = open_beneath(
+                context,
+                path,
+                true,
+                libc_flags::O_RDWR | libc_flags::O_CREAT | libc_flags::O_EXCL,
+                0o600,
+                CapabilityDomain::HostControl,
+            )?;
+            require_regular(&file, path)?;
+            Ok((file, false))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Securely create a host-owned control directory and any missing parents.
+pub(super) fn create_host_control_directories(
+    context: &ToolRunContext,
+    path: &Path,
+) -> Result<(), String> {
+    context
+        .require(ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    // The shared parent creator walks exactly the parent of its input. A
+    // synthetic leaf lets it create `path` itself without creating any file.
+    let synthetic_leaf = path.join(".openclaudia-directory-capability-leaf");
+    create_parent_directories(context, &synthetic_leaf, CapabilityDomain::HostControl)
+}
+
 /// A directory pinned to the kernel object reached through a capability root.
 pub(super) struct SecureDirectory {
+    context: Arc<ToolRunContext>,
     #[cfg(unix)]
     file: File,
     #[cfg(unix)]
@@ -90,22 +208,34 @@ impl Drop for Directory {
 
 /// Open a directory without following symlinks in any path component.
 #[cfg(unix)]
-pub(super) fn open_directory(path: &Path) -> Result<SecureDirectory, String> {
+pub(super) fn open_directory(
+    context: &Arc<ToolRunContext>,
+    path: &Path,
+) -> Result<SecureDirectory, String> {
+    context
+        .require(ToolResource::WorkspaceRead)
+        .map_err(|error| error.to_string())?;
     let file = open_beneath(
+        context,
         path,
         false,
         libc_flags::O_RDONLY | libc_flags::O_DIRECTORY,
         0,
+        CapabilityDomain::Agent,
     )?;
     require_directory(&file, path)?;
     Ok(SecureDirectory {
+        context: Arc::clone(context),
         file,
         display_path: path.to_path_buf(),
     })
 }
 
 #[cfg(not(unix))]
-pub(super) fn open_directory(_path: &Path) -> Result<SecureDirectory, String> {
+pub(super) fn open_directory(
+    _context: &Arc<ToolRunContext>,
+    _path: &Path,
+) -> Result<SecureDirectory, String> {
     Err(
         "Directory operation is blocked: this platform lacks a race-safe handle-relative filesystem backend"
             .to_string(),
@@ -117,7 +247,7 @@ impl SecureDirectory {
     /// Enumerate names relative to this pinned directory descriptor. Entry
     /// types are inspected with `fstatat(..., AT_SYMLINK_NOFOLLOW)`.
     pub(super) fn entries(&self) -> Result<Vec<SecureDirEntry>, String> {
-        read_directory_entries(&self.file, &self.display_path)
+        read_directory_entries(&self.context, &self.file, &self.display_path)
     }
 
     /// Securely enter one direct child directory.
@@ -138,7 +268,11 @@ impl SecureDirectory {
         })?;
         let display_path = self.display_path.join(name);
         require_directory(&file, &display_path)?;
-        Ok(Self { file, display_path })
+        Ok(Self {
+            context: Arc::clone(&self.context),
+            file,
+            display_path,
+        })
     }
 
     /// Securely open one direct regular-file child for reading.
@@ -265,9 +399,18 @@ fn is_not_found_message(error: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn open_beneath(path: &Path, write: bool, flags: i32, mode: u32) -> Result<File, String> {
-    let context = crate::tools::security::current_context()?;
-    let (root, root_fd) = context.root_handle_for(path, write)?;
+fn open_beneath(
+    context: &ToolRunContext,
+    path: &Path,
+    write: bool,
+    flags: i32,
+    mode: u32,
+    domain: CapabilityDomain,
+) -> Result<File, String> {
+    let (root, root_fd) = match domain {
+        CapabilityDomain::Agent => context.root_handle_for(path, write)?,
+        CapabilityDomain::HostControl => context.host_control_root_handle_for(path, write)?,
+    };
     let relative = relative_to_root(path, root)?;
     openat2_relative(root_fd, &relative, flags, mode).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -283,9 +426,18 @@ fn open_beneath(path: &Path, write: bool, flags: i32, mode: u32) -> Result<File,
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn open_beneath(path: &Path, write: bool, flags: i32, mode: u32) -> Result<File, String> {
-    let context = crate::tools::security::current_context()?;
-    let (root, root_fd) = context.root_handle_for(path, write)?;
+fn open_beneath(
+    context: &ToolRunContext,
+    path: &Path,
+    write: bool,
+    flags: i32,
+    mode: u32,
+    domain: CapabilityDomain,
+) -> Result<File, String> {
+    let (root, root_fd) = match domain {
+        CapabilityDomain::Agent => context.root_handle_for(path, write)?,
+        CapabilityDomain::HostControl => context.host_control_root_handle_for(path, write)?,
+    };
     let relative = relative_to_root(path, root)?;
     openat_walk(root_fd, &relative, flags, mode).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -301,7 +453,14 @@ fn open_beneath(path: &Path, write: bool, flags: i32, mode: u32) -> Result<File,
 }
 
 #[cfg(not(unix))]
-fn open_beneath(_path: &Path, _write: bool, _flags: i32, _mode: u32) -> Result<File, String> {
+fn open_beneath(
+    _context: &ToolRunContext,
+    _path: &Path,
+    _write: bool,
+    _flags: i32,
+    _mode: u32,
+    _domain: CapabilityDomain,
+) -> Result<File, String> {
     Err(
         "File operation is blocked: this platform does not yet provide a race-safe handle-relative filesystem backend"
             .to_string(),
@@ -407,13 +566,19 @@ fn openat2_relative(
 }
 
 #[cfg(unix)]
-fn create_parent_directories(path: &Path) -> Result<(), String> {
+fn create_parent_directories(
+    context: &ToolRunContext,
+    path: &Path,
+    domain: CapabilityDomain,
+) -> Result<(), String> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
 
-    let context = crate::tools::security::current_context()?;
-    let (root, root_handle) = context.root_handle_for(path, true)?;
+    let (root, root_handle) = match domain {
+        CapabilityDomain::Agent => context.root_handle_for(path, true)?,
+        CapabilityDomain::HostControl => context.host_control_root_handle_for(path, true)?,
+    };
     let parent = path
         .parent()
         .ok_or_else(|| format!("Path '{}' has no parent", path.display()))?;
@@ -485,7 +650,11 @@ fn single_component(name: &std::ffi::OsStr) -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn read_directory_entries(file: &File, path: &Path) -> Result<Vec<SecureDirEntry>, String> {
+fn read_directory_entries(
+    context: &ToolRunContext,
+    file: &File,
+    path: &Path,
+) -> Result<Vec<SecureDirEntry>, String> {
     use std::ffi::CStr;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStringExt as _;
@@ -573,7 +742,7 @@ fn read_directory_entries(file: &File, path: &Path) -> Result<Vec<SecureDirEntry
             SecureFileType::Other
         };
         let entry_path = path.join(&name);
-        if crate::tools::security::current_context()?.is_denied_path(&entry_path) {
+        if context.is_denied_path(&entry_path) {
             tracing::debug!(
                 target: "openclaudia::filesystem",
                 event = "masked_path_hidden",
@@ -605,7 +774,11 @@ fn clear_errno() {
 }
 
 #[cfg(not(unix))]
-fn create_parent_directories(_path: &Path) -> Result<(), String> {
+fn create_parent_directories(
+    _context: &ToolRunContext,
+    _path: &Path,
+    _domain: CapabilityDomain,
+) -> Result<(), String> {
     Err(
         "Directory creation is blocked: this platform lacks a race-safe handle-relative filesystem backend"
             .to_string(),
@@ -667,21 +840,24 @@ mod tests {
         std::fs::create_dir(&control).expect("control dir");
         std::fs::write(control.join("canary"), "secret").expect("control canary");
         std::fs::write(root.path().join("visible"), "public").expect("visible file");
-        let session = format!("secure-fs-control-mask-{}", uuid::Uuid::new_v4());
-        crate::tools::security::register_session_context(
-            &session,
+        let context = crate::tools::security::ToolRunContext::builder(
+            crate::state::SessionId::new(),
             root.path(),
-            root.path(),
-            &[],
-            &[],
         )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .build()
         .expect("security context");
-        let _guard = crate::tools::SessionIdGuard::set(&session);
 
-        let error = open_regular_read(&control.join("canary"))
+        let error = open_regular_read(&context, &control.join("canary"))
             .expect_err("control-plane file must not be readable");
         assert!(error.contains("masked"), "unexpected denial: {error}");
-        let names: Vec<_> = open_directory(root.path())
+        let names: Vec<_> = open_directory(&context, root.path())
             .expect("project directory")
             .entries()
             .expect("secure entries")
@@ -690,6 +866,5 @@ mod tests {
             .collect();
         assert!(names.contains(&OsString::from("visible")));
         assert!(!names.contains(&OsString::from(".openclaudia")));
-        crate::tools::security::release_session_context(&session);
     }
 }

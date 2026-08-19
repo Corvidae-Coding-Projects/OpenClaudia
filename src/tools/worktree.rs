@@ -35,25 +35,16 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Maximum time to wait for a git command (seconds).
 const GIT_TIMEOUT_SECS: u64 = 30;
 
-/// Absolute, PATH-independent location of the `git` binary for worktree ops.
-///
-/// The model-facing worktree tool executes branch validation, worktree add,
-/// status, merge, and removal commands. Resolve `git` once and then use the
-/// absolute path for every subprocess so a later PATH mutation cannot redirect
-/// those calls to an attacker-controlled executable.
-static GIT_BIN: LazyLock<Result<PathBuf, String>> =
-    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
-
-fn git_bin() -> Result<&'static Path, String> {
-    match &*GIT_BIN {
-        Ok(path) => Ok(path.as_path()),
-        Err(msg) => Err(msg.clone()),
-    }
+/// Resolve `git` through the immutable executable search path captured for the
+/// exact run that owns the worktree operation.
+fn git_bin(run: &crate::tools::ToolRunContext) -> Result<PathBuf, String> {
+    run.resolve_executable("git")
+        .map_err(|error| error.to_string())
 }
 
 /// Process-wide set of worktree paths currently held by the agent harness.
@@ -179,7 +170,10 @@ fn unregister_active_worktree(worktree_dir: &Path) {
 ///
 /// Returns a descriptive error when the name could enable option injection,
 /// shell interpretation, path traversal, or violates Git ref syntax.
-pub fn validate_branch_name(name: &str) -> Result<(), String> {
+pub fn validate_branch_name(
+    run: &crate::tools::security::ToolRunContext,
+    name: &str,
+) -> Result<(), String> {
     if name.is_empty() {
         return Err("branch name is required".to_string());
     }
@@ -246,12 +240,12 @@ pub fn validate_branch_name(name: &str) -> Result<(), String> {
     // empty path segments, etc.) to git itself. Although this invocation does
     // not inspect a repository, its argument is model-controlled, so keep it
     // inside the common subprocess boundary.
-    let security = crate::tools::security::current_context()?;
     let output = crate::tools::run_sandboxed_with_timeout_with_env(
+        run,
         crate::tools::SandboxProfile::StaticAnalyzer,
-        git_bin()?,
+        &git_bin(run)?,
         &["check-ref-format", "--branch", name],
-        security.working_directory(),
+        run.working_directory(),
         std::time::Duration::from_secs(GIT_TIMEOUT_SECS),
         &HashMap::new(),
     )
@@ -293,8 +287,12 @@ pub fn validate_branch_name(name: &str) -> Result<(), String> {
 /// implementation. The exponential-backoff schedule (1→2→5→10→25→50→100 ms,
 /// then sustained 100 ms) lives in that helper; the crosslink #956 latency
 /// fix is preserved unchanged.
-fn git_in(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let git = git_bin()?;
+fn git_in(
+    run: &crate::tools::security::ToolRunContext,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    let git = git_bin(run)?;
     // Crosslink #836: route through the shared [`run_with_timeout`]
     // helper so git, pdftotext, and any future tool subprocess share
     // one timeout/backoff implementation. The git-specific timeout
@@ -323,8 +321,9 @@ fn git_in(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
     ]);
     crate::tools::run_sandboxed_with_timeout_with_env(
+        run,
         crate::tools::SandboxProfile::GitWorktree,
-        git,
+        &git,
         &hardened_args,
         cwd,
         std::time::Duration::from_secs(GIT_TIMEOUT_SECS),
@@ -353,6 +352,7 @@ fn git_in(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
 /// subsequent tool calls (Phase 2).
 #[must_use]
 pub fn execute_enter_worktree<S: std::hash::BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
     args: &HashMap<String, Value, S>,
 ) -> (String, bool) {
     let branch = match args.get("branch") {
@@ -374,26 +374,18 @@ pub fn execute_enter_worktree<S: std::hash::BuildHasher>(
     // Crosslink #408: validate the branch name BEFORE any other git call.
     // This rejects shell-metacharacters, control chars, option-injection
     // prefixes, and forwards remaining rules to `git check-ref-format`.
-    if let Err(e) = validate_branch_name(branch) {
+    if let Err(e) = validate_branch_name(run, branch) {
         return (format!("Error: {e}"), true);
     }
 
-    let cwd = match crate::tools::security::current_context() {
-        Ok(context) => context.working_directory().to_path_buf(),
-        Err(e) => {
-            return (
-                format!("Error: cannot resolve session working directory: {e}"),
-                true,
-            )
-        }
-    };
+    let cwd = run.working_directory().to_path_buf();
 
-    match git_in(&cwd, &["rev-parse", "--is-inside-work-tree"]) {
+    match git_in(run, &cwd, &["rev-parse", "--is-inside-work-tree"]) {
         Ok(output) if output.status.success() => {}
         _ => return ("Error: not inside a git repository".to_string(), true),
     }
 
-    let git_root = git_in(&cwd, &["rev-parse", "--show-toplevel"])
+    let git_root = git_in(run, &cwd, &["rev-parse", "--show-toplevel"])
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map_or_else(|| cwd.clone(), |s| PathBuf::from(s.trim()));
@@ -420,8 +412,8 @@ pub fn execute_enter_worktree<S: std::hash::BuildHasher>(
         }
     }
 
-    let base_branch = get_current_branch_at(&cwd).unwrap_or_else(|| "HEAD".to_string());
-    create_worktree_on_disk(&cwd, &worktree_dir, branch, &base_branch)
+    let base_branch = get_current_branch_at(run, &cwd).unwrap_or_else(|| "HEAD".to_string());
+    create_worktree_on_disk(run, &cwd, &worktree_dir, branch, &base_branch)
 }
 
 /// Run `git worktree add` (with the existing-branch retry path) and surface
@@ -430,12 +422,14 @@ pub fn execute_enter_worktree<S: std::hash::BuildHasher>(
 /// `clippy::too_many_lines` ceiling. Records the new worktree in the active
 /// set on success (crosslink #624).
 fn create_worktree_on_disk(
+    run: &crate::tools::security::ToolRunContext,
     cwd: &Path,
     worktree_dir: &Path,
     branch: &str,
     base_branch: &str,
 ) -> (String, bool) {
     let result = git_in(
+        run,
         cwd,
         &[
             "worktree",
@@ -463,7 +457,9 @@ fn create_worktree_on_disk(
                 false,
             )
         }
-        Ok(output) => retry_worktree_add_for_existing_branch(cwd, worktree_dir, branch, &output),
+        Ok(output) => {
+            retry_worktree_add_for_existing_branch(run, cwd, worktree_dir, branch, &output)
+        }
         Err(e) => (format!("Failed to run git: {e}"), true),
     }
 }
@@ -473,6 +469,7 @@ fn create_worktree_on_disk(
 /// existing branch is checked out into the new worktree. Returns the final
 /// `(message, is_error)` tuple to surface to the caller.
 fn retry_worktree_add_for_existing_branch(
+    run: &crate::tools::security::ToolRunContext,
     cwd: &Path,
     worktree_dir: &Path,
     branch: &str,
@@ -486,6 +483,7 @@ fn retry_worktree_add_for_existing_branch(
         );
     }
     let retry = git_in(
+        run,
         cwd,
         &[
             "worktree",
@@ -534,8 +532,11 @@ struct ExitContext {
 /// Returns `Ok(true)` if the worktree has tracked or untracked dirty files,
 /// `Ok(false)` if it is clean, and `Err(msg)` if the porcelain status command
 /// itself failed.
-fn worktree_has_uncommitted_changes(worktree_path: &Path) -> Result<bool, String> {
-    match git_in(worktree_path, &["status", "--porcelain"]) {
+fn worktree_has_uncommitted_changes(
+    run: &crate::tools::security::ToolRunContext,
+    worktree_path: &Path,
+) -> Result<bool, String> {
+    match git_in(run, worktree_path, &["status", "--porcelain"]) {
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
             Ok(stdout.lines().any(|l| !l.trim().is_empty()))
@@ -552,6 +553,7 @@ fn worktree_has_uncommitted_changes(worktree_path: &Path) -> Result<bool, String
 /// resolved [`ExitContext`] or an error tuple ready to bubble back to the
 /// caller.
 fn validate_exit_request<S: std::hash::BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
     args: &HashMap<String, Value, S>,
 ) -> Result<ExitContext, (String, bool)> {
     let path_arg = match args.get("path") {
@@ -596,7 +598,7 @@ fn validate_exit_request<S: std::hash::BuildHasher>(
         .arg_bool_or_strict("discard_changes", false)
         .map_err(crate::tools::args::ToolArgError::into_tool_error)?;
 
-    let common_dir = match git_in(&worktree_path, &["rev-parse", "--git-common-dir"]) {
+    let common_dir = match git_in(run, &worktree_path, &["rev-parse", "--git-common-dir"]) {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
@@ -617,7 +619,7 @@ fn validate_exit_request<S: std::hash::BuildHasher>(
     // corrupted `.git` was misclassified as an isolated worktree and the
     // function would happily call `git worktree remove --force` on the
     // user's main repository. Surface the underlying git failure instead.
-    let git_dir = match git_in(&worktree_path, &["rev-parse", "--git-dir"]) {
+    let git_dir = match git_in(run, &worktree_path, &["rev-parse", "--git-dir"]) {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Ok(o) => {
             return Err((
@@ -649,7 +651,7 @@ fn validate_exit_request<S: std::hash::BuildHasher>(
         ));
     }
 
-    let current_branch = get_current_branch_at(&worktree_path).unwrap_or_default();
+    let current_branch = get_current_branch_at(run, &worktree_path).unwrap_or_default();
     let main_path = Path::new(&common_dir)
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -692,8 +694,11 @@ pub(crate) enum MergeOutcome {
 /// `git merge --abort` in the main worktree so the user is left in a clean
 /// state instead of a half-merged HEAD that the next `worktree remove
 /// --force` would silently throw away.
-fn merge_into_main(ctx: &ExitContext) -> MergeOutcome {
-    match git_in(&ctx.worktree_path, &["add", "-A"]) {
+fn merge_into_main(
+    run: &crate::tools::security::ToolRunContext,
+    ctx: &ExitContext,
+) -> MergeOutcome {
+    match git_in(run, &ctx.worktree_path, &["add", "-A"]) {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
             return MergeOutcome::Failed {
@@ -711,6 +716,7 @@ fn merge_into_main(ctx: &ExitContext) -> MergeOutcome {
     }
 
     let commit = git_in(
+        run,
         &ctx.worktree_path,
         &[
             "commit",
@@ -726,7 +732,11 @@ fn merge_into_main(ctx: &ExitContext) -> MergeOutcome {
         return MergeOutcome::NothingToMerge;
     }
 
-    match git_in(&ctx.main_path, &["merge", &ctx.current_branch, "--no-edit"]) {
+    match git_in(
+        run,
+        &ctx.main_path,
+        &["merge", &ctx.current_branch, "--no-edit"],
+    ) {
         Ok(o) if o.status.success() => MergeOutcome::Merged(format!(
             "Merged branch '{}' into main worktree.",
             ctx.current_branch
@@ -737,7 +747,7 @@ fn merge_into_main(ctx: &ExitContext) -> MergeOutcome {
             // then discard the user's uncommitted (conflict-resolution)
             // edits. Abort the merge first so HEAD is clean again.
             let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            let abort = git_in(&ctx.main_path, &["merge", "--abort"]);
+            let abort = git_in(run, &ctx.main_path, &["merge", "--abort"]);
             let aborted = abort.is_ok_and(|out| out.status.success());
             MergeOutcome::Failed {
                 message: format!(
@@ -759,8 +769,12 @@ fn merge_into_main(ctx: &ExitContext) -> MergeOutcome {
 /// Issue `git worktree remove --force` from the main worktree and return
 /// `(removed_ok, detail_string)`. On success, drop the worktree from the
 /// active set and bump the cwd-cache generation (crosslink #624).
-fn remove_worktree(ctx: &ExitContext) -> (bool, String) {
+fn remove_worktree(
+    run: &crate::tools::security::ToolRunContext,
+    ctx: &ExitContext,
+) -> (bool, String) {
     let removed = git_in(
+        run,
         &ctx.main_path,
         &[
             "worktree",
@@ -796,9 +810,10 @@ fn remove_worktree(ctx: &ExitContext) -> (bool, String) {
 ///   `apply_changes=true` because the merge path commits the work first.
 #[must_use]
 pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
     args: &HashMap<String, Value, S>,
 ) -> (String, bool) {
-    let ctx = match validate_exit_request(args) {
+    let ctx = match validate_exit_request(run, args) {
         Ok(ctx) => ctx,
         Err(err) => return err,
     };
@@ -807,7 +822,7 @@ pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
     // gate fires only on the discard path; `apply_changes=true` commits
     // work before removal so dirty state is not lost there.
     if !ctx.apply_changes && !ctx.discard_changes {
-        match worktree_has_uncommitted_changes(&ctx.worktree_path) {
+        match worktree_has_uncommitted_changes(run, &ctx.worktree_path) {
             Ok(true) => {
                 return (
                     format!(
@@ -832,7 +847,7 @@ pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
     }
 
     if ctx.apply_changes {
-        let merge_result = merge_into_main(&ctx);
+        let merge_result = merge_into_main(run, &ctx);
 
         // crosslink #858: on merge conflict, refuse the destructive
         // `worktree remove --force` and surface the conflict to the caller.
@@ -859,7 +874,7 @@ pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
             MergeOutcome::Failed { .. } => unreachable!("returned above"),
         };
 
-        let (removed_ok, detail) = remove_worktree(&ctx);
+        let (removed_ok, detail) = remove_worktree(run, &ctx);
         let warning = if removed_ok {
             String::new()
         } else {
@@ -877,7 +892,7 @@ pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
         );
     }
 
-    let (removed_ok, detail) = remove_worktree(&ctx);
+    let (removed_ok, detail) = remove_worktree(run, &ctx);
     if removed_ok {
         (
             format!(
@@ -905,17 +920,9 @@ pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
 /// Runs `git worktree list` from the process CWD (read-only) — this queries
 /// git but does not mutate any state.
 #[must_use]
-pub fn execute_list_worktrees() -> (String, bool) {
-    let cwd = match crate::tools::security::current_context() {
-        Ok(context) => context.working_directory().to_path_buf(),
-        Err(error) => {
-            return (
-                format!("Failed to resolve session working directory: {error}"),
-                true,
-            )
-        }
-    };
-    let output = git_in(&cwd, &["worktree", "list", "--porcelain"]);
+pub fn execute_list_worktrees(run: &crate::tools::security::ToolRunContext) -> (String, bool) {
+    let cwd = run.working_directory().to_path_buf();
+    let output = git_in(run, &cwd, &["worktree", "list", "--porcelain"]);
 
     match output {
         Ok(o) if o.status.success() => {
@@ -977,8 +984,11 @@ pub fn execute_list_worktrees() -> (String, bool) {
     }
 }
 
-fn get_current_branch_at(cwd: &Path) -> Option<String> {
-    git_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+fn get_current_branch_at(
+    run: &crate::tools::security::ToolRunContext,
+    cwd: &Path,
+) -> Option<String> {
+    git_in(run, cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -1077,6 +1087,10 @@ mod tests {
     use crate::tools::testutil::process_cwd_lock;
     use std::sync::MutexGuard;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     /// Local alias preserving call-site readability while delegating to the
     /// shared process-wide CWD lock in [`crate::tools::testutil`]. The
     /// previous implementation kept a private `static LOCK` here — that
@@ -1093,7 +1107,7 @@ mod tests {
     fn test_get_current_branch_at_cwd() {
         let _lock = cwd_lock();
         let cwd = std::env::current_dir().unwrap();
-        let branch = get_current_branch_at(&cwd);
+        let branch = get_current_branch_at(test_run(), &cwd);
         assert!(branch.is_some());
     }
 
@@ -1101,7 +1115,7 @@ mod tests {
     fn test_enter_worktree_requires_branch() {
         let _lock = cwd_lock();
         let args = HashMap::new();
-        let (msg, is_err) = execute_enter_worktree(&args);
+        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("branch name is required"));
     }
@@ -1110,7 +1124,7 @@ mod tests {
     fn enter_worktree_rejects_wrong_type_branch() {
         let mut args = HashMap::new();
         args.insert("branch".to_string(), serde_json::json!(42));
-        let (msg, is_err) = execute_enter_worktree(&args);
+        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("Invalid 'branch' argument: expected string"));
     }
@@ -1118,7 +1132,7 @@ mod tests {
     #[test]
     fn test_list_worktrees() {
         let _lock = cwd_lock();
-        let (msg, is_err) = execute_list_worktrees();
+        let (msg, is_err) = execute_list_worktrees(test_run());
         assert!(!is_err);
         assert!(msg.contains("worktree") || msg.contains("Active"));
     }
@@ -1133,7 +1147,7 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(String::new()),
         );
-        let (msg, is_err) = execute_enter_worktree(&args);
+        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
         assert!(is_err, "empty branch must produce is_error=true");
         assert!(
             msg.contains("branch name is required"),
@@ -1144,32 +1158,20 @@ mod tests {
     /// Contract: `enter_worktree` outside a git repo returns `is_error=true`
     /// with a repo-not-found message.
     ///
-    /// Because the production function no longer mutates CWD, the only way
-    /// to exercise the "not a git repo" path is to set CWD in the test
-    /// itself. We hold `cwd_lock` to serialise with other tests, and restore
-    /// CWD on the way out.
+    /// The test supplies an isolated run rooted at a non-git directory; no
+    /// process CWD mutation or ambient session registration is involved.
     #[test]
     fn enter_worktree_outside_git_repo_is_error() {
         let _lock = cwd_lock();
         let tmp = tempfile::tempdir().expect("temp dir");
-        let session_id = "worktree-outside-repository";
-        crate::tools::security::register_session_context(
-            session_id,
-            tmp.path(),
-            tmp.path(),
-            &[],
-            &[],
-        )
-        .expect("register isolated test capability");
-        let _session = crate::tools::SessionIdGuard::set(session_id);
+        let run = crate::tools::security::test_run_context_for(tmp.path());
 
         let mut args = HashMap::new();
         args.insert(
             "branch".to_string(),
             serde_json::Value::String("test-branch".to_string()),
         );
-        let (msg, is_err) = execute_enter_worktree(&args);
-        crate::tools::security::release_session_context(session_id);
+        let (msg, is_err) = execute_enter_worktree(&run, &args);
 
         assert!(is_err, "must error outside a git repo");
         assert!(
@@ -1185,7 +1187,7 @@ mod tests {
     fn exit_worktree_without_path_is_error() {
         let _lock = cwd_lock();
         let args = HashMap::new();
-        let (msg, is_err) = execute_exit_worktree(&args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
         assert!(is_err, "missing path must produce is_error=true");
         assert!(
             msg.contains("'path' is required"),
@@ -1197,7 +1199,7 @@ mod tests {
     fn exit_worktree_rejects_wrong_type_path() {
         let mut args = HashMap::new();
         args.insert("path".to_string(), serde_json::json!(42));
-        let (msg, is_err) = execute_exit_worktree(&args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("Invalid 'path' argument: expected string"));
     }
@@ -1215,7 +1217,7 @@ mod tests {
             serde_json::Value::String("true".to_string()),
         );
 
-        let (msg, is_err) = execute_exit_worktree(&args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
         assert!(is_err, "non-boolean apply_changes must error: {msg}");
         assert!(
             msg.contains("Invalid 'apply_changes' argument: expected boolean"),
@@ -1228,7 +1230,7 @@ mod tests {
             serde_json::Value::String("true".to_string()),
         );
 
-        let (msg, is_err) = execute_exit_worktree(&args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
         assert!(is_err, "non-boolean discard_changes must error: {msg}");
         assert!(
             msg.contains("Invalid 'discard_changes' argument: expected boolean"),
@@ -1259,7 +1261,7 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String(main.display().to_string()),
         );
-        let (msg, is_err) = execute_exit_worktree(&args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
         assert!(is_err, "exit on main worktree must produce is_error=true");
         assert!(
             msg.contains("Not in an isolated worktree")
@@ -1286,10 +1288,10 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (first_msg, first_err) = execute_enter_worktree(&args);
+        let (first_msg, first_err) = execute_enter_worktree(test_run(), &args);
         assert!(!first_err, "first call must succeed; got: {first_msg}");
 
-        let (second_msg, second_err) = execute_enter_worktree(&args);
+        let (second_msg, second_err) = execute_enter_worktree(test_run(), &args);
         assert!(!second_err, "duplicate call must be a no-op (not error)");
         assert!(
             second_msg.contains("already in worktree") && second_msg.contains("No-op"),
@@ -1305,8 +1307,8 @@ mod tests {
             serde_json::Value::String(wt.display().to_string()),
         );
         exit_args.insert("discard_changes".to_string(), serde_json::Value::Bool(true));
-        let _ = execute_exit_worktree(&exit_args);
-        let _ = git_in(&cwd, &["branch", "-D", &branch]);
+        let _ = execute_exit_worktree(test_run(), &exit_args);
+        let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
     }
 
     /// #624: the cwd-cache generation counter advances when a worktree is
@@ -1326,7 +1328,7 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (msg, is_err) = execute_enter_worktree(&args);
+        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
         assert!(!is_err, "enter must succeed; got: {msg}");
         let after_enter = cwd_cache_generation();
         assert!(
@@ -1342,7 +1344,7 @@ mod tests {
             serde_json::Value::String(wt.display().to_string()),
         );
         exit_args.insert("discard_changes".to_string(), serde_json::Value::Bool(true));
-        let (msg, is_err) = execute_exit_worktree(&exit_args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args);
         assert!(!is_err, "exit must succeed; got: {msg}");
         let after_exit = cwd_cache_generation();
         assert!(
@@ -1350,7 +1352,7 @@ mod tests {
             "cwd_cache_generation must advance on exit (after_enter={after_enter}, after_exit={after_exit})"
         );
 
-        let _ = git_in(&cwd, &["branch", "-D", &branch]);
+        let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
     }
 
     /// #623: with the worktree dirty and `discard_changes` omitted (or
@@ -1369,7 +1371,7 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (msg, is_err) = execute_enter_worktree(&args);
+        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
         assert!(!is_err, "enter must succeed; got: {msg}");
 
         let cwd = std::env::current_dir().unwrap();
@@ -1383,7 +1385,7 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String(wt.display().to_string()),
         );
-        let (msg, is_err) = execute_exit_worktree(&exit_args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args);
         assert!(is_err, "dirty exit without discard must error");
         assert!(
             msg.contains("uncommitted changes") && msg.contains("discard_changes=true"),
@@ -1398,11 +1400,11 @@ mod tests {
 
         // Now opt in: discard_changes=true must succeed.
         exit_args.insert("discard_changes".to_string(), serde_json::Value::Bool(true));
-        let (msg, is_err) = execute_exit_worktree(&exit_args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args);
         assert!(!is_err, "discard_changes=true must succeed; got: {msg}");
         assert!(!wt.exists(), "successful exit must remove the worktree");
 
-        let _ = git_in(&cwd, &["branch", "-D", &branch]);
+        let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
     }
 
     /// #623: a *clean* worktree exits successfully without needing the
@@ -1420,7 +1422,7 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (msg, is_err) = execute_enter_worktree(&args);
+        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
         assert!(!is_err, "enter must succeed; got: {msg}");
 
         let cwd = std::env::current_dir().unwrap();
@@ -1432,14 +1434,14 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String(wt.display().to_string()),
         );
-        let (msg, is_err) = execute_exit_worktree(&exit_args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args);
         assert!(
             !is_err,
             "clean exit without discard_changes must succeed; got: {msg}"
         );
         assert!(!wt.exists(), "clean exit must remove the worktree");
 
-        let _ = git_in(&cwd, &["branch", "-D", &branch]);
+        let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
     }
 
     // ─── #408 regression tests: branch-name validation ────────────────────────
@@ -1455,9 +1457,9 @@ mod tests {
             "user/alice/work",
         ] {
             assert!(
-                validate_branch_name(ok).is_ok(),
+                validate_branch_name(test_run(), ok).is_ok(),
                 "expected '{ok}' to validate; got: {:?}",
-                validate_branch_name(ok)
+                validate_branch_name(test_run(), ok)
             );
         }
     }
@@ -1469,7 +1471,7 @@ mod tests {
     fn validate_branch_name_rejects_double_dot_408() {
         let cases = ["..", "a..b", "../escape", "foo/..", "./..", "..foo"];
         for name in &cases {
-            let r = validate_branch_name(name);
+            let r = validate_branch_name(test_run(), name);
             assert!(r.is_err(), "expected '{name}' to be rejected; got Ok");
         }
     }
@@ -1480,7 +1482,7 @@ mod tests {
     #[test]
     fn validate_branch_name_rejects_leading_dash_408() {
         for name in &["-foo", "-rf", "--upload-pack=evil", "-"] {
-            let r = validate_branch_name(name);
+            let r = validate_branch_name(test_run(), name);
             assert!(r.is_err(), "expected '{name}' to be rejected; got Ok");
             let msg = r.unwrap_err();
             assert!(
@@ -1506,7 +1508,7 @@ mod tests {
             "a 'b",
             "a\"b",
         ] {
-            let r = validate_branch_name(name);
+            let r = validate_branch_name(test_run(), name);
             assert!(
                 r.is_err(),
                 "expected '{name}' to be rejected as shell metacharacter; got Ok"
@@ -1521,7 +1523,7 @@ mod tests {
     fn validate_branch_name_rejects_control_chars_408() {
         let cases = ["a\nb", "a\rb", "a\tb", "a\x01b", "a\x07b", "\x7fhello"];
         for name in &cases {
-            let r = validate_branch_name(name);
+            let r = validate_branch_name(test_run(), name);
             assert!(
                 r.is_err(),
                 "expected control-char name {name:?} to be rejected; got Ok"
@@ -1541,7 +1543,7 @@ mod tests {
         let cases = ["a:b", "a\\b", "a~b", "a?b", "a*b", "a[b", "trailing."];
         for name in &cases {
             assert!(
-                validate_branch_name(name).is_err(),
+                validate_branch_name(test_run(), name).is_err(),
                 "expected '{name}' to be rejected; got Ok"
             );
         }
@@ -1560,7 +1562,7 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String("../escape".to_string()),
         );
-        let (msg, is_err) = execute_enter_worktree(&args);
+        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
         assert!(is_err, "path-traversal branch must produce is_error=true");
         assert!(
             msg.contains("invalid branch name") || msg.contains("'..'"),
@@ -1578,7 +1580,7 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String("-rf".to_string()),
         );
-        let (msg, is_err) = execute_enter_worktree(&args);
+        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
         assert!(is_err, "leading-dash branch must produce is_error=true");
         assert!(
             msg.contains("invalid branch name"),
@@ -1606,7 +1608,7 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (msg, _is_err) = execute_enter_worktree(&args);
+        let (msg, _is_err) = execute_enter_worktree(test_run(), &args);
 
         let after = std::env::current_dir().expect("cwd after");
         assert_eq!(
@@ -1619,10 +1621,11 @@ mod tests {
         if !msg.contains("Failed") && !msg.contains("Error") {
             let wt = before.join(".worktrees").join(&branch);
             let _ = git_in(
+                test_run(),
                 &before,
                 &["worktree", "remove", wt.to_str().unwrap_or(""), "--force"],
             );
-            let _ = git_in(&before, &["branch", "-D", &branch]);
+            let _ = git_in(test_run(), &before, &["branch", "-D", &branch]);
         }
     }
 
@@ -1633,7 +1636,7 @@ mod tests {
         let _lock = cwd_lock();
         let before = std::env::current_dir().expect("cwd before");
 
-        let (_, is_err) = execute_exit_worktree(&HashMap::new());
+        let (_, is_err) = execute_exit_worktree(test_run(), &HashMap::new());
         assert!(is_err);
         let after_missing = std::env::current_dir().expect("cwd after missing-path");
         assert_eq!(before, after_missing, "CWD changed on missing-path error");
@@ -1643,7 +1646,7 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String("/nonexistent/path/for/345".to_string()),
         );
-        let (_, is_err) = execute_exit_worktree(&args);
+        let (_, is_err) = execute_exit_worktree(test_run(), &args);
         assert!(is_err);
         let after_nonexistent = std::env::current_dir().expect("cwd after nonexistent");
         assert_eq!(
@@ -1656,7 +1659,7 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String(before.display().to_string()),
         );
-        let (_, is_err) = execute_exit_worktree(&args);
+        let (_, is_err) = execute_exit_worktree(test_run(), &args);
         assert!(is_err);
         let after_main = std::env::current_dir().expect("cwd after main");
         assert_eq!(before, after_main, "CWD changed on main-worktree error");
@@ -1696,7 +1699,7 @@ mod tests {
 
     #[test]
     fn production_git_invocations_use_resolved_binary_path() {
-        let git = git_bin().expect("worktree tests require git on PATH");
+        let git = git_bin(test_run()).expect("worktree tests require git on the run-bound PATH");
         assert!(
             git.is_absolute(),
             "git_bin must resolve git to an absolute path, got {}",

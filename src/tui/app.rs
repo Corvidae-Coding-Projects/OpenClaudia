@@ -54,38 +54,6 @@ fn input_content_width(area_width: u16) -> u16 {
     area_width.saturating_sub(INPUT_PROMPT_WIDTH).max(1)
 }
 
-fn current_exe_command() -> Result<Command, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("failed to resolve current executable: {e}"))?;
-    Ok(Command::new(exe))
-}
-
-fn format_init_command_output(out: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let mut parts = Vec::new();
-    let stdout = stdout.trim();
-    let stderr = stderr.trim();
-    if !stdout.is_empty() {
-        parts.push(stdout);
-    }
-    if !stderr.is_empty() {
-        parts.push(stderr);
-    }
-    let details = parts.join("\n");
-    if out.status.success() {
-        if details.is_empty() {
-            "Initialized OpenClaudia configuration in .openclaudia/".to_string()
-        } else {
-            details
-        }
-    } else if details.is_empty() {
-        format!("Init failed: {}", out.status)
-    } else {
-        format!("Init failed: {details}")
-    }
-}
-
 fn format_review_command_output(out: &Output) -> String {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -178,7 +146,7 @@ fn compile_file_ref_regex(pattern: &str) -> Option<regex::Regex> {
 }
 
 /// Expand @filename references in user input by inlining file contents.
-fn expand_file_refs(input: &str) -> String {
+fn expand_file_refs(run: &crate::tools::ToolRunContext, input: &str) -> String {
     if !input.contains('@') {
         return input.to_string();
     }
@@ -187,9 +155,6 @@ fn expand_file_refs(input: &str) -> String {
     };
     let mut result = input.to_string();
     let mut replacements = Vec::new();
-
-    // Get project root for path traversal validation
-    let cwd = std::env::current_dir().unwrap_or_default();
 
     for cap in file_ref_re.captures_iter(input) {
         let full_match = match cap.get(0) {
@@ -201,57 +166,24 @@ fn expand_file_refs(input: &str) -> String {
             None => continue,
         };
 
-        // Resolve and validate path — reject traversal attempts
-        let resolved = if std::path::Path::new(raw_path).is_absolute() {
-            std::path::PathBuf::from(raw_path)
-        } else {
-            cwd.join(raw_path)
-        };
-
-        // Reject paths with .. components
-        if resolved
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
+        // Use the same immutable capability roots and descriptor-relative
+        // secure open as read_file. No process CWD or pathname-only check can
+        // grant this context-assembly helper additional authority.
+        let (canonical, mut file) = match crate::tools::open_capability_regular_read(run, raw_path)
         {
-            replacements.push((
-                full_match.to_string(),
-                format!("[Path traversal blocked: {raw_path}]"),
-            ));
-            continue;
-        }
-
-        // #818: open-then-read on a single file descriptor.  The previous
-        // canonicalize → read_to_string pair was a TOCTOU window — between
-        // the two syscalls the path could be replaced with a symlink to an
-        // arbitrary file.  We now open the file first (yielding an fd
-        // pinned to one inode), then validate the canonical path of the
-        // already-resolved name, then read from the same fd.  Any post-open
-        // symlink flip is irrelevant — the kernel keeps reading the
-        // originally-opened inode.
-        let Ok(mut file) = std::fs::File::open(&resolved) else {
-            replacements.push((
-                full_match.to_string(),
-                format!("[File not found: {raw_path}]"),
-            ));
-            continue;
+            Ok(opened) => opened,
+            Err(error) => {
+                let label = if error.contains("traversal") {
+                    "Path traversal blocked"
+                } else if error.contains("outside") || error.contains("masked") {
+                    "File outside granted roots"
+                } else {
+                    "Cannot read file"
+                };
+                replacements.push((full_match.to_string(), format!("[{label}: {raw_path}]")));
+                continue;
+            }
         };
-        // Canonicalize for the containment check.  Even if the symlink
-        // chain is swapped between the open() above and this canonicalize,
-        // the file we will actually read is the inode pinned by `file`.
-        let Ok(canonical) = std::fs::canonicalize(&resolved) else {
-            replacements.push((
-                full_match.to_string(),
-                format!("[File not found: {raw_path}]"),
-            ));
-            continue;
-        };
-        if !canonical.starts_with(&cwd) {
-            replacements.push((
-                full_match.to_string(),
-                format!("[File outside project directory: {raw_path}]"),
-            ));
-            continue;
-        }
         let mut content = String::new();
         match std::io::Read::read_to_string(&mut file, &mut content) {
             Ok(_) => {
@@ -795,12 +727,72 @@ impl Default for ApiClient {
     }
 }
 
+fn build_startup_session_run_context(
+    session: &Session,
+    provider: &str,
+) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
+    let identity = session.inspect_state(|state| state.identity.clone());
+    crate::tools::ToolRunContext::builder(identity.session_id, identity.project_root)
+        .working_directory(identity.cwd)
+        .host_startup_grants()
+        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(true)
+        .secrets(true)
+        .provider(provider)
+        .build()
+}
+
+fn derive_session_run_context(
+    parent: &crate::tools::ToolRunContext,
+    session: &Session,
+    active_provider: &str,
+) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
+    if !session.provider.eq_ignore_ascii_case(active_provider) {
+        return Err(format!(
+            "Saved session provider '{}' differs from the active provider '{}'; switch providers before resuming it",
+            session.provider, active_provider
+        ));
+    }
+    let identity = session.inspect_state(|state| state.identity.clone());
+    let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
+        format!(
+            "Cannot resume project root '{}': {error}",
+            identity.project_root.display()
+        )
+    })?;
+    if project_root != parent.project_root() {
+        return Err(format!(
+            "Session project '{}' differs from the authorized launch project '{}'; launch OpenClaudia from that project to resume it",
+            project_root.display(),
+            parent.project_root().display()
+        ));
+    }
+    parent.derive_frontend_session(
+        identity.session_id,
+        &project_root,
+        &identity.cwd,
+        active_provider,
+    )
+}
+
+struct TuiMcpRuntime {
+    plugin_manager: std::sync::Arc<crate::plugins::PluginManager>,
+    manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+    trusted_servers: std::collections::HashSet<String>,
+}
+
 /// Main TUI application state.
 pub struct App {
     pub messages: MessageList,
     pub input: TextInput,
     pub model: String,
     pub provider: String,
+    /// Exact immutable host capabilities for this interactive session.
+    run_context: Result<std::sync::Arc<crate::tools::ToolRunContext>, String>,
+    /// MCP composition snapshot rebound when the frontend creates a new exact
+    /// run generation. Trust and plugin discovery are captured at launch.
+    mcp_runtime: Option<TuiMcpRuntime>,
     pub mode: Mode,
     pub should_quit: bool,
     pub is_waiting: bool,
@@ -876,6 +868,20 @@ pub enum ActiveOverlay {
 }
 
 impl App {
+    /// Clone the exact run capability after startup/resume has selected the
+    /// final session identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the startup/resume capability-construction error when the TUI
+    /// could not bind its selected session to an immutable run.
+    pub fn tool_run_context(&self) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
+        self.run_context
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .map_err(Clone::clone)
+    }
+
     #[must_use]
     pub fn new(model: &str, provider: &str) -> Self {
         Self::new_with_policy(
@@ -896,11 +902,14 @@ impl App {
         let chat_session = Session::new(model, provider);
         let transcript_subscriber =
             crate::transcript::TranscriptStateSubscriber::new(chat_session.state_store());
+        let run_context = build_startup_session_run_context(&chat_session, provider);
         Self {
             messages: MessageList::new(),
             input: TextInput::new(),
             model: model.to_string(),
             provider: provider.to_string(),
+            run_context,
+            mcp_runtime: None,
             mode: Mode::Build,
             should_quit: false,
             is_waiting: false,
@@ -937,17 +946,50 @@ impl App {
         self.overlay = Some(ActiveOverlay::Help(super::components::HelpOverlay::new()));
     }
 
-    fn apply_loaded_session(&mut self, loaded: &Session) {
+    fn apply_loaded_session(&mut self, loaded: &Session) -> bool {
+        let current_run = match self.run_context.as_ref() {
+            Ok(run) => std::sync::Arc::clone(run),
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Cannot replace a session whose current run is unavailable: {error}"
+                )));
+                return false;
+            }
+        };
+        let next_run = match derive_session_run_context(&current_run, loaded, &self.provider) {
+            Ok(run) => run,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(error));
+                return false;
+            }
+        };
+        let permission_bypass = self.chat_session.permission_bypass_enabled();
+
         // Flush the old snapshot before replacement. Subscribers stay attached
         // because `apply_loaded` replaces the shared store in place.
         self.transcript_subscriber.flush_now();
+        crate::tools::retire_run(&current_run);
         self.chat_session.apply_loaded(loaded);
+        self.chat_session.set_permission_bypass(permission_bypass);
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
+        self.run_context = Ok(std::sync::Arc::clone(&next_run));
+        if let Some(config) = self.app_config.as_ref() {
+            crate::guardrails::configure(&next_run, &config.guardrails);
+        }
+        self.rebind_permission_manager(&next_run);
+        self.refresh_prompt_context_for_run();
+        self.rebind_mcp_runtime(&next_run);
         self.mode = tui_mode_for_agent(loaded.agent_mode());
         self.refresh_app_config_target();
         let _ = self.chat_session.refresh_estimated_tokens();
-        let transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let transcript_cwd = self.run_context.as_ref().map_or_else(
+            |_| {
+                self.chat_session
+                    .inspect_state(|state| state.identity.cwd.clone())
+            },
+            |run| run.working_directory().to_path_buf(),
+        );
         self.chat_session
             .set_transcript_position(transcript_cwd, self.chat_session.message_count());
         // Repaint the transcript.
@@ -977,6 +1019,52 @@ impl App {
             });
         }
         self.drain_state_subscribers();
+        true
+    }
+
+    fn refresh_prompt_context_for_run(&mut self) {
+        if self.api_client.prompt_blocks.is_none() {
+            return;
+        }
+        let Ok(run) = self.run_context.as_ref() else {
+            self.api_client.prompt_blocks = None;
+            return;
+        };
+        self.api_client.prompt_blocks = Some(crate::prompt::build_prompt_context_for_run(
+            &self.chat_session.behavior_mode(),
+            self.memory_db.as_deref(),
+            run,
+        ));
+    }
+
+    fn rebind_mcp_runtime(&mut self, run: &std::sync::Arc<crate::tools::ToolRunContext>) {
+        let Some(runtime) = self.mcp_runtime.as_mut() else {
+            return;
+        };
+        let next_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::mcp::McpManager::new(std::sync::Arc::clone(run)),
+        ));
+        let _ = crate::mcp::install_manager(run, &next_manager);
+        let previous_manager = std::mem::replace(&mut runtime.manager, next_manager.clone());
+        let plugin_manager = std::sync::Arc::clone(&runtime.plugin_manager);
+        let trusted_servers = runtime.trusted_servers.clone();
+        let Some(handle) = self.runtime_handle.clone() else {
+            tracing::warn!(
+                "MCP session rebind installed without reconnect because the TUI runtime is unavailable"
+            );
+            return;
+        };
+        drop(handle.spawn(async move {
+            if let Err(error) = previous_manager.write().await.disconnect_all().await {
+                tracing::warn!(%error, "failed to disconnect MCP servers for retired TUI run");
+            }
+            crate::proxy::connect_mcp_servers_with_trust(
+                &next_manager,
+                &plugin_manager,
+                &trusted_servers,
+            )
+            .await;
+        }));
     }
 
     /// Install the lifecycle analytics sink for the active state store.
@@ -1013,7 +1101,7 @@ impl App {
             )));
             return;
         };
-        self.apply_loaded_session(&loaded);
+        let _ = self.apply_loaded_session(&loaded);
     }
 
     /// Apply top-level `--resume` / `--session-id` startup options.
@@ -1038,14 +1126,34 @@ impl App {
                 .add(DisplayMessage::system("No saved sessions to resume."));
             return;
         };
-        self.apply_loaded_session(&loaded);
+        let _ = self.apply_loaded_session(&loaded);
     }
 
     /// Apply the current process's permission posture after any startup
     /// resume. This prevents a persisted session from carrying a dangerous
     /// bypass choice into a later invocation that omitted the flag.
-    pub fn set_permission_bypass(&self, enabled: bool) {
+    pub fn set_permission_bypass(&mut self, enabled: bool) {
         self.chat_session.set_permission_bypass(enabled);
+        if let Ok(run) = self.run_context.as_ref().map(std::sync::Arc::clone) {
+            self.rebind_permission_manager(&run);
+        }
+    }
+
+    fn rebind_permission_manager(&mut self, run: &crate::tools::ToolRunContext) {
+        let Some(config) = self.app_config.as_ref() else {
+            return;
+        };
+        let manager = if self.chat_session.permission_bypass_enabled() {
+            crate::permissions::PermissionManager::unrestricted_for_run(run)
+        } else {
+            crate::permissions::PermissionManager::trusted_for_run(
+                run,
+                config.permissions.enabled,
+                config.permissions.default_allow.clone(),
+                config.web_fetch.preapproved_domains.clone(),
+            )
+        };
+        self.permission_mgr = Some(std::sync::Arc::new(manager));
     }
 
     /// Open the log-selector (session picker) overlay seeded with
@@ -1077,11 +1185,15 @@ impl App {
         if let (Some(engine), Some(handle)) =
             (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
         {
+            let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
+                return;
+            };
             let engine = engine.clone();
             let session_id = self.chat_session.id();
             handle.spawn(async move {
-                let input = crate::hooks::HookInput::new(crate::hooks::HookEvent::Stop)
-                    .with_session_id(session_id);
+                let input =
+                    crate::hooks::HookInput::for_run(&run_context, crate::hooks::HookEvent::Stop)
+                        .with_session_id(session_id);
                 let _ = engine.run(crate::hooks::HookEvent::Stop, &input).await;
             });
         }
@@ -1093,6 +1205,9 @@ impl App {
         if let (Some(engine), Some(handle)) =
             (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
         {
+            let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
+                return;
+            };
             let engine = engine.clone();
             let session_id = self.chat_session.id();
             let message = message.to_string();
@@ -1103,7 +1218,15 @@ impl App {
                     "level": level.clone(),
                     "session_id": session_id,
                 });
-                let _ = engine.fire_notification(&level, payload).await;
+                let input = crate::hooks::HookInput::for_run(
+                    &run_context,
+                    crate::hooks::HookEvent::Notification,
+                )
+                .with_extra("notification_type", serde_json::Value::String(level))
+                .with_extra("data", payload);
+                let _ = engine
+                    .run(crate::hooks::HookEvent::Notification, &input)
+                    .await;
             });
         }
     }
@@ -1134,6 +1257,21 @@ impl App {
         self.api_client.claude_code_token = claude_code_token;
     }
 
+    /// Retain the launch-time MCP discovery/trust snapshot so a later session
+    /// transition can create a manager for the new exact run generation.
+    pub fn set_mcp_runtime(
+        &mut self,
+        plugin_manager: std::sync::Arc<crate::plugins::PluginManager>,
+        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+        trusted_servers: std::collections::HashSet<String>,
+    ) {
+        self.mcp_runtime = Some(TuiMcpRuntime {
+            plugin_manager,
+            manager,
+            trusted_servers,
+        });
+    }
+
     fn apply_provider_switch(&mut self, switch: ProviderSwitch) {
         let ProviderSwitch {
             provider,
@@ -1146,12 +1284,45 @@ impl App {
             prompt_blocks,
         } = switch;
 
+        let current_run = match self.run_context.as_ref() {
+            Ok(run) => std::sync::Arc::clone(run),
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Provider switch cannot create a run capability: {error}"
+                )));
+                return;
+            }
+        };
+        let identity = self
+            .chat_session
+            .inspect_state(|state| state.identity.clone());
+        let next_run = match current_run.derive_frontend_session(
+            identity.session_id,
+            &identity.project_root,
+            &identity.cwd,
+            &provider,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Provider switch cannot bind the session run: {error}"
+                )));
+                return;
+            }
+        };
+
+        crate::tools::retire_run(&current_run);
+        self.run_context = Ok(std::sync::Arc::clone(&next_run));
         self.provider = provider;
         self.model = model;
         self.chat_session.provider.clone_from(&self.provider);
         self.chat_session.model.clone_from(&self.model);
         self.chat_session.touch();
         self.refresh_app_config_target();
+        if let Some(config) = self.app_config.as_ref() {
+            crate::guardrails::configure(&next_run, &config.guardrails);
+        }
+        self.rebind_permission_manager(&next_run);
 
         self.set_api_config(
             endpoint,
@@ -1160,6 +1331,8 @@ impl App {
             prompt_blocks,
             claude_code_token,
         );
+        self.refresh_prompt_context_for_run();
+        self.rebind_mcp_runtime(&next_run);
         self.vdd_builder_auth = vdd_builder_auth;
         self.persist_session();
         self.messages.add(DisplayMessage::system(format!(
@@ -1296,12 +1469,25 @@ impl App {
         // within a runtime" panic that surfaced when the TUI was launched
         // via `#[tokio::main(flavor = "current_thread")]`.
         if let Some(engine) = self.hook_engine.as_ref() {
-            let session_id = self.chat_session.id();
-            let input = crate::hooks::HookInput::new(crate::hooks::HookEvent::SessionEnd)
+            if let Ok(run_context) = self.run_context.as_ref() {
+                let session_id = self.chat_session.id();
+                let input = crate::hooks::HookInput::for_run(
+                    run_context,
+                    crate::hooks::HookEvent::SessionEnd,
+                )
                 .with_session_id(session_id);
-            let _ = engine
-                .run(crate::hooks::HookEvent::SessionEnd, &input)
-                .await;
+                let _ = engine
+                    .run(crate::hooks::HookEvent::SessionEnd, &input)
+                    .await;
+            }
+        }
+        if let Some(runtime) = self.mcp_runtime.as_ref() {
+            if let Err(error) = runtime.manager.write().await.disconnect_all().await {
+                tracing::warn!(%error, "failed to disconnect MCP servers during TUI shutdown");
+            }
+        }
+        if let Ok(run_context) = self.run_context.as_ref() {
+            crate::tools::retire_run(run_context);
         }
 
         Ok(())
@@ -2348,7 +2534,7 @@ impl App {
 
     /// Table-handler entry point for `/skill` / `/skills` (no-arg list form).
     fn slash_skill_list(&mut self) {
-        let skills = crate::skills::load_skills();
+        let skills = self.session_skills();
         let invocable_skills = skills
             .iter()
             .filter(|skill| skill.user_invocable)
@@ -2375,7 +2561,11 @@ impl App {
         } else {
             text.strip_prefix('/').unwrap_or("")
         };
-        if let Some(skill) = crate::skills::get_user_invocable_skill(skill_name) {
+        if let Some(skill) = self
+            .session_skills()
+            .into_iter()
+            .find(|skill| skill.name == skill_name && skill.user_invocable)
+        {
             self.messages.add(DisplayMessage::system(format!(
                 "Running skill: /{}",
                 skill.name
@@ -2692,6 +2882,7 @@ impl App {
 
     /// Handle the `/doctor` slash command (environment diagnostics).
     fn handle_slash_doctor(&mut self) {
+        let skill_count = self.session_skills().len();
         let checks = [
             match crate::config::load_config() {
                 Ok(_) => "✓ Config: loaded".to_string(),
@@ -2700,7 +2891,7 @@ impl App {
             format!("✓ Provider: {}", self.provider),
             format!("✓ Model: {}", self.model),
             format!("✓ Endpoint: {}", self.api_client.endpoint),
-            format!("✓ Skills: {} loaded", crate::skills::load_skills().len()),
+            format!("✓ Skills: {skill_count} loaded"),
             if self.memory_db.is_some() {
                 "✓ Memory DB: connected".to_string()
             } else {
@@ -2711,6 +2902,22 @@ impl App {
             "Diagnostics:\n{}",
             checks.join("\n")
         )));
+    }
+
+    /// Discover skills through this session's immutable project boundary.
+    ///
+    /// A failed run construction deliberately yields no project skills rather
+    /// than falling back to the process current directory.
+    fn session_skills(&self) -> Vec<crate::skills::SkillDefinition> {
+        match self.run_context.as_ref() {
+            Ok(run) => {
+                crate::skills::load_skills_for_project(run.project_root(), run.working_directory())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "skill discovery unavailable without a valid TUI run");
+                Vec::new()
+            }
+        }
     }
 
     /// Handle the `/review` slash command (shows truncated `git diff HEAD`).
@@ -2728,19 +2935,19 @@ impl App {
 
     /// Handle the `/init` slash command (create config if absent).
     fn handle_slash_init(&mut self) {
-        if crate::config::config_file_exists() {
-            self.messages.add(DisplayMessage::system(
-                "Config already exists. Use /doctor to check it.",
-            ));
-        } else {
-            let content = match current_exe_command()
-                .and_then(|mut cmd| cmd.arg("init").output().map_err(|e| e.to_string()))
-            {
-                Ok(out) => format_init_command_output(&out),
-                Err(e) => format!("Init failed: {e}"),
-            };
-            self.messages.add(DisplayMessage::system(content));
-        }
+        let content = match self.run_context.as_deref() {
+            Ok(run) => match crate::tools::initialize_project_for_run(run) {
+                Ok(crate::tools::ProjectInitOutcome::Created) => {
+                    "Initialized OpenClaudia configuration in .openclaudia/".to_string()
+                }
+                Ok(crate::tools::ProjectInitOutcome::AlreadyExists) => {
+                    "Config already exists. Use /doctor to check it.".to_string()
+                }
+                Err(error) => format!("Init failed: {error}"),
+            },
+            Err(error) => format!("Init failed: no valid run capability: {error}"),
+        };
+        self.messages.add(DisplayMessage::system(content));
     }
 
     /// Handle diagnostic/info slash commands. Returns true if handled.
@@ -2812,7 +3019,10 @@ impl App {
 
     /// Send a user message to the API.
     fn send_user_message(&mut self, text: String) {
-        let expanded = expand_file_refs(&text);
+        let expanded = self
+            .run_context
+            .as_ref()
+            .map_or_else(|_| text.clone(), |run| expand_file_refs(run, &text));
 
         self.messages.add(DisplayMessage::user(text));
 
@@ -2821,7 +3031,9 @@ impl App {
             "content": expanded
         }));
 
-        crate::guardrails::reset_turn();
+        if let Ok(run) = &self.run_context {
+            crate::guardrails::reset_turn(run);
+        }
         self.is_waiting = true;
         self.spawn_api_turn();
     }
@@ -2912,6 +3124,7 @@ impl App {
     /// If no runtime is bound yet (`self.runtime_handle == None`) the
     /// helper posts an error `ShellDone` (`exit_code` = None, stderr
     /// explaining the missing runtime) and returns `None`.
+    #[allow(clippy::too_many_lines)] // Keep async process lifecycle and its single TUI completion event together.
     fn spawn_shell(
         &self,
         cmd: Vec<&str>,
@@ -2919,10 +3132,39 @@ impl App {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let tx = self.api_event_tx.clone();
         let session_id = self.chat_session.id();
-        let cwd = std::env::current_dir().ok();
         let ledger_target = target.clone();
         // Eagerly own the argv as Strings — the future outlives `&self`.
         let argv: Vec<String> = cmd.into_iter().map(str::to_owned).collect();
+
+        let run_context = match &self.run_context {
+            Ok(run_context) => std::sync::Arc::clone(run_context),
+            Err(error) => {
+                if let Some(tx) = tx {
+                    let _ = tx.send(AppEvent::ShellDone {
+                        target,
+                        stdout: String::new(),
+                        stderr: format!("session process capability unavailable: {error}"),
+                        exit_code: None,
+                    });
+                }
+                return None;
+            }
+        };
+        if let Err(error) = run_context.require(crate::tools::ToolResource::Process) {
+            if let Some(tx) = tx {
+                let _ = tx.send(AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: error.to_string(),
+                    exit_code: None,
+                });
+            }
+            return None;
+        }
+        let cwd = run_context.working_directory().to_path_buf();
+        let environment_grants = run_context.environment_grants().clone();
+        let private_temp = run_context.private_temp_root().to_path_buf();
+        let executable_search_path = run_context.executable_search_path().to_os_string();
 
         let Some(handle) = self.runtime_handle.clone() else {
             // No runtime — surface as a failed ShellDone so the receiver
@@ -2951,16 +3193,34 @@ impl App {
                 return;
             };
 
-            let result = tokio::process::Command::new(exe).args(rest).output().await;
+            let result = match run_context.resolve_executable(exe) {
+                Ok(executable) => {
+                    let mut command = tokio::process::Command::new(executable);
+                    command
+                        .args(rest)
+                        .current_dir(&cwd)
+                        .env_clear()
+                        .envs(&environment_grants)
+                        .env("HOME", &private_temp)
+                        .env("TMPDIR", &private_temp)
+                        .env("TMP", &private_temp)
+                        .env("TEMP", &private_temp)
+                        .env("PATH", &executable_search_path)
+                        .env("CLAUDE_PROJECT_DIR", &cwd);
+                    command.output().await
+                }
+                Err(error) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("cannot resolve '{exe}': {error}"),
+                )),
+            };
 
-            if let (SpawnTarget::ShellCommand { displayed }, Some(cwd), Ok(out)) =
-                (&ledger_target, cwd.as_deref(), &result)
-            {
+            if let (SpawnTarget::ShellCommand { displayed }, Ok(out)) = (&ledger_target, &result) {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 crate::grounded_loop::observe_shell_command_for_session(
                     &session_id,
-                    cwd,
+                    &cwd,
                     displayed,
                     out.status.code().unwrap_or(-1),
                     &stdout,
@@ -2994,6 +3254,7 @@ impl App {
     /// Sends events through the event handler's mpsc channel so the
     /// synchronous TUI event loop can display streaming output.
     fn spawn_api_turn(&mut self) {
+        self.refresh_prompt_context_for_run();
         let Some(ref handle) = self.runtime_handle else {
             // No async runtime — show fallback message
             self.messages.add(DisplayMessage::error(
@@ -3030,6 +3291,21 @@ impl App {
         let wire_api = api.wire_api;
         let hook_engine = self.hook_engine.clone();
         let session_id_for_task = self.chat_session.id();
+        let run_context = match &self.run_context {
+            Ok(run_context) => std::sync::Arc::clone(run_context),
+            Err(error) => {
+                send_or_warn(
+                    &tx,
+                    super::events::AppEvent::ApiError(format!(
+                        "Tool execution is unavailable: {error}"
+                    )),
+                    &session_id_for_task,
+                );
+                self.is_waiting = false;
+                self.clear_next_turn_metadata();
+                return;
+            }
+        };
         let memory_db = self.memory_db.clone();
         let app_config = self.app_config.clone();
         let permission_mgr = self.permission_mgr.clone();
@@ -3042,6 +3318,7 @@ impl App {
         let session_messages = self.chat_session.messages_snapshot();
 
         handle.spawn(run_api_turn_async(ApiTurnParams {
+            run_context,
             session_messages,
             client,
             endpoint,
@@ -3323,9 +3600,10 @@ impl App {
         } else {
             format!("Welcome back, {username}!")
         };
-        let cwd = std::env::current_dir().map_or_else(
+        let cwd = self.run_context.as_ref().map_or_else(
             |_| ".".to_string(),
-            |p| {
+            |run| {
+                let p = run.working_directory();
                 if let Some(home) = dirs::home_dir() {
                     if let Ok(rel) = p.strip_prefix(&home) {
                         return format!("~/{}", rel.display());
@@ -3376,8 +3654,17 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Ok(run) = self.run_context.as_ref() {
+            crate::tools::retire_run(run);
+        }
+    }
+}
+
 /// Owned call parameters for one spawned API turn.
 struct ApiTurnParams {
+    run_context: std::sync::Arc<crate::tools::ToolRunContext>,
     session_messages: Vec<serde_json::Value>,
     client: reqwest::Client,
     endpoint: String,
@@ -3421,6 +3708,7 @@ struct PreparedInitialTurn {
 
 /// Shared context threaded through the agentic follow-up loop.
 struct AgenticCtx<'a> {
+    run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     client: &'a reqwest::Client,
     endpoint: &'a str,
     headers: &'a [(String, String)],
@@ -3589,6 +3877,7 @@ fn check_provider_request_policy_for_messages(
 /// `ApiError` event if the hook denies the request; allowed model-visible
 /// outputs are appended as typed reference data.
 async fn run_preturn_hooks(
+    run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
     engine: &crate::hooks::HookEngine,
     session_messages: &mut Vec<serde_json::Value>,
     tx: &std::sync::mpsc::Sender<super::events::AppEvent>,
@@ -3599,8 +3888,9 @@ async fn run_preturn_hooks(
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string();
-    let hook_input = crate::hooks::HookInput::new(crate::hooks::HookEvent::UserPromptSubmit)
-        .with_prompt(&user_prompt);
+    let hook_input =
+        crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::UserPromptSubmit)
+            .with_prompt(&user_prompt);
     let hook_result = engine
         .run(crate::hooks::HookEvent::UserPromptSubmit, &hook_input)
         .await;
@@ -3975,6 +4265,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             }
         };
         match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
+            run_context: std::sync::Arc::clone(ctx.run_context),
             client: ctx.client,
             endpoint: ctx.endpoint,
             headers: ctx.headers,
@@ -4087,6 +4378,7 @@ fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInit
 /// follow-up loop when tool calls are present.
 async fn run_api_turn_async(p: ApiTurnParams) {
     let ApiTurnParams {
+        run_context,
         mut session_messages,
         client,
         endpoint,
@@ -4110,7 +4402,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         tx,
     } = p;
     if let Some(ref engine) = hook_engine {
-        if !run_preturn_hooks(engine, &mut session_messages, &tx).await {
+        if !run_preturn_hooks(&run_context, engine, &mut session_messages, &tx).await {
             return;
         }
     }
@@ -4130,6 +4422,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         return;
     };
     match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(&run_context),
         client: &client,
         endpoint: &endpoint,
         headers: &headers,
@@ -4152,6 +4445,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
                 turn_result,
                 session_messages,
                 TurnContext {
+                    run_context: &run_context,
                     client: &client,
                     endpoint: &endpoint,
                     headers: &headers,
@@ -4187,6 +4481,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
 /// struct to keep `run_api_turn_async` under the line-count lint while
 /// preserving the per-iteration data each branch needs.
 struct TurnContext<'a> {
+    run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     client: &'a reqwest::Client,
     endpoint: &'a str,
     headers: &'a [(String, String)],
@@ -4241,6 +4536,7 @@ async fn handle_turn_result(
             "Starting agentic follow-up loop"
         );
         let agentic = AgenticCtx {
+            run_context: ctx.run_context,
             client: ctx.client,
             endpoint: ctx.endpoint,
             headers: ctx.headers,
@@ -4331,7 +4627,10 @@ async fn run_tui_vdd_review(
         .unwrap_or_default()
         .to_string();
     let builder = crate::vdd::BuilderProvider::with_auth(ctx.provider, ctx.vdd_builder_auth);
-    match engine.review_text(content, &user_task, builder).await {
+    match engine
+        .review_text(ctx.run_context, content, &user_task, builder)
+        .await
+    {
         Ok(result) => {
             let genuine_count = result
                 .findings
@@ -4404,11 +4703,11 @@ fn parse_prompt_effort_level(effort: &str) -> Option<EffortLevel> {
 mod tests {
     use super::{compile_file_ref_regex, expand_file_refs};
     use super::{
-        current_exe_command, format_api_retry_delay, format_api_retry_message,
-        format_init_command_output, format_review_command_output, format_stream_timeout_message,
-        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, read_tui_session_file,
-        resolve_provider_switch_auth, save_session, ApiClient, App, AppEvent, EffortLevel,
-        MessageKind, ProviderSwitch, SpawnTarget, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
+        format_api_retry_delay, format_api_retry_message, format_review_command_output,
+        format_stream_timeout_message, git_bin, handle_turn_result, list_sessions,
+        lookup_tui_slash, read_tui_session_file, resolve_provider_switch_auth, save_session,
+        ApiClient, App, AppEvent, EffortLevel, MessageKind, ProviderSwitch, SpawnTarget,
+        TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
     };
     use crate::slash_commands::all_tui_commands;
     use crate::state::Session;
@@ -4444,32 +4743,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tui_init_uses_current_executable_path() {
-        let cmd = current_exe_command().expect("current executable must resolve in tests");
-        assert!(
-            std::path::Path::new(cmd.get_program()).is_absolute(),
-            "current executable command must use an absolute path, got {:?}",
-            cmd.get_program()
-        );
-
-        let src = include_str!("app.rs");
-        let cfg_test = src
-            .find("#[cfg(test)]")
-            .expect("test module marker must be present");
-        let production = &src[..cfg_test];
-
-        for (idx, raw_line) in production.lines().enumerate() {
-            let code = raw_line.split("//").next().unwrap_or("");
-            assert!(
-                !code.contains("Command::new(\"openclaudia\")")
-                    && !code.contains("std::process::Command::new(\"openclaudia\")"),
-                "production TUI app code must not invoke bare openclaudia; line {n}: {raw_line}",
-                n = idx + 1,
-            );
-        }
-    }
-
     #[cfg(unix)]
     fn output_with_status(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt as _;
@@ -4479,49 +4752,6 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tui_init_output_uses_stderr_on_success() {
-        let output = output_with_status(
-            0,
-            "",
-            "Initialized OpenClaudia configuration in .openclaudia/\nSet your API key",
-        );
-
-        let rendered = format_init_command_output(&output);
-
-        assert!(rendered.contains("Initialized OpenClaudia configuration"));
-        assert!(rendered.contains("Set your API key"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tui_init_output_reports_nonzero_status() {
-        let output = output_with_status(
-            1,
-            "",
-            "Configuration already exists. Use --force to overwrite.",
-        );
-
-        let rendered = format_init_command_output(&output);
-
-        assert!(rendered.starts_with("Init failed:"));
-        assert!(rendered.contains("Configuration already exists"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tui_init_output_never_renders_blank_on_silent_success() {
-        let output = output_with_status(0, "", "");
-
-        let rendered = format_init_command_output(&output);
-
-        assert_eq!(
-            rendered,
-            "Initialized OpenClaudia configuration in .openclaudia/"
-        );
     }
 
     #[cfg(unix)]
@@ -5044,6 +5274,7 @@ mod tests {
             direct_turn_result("Verified with cargo check.".to_string()),
             vec![serde_json::json!({"role":"user","content":"verify this"})],
             TurnContext {
+                run_context: crate::tools::security::test_run_context(),
                 client: &client,
                 endpoint: "https://example.invalid",
                 headers: &headers,
@@ -5105,6 +5336,7 @@ mod tests {
             direct_turn_result(content.clone()),
             vec![serde_json::json!({"role":"user","content":"verify this"})],
             TurnContext {
+                run_context: crate::tools::security::test_run_context(),
                 client: &client,
                 endpoint: "https://example.invalid",
                 headers: &headers,
@@ -5214,6 +5446,7 @@ mod tests {
     fn apply_provider_switch_updates_metadata_and_transport() {
         let mut app = App::new("old-model", "anthropic");
         let original_session_id = app.chat_session.id();
+        let original_run = app.tool_run_context().expect("original run");
         let blocks = crate::prompt::SystemPromptBlocks::from_items(
             vec![
                 crate::context::ContextItem::host_instruction(
@@ -5251,7 +5484,7 @@ mod tests {
             wire_api: crate::pipeline::WireApi::ChatCompletions,
             claude_code_token: None,
             vdd_builder_auth: crate::vdd::VddProviderAuth::None,
-            prompt_blocks: Some(blocks.clone()),
+            prompt_blocks: Some(blocks),
         });
 
         assert_eq!(app.provider, "kimi");
@@ -5259,6 +5492,10 @@ mod tests {
         assert_eq!(app.chat_session.id(), original_session_id);
         assert_eq!(app.chat_session.provider, "kimi");
         assert_eq!(app.chat_session.model, "kimi-k2.7-code");
+        let switched_run = app.tool_run_context().expect("switched run");
+        assert_ne!(switched_run.run_id(), original_run.run_id());
+        assert!(original_run.runtime().cancellation().is_cancelled());
+        assert_eq!(switched_run.session_id(), original_session_id);
         assert_eq!(
             app.api_client.endpoint,
             "https://api.moonshot.ai/v1/chat/completions"
@@ -5273,13 +5510,15 @@ mod tests {
             app.api_client.wire_api,
             crate::pipeline::WireApi::ChatCompletions
         );
-        assert_eq!(
-            app.api_client
-                .prompt_blocks
-                .as_ref()
-                .map(crate::prompt::SystemPromptBlocks::to_combined),
-            Some(blocks.to_combined())
-        );
+        let rebound_prompt = app
+            .api_client
+            .prompt_blocks
+            .as_ref()
+            .expect("provider switch must rebuild run-scoped prompt context");
+        assert!(rebound_prompt.reference_context().contains(&format!(
+            "Working directory: {}",
+            switched_run.working_directory().display()
+        )));
         assert!(
             app.messages
                 .messages
@@ -5550,6 +5789,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_shell_uses_exact_run_cwd_and_environment() {
+        let root = tempfile::tempdir_in(".").expect("TUI shell root");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::from([(
+                    "S019_TUI_ENV".to_string(),
+                    "exact".to_string(),
+                )]))
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .provider("tui-shell-environment-test")
+                .build()
+                .expect("explicit TUI shell run");
+        let expected_cwd = run.working_directory().to_string_lossy().into_owned();
+        let mut app = App::new("test-model", "test-provider");
+        app.run_context = Ok(run);
+        let rx = wire_app(&mut app);
+        let ungranted = "S019_TUI_UNGRANTED";
+        let command =
+            format!("printf '%s|%s|' \"$S019_TUI_ENV\" \"${{{ungranted}:-missing}}\"; pwd");
+
+        let join = app
+            .spawn_shell(vec!["bash", "-c", &command], SpawnTarget::Diff)
+            .expect("run-bound TUI shell task");
+        join.await.expect("TUI shell task panicked");
+
+        let (_, stdout, stderr, exit_code) =
+            recv_shell_done(&rx, Duration::from_millis(500)).expect("TUI shell result");
+        assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+        assert_eq!(stdout.trim(), format!("exact|missing|{expected_cwd}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_shell_failure_delivers_nonzero_exit() {
         // `bash -c 'exit 7'` exits with code 7. ShellDone must surface
         // exit_code = Some(7) so the renderer picks the ToolErr branch.
@@ -5665,7 +5941,10 @@ mod tests {
         // Fast path: no '@' in input — function returns immediately without
         // touching the regex.  Output must equal the input exactly.
         let input = "hello world, no references here";
-        assert_eq!(expand_file_refs(input), input);
+        assert_eq!(
+            expand_file_refs(crate::tools::security::test_run_context(), input),
+            input
+        );
     }
 
     #[test]
@@ -5696,6 +5975,24 @@ mod tests {
     }
 
     #[test]
+    fn expand_file_refs_cannot_read_a_foreign_run_root() {
+        let owner_root = tempfile::tempdir_in(".").expect("owner root");
+        let foreign_root = tempfile::tempdir_in(".").expect("foreign root");
+        let foreign_file = foreign_root.path().join("secret.txt");
+        std::fs::write(&foreign_file, "S019-TUI-FOREIGN-SECRET").expect("foreign fixture");
+        let run = crate::tools::security::test_run_context_for(owner_root.path());
+        let input = format!("inspect @\"{}\"", foreign_file.display());
+
+        let expanded = expand_file_refs(&run, &input);
+
+        assert!(!expanded.contains("S019-TUI-FOREIGN-SECRET"));
+        assert!(
+            expanded.contains("outside granted roots"),
+            "foreign reference must fail at the run capability boundary: {expanded}"
+        );
+    }
+
+    #[test]
     fn invalid_file_ref_regex_is_skipped() {
         assert!(compile_file_ref_regex("[").is_none());
     }
@@ -5704,24 +6001,26 @@ mod tests {
     fn expand_file_refs_double_at_does_not_panic() {
         // Regression guard for the old `.unwrap()` on cap.get(0): a bare '@@'
         // or '@ @' must not panic regardless of whether the regex matches.
-        let _ = expand_file_refs("@@");
-        let _ = expand_file_refs("@ @");
-        let _ = expand_file_refs("email@example.com and @another");
+        let run = crate::tools::security::test_run_context();
+        let _ = expand_file_refs(run, "@@");
+        let _ = expand_file_refs(run, "@ @");
+        let _ = expand_file_refs(run, "email@example.com and @another");
     }
 
     #[test]
     fn expand_file_refs_unclosed_quote_does_not_panic() {
         // A `@"` with no closing quote must not panic — the regex simply won't
         // match group 1, and the `if let Some` guard skips it cleanly.
-        let _ = expand_file_refs(r#"@"unclosed"#);
-        let _ = expand_file_refs(r#"some text @"no end here and more text"#);
+        let run = crate::tools::security::test_run_context();
+        let _ = expand_file_refs(run, r#"@"unclosed"#);
+        let _ = expand_file_refs(run, r#"some text @"no end here and more text"#);
     }
 
     #[test]
     fn expand_file_refs_many_at_signs_does_not_panic() {
         // Stress: 1 000 '@' characters in a row must not panic or overflow.
         let input = "@".repeat(1_000);
-        let _ = expand_file_refs(&input);
+        let _ = expand_file_refs(crate::tools::security::test_run_context(), &input);
     }
 
     // =========================================================================
@@ -5787,18 +6086,20 @@ mod tests {
 
     #[test]
     fn startup_resume_loads_most_recent_saved_session() {
+        const OLDER_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const NEWER_ID: &str = "22222222-2222-4222-8222-222222222222";
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut older = Session::new("old-model", "old-provider");
-        older.set_id("older-session".to_string());
+        let mut older = Session::new("old-model", "initial-provider");
+        older.set_id(OLDER_ID.to_string());
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
         older.push_message(serde_json::json!({"role": "user", "content": "older"}));
 
-        let mut newer = Session::new("new-model", "new-provider");
-        newer.set_id("newer-session".to_string());
+        let mut newer = Session::new("new-model", "initial-provider");
+        newer.set_id(NEWER_ID.to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
@@ -5812,9 +6113,18 @@ mod tests {
         let mut state_events = app.chat_session.state_store().subscribe_log_lag();
         app.apply_startup_resume(true, None);
 
-        assert_eq!(app.chat_session.id(), "newer-session");
+        assert_eq!(
+            app.chat_session.id(),
+            NEWER_ID,
+            "resume diagnostics: {:?}",
+            app.messages
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(app.model, "new-model");
-        assert_eq!(app.provider, "new-provider");
+        assert_eq!(app.provider, "initial-provider");
         assert_eq!(app.chat_session.messages_snapshot()[0]["content"], "newer");
         assert!(matches!(
             state_events.try_recv(),
@@ -5822,23 +6132,25 @@ mod tests {
                 from,
                 to,
                 from_messages: 0,
-            }) if from.as_str() == initial_id && to.as_str() == "newer-session"
+            }) if from.as_str() == initial_id && to.as_str() == NEWER_ID
         ));
     }
 
     #[test]
     fn startup_session_id_takes_precedence_over_resume() {
+        const OLDER_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const NEWER_ID: &str = "22222222-2222-4222-8222-222222222222";
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut older = Session::new("old-model", "old-provider");
-        older.set_id("older-session".to_string());
+        let mut older = Session::new("old-model", "initial-provider");
+        older.set_id(OLDER_ID.to_string());
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
 
-        let mut newer = Session::new("new-model", "new-provider");
-        newer.set_id("newer-session".to_string());
+        let mut newer = Session::new("new-model", "initial-provider");
+        newer.set_id(NEWER_ID.to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
@@ -5847,10 +6159,31 @@ mod tests {
         save_session(&newer).expect("newer session should save");
 
         let mut app = App::new("initial-model", "initial-provider");
-        app.apply_startup_resume(true, Some("older"));
+        app.apply_startup_resume(true, Some("11111111"));
 
-        assert_eq!(app.chat_session.id(), "older-session");
+        assert_eq!(app.chat_session.id(), OLDER_ID);
         assert_eq!(app.model, "old-model");
+    }
+
+    #[test]
+    fn startup_resume_rejects_a_different_provider_without_rebinding_transport() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
+        let foreign = Session::new("foreign-model", "foreign-provider");
+        let foreign_id = foreign.id();
+        save_session(&foreign).expect("foreign session should save");
+
+        let mut app = App::new("initial-model", "initial-provider");
+        let initial_id = app.chat_session.id();
+        app.apply_startup_resume(false, Some(&foreign_id));
+
+        assert_eq!(app.chat_session.id(), initial_id);
+        assert_eq!(app.provider, "initial-provider");
+        assert!(app
+            .messages
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("differs from the active provider") }));
     }
 
     #[test]

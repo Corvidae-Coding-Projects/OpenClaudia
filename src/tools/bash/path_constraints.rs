@@ -27,80 +27,26 @@
 //! Treat this as a defence-in-depth layer, not a sandbox.
 
 use std::path::{Component, Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
-
-/// Process-wide active path constraints. `None` (the default) means the
-/// gate is disabled — bash commands are not subject to path checks at all,
-/// preserving the legacy behaviour for callers that have not opted in.
-///
-/// Populated by [`install_global`] at startup (typically from
-/// `.claude/settings.json::additionalWorkingDirectories`), and consulted by
-/// [`check_command_against_global`] which the bash entry point calls before
-/// spawning the child.
-static GLOBAL_CONSTRAINTS: LazyLock<RwLock<Option<PathConstraints>>> =
-    LazyLock::new(|| RwLock::new(None));
-
-/// Install a [`PathConstraints`] set as the process-wide active gate.
-///
-/// Subsequent calls to [`check_command_against_global`] will validate
-/// commands against this set. Passing an empty constraint set is allowed
-/// — it disables the gate explicitly, distinct from "never installed".
-///
-/// See crosslink #594.
-pub fn install_global(constraints: PathConstraints) {
-    let mut slot = GLOBAL_CONSTRAINTS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = Some(constraints);
-}
-
-/// Clear any previously installed global constraints — primarily for tests
-/// that want to restore the default (gate disabled) state.
-pub fn clear_global() {
-    let mut slot = GLOBAL_CONSTRAINTS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = None;
-}
-
-/// Validate `command` against the process-wide global constraint set.
-///
-/// Returns `Ok(())` when no constraint set is active (the gate is
-/// disabled), or when every extracted path falls under an allowed root.
-///
-/// Called from `execute_bash` before spawning the child process so a
-/// `cat /etc/passwd` is rejected with an actionable error message instead
-/// of leaking the file's contents.
-///
-/// # Errors
-///
-/// Returns the same error string format as [`PathConstraints::check_command`].
-pub fn check_command_against_global(command: &str) -> Result<(), String> {
-    let slot = GLOBAL_CONSTRAINTS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    slot.as_ref().map_or(Ok(()), |pc| pc.check_command(command))
-}
 
 /// Allowlist of filesystem roots under which the bash tool may operate.
 ///
-/// Constructed with [`Self::new`] from the current working directory plus
-/// any additional roots (e.g. user-configured `additionalWorkingDirectories`
-/// from `.claude/settings.json`). Roots are canonicalised lazily on each
+/// Production dispatch constructs this with [`Self::from_run`], binding the
+/// roots and sandbox HOME to one exact run capability. [`Self::new`] remains
+/// available for isolated policy construction and tests. Roots are normalised on each
 /// check call so symlink targets are resolved at policy-evaluation time
 /// (not at constructor time, which would race with filesystem mutation).
 #[derive(Debug, Clone)]
 pub struct PathConstraints {
     roots: Vec<PathBuf>,
+    home: Option<PathBuf>,
 }
 
 impl PathConstraints {
     /// Build a new constraints object from an iterable of allowed roots.
     ///
     /// Each root is stored verbatim and canonicalised at check time. Empty
-    /// or whitespace-only roots are skipped. The list ends up *inclusive
-    /// of `cwd`* when called from the bash entry point; callers that want
-    /// only the cwd can pass `[std::env::current_dir()]`.
+    /// or whitespace-only roots are skipped. Production callers should use
+    /// [`Self::from_run`] so relative paths cannot inherit ambient process state.
     #[must_use]
     pub fn new<I, P>(roots: I) -> Self
     where
@@ -118,7 +64,23 @@ impl PathConstraints {
                 }
             })
             .collect();
-        Self { roots }
+        Self { roots, home: None }
+    }
+
+    /// Derive the syntactic defence-in-depth roots from one exact run.
+    #[must_use]
+    pub fn from_run(run: &crate::tools::ToolRunContext) -> Self {
+        let mut roots = vec![run.working_directory().to_path_buf()];
+        for root in run.read_write_roots().iter().chain(run.read_only_roots()) {
+            if !roots.contains(root) {
+                roots.push(root.clone());
+            }
+        }
+        Self {
+            roots,
+            // Sandboxed commands receive the generation-private temp as HOME.
+            home: Some(run.private_temp_root().to_path_buf()),
+        }
     }
 
     /// True if `roots` is empty. An empty constraint set means the check is
@@ -189,7 +151,7 @@ impl PathConstraints {
             return Ok(());
         }
         for token in path_tokens(command) {
-            let path = expand_home(&token);
+            let path = self.expand_home(&token);
             if !self.allows(&path) {
                 return Err(format!(
                     "Path '{token}' is outside the bash tool's allowed roots ({}). \
@@ -212,15 +174,22 @@ impl PathConstraints {
         if path.is_absolute() {
             return path.to_path_buf();
         }
-        // Fall back to cwd if no roots — relative inputs resolve against
-        // the agent's process cwd, which is the conventional anchor.
-        let anchor = self
-            .roots
+        self.roots
             .first()
-            .cloned()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        anchor.join(path)
+            .map_or_else(|| path.to_path_buf(), |anchor| anchor.join(path))
+    }
+
+    fn expand_home(&self, token: &str) -> PathBuf {
+        if let Some(rest) = token.strip_prefix("~/") {
+            return self
+                .home
+                .as_ref()
+                .map_or_else(|| PathBuf::from(token), |home| home.join(rest));
+        }
+        if token == "~" {
+            return self.home.clone().unwrap_or_else(|| PathBuf::from(token));
+        }
+        PathBuf::from(token)
     }
 }
 
@@ -245,22 +214,6 @@ fn normalise_lexically(p: &Path) -> PathBuf {
         }
     }
     out
-}
-
-/// Expand a leading `~` to the user's home directory; pass through anything
-/// else verbatim as a `PathBuf`. `~` alone resolves to `$HOME`.
-fn expand_home(token: &str) -> PathBuf {
-    if let Some(rest) = token.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    if token == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    PathBuf::from(token)
 }
 
 /// Extract path-shaped tokens from a bash command.
@@ -450,50 +403,5 @@ mod tests {
         assert!(!is_path_shaped("foo.txt"));
         assert!(!is_path_shaped("--help"));
         assert!(!is_path_shaped("-rf"));
-    }
-
-    /// Process-wide gate is disabled by default — `check_command_against_global`
-    /// must return `Ok(())` for any input until `install_global` is called.
-    ///
-    /// Uses a mutex to serialise with `global_install_then_clear_round_trip`
-    /// — both touch the shared `GLOBAL_CONSTRAINTS` and would race under
-    /// cargo's parallel test runner without explicit serialisation.
-    #[test]
-    fn global_gate_is_disabled_until_installed() {
-        let _lock = global_test_lock();
-        clear_global();
-        assert!(check_command_against_global("cat /etc/passwd").is_ok());
-        assert!(check_command_against_global("rm -rf /").is_ok());
-    }
-
-    /// `install_global` then `check_command_against_global` reject paths
-    /// outside the installed roots; `clear_global` returns to the disabled
-    /// state.
-    #[test]
-    fn global_install_then_clear_round_trip() {
-        let _lock = global_test_lock();
-        clear_global();
-        install_global(pc(&["/home/user/project"]));
-
-        // Outside the root: rejected.
-        let err = check_command_against_global("cat /etc/passwd")
-            .expect_err("must reject /etc/passwd outside root");
-        assert!(err.contains("/etc/passwd"), "{err}");
-
-        // Inside the root: allowed.
-        assert!(check_command_against_global("cat /home/user/project/src/main.rs").is_ok());
-
-        // After clear: gate is disabled again.
-        clear_global();
-        assert!(check_command_against_global("cat /etc/passwd").is_ok());
-    }
-
-    /// Serialise the two global-state tests so they don't race each other
-    /// under parallel test execution. Other tests in this file don't touch
-    /// `GLOBAL_CONSTRAINTS`, so they can run unsynchronised.
-    fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

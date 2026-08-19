@@ -291,10 +291,10 @@ pub fn classify_operation(args: &Value) -> Result<TypedEffect, String> {
 /// exists and `.crosslink/issues.db` does not, copies the legacy DB
 /// into the new location so existing project history survives the
 /// chainlink→crosslink migration.
-fn db_path_for_cwd() -> Result<PathBuf, String> {
-    let cwd = crate::tools::security::current_context()?
-        .working_directory()
-        .to_path_buf();
+fn db_path_for_cwd(run: &crate::tools::security::ToolRunContext) -> Result<PathBuf, String> {
+    run.require(crate::tools::security::ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    let cwd = run.working_directory().to_path_buf();
     let dir = cwd.join(CROSSLINK_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {CROSSLINK_DIR}/: {e}"))?;
     let db = dir.join("issues.db");
@@ -314,10 +314,10 @@ fn db_path_for_cwd() -> Result<PathBuf, String> {
 ///
 /// Returns an error when session capabilities are unavailable or when no
 /// store exists yet.
-fn db_path_for_query() -> Result<PathBuf, String> {
-    let cwd = crate::tools::security::current_context()?
-        .working_directory()
-        .to_path_buf();
+fn db_path_for_query(run: &crate::tools::security::ToolRunContext) -> Result<PathBuf, String> {
+    run.require(crate::tools::security::ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    let cwd = run.working_directory().to_path_buf();
     let db = cwd.join(CROSSLINK_DIR).join("issues.db");
     if db.exists() {
         Ok(db)
@@ -375,8 +375,8 @@ fn migrate_chainlink_if_needed(cwd: &std::path::Path, dest_db: &PathBuf) {
 /// This is the write path: it creates `.crosslink/` and migrates a legacy
 /// `.chainlink` store when needed. Query operations use
 /// [`open_db_for_query`], which does neither.
-fn open_db() -> Result<Database, String> {
-    let path = db_path_for_cwd()?;
+fn open_db(run: &crate::tools::security::ToolRunContext) -> Result<Database, String> {
+    let path = db_path_for_cwd(run)?;
     Database::open(&path).map_err(|e| format!("Failed to open crosslink DB: {e}"))
 }
 
@@ -386,8 +386,8 @@ fn open_db() -> Result<Database, String> {
 /// is why queries do not claim [`ToolEffect::ReadOnly`]. What this avoids is a
 /// query being the reason the store, its directory, or a migrated copy of a
 /// legacy database exists at all.
-fn open_db_for_query() -> Result<Database, String> {
-    let path = db_path_for_query()?;
+fn open_db_for_query(run: &crate::tools::security::ToolRunContext) -> Result<Database, String> {
+    let path = db_path_for_query(run)?;
     Database::open(&path).map_err(|e| format!("Failed to open crosslink DB: {e}"))
 }
 
@@ -451,7 +451,10 @@ impl<S: BuildHasher> Args<'_, S> {
 /// The operation is classified by [`classify_operation`] before this runs, so
 /// by the time execution begins the effect is already known and authorized.
 #[must_use]
-pub fn execute_crosslink<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
+pub fn execute_crosslink<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
     let value = Value::Object(args.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
 
     // Re-derive the operation through the same classifier the policy layer
@@ -489,12 +492,12 @@ pub fn execute_crosslink<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (S
     // comes from the same OPERATIONS row the classifier read, so the store is
     // materialized by exactly the operations that declare they write records.
     let db = if declared.mutates_records {
-        match open_db() {
+        match open_db(run) {
             Ok(db) => db,
             Err(e) => return (e, true),
         }
     } else {
-        match open_db_for_query() {
+        match open_db_for_query(run) {
             Ok(db) => db,
             Err(e) => return (e, true),
         }
@@ -998,18 +1001,22 @@ mod tests {
         }
     }
 
-    fn call(entries: &[(&str, Value)]) -> (String, bool) {
+    fn call(run: &crate::tools::ToolRunContext, entries: &[(&str, Value)]) -> (String, bool) {
         let args: HashMap<String, Value> = entries
             .iter()
             .map(|(key, value)| ((*key).to_string(), value.clone()))
             .collect();
-        execute_crosslink(&args)
+        execute_crosslink(run, &args)
     }
 
-    fn assert_ok(operation: &str, entries: &[(&str, Value)]) -> String {
+    fn assert_ok(
+        run: &crate::tools::ToolRunContext,
+        operation: &str,
+        entries: &[(&str, Value)],
+    ) -> String {
         let mut args = vec![("operation", json!(operation))];
         args.extend_from_slice(entries);
-        let (message, is_error) = call(&args);
+        let (message, is_error) = call(run, &args);
         assert!(!is_error, "{operation} failed: {message}");
         message
     }
@@ -1020,19 +1027,10 @@ mod tests {
     #[test]
     fn every_declared_operation_dispatches_against_an_isolated_store() {
         let root = tempfile::tempdir().expect("crosslink test root");
-        let session_id = format!("crosslink-typed-{}", uuid::Uuid::new_v4());
-        crate::tools::security::register_session_context(
-            &session_id,
-            root.path(),
-            root.path(),
-            &[],
-            &[],
-        )
-        .expect("register isolated tool context");
-        let session_guard = crate::tools::SessionIdGuard::set(&session_id);
+        let run = crate::tools::security::test_run_context_for(root.path());
 
         for help in ["help", "--help", "-h"] {
-            let message = assert_ok(help, &[]);
+            let message = assert_ok(&run, help, &[]);
             assert!(message.contains("Crosslink typed operations"));
             assert!(
                 !root.path().join(CROSSLINK_DIR).exists(),
@@ -1041,6 +1039,7 @@ mod tests {
         }
 
         assert_ok(
+            &run,
             "create",
             &[
                 ("title", json!("root issue")),
@@ -1049,33 +1048,51 @@ mod tests {
                 ("labels", json!(["audit"])),
             ],
         );
-        assert_ok("list", &[]);
-        assert_ok("show", &[("id", json!(1))]);
-        assert_ok("search", &[("query", json!("root"))]);
+        assert_ok(&run, "list", &[]);
+        assert_ok(&run, "show", &[("id", json!(1))]);
+        assert_ok(&run, "search", &[("query", json!("root"))]);
         assert_ok(
+            &run,
             "update",
             &[("id", json!(1)), ("title", json!("updated root"))],
         );
-        assert_ok("comment", &[("id", json!(1)), ("text", json!("note"))]);
-        assert_ok("label", &[("id", json!(1)), ("label", json!("review"))]);
-        assert_ok("unlabel", &[("id", json!(1)), ("label", json!("review"))]);
         assert_ok(
+            &run,
+            "comment",
+            &[("id", json!(1)), ("text", json!("note"))],
+        );
+        assert_ok(
+            &run,
+            "label",
+            &[("id", json!(1)), ("label", json!("review"))],
+        );
+        assert_ok(
+            &run,
+            "unlabel",
+            &[("id", json!(1)), ("label", json!("review"))],
+        );
+        assert_ok(
+            &run,
             "subissue",
             &[("parent_id", json!(1)), ("title", json!("child issue"))],
         );
-        assert_ok("relate", &[("id", json!(1)), ("other_id", json!(2))]);
-        assert_ok("block", &[("id", json!(1)), ("other_id", json!(2))]);
-        assert_ok("unblock", &[("id", json!(1)), ("other_id", json!(2))]);
-        assert_ok("tree", &[("id", json!(1))]);
-        assert_ok("next", &[]);
-        assert_ok("ready", &[]);
-        assert_ok("close", &[("id", json!(1))]);
-        assert_ok("reopen", &[("id", json!(1))]);
-        assert_ok("session_start", &[]);
-        assert_ok("session_work", &[("id", json!(1))]);
-        assert_ok("session_action", &[("text", json!("audited dispatch"))]);
-        assert_ok("session_status", &[]);
-        assert_ok("session_end", &[("text", json!("done"))]);
+        assert_ok(&run, "relate", &[("id", json!(1)), ("other_id", json!(2))]);
+        assert_ok(&run, "block", &[("id", json!(1)), ("other_id", json!(2))]);
+        assert_ok(&run, "unblock", &[("id", json!(1)), ("other_id", json!(2))]);
+        assert_ok(&run, "tree", &[("id", json!(1))]);
+        assert_ok(&run, "next", &[]);
+        assert_ok(&run, "ready", &[]);
+        assert_ok(&run, "close", &[("id", json!(1))]);
+        assert_ok(&run, "reopen", &[("id", json!(1))]);
+        assert_ok(&run, "session_start", &[]);
+        assert_ok(&run, "session_work", &[("id", json!(1))]);
+        assert_ok(
+            &run,
+            "session_action",
+            &[("text", json!("audited dispatch"))],
+        );
+        assert_ok(&run, "session_status", &[]);
+        assert_ok(&run, "session_end", &[("text", json!("done"))]);
 
         let exercised = [
             "create",
@@ -1112,8 +1129,6 @@ mod tests {
                 operation.name
             );
         }
-        drop(session_guard);
-        crate::tools::security::release_session_context(&session_id);
     }
 
     /// A shell-shaped payload is no longer a parse target. It is simply not a

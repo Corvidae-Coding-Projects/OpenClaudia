@@ -60,8 +60,12 @@ fn fixture_path() -> std::path::PathBuf {
 fn spawn_echo_transport() -> StdioTransport {
     let path = fixture_path();
     assert!(path.exists(), "fixture not found at {}", path.display());
-    StdioTransport::spawn("python3", &[path.to_str().expect("utf-8 path")])
-        .expect("spawn echo server")
+    StdioTransport::spawn(
+        support::shared_run_context(),
+        "python3",
+        &[path.to_str().expect("utf-8 path")],
+    )
+    .expect("spawn echo server")
 }
 
 /// Spawn the echo server with no `tools` capability in the `initialize`
@@ -70,6 +74,7 @@ fn spawn_echo_no_tools_cap() -> StdioTransport {
     let path = fixture_path();
     // Pass env var by invoking `env MCP_NO_TOOLS_CAP=1 python3 <fixture>`
     StdioTransport::spawn(
+        support::shared_run_context(),
         "env",
         &[
             "MCP_NO_TOOLS_CAP=1",
@@ -84,6 +89,7 @@ fn spawn_echo_no_tools_cap() -> StdioTransport {
 fn spawn_echo_no_resources_cap() -> StdioTransport {
     let path = fixture_path();
     StdioTransport::spawn(
+        support::shared_run_context(),
         "env",
         &[
             "MCP_NO_RESOURCES_CAP=1",
@@ -153,8 +159,12 @@ respond(tools["id"], {
     }]
 })
 "#;
-    let transport =
-        StdioTransport::spawn("python3", &["-u", "-c", script]).expect("spawn cap fixture");
+    let transport = StdioTransport::spawn(
+        support::shared_run_context(),
+        "python3",
+        &["-u", "-c", script],
+    )
+    .expect("spawn cap fixture");
     let server = McpServer::new("mock", Box::new(transport))
         .await
         .expect("handshake should succeed");
@@ -243,7 +253,7 @@ async fn tool_refresh_skips_list_without_tools_cap() {
 async fn manager_stdio_connection_passes_env_to_child_process() {
     let path = fixture_path();
     let path_str = path.to_str().expect("fixture path must be UTF-8");
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let env = HashMap::from([("MCP_NO_TOOLS_CAP".to_string(), "1".to_string())]);
 
     manager
@@ -287,7 +297,9 @@ async fn plugin_mcp_stdio_env_reaches_child_process() {
     let errors = plugins.discover();
     assert!(errors.is_empty(), "plugin discovery errors: {errors:?}");
     let plugins = Arc::new(plugins);
-    let manager = Arc::new(RwLock::new(McpManager::new()));
+    let manager = Arc::new(RwLock::new(McpManager::new(std::sync::Arc::clone(
+        support::shared_run_context(),
+    ))));
 
     connect_mcp_servers_with_trust(
         &manager,
@@ -335,7 +347,9 @@ async fn repository_mcp_server_requires_exact_host_trust_and_revocation_disconne
     let mut plugins = PluginManager::with_paths(vec![root.path().to_path_buf()]);
     assert!(plugins.discover().is_empty());
     let plugins = Arc::new(plugins);
-    let manager = Arc::new(RwLock::new(McpManager::new()));
+    let manager = Arc::new(RwLock::new(McpManager::new(std::sync::Arc::clone(
+        support::shared_run_context(),
+    ))));
 
     connect_mcp_servers_with_trust(&manager, &plugins, &std::collections::HashSet::new()).await;
     assert!(
@@ -368,6 +382,7 @@ fn stdio_mcp_rejects_an_executable_from_an_agent_writable_root() {
     std::fs::set_permissions(executable.path(), std::fs::Permissions::from_mode(0o755))
         .expect("executable mode");
     let result = StdioTransport::spawn(
+        support::shared_run_context(),
         executable.path().to_str().expect("utf-8 executable path"),
         &[],
     );
@@ -384,7 +399,12 @@ fn stdio_mcp_rejects_an_executable_from_an_agent_writable_root() {
 fn stdio_mcp_rejects_sensitive_environment_without_an_exact_host_grant() {
     let key = "OPENCLAUDIA_TEST_MCP_PRIVATE_TOKEN";
     let env = HashMap::from([(key.to_string(), "canary-value".to_string())]);
-    let Err(error) = StdioTransport::spawn_with_env("python3", &["-c", "pass"], &env) else {
+    let Err(error) = StdioTransport::spawn_with_env(
+        support::shared_run_context(),
+        "python3",
+        &["-c", "pass"],
+        &env,
+    ) else {
         panic!("sensitive MCP env must require an exact host grant");
     };
     assert!(
@@ -394,12 +414,45 @@ fn stdio_mcp_rejects_sensitive_environment_without_an_exact_host_grant() {
 }
 
 #[test]
+fn stdio_mcp_rejects_sensitive_environment_without_run_secret_capability() {
+    let run = openclaudia::tools::ToolRunContext::builder(
+        openclaudia::state::SessionId::new(),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .read_only_roots(Vec::new())
+    .read_write_roots(Vec::new())
+    .environment_grants(HashMap::new())
+    .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+    .process(true)
+    .network(false)
+    .secrets(false)
+    .provider("mcp-secret-denial-test")
+    .build()
+    .expect("restricted MCP run");
+    let env = HashMap::from([("SERVICE_API_KEY".to_string(), "canary".to_string())]);
+
+    let Err(error) = StdioTransport::spawn_with_env(&run, "python3", &["-c", "pass"], &env) else {
+        panic!("MCP secret env must require the run's secret capability");
+    };
+    assert!(
+        error.to_string().contains("secret environment grant")
+            && error.to_string().contains("unavailable"),
+        "unexpected secret capability error: {error}"
+    );
+}
+
+#[test]
 fn stdio_mcp_rejects_host_dynamic_loader_environment() {
     let env = HashMap::from([(
         "LD_PRELOAD".to_string(),
         "./repository-controlled-library.so".to_string(),
     )]);
-    let Err(error) = StdioTransport::spawn_with_env("python3", &["-c", "pass"], &env) else {
+    let Err(error) = StdioTransport::spawn_with_env(
+        support::shared_run_context(),
+        "python3",
+        &["-c", "pass"],
+        &env,
+    ) else {
         panic!("MCP env must not influence the host sandbox launcher");
     };
     assert!(
@@ -446,8 +499,12 @@ name = "sandbox_blocked" if blocked_file and blocked_network else "sandbox_escap
 reply(request["id"], {{"tools":[{{"name":name,"inputSchema":{{"type":"object"}}}}]}})
 "#
     );
-    let transport =
-        StdioTransport::spawn("python3", &["-u", "-c", &script]).expect("sandboxed MCP");
+    let transport = StdioTransport::spawn(
+        support::shared_run_context(),
+        "python3",
+        &["-u", "-c", &script],
+    )
+    .expect("sandboxed MCP");
     let server = McpServer::new("sandbox-probe", Box::new(transport))
         .await
         .expect("probe handshake");
@@ -561,7 +618,7 @@ async fn call_tool_unknown_tool_returns_tool_not_found() {
 /// server name in `mcp__server__tool` is not registered.
 #[tokio::test]
 async fn call_tool_missing_server_returns_not_connected() {
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let result = manager
         .call_tool("mcp__missing_server__tool", json!({}))
         .await;
@@ -640,7 +697,7 @@ async fn call_tool_with_timeout_returns_timeout_error() {
         .mount(&mock_server)
         .await;
 
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     // mock_server.uri() is a 127.0.0.1 loopback that the SSRF guard
     // (fix #677) rejects in production; tests use the unchecked
     // variant to point at their own listener.
@@ -667,7 +724,7 @@ async fn call_tool_with_timeout_returns_timeout_error() {
 async fn manager_per_server_tool_timeout_limits_stdio_call() {
     let path = fixture_path();
     let path_str = path.to_str().expect("fixture path must be UTF-8");
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
 
     manager
         .connect_stdio_with_env_and_timeout(
@@ -847,7 +904,7 @@ async fn stdio_mid_call_disconnect_returns_transport_error() {
 async fn manager_marks_server_disconnected_after_transport_error() {
     let path = fixture_path();
     let path_str = path.to_str().expect("fixture path must be UTF-8");
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
 
     manager
         .connect_stdio("flaky", "python3", &[path_str])
@@ -880,7 +937,7 @@ async fn manager_marks_server_disconnected_after_transport_error() {
 /// prefix or wrong delimiter count) returns `McpError::ToolNotFound`.
 #[tokio::test]
 async fn call_tool_invalid_name_format_returns_tool_not_found() {
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
 
     for bad_name in &["notool", "server_tool", "mcp_server_tool", "server__tool"] {
         let result = manager.call_tool(bad_name, json!({})).await;
@@ -899,7 +956,7 @@ async fn call_tool_invalid_name_format_returns_tool_not_found() {
 /// `mcp__my_server__my_tool` must parse `server_name` = "`my_server`", tool = "`my_tool`".
 #[tokio::test]
 async fn call_tool_underscored_names_parse_correctly() {
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let result = manager
         .call_tool("mcp__my_server__my_tool", json!({}))
         .await;
@@ -946,7 +1003,7 @@ async fn arbitrary_unknown_error_codes_do_not_panic() {
 /// B4 — `McpManager::list_resources` for a non-existent server returns `Err`.
 #[tokio::test]
 async fn manager_list_resources_missing_server_returns_err() {
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let result = manager.list_resources(Some("missing")).await;
     assert!(result.is_err(), "expected Err for missing server");
 }
@@ -955,7 +1012,8 @@ async fn manager_list_resources_missing_server_returns_err() {
 /// not an error (multi-server path with zero servers).
 #[tokio::test]
 async fn manager_list_resources_no_servers_returns_empty() {
-    let manager = McpManager::new();
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let result = manager.list_resources(None).await.expect("should be Ok");
     assert!(result.is_empty());
 }
+mod support;

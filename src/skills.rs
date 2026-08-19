@@ -328,8 +328,64 @@ fn walk_project_skill_dirs(start: &Path, home: Option<&Path>) -> Vec<PathBuf> {
 /// `.openclaudia/config.yaml` still anchors discovery when no skills
 /// directory exists at any ancestor.
 fn skill_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
     let home = dirs::home_dir();
+    let mut project_dirs = Vec::new();
+
+    // Project layer (#661): every `.openclaudia/skills/` from cwd up to
+    // HOME, deepest first.
+    if let Ok(cwd) = std::env::current_dir() {
+        project_dirs = walk_project_skill_dirs(&cwd, home.as_deref());
+        if project_dirs.is_empty() {
+            // Legacy fall-back: anchor on the nearest config.yaml so the
+            // pre-#661 behaviour still works when none of the walked
+            // ancestors actually has a skills dir created yet.
+            if let Some(root) = find_project_root(&cwd) {
+                let project_skills = root.join(".openclaudia").join("skills");
+                tracing::info!(
+                    path = %project_skills.display(),
+                    "Project skills dir resolved via config.yaml anchor"
+                );
+                project_dirs.push(project_skills);
+            } else {
+                tracing::debug!(
+                    cwd = %cwd.display(),
+                    "No ancestor .openclaudia/skills/ or config.yaml found; skipping project skills dirs"
+                );
+            }
+        }
+    }
+
+    layered_skill_dirs(project_dirs, home.as_deref())
+}
+
+/// Resolve the skill layers visible to one immutable agent run.
+///
+/// Unlike [`skill_dirs`], project discovery never consults the process CWD
+/// and never walks above `project_root`. Managed and user skills remain
+/// host-owned application layers; only the project layer is run-scoped.
+fn skill_dirs_for_project(project_root: &Path, working_directory: &Path) -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let project_dirs = if working_directory.starts_with(project_root) {
+        let walked = walk_project_skill_dirs(working_directory, Some(project_root));
+        if walked.is_empty() && project_root.join(".openclaudia/config.yaml").exists() {
+            vec![project_root.join(".openclaudia/skills")]
+        } else {
+            walked
+        }
+    } else {
+        tracing::error!(
+            project_root = %project_root.display(),
+            working_directory = %working_directory.display(),
+            "Refusing project skill discovery outside the run root"
+        );
+        Vec::new()
+    };
+
+    layered_skill_dirs(project_dirs, home.as_deref())
+}
+
+fn layered_skill_dirs(project_dirs: Vec<PathBuf>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
 
     // 1. Managed / policy layer (#664). Off by default; opt in by setting
     //    OPENCLAUDIA_MANAGED_PATH. Disable with OPENCLAUDIA_DISABLE_POLICY_SKILLS.
@@ -344,33 +400,10 @@ fn skill_dirs() -> Vec<PathBuf> {
         }
     }
 
-    // 2. Project layer (#661): every `.openclaudia/skills/` from cwd up to
-    //    HOME, deepest first.
-    if let Ok(cwd) = std::env::current_dir() {
-        let walked = walk_project_skill_dirs(&cwd, home.as_deref());
-        if walked.is_empty() {
-            // Legacy fall-back: anchor on the nearest config.yaml so the
-            // pre-#661 behaviour still works when none of the walked
-            // ancestors actually has a skills dir created yet.
-            if let Some(root) = find_project_root(&cwd) {
-                let project_skills = root.join(".openclaudia").join("skills");
-                tracing::info!(
-                    path = %project_skills.display(),
-                    "Project skills dir resolved via config.yaml anchor"
-                );
-                dirs.push(project_skills);
-            } else {
-                tracing::debug!(
-                    cwd = %cwd.display(),
-                    "No ancestor .openclaudia/skills/ or config.yaml found; skipping project skills dirs"
-                );
-            }
-        } else {
-            for d in walked {
-                tracing::info!(path = %d.display(), "Project skills dir registered");
-                dirs.push(d);
-            }
-        }
+    // 2. Project layer.
+    for dir in project_dirs {
+        tracing::info!(path = %dir.display(), "Project skills dir registered");
+        dirs.push(dir);
     }
 
     // 3. User layer.
@@ -600,7 +633,37 @@ fn load_skills_uncached(dirs: &[PathBuf]) -> Vec<SkillDefinition> {
 #[must_use]
 pub fn load_skills() -> Vec<SkillDefinition> {
     let dirs = skill_dirs();
-    let mtimes_now = current_mtimes(&dirs);
+    load_skills_from_dirs(&dirs)
+}
+
+/// Load only host-managed and user-owned application skill layers.
+///
+/// This is the fail-closed choice when no immutable run is available: project
+/// discovery is omitted instead of being inferred from the process CWD.
+#[must_use]
+pub fn load_global_skills() -> Vec<SkillDefinition> {
+    let dirs = layered_skill_dirs(Vec::new(), dirs::home_dir().as_deref());
+    load_skills_from_dirs(&dirs)
+}
+
+/// Load skills for one run without deriving project authority from ambient
+/// process state.
+///
+/// Project discovery starts at `working_directory` and stops at
+/// `project_root`, both inclusive. This lets nested project skills override
+/// root skills while preventing one concurrent run from loading another
+/// run's project layer through the process CWD.
+#[must_use]
+pub fn load_skills_for_project(
+    project_root: &Path,
+    working_directory: &Path,
+) -> Vec<SkillDefinition> {
+    let dirs = skill_dirs_for_project(project_root, working_directory);
+    load_skills_from_dirs(&dirs)
+}
+
+fn load_skills_from_dirs(dirs: &[PathBuf]) -> Vec<SkillDefinition> {
+    let mtimes_now = current_mtimes(dirs);
 
     // Fast path: read lock, cache hit.
     {
@@ -620,7 +683,7 @@ pub fn load_skills() -> Vec<SkillDefinition> {
             return cache.skills.clone();
         }
     }
-    let skills = load_skills_uncached(&dirs);
+    let skills = load_skills_uncached(dirs);
     *guard = Some(SkillsCache {
         mtimes: mtimes_now,
         skills: skills.clone(),
@@ -643,10 +706,35 @@ pub fn get_skill(name: &str) -> Option<SkillDefinition> {
     load_skills().into_iter().find(|s| s.name == name)
 }
 
+/// Get a skill by name using a run-bounded project layer.
+#[must_use]
+pub fn get_skill_for_project(
+    name: &str,
+    project_root: &Path,
+    working_directory: &Path,
+) -> Option<SkillDefinition> {
+    load_skills_for_project(project_root, working_directory)
+        .into_iter()
+        .find(|skill| skill.name == name)
+}
+
 /// Load a skill only if it is allowed to be invoked from user-facing slash UI.
 #[must_use]
 pub fn get_user_invocable_skill(name: &str) -> Option<SkillDefinition> {
-    get_skill(name).filter(|skill| skill.user_invocable)
+    load_global_skills()
+        .into_iter()
+        .find(|skill| skill.name == name && skill.user_invocable)
+}
+
+/// Load a user-invocable skill through one run-bounded project layer.
+#[must_use]
+pub fn get_user_invocable_skill_for_project(
+    name: &str,
+    project_root: &Path,
+    working_directory: &Path,
+) -> Option<SkillDefinition> {
+    get_skill_for_project(name, project_root, working_directory)
+        .filter(|skill| skill.user_invocable)
 }
 
 #[cfg(test)]

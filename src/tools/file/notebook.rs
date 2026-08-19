@@ -218,12 +218,15 @@ fn parse_args(args: &HashMap<String, Value>) -> Result<ParsedArgs, ToolFailure> 
 /// Step 2: resolve the path, enforce read-before-edit, canonicalize for the
 /// blast-radius check, then open ONCE with `O_NOFOLLOW`. Returns the open
 /// handle plus the canonicalized path for downstream messages.
-fn preflight_and_open(raw_path: &str) -> Result<NotebookHandle, ToolFailure> {
-    let resolved = resolve_path(raw_path).map_err(|e| (e, true))?;
+fn preflight_and_open(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    raw_path: &str,
+) -> Result<NotebookHandle, ToolFailure> {
+    let resolved = resolve_path(run, raw_path).map_err(|e| (e, true))?;
     // Leaf-preserving path for the O_NOFOLLOW open. See crosslink #417.
-    let open_path = resolve_open_path(raw_path).map_err(|e| (e, true))?;
+    let open_path = resolve_open_path(run, raw_path).map_err(|e| (e, true))?;
 
-    if !READ_TRACKER.has_been_read(&resolved) {
+    if !READ_TRACKER.has_been_read(run, &resolved) {
         return Err((
             format!(
                 "You must read '{}' before editing it. Use read_file first to see the actual contents.",
@@ -243,16 +246,17 @@ fn preflight_and_open(raw_path: &str) -> Result<NotebookHandle, ToolFailure> {
         })?;
 
     super::require_fresh_file_observation_if_ledger_active(
+        run,
         Path::new(&canonical_path),
         "editing it",
     )
     .map_err(|msg| (msg, true))?;
 
-    crate::guardrails::check_file_access(&canonical_path).map_err(|msg| (msg, true))?;
+    crate::guardrails::check_file_access(run, &canonical_path).map_err(|msg| (msg, true))?;
 
     // Open once through the capability-root descriptor. `openat2` rejects
     // symlinks in every component, not just the final notebook name.
-    let file = super::secure_fs::open_regular_edit(&open_path).map_err(|e| {
+    let file = super::secure_fs::open_regular_edit(run, &open_path).map_err(|e| {
         (
             format!("Failed to open notebook '{canonical_path}': {e}"),
             true,
@@ -506,6 +510,7 @@ fn dispatch_edit(
 /// truncate + write) and update guardrail diff counters. See #417 for
 /// why we don't reopen by path here.
 fn write_notebook(
+    run: &crate::tools::security::ToolRunContext,
     handle: &mut NotebookHandle,
     notebook: &Value,
     original_content: &str,
@@ -528,8 +533,8 @@ fn write_notebook(
             )
         })?;
 
-    crate::guardrails::record_file_modification(&handle.canonical_path, new_lines, old_lines);
-    super::record_active_diff_observation(&handle.canonical_path, original_content, &pretty);
+    crate::guardrails::record_file_modification(run, &handle.canonical_path, new_lines, old_lines);
+    super::record_active_diff_observation(run, &handle.canonical_path, original_content, &pretty);
     Ok(())
 }
 
@@ -537,6 +542,7 @@ fn write_notebook(
 /// the locator's target description for the (rare) head-insert case where
 /// the caller supplied no locator.
 fn format_success(
+    run: &crate::tools::ToolRunContext,
     handle: &NotebookHandle,
     notebook: &Value,
     locator: &Locator,
@@ -564,7 +570,7 @@ fn format_success(
             .and_then(|c| c.as_array())
             .map_or(0, std::vec::Vec::len)
     );
-    if let Some(warning) = crate::guardrails::check_diff_thresholds() {
+    if let Some(warning) = crate::guardrails::check_diff_thresholds(run) {
         let _ = write!(result, "\n\nWarning: {}", warning.message);
     }
     result
@@ -582,12 +588,15 @@ fn format_success(
 /// Body is the linear pipeline: validate → preflight → read → resolve
 /// → dispatch → persist → summarize. Each step is a private helper above.
 /// Refactored from a 200+-line god function per crosslink #681.
-pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_notebook_edit(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let parsed = match parse_args(args) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let mut handle = match preflight_and_open(&parsed.raw_path) {
+    let mut handle = match preflight_and_open(run, &parsed.raw_path) {
         Ok(h) => h,
         Err(e) => return e,
     };
@@ -606,11 +615,11 @@ pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
         Ok(o) => o,
         Err(e) => return e,
     };
-    if let Err(e) = write_notebook(&mut handle, &notebook, &original_content) {
+    if let Err(e) = write_notebook(run, &mut handle, &notebook, &original_content) {
         return e;
     }
     (
-        format_success(&handle, &notebook, &locator, &outcome, &parsed),
+        format_success(run, &handle, &notebook, &locator, &outcome, &parsed),
         false,
     )
 }
@@ -623,6 +632,10 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Write as _;
     use tempfile::NamedTempFile;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     // =========================================================================
     // source_to_line_array unit tests
@@ -668,7 +681,7 @@ mod tests {
         let text = serde_json::to_string_pretty(nb).expect("serialize");
         f.write_all(text.as_bytes()).expect("write");
         let canon = f.path().canonicalize().expect("canonicalize");
-        READ_TRACKER.mark_read(&canon);
+        READ_TRACKER.mark_read(test_run(), &canon);
         (f, canon.to_string_lossy().to_string())
     }
 
@@ -743,7 +756,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_replace_by_id(&path, "cell-a", "new source");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "replace by id must succeed: {msg}");
         let cells = read_cells(&path);
         let src: String = match &cells[0]["source"] {
@@ -763,11 +776,11 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_replace_by_id(&path, "cell-a", "new");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "first notebook edit must succeed: {msg}");
 
         let args2 = args_replace_by_id(&path, "cell-b", "changed");
-        let (msg2, is_err2) = execute_notebook_edit(&args2);
+        let (msg2, is_err2) = execute_notebook_edit(test_run(), &args2);
         assert!(
             is_err2,
             "second notebook edit without a fresh read must fail: {msg2}"
@@ -782,20 +795,18 @@ mod tests {
     fn active_ledger_notebook_edit_requires_fresh_file_read_observation() {
         let _lock = super::super::shared_tracker_lock();
         READ_TRACKER.clear_all();
-        let _session_guard = crate::tools::SessionIdGuard::set("notebook-ledger-read-required");
+        let run = test_run();
         let ledger =
             std::sync::Arc::new(std::sync::Mutex::new(crate::ledger::RealityLedger::new()));
-        let _ledger_guard = crate::ledger::install_active_ledger_for_session(
-            "notebook-ledger-read-required",
-            ledger,
-        );
+        let _ledger_guard =
+            crate::ledger::install_active_ledger_for_session(run.session_id(), ledger);
         let nb = make_notebook(&json!([
             {"id": "cell-a", "cell_type": "code", "source": "old", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
         let (_f, path) = tmp_notebook(&nb);
 
         let args = args_replace_by_id(&path, "cell-a", "new");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(run, &args);
 
         assert!(is_err, "notebook edit without ledger read must fail: {msg}");
         assert!(
@@ -819,7 +830,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_replace_by_id(&path, "nonexistent-id", "y");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(is_err, "unknown cell_id must error: {msg}");
         assert!(msg.contains("No cell with id"), "message: {msg}");
     }
@@ -839,7 +850,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_replace_by_number(&path, 1, "updated second");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "replace by cell_number must succeed: {msg}");
         let cells = read_cells(&path);
         let src: String = match &cells[1]["source"] {
@@ -861,7 +872,7 @@ mod tests {
         args.insert("notebook_path".to_string(), json!(&path));
         args.insert("new_source".to_string(), json!("y"));
         args.insert("edit_mode".to_string(), json!("replace"));
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(is_err, "replace without locator must error: {msg}");
         assert!(msg.contains("replace requires"), "message: {msg}");
     }
@@ -883,7 +894,7 @@ mod tests {
         let (_f, path) = tmp_notebook(&nb);
         // cell_number = 1 but there is only 1 cell (index 0)
         let args = args_replace_by_number(&path, 1, "oob");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(
             is_err,
             "replace at index == len without cell_type must error: {msg}"
@@ -907,7 +918,7 @@ mod tests {
         let (_f, path) = tmp_notebook(&nb);
         let mut args = args_replace_by_number(&path, 1, "appended via replace");
         args.insert("cell_type".to_string(), json!("markdown"));
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "replace at len with cell_type must succeed: {msg}");
         let cells = read_cells(&path);
         assert_eq!(cells.len(), 2, "cell appended at end");
@@ -924,7 +935,7 @@ mod tests {
         let (_f, path) = tmp_notebook(&nb);
         let mut args = args_replace_by_number(&path, 5, "way past");
         args.insert("cell_type".to_string(), json!("code"));
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(is_err, "replace strictly past end must still error: {msg}");
         assert!(msg.contains("out of bounds"), "message: {msg}");
     }
@@ -952,7 +963,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_replace_by_id(&path, "cell-x", "print('world')");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "replace must succeed: {msg}");
         let cells = read_cells(&path);
         assert_eq!(
@@ -981,7 +992,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_replace_by_id(&path, "md", "# bye");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "markdown replace must succeed: {msg}");
         let cells = read_cells(&path);
         assert!(
@@ -1006,7 +1017,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_insert(&path, None, None, "markdown", "# new first");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "insert at 0 must succeed: {msg}");
         let cells = read_cells(&path);
         assert_eq!(cells.len(), 2, "cell count grew by 1");
@@ -1027,7 +1038,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_insert(&path, Some("first"), None, "markdown", "inserted");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "insert after cell must succeed: {msg}");
         let cells = read_cells(&path);
         assert_eq!(cells.len(), 3, "cell count");
@@ -1051,7 +1062,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_delete_by_id(&path, "remove");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "delete must succeed: {msg}");
         let cells = read_cells(&path);
         assert_eq!(cells.len(), 1, "one cell remains");
@@ -1073,10 +1084,10 @@ mod tests {
         let mut f = NamedTempFile::new_in(".").expect("tempfile");
         f.write_all(b"not valid json {{{{").expect("write");
         let canon = f.path().canonicalize().expect("canon");
-        READ_TRACKER.mark_read(&canon);
+        READ_TRACKER.mark_read(test_run(), &canon);
         let path = canon.to_string_lossy().to_string();
         let args = args_replace_by_number(&path, 0, "x");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(is_err, "invalid JSON must error: {msg}");
         assert!(msg.contains("Failed to parse notebook"), "message: {msg}");
     }
@@ -1093,7 +1104,7 @@ mod tests {
         args.insert("notebook_path".to_string(), json!(&path));
         args.insert("new_source".to_string(), json!("x"));
         args.insert("edit_mode".to_string(), json!("upsert"));
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(is_err, "invalid edit_mode must error: {msg}");
         assert!(msg.contains("Invalid edit_mode"), "message: {msg}");
     }
@@ -1117,7 +1128,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_replace_by_number(&path, u64::MAX, "boom");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(is_err, "u64::MAX cell_number must error: {msg}");
         // On 32-bit: hits the new checked-conversion branch.
         // On 64-bit: hits the existing bounds check (the cast succeeds since
@@ -1163,13 +1174,13 @@ mod tests {
         let leaf = dir.path().join("leaf.ipynb");
         std::os::unix::fs::symlink(&target, &leaf).expect("symlink");
         let leaf_canon = leaf.canonicalize().expect("canonicalize leaf");
-        READ_TRACKER.mark_read(&leaf_canon);
+        READ_TRACKER.mark_read(test_run(), &leaf_canon);
         let args = args_replace_by_id(
             &leaf.to_string_lossy(),
             "guarded",
             "ATTACKER_INJECTED_SOURCE",
         );
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(
             is_err,
             "notebook_edit through a symlink leaf must fail (O_NOFOLLOW): {msg}"
@@ -1192,7 +1203,7 @@ mod tests {
         ]));
         let (_f, path) = tmp_notebook(&nb);
         let args = args_replace_by_id(&path, "a", "new");
-        let (msg, is_err) = execute_notebook_edit(&args);
+        let (msg, is_err) = execute_notebook_edit(test_run(), &args);
         assert!(!is_err, "regular notebook edit must succeed: {msg}");
         let cells = read_cells(&path);
         let src: String = match &cells[0]["source"] {

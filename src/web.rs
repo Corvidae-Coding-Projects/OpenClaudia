@@ -505,7 +505,7 @@ pub fn html_to_markdown(html: &str) -> String {
 const DUCKDUCKGO_HTML_URL: &str = "https://html.duckduckgo.com/html/";
 
 #[cfg(feature = "browser")]
-const BROWSER_PROFILE_DIR: &str = ".openclaudia/browser_profile";
+const BROWSER_PROFILE_DIR: &str = "browser_profile";
 
 /// Result from `web_fetch`
 #[derive(Debug, Clone)]
@@ -545,7 +545,12 @@ pub struct SearchResult {
 ///
 /// Returns an error string if URL validation fails, both fetch tiers
 /// fail, or the response exceeds [`MAX_WEB_FETCH_BYTES`].
-pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
+pub async fn fetch_url(
+    url: &str,
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Result<FetchResult, String> {
+    run.require(crate::tools::ToolResource::Network)
+        .map_err(|error| error.to_string())?;
     // crosslink #673 — async DNS via tokio::net::lookup_host. The legacy
     // sync `validate_url` invoked the blocking std-library resolver from
     // inside this async function, which stalled the tokio worker for the
@@ -565,8 +570,13 @@ pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
     // `browser` feature we surface a single combined error.
     #[cfg(feature = "browser")]
     {
+        let browser_scratch_root = browser_scratch_for_fallback(&run, &direct_err)?;
         let url_owned = url.to_string();
-        match tokio::task::spawn_blocking(move || fetch_with_browser(&url_owned)).await {
+        match tokio::task::spawn_blocking(move || {
+            fetch_with_browser(&url_owned, &browser_scratch_root)
+        })
+        .await
+        {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(browser_err)) => Err(format!(
                 "Both fetch tiers failed. Direct: {direct_err}. Browser: {browser_err}."
@@ -583,6 +593,18 @@ pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
              rebuild with `--features browser` to enable headless-Chrome fallback)"
         ))
     }
+}
+
+#[cfg(feature = "browser")]
+fn browser_scratch_for_fallback(
+    run: &crate::tools::ToolRunContext,
+    direct_error: &str,
+) -> Result<PathBuf, String> {
+    run.require(crate::tools::ToolResource::Process)
+        .map_err(|error| {
+            format!("Direct fetch failed: {direct_error}. Browser fallback is unavailable: {error}")
+        })?;
+    Ok(run.private_temp_root().to_path_buf())
 }
 
 /// Tier-1 direct HTTP fetch. HTML response bodies are converted to
@@ -657,12 +679,16 @@ fn extract_html_title(html: &str) -> Option<String> {
 /// # Errors
 ///
 /// Returns an error string if all search backends fail.
-pub fn search_web(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+pub fn search_web(
+    browser_scratch_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
     let mut backend_errors = Vec::new();
 
     // Tier 1 — DuckDuckGo via headless Chromium in browser builds
     // (free, no API key).
-    match search_duckduckgo(query, limit) {
+    match search_duckduckgo(browser_scratch_root, query, limit) {
         Ok(results) => return Ok(results),
         Err(e) => {
             tracing::warn!("DuckDuckGo search failed: {e}");
@@ -672,7 +698,7 @@ pub fn search_web(query: &str, limit: usize) -> Result<Vec<SearchResult>, String
 
     // Tier 2 — Bing HTML scrape via headless Chromium in browser
     // builds.
-    match search_bing(query, limit) {
+    match search_bing(browser_scratch_root, query, limit) {
         Ok(results) if !results.is_empty() => return Ok(results),
         Ok(_) => {
             backend_errors.push("Bing: returned zero results (likely bot-challenged)".to_string());
@@ -737,8 +763,12 @@ fn decode_bing_ck_url(href: &str) -> String {
 /// navigation times out, or if the rendered DOM exceeds
 /// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]
-pub fn search_bing(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
-    let browser = launch_browser_for_scraping()?;
+pub fn search_bing(
+    browser_scratch_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let browser = launch_browser_for_scraping(browser_scratch_root)?;
 
     let tab = browser
         .new_tab()
@@ -848,7 +878,11 @@ pub fn parse_bing_results_from_html(html: &str, limit: usize) -> Result<Vec<Sear
 ///
 /// Always returns an error.
 #[cfg(not(feature = "browser"))]
-pub fn search_bing(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, String> {
+pub fn search_bing(
+    _browser_scratch_root: &Path,
+    _query: &str,
+    _limit: usize,
+) -> Result<Vec<SearchResult>, String> {
     Err("Bing search requires the browser feature".to_string())
 }
 
@@ -874,10 +908,12 @@ pub fn search_bing(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, Str
 /// and the error path stays actionable when both fail (e.g. no
 /// network during first-run auto-download).
 #[cfg(feature = "browser")]
-fn launch_browser_for_scraping() -> Result<headless_chrome::Browser, String> {
+fn launch_browser_for_scraping(
+    browser_scratch_root: &Path,
+) -> Result<headless_chrome::Browser, String> {
     use headless_chrome::{Browser, LaunchOptions};
 
-    let user_data_dir = browser_profile_dir()?;
+    let user_data_dir = browser_profile_dir_under(browser_scratch_root)?;
     let opts = LaunchOptions::default_builder()
         .headless(true)
         .user_data_dir(Some(user_data_dir))
@@ -892,15 +928,8 @@ fn launch_browser_for_scraping() -> Result<headless_chrome::Browser, String> {
 }
 
 #[cfg(feature = "browser")]
-fn browser_profile_dir() -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("Failed to resolve current directory for browser profile: {e}"))?;
-    browser_profile_dir_under(&cwd)
-}
-
-#[cfg(feature = "browser")]
-fn browser_profile_dir_under(project_root: &Path) -> Result<PathBuf, String> {
-    let dir = project_root.join(BROWSER_PROFILE_DIR);
+fn browser_profile_dir_under(browser_scratch_root: &Path) -> Result<PathBuf, String> {
+    let dir = browser_scratch_root.join(BROWSER_PROFILE_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| {
         format!(
             "Failed to create Chromium browser profile directory '{}': {e}",
@@ -920,8 +949,12 @@ fn browser_profile_dir_under(project_root: &Path) -> Result<PathBuf, String> {
 /// navigation times out, if the response exceeds the rendered-HTML
 /// cap, or if the DOM does not contain the expected selectors.
 #[cfg(feature = "browser")]
-pub fn search_duckduckgo(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
-    let browser = launch_browser_for_scraping()?;
+pub fn search_duckduckgo(
+    browser_scratch_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let browser = launch_browser_for_scraping(browser_scratch_root)?;
 
     let tab = browser
         .new_tab()
@@ -1085,7 +1118,11 @@ pub fn parse_duckduckgo_results_from_html(
 ///
 /// Always returns an error when the browser feature is not enabled.
 #[cfg(not(feature = "browser"))]
-pub fn search_duckduckgo(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, String> {
+pub fn search_duckduckgo(
+    _browser_scratch_root: &Path,
+    _query: &str,
+    _limit: usize,
+) -> Result<Vec<SearchResult>, String> {
     Err("DuckDuckGo search requires the browser feature. Rebuild with the default `browser` feature to enable free search.".to_string())
 }
 
@@ -1105,10 +1142,10 @@ pub fn search_duckduckgo(_query: &str, _limit: usize) -> Result<Vec<SearchResult
 /// navigation times out, or the rendered DOM exceeds
 /// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]
-pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
+pub fn fetch_with_browser(url: &str, browser_scratch_root: &Path) -> Result<FetchResult, String> {
     validate_url(url)?;
 
-    let browser = launch_browser_for_scraping()?;
+    let browser = launch_browser_for_scraping(browser_scratch_root)?;
 
     let tab = browser
         .new_tab()
@@ -1161,7 +1198,7 @@ pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
 ///
 /// Always returns an error when the browser feature is not enabled.
 #[cfg(not(feature = "browser"))]
-pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
+pub fn fetch_with_browser(url: &str, _browser_scratch_root: &Path) -> Result<FetchResult, String> {
     validate_url(url)?;
     Err("Browser feature not enabled. Rebuild with `cargo build --features browser`".to_string())
 }
@@ -1205,16 +1242,39 @@ mod tests {
 
     #[cfg(feature = "browser")]
     #[test]
-    fn browser_profile_dir_is_project_local_and_created() {
-        let root = tempfile::tempdir().expect("temp project root");
+    fn browser_profile_dir_is_run_scratch_local_and_created() {
+        let root = tempfile::tempdir().expect("temp run scratch root");
         let dir = browser_profile_dir_under(root.path()).expect("browser profile dir");
 
-        assert_eq!(dir, root.path().join(".openclaudia/browser_profile"));
+        assert_eq!(dir, root.path().join("browser_profile"));
         assert!(dir.is_dir(), "browser profile directory must be created");
         assert!(
             dir.starts_with(root.path()),
-            "browser profile must stay inside the project root"
+            "browser profile must stay inside the run scratch root"
         );
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn browser_fallback_requires_process_only_after_direct_tier_failure() {
+        let root = tempfile::tempdir().expect("network-only run root");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .process(false)
+                .network(true)
+                .secrets(false)
+                .provider("web-fallback-capability-test")
+                .build()
+                .expect("network-only run");
+
+        let error = browser_scratch_for_fallback(&run, "simulated direct failure")
+            .expect_err("browser fallback must require process authority");
+        assert!(error.contains("simulated direct failure"), "{error}");
+        assert!(error.contains("Process"), "{error}");
     }
 
     #[test]

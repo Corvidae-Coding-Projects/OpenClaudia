@@ -152,7 +152,25 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
 
     let mut has_failures = false;
 
-    let sandbox = openclaudia::tools::sandbox_diagnostics();
+    let workspace = std::env::current_dir()
+        .map_err(|error| anyhow::anyhow!("Cannot resolve doctor workspace: {error}"))?;
+    let run_context = openclaudia::tools::ToolRunContext::builder(
+        openclaudia::state::SessionId::new(),
+        &workspace,
+    )
+    .working_directory(&workspace)
+    .read_only_roots(Vec::new())
+    .read_write_roots(Vec::new())
+    .environment_grants(std::collections::HashMap::new())
+    .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+    .process(false)
+    .network(false)
+    .secrets(false)
+    .provider("doctor")
+    .build()
+    .map_err(|error| anyhow::anyhow!("Cannot create doctor run capabilities: {error}"))?;
+
+    let sandbox = openclaudia::tools::sandbox_diagnostics_for_run(&run_context);
     println!(
         "Agent sandbox... {}",
         if sandbox.healthy { "OK" } else { "FAILED" }
@@ -294,11 +312,11 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
     print!("\nPlugins... ");
     // crosslink #893: try_new surfaces missing-$HOME loudly in `doctor`
     // since that is the exact UX a confused user is checking.
-    let mut plugin_manager = match PluginManager::try_new() {
+    let mut plugin_manager = match PluginManager::try_new_for_project(&workspace) {
         Ok(pm) => pm,
         Err(e) => {
             println!("WARN ({e}); using project-only search");
-            PluginManager::new()
+            PluginManager::new_for_project(&workspace)
         }
     };
     let errors = plugin_manager.discover();
@@ -392,7 +410,7 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
 
     // Test MCP manager functionality
     print!("\nMCP Manager... ");
-    let mcp_manager = McpManager::new();
+    let mcp_manager = McpManager::new(std::sync::Arc::clone(&run_context));
 
     let is_connected = mcp_manager.is_connected("test-server").await;
     println!(
@@ -466,8 +484,8 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
         }
     }
 
-    let custom_paths = vec![PathBuf::from(".openclaudia/plugins")];
-    let mut custom_plugin_manager = PluginManager::with_paths(custom_paths);
+    let custom_paths = vec![workspace.join(".openclaudia/plugins")];
+    let mut custom_plugin_manager = PluginManager::with_paths_for_project(custom_paths, &workspace);
     let _ = custom_plugin_manager.discover();
     info!(
         "Custom plugin manager: {} plugins",

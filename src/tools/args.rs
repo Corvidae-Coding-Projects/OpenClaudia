@@ -163,6 +163,8 @@ pub enum ToolError {
     /// The arguments parsed but failed a domain validation rule (e.g.
     /// command on the bash denylist, length cap exceeded, malformed path).
     InvalidInput(String),
+    /// A required immutable run resource is absent or invalid.
+    Unavailable(String),
     /// An external operation failed (subprocess, filesystem, HTTP, …).
     /// The message is the upstream error rendered for human consumption.
     External(String),
@@ -181,6 +183,7 @@ impl std::fmt::Display for ToolError {
         match self {
             Self::InvalidArgument(e) => write!(f, "{e}"),
             Self::InvalidInput(msg)
+            | Self::Unavailable(msg)
             | Self::External(msg)
             | Self::PermissionDenied(msg)
             | Self::Other(msg) => write!(f, "{msg}"),

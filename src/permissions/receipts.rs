@@ -74,6 +74,7 @@ pub struct ApprovalBinding {
     workspace_digest: String,
     workspace_root: PathBuf,
     workspace_generation_base: u64,
+    follows_process_cwd_generation: bool,
 }
 
 impl ApprovalBinding {
@@ -87,6 +88,7 @@ impl ApprovalBinding {
             workspace_digest: digest_text(&workspace_root.to_string_lossy()),
             workspace_root,
             workspace_generation_base: generation.max(1),
+            follows_process_cwd_generation: false,
         }
     }
 
@@ -95,12 +97,28 @@ impl ApprovalBinding {
     pub fn current() -> Self {
         let actor = current_actor_identity();
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::new(actor, workspace, 1)
+        let mut binding = Self::new(actor, workspace, 1);
+        binding.follows_process_cwd_generation = true;
+        binding
+    }
+
+    /// Bind approvals to the current host actor and one exact run generation.
+    #[must_use]
+    pub fn for_run(run: &crate::tools::ToolRunContext) -> Self {
+        Self::new(
+            current_actor_identity(),
+            run.project_root(),
+            run.generation().get(),
+        )
     }
 
     fn workspace_generation(&self) -> u64 {
-        self.workspace_generation_base
-            .saturating_add(crate::tools::cwd_cache_generation())
+        if self.follows_process_cwd_generation {
+            self.workspace_generation_base
+                .saturating_add(crate::tools::cwd_cache_generation())
+        } else {
+            self.workspace_generation_base
+        }
     }
 }
 
@@ -862,6 +880,12 @@ impl LocalApprovalCache {
             capability_generation: 1,
             records: Vec::new(),
         }
+    }
+
+    /// Construct a cache bound to one exact run's workspace generation.
+    #[must_use]
+    pub fn for_run(run: &crate::tools::ToolRunContext) -> Self {
+        Self::new(ApprovalBinding::for_run(run))
     }
 
     /// Consume one matching allow use or return the matching exact denial.

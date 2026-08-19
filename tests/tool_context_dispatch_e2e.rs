@@ -17,7 +17,7 @@ mod support;
 #[test]
 fn tool_context_struct_literal_supports_absent_optional_services() {
     let context = ToolContext {
-        security: openclaudia::tools::security::current_context(),
+        run: support::shared_run_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
@@ -30,12 +30,16 @@ fn tool_context_struct_literal_supports_absent_optional_services() {
 #[test]
 fn tool_context_can_be_borrowed_mutably_by_the_internal_executor() {
     let mut context = ToolContext {
-        security: openclaudia::tools::security::current_context(),
+        run: support::shared_run_context(),
         memory_db: None,
         app_config: None,
         task_mgr: None,
     };
     context.task_mgr = None;
+    assert!(std::ptr::eq(
+        context.run.as_ref(),
+        support::shared_run_context().as_ref()
+    ));
 }
 
 #[test]

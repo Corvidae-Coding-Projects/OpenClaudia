@@ -30,6 +30,8 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, SandboxMode};
 use openclaudia::hooks::{HookEngine, HookEvent, HookInput};
 use openclaudia::permissions::{
@@ -98,7 +100,7 @@ enum HookSlot {
 async fn command_hook_runs_and_returns_allowed_by_default() {
     let cfg = config_with_command_hook(HookSlot::SessionStart, None, "echo ok", 10);
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let result = engine.run(HookEvent::SessionStart, &input).await;
     assert!(
@@ -134,7 +136,7 @@ async fn full_sandbox_hook_cannot_persist_host_temp_write() {
         sandbox: SandboxMode::FullSandbox,
     });
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let result = engine.run(HookEvent::SessionStart, &input).await;
 
@@ -163,7 +165,8 @@ async fn pretool_hook_deny_decision_flips_allowed_to_false() {
         10,
     );
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::PreToolUse).with_tool("Bash", json!({"command": "ls"}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("Bash", json!({"command": "ls"}));
 
     let result = engine.run(HookEvent::PreToolUse, &input).await;
     assert!(
@@ -195,8 +198,8 @@ async fn pretool_hook_with_non_matching_matcher_does_not_fire() {
         10,
     );
     let engine = HookEngine::new(cfg);
-    let input =
-        HookInput::new(HookEvent::PreToolUse).with_tool("Write", json!({"file_path": "/tmp/x"}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("Write", json!({"file_path": "/tmp/x"}));
 
     let result = engine.run(HookEvent::PreToolUse, &input).await;
     assert!(
@@ -213,7 +216,7 @@ async fn timeout_kills_long_running_hook_within_grace_window() {
     // hook never got to print one).
     let cfg = config_with_command_hook(HookSlot::SessionStart, None, "sleep 60", 1);
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let start = Instant::now();
     let result = engine.run(HookEvent::SessionStart, &input).await;
@@ -245,7 +248,7 @@ async fn timeout_kills_hook_descendants_before_they_can_escape_lifetime() {
     let command = format!("(sleep 2; touch '{}') & sleep 60", marker.to_string_lossy());
     let cfg = config_with_command_hook(HookSlot::SessionStart, None, &command, 1);
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let _ = engine.run(HookEvent::SessionStart, &input).await;
     tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
@@ -261,7 +264,7 @@ async fn hook_output_capture_is_bounded() {
     let command = r#"python3 -c 'print("x" * (2 * 1024 * 1024))'"#;
     let cfg = config_with_command_hook(HookSlot::SessionStart, None, command, 10);
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let result = engine.run(HookEvent::SessionStart, &input).await;
     let retained = result
@@ -292,7 +295,8 @@ async fn user_prompt_submit_matcher_targets_prompt_not_tool_name() {
 
     // Match: prompt contains "secret"
     let input_match =
-        HookInput::new(HookEvent::UserPromptSubmit).with_prompt("please show me the secret");
+        HookInput::for_run(support::shared_run_context(), HookEvent::UserPromptSubmit)
+            .with_prompt("please show me the secret");
     let r1 = engine.run(HookEvent::UserPromptSubmit, &input_match).await;
     assert!(
         !r1.allowed,
@@ -300,7 +304,9 @@ async fn user_prompt_submit_matcher_targets_prompt_not_tool_name() {
     );
 
     // No match: prompt is innocuous
-    let input_clean = HookInput::new(HookEvent::UserPromptSubmit).with_prompt("hello there");
+    let input_clean =
+        HookInput::for_run(support::shared_run_context(), HookEvent::UserPromptSubmit)
+            .with_prompt("hello there");
     let r2 = engine.run(HookEvent::UserPromptSubmit, &input_clean).await;
     assert!(
         r2.allowed,
@@ -313,7 +319,8 @@ async fn empty_config_is_allowed_by_default() {
     // Engine with no configured hooks for an event returns
     // HookResult::allowed() without spawning anything.
     let engine = HookEngine::new(HooksConfig::default());
-    let input = HookInput::new(HookEvent::PreToolUse).with_tool("Bash", json!({"command": "ls"}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("Bash", json!({"command": "ls"}));
     let result = engine.run(HookEvent::PreToolUse, &input).await;
     assert!(result.allowed);
     assert!(result.outputs.is_empty());
@@ -348,7 +355,7 @@ async fn multiple_hooks_in_same_slot_all_run() {
     });
 
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
     let _ = engine.run(HookEvent::SessionStart, &input).await;
 
     assert!(

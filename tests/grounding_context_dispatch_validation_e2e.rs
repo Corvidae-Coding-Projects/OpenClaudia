@@ -6,7 +6,6 @@
 #![allow(clippy::expect_used)]
 
 use openclaudia::ledger::{project_session_ledger_path, ObsId};
-use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -105,16 +104,17 @@ fn include_stale_wrong_type_returns_validation_error() {
 
 #[test]
 fn valid_args_without_session_ledger_reach_no_ledger_error() {
-    let session_id = format!("grounding-dispatch-missing-{}", uuid::Uuid::new_v4());
+    let run = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let session_id = run.session_id().to_string();
     let ledger_path = project_session_ledger_path(&session_id).expect("ledger path");
     let _ = std::fs::remove_file(&ledger_path);
-    let _session_guard = SessionIdGuard::set(&session_id);
 
     let args = args_with(&[
         ("ids", json!([ObsId::new().to_string()])),
         ("include_stale", json!(false)),
     ]);
-    let (msg, is_err) = dispatch(&args);
+    let result = support::dispatch_tool_result_for_run(&run, "grounding_context", &args);
+    let (msg, is_err) = support::legacy(&result);
 
     assert!(is_err);
     assert!(

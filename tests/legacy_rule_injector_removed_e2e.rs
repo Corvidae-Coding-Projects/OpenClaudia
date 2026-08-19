@@ -122,6 +122,7 @@ async fn pre_tool_hook_trace_keeps_only_neutral_extension_metadata() {
     let engine = HookEngine::new(config);
 
     ToolExecutor::run_pre_tool_use(
+        support::shared_run_context(),
         &engine,
         Some("s-007-trace"),
         "write_file",
@@ -137,3 +138,5 @@ async fn pre_tool_hook_trace_keeps_only_neutral_extension_metadata() {
     assert!(!trace.to_string().contains(SENTINEL));
     assert!(trace.get("instructions").is_none());
 }
+
+mod support;

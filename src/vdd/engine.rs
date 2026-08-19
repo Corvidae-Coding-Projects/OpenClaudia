@@ -120,6 +120,7 @@ impl VddEngine {
     /// Returns an error if the adversary request fails or the response cannot be parsed.
     pub async fn review_text(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         builder_text: &str,
         user_task: &str,
         builder: BuilderProvider<'_>,
@@ -141,7 +142,10 @@ impl VddEngine {
             "VDD: Starting adversarial review"
         );
 
-        self.single_pass_review(builder_text, user_task, builder)
+        run.require(crate::tools::ToolResource::Network)?;
+        run.require(crate::tools::ToolResource::Secrets)?;
+
+        self.single_pass_review(run, builder_text, user_task, builder)
             .await
     }
 
@@ -157,12 +161,13 @@ impl VddEngine {
     /// Crosslink #746: previously duplicated verbatim across the two callers.
     async fn single_pass_review(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         builder_text: &str,
         user_task: &str,
         builder: BuilderProvider<'_>,
     ) -> Result<VddAdvisoryResult, VddError> {
         // Run static analysis
-        let static_results = self.run_static_analysis().await;
+        let static_results = self.run_static_analysis(run).await;
 
         // Build and send adversary request
         let adversary_request = build_adversary_request(
@@ -225,6 +230,7 @@ impl VddEngine {
     /// Returns an error if the adversary request or builder revision fails.
     pub async fn process_response(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         builder_response: &Value,
         original_request: &ChatCompletionRequest,
         builder: BuilderProvider<'_>,
@@ -275,16 +281,25 @@ impl VddEngine {
             "VDD: Starting adversarial review"
         );
 
+        run.require(crate::tools::ToolResource::Network)?;
+        run.require(crate::tools::ToolResource::Secrets)?;
+
         match self.config.mode {
             VddMode::Advisory => {
                 let result = self
-                    .advisory_review(&builder_text, original_request, builder)
+                    .advisory_review(run, &builder_text, original_request, builder)
                     .await?;
                 Ok(VddResult::Advisory(result))
             }
             VddMode::Blocking => {
                 let result = self
-                    .blocking_loop(builder_response, &builder_text, original_request, builder)
+                    .blocking_loop(
+                        run,
+                        builder_response,
+                        &builder_text,
+                        original_request,
+                        builder,
+                    )
                     .await?;
                 Ok(VddResult::Blocking(result))
             }
@@ -299,18 +314,20 @@ impl VddEngine {
     /// this is called, so we do not re-check it here.
     async fn advisory_review(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         builder_text: &str,
         original_request: &ChatCompletionRequest,
         builder: BuilderProvider<'_>,
     ) -> Result<VddAdvisoryResult, VddError> {
         let original_task = extract_user_task(original_request);
-        self.single_pass_review(builder_text, &original_task, builder)
+        self.single_pass_review(run, builder_text, &original_task, builder)
             .await
     }
 
     /// Blocking mode: full adversarial loop until convergence.
     async fn blocking_loop(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         initial_builder_response: &Value,
         initial_builder_text: &str,
         original_request: &ChatCompletionRequest,
@@ -351,7 +368,7 @@ impl VddEngine {
                 "VDD blocking: iteration"
             );
 
-            let static_results = self.run_static_analysis().await;
+            let static_results = self.run_static_analysis(run).await;
 
             let iteration_ctx = IterationContext {
                 builder_text: &current_builder_text,
@@ -411,7 +428,7 @@ impl VddEngine {
         }
 
         self.finalize_unconverged_session(&mut session);
-        let crosslink_issues = self.create_issues_and_persist(&session).await;
+        let crosslink_issues = self.create_issues_and_persist(run, &session).await;
 
         Ok(VddBlockingResult {
             final_response: current_builder_response,
@@ -614,7 +631,11 @@ impl VddEngine {
     /// persist the session if configured. Extracted from
     /// [`Self::blocking_loop`] purely to keep that function under the
     /// project's 100-line limit; behaviour is unchanged.
-    async fn create_issues_and_persist(&self, session: &VddSession) -> Vec<String> {
+    async fn create_issues_and_persist(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        session: &VddSession,
+    ) -> Vec<String> {
         let all_genuine: Vec<&Finding> = session
             .iterations
             .iter()
@@ -625,7 +646,7 @@ impl VddEngine {
         let crosslink_issues = if all_genuine.is_empty() {
             Vec::new()
         } else {
-            match create_crosslink_issues(&all_genuine).await {
+            match create_crosslink_issues(run, &all_genuine).await {
                 Ok(ids) => ids,
                 Err(e) => {
                     warn!("VDD: Crosslink issue creation failed: {}", e);
@@ -644,7 +665,10 @@ impl VddEngine {
     }
 
     /// Run configured static analysis commands.
-    async fn run_static_analysis(&self) -> Vec<StaticAnalysisResult> {
+    async fn run_static_analysis(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    ) -> Vec<StaticAnalysisResult> {
         if !self.config.static_analysis.enabled {
             return Vec::new();
         }
@@ -653,7 +677,7 @@ impl VddEngine {
         let commands: Vec<String> = if !self.config.static_analysis.commands.is_empty() {
             self.config.static_analysis.commands.clone()
         } else if self.config.static_analysis.auto_detect {
-            let detected = crate::guardrails::get_auto_detected_commands();
+            let detected = crate::guardrails::get_auto_detected_commands(run);
             if detected.is_empty() {
                 debug!("VDD: No static analysis commands configured or auto-detected");
                 return Vec::new();
@@ -669,7 +693,7 @@ impl VddEngine {
         for command in &commands {
             debug!(command = %command, "VDD: Running static analysis");
 
-            let result = run_shell_command(command, timeout).await;
+            let result = run_shell_command(run, command, timeout).await;
             info!(
                 command = %command,
                 passed = result.passed,

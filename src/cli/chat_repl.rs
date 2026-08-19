@@ -30,8 +30,9 @@ use crate::cli::repl::session_io::{
     save_session_to_short_term_memory,
 };
 use crate::cli::repl::slash::{
-    handle_activity_command, handle_memory_command, handle_slash_command, PluginActionOutcome,
-    PluginActionRunner, PluginCommandInvocation, SkillInvocation, SlashCommandResult,
+    handle_activity_command, handle_memory_command, handle_slash_command_for_run,
+    PluginActionOutcome, PluginActionRunner, PluginCommandInvocation, SkillInvocation,
+    SlashCommandResult,
 };
 use crate::cli::repl::vim::{self, VimState};
 use crate::cli::repl::{load_chat_session, save_chat_session, Session};
@@ -62,6 +63,7 @@ use openclaudia::{
 use rustyline::error::ReadlineError;
 
 fn execute_tool_with_memory_after_permission(
+    run_context: &std::sync::Arc<tools::ToolRunContext>,
     tool_call: &tools::ToolCall,
     memory_db: Option<&memory::MemoryDb>,
     permission_mgr: &PermissionManager,
@@ -71,6 +73,7 @@ fn execute_tool_with_memory_after_permission(
 ) -> tools::ToolResult {
     openclaudia::services::tool_executor::ToolExecutor::execute(
         openclaudia::services::tool_executor::ToolExecutorRequest {
+            run_context,
             tool_call,
             memory_db,
             app_config: None,
@@ -189,6 +192,7 @@ pub struct ChatRepl {
     claude_code_token: Option<String>,
     permission_mgr: PermissionManager,
     policy_enforcer: std::sync::Arc<openclaudia::services::policy::PolicyEnforcer>,
+    run_context: std::sync::Arc<tools::ToolRunContext>,
     vdd_engine: Option<vdd::VddEngine>,
     history_path: std::path::PathBuf,
     // ── Per-session mutable state ──
@@ -231,6 +235,53 @@ enum SlashOutcome {
 struct TurnTransport<'a> {
     endpoint: &'a str,
     headers: &'a [(String, String)],
+}
+
+fn derive_repl_session_run(
+    parent: &tools::ToolRunContext,
+    session: &Session,
+    configured_provider: &str,
+) -> Result<std::sync::Arc<tools::ToolRunContext>, String> {
+    if canonical_provider_name(&session.provider) != canonical_provider_name(configured_provider) {
+        return Err(format!(
+            "Saved session provider '{}' differs from the active provider '{}'; relaunch with --target {} to resume it",
+            session.provider, configured_provider, session.provider
+        ));
+    }
+    let identity = session.inspect_state(|state| state.identity.clone());
+    let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
+        format!(
+            "Cannot resume project root '{}': {error}",
+            identity.project_root.display()
+        )
+    })?;
+    if project_root != parent.project_root() {
+        return Err(format!(
+            "Session project '{}' differs from the authorized launch project '{}'; launch OpenClaudia from that project to resume it",
+            project_root.display(),
+            parent.project_root().display()
+        ));
+    }
+    parent.derive_frontend_session(
+        identity.session_id,
+        &project_root,
+        &identity.cwd,
+        configured_provider,
+    )
+}
+
+fn fresh_repl_session_in_run(current: &Session, model: &str, provider: &str) -> Session {
+    let behavior_mode = current.behavior_mode();
+    let identity = current.inspect_state(|state| state.identity.clone());
+    let fresh = Session::new_with_behavior_mode(model, provider, behavior_mode);
+    let fresh_id = fresh.inspect_state(|state| state.identity.session_id.clone());
+    fresh.update_state(|state, _| {
+        state.identity = identity;
+        state.identity.session_id = fresh_id;
+        state.identity.parent_session_id = None;
+        state.transcript.transcript_cwd = state.identity.cwd.clone();
+    });
+    fresh
 }
 
 /// Mutable state threaded through the Gemini agentic tool loop.
@@ -406,6 +457,7 @@ impl ChatRepl {
     /// initialized REPL. Setup failures return an error after printing the
     /// same user-facing diagnostics as the default TUI path, so the process
     /// exits non-zero instead of making automation believe startup succeeded.
+    #[allow(clippy::too_many_lines)] // Session composition is intentionally linear and fail-fast.
     pub async fn new(args: ChatReplArgs) -> anyhow::Result<Self> {
         chdir_to_git_root();
 
@@ -423,8 +475,6 @@ impl ChatRepl {
                 anyhow::bail!(e);
             }
         };
-
-        guardrails::configure(&config.guardrails);
 
         let provider = match active_provider_for_turn(&config) {
             Ok(provider) => provider,
@@ -452,7 +502,6 @@ impl ChatRepl {
         };
         let client = reqwest::Client::new();
         let hook_engine = build_hook_engine(&config);
-        let plugin_manager = init_plugin_manager();
         let (rl, history_path) = init_rustyline_with_history()?;
 
         render_welcome_or_fallback(&config.proxy.target, &model);
@@ -474,11 +523,27 @@ impl ChatRepl {
 
         let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id())?;
         let memory_db: Option<memory::MemoryDb> = init_memory_with_banner();
-        let permission_mgr = init_permission_manager(&config, args.dangerously_skip_permissions);
         let policy_enforcer = std::sync::Arc::new(
             openclaudia::services::policy::PolicyEnforcer::new(config.policy.clone()),
         );
         let vdd_engine: Option<vdd::VddEngine> = init_vdd_engine_if_enabled(&config);
+        let identity = chat_session.inspect_state(|state| state.identity.clone());
+        let run_context =
+            tools::ToolRunContext::builder(identity.session_id, identity.project_root)
+                .working_directory(identity.cwd)
+                .host_startup_grants()
+                .workspace_access(tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(true)
+                .secrets(true)
+                .provider(config.proxy.target.clone())
+                .build()
+                .map_err(anyhow::Error::msg)?;
+        guardrails::configure(&run_context, &config.guardrails);
+        let permission_mgr =
+            init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);
+        let plugin_manager = init_plugin_manager(run_context.project_root());
+        let permissions = openclaudia::permissions::LocalApprovalCache::for_run(&run_context);
 
         Ok(Self {
             config,
@@ -490,6 +555,7 @@ impl ChatRepl {
             claude_code_token,
             permission_mgr,
             policy_enforcer,
+            run_context,
             vdd_engine,
             history_path,
             model,
@@ -502,7 +568,7 @@ impl ChatRepl {
             vim_state: VimState::new(),
             audit_logger,
             memory_db,
-            permissions: openclaudia::permissions::LocalApprovalCache::default(),
+            permissions,
             transient_allowed_tool_rules: Vec::new(),
             transient_model_restore: None,
             transient_effort_override: None,
@@ -557,6 +623,16 @@ impl ChatRepl {
             &self.history_path,
         );
         self.analytics_subscriber.finish();
+        let end_input = openclaudia::hooks::HookInput::for_run(
+            &self.run_context,
+            openclaudia::hooks::HookEvent::SessionEnd,
+        )
+        .with_session_id(self.chat_session.id());
+        let _ = self
+            .hook_engine
+            .run(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
+            .await;
+        tools::retire_run(&self.run_context);
         // Drop the learner before memory_db.
         drop(auto_learner);
         drop(memory_db);
@@ -635,9 +711,11 @@ impl ChatRepl {
                     self.clear_transient_prompt_options();
                     return Ok(Some(false));
                 }
-                if let Some(execution) =
-                    execute_shell_command_with_permission(cmd, &mut self.permissions)
-                {
+                if let Some(execution) = execute_shell_command_with_permission(
+                    &self.run_context,
+                    cmd,
+                    &mut self.permissions,
+                ) {
                     openclaudia::grounded_loop::observe_shell_command_for_session(
                         &self.chat_session.id(),
                         &execution.cwd,
@@ -774,7 +852,13 @@ impl ChatRepl {
         memory_db: Option<&memory::MemoryDb>,
     ) -> SlashOutcome {
         let result = self.chat_session.update_messages(|messages| {
-            handle_slash_command(input, messages, &self.config.proxy.target, &self.model)
+            handle_slash_command_for_run(
+                input,
+                messages,
+                &self.config.proxy.target,
+                &self.model,
+                &self.run_context,
+            )
         });
         let Some(result) = result else {
             return SlashOutcome::FallThrough;
@@ -786,24 +870,25 @@ impl ChatRepl {
             }
             SlashCommandResult::Clear => {
                 save_session_to_short_term_memory(&self.chat_session, memory_db);
-                let prev_mode = self.chat_session.behavior_mode();
-                self.chat_session
-                    .apply_loaded(&Session::new_with_behavior_mode(
-                        &self.model,
-                        &self.config.proxy.target,
-                        prev_mode,
-                    ));
+                let fresh = fresh_repl_session_in_run(
+                    &self.chat_session,
+                    &self.model,
+                    &self.config.proxy.target,
+                );
+                if let Err(error) = self.apply_session_transition(&fresh) {
+                    eprintln!("Could not start a new session: {error}");
+                }
                 SlashOutcome::Continue
             }
             SlashCommandResult::LoadSession(sid) => {
                 match load_chat_session(&sid) {
-                    Ok(Some(loaded)) => {
-                        self.chat_session.apply_loaded(&loaded);
-                        println!(
+                    Ok(Some(loaded)) => match self.apply_session_transition(&loaded) {
+                        Ok(()) => println!(
                             "Loaded {} messages from previous session.\n",
                             self.chat_session.message_count()
-                        );
-                    }
+                        ),
+                        Err(error) => eprintln!("Failed to activate session {sid}: {error}"),
+                    },
                     Ok(None) => {
                         eprintln!("Session {sid} was not found.");
                     }
@@ -832,6 +917,28 @@ impl ChatRepl {
             }
             other => self.dispatch_slash_rest(input, other, memory_db),
         }
+    }
+
+    fn apply_session_transition(&mut self, loaded: &Session) -> Result<(), String> {
+        let next_run =
+            derive_repl_session_run(&self.run_context, loaded, &self.config.proxy.target)?;
+        let next_audit = openclaudia::session::AuditLogger::new(&loaded.id())
+            .map_err(|error| format!("cannot initialize session audit log: {error}"))?;
+        let permission_bypass = self.chat_session.permission_bypass_enabled();
+
+        self.clear_transient_prompt_options();
+        tools::retire_run(&self.run_context);
+        self.chat_session.apply_loaded(loaded);
+        self.chat_session.set_permission_bypass(permission_bypass);
+        self.model.clone_from(&loaded.model);
+        self.run_context = next_run;
+        self.permission_mgr =
+            init_permission_manager(&self.config, permission_bypass, &self.run_context);
+        self.audit_logger = next_audit;
+        self.current_task_obs = None;
+        self.permissions = openclaudia::permissions::LocalApprovalCache::for_run(&self.run_context);
+        guardrails::configure(&self.run_context, &self.config.guardrails);
+        Ok(())
     }
 
     /// Tail of [`Self::dispatch_slash`] — kept separate so neither
@@ -884,14 +991,16 @@ impl ChatRepl {
                 self.apply_skill_invocation(input, invocation);
                 SlashOutcome::RewrittenPrompt
             }
-            SlashCommandResult::Plugin(action) => match action.apply(&mut self.plugin_manager) {
-                PluginActionOutcome::Handled => SlashOutcome::Continue,
-                PluginActionOutcome::Prompt(invocation) => {
-                    eprintln!("\x1b[36m⚡ Running plugin command...\x1b[0m");
-                    self.apply_plugin_command_invocation(input, invocation);
-                    SlashOutcome::RewrittenPrompt
+            SlashCommandResult::Plugin(action) => {
+                match action.apply(&mut self.plugin_manager, &self.run_context) {
+                    PluginActionOutcome::Handled => SlashOutcome::Continue,
+                    PluginActionOutcome::Prompt(invocation) => {
+                        eprintln!("\x1b[36m⚡ Running plugin command...\x1b[0m");
+                        self.apply_plugin_command_invocation(input, invocation);
+                        SlashOutcome::RewrittenPrompt
+                    }
                 }
-            },
+            }
             other => self.dispatch_slash_simple(other, memory_db),
         }
     }
@@ -1012,7 +1121,7 @@ impl ChatRepl {
     /// a fresh user message and reset undo state.
     fn handle_editor_input(&mut self, editor_content: String) -> SlashOutcome {
         let expanded = if editor_content.contains('@') {
-            expand_file_references(&editor_content)
+            expand_file_references(&self.run_context, &editor_content)
         } else {
             editor_content
         };
@@ -1213,7 +1322,7 @@ impl ChatRepl {
         use openclaudia::hooks::{HookEvent, HookInput};
 
         let expanded_input = if input.contains('@') {
-            expand_file_references(input)
+            expand_file_references(&self.run_context, input)
         } else {
             input.to_string()
         };
@@ -1237,7 +1346,8 @@ impl ChatRepl {
             learner.on_user_message(&expanded_input, prev_assistant.as_deref());
         }
 
-        let hook_input = HookInput::new(HookEvent::UserPromptSubmit).with_prompt(&expanded_input);
+        let hook_input = HookInput::for_run(&self.run_context, HookEvent::UserPromptSubmit)
+            .with_prompt(&expanded_input);
         let hook_result = self
             .hook_engine
             .run(HookEvent::UserPromptSubmit, &hook_input)
@@ -1339,6 +1449,7 @@ impl ChatRepl {
         tool_args: &serde_json::Value,
     ) -> Option<tools::ToolResult> {
         openclaudia::services::tool_executor::ToolExecutor::run_pre_tool_use(
+            &self.run_context,
             &self.hook_engine,
             Some(&self.chat_session.id()),
             &tool_call.function.name,
@@ -1375,9 +1486,6 @@ impl ChatRepl {
         memory_db: Option<&memory::MemoryDb>,
     ) -> prompt::SystemPromptBlocks {
         let messages = self.chat_session.messages_snapshot();
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
         let behavior_mode = self.chat_session.behavior_mode();
         let mut additional_items = Vec::new();
 
@@ -1446,10 +1554,10 @@ impl ChatRepl {
                 }
             }
         }
-        prompt::build_prompt_context_with_items(
+        prompt::build_prompt_context_with_items_for_run(
             &behavior_mode,
             memory_db,
-            Some(&cwd),
+            &self.run_context,
             additional_items,
             openclaudia::context::ContextBudget::default(),
         )
@@ -1645,7 +1753,7 @@ impl ChatRepl {
         let mut iteration: u32 = 0;
         while !state.tool_calls.is_empty() && (max_iterations == 0 || iteration < max_iterations) {
             iteration += 1;
-            guardrails::reset_turn();
+            guardrails::reset_turn(&self.run_context);
             self.gemini_record_model_turn(
                 &state.full_content,
                 &state.tool_calls,
@@ -1726,6 +1834,7 @@ impl ChatRepl {
             let mut messages = original.clone();
             run_vdd_review(
                 engine,
+                &self.run_context,
                 full_content,
                 &mut messages,
                 &self.config.proxy.target,
@@ -1953,6 +2062,7 @@ impl ChatRepl {
         }
 
         let result = execute_tool_with_memory_after_permission(
+            &self.run_context,
             tool_call,
             memory_db,
             &self.permission_mgr,
@@ -1971,13 +2081,14 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         result: &tools::ToolResult,
     ) -> serde_json::Value {
-        let final_result = process_tool_follow_up(&self.chat_session, result);
+        let final_result = process_tool_follow_up(&self.run_context, &self.chat_session, result);
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
         let tool_input = parse_tool_args(&tool_call.function).unwrap_or_else(
             |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.run_context,
             &self.hook_engine,
             !final_is_error,
             &tool_call.function.name,
@@ -2258,6 +2369,7 @@ impl ChatRepl {
             let mut messages = original.clone();
             run_vdd_review(
                 engine,
+                &self.run_context,
                 &final_content,
                 &mut messages,
                 &self.config.proxy.target,
@@ -2498,7 +2610,7 @@ impl ChatRepl {
                 break;
             }
             proxy_iteration += 1;
-            guardrails::reset_turn();
+            guardrails::reset_turn(&self.run_context);
 
             let Some(tool_calls) =
                 self.collect_anthropic_iteration(&*anthropic_accumulator, &mut executed_tool_sigs)
@@ -2627,7 +2739,7 @@ impl ChatRepl {
         };
         let result = self.run_tool_with_audit(tool_call, memory_db, auto_learner, authorization);
 
-        let final_result = process_tool_follow_up(&self.chat_session, &result);
+        let final_result = process_tool_follow_up(&self.run_context, &self.chat_session, &result);
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
 
@@ -2646,6 +2758,7 @@ impl ChatRepl {
             |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.run_context,
             &self.hook_engine,
             !final_is_error,
             &tool_call.function.name,
@@ -2763,6 +2876,7 @@ impl ChatRepl {
             tracing::error!("Security audit failed for tool_call: {e}");
         }
         let result = execute_tool_with_memory_after_permission(
+            &self.run_context,
             tool_call,
             memory_db,
             &self.permission_mgr,
@@ -2882,7 +2996,7 @@ impl ChatRepl {
             && (max_iterations == 0 || iteration < max_iterations)
         {
             iteration += 1;
-            guardrails::reset_turn();
+            guardrails::reset_turn(&self.run_context);
             let tool_calls = tool_accumulator.finalize();
 
             if iteration > 1
@@ -3046,6 +3160,7 @@ impl ChatRepl {
         let mut messages = original.clone();
         run_vdd_review(
             engine,
+            &self.run_context,
             current_content,
             &mut messages,
             &self.config.proxy.target,
@@ -3214,7 +3329,7 @@ impl ChatRepl {
         let result =
             self.run_openai_tool_unaudited(tool_call, memory_db, auto_learner, authorization);
 
-        let final_result = process_tool_follow_up(&self.chat_session, &result);
+        let final_result = process_tool_follow_up(&self.run_context, &self.chat_session, &result);
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
 
@@ -3228,6 +3343,7 @@ impl ChatRepl {
             |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.run_context,
             &self.hook_engine,
             !final_is_error,
             &tool_call.function.name,
@@ -3256,6 +3372,7 @@ impl ChatRepl {
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
         let result = execute_tool_with_memory_after_permission(
+            &self.run_context,
             tool_call,
             memory_db,
             &self.permission_mgr,
@@ -3301,7 +3418,7 @@ impl ChatRepl {
     /// Run quality gates after a tool batch and inject any failures
     /// back into the session as system messages.
     fn run_quality_gates_and_inject(&mut self) {
-        let qg_results = guardrails::run_quality_gates();
+        let qg_results = guardrails::run_quality_gates(&self.run_context);
         self.record_quality_gate_verifications(&qg_results);
         let mut injected_failure = false;
         for qg in &qg_results {
@@ -3355,9 +3472,11 @@ impl ChatRepl {
                 }
             };
         for gate in qg_results {
-            if let Err(err) =
-                openclaudia::grounded_loop::append_quality_gate_observations(&mut ledger, gate)
-            {
+            if let Err(err) = openclaudia::grounded_loop::append_quality_gate_observations(
+                &self.run_context,
+                &mut ledger,
+                gate,
+            ) {
                 tracing::warn!(
                     session_id = %self.chat_session.id(),
                     gate = %gate.name,
@@ -3426,6 +3545,12 @@ impl ChatRepl {
             }
             _ => false,
         }
+    }
+}
+
+impl Drop for ChatRepl {
+    fn drop(&mut self) {
+        tools::retire_run(&self.run_context);
     }
 }
 
@@ -3741,6 +3866,91 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn test_run() -> &'static Arc<openclaudia::tools::ToolRunContext> {
+        static RUN: std::sync::OnceLock<Arc<openclaudia::tools::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            openclaudia::tools::ToolRunContext::builder(
+                openclaudia::state::SessionId::new(),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("chat-repl-test")
+            .build()
+            .expect("explicit chat REPL test run")
+        })
+    }
+
+    fn test_session_at(root: &std::path::Path, provider: &str) -> Session {
+        let session = Session::new("test-model", provider);
+        session.update_state(|state, _| {
+            state.identity.original_cwd = root.to_path_buf();
+            state.identity.cwd = root.to_path_buf();
+            state.identity.project_root = root.to_path_buf();
+            state.identity.session_project_dir = root.to_path_buf();
+            state.transcript.transcript_cwd = root.to_path_buf();
+        });
+        session
+    }
+
+    #[test]
+    fn repl_session_derivation_preserves_authority_and_rejects_foreign_state() {
+        let root = tempfile::tempdir().expect("REPL transition root");
+        let foreign = tempfile::tempdir().expect("foreign REPL transition root");
+        let parent = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            root.path(),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("anthropic")
+        .build()
+        .expect("parent REPL run");
+        let loaded = test_session_at(root.path(), "anthropic");
+
+        let derived = derive_repl_session_run(&parent, &loaded, "anthropic")
+            .expect("same-project session must derive");
+        assert_eq!(derived.session_id(), loaded.id());
+        assert_eq!(derived.project_root(), parent.project_root());
+        assert_ne!(derived.run_id(), parent.run_id());
+
+        let foreign_session = test_session_at(foreign.path(), "anthropic");
+        let foreign_error = derive_repl_session_run(&parent, &foreign_session, "anthropic")
+            .expect_err("foreign project must not widen launch authority");
+        assert!(foreign_error.contains("differs from the authorized launch project"));
+
+        let provider_error = derive_repl_session_run(&parent, &loaded, "openai")
+            .expect_err("foreign provider must not retain a mismatched transport");
+        assert!(provider_error.contains("differs from the active provider"));
+    }
+
+    #[test]
+    fn fresh_repl_session_keeps_the_run_workspace_without_reusing_identity() {
+        let root = tempfile::tempdir().expect("fresh REPL root");
+        let current = test_session_at(root.path(), "anthropic");
+        let current_id = current.id();
+        let fresh = fresh_repl_session_in_run(&current, "next-model", "anthropic");
+
+        assert_ne!(fresh.id(), current_id);
+        let identity = fresh.inspect_state(|state| state.identity.clone());
+        assert_eq!(identity.project_root, root.path());
+        assert_eq!(identity.cwd, root.path());
+        assert_eq!(identity.original_cwd, root.path());
+        assert_eq!(fresh.model, "next-model");
+        assert_eq!(fresh.provider, "anthropic");
+    }
+
     struct EnvGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -3911,8 +4121,12 @@ providers: {}
             required: true,
         };
 
-        let ids = openclaudia::grounded_loop::append_quality_gate_observations(&mut ledger, &gate)
-            .expect("quality gate should ledger command and verification");
+        let ids = openclaudia::grounded_loop::append_quality_gate_observations(
+            test_run(),
+            &mut ledger,
+            &gate,
+        )
+        .expect("quality gate should ledger command and verification");
 
         let command_obs = ledger
             .get(ids.command)

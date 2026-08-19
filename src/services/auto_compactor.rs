@@ -117,6 +117,7 @@ impl AutoCompactor {
         request: &mut ChatCompletionRequest,
         actual_input_tokens: Option<usize>,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<Option<CompactionResult>, CompactionError> {
@@ -128,6 +129,7 @@ impl AutoCompactor {
             .compact_with_hint(
                 request,
                 hook_engine,
+                run_context,
                 session_id,
                 actual_input_tokens,
                 memory_db,
@@ -147,6 +149,7 @@ impl AutoCompactor {
         request: &mut ChatCompletionRequest,
         target_tokens: usize,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<Option<CompactionResult>, CompactionError> {
@@ -155,7 +158,14 @@ impl AutoCompactor {
         }
         let result = self
             .compactor
-            .microcompact(request, target_tokens, hook_engine, session_id, memory_db)
+            .microcompact(
+                request,
+                target_tokens,
+                hook_engine,
+                run_context,
+                session_id,
+                memory_db,
+            )
             .await?;
         Ok(Some(result))
     }
@@ -167,6 +177,10 @@ mod tests {
     use crate::compaction::CompactionConfig;
     use crate::proxy::{ChatMessage, MessageContent};
     use std::collections::HashMap;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     fn small_request() -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -212,7 +226,7 @@ mod tests {
         let ac = AutoCompactor::auto(compactor);
         let mut req = small_request();
         let result = ac
-            .auto_compact(&mut req, None, None, None, None)
+            .auto_compact(&mut req, None, None, test_run(), None, None)
             .await
             .unwrap();
         assert!(result.is_none());

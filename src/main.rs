@@ -622,13 +622,13 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         (endpoint, headers)
     };
 
-    guardrails::configure(&config.guardrails);
     tui_launch(TuiLaunchOptions {
         config: &config,
         model: &model,
         endpoint,
         headers,
         wire_api,
+        codex_responses_backend: codex_responses_auth.is_some(),
         claude_code_token,
         builder_vdd_auth,
         vdd_adversary_auth,
@@ -649,6 +649,7 @@ struct TuiLaunchOptions<'a> {
     endpoint: String,
     headers: Vec<(String, String)>,
     wire_api: openclaudia::pipeline::WireApi,
+    codex_responses_backend: bool,
     claude_code_token: Option<String>,
     builder_vdd_auth: openclaudia::vdd::VddProviderAuth,
     vdd_adversary_auth: Option<openclaudia::vdd::VddProviderAuth>,
@@ -667,6 +668,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         endpoint,
         headers,
         wire_api,
+        codex_responses_backend,
         claude_code_token,
         builder_vdd_auth,
         vdd_adversary_auth,
@@ -679,28 +681,51 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     let cwd_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let memory_db: Option<memory::MemoryDb> = open_project_memory_db(&cwd_path);
 
-    let cwd = cwd_path.to_string_lossy().to_string();
-    let tui_prompt_blocks =
-        prompt::build_prompt_context(behavior_mode, memory_db.as_ref(), Some(&cwd));
-
     let merged_hooks = load_effective_hooks(config.hooks.clone());
     let hook_engine = std::sync::Arc::new(HookEngine::new(merged_hooks));
-
-    // Install a process-wide MCP manager so `list_mcp_resources` /
-    // `read_mcp_resource` can dispatch into real servers instead of
-    // returning the "not wired" stub. Plugin-discovered servers are
-    // connected best-effort — failures are logged by
-    // `connect_mcp_servers` and do not block TUI startup.
-    let plugin_manager = std::sync::Arc::new(init_plugin_manager());
-    let mcp_manager =
-        std::sync::Arc::new(tokio::sync::RwLock::new(openclaudia::mcp::McpManager::new()));
-    openclaudia::proxy::connect_mcp_servers(&mcp_manager, &plugin_manager).await;
-    let _ = openclaudia::mcp::install_manager(mcp_manager);
 
     let policy_enforcer = std::sync::Arc::new(openclaudia::services::policy::PolicyEnforcer::new(
         config.policy.clone(),
     ));
     let mut app = tui::app::App::new_with_policy(model, &config.proxy.target, policy_enforcer);
+    app.hook_engine = Some(hook_engine);
+    app.vdd_engine =
+        init_vdd_engine_if_enabled_with_auth(config, vdd_adversary_auth).map(std::sync::Arc::new);
+    app.vdd_builder_auth = builder_vdd_auth;
+    app.app_config = Some(std::sync::Arc::new(config.clone()));
+    app.apply_startup_resume(resume, session_id);
+    let endpoint = if app.model == model {
+        endpoint
+    } else {
+        let provider = config.active_provider().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot rebuild resumed TUI endpoint for missing provider '{}'",
+                config.proxy.target
+            )
+        })?;
+        let base_url = if codex_responses_backend {
+            openclaudia::codex_credentials::CODEX_CHATGPT_BASE_URL
+        } else {
+            &provider.base_url
+        };
+        openclaudia::pipeline::resolve_endpoint_for_wire(
+            wire_api,
+            &config.proxy.target,
+            &app.model,
+            base_url,
+            claude_code_token.as_deref(),
+        )?
+    };
+    // MCP subprocesses/reconnects retain this exact resumed-session
+    // capability rather than discovering identity from a worker thread.
+    let run_context = app.tool_run_context().map_err(anyhow::Error::msg)?;
+    app.permission_mgr = Some(std::sync::Arc::new(init_permission_manager(
+        config,
+        dangerously_skip_permissions,
+        &run_context,
+    )));
+    let tui_prompt_blocks =
+        prompt::build_prompt_context_for_run(behavior_mode, memory_db.as_ref(), &run_context);
     app.set_api_config(
         endpoint,
         headers,
@@ -708,17 +733,16 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         Some(tui_prompt_blocks),
         claude_code_token,
     );
-    app.hook_engine = Some(hook_engine);
     app.memory_db = memory_db.map(std::sync::Arc::new);
-    app.permission_mgr = Some(std::sync::Arc::new(init_permission_manager(
-        config,
-        dangerously_skip_permissions,
-    )));
-    app.vdd_engine =
-        init_vdd_engine_if_enabled_with_auth(config, vdd_adversary_auth).map(std::sync::Arc::new);
-    app.vdd_builder_auth = builder_vdd_auth;
-    app.app_config = Some(std::sync::Arc::new(config.clone()));
-    app.apply_startup_resume(resume, session_id);
+    guardrails::configure(&run_context, &config.guardrails);
+    let plugin_manager = std::sync::Arc::new(init_plugin_manager(run_context.project_root()));
+    let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+        openclaudia::mcp::McpManager::new(std::sync::Arc::clone(&run_context)),
+    ));
+    let trusted_mcp_servers =
+        openclaudia::proxy::connect_mcp_servers(&mcp_manager, &plugin_manager).await;
+    let _ = openclaudia::mcp::install_manager(&run_context, &mcp_manager);
+    app.set_mcp_runtime(plugin_manager, mcp_manager, trusted_mcp_servers);
     app.set_permission_bypass(dangerously_skip_permissions || !config.permissions.enabled);
     app.set_analytics_sink(std::sync::Arc::new(
         openclaudia::services::analytics::TracingAnalytics,
@@ -958,6 +982,7 @@ fn render_welcome_or_fallback(target: &str, model: &str) {
 fn init_permission_manager(
     config: &config::AppConfig,
     dangerously_skip_permissions: bool,
+    run: &openclaudia::tools::ToolRunContext,
 ) -> PermissionManager {
     // `--dangerously-skip-permissions` is the documented bypass. Lift it all
     // the way to the lower-level gate by constructing a permission manager
@@ -967,9 +992,10 @@ fn init_permission_manager(
     // `execute_tool_with_*` path kept producing `PERMISSION_PROMPT` results
     // that the model could not satisfy in a non-interactive run.
     if dangerously_skip_permissions {
-        return PermissionManager::unrestricted();
+        return PermissionManager::unrestricted_for_run(run);
     }
-    PermissionManager::trusted(
+    PermissionManager::trusted_for_run(
+        run,
         config.permissions.enabled,
         config.permissions.default_allow.clone(),
         config.web_fetch.preapproved_domains.clone(),
@@ -1129,19 +1155,19 @@ fn finalize_chat(
 /// Wraps `PluginManager::new()` + `.discover()` + the "N plugin(s)
 /// loaded" print + per-error `tracing::warn!`. Returns the manager
 /// for the caller to use. Extracted from `cmd_chat` per crosslink #262.
-fn init_plugin_manager() -> plugins::PluginManager {
+fn init_plugin_manager(project_root: &std::path::Path) -> plugins::PluginManager {
     // crosslink #893: try_new surfaces "no home directory" as an explicit
     // error. Production code logs it loudly and falls back to the
     // project-only manager so the operator sees the misconfiguration
     // rather than discovering it via missing plugins.
-    let mut plugin_manager = match plugins::PluginManager::try_new() {
+    let mut plugin_manager = match plugins::PluginManager::try_new_for_project(project_root) {
         Ok(pm) => pm,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "PluginManager: falling back to project-only search (no user home)"
             );
-            plugins::PluginManager::new()
+            plugins::PluginManager::new_for_project(project_root)
         }
     };
     let plugin_errors = plugin_manager.discover();
@@ -2113,6 +2139,7 @@ async fn resolve_chat_auth(
 /// guard and the `vdd_engine.is_some()` check before calling.
 async fn run_vdd_review(
     engine: &vdd::VddEngine,
+    run_context: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
     content: &str,
     messages: &mut Vec<serde_json::Value>,
     target: &str,
@@ -2126,7 +2153,10 @@ async fn run_vdd_review(
         .unwrap_or("");
 
     let builder = vdd::BuilderProvider::new(target, api_key);
-    match engine.review_text(content, user_task, builder).await {
+    match engine
+        .review_text(run_context, content, user_task, builder)
+        .await
+    {
         Ok(result) => {
             if result.findings.is_empty() {
                 println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");

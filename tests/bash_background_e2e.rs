@@ -44,12 +44,18 @@ fn call(name: &str, args: &Value) -> ToolCall {
 }
 
 fn execute_with_exact_approval(tool_call: &ToolCall) -> ToolResult {
+    let run = support::shared_run_context();
     let state = tempfile::TempDir::new().expect("create permission state directory");
     let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
     let permit = manager
-        .approve_tool_call_once(tool_call, None, ApprovalProvenance::InteractiveUser)
+        .approve_tool_call_once(
+            tool_call,
+            Some(run.session_id()),
+            ApprovalProvenance::InteractiveUser,
+        )
         .expect("host approval must mint an exact one-use permit");
     ToolExecutor::execute(ToolExecutorRequest {
+        run_context: run,
         tool_call,
         memory_db: None,
         app_config: None,
@@ -70,12 +76,18 @@ fn bash_bg(command: &str) -> (String, bool) {
 }
 
 fn bash_output(shell_id: &str) -> (String, bool) {
-    let r = execute_tool(&call("bash_output", &json!({"shell_id": shell_id})));
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call("bash_output", &json!({"shell_id": shell_id})),
+    );
     (r.content().to_string(), r.is_error())
 }
 
 fn kill_shell(shell_id: &str) -> (String, bool) {
-    let r = execute_tool(&call("kill_shell", &json!({"shell_id": shell_id})));
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call("kill_shell", &json!({"shell_id": shell_id})),
+    );
     (r.content().to_string(), r.is_error())
 }
 
@@ -306,3 +318,4 @@ fn bash_output_two_calls_each_return_incremental_drain() {
     // Cleanup the long-runner.
     let _ = kill_shell(&shell_id);
 }
+mod support;

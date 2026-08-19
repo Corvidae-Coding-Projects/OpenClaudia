@@ -16,7 +16,10 @@ use crate::vdd::static_analysis::create_crosslink_issue;
 /// `.crosslink/issues.db` via `crosslink::db::Database`, matching the
 /// store the agent-facing `crosslink` tool writes to. The previous
 /// `chainlink` shell-out has been removed entirely.
-pub async fn create_crosslink_issues(findings: &[&Finding]) -> Result<Vec<String>, VddError> {
+pub async fn create_crosslink_issues(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    findings: &[&Finding],
+) -> Result<Vec<String>, VddError> {
     let mut issue_ids = Vec::new();
 
     for finding in findings {
@@ -44,7 +47,7 @@ pub async fn create_crosslink_issues(findings: &[&Finding]) -> Result<Vec<String
             finding.adversary_reasoning,
         );
 
-        match create_crosslink_issue(&title, label, &comment).await {
+        match create_crosslink_issue(run, &title, label, &comment).await {
             Ok(id) => {
                 info!(issue_id = %id, severity = %finding.severity, "VDD: Created Crosslink issue");
                 issue_ids.push(id);

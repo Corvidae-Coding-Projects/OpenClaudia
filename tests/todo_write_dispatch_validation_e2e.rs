@@ -28,7 +28,14 @@ fn todo_lock() -> MutexGuard<'static, ()> {
 }
 
 fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    support::dispatch_tool(name, args)
+    // This binary exercises multiple tool calls within one frontend run. Keep
+    // that run explicit and stable so persistence assertions do not depend on
+    // the retired process-global todo bucket.
+    support::legacy(&support::dispatch_tool_result_for_run(
+        support::shared_run_context(),
+        name,
+        args,
+    ))
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {

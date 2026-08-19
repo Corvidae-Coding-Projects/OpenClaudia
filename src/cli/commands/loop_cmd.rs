@@ -1,4 +1,4 @@
-use openclaudia::{config, guardrails, proxy};
+use openclaudia::{config, proxy};
 use tracing::{error, info};
 
 /// Run in iteration/loop mode with Stop hooks
@@ -31,8 +31,6 @@ pub async fn cmd_loop(
     if let Some(t) = target {
         config.proxy.target = t;
     }
-
-    guardrails::configure(&config.guardrails);
 
     let Some(provider) = config.active_provider() else {
         error!(

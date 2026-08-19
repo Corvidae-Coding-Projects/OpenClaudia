@@ -20,7 +20,7 @@ use tempfile::TempDir;
 static READ_TRACKER_LOCK: Mutex<()> = Mutex::new(());
 
 /// Global lock for tests that depend on the shared `TODO_LIST` state.
-/// Tests that call `clear_todo_list()` must hold this lock to avoid races.
+/// Tests that mutate the shared todo store hold this lock to avoid races.
 static TODO_LIST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Helper to create a `ToolCall` from name and arguments
@@ -43,12 +43,18 @@ fn make_tool_call(name: &str, args: &Value) -> ToolCall {
 /// through a real approval path rather than relying on the retired
 /// manager-less dispatch bypass.
 fn execute_tool_with_bash_approval(tool_call: &ToolCall) -> ToolResult {
+    let run = support::shared_run_context();
     let state = TempDir::new().expect("create permission state directory");
     let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
     let permit = manager
-        .approve_tool_call_once(tool_call, None, ApprovalProvenance::InteractiveUser)
+        .approve_tool_call_once(
+            tool_call,
+            Some(run.session_id()),
+            ApprovalProvenance::InteractiveUser,
+        )
         .expect("host approval must mint an exact one-use permit");
     ToolExecutor::execute(ToolExecutorRequest {
+        run_context: run,
         tool_call,
         memory_db: None,
         app_config: None,
@@ -110,7 +116,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -136,7 +142,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(result.is_error(), "Read of nonexistent file should fail");
         // The path-jail (crosslink #269) rejects out-of-root paths before
@@ -169,7 +175,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -196,7 +202,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -212,7 +218,7 @@ mod file_tools {
     #[test]
     fn test_write_file_overwrite() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker();
+        reset_read_tracker(support::shared_run_context());
         let dir = setup_test_dir();
         let file_path = dir.path().join("test.txt");
 
@@ -221,7 +227,7 @@ mod file_tools {
         // before the write so the test exercises the realistic
         // read-then-write flow.
         let read_call = make_tool_call("read_file", &json!({"path": file_path.to_string_lossy()}));
-        let read_result = execute_tool(&read_call);
+        let read_result = execute_tool(support::shared_run_context(), &read_call);
         assert!(
             !read_result.is_error(),
             "read_file precondition failed: {}",
@@ -236,7 +242,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -251,14 +257,14 @@ mod file_tools {
     #[test]
     fn test_edit_file_replace() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker(); // Clear tracker for clean test state
+        reset_read_tracker(support::shared_run_context()); // Clear this run's tracker state
         let dir = setup_test_dir();
         let file_path = dir.path().join("test.txt");
 
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
@@ -269,7 +275,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -291,14 +297,14 @@ mod file_tools {
     #[test]
     fn test_edit_file_old_string_not_found() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker(); // Clear tracker for clean test state
+        reset_read_tracker(support::shared_run_context()); // Clear this run's tracker state
         let dir = setup_test_dir();
         let file_path = dir.path().join("test.txt");
 
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
@@ -309,7 +315,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             result.is_error(),
@@ -336,7 +342,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -361,7 +367,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should succeed but with no matches
         assert!(
@@ -388,7 +394,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -413,7 +419,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -438,7 +444,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -467,7 +473,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -501,7 +507,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(!result.is_error(), "Read with offset/limit should succeed");
         assert!(
@@ -513,7 +519,7 @@ mod file_tools {
     #[test]
     fn test_edit_file_multiline() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker(); // Clear tracker for clean test state
+        reset_read_tracker(support::shared_run_context()); // Clear this run's tracker state
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("multiline.txt");
 
@@ -523,7 +529,7 @@ mod file_tools {
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
@@ -534,7 +540,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -552,7 +558,7 @@ mod file_tools {
     #[test]
     fn test_edit_file_special_characters() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker(); // Clear tracker for clean test state
+        reset_read_tracker(support::shared_run_context()); // Clear this run's tracker state
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("special.txt");
 
@@ -562,7 +568,7 @@ mod file_tools {
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
@@ -573,7 +579,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -597,7 +603,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -624,7 +630,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // write_file should create parent directories automatically
         assert!(
@@ -652,7 +658,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Must produce a non-empty response (either content or error message)
         assert!(
@@ -677,7 +683,7 @@ mod file_tools {
     #[test]
     fn test_edit_file_without_prior_read() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker();
+        reset_read_tracker(support::shared_run_context());
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("unread.txt");
         fs::write(&file_path, "original content").expect("Failed to write");
@@ -692,7 +698,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             result.is_error(),
@@ -726,7 +732,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -742,7 +748,7 @@ mod file_tools {
     #[test]
     fn test_edit_file_identical_old_new() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker();
+        reset_read_tracker(support::shared_run_context());
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("identical.txt");
         fs::write(&file_path, "some content here").expect("Failed to write");
@@ -750,7 +756,7 @@ mod file_tools {
         // Read first
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         // Edit with same old and new string
         let tool_call = make_tool_call(
@@ -762,7 +768,7 @@ mod file_tools {
             }),
         );
 
-        let _result = execute_tool(&tool_call);
+        let _result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should either succeed (no-op) or warn — but file must be unchanged
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -783,7 +789,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // On Windows this path won't exist; on any OS this should fail or return safely
         assert!(
@@ -808,7 +814,7 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should fail gracefully — most filesystems reject names > 255 chars
         assert!(
@@ -837,7 +843,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -859,7 +865,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // A non-zero exit must be flagged as an error
         assert!(
@@ -878,7 +884,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should indicate command not found (either error or in content)
         assert!(
@@ -938,7 +944,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should either error with timeout or produce some output
         assert!(
@@ -960,7 +966,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -983,7 +989,7 @@ mod bash_tools {
                 "run_in_background": true
             }),
         );
-        let bg_result = execute_tool(&bg_call);
+        let bg_result = execute_tool(support::shared_run_context(), &bg_call);
         assert!(!bg_result.is_error(), "Background start should succeed");
 
         // Small delay for process to start
@@ -991,7 +997,7 @@ mod bash_tools {
 
         // Now list shells (no shell_id = list all)
         let list_call = make_tool_call("bash_output", &json!({}));
-        let list_result = execute_tool(&list_call);
+        let list_result = execute_tool(support::shared_run_context(), &list_call);
 
         assert!(
             !list_result.is_error(),
@@ -1033,7 +1039,7 @@ mod bash_tools {
                 "shell_id": shell_id
             }),
         );
-        let output_result = execute_tool(&output_call);
+        let output_result = execute_tool(support::shared_run_context(), &output_call);
 
         // Should have some output (might be empty if command finished quickly)
         assert!(
@@ -1053,7 +1059,7 @@ mod bash_tools {
                 "run_in_background": true
             }),
         );
-        let bg_result = execute_tool(&bg_call);
+        let bg_result = execute_tool(support::shared_run_context(), &bg_call);
 
         // Extract shell ID
         let shell_id = extract_shell_id(bg_result.content());
@@ -1067,7 +1073,7 @@ mod bash_tools {
                 "shell_id": shell_id
             }),
         );
-        let kill_result = execute_tool(&kill_call);
+        let kill_result = execute_tool(support::shared_run_context(), &kill_call);
 
         assert!(
             !kill_result.is_error(),
@@ -1204,7 +1210,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&kill_call);
+        let result = execute_tool(support::shared_run_context(), &kill_call);
 
         // Should fail or indicate shell not found
         assert!(
@@ -1223,7 +1229,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&output_call);
+        let result = execute_tool(support::shared_run_context(), &output_call);
 
         // Should fail or indicate shell not found
         assert!(
@@ -1244,7 +1250,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Empty command should either error or produce a safe no-op result — not crash
         assert!(
@@ -1268,7 +1274,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -1294,7 +1300,7 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -1350,7 +1356,7 @@ mod web_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(result.is_error(), "loopback web_fetch must be rejected");
         assert!(
@@ -1371,7 +1377,7 @@ mod web_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -1399,7 +1405,7 @@ mod web_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(result.is_error(), "Invalid URL should fail");
     }
@@ -1417,7 +1423,7 @@ mod web_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         if !result.is_error() {
             assert!(result.content().contains("http"), "Should contain URLs");
@@ -1751,7 +1757,7 @@ mod todo_tools {
     #[test]
     fn test_todo_write_basic() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
@@ -1771,7 +1777,7 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             !result.is_error(),
@@ -1798,7 +1804,7 @@ mod todo_tools {
     #[test]
     fn test_todo_write_with_completed() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
@@ -1823,7 +1829,7 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
@@ -1841,7 +1847,7 @@ mod todo_tools {
     #[test]
     fn test_todo_write_multiple_in_progress_warning() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
@@ -1861,7 +1867,7 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
@@ -1875,7 +1881,7 @@ mod todo_tools {
     #[test]
     fn test_todo_write_missing_field() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // Missing activeForm
         let tool_call = make_tool_call(
@@ -1890,7 +1896,7 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             result.is_error(),
@@ -1907,7 +1913,7 @@ mod todo_tools {
     #[test]
     fn test_todo_write_invalid_status() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
@@ -1922,7 +1928,7 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
             result.is_error(),
@@ -1942,10 +1948,10 @@ mod todo_tools {
     #[test]
     fn test_todo_read_empty() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call("todo_read", &json!({}));
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
@@ -1960,7 +1966,7 @@ mod todo_tools {
     #[test]
     fn test_todo_read_after_write() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // Write some todos
         let write_call = make_tool_call(
@@ -1985,11 +1991,11 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write_call);
+        let _ = execute_tool(support::shared_run_context(), &write_call);
 
         // Read them back
         let read_call = make_tool_call("todo_read", &json!({}));
-        let result = execute_tool(&read_call);
+        let result = execute_tool(support::shared_run_context(), &read_call);
 
         assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
@@ -2022,7 +2028,7 @@ mod todo_tools {
     #[test]
     fn test_todo_list_persistence() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // Write todos
         let write_call = make_tool_call(
@@ -2037,10 +2043,10 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write_call);
+        let _ = execute_tool(support::shared_run_context(), &write_call);
 
         // Get the list directly using helper function
-        let todos = get_todo_list();
+        let todos = get_todo_list(support::shared_run_context().session_id());
 
         assert_eq!(todos.len(), 1, "Should have 1 todo");
         assert_eq!(todos[0].content, "Persistent task");
@@ -2051,7 +2057,7 @@ mod todo_tools {
     #[test]
     fn test_todo_write_replaces_list() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // First write
         let write1 = make_tool_call(
@@ -2071,7 +2077,7 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write1);
+        let _ = execute_tool(support::shared_run_context(), &write1);
 
         // Second write (should replace, not append)
         let write2 = make_tool_call(
@@ -2086,9 +2092,9 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write2);
+        let _ = execute_tool(support::shared_run_context(), &write2);
 
-        let todos = get_todo_list();
+        let todos = get_todo_list(support::shared_run_context().session_id());
         assert_eq!(todos.len(), 1, "Should have replaced list with 1 todo");
         assert_eq!(todos[0].content, "New task");
     }
@@ -2096,7 +2102,7 @@ mod todo_tools {
     #[test]
     fn test_todo_write_empty_list() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // First add some todos
         let write1 = make_tool_call(
@@ -2111,7 +2117,7 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write1);
+        let _ = execute_tool(support::shared_run_context(), &write1);
 
         // Then clear by writing empty list
         let write_empty = make_tool_call(
@@ -2120,7 +2126,7 @@ mod todo_tools {
                 "todos": []
             }),
         );
-        let result = execute_tool(&write_empty);
+        let result = execute_tool(support::shared_run_context(), &write_empty);
 
         assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
@@ -2129,7 +2135,7 @@ mod todo_tools {
             result.content()
         );
 
-        let todos = get_todo_list();
+        let todos = get_todo_list(support::shared_run_context().session_id());
         assert!(todos.is_empty(), "List should be empty");
     }
 }
@@ -2145,7 +2151,7 @@ mod subagent_tools {
     fn test_task_tool_missing_args() {
         // Missing all required arguments
         let tool_call = make_tool_call("task", &json!({}));
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should fail because subagent tools require config context
         assert!(
@@ -2166,7 +2172,7 @@ mod subagent_tools {
     fn test_agent_output_no_agents() {
         // When no agent_id is provided, should list agents (empty list)
         let tool_call = make_tool_call("agent_output", &json!({}));
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Must produce a meaningful response — either error about config or empty list message
         assert!(
@@ -2199,7 +2205,7 @@ mod subagent_tools {
                 "agent_id": "nonexistent_agent_12345"
             }),
         );
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should fail because agent doesn't exist or config is missing
         assert!(
@@ -2964,7 +2970,14 @@ mod token_tracking {
 
         // compact_with_hint with None behaves like compact
         let result = compactor
-            .compact_with_hint(&mut request, None, None, None, None)
+            .compact_with_hint(
+                &mut request,
+                None,
+                crate::support::shared_run_context(),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -3385,7 +3398,10 @@ mod vdd_tests {
         // VDD hooks with empty config should be no-ops
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async {
-            let input = openclaudia::hooks::HookInput::new(HookEvent::VddConflict);
+            let input = openclaudia::hooks::HookInput::for_run(
+                crate::support::shared_run_context(),
+                HookEvent::VddConflict,
+            );
             engine.run(HookEvent::VddConflict, &input).await
         });
 
@@ -3608,7 +3624,14 @@ mod gated_dispatch_460 {
             },
         };
         let (mgr, _tmp) = deny_bash_mgr();
-        match execute_tool_gated(&tc, None, None, None, &mgr) {
+        match execute_tool_gated(
+            crate::support::shared_run_context(),
+            &tc,
+            None,
+            None,
+            None,
+            &mgr,
+        ) {
             ExecutionOutcome::Result(r) => {
                 assert!(
                     r.is_error(),
@@ -3631,3 +3654,4 @@ mod gated_dispatch_460 {
         }
     }
 }
+mod support;

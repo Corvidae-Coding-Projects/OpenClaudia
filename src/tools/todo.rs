@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, MutexGuard};
@@ -69,71 +68,8 @@ pub struct TodoItem {
     pub active_form: String,
 }
 
-/// Sentinel key used when no session context is active. Keeps
-/// non-session callers (tests, scripts, the chat REPL pre-session)
-/// from losing their list in a world where everything else is keyed
-/// by session. Matches Claude Code's agentId-fallback pattern
-/// (`context.agentId ?? getSessionId()`).
-const DEFAULT_SESSION_KEY: &str = "__default__";
-
-thread_local! {
-    /// Per-thread "current session id" used by [`execute_todo_write`]
-    /// and [`execute_todo_read`] to pick the bucket in [`TODO_LISTS`].
-    /// Tokio's `spawn_blocking` reuses worker threads, so callers must
-    /// set-and-clear this via [`SessionIdGuard`] rather than raw
-    /// `set()`/`get()` to avoid leaking state to the next tool call
-    /// that lands on the same worker.
-    static CURRENT_SESSION_ID: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-/// RAII guard: set the thread-local session id on construction, clear
-/// it on drop. Drop runs unconditionally even on panic, so the next
-/// unrelated task on the same worker thread can't read a stale value.
-#[must_use = "dropping the guard immediately clears the session id"]
-pub struct SessionIdGuard {
-    previous: Option<String>,
-}
-
-impl SessionIdGuard {
-    /// Set the current thread's session id to `id` for the lifetime
-    /// of the returned guard. Restores whatever value was there
-    /// before (which is almost always `None`).
-    pub fn set(id: impl Into<String>) -> Self {
-        let id = id.into();
-        if let Err(error) = super::security::ensure_session_context(&id) {
-            tracing::error!(
-                session_id = %id,
-                %error,
-                "Failed to initialize immutable tool security context"
-            );
-        }
-        let previous = CURRENT_SESSION_ID.with(|cell| cell.replace(Some(id)));
-        Self { previous }
-    }
-}
-
-impl Drop for SessionIdGuard {
-    fn drop(&mut self) {
-        let restore = self.previous.take();
-        CURRENT_SESSION_ID.with(|cell| *cell.borrow_mut() = restore);
-    }
-}
-
-/// Read the current thread's session id, or the default key when no
-/// guard is active on this thread. Other tool modules in this crate
-/// (e.g. `file::ReadFileTracker`) call this via the sibling
-/// `tools::todo::` path so per-session bucketing is shared instead
-/// of each module rolling its own thread-local.
-pub(super) fn current_session_key() -> String {
-    CURRENT_SESSION_ID
-        .with(|cell| cell.borrow().clone())
-        .unwrap_or_else(|| DEFAULT_SESSION_KEY.to_string())
-}
-
-/// Per-session todo storage. Keyed by session id (or
-/// [`DEFAULT_SESSION_KEY`] when no guard is active). Claude Code uses
-/// the same model — see TodoWriteTool.ts where `todoKey = context.agentId
-/// ?? getSessionId()` buckets each agent/session separately.
+/// Per-session todo storage. Every caller supplies the exact logical session
+/// key; there is no thread-local or default fallback identity.
 type TodoLists = HashMap<String, Vec<TodoItem>>;
 
 static TODO_LISTS: std::sync::LazyLock<Mutex<TodoLists>> =
@@ -216,7 +152,7 @@ fn parse_todo_item(i: usize, item: &Value) -> Result<TodoItem, (String, bool)> {
     })
 }
 
-pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_todo_write(session_key: &str, args: &HashMap<String, Value>) -> (String, bool) {
     let Some(todos_value) = args.get("todos") else {
         return ("Missing 'todos' argument".to_string(), true);
     };
@@ -261,18 +197,17 @@ pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
     let all_done =
         !new_todos.is_empty() && new_todos.iter().all(|t| t.status == TodoStatus::Completed);
 
-    // Update the per-session todo list. Thread-local
-    // `CURRENT_SESSION_ID` picks the bucket; absent guard → default key.
+    // Update the caller-selected logical session bucket. The executor passes
+    // this key explicitly; it is state partitioning, not host authority.
     // The all_done compare-and-{remove|insert} pair runs atomically under the
     // map lock so two concurrent todo_write calls cannot race the bucket
     // (crosslink #972).
-    let session_key = current_session_key();
     match todo_lists_guard("execute_todo_write") {
         Ok(mut map) => {
             if all_done {
-                map.remove(&session_key);
+                map.remove(session_key);
             } else {
-                map.insert(session_key, new_todos.clone());
+                map.insert(session_key.to_string(), new_todos.clone());
             }
         }
         Err(e) => return (format!("Failed to update todo list: {e}"), true),
@@ -323,10 +258,9 @@ pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
 }
 
 /// Read the current todo list for the active session bucket.
-pub fn execute_todo_read() -> (String, bool) {
-    let session_key = current_session_key();
+pub fn execute_todo_read(session_key: &str) -> (String, bool) {
     let todos = match todo_lists_guard("execute_todo_read") {
-        Ok(map) => map.get(&session_key).cloned().unwrap_or_default(),
+        Ok(map) => map.get(session_key).cloned().unwrap_or_default(),
         Err(e) => return (format!("Failed to read todo list: {e}"), true),
     };
 
@@ -361,26 +295,24 @@ pub fn execute_todo_read() -> (String, bool) {
     (output, false)
 }
 
-/// Get the todo list for the active session bucket (for external use).
+/// Get the todo list for one explicit logical session bucket.
 #[must_use]
-pub fn get_todo_list() -> Vec<TodoItem> {
-    let session_key = current_session_key();
+pub fn get_todo_list(session_key: &str) -> Vec<TodoItem> {
     todo_lists_guard("get_todo_list")
-        .map(|m| m.get(&session_key).cloned().unwrap_or_default())
+        .map(|m| m.get(session_key).cloned().unwrap_or_default())
         .unwrap_or_default()
 }
 
-/// Clear the todo list for the active session bucket.
-pub fn clear_todo_list() {
-    let session_key = current_session_key();
+/// Clear one explicit logical session bucket.
+pub fn clear_todo_list(session_key: &str) {
     if let Ok(mut map) = todo_lists_guard("clear_todo_list") {
-        map.remove(&session_key);
+        map.remove(session_key);
     }
 }
 
 /// Clear every session's list. Used by tests and by explicit "reset
 /// all state" code paths — the single-session `clear_todo_list` only
-/// removes the current bucket.
+/// removes its named bucket.
 pub fn clear_all_todo_lists() {
     if let Ok(mut map) = todo_lists_guard("clear_all_todo_lists") {
         map.clear();
@@ -392,6 +324,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    const TEST_SESSION: &str = "todo-unit-session";
 
     /// The task list is process-global state (matches the original
     /// design), so these tests serialize on a shared mutex to avoid
@@ -418,10 +352,10 @@ mod tests {
             {"content": "one", "status": "completed", "activeForm": "Doing one"},
             {"content": "two", "status": "completed", "activeForm": "Doing two"},
         ]));
-        let (msg, err) = execute_todo_write(&args);
+        let (msg, err) = execute_todo_write(TEST_SESSION, &args);
         assert!(!err);
         assert!(msg.contains("all 2 items completed"));
-        assert!(get_todo_list().is_empty());
+        assert!(get_todo_list(TEST_SESSION).is_empty());
     }
 
     #[test]
@@ -433,9 +367,9 @@ mod tests {
             {"content": "one", "status": "completed", "activeForm": "Doing one"},
             {"content": "two", "status": "in_progress", "activeForm": "Doing two"},
         ]));
-        let (_, err) = execute_todo_write(&args);
+        let (_, err) = execute_todo_write(TEST_SESSION, &args);
         assert!(!err);
-        let stored = get_todo_list();
+        let stored = get_todo_list(TEST_SESSION);
         assert_eq!(stored.len(), 2, "partial completion must keep the list");
     }
 
@@ -444,54 +378,31 @@ mod tests {
         let _lock = task_lock();
         clear_all_todo_lists();
 
-        {
-            let _g = SessionIdGuard::set("session-a");
-            let (_, err) = execute_todo_write(&args_with(json!([{
+        let (_, err) = execute_todo_write(
+            "session-a",
+            &args_with(json!([{
                 "content": "a task",
                 "status": "in_progress",
                 "activeForm": "Doing a"
-            }])));
-            assert!(!err);
-            let list = get_todo_list();
-            assert_eq!(list.len(), 1);
-            assert_eq!(list[0].content, "a task");
-        }
+            }])),
+        );
+        assert!(!err);
+        assert!(get_todo_list("session-b").is_empty());
 
-        {
-            let _g = SessionIdGuard::set("session-b");
-            // session-b starts empty — session-a's list does not leak.
-            assert!(get_todo_list().is_empty());
-            let (_, err) = execute_todo_write(&args_with(json!([{
+        let (_, err) = execute_todo_write(
+            "session-b",
+            &args_with(json!([{
                 "content": "b task",
                 "status": "in_progress",
                 "activeForm": "Doing b"
-            }])));
-            assert!(!err);
-            assert_eq!(get_todo_list().len(), 1);
-            assert_eq!(get_todo_list()[0].content, "b task");
-        }
+            }])),
+        );
+        assert!(!err);
+        assert_eq!(get_todo_list("session-b")[0].content, "b task");
 
-        // Back to session-a — its list must still be intact.
-        {
-            let _g = SessionIdGuard::set("session-a");
-            let list = get_todo_list();
-            assert_eq!(list.len(), 1, "session-a list must survive session-b edits");
-            assert_eq!(list[0].content, "a task");
-        }
-    }
-
-    #[test]
-    fn guard_drop_restores_previous_session_id() {
-        let _lock = task_lock();
-        clear_all_todo_lists();
-
-        let _outer = SessionIdGuard::set("outer");
-        {
-            let _inner = SessionIdGuard::set("inner");
-            assert_eq!(current_session_key(), "inner");
-        }
-        // inner guard dropped — outer value restored.
-        assert_eq!(current_session_key(), "outer");
+        let list = get_todo_list("session-a");
+        assert_eq!(list.len(), 1, "session-a list must survive session-b edits");
+        assert_eq!(list[0].content, "a task");
     }
 
     #[test]
@@ -500,12 +411,12 @@ mod tests {
         clear_all_todo_lists();
 
         let args = args_with(json!([]));
-        let (msg, err) = execute_todo_write(&args);
+        let (msg, err) = execute_todo_write(TEST_SESSION, &args);
         assert!(!err);
         // Empty input must NOT trigger the "all done" cleared-list
         // message — that message implies the agent finished actual work.
         assert!(!msg.contains("all 0 items completed"));
-        assert!(get_todo_list().is_empty());
+        assert!(get_todo_list(TEST_SESSION).is_empty());
     }
 
     // ─── Spec §4: todo_write — full-replacement, atomic, per-session ───────────
@@ -515,7 +426,7 @@ mod tests {
     fn todo_write_requires_todos_argument() {
         let _lock = task_lock();
         let args = HashMap::new(); // no "todos" key
-        let (msg, is_err) = execute_todo_write(&args);
+        let (msg, is_err) = execute_todo_write(TEST_SESSION, &args);
         assert!(is_err, "missing 'todos' must be an error");
         assert!(
             msg.contains("Missing 'todos'"),
@@ -529,7 +440,7 @@ mod tests {
         let _lock = task_lock();
         let mut args = HashMap::new();
         args.insert("todos".to_string(), json!("not-an-array"));
-        let (msg, is_err) = execute_todo_write(&args);
+        let (msg, is_err) = execute_todo_write(TEST_SESSION, &args);
         assert!(is_err);
         assert!(
             msg.contains("must be an array"),
@@ -542,7 +453,7 @@ mod tests {
     fn todo_write_rejects_item_missing_content() {
         let _lock = task_lock();
         let args = args_with(json!([{"status": "pending", "activeForm": "doing"}]));
-        let (msg, is_err) = execute_todo_write(&args);
+        let (msg, is_err) = execute_todo_write(TEST_SESSION, &args);
         assert!(is_err);
         assert!(
             msg.contains("missing 'content'"),
@@ -555,7 +466,7 @@ mod tests {
     fn todo_write_rejects_item_missing_status() {
         let _lock = task_lock();
         let args = args_with(json!([{"content": "task", "activeForm": "doing"}]));
-        let (msg, is_err) = execute_todo_write(&args);
+        let (msg, is_err) = execute_todo_write(TEST_SESSION, &args);
         assert!(is_err);
         assert!(
             msg.contains("missing 'status'"),
@@ -568,7 +479,7 @@ mod tests {
     fn todo_write_rejects_item_missing_active_form() {
         let _lock = task_lock();
         let args = args_with(json!([{"content": "task", "status": "pending"}]));
-        let (msg, is_err) = execute_todo_write(&args);
+        let (msg, is_err) = execute_todo_write(TEST_SESSION, &args);
         assert!(is_err);
         assert!(
             msg.contains("missing 'activeForm'"),
@@ -585,7 +496,7 @@ mod tests {
             "status": "doing",   // not pending/in_progress/completed
             "activeForm": "doing"
         }]));
-        let (msg, is_err) = execute_todo_write(&args);
+        let (msg, is_err) = execute_todo_write(TEST_SESSION, &args);
         assert!(is_err);
         assert!(
             msg.contains("invalid status"),
@@ -603,7 +514,7 @@ mod tests {
             "status": "pending",
             "activeForm": "working"
         }]));
-        let (msg, is_err) = execute_todo_write(&args);
+        let (msg, is_err) = execute_todo_write(TEST_SESSION, &args);
         assert!(is_err);
         assert!(
             msg.contains("maximum length"),
@@ -622,7 +533,7 @@ mod tests {
             "status": "pending",
             "activeForm": "working"
         }]));
-        let (_, is_err) = execute_todo_write(&args);
+        let (_, is_err) = execute_todo_write(TEST_SESSION, &args);
         assert!(!is_err, "exactly 2000 chars must be accepted");
     }
 
@@ -634,19 +545,25 @@ mod tests {
         clear_all_todo_lists();
 
         // First write: two items
-        let (_, e1) = execute_todo_write(&args_with(json!([
-            {"content": "first",  "status": "pending",     "activeForm": "A"},
-            {"content": "second", "status": "in_progress", "activeForm": "B"},
-        ])));
+        let (_, e1) = execute_todo_write(
+            TEST_SESSION,
+            &args_with(json!([
+                {"content": "first",  "status": "pending",     "activeForm": "A"},
+                {"content": "second", "status": "in_progress", "activeForm": "B"},
+            ])),
+        );
         assert!(!e1);
-        assert_eq!(get_todo_list().len(), 2);
+        assert_eq!(get_todo_list(TEST_SESSION).len(), 2);
 
         // Second write: one item — must replace, not append
-        let (_, e2) = execute_todo_write(&args_with(json!([
-            {"content": "replacement", "status": "pending", "activeForm": "C"},
-        ])));
+        let (_, e2) = execute_todo_write(
+            TEST_SESSION,
+            &args_with(json!([
+                {"content": "replacement", "status": "pending", "activeForm": "C"},
+            ])),
+        );
         assert!(!e2);
-        let stored = get_todo_list();
+        let stored = get_todo_list(TEST_SESSION);
         assert_eq!(
             stored.len(),
             1,
@@ -662,18 +579,21 @@ mod tests {
         let _lock = task_lock();
         clear_all_todo_lists();
 
-        let (msg, is_err) = execute_todo_write(&args_with(json!([
-            {"content": "alpha", "status": "completed", "activeForm": "A"},
-            {"content": "beta",  "status": "completed", "activeForm": "B"},
-            {"content": "gamma", "status": "completed", "activeForm": "C"},
-        ])));
+        let (msg, is_err) = execute_todo_write(
+            TEST_SESSION,
+            &args_with(json!([
+                {"content": "alpha", "status": "completed", "activeForm": "A"},
+                {"content": "beta",  "status": "completed", "activeForm": "B"},
+                {"content": "gamma", "status": "completed", "activeForm": "C"},
+            ])),
+        );
         assert!(!is_err);
         assert!(
             msg.contains("all 3 items completed"),
             "success message must state count; got: {msg}"
         );
         assert!(
-            get_todo_list().is_empty(),
+            get_todo_list(TEST_SESSION).is_empty(),
             "list must be empty after all-done"
         );
     }
@@ -685,10 +605,13 @@ mod tests {
         let _lock = task_lock();
         clear_all_todo_lists();
 
-        let (msg, is_err) = execute_todo_write(&args_with(json!([
-            {"content": "a", "status": "in_progress", "activeForm": "A"},
-            {"content": "b", "status": "in_progress", "activeForm": "B"},
-        ])));
+        let (msg, is_err) = execute_todo_write(
+            TEST_SESSION,
+            &args_with(json!([
+                {"content": "a", "status": "in_progress", "activeForm": "A"},
+                {"content": "b", "status": "in_progress", "activeForm": "B"},
+            ])),
+        );
         assert!(!is_err, "multiple in_progress is not an error");
         assert!(
             msg.contains("Warning"),
@@ -702,9 +625,12 @@ mod tests {
         let _lock = task_lock();
         clear_all_todo_lists();
 
-        let (msg, is_err) = execute_todo_write(&args_with(json!([
-            {"content": "only", "status": "in_progress", "activeForm": "Only"},
-        ])));
+        let (msg, is_err) = execute_todo_write(
+            TEST_SESSION,
+            &args_with(json!([
+                {"content": "only", "status": "in_progress", "activeForm": "Only"},
+            ])),
+        );
         assert!(!is_err);
         assert!(
             !msg.contains("Warning"),
@@ -719,7 +645,7 @@ mod tests {
         let _lock = task_lock();
         clear_all_todo_lists();
 
-        let (msg, is_err) = execute_todo_read();
+        let (msg, is_err) = execute_todo_read(TEST_SESSION);
         assert!(!is_err);
         assert!(
             msg.contains("No todos"),
@@ -733,45 +659,19 @@ mod tests {
         let _lock = task_lock();
         clear_all_todo_lists();
 
-        let (_, err) = execute_todo_write(&args_with(json!([
-            {"content": "readable task", "status": "pending", "activeForm": "T"},
-        ])));
+        let (_, err) = execute_todo_write(
+            TEST_SESSION,
+            &args_with(json!([
+                {"content": "readable task", "status": "pending", "activeForm": "T"},
+            ])),
+        );
         assert!(!err);
 
-        let (msg, is_err) = execute_todo_read();
+        let (msg, is_err) = execute_todo_read(TEST_SESSION);
         assert!(!is_err);
         assert!(
             msg.contains("readable task"),
             "read must show written content; got: {msg}"
         );
-    }
-
-    /// Contract: `SessionIdGuard` clears the session on drop even under panic
-    /// (RAII). After the inner scope drops, the outer session key is active again.
-    #[test]
-    fn session_id_guard_restores_on_drop() {
-        let _lock = task_lock();
-
-        let _outer = SessionIdGuard::set("outer-session");
-        assert_eq!(current_session_key(), "outer-session");
-        {
-            let _inner = SessionIdGuard::set("inner-session");
-            assert_eq!(current_session_key(), "inner-session");
-        }
-        assert_eq!(
-            current_session_key(),
-            "outer-session",
-            "guard drop must restore outer session key"
-        );
-    }
-
-    /// Contract: without any guard, the key falls back to `DEFAULT_SESSION_KEY`.
-    #[test]
-    fn session_key_defaults_without_guard() {
-        // No guard active in this thread at entry.
-        // (We cannot guarantee other tests haven't left a guard, so we only
-        // assert the format contract — it must be a non-empty string.)
-        let key = current_session_key();
-        assert!(!key.is_empty(), "session key must never be empty");
     }
 }

@@ -11,6 +11,9 @@ use crate::vdd::static_analysis::StaticAnalysisResult;
 
 #[derive(Error, Debug)]
 pub enum VddError {
+    #[error(transparent)]
+    Capability(#[from] crate::tools::ToolCapabilityError),
+
     #[error("Adversary provider request failed: {0}")]
     AdversaryRequestFailed(String),
 

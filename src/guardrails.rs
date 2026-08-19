@@ -8,7 +8,7 @@
 //! Also provides language detection utilities shared with the VDD engine.
 
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -20,10 +20,10 @@ use crate::config::{
 };
 
 // ==========================================================================
-// Global guardrails instance — crosslink #749 fail-closed refactor
+// Explicit run-scoped guardrails registry
 // ==========================================================================
 
-/// Tri-state holder for the global guardrails engine.
+/// Tri-state holder for one exact run generation's guardrails engine.
 ///
 /// Per the QA mandate in crosslink #749, we distinguish three states
 /// explicitly so the security-boundary caller (`check_file_access`)
@@ -37,11 +37,6 @@ use crate::config::{
 ///   "I tried to evaluate the policy and could not".
 /// * `Enabled(engine)` — `configure()` produced a real engine; the
 ///   policy is delegated to it.
-/// * `Poisoned` — a previous panic left the mutex in an unrecoverable
-///   state. Returning success here would let the next write proceed
-///   against an unknown rule set; we refuse instead by returning
-///   `Err(POISON_ERR)`. This is the fail-closed contract that closes
-///   the original bug.
 enum GuardrailsState {
     Disabled,
     // Box keeps the variant size small (~16 B vs ~280 B inline). The
@@ -49,11 +44,24 @@ enum GuardrailsState {
     // tool dispatch, so the heap indirection is negligible compared to
     // the regex match it gates.
     Enabled(Box<GuardrailsEngine>),
-    Poisoned,
 }
 
-static GUARDRAILS: std::sync::LazyLock<Mutex<GuardrailsState>> =
-    std::sync::LazyLock::new(|| Mutex::new(GuardrailsState::Disabled));
+#[derive(Default)]
+struct GuardrailsRegistry {
+    /// A poisoned registry is sticky and fail-closed for every run,
+    /// including runs not yet inserted into `runs`.
+    poisoned: bool,
+    runs: HashMap<(crate::runtime::RunId, crate::runtime::CapabilityGeneration), GuardrailsState>,
+}
+
+static GUARDRAILS: std::sync::LazyLock<Mutex<GuardrailsRegistry>> =
+    std::sync::LazyLock::new(|| Mutex::new(GuardrailsRegistry::default()));
+
+fn run_key(
+    run: &crate::tools::ToolRunContext,
+) -> (crate::runtime::RunId, crate::runtime::CapabilityGeneration) {
+    (run.run_id(), run.generation())
+}
 
 /// Sentinel error string returned at every security boundary when the
 /// guardrails mutex is found poisoned. The exact text is part of the
@@ -61,11 +69,11 @@ static GUARDRAILS: std::sync::LazyLock<Mutex<GuardrailsState>> =
 /// substring to distinguish poison-fail-closed from a rule-driven deny.
 const POISON_ERR: &str = "guardrails poisoned — refusing access";
 
-/// Lock the global guardrails mutex, transitioning the state to
-/// `Poisoned` on OS-level poison. After this point every
+/// Lock the process registry mutex, transitioning the registry to a sticky
+/// poisoned state on OS-level poison. After this point every
 /// security-boundary check returns `Err(POISON_ERR)` until the
 /// process restarts.
-fn lock_or_poison() -> std::sync::MutexGuard<'static, GuardrailsState> {
+fn lock_or_poison() -> std::sync::MutexGuard<'static, GuardrailsRegistry> {
     match GUARDRAILS.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -73,7 +81,7 @@ fn lock_or_poison() -> std::sync::MutexGuard<'static, GuardrailsState> {
                 "Guardrails mutex was poisoned by a previous panic;                  transitioning to fail-closed state"
             );
             let mut guard = poisoned.into_inner();
-            *guard = GuardrailsState::Poisoned;
+            guard.poisoned = true;
             guard
         }
     }
@@ -89,12 +97,12 @@ fn config_has_active_guards(config: &GuardrailsConfig) -> bool {
     br || dm || qg
 }
 
-/// Initialize the guardrails engine from config. Called once at startup.
+/// Initialize the guardrails engine for one explicit run at startup.
 ///
 /// If the state is poisoned, this function does NOT reconfigure — the
 /// poisoned state is sticky on purpose so a panic during a write-policy
 /// evaluation cannot be papered over by a subsequent `configure()`.
-pub fn configure(config: &GuardrailsConfig) {
+pub fn configure(run: &crate::tools::ToolRunContext, config: &GuardrailsConfig) {
     // Build the new state OUTSIDE the lock. `GuardrailsEngine::from_config`
     // walks regex / glob compilation and emits structured `info!` events;
     // none of that needs the guardrails mutex held. Tightening the critical
@@ -115,11 +123,11 @@ pub fn configure(config: &GuardrailsConfig) {
 
     {
         let mut guard = lock_or_poison();
-        if matches!(*guard, GuardrailsState::Poisoned) {
+        if guard.poisoned {
             error!("Refusing to (re)configure guardrails: state is poisoned");
             return;
         }
-        *guard = new_state;
+        guard.runs.insert(run_key(run), new_state);
         // Drop the guard at the end of this block (before the `info!`
         // below) so concurrent readers do not block while we format the
         // log line. Per `clippy::significant_drop_tightening`.
@@ -141,18 +149,19 @@ pub fn configure(config: &GuardrailsConfig) {
 ///
 /// This function is the security boundary for file-write dispatch and
 /// MUST fail closed on poison. See crosslink #749.
-pub fn check_file_access(path: &str) -> Result<(), String> {
+pub fn check_file_access(run: &crate::tools::ToolRunContext, path: &str) -> Result<(), String> {
     let guard = lock_or_poison();
-    match &*guard {
-        GuardrailsState::Enabled(engine) => engine.as_ref().check_file_access(path),
-        GuardrailsState::Poisoned => {
-            error!(
-                path = path,
-                "check_file_access: guardrails poisoned — denying"
-            );
-            Err(POISON_ERR.to_string())
-        }
-        GuardrailsState::Disabled => Ok(()),
+    if guard.poisoned {
+        error!(
+            path = path,
+            session_id = run.session_id(),
+            "check_file_access: guardrails registry poisoned — denying"
+        );
+        return Err(POISON_ERR.to_string());
+    }
+    match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().check_file_access(path),
+        Some(GuardrailsState::Disabled) | None => Ok(()),
     }
 }
 
@@ -161,98 +170,128 @@ pub fn check_file_access(path: &str) -> Result<(), String> {
 ///
 /// Non-security path: silently no-ops when disabled, logs an error
 /// when the mutex is poisoned.
-pub fn record_file_modification(path: &str, lines_added: u32, lines_removed: u32) {
+pub fn record_file_modification(
+    run: &crate::tools::ToolRunContext,
+    path: &str,
+    lines_added: u32,
+    lines_removed: u32,
+) {
     let guard = lock_or_poison();
-    match &*guard {
-        GuardrailsState::Enabled(engine) => {
+    if guard.poisoned {
+        error!(
+            path = path,
+            "record_file_modification: registry poisoned — skipping"
+        );
+        return;
+    }
+    match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => {
             engine.record_modification(path, lines_added, lines_removed);
         }
-        GuardrailsState::Poisoned => {
-            error!(
-                path = path,
-                "record_file_modification: guardrails poisoned — skipping"
-            );
-        }
-        GuardrailsState::Disabled => {}
+        Some(GuardrailsState::Disabled) | None => {}
     }
 }
 
 /// Check diff thresholds. Returns a warning if thresholds exceeded.
-pub fn check_diff_thresholds() -> Option<DiffWarning> {
+pub fn check_diff_thresholds(run: &crate::tools::ToolRunContext) -> Option<DiffWarning> {
     let guard = lock_or_poison();
-    match &*guard {
-        GuardrailsState::Enabled(engine) => engine.as_ref().check_diff_thresholds(),
-        GuardrailsState::Poisoned => {
-            error!("check_diff_thresholds: guardrails poisoned — returning None");
-            None
-        }
-        GuardrailsState::Disabled => None,
+    if guard.poisoned {
+        error!("check_diff_thresholds: registry poisoned — returning None");
+        return None;
+    }
+    match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().check_diff_thresholds(),
+        Some(GuardrailsState::Disabled) | None => None,
     }
 }
 
 /// Run quality gate checks. Returns results for each configured check.
-pub fn run_quality_gates() -> Vec<QualityCheckResult> {
+pub fn run_quality_gates(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Vec<QualityCheckResult> {
     let guard = lock_or_poison();
-    match &*guard {
-        GuardrailsState::Enabled(engine) => engine.as_ref().run_quality_gates(),
-        GuardrailsState::Poisoned => {
-            error!("run_quality_gates: guardrails poisoned — returning empty");
-            Vec::new()
-        }
-        GuardrailsState::Disabled => Vec::new(),
+    if guard.poisoned {
+        error!("run_quality_gates: registry poisoned — returning empty");
+        return Vec::new();
+    }
+    match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().run_quality_gates(run),
+        Some(GuardrailsState::Disabled) | None => Vec::new(),
     }
 }
 
 /// Reset per-turn tracking (blast radius file count).
-pub fn reset_turn() {
+pub fn reset_turn(run: &crate::tools::ToolRunContext) {
     let guard = lock_or_poison();
-    match &*guard {
-        GuardrailsState::Enabled(engine) => engine.as_ref().reset_turn(),
-        GuardrailsState::Poisoned => {
-            error!("reset_turn: guardrails poisoned — skipping");
-        }
-        GuardrailsState::Disabled => {}
+    if guard.poisoned {
+        error!("reset_turn: registry poisoned — skipping");
+        return;
+    }
+    match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().reset_turn(),
+        Some(GuardrailsState::Disabled) | None => {}
     }
 }
 
 /// Get current diff stats summary.
-pub fn get_diff_summary() -> Option<DiffStats> {
+pub fn get_diff_summary(run: &crate::tools::ToolRunContext) -> Option<DiffStats> {
     let guard = lock_or_poison();
-    match &*guard {
-        GuardrailsState::Enabled(engine) => engine.as_ref().get_diff_stats(),
-        GuardrailsState::Poisoned => {
-            error!("get_diff_summary: guardrails poisoned — returning None");
-            None
-        }
-        GuardrailsState::Disabled => None,
+    if guard.poisoned {
+        error!("get_diff_summary: registry poisoned — returning None");
+        return None;
+    }
+    match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().get_diff_stats(),
+        Some(GuardrailsState::Disabled) | None => None,
     }
 }
 
 // ==========================================================================
-// Test-only helpers for the global guardrails state.
+// Test-only helpers for the run-scoped guardrails registry.
 // ==========================================================================
 
-/// Replace the global guardrails state. Test-only. Used to drive
+/// Replace one run's guardrails state. Test-only. Used to drive
 /// poisoned-state regression tests for crosslink #749.
 #[cfg(test)]
-fn set_state_for_test(new_state: GuardrailsState) {
+fn set_state_for_test(run: &crate::tools::ToolRunContext, new_state: GuardrailsState) {
     let mut guard = GUARDRAILS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = new_state;
+    guard.poisoned = false;
+    guard.runs.insert(run_key(run), new_state);
+}
+
+#[cfg(test)]
+fn set_poisoned_for_test() {
+    let mut guard = GUARDRAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.poisoned = true;
 }
 
 /// Snapshot the discriminant of the current state. Test-only.
 #[cfg(test)]
-fn current_state_kind() -> &'static str {
+fn current_state_kind(run: &crate::tools::ToolRunContext) -> &'static str {
     let guard = GUARDRAILS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match *guard {
-        GuardrailsState::Disabled => "disabled",
-        GuardrailsState::Enabled(_) => "enabled",
-        GuardrailsState::Poisoned => "poisoned",
+    if guard.poisoned {
+        return "poisoned";
     }
+    match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(_)) => "enabled",
+        Some(GuardrailsState::Disabled) | None => "disabled",
+    }
+}
+
+/// Release policy and mutable diff state for one completed run generation.
+///
+/// Called from the last-`Arc` lifecycle boundary so a long-lived process does
+/// not retain stale policy buckets or accidentally associate them with a
+/// resumed session generation.
+pub(crate) fn release_run(run: &crate::tools::ToolRunContext) {
+    let mut guard = lock_or_poison();
+    guard.runs.remove(&run_key(run));
 }
 
 // ==========================================================================
@@ -407,10 +446,13 @@ impl GuardrailsEngine {
             .and_then(DiffMonitor::check_thresholds)
     }
 
-    fn run_quality_gates(&self) -> Vec<QualityCheckResult> {
+    fn run_quality_gates(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    ) -> Vec<QualityCheckResult> {
         self.quality_gates
             .as_ref()
-            .map(QualityGateRunner::run)
+            .map(|runner| runner.run(run))
             .unwrap_or_default()
     }
 
@@ -706,13 +748,13 @@ impl QualityGateRunner {
         Self { config }
     }
 
-    fn run(&self) -> Vec<QualityCheckResult> {
+    fn run(&self, run: &std::sync::Arc<crate::tools::ToolRunContext>) -> Vec<QualityCheckResult> {
         let mut results = Vec::new();
 
         for check in &self.config.checks {
             info!(name = %check.name, "Running quality gate");
 
-            let outcome = run_shell_command_sync(&check.command, self.config.timeout_seconds);
+            let outcome = run_shell_command_sync(run, &check.command, self.config.timeout_seconds);
 
             // Translate the typed enum into the (passed, exit_code,
             // stdout, stderr) shape that `QualityCheckResult` still
@@ -825,14 +867,12 @@ impl QualityGateRunner {
 /// full argv (program + arguments) and the wall-clock timeout before
 /// the process is spawned. Tokenisation failures, spawn errors, and
 /// timeouts are logged at `warn!` / `error!` level.
-fn run_shell_command_sync(command: &str, timeout_seconds: u64) -> ShellResult {
-    let cwd = std::env::current_dir().unwrap_or_else(|e| {
-        warn!(
-            "Failed to get current directory ({}), falling back to \".\"",
-            e
-        );
-        std::path::PathBuf::from(".")
-    });
+fn run_shell_command_sync(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    command: &str,
+    timeout_seconds: u64,
+) -> ShellResult {
+    let cwd = run.working_directory().to_path_buf();
 
     // POSIX-tokenise the user-supplied command into an argv. No shell
     // is ever invoked, so $(...), `...`, ;, &&, |, > etc. survive as
@@ -885,7 +925,13 @@ fn run_shell_command_sync(command: &str, timeout_seconds: u64) -> ShellResult {
 
     // Build the async future once; the sync wrapper below decides how
     // to drive it depending on the ambient runtime context.
-    let fut = run_shell_command_async(program_owned, args_owned, cwd_owned, timeout_seconds);
+    let fut = run_shell_command_async(
+        std::sync::Arc::clone(run),
+        program_owned,
+        args_owned,
+        cwd_owned,
+        timeout_seconds,
+    );
 
     match drive_future_sync(fut) {
         Ok(result) => result,
@@ -905,6 +951,7 @@ fn run_shell_command_sync(command: &str, timeout_seconds: u64) -> ShellResult {
 /// argv-direct exec, `kill_on_drop(true)`-backed timeout, and structured
 /// logging from crosslink #395 in one cohesive place.
 async fn run_shell_command_async(
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
     program_owned: String,
     args_owned: Vec<String>,
     cwd_owned: std::path::PathBuf,
@@ -914,14 +961,19 @@ async fn run_shell_command_async(
     // and test binaries. Running argv directly prevents shell injection but
     // does not prevent those programs from accessing the host, so use the
     // same OS boundary as the model-facing Bash tool.
-    let Ok(resolved_program) = which::which(&program_owned) else {
-        return ShellResult::ShellMissing {
-            tried: vec![program_owned],
-        };
+    let resolved_program = match run.resolve_executable(&program_owned) {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(program = %program_owned, %error, "Quality gate: executable resolution failed");
+            return ShellResult::ShellMissing {
+                tried: vec![program_owned],
+            };
+        }
     };
     let sandbox_args: Vec<std::ffi::OsString> =
         args_owned.iter().map(std::ffi::OsString::from).collect();
     let sandboxed = match crate::tools::sandboxed_process_command(
+        &run,
         crate::tools::SandboxProfile::QualityGate,
         resolved_program.as_os_str(),
         &sandbox_args,
@@ -943,8 +995,10 @@ async fn run_shell_command_async(
         timeout_seconds
     });
     let program_for_worker = program_owned.clone();
+    let run_for_worker = std::sync::Arc::clone(&run);
     let result = match tokio::task::spawn_blocking(move || {
         crate::tools::run_prepared_sandboxed_with_timeout(
+            &run_for_worker,
             sandboxed,
             &program_for_worker,
             effective_timeout,
@@ -1085,9 +1139,10 @@ impl std::fmt::Display for ProjectLanguage {
 
 /// Detect project languages by checking for marker files in the working directory.
 #[must_use]
-pub fn detect_project_languages() -> Vec<ProjectLanguage> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    detect_languages_in_dir(&cwd)
+pub fn detect_project_languages(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Vec<ProjectLanguage> {
+    detect_languages_in_dir(run.working_directory())
 }
 
 /// Detect languages in a specific directory.
@@ -1188,7 +1243,10 @@ pub fn detect_languages_in_dir(dir: &Path) -> Vec<ProjectLanguage> {
 /// Get default static analysis commands for a detected language.
 /// Returns Vec<(name, command)>.
 #[must_use]
-pub fn get_default_analysis_commands(lang: &ProjectLanguage) -> Vec<(String, String)> {
+pub fn get_default_analysis_commands(
+    lang: &ProjectLanguage,
+    project_dir: &Path,
+) -> Vec<(String, String)> {
     match lang {
         ProjectLanguage::Rust => vec![
             (
@@ -1216,7 +1274,7 @@ pub fn get_default_analysis_commands(lang: &ProjectLanguage) -> Vec<(String, Str
             ("test".to_string(), "go test ./...".to_string()),
         ],
         ProjectLanguage::Java => {
-            if Path::new("pom.xml").exists() {
+            if project_dir.join("pom.xml").exists() {
                 vec![("maven".to_string(), "mvn compile -q".to_string())]
             } else {
                 vec![("gradle".to_string(), "gradle build -q".to_string())]
@@ -1238,9 +1296,9 @@ pub fn get_default_analysis_commands(lang: &ProjectLanguage) -> Vec<(String, Str
             )]
         }
         ProjectLanguage::Cpp | ProjectLanguage::C => {
-            if Path::new("CMakeLists.txt").exists() {
+            if project_dir.join("CMakeLists.txt").exists() {
                 vec![("cmake".to_string(), "cmake --build build".to_string())]
-            } else if Path::new("Makefile").exists() {
+            } else if project_dir.join("Makefile").exists() {
                 vec![("make".to_string(), "make".to_string())]
             } else {
                 Vec::new()
@@ -1251,12 +1309,14 @@ pub fn get_default_analysis_commands(lang: &ProjectLanguage) -> Vec<(String, Str
 
 /// Get auto-detected static analysis commands for the current project.
 /// Used by VDD when `auto_detect` is enabled and no explicit commands are configured.
-pub fn get_auto_detected_commands() -> Vec<String> {
-    let languages = detect_project_languages();
+pub fn get_auto_detected_commands(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Vec<String> {
+    let languages = detect_project_languages(run);
     let mut commands = Vec::new();
 
     for lang in &languages {
-        for (_name, cmd) in get_default_analysis_commands(lang) {
+        for (_name, cmd) in get_default_analysis_commands(lang, run.working_directory()) {
             if !commands.contains(&cmd) {
                 commands.push(cmd);
             }
@@ -1339,6 +1399,10 @@ fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
     use crate::config::QualityCheck;
 
     // ====== Glob matching tests ======
@@ -1679,7 +1743,7 @@ mod tests {
             timeout_seconds: 30,
         };
         let runner = QualityGateRunner::new(config);
-        let results = runner.run();
+        let results = runner.run(test_run());
 
         assert_eq!(results.len(), 1);
         assert!(results[0].passed);
@@ -1710,7 +1774,7 @@ mod tests {
             timeout_seconds: 30,
         };
         let runner = QualityGateRunner::new(config);
-        let results = runner.run();
+        let results = runner.run(test_run());
 
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
@@ -1746,7 +1810,7 @@ mod tests {
             timeout_seconds: 30,
         };
         let runner = QualityGateRunner::new(config);
-        let results = runner.run();
+        let results = runner.run(test_run());
 
         assert_eq!(results.len(), 1);
         // The sentinel file MUST still exist. If the runner shelled out
@@ -1778,7 +1842,7 @@ mod tests {
             timeout_seconds: 30,
         };
         let runner = QualityGateRunner::new(config);
-        let results = runner.run();
+        let results = runner.run(test_run());
 
         assert_eq!(results.len(), 1);
         assert!(results[0].passed);
@@ -1812,7 +1876,7 @@ mod tests {
             };
             let runner = QualityGateRunner::new(config);
             let start = std::time::Instant::now();
-            let results = runner.run();
+            let results = runner.run(test_run());
             let elapsed = start.elapsed();
 
             assert_eq!(results.len(), 1);
@@ -1844,7 +1908,7 @@ mod tests {
             timeout_seconds: 30,
         };
         let runner = QualityGateRunner::new(config);
-        let results = runner.run();
+        let results = runner.run(test_run());
 
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
@@ -1868,7 +1932,7 @@ mod tests {
             timeout_seconds: 30,
         };
         let runner = QualityGateRunner::new(config);
-        let results = runner.run();
+        let results = runner.run(test_run());
 
         assert_eq!(results.len(), 1);
         assert!(results[0].passed);
@@ -1947,7 +2011,8 @@ mod tests {
 
     #[test]
     fn test_default_commands_rust() {
-        let cmds = get_default_analysis_commands(&ProjectLanguage::Rust);
+        let cmds =
+            get_default_analysis_commands(&ProjectLanguage::Rust, test_run().working_directory());
         assert_eq!(cmds.len(), 2);
         assert!(cmds[0].1.contains("clippy"));
         assert!(cmds[1].1.contains("cargo test"));
@@ -1955,7 +2020,8 @@ mod tests {
 
     #[test]
     fn test_default_commands_python() {
-        let cmds = get_default_analysis_commands(&ProjectLanguage::Python);
+        let cmds =
+            get_default_analysis_commands(&ProjectLanguage::Python, test_run().working_directory());
         assert!(!cmds.is_empty());
         assert!(cmds.iter().any(|(name, _)| name == "ruff"));
     }
@@ -1968,7 +2034,7 @@ mod tests {
         assert_eq!(ProjectLanguage::Cpp.to_string(), "C++");
     }
 
-    // ====== Global API tests ======
+    // ====== Run-scoped registry API tests ======
     //
     // These tests mutate the process-global `GUARDRAILS` static, so
     // they must serialize against one another. We use a dedicated
@@ -2002,18 +2068,134 @@ mod tests {
         GuardrailsEngine::from_config(&cfg)
     }
 
+    fn isolated_run(root: &Path) -> std::sync::Arc<crate::tools::ToolRunContext> {
+        isolated_run_for_session(crate::state::SessionId::new(), root)
+    }
+
+    fn isolated_run_for_session(
+        session_id: crate::state::SessionId,
+        root: &Path,
+    ) -> std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::ToolRunContext::builder(session_id, root)
+            .working_directory(root)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("guardrails-isolation-test")
+            .build()
+            .expect("explicit isolated guardrails run")
+    }
+
+    #[test]
+    fn guardrail_policy_and_diff_state_are_session_scoped() {
+        let _serialize = lock_global_for_test();
+        let root_a = tempfile::tempdir_in(".").expect("first guardrail root");
+        let root_b = tempfile::tempdir_in(".").expect("second guardrail root");
+        let run_a = isolated_run(root_a.path());
+        let run_b = isolated_run(root_b.path());
+        let config_a = GuardrailsConfig {
+            blast_radius: Some(BlastRadiusConfig {
+                enabled: true,
+                mode: GuardrailMode::Strict,
+                allowed_paths: Vec::new(),
+                denied_paths: vec!["**/secret.txt".to_string()],
+                max_files_per_turn: 0,
+            }),
+            diff_monitor: Some(DiffMonitorConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            quality_gates: None,
+        };
+        let config_b = GuardrailsConfig {
+            blast_radius: Some(BlastRadiusConfig {
+                enabled: true,
+                mode: GuardrailMode::Strict,
+                allowed_paths: Vec::new(),
+                denied_paths: Vec::new(),
+                max_files_per_turn: 0,
+            }),
+            diff_monitor: Some(DiffMonitorConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            quality_gates: None,
+        };
+        configure(&run_a, &config_a);
+        configure(&run_b, &config_b);
+
+        assert!(check_file_access(&run_a, "nested/secret.txt").is_err());
+        assert!(check_file_access(&run_b, "nested/secret.txt").is_ok());
+        record_file_modification(&run_a, "src/a.rs", 4, 1);
+        let first = get_diff_summary(&run_a).expect("first session diff state");
+        let second = get_diff_summary(&run_b).expect("second session diff state");
+        assert_eq!(first.files_changed, 1);
+        assert_eq!(first.lines_changed, 5);
+        assert_eq!(second.files_changed, 0);
+        assert_eq!(second.lines_changed, 0);
+    }
+
+    #[test]
+    fn guardrail_state_is_generation_scoped_and_last_arc_cleanup_is_exact() {
+        let _serialize = lock_global_for_test();
+        let root_a = tempfile::tempdir_in(".").expect("first generation root");
+        let root_b = tempfile::tempdir_in(".").expect("second generation root");
+        let session_id = crate::state::SessionId::new();
+        let run_a = isolated_run_for_session(session_id.clone(), root_a.path());
+        let run_b = isolated_run_for_session(session_id, root_b.path());
+        let denied = GuardrailsConfig {
+            blast_radius: Some(BlastRadiusConfig {
+                enabled: true,
+                mode: GuardrailMode::Strict,
+                allowed_paths: Vec::new(),
+                denied_paths: vec!["**/generation-secret.txt".to_string()],
+                max_files_per_turn: 0,
+            }),
+            diff_monitor: None,
+            quality_gates: None,
+        };
+        let allowed = GuardrailsConfig {
+            blast_radius: Some(BlastRadiusConfig {
+                enabled: true,
+                mode: GuardrailMode::Strict,
+                allowed_paths: Vec::new(),
+                denied_paths: Vec::new(),
+                max_files_per_turn: 0,
+            }),
+            diff_monitor: None,
+            quality_gates: None,
+        };
+        configure(&run_a, &denied);
+        configure(&run_b, &allowed);
+
+        assert!(check_file_access(&run_a, "generation-secret.txt").is_err());
+        assert!(check_file_access(&run_b, "generation-secret.txt").is_ok());
+        assert_ne!(run_key(&run_a), run_key(&run_b));
+
+        drop(run_a);
+        assert_eq!(
+            current_state_kind(&run_b),
+            "enabled",
+            "dropping one generation must preserve the other generation's policy"
+        );
+    }
+
     #[test]
     fn test_disabled_guardrails_allow_all() {
         // "Disabled" == no policy loaded. The security boundary must
         // return Ok so default-install installs behave the same as the
         // pre-#749 codebase. Fail-closed only applies to Poisoned.
         let _serialize = lock_global_for_test();
-        set_state_for_test(GuardrailsState::Disabled);
+        set_state_for_test(test_run(), GuardrailsState::Disabled);
 
-        assert!(check_file_access("any/file.rs").is_ok());
-        assert!(check_diff_thresholds().is_none());
-        assert!(run_quality_gates().is_empty());
-        assert!(get_diff_summary().is_none());
+        assert!(check_file_access(test_run(), "any/file.rs").is_ok());
+        assert!(check_diff_thresholds(test_run()).is_none());
+        assert!(run_quality_gates(test_run()).is_empty());
+        assert!(get_diff_summary(test_run()).is_none());
     }
 
     // ====== Crosslink #749 regression: fail-closed on bad state ======
@@ -2024,10 +2206,10 @@ mod tests {
         // `if let Ok(guard) = ...lock()` and the function returned
         // Ok(()). After the fix the security boundary must refuse.
         let _serialize = lock_global_for_test();
-        set_state_for_test(GuardrailsState::Poisoned);
-        assert_eq!(current_state_kind(), "poisoned");
+        set_poisoned_for_test();
+        assert_eq!(current_state_kind(test_run()), "poisoned");
 
-        let result = check_file_access("/etc/shadow");
+        let result = check_file_access(test_run(), "/etc/shadow");
         assert!(
             result.is_err(),
             "poisoned guardrails must fail-closed at the security              boundary, got: {result:?}"
@@ -2038,7 +2220,7 @@ mod tests {
             "error must identify the poisoned cause: got {msg:?}"
         );
 
-        set_state_for_test(GuardrailsState::Disabled);
+        set_state_for_test(test_run(), GuardrailsState::Disabled);
     }
 
     #[test]
@@ -2048,15 +2230,15 @@ mod tests {
         // tri-state refactor must not regress the allow-decision path.
         let _serialize = lock_global_for_test();
         let engine = make_strict_engine_with_deny(".env*");
-        set_state_for_test(GuardrailsState::Enabled(Box::new(engine)));
-        assert_eq!(current_state_kind(), "enabled");
+        set_state_for_test(test_run(), GuardrailsState::Enabled(Box::new(engine)));
+        assert_eq!(current_state_kind(test_run()), "enabled");
 
         assert!(
-            check_file_access("src/main.rs").is_ok(),
+            check_file_access(test_run(), "src/main.rs").is_ok(),
             "enabled engine should allow non-denied paths"
         );
 
-        let blocked = check_file_access(".env.local");
+        let blocked = check_file_access(test_run(), ".env.local");
         assert!(blocked.is_err(), "deny rule must fire");
         let msg = blocked.unwrap_err();
         assert!(
@@ -2065,7 +2247,7 @@ mod tests {
         );
         assert!(!msg.contains("poisoned"));
 
-        set_state_for_test(GuardrailsState::Disabled);
+        set_state_for_test(test_run(), GuardrailsState::Disabled);
     }
 
     #[test]
@@ -2073,33 +2255,33 @@ mod tests {
         // Sticky-poison contract: once poisoned, configure() must NOT
         // silently re-arm the engine.
         let _serialize = lock_global_for_test();
-        set_state_for_test(GuardrailsState::Poisoned);
+        set_poisoned_for_test();
 
         let cfg = GuardrailsConfig::default();
-        configure(&cfg);
+        configure(test_run(), &cfg);
 
         assert_eq!(
-            current_state_kind(),
+            current_state_kind(test_run()),
             "poisoned",
             "configure() must be a no-op once the state is poisoned"
         );
 
-        set_state_for_test(GuardrailsState::Disabled);
+        set_state_for_test(test_run(), GuardrailsState::Disabled);
     }
 
     #[test]
     fn test_749_non_security_paths_safe_when_poisoned() {
         // Non-security accessors must not panic or hang on poison.
         let _serialize = lock_global_for_test();
-        set_state_for_test(GuardrailsState::Poisoned);
+        set_poisoned_for_test();
 
-        assert!(check_diff_thresholds().is_none());
-        assert!(run_quality_gates().is_empty());
-        assert!(get_diff_summary().is_none());
-        record_file_modification("any.rs", 1, 0);
-        reset_turn();
+        assert!(check_diff_thresholds(test_run()).is_none());
+        assert!(run_quality_gates(test_run()).is_empty());
+        assert!(get_diff_summary(test_run()).is_none());
+        record_file_modification(test_run(), "any.rs", 1, 0);
+        reset_turn(test_run());
 
-        set_state_for_test(GuardrailsState::Disabled);
+        set_state_for_test(test_run(), GuardrailsState::Disabled);
     }
 
     #[test]
@@ -2109,10 +2291,10 @@ mod tests {
         // not allocate a real engine. This is what makes the global
         // API safe for the existing tools tests.
         let _serialize = lock_global_for_test();
-        set_state_for_test(GuardrailsState::Disabled);
-        configure(&GuardrailsConfig::default());
-        assert_eq!(current_state_kind(), "disabled");
-        assert!(check_file_access("any/file.rs").is_ok());
+        set_state_for_test(test_run(), GuardrailsState::Disabled);
+        configure(test_run(), &GuardrailsConfig::default());
+        assert_eq!(current_state_kind(test_run()), "disabled");
+        assert!(check_file_access(test_run(), "any/file.rs").is_ok());
     }
 
     // ====== crosslink #395: cross-platform shell ======
@@ -2131,7 +2313,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cl395_run_shell_success_captures_stdout() {
-        let outcome = run_shell_command_sync("printf %s hello", 5);
+        let outcome = run_shell_command_sync(test_run(), "printf %s hello", 5);
         match outcome {
             ShellResult::Success { stdout, .. } => assert_eq!(stdout, "hello"),
             other => panic!("expected Success, got {other:?}"),
@@ -2144,7 +2326,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cl395_run_shell_nonzero_exit_returns_exit_failed_with_code() {
-        let outcome = run_shell_command_sync("sh -c \"exit 7\"", 5);
+        let outcome = run_shell_command_sync(test_run(), "sh -c \"exit 7\"", 5);
         match outcome {
             ShellResult::ExitFailed { code, .. } => assert_eq!(code, 7),
             other => panic!("expected ExitFailed{{code:7,..}}, got {other:?}"),
@@ -2160,7 +2342,7 @@ mod tests {
     #[test]
     fn cl395_run_shell_long_running_returns_timeout() {
         let start = std::time::Instant::now();
-        let outcome = run_shell_command_sync("sleep 30", 1);
+        let outcome = run_shell_command_sync(test_run(), "sleep 30", 1);
         let elapsed = start.elapsed();
         assert!(
             matches!(outcome, ShellResult::Timeout),
@@ -2181,6 +2363,7 @@ mod tests {
     #[test]
     fn cl395_run_shell_missing_program_returns_shell_missing() {
         let outcome = run_shell_command_sync(
+            test_run(),
             "openclaudia-cl395-definitely-not-a-real-binary-name --version",
             5,
         );
@@ -2205,7 +2388,7 @@ mod tests {
     #[test]
     fn cl395_run_shell_success_captures_stderr_alongside_stdout() {
         // sh -c 'echo out; echo err >&2' — both streams populated, exit 0.
-        let outcome = run_shell_command_sync("sh -c \"echo out; echo err 1>&2\"", 5);
+        let outcome = run_shell_command_sync(test_run(), "sh -c \"echo out; echo err 1>&2\"", 5);
         match outcome {
             ShellResult::Success { stdout, stderr } => {
                 assert!(stdout.contains("out"), "stdout missing payload: {stdout:?}");
@@ -2222,7 +2405,7 @@ mod tests {
         let host_file = host_dir.path().join("escape.txt");
         let command = format!("sh -c \"printf escaped > {}\"", host_file.to_string_lossy());
 
-        let _ = run_shell_command_sync(&command, 5);
+        let _ = run_shell_command_sync(test_run(), &command, 5);
 
         assert!(
             !host_file.exists(),
@@ -2239,7 +2422,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cl395_run_shell_does_not_invoke_a_shell_for_argv_expansion() {
-        let outcome = run_shell_command_sync("printf %s $(date)", 5);
+        let outcome = run_shell_command_sync(test_run(), "printf %s $(date)", 5);
         match outcome {
             ShellResult::Success { stdout, .. } => {
                 assert_eq!(

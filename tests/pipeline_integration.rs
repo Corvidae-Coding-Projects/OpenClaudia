@@ -136,6 +136,7 @@ async fn b1_retry_max_matches_cc_10_attempts() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
         headers: &[],
@@ -200,6 +201,7 @@ async fn b1_503_is_retried() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
         headers: &[],
@@ -264,6 +266,7 @@ async fn b1_retry_after_zero_retries_without_sleep() {
     let (tx, rx) = std::sync::mpsc::channel();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
         headers: &[],
@@ -347,6 +350,7 @@ async fn b1_408_is_retried() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
         headers: &[],
@@ -368,6 +372,8 @@ async fn b1_408_is_retried() {
 
     assert!(result.is_ok(), "408 must be retried and succeed on 2nd try");
 }
+
+mod support;
 
 // ── B3: process_sse_event pure-function contract ──────────────────────────────
 

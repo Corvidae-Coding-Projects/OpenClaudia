@@ -13,7 +13,6 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,11 +20,19 @@ use std::sync::{Arc, Mutex};
 mod support;
 
 fn dispatch_edit(args: &HashMap<String, Value>) -> (String, bool) {
-    support::dispatch_tool("edit_file", args)
+    support::legacy(&support::dispatch_tool_result_for_run(
+        support::shared_run_context(),
+        "edit_file",
+        args,
+    ))
 }
 
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
-    support::dispatch_tool("read_file", args)
+    support::legacy(&support::dispatch_tool_result_for_run(
+        support::shared_run_context(),
+        "read_file",
+        args,
+    ))
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -126,20 +133,24 @@ fn edit_existing_file_without_prior_read_errors_with_documented_message() {
 
 #[test]
 fn failed_read_does_not_satisfy_edit_gate() {
-    let _session_guard = SessionIdGuard::set("failed-read-edit-gate");
     let dir = tempfile::TempDir::new_in(".").expect("tempdir");
+    let run = support::test_run_context(dir.path());
     let path = dir.path().join("empty.png");
     std::fs::write(&path, "").expect("create empty image");
     let path_str = path.to_str().expect("utf8 path");
 
-    let (read_msg, read_err) = dispatch_read(&args_with(&[("path", json!(path_str))]));
+    let read_args = args_with(&[("path", json!(path_str))]);
+    let read_result = support::dispatch_tool_result_for_run(&run, "read_file", &read_args);
+    let (read_msg, read_err) = support::legacy(&read_result);
     assert!(read_err, "empty image read must fail: {read_msg}");
 
-    let (edit_msg, edit_err) = dispatch_edit(&args_with(&[
+    let edit_args = args_with(&[
         ("path", json!(path_str)),
         ("old_string", json!("")),
         ("new_string", json!("replacement")),
-    ]));
+    ]);
+    let edit_result = support::dispatch_tool_result_for_run(&run, "edit_file", &edit_args);
+    let (edit_msg, edit_err) = support::legacy(&edit_result);
     assert!(
         edit_err,
         "failed read must not unlock edit gate: {edit_msg}"
@@ -158,13 +169,15 @@ fn failed_read_does_not_satisfy_edit_gate() {
 #[test]
 fn edit_after_explicit_read_file_dispatch_passes_must_read_gate() {
     let dir = tempfile::TempDir::new_in(".").expect("tempdir");
+    let run = support::test_run_context(dir.path());
     let path = dir.path().join("read_then_edited_unique.txt");
     std::fs::write(&path, "before").expect("create");
     let path_str = path.to_str().unwrap();
 
     // Read first via dispatched read_file (populates READ_TRACKER).
     let read_args = args_with(&[("path", json!(path_str))]);
-    let (_msg, read_err) = dispatch_read(&read_args);
+    let read_result = support::dispatch_tool_result_for_run(&run, "read_file", &read_args);
+    let (_msg, read_err) = support::legacy(&read_result);
     assert!(!read_err, "read_file MUST succeed");
 
     // Now edit succeeds.
@@ -173,7 +186,8 @@ fn edit_after_explicit_read_file_dispatch_passes_must_read_gate() {
         ("old_string", json!("before")),
         ("new_string", json!("after")),
     ]);
-    let (msg, is_err) = dispatch_edit(&edit_args);
+    let edit_result = support::dispatch_tool_result_for_run(&run, "edit_file", &edit_args);
+    let (msg, is_err) = support::legacy(&edit_result);
     assert!(!is_err, "edit after read MUST succeed; got error {msg:?}");
 
     // Content actually changed on disk.
@@ -183,10 +197,11 @@ fn edit_after_explicit_read_file_dispatch_passes_must_read_gate() {
 
 #[test]
 fn edit_records_diff_and_stales_prior_read_observation() {
-    let _session_guard = openclaudia::tools::SessionIdGuard::set("editledger");
+    let run = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let session_id = run.session_id().to_string();
     let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
     let _ledger_guard =
-        openclaudia::ledger::install_active_ledger_for_session("editledger", Arc::clone(&ledger));
+        openclaudia::ledger::install_active_ledger_for_session(&session_id, Arc::clone(&ledger));
 
     let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("ledger_edit.txt");
@@ -194,7 +209,8 @@ fn edit_records_diff_and_stales_prior_read_observation() {
     let path_str = path.to_str().unwrap();
 
     let read_args = args_with(&[("path", json!(path_str))]);
-    let (_msg, read_err) = dispatch_read(&read_args);
+    let read_result = support::dispatch_tool_result_for_run(&run, "read_file", &read_args);
+    let (_msg, read_err) = support::legacy(&read_result);
     assert!(!read_err, "read_file MUST succeed");
     let read_id = {
         let ledger = ledger.lock().expect("ledger lock");
@@ -207,7 +223,8 @@ fn edit_records_diff_and_stales_prior_read_observation() {
         ("old_string", json!("before")),
         ("new_string", json!("after")),
     ]);
-    let (msg, is_err) = dispatch_edit(&edit_args);
+    let edit_result = support::dispatch_tool_result_for_run(&run, "edit_file", &edit_args);
+    let (msg, is_err) = support::legacy(&edit_result);
     assert!(!is_err, "edit after read MUST succeed; got error {msg:?}");
 
     let (read_is_stale, diff) = {

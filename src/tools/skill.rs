@@ -4,7 +4,7 @@
 //! Skills already live on disk as YAML-frontmatter markdown under
 //! `.openclaudia/skills/` and `~/.openclaudia/skills/`; they were previously
 //! reachable only via the `/skill` slash command in the TUI. This tool wraps
-//! [`crate::skills::get_skill`] so the model can request a skill body during
+//! [`crate::skills::get_skill_for_project`] so the model can request a skill body during
 //! tool dispatch the same way it requests any other tool, returning the
 //! markdown body inside an explicit `<skill>...</skill>` envelope that the
 //! caller can splice into the next turn's system prompt.
@@ -30,6 +30,7 @@ use std::hash::BuildHasher;
 
 use crate::skills;
 use crate::tools::args::ToolArgError;
+use crate::tools::security::ToolRunContext;
 
 /// Open-tag emitted before the skill body.
 pub(crate) const ENVELOPE_OPEN: &str = "<skill";
@@ -78,12 +79,16 @@ fn xml_attr_escape(s: &str) -> String {
 /// Execute the `skill` tool.
 ///
 /// Required argument: `name` (string). The handler looks up the skill via
-/// [`crate::skills::get_skill`] and returns either an envelope-wrapped body or
+/// [`crate::skills::get_skill_for_project`] and returns either an
+/// envelope-wrapped body or
 /// a structured error message.
 ///
 /// Returns `(text, is_error)`.
 #[must_use]
-pub fn execute_skill<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
+pub fn execute_skill<S: BuildHasher>(
+    run: &ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
     let name = match args.get("name") {
         None => return ("skill: missing required argument `name`".to_string(), true),
         Some(Value::String(name)) => name.as_str(),
@@ -101,7 +106,9 @@ pub fn execute_skill<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (Strin
         return ("skill: `name` is empty".to_string(), true);
     }
 
-    let Some(def) = skills::get_skill(trimmed) else {
+    let Some(def) =
+        skills::get_skill_for_project(trimmed, run.project_root(), run.working_directory())
+    else {
         // Listing the available skills here would be friendly but the cache is
         // potentially large and we do not want to surprise the model with a
         // multi-KiB error blob; the caller can request the list via the
@@ -117,6 +124,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn run() -> &'static ToolRunContext {
+        crate::tools::security::test_run_context().as_ref()
+    }
+
     // Note: tests do NOT mutate the process CWD because that races with
     // every other parallel test in the same binary. Instead, the
     // unknown / known-skill tests just exercise the `(name, body)`
@@ -127,7 +138,7 @@ mod tests {
     #[test]
     fn missing_name_arg_errors() {
         let args = HashMap::new();
-        let (text, is_err) = execute_skill(&args);
+        let (text, is_err) = execute_skill(run(), &args);
         assert!(is_err);
         assert!(text.contains("missing required argument"));
     }
@@ -136,7 +147,7 @@ mod tests {
     fn wrong_type_name_arg_errors() {
         let mut args = HashMap::new();
         args.insert("name".to_string(), json!(42));
-        let (text, is_err) = execute_skill(&args);
+        let (text, is_err) = execute_skill(run(), &args);
         assert!(is_err);
         assert!(text.contains("Invalid 'name' argument: expected string"));
     }
@@ -145,7 +156,7 @@ mod tests {
     fn empty_name_errors() {
         let mut args = HashMap::new();
         args.insert("name".to_string(), json!(""));
-        let (text, is_err) = execute_skill(&args);
+        let (text, is_err) = execute_skill(run(), &args);
         assert!(is_err);
         assert!(text.contains("empty"));
     }
@@ -159,7 +170,7 @@ mod tests {
             "name".to_string(),
             json!("__definitely_not_a_real_skill_xyz_637__"),
         );
-        let (text, is_err) = execute_skill(&args);
+        let (text, is_err) = execute_skill(run(), &args);
         assert!(is_err);
         assert!(text.contains("unknown skill"));
     }

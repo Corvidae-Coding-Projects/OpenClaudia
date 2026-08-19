@@ -355,6 +355,26 @@ pub fn build_prompt_context(
     )
 }
 
+/// Build the default bounded prompt context for one immutable run.
+///
+/// The run supplies both the working-directory reference and the project
+/// boundary used for skill discovery. This prevents concurrent frontends from
+/// assembling prompt metadata through the process current directory.
+#[must_use]
+pub fn build_prompt_context_for_run(
+    mode: &BehaviorMode,
+    memory_db: Option<&MemoryDb>,
+    run: &crate::tools::ToolRunContext,
+) -> SystemPromptBlocks {
+    build_prompt_context_with_items_for_run(
+        mode,
+        memory_db,
+        run,
+        Vec::new(),
+        ContextBudget::default(),
+    )
+}
+
 /// Build bounded provider context from typed inputs. There is deliberately no
 /// raw hook/custom prefix or suffix argument: callers must select provenance
 /// and authority by constructing a [`ContextItem`].
@@ -363,13 +383,55 @@ pub fn build_prompt_context_with_items(
     mode: &BehaviorMode,
     memory_db: Option<&MemoryDb>,
     working_dir: Option<&str>,
+    additional_items: Vec<ContextItem>,
+    budget: ContextBudget,
+) -> SystemPromptBlocks {
+    build_prompt_context_with_items_scoped(
+        mode,
+        memory_db,
+        working_dir,
+        None,
+        additional_items,
+        budget,
+    )
+}
+
+/// Build bounded provider context for one immutable run.
+///
+/// Unlike [`build_prompt_context_with_items`], this entry point may load the
+/// project skill layer because its discovery bounds come from the exact run
+/// capability rather than ambient process state.
+#[must_use]
+pub fn build_prompt_context_with_items_for_run(
+    mode: &BehaviorMode,
+    memory_db: Option<&MemoryDb>,
+    run: &crate::tools::ToolRunContext,
+    additional_items: Vec<ContextItem>,
+    budget: ContextBudget,
+) -> SystemPromptBlocks {
+    let working_directory = run.working_directory().to_string_lossy();
+    build_prompt_context_with_items_scoped(
+        mode,
+        memory_db,
+        Some(working_directory.as_ref()),
+        Some(run),
+        additional_items,
+        budget,
+    )
+}
+
+fn build_prompt_context_with_items_scoped(
+    mode: &BehaviorMode,
+    memory_db: Option<&MemoryDb>,
+    working_dir: Option<&str>,
+    run: Option<&crate::tools::ToolRunContext>,
     mut additional_items: Vec<ContextItem>,
     budget: ContextBudget,
 ) -> SystemPromptBlocks {
     let mut items = core_items(mode);
     add_runtime_items(&mut items, working_dir);
     add_output_style_item(&mut items);
-    add_skill_items(&mut items);
+    add_skill_items(&mut items, run);
     add_memory_items(&mut items, memory_db);
     items.append(&mut additional_items);
 
@@ -453,8 +515,10 @@ fn add_output_style_item(items: &mut Vec<ContextItem>) {
     }
 }
 
-fn add_skill_items(items: &mut Vec<ContextItem>) {
-    let mut skills = crate::skills::load_skills();
+fn add_skill_items(items: &mut Vec<ContextItem>, run: Option<&crate::tools::ToolRunContext>) {
+    let mut skills = run.map_or_else(crate::skills::load_global_skills, |run| {
+        crate::skills::load_skills_for_project(run.project_root(), run.working_directory())
+    });
     skills.sort_by(|left, right| {
         left.name
             .cmp(&right.name)

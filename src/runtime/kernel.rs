@@ -54,6 +54,12 @@ impl RunContext {
     pub const fn descriptor(&self) -> &RunDescriptor {
         &self.descriptor
     }
+
+    /// Root cancellation capability for this exact run generation.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationHandle {
+        self.cancellation.clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

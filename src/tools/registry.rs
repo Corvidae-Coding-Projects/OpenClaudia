@@ -31,11 +31,12 @@ use super::effect::{ToolEffect, ToolEffectSpec, ToolTarget, TypedEffect};
 
 /// Everything a [`ToolHandler`] may need at dispatch time.
 ///
-/// Bundles the three optional context objects that the old 3-function overload
-/// set threaded independently. Handlers that don't need a field ignore it.
+/// The run context is mandatory and immutable. Optional feature services remain
+/// explicit because a run may legitimately omit memory, configuration, or task
+/// state, but no handler may infer host authority from ambient process state.
 pub struct ToolContext<'a> {
-    /// Immutable filesystem/process capabilities for this session.
-    pub security: Result<std::sync::Arc<super::security::ToolSecurityContext>, String>,
+    /// Immutable workspace/filesystem/process/network/secret capabilities.
+    pub run: &'a std::sync::Arc<super::security::ToolRunContext>,
     /// Optional archival memory database (stateful mode).
     pub memory_db: Option<&'a MemoryDb>,
     /// Optional application configuration (subagent tools).
@@ -122,6 +123,21 @@ pub trait ToolHandler: Send + Sync {
     /// changes no state and performs no egress. Everything else reaches an
     /// authorization decision.
     fn effect_spec(&self) -> ToolEffectSpec;
+
+    /// Concrete host resources required before this handler may execute.
+    ///
+    /// Every tool is bound to a valid workspace-bearing run. Handlers that
+    /// additionally write, spawn, or perform egress override this baseline;
+    /// dispatch converts a missing grant into a typed `Unavailable` result
+    /// before leaf code can collapse it into a generic external error.
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        const BASELINE: &[super::security::ToolResource] =
+            &[super::security::ToolResource::WorkspaceRead];
+        BASELINE
+    }
 
     /// Resolve the effect of one concrete invocation for handlers that
     /// multiplex several operations behind a single wire-level tool.
@@ -211,16 +227,20 @@ impl ToolRegistry {
                 ToolRetryability::Never,
             )));
         }
-        if let Err(error) = &ctx.security {
-            return Some(ToolHandlerResult::error(ToolFailure::new(
-                ToolFailureCode::Unavailable,
-                format!("Tool execution is blocked because session capabilities are unavailable: {error}"),
-                ToolRetryability::Never,
-            )));
-        }
-        self.handlers
-            .get(tool_name)
-            .map(|h| h.execute(permit, args, ctx))
+        self.handlers.get(tool_name).map(|handler| {
+            for resource in handler.required_resources(args) {
+                if let Err(error) = ctx.run.require(*resource) {
+                    return ToolHandlerResult::error(ToolFailure::new(
+                        ToolFailureCode::Unavailable,
+                        format!(
+                            "Tool execution is blocked because run capability {resource:?} is unavailable: {error}"
+                        ),
+                        ToolRetryability::Never,
+                    ));
+                }
+            }
+            handler.execute(permit, args, ctx)
+        })
     }
 }
 
@@ -232,12 +252,48 @@ use super::{
     worktree, ToolFailure, ToolFailureCode, ToolHandlerResult, ToolRetryability,
 };
 
+const REQUIRES_READ: &[super::security::ToolResource] =
+    &[super::security::ToolResource::WorkspaceRead];
+const REQUIRES_WRITE: &[super::security::ToolResource] = &[
+    super::security::ToolResource::WorkspaceRead,
+    super::security::ToolResource::WorkspaceWrite,
+];
+const REQUIRES_PROCESS: &[super::security::ToolResource] = &[
+    super::security::ToolResource::WorkspaceRead,
+    super::security::ToolResource::Process,
+];
+const REQUIRES_NETWORK: &[super::security::ToolResource] = &[
+    super::security::ToolResource::WorkspaceRead,
+    super::security::ToolResource::Network,
+];
+const REQUIRES_PROCESS_AND_WRITE: &[super::security::ToolResource] = &[
+    super::security::ToolResource::WorkspaceRead,
+    super::security::ToolResource::WorkspaceWrite,
+    super::security::ToolResource::Process,
+];
+const REQUIRES_PROCESS_AND_NETWORK: &[super::security::ToolResource] = &[
+    super::security::ToolResource::WorkspaceRead,
+    super::security::ToolResource::Process,
+    super::security::ToolResource::Network,
+];
+const REQUIRES_BROWSER: &[super::security::ToolResource] = &[
+    super::security::ToolResource::WorkspaceRead,
+    super::security::ToolResource::Process,
+    super::security::ToolResource::Network,
+];
+
 // ── bash ─────────────────────────────────────────────────────────────────────
 
 struct BashHandler;
 impl ToolHandler for BashHandler {
     fn name(&self) -> &'static str {
         "bash"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::Destructive, "Bash", "command")
@@ -269,9 +325,9 @@ impl ToolHandler for BashHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
-        ToolHandlerResult::from_migrated(bash::try_execute_bash(args))
+        ToolHandlerResult::from_migrated(bash::try_execute_bash(ctx.run, args))
     }
 }
 
@@ -279,6 +335,12 @@ struct BashOutputHandler;
 impl ToolHandler for BashOutputHandler {
     fn name(&self) -> &'static str {
         "bash_output"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::typed_operation(ToolEffect::SessionMutation, "BashOutput")
@@ -311,9 +373,9 @@ impl ToolHandler for BashOutputHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        bash::execute_bash_output(args)
+        bash::execute_bash_output(ctx.run, args)
     }
 }
 
@@ -321,6 +383,12 @@ struct KillShellHandler;
 impl ToolHandler for KillShellHandler {
     fn name(&self) -> &'static str {
         "kill_shell"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "KillShell", "shell_id")
@@ -348,9 +416,9 @@ impl ToolHandler for KillShellHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        bash::execute_kill_shell(args)
+        bash::execute_kill_shell(ctx.run, args)
     }
 }
 
@@ -358,6 +426,12 @@ struct KillShellsForAgentHandler;
 impl ToolHandler for KillShellsForAgentHandler {
     fn name(&self) -> &'static str {
         "kill_shells_for_agent"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "KillShell", "agent_id")
@@ -385,9 +459,9 @@ impl ToolHandler for KillShellsForAgentHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        bash::execute_kill_shells_for_agent(args)
+        bash::execute_kill_shells_for_agent(ctx.run, args)
     }
 }
 
@@ -397,6 +471,20 @@ struct ReadFileHandler;
 impl ToolHandler for ReadFileHandler {
     fn name(&self) -> &'static str {
         "read_file"
+    }
+    fn required_resources(
+        &self,
+        args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        if args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| matches!(file::detect_file_type(path), file::FileType::Pdf))
+        {
+            REQUIRES_PROCESS
+        } else {
+            REQUIRES_READ
+        }
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::read_only_arg("Read", "path")
@@ -438,9 +526,9 @@ impl ToolHandler for ReadFileHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        file::execute_read_file(args)
+        file::execute_read_file(ctx.run, args)
     }
 }
 
@@ -484,9 +572,9 @@ impl ToolHandler for GroundingContextHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        grounding::execute_grounding_context(args)
+        grounding::execute_grounding_context(ctx.run.session_id(), args)
     }
 }
 
@@ -494,6 +582,12 @@ struct WriteFileHandler;
 impl ToolHandler for WriteFileHandler {
     fn name(&self) -> &'static str {
         "write_file"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Write", "path")
@@ -525,9 +619,9 @@ impl ToolHandler for WriteFileHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        file::execute_write_file(args)
+        file::execute_write_file(ctx.run, args)
     }
 }
 
@@ -535,6 +629,12 @@ struct EditFileHandler;
 impl ToolHandler for EditFileHandler {
     fn name(&self) -> &'static str {
         "edit_file"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Edit", "path")
@@ -574,9 +674,9 @@ impl ToolHandler for EditFileHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
-        file::execute_edit_file(args)
+        file::execute_edit_file(ctx.run, args)
     }
 }
 
@@ -584,6 +684,12 @@ struct NotebookEditHandler;
 impl ToolHandler for NotebookEditHandler {
     fn name(&self) -> &'static str {
         "notebook_edit"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Edit", "notebook_path")
@@ -633,9 +739,9 @@ impl ToolHandler for NotebookEditHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        file::execute_notebook_edit(args)
+        file::execute_notebook_edit(ctx.run, args)
     }
 }
 
@@ -670,9 +776,9 @@ impl ToolHandler for ListFilesHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        file::execute_list_files(args)
+        file::execute_list_files(ctx.run, args)
     }
 }
 
@@ -711,9 +817,9 @@ impl ToolHandler for GlobHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        file::execute_glob(args)
+        file::execute_glob(ctx.run, args)
     }
 }
 
@@ -761,9 +867,9 @@ impl ToolHandler for GrepHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        file::execute_grep(args)
+        file::execute_grep(ctx.run, args)
     }
 }
 
@@ -780,6 +886,21 @@ struct CrosslinkHandler;
 impl ToolHandler for CrosslinkHandler {
     fn name(&self) -> &'static str {
         "crosslink"
+    }
+    fn required_resources(
+        &self,
+        args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        args.get("operation")
+            .and_then(Value::as_str)
+            .and_then(crosslink_tool::operation)
+            .map_or(REQUIRES_READ, |operation| {
+                if operation.requires_store {
+                    REQUIRES_WRITE
+                } else {
+                    REQUIRES_READ
+                }
+            })
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::typed_operation(ToolEffect::WorkspaceMutation, "Crosslink")
@@ -809,9 +930,9 @@ impl ToolHandler for CrosslinkHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        crosslink_tool::execute_crosslink(args)
+        crosslink_tool::execute_crosslink(ctx.run, args)
     }
 }
 
@@ -830,6 +951,12 @@ struct WebFetchHandler;
 impl ToolHandler for WebFetchHandler {
     fn name(&self) -> &'static str {
         "web_fetch"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_NETWORK
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::NetworkRead, "WebFetch", "url")
@@ -863,7 +990,7 @@ impl ToolHandler for WebFetchHandler {
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        web::execute_web_fetch_with_config(args, ctx.app_config)
+        web::execute_web_fetch_with_config(ctx.run, args, ctx.app_config)
     }
 }
 
@@ -873,6 +1000,12 @@ struct WebSearchHandler;
 impl ToolHandler for WebSearchHandler {
     fn name(&self) -> &'static str {
         "web_search"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_BROWSER
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::NetworkRead, "WebSearch", "query")
@@ -916,9 +1049,9 @@ impl ToolHandler for WebSearchHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        web::execute_web_search(args)
+        web::execute_web_search(ctx.run, args)
     }
 }
 
@@ -931,6 +1064,12 @@ struct WebBrowserHandler;
 impl ToolHandler for WebBrowserHandler {
     fn name(&self) -> &'static str {
         "web_browser"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_BROWSER
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         // Launches a headless Chromium process, so it is an external effect
@@ -960,9 +1099,9 @@ impl ToolHandler for WebBrowserHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        web::execute_web_browser(args)
+        web::execute_web_browser(ctx.run, args)
     }
 }
 
@@ -972,6 +1111,12 @@ struct LspHandler;
 impl ToolHandler for LspHandler {
     fn name(&self) -> &'static str {
         "lsp"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "Lsp", "file_path")
@@ -1032,9 +1177,9 @@ impl ToolHandler for LspHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        lsp::execute_lsp(args)
+        lsp::execute_lsp(ctx.run, args)
     }
 }
 
@@ -1090,9 +1235,9 @@ impl ToolHandler for TodoWriteHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        todo::execute_todo_write(args)
+        todo::execute_todo_write(ctx.run.session_id(), args)
     }
 }
 
@@ -1122,9 +1267,9 @@ impl ToolHandler for TodoReadHandler {
         &self,
         _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        todo::execute_todo_read()
+        todo::execute_todo_read(ctx.run.session_id())
     }
 }
 
@@ -1223,6 +1368,12 @@ impl ToolHandler for EnterWorktreeHandler {
     fn name(&self) -> &'static str {
         "enter_worktree"
     }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS_AND_WRITE
+    }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Worktree", "branch")
     }
@@ -1249,9 +1400,9 @@ impl ToolHandler for EnterWorktreeHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        worktree::execute_enter_worktree(args)
+        worktree::execute_enter_worktree(ctx.run, args)
     }
 }
 
@@ -1259,6 +1410,12 @@ struct ExitWorktreeHandler;
 impl ToolHandler for ExitWorktreeHandler {
     fn name(&self) -> &'static str {
         "exit_worktree"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS_AND_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::typed_operation(ToolEffect::Destructive, "Worktree")
@@ -1307,9 +1464,9 @@ impl ToolHandler for ExitWorktreeHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        worktree::execute_exit_worktree(args)
+        worktree::execute_exit_worktree(ctx.run, args)
     }
 }
 
@@ -1317,6 +1474,12 @@ struct ListWorktreesHandler;
 impl ToolHandler for ListWorktreesHandler {
     fn name(&self) -> &'static str {
         "list_worktrees"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::read_only("Worktree")
@@ -1339,9 +1502,9 @@ impl ToolHandler for ListWorktreesHandler {
         &self,
         _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        worktree::execute_list_worktrees()
+        worktree::execute_list_worktrees(ctx.run)
     }
 }
 
@@ -1351,6 +1514,12 @@ struct CronCreateHandler;
 impl ToolHandler for CronCreateHandler {
     fn name(&self) -> &'static str {
         "cron_create"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Cron", "name")
@@ -1394,9 +1563,9 @@ impl ToolHandler for CronCreateHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        cron::execute_cron_create(args)
+        cron::execute_cron_create(ctx.run, args)
     }
 }
 
@@ -1404,6 +1573,12 @@ struct CronDeleteHandler;
 impl ToolHandler for CronDeleteHandler {
     fn name(&self) -> &'static str {
         "cron_delete"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful_tool_scope(ToolEffect::WorkspaceMutation, "Cron")
@@ -1441,9 +1616,9 @@ impl ToolHandler for CronDeleteHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        cron::execute_cron_delete(args)
+        cron::execute_cron_delete(ctx.run, args)
     }
 }
 
@@ -1451,6 +1626,12 @@ struct CronListHandler;
 impl ToolHandler for CronListHandler {
     fn name(&self) -> &'static str {
         "cron_list"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         // Listing acquires an exclusive advisory lock by creating
@@ -1477,9 +1658,9 @@ impl ToolHandler for CronListHandler {
         &self,
         _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        cron::execute_cron_list(&HashMap::new())
+        cron::execute_cron_list(ctx.run, &HashMap::new())
     }
 }
 
@@ -1517,9 +1698,9 @@ impl ToolHandler for EnterPlanModeHandler {
         &self,
         _permit: &ToolDispatchPermit,
         _args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
-        plan_mode::execute_enter_plan_mode()
+        plan_mode::execute_enter_plan_mode(ctx.run.as_ref())
     }
 }
 
@@ -1770,7 +1951,7 @@ impl ToolHandler for TaskListHandler {
 
 // ── mcp resource tools ────────────────────────────────────────────────────────
 //
-// These tools dispatch through the process-wide MCP manager installed by the
+// These tools dispatch through the exact-run MCP manager installed by the
 // proxy/TUI startup path. Keeping schema and dispatch in the registry prevents
 // MCP resource support from drifting back into an advertised-but-unreachable
 // tool surface.
@@ -1779,6 +1960,12 @@ struct ListMcpResourcesHandler;
 impl ToolHandler for ListMcpResourcesHandler {
     fn name(&self) -> &'static str {
         "list_mcp_resources"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS_AND_NETWORK
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         // A resource read can reconnect a disconnected MCP server, spawning
@@ -1810,13 +1997,13 @@ impl ToolHandler for ListMcpResourcesHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
         let server_filter = match optional_registry_string_arg(args, "server") {
             Ok(server) => server.map(str::to_string),
             Err(err) => return (format!("list_mcp_resources: {err}"), true),
         };
-        let Some(mgr) = crate::mcp::registered_manager() else {
+        let Some(mgr) = crate::mcp::registered_manager(ctx.run) else {
             return (
                 "No MCP manager has been installed for this session. \
                  Configure MCP servers under `mcp.servers` in \
@@ -1826,9 +2013,9 @@ impl ToolHandler for ListMcpResourcesHandler {
             );
         };
         // We're already inside `pipeline::execute_single_tool`'s
-        // `spawn_blocking` thread, so blocking on the runtime here
-        // does NOT pin the current_thread executor. See the docstring
-        // on `REGISTERED_MANAGER` in `src/mcp.rs` for the architecture.
+        // `spawn_blocking` thread, so blocking on the runtime here does NOT
+        // pin the current-thread executor. The manager lookup above is bound
+        // to the exact run id and capability generation.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return (
                 "list_mcp_resources requires an active tokio runtime to \
@@ -1837,9 +2024,14 @@ impl ToolHandler for ListMcpResourcesHandler {
                 true,
             );
         };
-        let mgr = mgr.clone();
+        let caller_run = std::sync::Arc::clone(ctx.run);
         let result = handle.block_on(async move {
             let guard = mgr.read().await;
+            if !guard.matches_run(&caller_run) {
+                return Err(anyhow::anyhow!(
+                    "MCP manager capability binding does not match the calling run"
+                ));
+            }
             guard.list_resources(server_filter.as_deref()).await
         });
         match result {
@@ -1880,6 +2072,12 @@ impl ToolHandler for ReadMcpResourceHandler {
     fn name(&self) -> &'static str {
         "read_mcp_resource"
     }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_PROCESS_AND_NETWORK
+    }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "McpRead", "uri")
     }
@@ -1910,7 +2108,7 @@ impl ToolHandler for ReadMcpResourceHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
         let server = match required_registry_string_arg(args, "read_mcp_resource", "server") {
             Ok(server) => server,
@@ -1920,7 +2118,7 @@ impl ToolHandler for ReadMcpResourceHandler {
             Ok(uri) => uri,
             Err(result) => return result,
         };
-        let Some(mgr) = crate::mcp::registered_manager() else {
+        let Some(mgr) = crate::mcp::registered_manager(ctx.run) else {
             return (
                 "No MCP manager has been installed for this session. \
                  Configure MCP servers under `mcp.servers` in \
@@ -1939,9 +2137,14 @@ impl ToolHandler for ReadMcpResourceHandler {
         };
         let server_owned = server.to_string();
         let uri_owned = uri.to_string();
-        let mgr = mgr.clone();
+        let caller_run = std::sync::Arc::clone(ctx.run);
         let result = handle.block_on(async move {
             let guard = mgr.read().await;
+            if !guard.matches_run(&caller_run) {
+                return Err(anyhow::anyhow!(
+                    "MCP manager capability binding does not match the calling run"
+                ));
+            }
             guard.read_resource(&server_owned, &uri_owned).await
         });
         match result {
@@ -2018,9 +2221,9 @@ impl ToolHandler for SkillHandler {
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        skill::execute_skill(args)
+        skill::execute_skill(ctx.run.as_ref(), args)
     }
 }
 
@@ -2385,7 +2588,7 @@ mod dispatch_permit_tests {
         let changed_args = HashMap::from([("path".to_string(), json!("src"))]);
         let permit = ToolDispatchPermit::new("list_files", &permitted_args);
         let mut context = ToolContext {
-            security: Err("security must not be reached for a mismatched permit".to_string()),
+            run: crate::tools::security::test_run_context(),
             memory_db: None,
             app_config: None,
             task_mgr: None,
@@ -2397,6 +2600,5 @@ mod dispatch_permit_tests {
         let (message, is_error) = result.into_legacy();
         assert!(is_error);
         assert!(message.contains("does not match the exact tool invocation"));
-        assert!(!message.contains("security must not be reached"));
     }
 }

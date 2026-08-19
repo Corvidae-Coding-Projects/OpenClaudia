@@ -5,7 +5,7 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::{execute_tool, FunctionCall, SessionIdGuard, ToolCall};
+use openclaudia::tools::{execute_tool, FunctionCall, ToolCall, ToolRunContext};
 use serde_json::json;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -17,27 +17,43 @@ fn session_lock() -> MutexGuard<'static, ()> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn call(name: &str, arguments: serde_json::Value) -> openclaudia::tools::ToolResult {
-    execute_tool(&ToolCall {
-        id: format!("filesystem-capability-{name}"),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name: name.to_string(),
-            arguments: arguments.to_string(),
+fn call(
+    run: &std::sync::Arc<ToolRunContext>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> openclaudia::tools::ToolResult {
+    execute_tool(
+        run,
+        &ToolCall {
+            id: format!("filesystem-capability-{name}"),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
         },
-    })
+    )
 }
 
 #[cfg(unix)]
 #[test]
 fn private_session_temp_is_narrow_isolated_and_symlink_safe() {
     let _serial = session_lock();
-    let session_a = SessionIdGuard::set("filesystem-private-temp-a");
-    let context_a = openclaudia::tools::security::current_context().expect("context A");
+    let project = tempfile::tempdir_in(".").expect("project fixture");
+    let context_a = ToolRunContext::builder(openclaudia::state::SessionId::new(), project.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .build()
+        .expect("context A");
     let a_file = context_a.private_temp_root().join("owned.txt");
     std::fs::write(&a_file, "session-a-secret").expect("write A fixture");
 
-    let own_read = call("read_file", json!({ "path": a_file }));
+    let own_read = call(&context_a, "read_file", json!({ "path": a_file }));
     assert!(
         !own_read.is_error(),
         "session must read its own temp: {own_read:?}"
@@ -47,7 +63,7 @@ fn private_session_temp_is_narrow_isolated_and_symlink_safe() {
     let sibling = tempfile::tempdir().expect("sibling OS temp");
     let sibling_file = sibling.path().join("sibling.txt");
     std::fs::write(&sibling_file, "sibling-secret").expect("write sibling");
-    let sibling_read = call("read_file", json!({ "path": sibling_file }));
+    let sibling_read = call(&context_a, "read_file", json!({ "path": sibling_file }));
     assert!(
         sibling_read.is_error(),
         "shared OS temp must not be granted"
@@ -56,19 +72,26 @@ fn private_session_temp_is_narrow_isolated_and_symlink_safe() {
 
     let link = context_a.private_temp_root().join("escape-link");
     std::os::unix::fs::symlink(&sibling_file, &link).expect("plant symlink");
-    let link_read = call("read_file", json!({ "path": link }));
+    let link_read = call(&context_a, "read_file", json!({ "path": link }));
     assert!(link_read.is_error(), "temp symlink escape must be denied");
     assert!(!link_read.content().contains("sibling-secret"));
 
-    drop(session_a);
-    let _session_b = SessionIdGuard::set("filesystem-private-temp-b");
-    let context_b = openclaudia::tools::security::current_context().expect("context B");
+    let context_b = ToolRunContext::builder(openclaudia::state::SessionId::new(), project.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .build()
+        .expect("context B");
     assert_ne!(
         context_a.private_temp_root(),
         context_b.private_temp_root(),
         "sessions must not share temporary roots"
     );
-    let cross_read = call("read_file", json!({ "path": a_file }));
+    let cross_read = call(&context_b, "read_file", json!({ "path": a_file }));
     assert!(
         cross_read.is_error(),
         "session B must not read session A temp"
@@ -123,9 +146,18 @@ fn intermediate_directory_symlink_swap_cannot_escape_reads_or_writes() {
     }
 
     let _serial = session_lock();
-    let _session = SessionIdGuard::set("filesystem-openat2-intermediate-race");
     let project_fixture = tempfile::tempdir_in(".").expect("project fixture");
     let outside = tempfile::tempdir().expect("outside fixture");
+    let run = ToolRunContext::builder(openclaudia::state::SessionId::new(), project_fixture.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .build()
+        .expect("race run context");
 
     let live = project_fixture.path().join("live");
     let alternate = project_fixture.path().join("alternate");
@@ -155,7 +187,11 @@ fn intermediate_directory_symlink_swap_cannot_escape_reads_or_writes() {
     };
 
     for index in 0..500 {
-        let read = call("read_file", json!({ "path": live.join("secret.txt") }));
+        let read = call(
+            &run,
+            "read_file",
+            json!({ "path": live.join("secret.txt") }),
+        );
         assert!(
             !read.content().contains("OUTSIDE-SENTINEL"),
             "confined read returned outside content: {read:?}"
@@ -163,6 +199,7 @@ fn intermediate_directory_symlink_swap_cannot_escape_reads_or_writes() {
 
         let write_name = format!("race-write-{index}.txt");
         let write = call(
+            &run,
             "write_file",
             json!({
                 "path": live.join(&write_name),

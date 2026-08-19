@@ -452,7 +452,7 @@ pub struct PluginManifest {
     /// Each entry maps a language identifier (e.g. `"rust"`) to an
     /// [`LspServerConfig`] describing how to spawn the server binary.
     /// On plugin load the host wires every entry into the LSP pool so
-    /// `is_lsp_connected("rust")` returns true once the plugin is enabled.
+    /// `is_lsp_connected(run, "rust")` returns true once the plugin is enabled.
     /// `None` ⇒ plugin contributes no LSP servers (overwhelmingly common).
     #[serde(
         default,

@@ -33,4 +33,4 @@ pub use ids::{
 };
 pub use kernel::{KernelError, ReplayError, RunContext, RunPhase, RunSnapshot, RuntimeKernel};
 pub use reference::{ReferenceRunAdapter, ReferenceRunResult};
-pub use trace::{ReferenceTraceSink, TraceSink, TraceSinkError};
+pub use trace::{ReferenceTraceSink, TraceSink, TraceSinkError, TracingTraceSink};

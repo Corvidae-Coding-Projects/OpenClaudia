@@ -22,10 +22,6 @@ fn dispatch_bash(args: &HashMap<String, Value>) -> (String, bool) {
     support::dispatch_tool("bash", args)
 }
 
-fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
-    support::dispatch_tool("bash_output", args)
-}
-
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
     let mut m = HashMap::new();
     for (k, v) in entries {
@@ -137,14 +133,16 @@ fn command_at_exactly_4096_bytes_passes_length_check() {
 
 #[test]
 fn bash_records_command_observation_when_session_ledger_is_active() {
-    let _session_guard = openclaudia::tools::SessionIdGuard::set("bashledger");
+    let run = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let session_id = run.session_id().to_string();
     let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
     let _ledger_guard =
-        openclaudia::ledger::install_active_ledger_for_session("bashledger", Arc::clone(&ledger));
+        openclaudia::ledger::install_active_ledger_for_session(&session_id, Arc::clone(&ledger));
 
     let command = "printf ledger-bash";
     let args = args_with(&[("command", json!(command))]);
-    let (msg, is_err) = dispatch_bash(&args);
+    let result = support::dispatch_tool_result_for_run(&run, "bash", &args);
+    let (msg, is_err) = support::legacy(&result);
     assert!(!is_err, "bash should succeed: {msg}");
     assert_eq!(msg, "ledger-bash");
 
@@ -180,17 +178,19 @@ fn bash_records_command_observation_when_session_ledger_is_active() {
 
 #[test]
 fn background_bash_records_command_observation_after_finish() {
-    let _session_guard = openclaudia::tools::SessionIdGuard::set("bashbgledger");
+    let run = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let session_id = run.session_id().to_string();
     let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
     let _ledger_guard =
-        openclaudia::ledger::install_active_ledger_for_session("bashbgledger", Arc::clone(&ledger));
+        openclaudia::ledger::install_active_ledger_for_session(&session_id, Arc::clone(&ledger));
 
     let command = "printf ledger-background";
     let args = args_with(&[
         ("command", json!(command)),
         ("run_in_background", json!(true)),
     ]);
-    let (msg, is_err) = dispatch_bash(&args);
+    let result = support::dispatch_tool_result_for_run(&run, "bash", &args);
+    let (msg, is_err) = support::legacy(&result);
     assert!(!is_err, "background bash should start: {msg}");
     let shell_id = msg
         .lines()
@@ -207,7 +207,8 @@ fn background_bash_records_command_observation_after_finish() {
     }
 
     let output_args = args_with(&[("shell_id", json!(shell_id))]);
-    let (output_msg, output_is_err) = dispatch_bash_output(&output_args);
+    let output_result = support::dispatch_tool_result_for_run(&run, "bash_output", &output_args);
+    let (output_msg, output_is_err) = support::legacy(&output_result);
     assert!(
         !output_is_err,
         "bash_output should retrieve finished shell: {output_msg}"

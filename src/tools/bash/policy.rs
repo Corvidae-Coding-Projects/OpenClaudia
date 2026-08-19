@@ -212,124 +212,13 @@ pub fn denied_reason(command: &str) -> Option<&'static str> {
     None
 }
 
-/// Explicit allowlist of env-var names that the spawned child process is
-/// allowed to inherit from the parent.
+/// Clear ambient process environment before an agent subprocess spawn.
 ///
-/// History: this used to be a denylist driven by [`is_sensitive_env`], but
-/// that approach silently leaked any credential whose name did not match
-/// the suffix/prefix heuristics (e.g. `DATABASE_URL`, `STRIPE_KEY`,
-/// `MONGODB_URI`, `SLACK_WEBHOOK`). The allowlist inverts the default:
-/// unknown variables are dropped, not inherited. See crosslink #730.
-///
-/// Entries are matched **case-insensitively** against the env-var name.
-/// Use exact names for well-known POSIX variables and use [`ENV_ALLOWLIST_PREFIXES`]
-/// for whole families of toolchain variables (CARGO_*, RUSTC_*, LC_*).
-const ENV_ALLOWLIST_EXACT: &[&str] = &[
-    // POSIX core — every standard shell relies on these.
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "PWD",
-    "OLDPWD",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "LANG",
-    "LANGUAGE",
-    "TERM",
-    "TERMINFO",
-    "TZ",
-    "HOSTNAME",
-    "HOSTTYPE",
-    "OSTYPE",
-    "MACHTYPE",
-    "COLORTERM",
-    "MANPATH",
-    "INFOPATH",
-    "PKG_CONFIG_PATH",
-    // Rust toolchain — needed by cargo/rustc.
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "RUSTUP_TOOLCHAIN",
-    "RUST_BACKTRACE",
-    "RUST_LOG",
-    "CARGO_TARGET_DIR",
-    // Common compiler toolchain knobs (no secrets).
-    "CC",
-    "CXX",
-    "LD",
-    "AR",
-    "RANLIB",
-    "MAKEFLAGS",
-    // Node / Python / Go / Java — non-secret toolchain knobs.
-    "NODE_ENV",
-    "NPM_CONFIG_PREFIX",
-    "NVM_DIR",
-    "VIRTUAL_ENV",
-    "PIPENV_VENV_IN_PROJECT",
-    "POETRY_HOME",
-    "JAVA_HOME",
-    "JDK_HOME",
-    "GOPATH",
-    "GOROOT",
-    // CI introspection (presence-only, not credentials).
-    "CI",
-    // Locale fallbacks beyond LC_*.
-    "LC_ALL",
-];
-
-/// Allowlist prefixes — any env var whose uppercased name starts with one
-/// of these strings is inherited. Used for whole-family toolchain knobs
-/// where enumerating every variable would be brittle.
-///
-/// Each prefix MUST be conservative: it must not subsume any credential
-/// family already named in [`is_sensitive_env`]. For example, `CARGO_`
-/// would subsume `CARGO_REGISTRY_TOKEN`, so we exclude that prefix and
-/// instead enumerate the safe CARGO_* knobs in [`ENV_ALLOWLIST_EXACT`].
-const ENV_ALLOWLIST_PREFIXES: &[&str] = &[
-    "LC_", // locale families: LC_CTYPE, LC_NUMERIC, LC_TIME, ...
-];
-
-/// True if `key` is on the allowlist AND is not classified as sensitive.
-///
-/// The sensitivity check is a belt-and-braces second gate so that even if
-/// a future allowlist entry accidentally subsumes a credential family
-/// (e.g. someone adds a broad prefix and `SSH_PRIVATE_KEY` snuck through), the
-/// suffix/prefix denylist in [`is_sensitive_env`] still drops it.
-#[must_use]
-pub fn is_env_allowed(key: &str) -> bool {
-    if is_sensitive_env(key) {
-        return false;
-    }
-    let upper = key.to_ascii_uppercase();
-    if ENV_ALLOWLIST_EXACT
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(key))
-    {
-        return true;
-    }
-    ENV_ALLOWLIST_PREFIXES
-        .iter()
-        .any(|prefix| upper.starts_with(prefix))
-}
-
-/// Apply standard hardening to a `Command` before spawn:
-///
-/// * Clear the inherited environment entirely (`env_clear`).
-/// * Re-inject only variables on [`is_env_allowed`].
-///
-/// History: this used to be a denylist (remove vars matching
-/// [`is_sensitive_env`]) but that leaked any credential whose name did
-/// not match the suffix/prefix heuristics. See crosslink #730.
+/// Concrete values are injected afterward from the immutable
+/// [`ToolRunContext`](crate::tools::ToolRunContext), never rediscovered from
+/// `std::env` here.
 pub fn apply_env_scrub(cmd: &mut Command) {
     cmd.env_clear();
-    for (key, value) in std::env::vars() {
-        if is_env_allowed(&key) {
-            cmd.env(key, value);
-        }
-    }
 }
 
 /// Read-only command names that are eligible for auto-allow. Each entry is
@@ -1038,100 +927,17 @@ mod tests {
         );
     }
 
-    // ── #730 allowlist tests ──────────────────────────────────────────────────
-    // The env scrub was flipped from denylist to allowlist. These tests pin
-    // the new contract: only ENV_ALLOWLIST_EXACT / ENV_ALLOWLIST_PREFIXES
-    // names pass through; everything else (including credentials whose names
-    // do NOT match is_sensitive_env heuristics) is dropped.
-
-    /// #730-a: arbitrary secret-shaped names whose form does not match
-    /// the legacy denylist still get dropped under the new allowlist.
+    /// S-019: environment scrub must not rediscover even allowlisted values
+    /// from mutable process-global state. Exact run grants are added by the
+    /// sandbox builder after this function returns.
     #[test]
-    fn allowlist_drops_arbitrary_secret_names() {
-        // None of these match is_sensitive_env heuristics; the old
-        // denylist would have leaked all of them.
-        let leaks_under_denylist = [
-            "DATABASE_URL",
-            "MONGODB_URI",
-            "REDIS_URL",
-            "STRIPE_KEY",
-            "SLACK_WEBHOOK",
-            "JWT_PRIVATE_KEY_FILE",
-            "TWILIO_AUTH",
-            "SENDGRID_KEY_ID",
-            "FOO_CREDENTIAL",
-        ];
-        for key in leaks_under_denylist {
-            assert!(
-                !is_env_allowed(key),
-                "#730: {key} must NOT be allowed under the allowlist"
-            );
-        }
-    }
-
-    /// #730-b: well-known POSIX variables remain inherited.
-    #[test]
-    fn allowlist_preserves_posix_core() {
-        for key in ["PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "TERM"] {
-            assert!(is_env_allowed(key), "#730: {key} must be on the allowlist");
-        }
-    }
-
-    /// #730-c: Rust toolchain knobs (`CARGO_HOME`, `RUSTUP_HOME`, `RUST_LOG`)
-    /// remain inherited so cargo/rustc continue to work in the child.
-    #[test]
-    fn allowlist_preserves_rust_toolchain() {
-        for key in [
-            "CARGO_HOME",
-            "RUSTUP_HOME",
-            "RUSTUP_TOOLCHAIN",
-            "RUST_BACKTRACE",
-            "RUST_LOG",
-            "CARGO_TARGET_DIR",
-        ] {
-            assert!(is_env_allowed(key), "#730: {key} must be on the allowlist");
-        }
-    }
-
-    /// Only locale prefixes are inherited. Desktop/IPC prefix families remain
-    /// denied even when their individual values do not look secret.
-    #[test]
-    fn allowlist_prefix_families_and_belt_and_braces() {
-        assert!(is_env_allowed("LC_CTYPE"));
-        assert!(is_env_allowed("LC_NUMERIC"));
-        assert!(!is_env_allowed("XDG_RUNTIME_DIR"));
-        assert!(!is_env_allowed("XDG_CONFIG_HOME"));
-        assert!(!is_env_allowed("SSH_AUTH_SOCK"));
-        assert!(!is_env_allowed("DBUS_SESSION_BUS_ADDRESS"));
-        // Belt-and-braces: sensitive names remain denied independently.
-        assert!(
-            !is_env_allowed("SSH_PRIVATE_KEY"),
-            "#730: is_sensitive_env must override allowlist prefix"
-        );
-        // CARGO_REGISTRY_TOKEN must not leak via CARGO_HOME's family — we
-        // intentionally use exact names for cargo, no CARGO_ prefix.
-        assert!(!is_env_allowed("CARGO_REGISTRY_TOKEN"));
-    }
-
-    /// #730-e: `apply_env_scrub` on a `Command` must clear inherited env and
-    /// only re-inject allowlisted keys. We can't directly observe the
-    /// process-spawn-side env, but `Command::get_envs()` exposes the explicit
-    /// env changes; every entry must correspond to an allowlisted key.
-    #[test]
-    fn apply_env_scrub_handles_empty_env_clear() {
+    fn apply_env_scrub_leaves_no_ambient_reinjection() {
         let mut cmd = Command::new("true");
         apply_env_scrub(&mut cmd);
-        for (k, v) in cmd.get_envs() {
-            let key = k.to_string_lossy();
-            assert!(
-                v.is_some(),
-                "#730: no allowlisted key should be marked for removal; {key} was"
-            );
-            assert!(
-                is_env_allowed(&key),
-                "#730: apply_env_scrub leaked non-allowlisted key {key}"
-            );
-        }
+        assert!(
+            cmd.get_envs().next().is_none(),
+            "ambient values must not be re-injected after env_clear"
+        );
     }
 
     // ── #589 SAFETY allowlist tests ───────────────────────────────────────────

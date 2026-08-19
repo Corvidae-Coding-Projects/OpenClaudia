@@ -29,6 +29,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
+mod support;
+
 #[derive(Clone, Default)]
 struct TraceWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -1144,7 +1146,14 @@ fn tool_call(name: &str, args: &Value) -> ToolCall {
 fn unclassified_tool_does_not_execute_through_the_gated_entrypoint() {
     let (mgr, _dir) = gated_manager();
     let call = tool_call("mystery_tool", &json!({"path": "/tmp/x"}));
-    let result = execute_tool_with_permission_required(&call, None, None, None, &mgr);
+    let result = execute_tool_with_permission_required(
+        support::shared_run_context(),
+        &call,
+        None,
+        None,
+        None,
+        &mgr,
+    );
 
     let rendered = format!("{result:?}");
     assert!(
@@ -1161,7 +1170,14 @@ fn destructive_tool_without_a_rule_does_not_execute() {
         "exit_worktree",
         &json!({"path": "/tmp/wt", "discard_changes": true}),
     );
-    let result = execute_tool_with_permission_required(&call, None, None, None, &mgr);
+    let result = execute_tool_with_permission_required(
+        support::shared_run_context(),
+        &call,
+        None,
+        None,
+        None,
+        &mgr,
+    );
 
     let rendered = format!("{result:?}");
     assert!(

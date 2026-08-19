@@ -86,13 +86,9 @@ pub struct SandboxDiagnostics {
 #[must_use]
 pub fn sandbox_diagnostics() -> SandboxDiagnostics {
     let disabled = SANDBOX_DISABLED.as_ref().copied().unwrap_or(false);
-    let context = crate::tools::security::current_context().ok();
-    let (read_only_root_count, read_write_root_count) = context.as_ref().map_or((0, 0), |ctx| {
-        (ctx.read_only_roots().len(), ctx.read_write_roots().len())
-    });
-    let environment_grant_count = context
-        .as_ref()
-        .map_or(0, |ctx| ctx.environment_grants().len());
+    // Startup diagnostics intentionally do not discover a run context. Exact
+    // capability counts are emitted when a concrete sandbox command is built.
+    let (read_only_root_count, read_write_root_count, environment_grant_count) = (0, 0, 0);
     if disabled {
         return SandboxDiagnostics {
             backend: "host-opt-out",
@@ -158,6 +154,16 @@ pub fn sandbox_diagnostics() -> SandboxDiagnostics {
         read_write_root_count,
         environment_grant_count,
     }
+}
+
+/// Probe the backend and include redacted counts from one explicit run.
+#[must_use]
+pub fn sandbox_diagnostics_for_run(run: &crate::tools::ToolRunContext) -> SandboxDiagnostics {
+    let mut diagnostics = sandbox_diagnostics();
+    diagnostics.read_only_root_count = run.read_only_roots().len();
+    diagnostics.read_write_root_count = run.read_write_roots().len();
+    diagnostics.environment_grant_count = run.environment_grants().len();
+    diagnostics
 }
 
 /// Fail closed during startup when an agent-capable surface has no usable
@@ -246,11 +252,13 @@ impl SandboxProfile {
 /// The opt-out is deliberately process-level only. Tool arguments are hostile
 /// input and can never select the unsandboxed branch.
 pub(super) fn sandboxed_bash_command(
+    run: &crate::tools::security::ToolRunContext,
     bash: &Path,
     command: &str,
     cwd: &Path,
 ) -> Result<Command, String> {
     sandboxed_process_command(
+        run,
         SandboxProfile::Shell,
         bash.as_os_str(),
         &[OsString::from("-c"), OsString::from(command)],
@@ -261,20 +269,26 @@ pub(super) fn sandboxed_bash_command(
 /// Build an OS-contained process command for code that may have been
 /// influenced by project content (quality gates, compilers, and similar).
 pub fn sandboxed_process_command(
+    run: &crate::tools::security::ToolRunContext,
     profile: SandboxProfile,
     program: &OsStr,
     args: &[OsString],
     cwd: &Path,
 ) -> Result<Command, String> {
-    sandboxed_process_command_for_profile(profile, program, args, cwd)
+    sandboxed_process_command_for_profile(run, profile, program, args, cwd)
 }
 
 /// Contain a user-configured hook while leaving its control-directory scripts
 /// readable. The source command's explicit environment changes are preserved
 /// on top of the sandbox's allowlisted environment.
-pub fn sandboxed_hook_command(source: &Command, cwd: &Path) -> Result<Command, String> {
+pub fn sandboxed_hook_command(
+    run: &crate::tools::security::ToolRunContext,
+    source: &Command,
+    cwd: &Path,
+) -> Result<Command, String> {
     let args: Vec<OsString> = source.get_args().map(OsString::from).collect();
     let mut command = sandboxed_process_command_for_profile(
+        run,
         SandboxProfile::RepositoryHook,
         source.get_program(),
         &args,
@@ -291,11 +305,14 @@ pub fn sandboxed_hook_command(source: &Command, cwd: &Path) -> Result<Command, S
 }
 
 fn sandboxed_process_command_for_profile(
+    run: &crate::tools::security::ToolRunContext,
     profile: SandboxProfile,
     program: &OsStr,
     args: &[OsString],
     cwd: &Path,
 ) -> Result<Command, String> {
+    run.require(crate::tools::security::ToolResource::Process)
+        .map_err(|error| error.to_string())?;
     if *SANDBOX_DISABLED.as_ref().map_err(Clone::clone)? {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -305,12 +322,12 @@ fn sandboxed_process_command_for_profile(
                 "Bash OS sandbox explicitly disabled by the host user; model commands have host access"
             );
         }
-        return unsandboxed_process_command(program, args, cwd);
+        return unsandboxed_process_command(run, program, args, cwd);
     }
 
     #[cfg(target_os = "linux")]
     {
-        linux_bubblewrap_command(profile, program, args, cwd)
+        linux_bubblewrap_command(run, profile, program, args, cwd)
     }
 
     #[cfg(target_os = "macos")]
@@ -370,6 +387,7 @@ fn sandbox_explicitly_disabled_value(value: &str) -> Result<bool, String> {
 }
 
 fn unsandboxed_process_command(
+    run: &crate::tools::security::ToolRunContext,
     program: &OsStr,
     args: &[OsString],
     cwd: &Path,
@@ -378,12 +396,21 @@ fn unsandboxed_process_command(
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
     super::apply_env_scrub(&mut cmd);
+    cmd.env("HOME", run.private_temp_root())
+        .env("TMPDIR", run.private_temp_root())
+        .env("TMP", run.private_temp_root())
+        .env("TEMP", run.private_temp_root())
+        .env("PATH", run.executable_search_path());
+    for (key, value) in run.environment_grants() {
+        cmd.env(key, value);
+    }
     Ok(cmd)
 }
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines)]
 fn linux_bubblewrap_command(
+    security: &crate::tools::security::ToolRunContext,
     profile: SandboxProfile,
     program: &OsStr,
     args: &[OsString],
@@ -391,7 +418,6 @@ fn linux_bubblewrap_command(
 ) -> Result<Command, String> {
     let cwd = canonical_working_directory(cwd)?;
     let backend = BWRAP_BACKEND.as_ref().map_err(Clone::clone)?;
-    let security = crate::tools::security::current_context()?;
     if !security.permits_read(&cwd) {
         return Err(format!(
             "Sandbox working directory '{}' is outside the immutable session capabilities rooted at '{}'",
@@ -535,12 +561,13 @@ fn linux_bubblewrap_command(
         project_root,
         host_home.as_deref(),
         profile.permits_project_path(),
+        security.executable_search_path(),
     );
     let private_temp = security.private_temp_root();
     cmd.arg("--chdir")
         .arg(&cwd)
         .args(["--setenv", "HOME"])
-        .arg(&sandbox_home)
+        .arg(private_temp)
         .args(["--setenv", "TMPDIR"])
         .arg(private_temp)
         .args(["--setenv", "TMP"])
@@ -1428,10 +1455,15 @@ fn hide_control_path(cmd: &mut Command, path: &Path) {
 }
 
 #[cfg(target_os = "linux")]
-fn sandbox_path(cwd: &Path, home: Option<&Path>, permit_project_path: bool) -> String {
+fn sandbox_path(
+    cwd: &Path,
+    home: Option<&Path>,
+    permit_project_path: bool,
+    executable_search_path: &OsStr,
+) -> String {
     let mut allowed = Vec::new();
     let cargo_bin = home.map(|path| path.join(".cargo/bin"));
-    for entry in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+    for entry in std::env::split_paths(executable_search_path) {
         let is_allowed = entry.starts_with("/usr")
             || entry.starts_with("/bin")
             || entry.starts_with("/sbin")
@@ -1466,10 +1498,28 @@ mod tests {
     fn sandbox_path_does_not_include_arbitrary_home_directories() {
         let cwd = Path::new("/home/user/project");
         let home = Path::new("/home/user");
-        let path = sandbox_path(cwd, Some(home), true);
+        let path = sandbox_path(
+            cwd,
+            Some(home),
+            true,
+            OsStr::new("/home/user/private/bin:/usr/bin"),
+        );
         assert!(!path
             .split(':')
             .any(|entry| entry == "/home/user/private/bin"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sandbox_path_uses_only_the_run_bound_search_path() {
+        let path = sandbox_path(
+            Path::new("/workspace/project"),
+            None,
+            true,
+            OsStr::new("/outside/bin:/workspace/project/bin:/usr/bin"),
+        );
+        let entries: Vec<&str> = path.split(':').collect();
+        assert_eq!(entries, ["/workspace/project/bin", "/usr/bin"]);
     }
 
     #[test]
@@ -1543,8 +1593,9 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn capability_roots_are_handed_to_bubblewrap_by_descriptor() {
-        let security = crate::tools::security::current_context().expect("security context");
+        let security = crate::tools::security::test_run_context();
         let command = sandboxed_process_command(
+            security,
             SandboxProfile::Shell,
             std::ffi::OsStr::new("/usr/bin/true"),
             &[],

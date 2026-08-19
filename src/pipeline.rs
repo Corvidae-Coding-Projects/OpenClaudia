@@ -696,6 +696,7 @@ pub fn resolve_headers(
 /// Parameters for [`run_turn`]. Bundled to keep the call-site argument count
 /// within clippy's `too_many_arguments` limit.
 pub struct RunTurnParams<'a> {
+    pub run_context: Arc<tools::ToolRunContext>,
     pub client: &'a reqwest::Client,
     pub endpoint: &'a str,
     pub headers: &'a [(String, String)],
@@ -993,6 +994,7 @@ async fn send_with_retry(
 /// Returns `Err` if the HTTP request itself fails (network error, etc.).
 pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     let RunTurnParams {
+        run_context,
         client,
         endpoint,
         headers,
@@ -1036,6 +1038,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     // For Google, handle non-streaming JSON response
     if provider == "google" {
         return handle_google_response(
+            run_context,
             response,
             memory_db,
             app_config,
@@ -1052,6 +1055,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
 
     if request_body.get("input").is_some() && request_body.get("messages").is_none() {
         return stream_responses_sse_response(SseStreamParams {
+            run_context,
             response,
             provider,
             memory_db,
@@ -1069,6 +1073,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
 
     // Stream SSE response (Anthropic / OpenAI format)
     stream_sse_response(SseStreamParams {
+        run_context,
         response,
         provider,
         memory_db,
@@ -1270,6 +1275,7 @@ fn extract_google_usage(gemini_json: &Value) -> (u64, u64) {
 /// Handle a non-streaming Google Gemini response.
 #[allow(clippy::too_many_arguments)]
 async fn handle_google_response(
+    run_context: Arc<tools::ToolRunContext>,
     response: reqwest::Response,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -1322,6 +1328,7 @@ async fn handle_google_response(
 
     // Execute tool calls if any
     let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+        run_context,
         &tool_calls,
         memory_db,
         app_config,
@@ -1432,6 +1439,7 @@ fn handle_sse_timeout(
 /// stages need; the param struct mirrors the established
 /// [`RunTurnParams`] pattern.
 struct SseStreamParams<'a> {
+    run_context: Arc<tools::ToolRunContext>,
     response: reqwest::Response,
     provider: &'a str,
     memory_db: Option<Arc<MemoryDb>>,
@@ -1447,6 +1455,7 @@ struct SseStreamParams<'a> {
 
 async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
+        run_context,
         response,
         provider,
         memory_db,
@@ -1513,6 +1522,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
     }
 
     finalize_sse_stream(SseFinalize {
+        run_context,
         provider,
         full_content,
         reasoning_content,
@@ -1579,6 +1589,7 @@ fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<
 /// through). The struct lets the finalize helper take ownership of the
 /// accumulators and the per-turn channels in a single move.
 struct SseFinalize<'a> {
+    run_context: Arc<tools::ToolRunContext>,
     provider: &'a str,
     full_content: String,
     reasoning_content: String,
@@ -1611,6 +1622,7 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
 
     // Execute tool calls if any
     let (tool_results, has_tools) = execute_tool_calls_for_tui(
+        f.run_context,
         &tool_calls,
         f.memory_db,
         f.app_config,
@@ -1888,6 +1900,7 @@ fn dispatch_responses_action(
 
 async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
+        run_context,
         response,
         memory_db,
         app_config,
@@ -1943,6 +1956,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
     }
 
     let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+        run_context,
         &tool_calls,
         memory_db,
         app_config,
@@ -2083,6 +2097,7 @@ fn policy_denied_tool_result(
 }
 
 async fn permission_request_hook_outcome(
+    run_context: &Arc<tools::ToolRunContext>,
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
@@ -2093,12 +2108,13 @@ async fn permission_request_hook_outcome(
     let engine = hook_engine?;
     let tool_input = serde_json::from_str::<Value>(arguments)
         .unwrap_or_else(|_| serde_json::json!({ "raw_arguments": arguments }));
-    let mut input = crate::hooks::HookInput::new(crate::hooks::HookEvent::PermissionRequest)
-        .with_tool(tool_name, tool_input)
-        .with_extra(
-            "tool_call_id",
-            serde_json::Value::String(tool_call_id.to_string()),
-        );
+    let mut input =
+        crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::PermissionRequest)
+            .with_tool(tool_name, tool_input)
+            .with_extra(
+                "tool_call_id",
+                serde_json::Value::String(tool_call_id.to_string()),
+            );
     if let Some(session_id) = session_id {
         input = input.with_session_id(session_id);
     }
@@ -2137,6 +2153,7 @@ async fn permission_request_hook_outcome(
 /// one that has to deliver the user's response).
 #[allow(clippy::too_many_arguments)]
 async fn check_tool_permission(
+    run_context: &Arc<tools::ToolRunContext>,
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
@@ -2178,6 +2195,7 @@ async fn check_tool_permission(
     }
 
     if let Some(outcome) = permission_request_hook_outcome(
+        run_context,
         tool_name,
         tool_call_id,
         arguments,
@@ -2302,6 +2320,7 @@ struct ToolPermissionDispatch {
 }
 
 struct SingleToolExecution<'a> {
+    run_context: Arc<tools::ToolRunContext>,
     tool_call: &'a ToolCall,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -2318,6 +2337,7 @@ struct SingleToolExecution<'a> {
 /// Returns `None` when the event channel is broken (caller should `break`).
 async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolResult> {
     let SingleToolExecution {
+        run_context,
         tool_call,
         memory_db,
         app_config,
@@ -2338,6 +2358,7 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
     let session_for_blocking = session_id.map(str::to_string);
     let policy_for_blocking = policy_enforcer;
     let task_mgr_for_blocking = task_mgr;
+    let run_context_for_blocking = Arc::clone(&run_context);
     let result = tokio::task::spawn_blocking(move || {
         // Lock the TaskManager only inside the blocking thread so we
         // don't hold the mutex across `.await`. Failure-mode parity with
@@ -2349,6 +2370,7 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::services::tool_executor::ToolExecutor::execute(
             crate::services::tool_executor::ToolExecutorRequest {
+                run_context: &run_context_for_blocking,
                 tool_call: &tool_call_clone,
                 memory_db: mem_db.as_deref(),
                 app_config: app_config_for_blocking.as_deref(),
@@ -2381,6 +2403,7 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
     }
     if let Some((engine, tool_input)) = hook_context {
         crate::services::tool_executor::ToolExecutor::fire_post_tool(
+            &run_context,
             engine,
             !result.is_error(),
             tool_name,
@@ -2568,14 +2591,22 @@ fn guardrail_path_for_tool_call(tool_name: &str, args: &Value) -> Option<String>
     }
 }
 
-fn guardrail_block_for_tool_call(tool_name: &str, args: &Value) -> Option<String> {
+fn guardrail_block_for_tool_call(
+    run: &crate::tools::ToolRunContext,
+    tool_name: &str,
+    args: &Value,
+) -> Option<String> {
     let path = guardrail_path_for_tool_call(tool_name, args)?;
-    crate::guardrails::check_file_access(&path).err()
+    crate::guardrails::check_file_access(run, &path).err()
 }
 
-fn emit_failed_quality_gate_events(tx: &mpsc::Sender<AppEvent>, session_id: Option<&str>) {
-    for gate in crate::guardrails::run_quality_gates() {
-        record_quality_gate_verification(session_id, &gate);
+fn emit_failed_quality_gate_events(
+    run_context: &Arc<tools::ToolRunContext>,
+    tx: &mpsc::Sender<AppEvent>,
+    session_id: Option<&str>,
+) {
+    for gate in crate::guardrails::run_quality_gates(run_context) {
+        record_quality_gate_verification(run_context, session_id, &gate);
         if gate.passed {
             continue;
         }
@@ -2594,6 +2625,7 @@ fn emit_failed_quality_gate_events(tx: &mpsc::Sender<AppEvent>, session_id: Opti
 }
 
 fn record_quality_gate_verification(
+    run: &crate::tools::ToolRunContext,
     session_id: Option<&str>,
     gate: &crate::guardrails::QualityCheckResult,
 ) {
@@ -2612,7 +2644,8 @@ fn record_quality_gate_verification(
             return;
         }
     };
-    if let Err(err) = crate::grounded_loop::append_quality_gate_observations(&mut ledger, gate) {
+    if let Err(err) = crate::grounded_loop::append_quality_gate_observations(run, &mut ledger, gate)
+    {
         tracing::warn!(
             session_id,
             gate = %gate.name,
@@ -2630,6 +2663,7 @@ fn record_quality_gate_verification(
 /// and a boolean indicating whether there were any tool calls.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_tool_calls_for_tui(
+    run_context: Arc<tools::ToolRunContext>,
     tool_calls: &[ToolCall],
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -2690,7 +2724,7 @@ async fn execute_tool_calls_for_tui(
 
         // Check read/search blast radius guardrails against the effective
         // filesystem path, not the raw JSON argument envelope.
-        if let Some(msg) = guardrail_block_for_tool_call(tool_name, &tool_args) {
+        if let Some(msg) = guardrail_block_for_tool_call(&run_context, tool_name, &tool_args) {
             send_event_or_break!(
                 tx,
                 AppEvent::ToolDone {
@@ -2724,7 +2758,11 @@ async fn execute_tool_calls_for_tui(
 
         if let Some(engine) = hook_engine.as_deref() {
             if let Err(blocked) = crate::services::tool_executor::ToolExecutor::run_pre_tool_use(
-                engine, session_id, tool_name, &tool_args,
+                &run_context,
+                engine,
+                session_id,
+                tool_name,
+                &tool_args,
             )
             .await
             {
@@ -2751,6 +2789,7 @@ async fn execute_tool_calls_for_tui(
         // Every call, including read-only calls, reaches the concrete manager
         // so explicit denials and host safety remain enforceable.
         let authorization = match check_tool_permission(
+            &run_context,
             tool_name,
             &tool_call.id,
             &tool_call.function.arguments,
@@ -2784,6 +2823,7 @@ async fn execute_tool_calls_for_tui(
         );
 
         let tool_result = execute_single_tool(SingleToolExecution {
+            run_context: Arc::clone(&run_context),
             tool_call,
             memory_db: memory_db.clone(),
             app_config: app_config.clone(),
@@ -2810,7 +2850,7 @@ async fn execute_tool_calls_for_tui(
         }
     }
 
-    emit_failed_quality_gate_events(tx, session_id);
+    emit_failed_quality_gate_events(&run_context, tx, session_id);
 
     (results, true)
 }
@@ -2943,6 +2983,10 @@ pub fn build_assistant_message_with_tools(
 mod tests {
     use super::*;
 
+    fn test_run() -> Arc<tools::ToolRunContext> {
+        Arc::clone(tools::security::test_run_context())
+    }
+
     fn typed_test_blocks(prefix: &str, suffix: &str) -> crate::prompt::SystemPromptBlocks {
         let mut items = Vec::new();
         if !prefix.is_empty() {
@@ -2984,8 +3028,9 @@ mod tests {
             required: true,
         };
 
-        let ids = crate::grounded_loop::append_quality_gate_observations(&mut ledger, &gate)
-            .expect("append");
+        let ids =
+            crate::grounded_loop::append_quality_gate_observations(&test_run(), &mut ledger, &gate)
+                .expect("append");
         let command_observation = ledger.get(ids.command).expect("command observation");
         assert_eq!(
             command_observation.authority,
@@ -3126,6 +3171,7 @@ mod tests {
         let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            test_run(),
             &[tool_call],
             None,
             None,
@@ -3221,6 +3267,7 @@ mod tests {
             async move {
                 let tool_calls = vec![tool_call];
                 execute_tool_calls_for_tui(
+                    test_run(),
                     &tool_calls,
                     None,
                     None,
@@ -3303,6 +3350,7 @@ mod tests {
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            test_run(),
             &[tool_call],
             None,
             None,
@@ -3377,6 +3425,7 @@ mod tests {
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            test_run(),
             &[tool_call],
             None,
             None,
@@ -3473,6 +3522,7 @@ mod tests {
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            test_run(),
             &[tool_call],
             None,
             None,
@@ -3538,6 +3588,7 @@ mod tests {
         let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            test_run(),
             &[tool_call],
             None,
             None,
@@ -4512,6 +4563,7 @@ mod tests {
         let (tx, _rx) = std_mpsc::channel::<AppEvent>();
 
         let outcome = check_tool_permission(
+            &test_run(),
             "read_file",
             "call_read",
             r#"{"path":"/etc/shadow"}"#,
@@ -4533,6 +4585,7 @@ mod tests {
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
 
         let outcome = check_tool_permission(
+            &test_run(),
             "unknown_from_model",
             "call_unknown",
             "{}",
@@ -4578,6 +4631,7 @@ mod tests {
 
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_1",
             "{\"command\":\"ls\"}",
@@ -4620,6 +4674,7 @@ mod tests {
         );
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "web_fetch",
             "call_web",
             r#"{"url":"https://docs.python.org/3/"}"#,
@@ -4660,6 +4715,7 @@ mod tests {
         }];
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_git",
             r#"{"command":"git status --short"}"#,
@@ -4708,6 +4764,7 @@ mod tests {
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
 
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_hook",
             r#"{"command":"printf permission-hook-test"}"#,
@@ -4787,6 +4844,7 @@ mod tests {
 
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_1",
             "{\"command\":\"cargo test\"}",

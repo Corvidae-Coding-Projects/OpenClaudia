@@ -46,7 +46,6 @@ pub use validate::{
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
@@ -402,40 +401,6 @@ pub struct PluginMcpServer {
     pub always_load: Option<bool>,
 }
 
-fn process_env_lookup(name: &str) -> Result<Option<String>, String> {
-    let grants = env::var_os("OPENCLAUDIA_MCP_ENV_GRANTS")
-        .map(|value| {
-            value
-                .to_str()
-                .ok_or_else(|| "OPENCLAUDIA_MCP_ENV_GRANTS contains non-Unicode data".to_string())
-                .and_then(|value| {
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|entry| !entry.is_empty())
-                        .try_fold(std::collections::HashSet::new(), |mut grants, entry| {
-                            validate_mcp_env_var_name(entry)?;
-                            grants.insert(entry.to_string());
-                            Ok(grants)
-                        })
-                })
-        })
-        .transpose()?
-        .unwrap_or_default();
-    if !grants.contains(name) {
-        // An ungranted variable behaves as absent, allowing `${VAR:-safe}`
-        // defaults without exposing ambient host state.
-        return Ok(None);
-    }
-    match env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(format!("environment variable {name} is not valid UTF-8"))
-        }
-    }
-}
-
 fn validate_mcp_env_var_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     match chars.next() {
@@ -554,13 +519,6 @@ where
         timeout: config.timeout,
         always_load: config.always_load,
     })
-}
-
-fn resolved_mcp_server_from_config(
-    name: &str,
-    config: &McpServerConfig,
-) -> Result<PluginMcpServer, String> {
-    resolved_mcp_server_from_config_with(name, config, &process_env_lookup)
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,10 +1341,30 @@ impl Plugin {
     /// Get all resolved MCP servers
     #[must_use]
     pub fn resolved_mcp_servers(&self) -> Vec<PluginMcpServer> {
+        self.resolved_mcp_servers_with_lookup(&|_| Ok(None))
+    }
+
+    /// Resolve MCP configuration only from one immutable run environment
+    /// snapshot. Missing names may still use manifest defaults, but can never
+    /// fall back to the mutable host process environment.
+    #[must_use]
+    pub fn resolved_mcp_servers_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Vec<PluginMcpServer> {
+        self.resolved_mcp_servers_with_lookup(&|name| {
+            Ok(run.mcp_environment_grants().get(name).cloned())
+        })
+    }
+
+    fn resolved_mcp_servers_with_lookup<F>(&self, lookup: &F) -> Vec<PluginMcpServer>
+    where
+        F: Fn(&str) -> Result<Option<String>, String>,
+    {
         self.mcp_configs
             .iter()
-            .filter_map(
-                |(name, config)| match resolved_mcp_server_from_config(name, config) {
+            .filter_map(|(name, config)| {
+                match resolved_mcp_server_from_config_with(name, config, lookup) {
                     Ok(server) => Some(server),
                     Err(error) => {
                         warn!(
@@ -1397,8 +1375,8 @@ impl Plugin {
                         );
                         None
                     }
-                },
-            )
+                }
+            })
             .collect()
     }
 }
@@ -1916,6 +1894,52 @@ mod tests {
         let expanded = expand_mcp_env_vars_with(&template, &lookup).unwrap();
 
         assert_eq!(expanded, "secret:fallback:secret:");
+    }
+
+    #[test]
+    fn mcp_resolution_uses_each_run_snapshot_without_ambient_lookup() {
+        let root = TempDir::new().unwrap();
+        create_cc_plugin(root.path(), "snapshot-mcp");
+        let plugin_dir = root.path().join("snapshot-mcp");
+        fs::write(
+            plugin_dir.join(".mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "snapshot": {
+                        "transport": "stdio",
+                        "command": "runner",
+                        "env": {"SNAPSHOT_TOKEN": "${S019_MCP_TOKEN}"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        let build_run = |value: &str| {
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .mcp_environment_grants(HashMap::from([(
+                    "S019_MCP_TOKEN".to_string(),
+                    value.to_string(),
+                )]))
+                .environment_grants(HashMap::new())
+                .process(false)
+                .network(false)
+                .secrets(true)
+                .provider("plugin-mcp-snapshot-test")
+                .build()
+                .unwrap()
+        };
+        let run_a = build_run("run-a");
+        let run_b = build_run("run-b");
+
+        let resolved_a = plugin.resolved_mcp_servers_for_run(&run_a);
+        let resolved_b = plugin.resolved_mcp_servers_for_run(&run_b);
+        assert_eq!(resolved_a[0].env["SNAPSHOT_TOKEN"], "run-a");
+        assert_eq!(resolved_b[0].env["SNAPSHOT_TOKEN"], "run-b");
     }
 
     #[test]

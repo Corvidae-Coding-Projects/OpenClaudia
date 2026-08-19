@@ -37,7 +37,7 @@ fn write_read_edit_read_cross_tool_flow() {
     // Covers Behavior 6 (write with parent-dir create), Behavior 1 (read with
     // offset/limit), and Behavior 4 (edit with old_string present/absent).
     let _lock = READ_TRACKER_LOCK.lock().expect("lock");
-    reset_read_tracker();
+    reset_read_tracker(support::shared_run_context());
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let sub = dir.path().join("subdir").join("notes.txt");
@@ -50,14 +50,14 @@ fn write_read_edit_read_cross_tool_flow() {
             "content": "line one\nline two\nline three\n"
         }),
     );
-    let wr = execute_tool(&write_call);
+    let wr = execute_tool(support::shared_run_context(), &write_call);
     assert!(!wr.is_error(), "write_file must succeed: {}", wr.content());
     assert!(sub.exists(), "file created on disk");
     assert!(sub.parent().expect("parent").is_dir(), "parent dir created");
 
     // ---- Step 2: read without offset returns all lines (Behavior 1) ----------
     let read_all_call = make_call("read_file", &json!({ "path": sub.to_string_lossy() }));
-    let ra = execute_tool(&read_all_call);
+    let ra = execute_tool(support::shared_run_context(), &read_all_call);
     assert!(!ra.is_error(), "read_file must succeed: {}", ra.content());
     assert!(ra.content().contains("line one"), "all lines present");
     assert!(ra.content().contains("line three"), "all lines present");
@@ -71,7 +71,7 @@ fn write_read_edit_read_cross_tool_flow() {
             "limit": 1
         }),
     );
-    let rs = execute_tool(&read_slice_call);
+    let rs = execute_tool(support::shared_run_context(), &read_slice_call);
     assert!(
         !rs.is_error(),
         "read with offset must succeed: {}",
@@ -95,7 +95,7 @@ fn write_read_edit_read_cross_tool_flow() {
             "new_string": "LINE TWO (edited)"
         }),
     );
-    let eo = execute_tool(&edit_ok_call);
+    let eo = execute_tool(support::shared_run_context(), &edit_ok_call);
     assert!(!eo.is_error(), "edit_file must succeed: {}", eo.content());
 
     // ---- Step 5: verify the edit landed on disk -----------------------------
@@ -105,7 +105,7 @@ fn write_read_edit_read_cross_tool_flow() {
 
     // ---- Step 6: re-read and confirm the new content (Behavior 1 round-trip)
     let read_final = make_call("read_file", &json!({ "path": sub.to_string_lossy() }));
-    let rf = execute_tool(&read_final);
+    let rf = execute_tool(support::shared_run_context(), &read_final);
     assert!(!rf.is_error(), "re-read must succeed: {}", rf.content());
     assert!(
         rf.content().contains("LINE TWO (edited)"),
@@ -121,7 +121,7 @@ fn write_read_edit_read_cross_tool_flow() {
             "new_string": "whatever"
         }),
     );
-    let eb = execute_tool(&edit_bad_call);
+    let eb = execute_tool(support::shared_run_context(), &edit_bad_call);
     assert!(
         eb.is_error(),
         "edit with missing old_string must error: {}",
@@ -163,7 +163,7 @@ fn write_creates_deeply_nested_parent_directories() {
             "content": "deep"
         }),
     );
-    let r = execute_tool(&call);
+    let r = execute_tool(support::shared_run_context(), &call);
     assert!(!r.is_error(), "deep write must succeed: {}", r.content());
     assert_eq!(fs::read_to_string(&deep).expect("read"), "deep");
 }
@@ -187,7 +187,7 @@ fn read_offset_beyond_eof_is_non_error() {
             "offset": 999
         }),
     );
-    let r = execute_tool(&call);
+    let r = execute_tool(support::shared_run_context(), &call);
     assert!(
         !r.is_error(),
         "offset > EOF must NOT be an error in OC: {}",
@@ -216,7 +216,7 @@ fn read_large_file_truncated_as_non_error() {
     fs::write(&path, &content).expect("write");
 
     let call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
-    let r = execute_tool(&call);
+    let r = execute_tool(support::shared_run_context(), &call);
     assert!(
         !r.is_error(),
         "OC large-file truncation is NOT an error (CC parity gap, Behavior 8): {}",
@@ -242,7 +242,7 @@ fn read_image_extensions_dispatched_as_image() {
         let path = dir.path().join(format!("img.{ext}"));
         fs::write(&path, b"\x00").expect("write");
         let call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
-        let r = execute_tool(&call);
+        let r = execute_tool(support::shared_run_context(), &call);
         // OC returns a plain-text block with base64 (Behavior 2 OC path)
         assert!(
             !r.is_error(),
@@ -275,7 +275,7 @@ fn glob_tool_finds_matching_files_through_execute_tool() {
             "path": dir.path().to_string_lossy()
         }),
     );
-    let r = execute_tool(&call);
+    let r = execute_tool(support::shared_run_context(), &call);
     assert!(
         !r.is_error(),
         "glob must be implemented and succeed through execute_tool: {}",
@@ -311,7 +311,7 @@ fn grep_tool_finds_matching_lines_through_execute_tool() {
             "path": dir.path().to_string_lossy()
         }),
     );
-    let r = execute_tool(&call);
+    let r = execute_tool(support::shared_run_context(), &call);
     assert!(
         !r.is_error(),
         "grep must be implemented and succeed through execute_tool: {}",
@@ -332,7 +332,7 @@ fn grep_tool_finds_matching_lines_through_execute_tool() {
 #[test]
 fn edit_replace_all_multi_occurrence_replaces_every_match() {
     let _lock = READ_TRACKER_LOCK.lock().expect("lock");
-    reset_read_tracker();
+    reset_read_tracker(support::shared_run_context());
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("multi.txt");
@@ -340,7 +340,7 @@ fn edit_replace_all_multi_occurrence_replaces_every_match() {
 
     // Read first (enforced by OC)
     let read_call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
-    let _ = execute_tool(&read_call);
+    let _ = execute_tool(support::shared_run_context(), &read_call);
 
     let edit_call = make_call(
         "edit_file",
@@ -351,7 +351,7 @@ fn edit_replace_all_multi_occurrence_replaces_every_match() {
             "replace_all": true
         }),
     );
-    let r = execute_tool(&edit_call);
+    let r = execute_tool(support::shared_run_context(), &edit_call);
     assert!(
         !r.is_error(),
         "replace_all multi-occurrence edit must succeed: {}",
@@ -365,3 +365,4 @@ fn edit_replace_all_multi_occurrence_replaces_every_match() {
     let disk = fs::read_to_string(&path).expect("read back");
     assert_eq!(disk, "qux bar qux baz qux\n");
 }
+mod support;
