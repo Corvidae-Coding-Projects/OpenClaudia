@@ -1,6 +1,6 @@
 {
   "next_display_id": 1032,
-  "next_comment_id": 823,
+  "next_comment_id": 824,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11400,11 +11400,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T22:55:50.010022472Z",
-      "updated_at": "2026-08-19T23:25:04.036769264Z",
+      "updated_at": "2026-08-19T23:25:22.899416057Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "15c6ba96-4456-4076-bf1a-6a313b1cef2c": {
+          "display_id": 823,
+          "author": "6Vw9",
+          "content": "Commit 4591ce1 refactor(security): require typed Bash effects. Verification: complete serial workspace suite passed; native all-target/all-feature check and strict Clippy passed; focused 7-test adversarial classification and 11-test Linux sandbox suites passed; Windows library cross-check built with unrelated warning tracked as #1031. Source/test digest: 1700eb04920f15b8e4c633e6f54d781fd2998443e1e9fedc1974085b37e13caa. Follow-up #1030 tracks the dormant compatibility API; VDD queued for S-088.",
+          "created_at": "2026-08-19T23:25:22.896993947Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKOYcbBlFH4mazPyRAlOz3i2aDu/n9nNm5w87Y9tPjbtvbTzX7Mna+uDHegfgr9y3J9K+fVOwgU0uJ+eobxyICA=="
+        },
         "23e2b3fb-5dfc-4862-8085-6f332378ce46": {
           "display_id": 820,
           "author": "6Vw9",
@@ -24581,11 +24590,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 252,
       "timestamp": "2026-08-19T23:25:04.036769264Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 253,
+      "timestamp": "2026-08-19T23:25:22.899416057Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:25:04.036769264Z",
+    "timestamp": "2026-08-19T23:25:22.899416057Z",
     "agent_id": "6Vw9",
-    "agent_seq": 252
+    "agent_seq": 253
   }
 }
