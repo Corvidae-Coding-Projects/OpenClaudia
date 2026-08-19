@@ -12993,11 +12993,12 @@
       "uuid": "99cc9588-0963-48eb-a6f4-8c7ef4ea1832",
       "display_id": 1005,
       "title": "S-016: require effect classification for every tool (F-001, F-052)",
-      "status": "open",
+      "status": "closed",
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-18T22:08:13.492515592Z",
-      "updated_at": "2026-08-19T01:18:36.793201550Z",
+      "updated_at": "2026-08-19T01:18:41.463463276Z",
+      "closed_at": "2026-08-19T01:18:41.463458525Z",
       "labels": [
         "remediation"
       ],
@@ -22002,11 +22003,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 36,
       "timestamp": "2026-08-19T01:18:36.793201550Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 37,
+      "timestamp": "2026-08-19T01:18:41.463463276Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T01:18:36.793201550Z",
+    "timestamp": "2026-08-19T01:18:41.463463276Z",
     "agent_id": "6Vw9",
-    "agent_seq": 36
+    "agent_seq": 37
   }
 }
