@@ -1,6 +1,6 @@
 {
   "next_display_id": 1014,
-  "next_comment_id": 718,
+  "next_comment_id": 719,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3802,7 +3802,18 @@
       "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T03:37:01.888506992Z",
-      "updated_at": "2026-08-19T03:37:01.888506992Z"
+      "updated_at": "2026-08-19T03:57:15.411908652Z",
+      "comments": {
+        "628b0aa8-7651-4685-a339-a084c959498e": {
+          "display_id": 718,
+          "author": "6Vw9",
+          "content": "Resolved after contract review: empty/null/non-string web_search targets now explicitly assert mandatory fail-closed effect-classification denial, while a one-character string still reaches the tool's minimum-length validator. web_integration passes 29 tests with 2 environment-dependent browser tests ignored, and the complete suite passes.",
+          "created_at": "2026-08-19T03:57:15.408978950Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAX+lvsCFLrzt0/FyD6pRfnnl5Z6M5PtCyXy0PUaTu7TwReMvOCEr6CSdX9xr1+P5e5Aw+RVvUoVRGMrs+v8QADQ=="
+        }
+      }
     },
     "24c0bc1c-c63f-48c6-ac5f-ccaac2d81cd3": {
       "uuid": "24c0bc1c-c63f-48c6-ac5f-ccaac2d81cd3",
@@ -22332,10 +22343,15 @@
       "agent_id": "6Vw9",
       "agent_seq": 61,
       "timestamp": "2026-08-19T03:57:11.530884149Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 61,
+      "timestamp": "2026-08-19T03:57:15.411908652Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T03:57:11.530884149Z",
+    "timestamp": "2026-08-19T03:57:15.411908652Z",
     "agent_id": "6Vw9",
     "agent_seq": 61
   }
