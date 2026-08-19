@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1022,
+  "next_display_id": 1023,
   "next_comment_id": 742,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -67,6 +67,7 @@
     "0fc8318a-d946-4c84-8c9c-dbceea3f9f97": 236,
     "0fcc0911-8074-4271-9e8c-10aeb29ddfbb": 89,
     "0ff708eb-bd2d-4060-8d1e-6d181bc7084c": 383,
+    "105b2370-e9f2-4b9e-8be3-b3ad5daae403": 1022,
     "109d20eb-bfd8-409f-926d-dc4bb5da4719": 40,
     "10c2bf7d-b5c3-4907-83b1-41c194fbd771": 622,
     "10e36fa2-7ca9-4b75-a487-0f43e7da228a": 205,
@@ -2480,6 +2481,17 @@
         "qa-review-2026-04",
         "qa-seam-vdd"
       ]
+    },
+    "105b2370-e9f2-4b9e-8be3-b3ad5daae403": {
+      "uuid": "105b2370-e9f2-4b9e-8be3-b3ad5daae403",
+      "display_id": 1022,
+      "title": "Process-tree termination accepts Unix sentinel PID 0",
+      "description": "QA of S-018 found that terminate_process_tree(0) and terminate_sandbox_process_tree(0) accepted an arbitrary u32 and could pass PID 0 to kill(2), which targets the caller's process group on Unix. Refuse PID 0 before any platform-specific signaling and retain a regression test for both public helpers.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T06:55:01.892682555Z",
+      "updated_at": "2026-08-19T06:55:01.892682555Z"
     },
     "109d20eb-bfd8-409f-926d-dc4bb5da4719": {
       "uuid": "109d20eb-bfd8-409f-926d-dc4bb5da4719",
@@ -23012,11 +23024,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 122,
       "timestamp": "2026-08-19T06:16:14.477614361Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 123,
+      "timestamp": "2026-08-19T06:55:01.892682555Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T06:16:14.477614361Z",
+    "timestamp": "2026-08-19T06:55:01.892682555Z",
     "agent_id": "6Vw9",
-    "agent_seq": 122
+    "agent_seq": 123
   }
 }
