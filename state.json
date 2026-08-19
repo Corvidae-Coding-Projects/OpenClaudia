@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1020,
+  "next_display_id": 1021,
   "next_comment_id": 740,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -417,6 +417,7 @@
     "71f73fde-8acb-4db6-b71c-759106cbb7c9": 638,
     "72265fc4-50b8-4038-8785-d223b2ac1569": 888,
     "72456e4b-c65b-4bab-a590-026dce5ef6c5": 174,
+    "72d111a6-ef81-4821-be15-71fb92bcd054": 1020,
     "72d3cf2b-955d-4410-8c56-a896d263b039": 853,
     "72ec875c-cb8a-4a99-b0af-8acbb9479203": 161,
     "73cf3f0d-747e-4d22-9e97-5fef1973dd15": 607,
@@ -10455,6 +10456,17 @@
       "labels": [
         "enhancement"
       ]
+    },
+    "72d111a6-ef81-4821-be15-71fb92bcd054": {
+      "uuid": "72d111a6-ef81-4821-be15-71fb92bcd054",
+      "display_id": 1020,
+      "title": "Bash timeout waits for descendant-held pipes and weak test masks delay",
+      "description": "Observed during serial S-018 verification on 2026-08-19: CARGO_BUILD_JOBS=1 cargo test --test integration_tests bash_tools:: -- --nocapture --test-threads=1 took 62.47s. The test_bash_timeout invocation supplies timeout=1000 for command 'sleep 60', but the case remained at 'test_bash_timeout ...' for about 60s before passing. Its assertion accepts any nonempty result, so it does not enforce the documented 1-second timeout. Inspect synchronous Bash timeout/termination and stdout/stderr reader lifetime; add a bounded elapsed-time assertion with enough CI tolerance and prove the process tree/pipes are reaped promptly on supported platforms. Discovered while working #1019; intentionally not folded into S-018.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T05:27:21.421113555Z",
+      "updated_at": "2026-08-19T05:27:21.421113555Z"
     },
     "72d3cf2b-955d-4410-8c56-a896d263b039": {
       "uuid": "72d3cf2b-955d-4410-8c56-a896d263b039",
@@ -22922,11 +22934,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 114,
       "timestamp": "2026-08-19T04:48:17.177505469Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 115,
+      "timestamp": "2026-08-19T05:27:21.421113555Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T04:48:17.177505469Z",
+    "timestamp": "2026-08-19T05:27:21.421113555Z",
     "agent_id": "6Vw9",
-    "agent_seq": 114
+    "agent_seq": 115
   }
 }
