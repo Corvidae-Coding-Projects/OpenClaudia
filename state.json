@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 783,
+  "next_comment_id": 784,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:13:09.689968311Z",
+      "updated_at": "2026-08-19T12:18:00.091681963Z",
       "labels": [
         "remediation"
       ],
@@ -15538,6 +15538,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfv7OSpVpzLsK6WdWgL9TIIBbaNuwmxOpJzZf8M2ZRAtqc/Mg3wo9coepgcEWi8r2eY9iQqI/oUJWTUbSFa6EBQ=="
+        },
+        "600fa8d0-9966-4ccf-8316-3655431fd31a": {
+          "display_id": 783,
+          "author": "6Vw9",
+          "content": "[action] S-019 audit also found enter_plan_mode's claimed subagent gate was a test-only thread-local that production never set. Removed the ambient AgentContextGuard/in_agent_task API; registry dispatch now authorizes only ActorRole::Frontend from the immutable run descriptor. Replaced misleading RAII tests with real concurrent frontend/worker dispatch coverage; focused unit and integration suites pass serially.",
+          "created_at": "2026-08-19T12:18:00.089062220Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1VMOJx6tgvSw9DzlipjJumZKWM41EV7d2XfCxXAAYWOfIMlOSLlt4zQVCSaAfgOuHKmnPS9l7TSamuIX2eEdCw=="
         },
         "630bb243-7224-4169-bbfc-2c0458b22726": {
           "display_id": 775,
@@ -23793,11 +23802,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 187,
       "timestamp": "2026-08-19T12:13:09.689968311Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 188,
+      "timestamp": "2026-08-19T12:18:00.091681963Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:13:09.689968311Z",
+    "timestamp": "2026-08-19T12:18:00.091681963Z",
     "agent_id": "6Vw9",
-    "agent_seq": 187
+    "agent_seq": 188
   }
 }
