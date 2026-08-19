@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1012,
+  "next_display_id": 1013,
   "next_comment_id": 712,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -608,6 +608,7 @@
     "a92d521c-59f2-4f4b-94f9-431c61630450": 876,
     "a95e7c46-fefa-417d-8d8a-450481b615fa": 645,
     "a962240b-0eb5-41ef-bca4-0ebcc1d735b7": 679,
+    "a97cce6f-2710-47db-9133-b016655fcba9": 1012,
     "a9aa50b8-c9f5-4f2a-86e0-b5c322367b45": 681,
     "a9f719b7-4b6c-4b50-bb2d-735a32642c48": 376,
     "a9f82755-47d3-49ac-a877-089c10975789": 975,
@@ -14661,6 +14662,18 @@
         }
       }
     },
+    "a97cce6f-2710-47db-9133-b016655fcba9": {
+      "uuid": "a97cce6f-2710-47db-9133-b016655fcba9",
+      "display_id": 1012,
+      "title": "ACP sandbox cancellation can leave daemonized descendants alive",
+      "description": "Full serial all-feature suite intermittently proves that ACP cancellation returns success after terminating the registered bubblewrap root while a daemonized descendant survives long enough to mutate the project. Investigate and fix process-tree teardown; do not weaken the safety assertion.",
+      "status": "open",
+      "priority": "critical",
+      "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T03:27:59.048005058Z",
+      "updated_at": "2026-08-19T03:27:59.048005058Z"
+    },
     "a9aa50b8-c9f5-4f2a-86e0-b5c322367b45": {
       "uuid": "a9aa50b8-c9f5-4f2a-86e0-b5c322367b45",
       "display_id": 681,
@@ -22175,11 +22188,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 49,
       "timestamp": "2026-08-19T03:07:18.480747958Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 50,
+      "timestamp": "2026-08-19T03:27:59.048005058Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T03:07:18.480747958Z",
+    "timestamp": "2026-08-19T03:27:59.048005058Z",
     "agent_id": "6Vw9",
-    "agent_seq": 49
+    "agent_seq": 50
   }
 }
