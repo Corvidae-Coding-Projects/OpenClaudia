@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 776,
+  "next_comment_id": 777,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15466,7 +15466,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T11:28:30.235275845Z",
+      "updated_at": "2026-08-19T11:42:07.600096455Z",
       "labels": [
         "remediation"
       ],
@@ -15524,6 +15524,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJvXNDO9nKdC2fxEOvZXnsHJdUAZYch1POls8xFYZxJz3L6/DxVVj2odGgHtRtF0fYjC2CetrER5dVtg2aC3KCQ=="
+        },
+        "6b730829-229d-45a4-b50c-81f6084d9735": {
+          "display_id": 776,
+          "author": "6Vw9",
+          "content": "[action] S-019 run-bound executable resolution centralized in ToolRunContext; Bash, PDF, worktree, subagent, LSP, MCP, hooks, TUI shell, and quality gates no longer consult mutable ambient PATH. Serial all-target/all-feature check passes after the repair.",
+          "created_at": "2026-08-19T11:42:07.597560088Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1UBD30VBcJ4lY5pUkYMr6iOcDlPKRLs1knHNGcVLJGFZFgCVtBGPmGzuUBhu9O3DTtuvX/Gxy9JHWebi4wRfDw=="
         },
         "6dbdf2f5-5f21-484d-a17c-6e92f786601e": {
           "display_id": 762,
@@ -23682,11 +23691,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 179,
       "timestamp": "2026-08-19T11:28:30.235275845Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 180,
+      "timestamp": "2026-08-19T11:42:07.600096455Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T11:28:30.235275845Z",
+    "timestamp": "2026-08-19T11:42:07.600096455Z",
     "agent_id": "6Vw9",
-    "agent_seq": 179
+    "agent_seq": 180
   }
 }
