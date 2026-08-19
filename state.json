@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 787,
+  "next_comment_id": 788,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15471,7 +15471,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T12:39:47.892978559Z",
+      "updated_at": "2026-08-19T12:43:08.312170191Z",
       "labels": [
         "remediation"
       ],
@@ -15493,6 +15493,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALcQkL0qmcwW6Lk79ojvDZ+BajpyGP8B9Arm4lVC6xBUz6uhkdJdI0gmUOYNiXFlR4CrGBSRDeEymmozt8IHlAw=="
+        },
+        "2ce1590b-30dc-4799-9435-f833f1fe098e": {
+          "display_id": 787,
+          "author": "6Vw9",
+          "content": "Full serial suite later found todo_write_dispatch_validation_e2e minted a fresh run per call while asserting write/read persistence. Bound that binary to one explicit shared test run; 25 dispatch tests and 14 run-isolation tests pass. Production remains exactly keyed by immutable run session ID.",
+          "created_at": "2026-08-19T12:43:08.309772257Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXTHuJ0vmmxA5uux+Ek30F6ZmA2JAsE7Lbidvy+SJOT1PV5p3R4CYZWjGlhy1uCthLtR5goHXWN3A3aQ96GekCg=="
         },
         "34cbcdf8-5127-43e9-b6bf-1a52a71c52ea": {
           "display_id": 769,
@@ -23849,11 +23858,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 191,
       "timestamp": "2026-08-19T12:39:47.892978559Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 192,
+      "timestamp": "2026-08-19T12:43:08.312170191Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T12:39:47.892978559Z",
+    "timestamp": "2026-08-19T12:43:08.312170191Z",
     "agent_id": "6Vw9",
-    "agent_seq": 191
+    "agent_seq": 192
   }
 }
