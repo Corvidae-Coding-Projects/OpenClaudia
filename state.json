@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1014,
+  "next_display_id": 1015,
   "next_comment_id": 722,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -308,6 +308,7 @@
     "56f05f88-270b-405d-9eed-d1d1dec78ede": 506,
     "5761f3f4-1da4-4206-bd19-84815ace19ef": 455,
     "57dfbcfb-77ca-41e7-8e38-af1369afc75f": 292,
+    "585676a3-5b3e-4925-8f2c-2d4a652d2259": 1014,
     "588eade6-3433-4e57-83e4-50304fc73a46": 118,
     "58cd7cd1-df98-4d06-8413-f4e8449df4ba": 355,
     "59280dc0-d2a2-481c-ac27-c6f55de02c0d": 206,
@@ -7816,6 +7817,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABADJV+hKdezv5g0i7/nVimWGkgnqEsHB62KXFq8I85n8Eez95xlvzqjMknFcWPNrD0425i45o89M7pSwnQaorZAw=="
         }
       }
+    },
+    "585676a3-5b3e-4925-8f2c-2d4a652d2259": {
+      "uuid": "585676a3-5b3e-4925-8f2c-2d4a652d2259",
+      "display_id": 1014,
+      "title": "ACP delegated tools bypass exact permit enforcement after S-017 gate removal",
+      "description": "Final pre-commit trace found execute_tool_via_acp removed acp_permission_gate, while read_file/write_file/edit_file/list_files/glob/grep still dispatch through ACP-specific handlers rather than ToolExecutor. Those paths receive neither an exact ExecutionPermit nor check_and_record_tool, so effectful delegated calls can bypass permission enforcement and successful delegated calls do not consume enterprise caps. Add a single call-bound authorization path for all ACP tools, consume it exactly once at the actual direct/local dispatch boundary, record caps only after permission succeeds, and add adversarial direct-handler tests.",
+      "status": "open",
+      "priority": "critical",
+      "parent_uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T04:02:07.465322183Z",
+      "updated_at": "2026-08-19T04:02:07.465322183Z"
     },
     "588eade6-3433-4e57-83e4-50304fc73a46": {
       "uuid": "588eade6-3433-4e57-83e4-50304fc73a46",
@@ -22411,11 +22424,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 67,
       "timestamp": "2026-08-19T03:57:42.882356973Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 68,
+      "timestamp": "2026-08-19T04:02:07.465322183Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T03:57:42.882356973Z",
+    "timestamp": "2026-08-19T04:02:07.465322183Z",
     "agent_id": "6Vw9",
-    "agent_seq": 67
+    "agent_seq": 68
   }
 }
