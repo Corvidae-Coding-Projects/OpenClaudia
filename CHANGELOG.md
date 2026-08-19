@@ -10,6 +10,13 @@ the original record.
 
 ## [Unreleased]
 
+### Security
+- S-018: Make host safety non-bypassable (#1019)
+
+### Fixed
+- Process-tree termination accepts Unix sentinel PID 0 (#1022)
+- ACP cancellation can leave daemonized sandbox descendants alive under suite load (#1021)
+
 ### Removed
 
 - Remove the legacy filesystem rule injector from every Rust frontend,
