@@ -1,6 +1,6 @@
 {
   "next_display_id": 1008,
-  "next_comment_id": 710,
+  "next_comment_id": 711,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8182,13 +8182,24 @@
       "priority": "critical",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T01:19:03.818814081Z",
-      "updated_at": "2026-08-19T01:19:17.162503289Z",
+      "updated_at": "2026-08-19T01:28:34.829223120Z",
       "labels": [
         "remediation"
       ],
       "related": [
         "99cc9588-0963-48eb-a6f4-8c7ef4ea1832"
-      ]
+      ],
+      "comments": {
+        "b333f51b-f9c5-434a-a034-2f8b19376ad7": {
+          "display_id": 710,
+          "author": "6Vw9",
+          "content": "[action] S-017 architecture fixed: exact normalized approval records mint opaque one-use executor permits; deny checks precede receipt/default; trusted versioned store; session documents carry no authority",
+          "created_at": "2026-08-19T01:28:34.825855896Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPMIZZuXQPvZTZyWj+kKxN71kAGRY3Hz1TCpVByg5lwnSypQ+GNsYGBAeARwpMCMn3MpqJMbgcg8eHOEwu1SnDw=="
+        }
+      }
     },
     "5cbba6c5-dcd3-4f6d-bb29-4608f462249f": {
       "uuid": "5cbba6c5-dcd3-4f6d-bb29-4608f462249f",
@@ -22074,11 +22085,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 43,
       "timestamp": "2026-08-19T01:19:44.666899151Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 44,
+      "timestamp": "2026-08-19T01:28:34.829223120Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T01:19:44.666899151Z",
+    "timestamp": "2026-08-19T01:28:34.829223120Z",
     "agent_id": "6Vw9",
-    "agent_seq": 43
+    "agent_seq": 44
   }
 }
