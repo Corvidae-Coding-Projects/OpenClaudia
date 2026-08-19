@@ -1,6 +1,6 @@
 {
   "next_display_id": 1026,
-  "next_comment_id": 774,
+  "next_comment_id": 775,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15466,7 +15466,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T07:27:28.408171487Z",
-      "updated_at": "2026-08-19T11:23:23.542030923Z",
+      "updated_at": "2026-08-19T11:28:25.743848176Z",
       "labels": [
         "remediation"
       ],
@@ -15497,6 +15497,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA4qll6MjW2ulnkpq0Bi2ljitmpt/zmoXZG88g5Ucpi56DZ8NIL8N5uUSrjeE4EUS4fU0Hcx/G0BcskiTWHb5uBw=="
+        },
+        "458c15e4-ab05-48be-bbf9-5a4d82fdf30b": {
+          "display_id": 774,
+          "author": "6Vw9",
+          "content": "[action] S-019 hardening: serial all-target/all-feature check exposed and fixed a stale hook shell test call. Read-only contexts now reject all caller-supplied writable roots; additional roots canonicalize before containment; executable PATH is captured per run; cancellation uses exact run trees; PDF/model-hook/process resource checks fail closed; lifecycle tests now use leak-safe cleanup and prove last-Arc read-tracker cleanup plus run-bound PATH.",
+          "created_at": "2026-08-19T11:28:25.741359311Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+MlTB5dY2EkWwjAW68tB7VLDDkA27rAbRv7cw36/q1GeLV5UWVMfgce72ajKQjS/AaN85LP0pZwub40Aez71BA=="
         },
         "635cba37-82df-4e97-9f5b-474da397b156": {
           "display_id": 773,
@@ -23654,11 +23663,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 177,
       "timestamp": "2026-08-19T11:23:23.542030923Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 178,
+      "timestamp": "2026-08-19T11:28:25.743848176Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T11:23:23.542030923Z",
+    "timestamp": "2026-08-19T11:28:25.743848176Z",
     "agent_id": "6Vw9",
-    "agent_seq": 177
+    "agent_seq": 178
   }
 }
