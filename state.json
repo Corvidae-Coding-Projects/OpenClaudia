@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1021,
+  "next_display_id": 1022,
   "next_comment_id": 741,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -515,6 +515,7 @@
     "8fa2ca49-31ff-4f86-ad82-75c4574a81f5": 234,
     "8fea630d-d6df-40f0-b116-52e19a99a11e": 18,
     "903a7eb1-bcd0-46cf-958c-961b16740a8d": 827,
+    "9056ad0c-5006-44eb-b9da-af4952319f14": 1021,
     "90ccf966-61b6-4f94-9cb8-bb4394ffe719": 66,
     "90ed3939-45f3-4472-a731-124ea9c2e9cc": 793,
     "91788026-8231-4aa6-a997-9e15199b9183": 7,
@@ -12627,6 +12628,17 @@
         }
       }
     },
+    "9056ad0c-5006-44eb-b9da-af4952319f14": {
+      "uuid": "9056ad0c-5006-44eb-b9da-af4952319f14",
+      "display_id": 1021,
+      "title": "ACP cancellation can leave daemonized sandbox descendants alive under suite load",
+      "description": "The serial all-features suite on S-018 reproduced src/acp.rs::acp_foreground_bash_cancellation_terminates_descendants_promptly: ACP reported one sandbox process tree terminated, but the daemonized child wrote its marker after cancellation. Fix the process-tree lifecycle at the root and retain the adversarial test; do not weaken timing or assertions.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-19T06:16:01.622580114Z",
+      "updated_at": "2026-08-19T06:16:01.622580114Z"
+    },
     "90ccf966-61b6-4f94-9cb8-bb4394ffe719": {
       "uuid": "90ccf966-61b6-4f94-9cb8-bb4394ffe719",
       "display_id": 66,
@@ -22967,11 +22979,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 118,
       "timestamp": "2026-08-19T05:35:06.923623054Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 119,
+      "timestamp": "2026-08-19T06:16:01.622580114Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T05:35:06.923623054Z",
+    "timestamp": "2026-08-19T06:16:01.622580114Z",
     "agent_id": "6Vw9",
-    "agent_seq": 118
+    "agent_seq": 119
   }
 }
