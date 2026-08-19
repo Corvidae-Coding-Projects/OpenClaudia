@@ -1,6 +1,6 @@
 {
   "next_display_id": 1032,
-  "next_comment_id": 827,
+  "next_comment_id": 828,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11400,7 +11400,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T22:55:50.010022472Z",
-      "updated_at": "2026-08-19T23:26:22.136594847Z",
+      "updated_at": "2026-08-19T23:26:49.973531243Z",
       "labels": [
         "remediation"
       ],
@@ -11470,6 +11470,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALOnK+jjcTXdYsmr+RFpiPVWJuczNX/pK6HPdy0rMuOLO7go1ui8P/ZUb6uCp7+oglW8tJpunYpH3b2+XTY1FBQ=="
+        },
+        "97d68846-6639-45c9-bd26-f680260760c3": {
+          "display_id": 827,
+          "author": "6Vw9",
+          "content": "Blocked handoff after three publication audits: verified local commit 4591ce1c9615f305927ae757a4a23e276cd7b61d remains one ahead of remote 9bc74ceb1404f0d23f44dfd0f032510617449eed. Repository policy permanently blocks agent Git writes. Human action required: git push origin agent/refactor-agent-system-remediation. Keep #1029 open; after publication, confirm PR #66 remains draft, monitor the new hosted checks, then close this issue.",
+          "created_at": "2026-08-19T23:26:49.970863057Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAF48dQT5/53EgtH/z5UmfdcgOHUKdPITas3PfqytL4e1q5roTDUZwNteagzqXoGF/VKNBaP0GTJzNavmO9+wSBA=="
         },
         "bad0f2be-d4f9-4784-a42d-aff24e56977e": {
           "display_id": 826,
@@ -24640,11 +24649,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 256,
       "timestamp": "2026-08-19T23:26:22.136594847Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 257,
+      "timestamp": "2026-08-19T23:26:49.973531243Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:26:22.136594847Z",
+    "timestamp": "2026-08-19T23:26:49.973531243Z",
     "agent_id": "6Vw9",
-    "agent_seq": 256
+    "agent_seq": 257
   }
 }
