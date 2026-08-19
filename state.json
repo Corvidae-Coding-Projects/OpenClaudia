@@ -1,6 +1,6 @@
 {
   "next_display_id": 1029,
-  "next_comment_id": 817,
+  "next_comment_id": 818,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20474,11 +20474,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T14:50:39.964999817Z",
-      "updated_at": "2026-08-19T18:44:23.375583098Z",
+      "updated_at": "2026-08-19T18:58:14.487989761Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "11938486-eb0b-4757-b968-7d7cb51f1aeb": {
+          "display_id": 817,
+          "author": "6Vw9",
+          "content": "S019-G2 publication and hosted verification are complete. Commit 9bc74ceb1404f0d23f44dfd0f032510617449eed matches local HEAD, origin, and open draft PR #66. Sandbox security run 32288944565 completed SUCCESS: Linux passed format, strict all-target/all-feature Clippy, all-target serial tests, sandbox_escape_e2e, and session_filesystem_capabilities_e2e; macOS and Windows each passed all-target check plus sandbox_platform_fail_closed_e2e. Worktree is clean and rule-loader inputs remain zero-byte. The Node 20 checkout warning is separately tracked by open issue #1028.",
+          "created_at": "2026-08-19T18:58:14.484980720Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXcdrwworBHTzdMgxiT2mfDDSUzv3+4kFPyaW+k2c0AGHYsslDtcDBDhUzTGoq9PJJIkV3j2xW3qDXOZneChTCw=="
+        },
         "27b4ee32-c5c0-478f-ba78-d2bfd3bc1199": {
           "display_id": 810,
           "author": "6Vw9",
@@ -24400,11 +24409,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 236,
       "timestamp": "2026-08-19T18:44:23.375583098Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 237,
+      "timestamp": "2026-08-19T18:58:14.487989761Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T18:44:23.375583098Z",
+    "timestamp": "2026-08-19T18:58:14.487989761Z",
     "agent_id": "6Vw9",
-    "agent_seq": 236
+    "agent_seq": 237
   }
 }
