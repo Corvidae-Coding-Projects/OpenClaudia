@@ -1,6 +1,6 @@
 {
   "next_display_id": 1046,
-  "next_comment_id": 907,
+  "next_comment_id": 908,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6355,11 +6355,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:09:55.024359Z",
-      "updated_at": "2026-08-20T21:21:45.946220203Z",
+      "updated_at": "2026-08-20T21:22:00.472059103Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "047c0948-5954-4200-89f1-591a91274dd5": {
+          "display_id": 907,
+          "author": "6Vw9",
+          "content": "Reopened only to satisfy the repository's active-issue commit hook after verified implementation closure; no new scope. The completed S031-G1 artifact and result evidence are unchanged.",
+          "created_at": "2026-08-20T21:22:00.469606006Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdRGHFwiroRdySdTCEZy5doSzc+6c7Zlipbqhak+69ALrrARQT/Bl9pScEE4eYmV8soZLkEZhT9K/58Mh8PzUDA=="
+        },
         "1c318c3c-dc2b-4c49-a82e-fd6d76380c3e": {
           "display_id": 900,
           "author": "6Vw9",
@@ -26604,11 +26613,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 452,
       "timestamp": "2026-08-20T21:21:52.731198588Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 453,
+      "timestamp": "2026-08-20T21:22:00.472059103Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T21:21:52.731198588Z",
+    "timestamp": "2026-08-20T21:22:00.472059103Z",
     "agent_id": "6Vw9",
-    "agent_seq": 452
+    "agent_seq": 453
   }
 }
