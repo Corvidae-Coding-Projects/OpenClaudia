@@ -1,6 +1,6 @@
 {
   "next_display_id": 1055,
-  "next_comment_id": 924,
+  "next_comment_id": 925,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13164,7 +13164,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:09:48.149662321Z",
-      "updated_at": "2026-08-20T22:12:13.969541887Z",
+      "updated_at": "2026-08-20T22:13:44.787039099Z",
       "labels": [
         "orchestration"
       ],
@@ -13192,6 +13192,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "f1a1bcdd-f13b-47ce-8fc6-a3d6c1174e95": {
+          "display_id": 924,
+          "author": "6Vw9",
+          "content": "Launch preflight: clean common baseline 9194ac26 equals origin; expected generated hook override traced for Claude Edit and Codex apply_patch at 0.39s each with no cargo exec; rules present and zero-byte. #1008 canonical commit/push precondition superseded by the user's accepted local mitigation and external Crosslink ownership. Administrative duplicate child issues #1052-#1054 were deleted; canonical children are #1049 S-001, #1050 S-004, #1051 S-005.",
+          "created_at": "2026-08-20T22:13:44.784595364Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6ImrJTYZQQ7NVKqGOYaGn4BfTkxWWcKpS1r1CaphFiF+3YpxI2UhFKmGUY1s1GMI4SCcoFixPMve0u4hvcKAAQ=="
         }
       }
     },
@@ -27160,11 +27169,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 504,
       "timestamp": "2026-08-20T22:13:36.038716507Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 505,
+      "timestamp": "2026-08-20T22:13:44.787039099Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:13:36.038716507Z",
+    "timestamp": "2026-08-20T22:13:44.787039099Z",
     "agent_id": "6Vw9",
-    "agent_seq": 504
+    "agent_seq": 505
   }
 }
