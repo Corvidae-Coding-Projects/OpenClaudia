@@ -12630,11 +12630,12 @@
       "display_id": 1035,
       "title": "Commit restored Crosslink changelog output",
       "description": "Commit only the machine-reconstructed CHANGELOG.md after #1034 closes normally and appends its own entry. Verify exact Crosslink lifecycle ordering/category/multiplicity and Markdown diff hygiene, then close this bookkeeping issue with --no-changelog to avoid recursively creating another uncommitted entry.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T00:06:32.037875612Z",
-      "updated_at": "2026-08-20T00:08:17.389220100Z",
+      "updated_at": "2026-08-20T00:08:26.280271117Z",
+      "closed_at": "2026-08-20T00:08:26.280269777Z",
       "labels": [
         "docs"
       ],
@@ -25040,11 +25041,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 298,
       "timestamp": "2026-08-20T00:08:17.389220100Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 299,
+      "timestamp": "2026-08-20T00:08:26.280271117Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T00:08:17.389220100Z",
+    "timestamp": "2026-08-20T00:08:26.280271117Z",
     "agent_id": "6Vw9",
-    "agent_seq": 298
+    "agent_seq": 299
   }
 }
