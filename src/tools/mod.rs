@@ -34,6 +34,7 @@ pub mod effect;
 pub use cron::{execute_cron_create, execute_cron_delete, execute_cron_list};
 mod file;
 pub(crate) use file::open_capability_regular_read;
+pub(crate) use file::resolve_path as resolve_capability_path;
 pub use file::{
     create_capability_text_file, create_run_control_directory, create_run_control_text_file,
     initialize_project_for_run, read_capability_text_attachment, read_run_control_text,
@@ -316,6 +317,36 @@ fn dispatch_registered_with_permit(
     ctx: &mut ToolContext<'_>,
     permit: &registry::ToolDispatchPermit,
 ) -> ToolResult {
+    let resolved = match effect::resolve_for_call(
+        &tool_call.function.name,
+        &Value::Object(
+            args.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                error.reason(),
+                ToolRetryability::Never,
+            );
+        }
+    };
+    let mut guardrail_reservation = match crate::guardrails::reserve_tool_effect(ctx.run, &resolved)
+    {
+        Ok(reservation) => reservation,
+        Err(reason) => {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by blast radius guardrails: {reason}"),
+                ToolRetryability::Never,
+            );
+        }
+    };
     let handler_result = registry::registry()
         .dispatch(tool_call.function.name.as_str(), args, ctx, permit)
         .unwrap_or_else(|| {
@@ -325,7 +356,11 @@ fn dispatch_registered_with_permit(
                 ToolRetryability::Never,
             ))
         });
-    ToolResult::bind(tool_call, &tool_call.function.name, handler_result)
+    let result = ToolResult::bind(tool_call, &tool_call.function.name, handler_result);
+    if !result.is_error() {
+        guardrail_reservation.commit();
+    }
+    result
 }
 
 fn dispatch_registered_after_authorization(
@@ -456,11 +491,49 @@ fn execute_tool_full_after_authorization(
         Err(result) => return *result,
     };
 
+    let resolved = match effect::resolve_for_call(
+        &tool_call.function.name,
+        &Value::Object(
+            args.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                error.reason(),
+                ToolRetryability::Never,
+            );
+        }
+    };
+
     // Check for subagent tools first (they need config). Each match arm
     // produces the inner `(content, is_error)` pair; the `ToolResult`
     // wrapping happens *after* the match so there is a single return point
     // (crosslink #491 — previously the default arm returned mid-match,
     // bypassing the wrapper and creating asymmetric control flow).
+    let mut guardrail_reservation = if matches!(
+        tool_call.function.name.as_str(),
+        "task" | "agent_output" | "task_stop"
+    ) {
+        match crate::guardrails::reserve_tool_effect(run, &resolved) {
+            Ok(reservation) => Some(reservation),
+            Err(reason) => {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::PolicyDenied,
+                    format!("Blocked by blast radius guardrails: {reason}"),
+                    ToolRetryability::Never,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     let handler_result = match tool_call.function.name.as_str() {
         "task" => run
             .require(ToolResource::Network)
@@ -482,18 +555,11 @@ fn execute_tool_full_after_authorization(
                                 ToolRetryability::Never,
                             ))
                         },
-                        |config| {
-                            let (content, is_error) =
-                                subagent::execute_task_tool(run, &args, config);
-                            ToolHandlerResult::legacy(content, is_error)
-                        },
+                        |config| subagent::execute_task_tool_typed(run, &args, config),
                     )
                 },
             ),
-        "agent_output" => {
-            let (content, is_error) = subagent::execute_agent_output_tool(run, &args);
-            ToolHandlerResult::legacy(content, is_error)
-        }
+        "agent_output" => subagent::execute_agent_output_tool_typed(run, &args),
         "task_stop" => {
             let (content, is_error) = subagent::execute_task_stop_tool(run, &args);
             ToolHandlerResult::legacy(content, is_error)
@@ -509,7 +575,13 @@ fn execute_tool_full_after_authorization(
         }
     };
 
-    ToolResult::bind(tool_call, &tool_call.function.name, handler_result)
+    let result = ToolResult::bind(tool_call, &tool_call.function.name, handler_result);
+    if !result.is_error() {
+        if let Some(reservation) = guardrail_reservation.as_mut() {
+            reservation.commit();
+        }
+    }
+    result
 }
 
 /// Get all tool definitions, optionally including subagent tools

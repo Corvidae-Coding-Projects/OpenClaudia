@@ -1,5 +1,6 @@
 use super::{resolve_open_path, resolve_path, READ_TRACKER};
 use crate::tools::args::{ToolArgError, ToolArgs as _};
+use crate::tools::{ToolFailureCode, ToolHandlerResult, ToolRetryability};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -44,6 +45,11 @@ fn find_cell_by_id(cells: &[Value], cell_id: &str) -> Option<usize> {
 /// `Result<T, ToolFailure>` so the entry point can `?`-bubble errors and keep
 /// its body linear (validate → resolve → dispatch → persist).
 type ToolFailure = (String, bool);
+
+enum NotebookWriteOutcome {
+    Complete,
+    Partial(String),
+}
 
 /// Edit operation on a notebook cell. crosslink #974.
 ///
@@ -251,8 +257,6 @@ fn preflight_and_open(
         "editing it",
     )
     .map_err(|msg| (msg, true))?;
-
-    crate::guardrails::check_file_access(run, &canonical_path).map_err(|msg| (msg, true))?;
 
     // Open once through the capability-root descriptor. `openat2` rejects
     // symlinks in every component, not just the final notebook name.
@@ -514,28 +518,65 @@ fn write_notebook(
     handle: &mut NotebookHandle,
     notebook: &Value,
     original_content: &str,
-) -> Result<(), ToolFailure> {
+) -> Result<NotebookWriteOutcome, ToolFailure> {
     let pretty = serde_json::to_string_pretty(notebook)
         .map_err(|e| (format!("Failed to serialize notebook: {e}"), true))?;
 
-    let old_lines = u32::try_from(original_content.lines().count()).unwrap_or(u32::MAX);
-    let new_lines = u32::try_from(pretty.lines().count()).unwrap_or(u32::MAX);
+    let (lines_added, lines_removed) = super::changed_line_counts(original_content, &pretty);
+    let mut line_reservation = crate::guardrails::reserve_changed_lines(
+        run,
+        u64::from(lines_added) + u64::from(lines_removed),
+    )
+    .map_err(|message| (message, true))?;
 
-    handle
+    let write_result = handle
         .file
         .seek(SeekFrom::Start(0))
         .and_then(|_| handle.file.set_len(0))
-        .and_then(|()| handle.file.write_all(pretty.as_bytes()))
-        .map_err(|e| {
-            (
-                format!("Failed to write notebook '{}': {e}", handle.canonical_path),
-                true,
-            )
-        })?;
+        .and_then(|()| handle.file.write_all(pretty.as_bytes()));
+    if let Err(error) = write_result {
+        let failure_message = format!(
+            "Failed to write notebook '{}': {error}",
+            handle.canonical_path
+        );
+        let mut actual_content = String::new();
+        if handle
+            .file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| handle.file.read_to_string(&mut actual_content))
+            .is_ok()
+        {
+            let (actual_added, actual_removed) =
+                super::changed_line_counts(original_content, &actual_content);
+            line_reservation
+                .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
+            crate::guardrails::record_file_modification(
+                run,
+                &handle.canonical_path,
+                actual_added,
+                actual_removed,
+            );
+            super::record_active_diff_observation(
+                run,
+                &handle.canonical_path,
+                original_content,
+                &actual_content,
+            );
+        } else {
+            line_reservation.commit();
+        }
+        return Ok(NotebookWriteOutcome::Partial(failure_message));
+    }
 
-    crate::guardrails::record_file_modification(run, &handle.canonical_path, new_lines, old_lines);
+    line_reservation.commit();
+    crate::guardrails::record_file_modification(
+        run,
+        &handle.canonical_path,
+        lines_added,
+        lines_removed,
+    );
     super::record_active_diff_observation(run, &handle.canonical_path, original_content, &pretty);
-    Ok(())
+    Ok(NotebookWriteOutcome::Complete)
 }
 
 /// Step 7: format the success summary. The summary index falls back to
@@ -588,40 +629,63 @@ fn format_success(
 /// Body is the linear pipeline: validate → preflight → read → resolve
 /// → dispatch → persist → summarize. Each step is a private helper above.
 /// Refactored from a 200+-line god function per crosslink #681.
+#[cfg(test)]
 pub fn execute_notebook_edit(
     run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
     args: &HashMap<String, Value>,
 ) -> (String, bool) {
+    execute_notebook_edit_typed(run, args).into_legacy()
+}
+
+pub fn execute_notebook_edit_typed(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> ToolHandlerResult {
     let parsed = match parse_args(args) {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => return notebook_error(e.0),
     };
     let mut handle = match preflight_and_open(run, &parsed.raw_path) {
         Ok(h) => h,
-        Err(e) => return e,
+        Err(e) => return notebook_error(e.0),
     };
     let (mut notebook, original_content) = match read_and_parse(&mut handle) {
         Ok(t) => t,
-        Err(e) => return e,
+        Err(e) => return notebook_error(e.0),
     };
     let Some(cells) = notebook.get_mut("cells").and_then(|c| c.as_array_mut()) else {
-        return ("Notebook has no 'cells' array.".to_string(), true);
+        return notebook_error("Notebook has no 'cells' array.".to_string());
     };
     let locator = match resolve_locator(&parsed, cells) {
         Ok(l) => l,
-        Err(e) => return e,
+        Err(e) => return notebook_error(e.0),
     };
     let outcome = match dispatch_edit(cells, &locator, &parsed) {
         Ok(o) => o,
-        Err(e) => return e,
+        Err(e) => return notebook_error(e.0),
     };
-    if let Err(e) = write_notebook(run, &mut handle, &notebook, &original_content) {
-        return e;
+    match write_notebook(run, &mut handle, &notebook, &original_content) {
+        Ok(NotebookWriteOutcome::Complete) => ToolHandlerResult::success_text(format_success(
+            run, &handle, &notebook, &locator, &outcome, &parsed,
+        )),
+        Ok(NotebookWriteOutcome::Partial(message)) => ToolHandlerResult::partial_text(
+            message.clone(),
+            vec![crate::tools::ToolFailure::new(
+                ToolFailureCode::External,
+                message,
+                ToolRetryability::Unknown,
+            )],
+        ),
+        Err(error) => notebook_error(error.0),
     }
-    (
-        format_success(run, &handle, &notebook, &locator, &outcome, &parsed),
-        false,
-    )
+}
+
+fn notebook_error(message: String) -> ToolHandlerResult {
+    ToolHandlerResult::error(crate::tools::ToolFailure::new(
+        ToolFailureCode::Legacy,
+        message,
+        ToolRetryability::Unknown,
+    ))
 }
 
 #[cfg(test)]

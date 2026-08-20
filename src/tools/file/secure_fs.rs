@@ -394,7 +394,7 @@ fn reject_writable_hardlink(_file: &File, _path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn is_not_found_message(error: &str) -> bool {
+pub(super) fn is_not_found_message(error: &str) -> bool {
     error.starts_with("NOT_FOUND:")
 }
 

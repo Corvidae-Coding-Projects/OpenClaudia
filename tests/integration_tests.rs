@@ -867,11 +867,11 @@ mod bash_tools {
 
         let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        // A non-zero exit must be flagged as an error
+        // The process started, so a non-zero exit is a typed partial outcome:
+        // the generic Bash executor cannot prove that no effect occurred.
         assert!(
-            result.is_error(),
-            "Non-zero exit code should set is_error=true, got content: {}",
-            result.content()
+            result.is_partial(),
+            "Non-zero exit after process start must preserve a partial receipt, got: {result:?}"
         );
     }
 

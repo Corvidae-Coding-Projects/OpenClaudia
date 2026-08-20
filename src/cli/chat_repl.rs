@@ -539,7 +539,7 @@ impl ChatRepl {
                 .provider(config.proxy.target.clone())
                 .build()
                 .map_err(anyhow::Error::msg)?;
-        guardrails::configure(&run_context, &config.guardrails);
+        guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
         let permission_mgr =
             init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);
         let plugin_manager = init_plugin_manager(run_context.project_root());
@@ -925,6 +925,7 @@ impl ChatRepl {
         let next_audit = openclaudia::session::AuditLogger::new(&loaded.id())
             .map_err(|error| format!("cannot initialize session audit log: {error}"))?;
         let permission_bypass = self.chat_session.permission_bypass_enabled();
+        guardrails::configure(&next_run, &self.config.guardrails)?;
 
         self.clear_transient_prompt_options();
         tools::retire_run(&self.run_context);
@@ -937,7 +938,6 @@ impl ChatRepl {
         self.audit_logger = next_audit;
         self.current_task_obs = None;
         self.permissions = openclaudia::permissions::LocalApprovalCache::for_run(&self.run_context);
-        guardrails::configure(&self.run_context, &self.config.guardrails);
         Ok(())
     }
 
@@ -1753,7 +1753,6 @@ impl ChatRepl {
         let mut iteration: u32 = 0;
         while !state.tool_calls.is_empty() && (max_iterations == 0 || iteration < max_iterations) {
             iteration += 1;
-            guardrails::reset_turn(&self.run_context);
             self.gemini_record_model_turn(
                 &state.full_content,
                 &state.tool_calls,
@@ -2610,7 +2609,6 @@ impl ChatRepl {
                 break;
             }
             proxy_iteration += 1;
-            guardrails::reset_turn(&self.run_context);
 
             let Some(tool_calls) =
                 self.collect_anthropic_iteration(&*anthropic_accumulator, &mut executed_tool_sigs)
@@ -2996,7 +2994,6 @@ impl ChatRepl {
             && (max_iterations == 0 || iteration < max_iterations)
         {
             iteration += 1;
-            guardrails::reset_turn(&self.run_context);
             let tool_calls = tool_accumulator.finalize();
 
             if iteration > 1

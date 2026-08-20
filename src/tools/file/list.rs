@@ -25,6 +25,14 @@ pub fn execute_list_files(
         Err(e) => return (e, true),
     };
 
+    let mut resource_batch = match crate::guardrails::begin_path_resource_batch(run) {
+        Ok(batch) => batch,
+        Err(error) => return (format!("Blocked by blast radius guardrails: {error}"), true),
+    };
+    if let Err(error) = resource_batch.check_scope(run, &path) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
+
     match secure_fs::open_directory(run, &path).and_then(|directory| directory.entries()) {
         Ok(entries) => {
             // (is_dir, name) tuples — sort puts every dir before every
@@ -40,6 +48,15 @@ pub fn execute_list_files(
             for entry in entries {
                 let name = entry.name.to_string_lossy().to_string();
                 let is_dir = entry.kind == secure_fs::SecureFileType::Directory;
+                let entry_path = path.join(&entry.name);
+                let admission = if is_dir {
+                    resource_batch.check_disclosed_scope(run, &entry_path)
+                } else {
+                    resource_batch.reserve_file(run, &entry_path)
+                };
+                if let Err(error) = admission {
+                    return (format!("Blocked by blast radius guardrails: {error}"), true);
+                }
                 items.push((is_dir, name));
             }
             // Primary key: dirs before files (so invert is_dir).
@@ -49,6 +66,7 @@ pub fn execute_list_files(
                 .into_iter()
                 .map(|(is_dir, name)| if is_dir { format!("{name}/") } else { name })
                 .collect();
+            resource_batch.commit();
             (rendered.join("\n"), false)
         }
         Err(e) => (

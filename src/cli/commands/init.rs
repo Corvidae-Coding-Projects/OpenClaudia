@@ -222,7 +222,10 @@ session:
 #       - ".env"
 #       - "secrets/**"
 #       - "*.pem"
-#     max_files_per_turn: 10   # 0 = unlimited
+#     max_files_per_run: 10
+#     max_lines_per_run: 500
+#     max_tool_calls_per_run: 200
+#     max_mutations_per_run: 50
 #   diff_monitor:
 #     enabled: true
 #     max_lines_changed: 500   # 0 = unlimited

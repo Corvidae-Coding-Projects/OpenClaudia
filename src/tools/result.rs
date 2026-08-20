@@ -389,6 +389,25 @@ impl ToolHandlerResult {
         }
     }
 
+    /// Report an operation that produced a real effect but did not complete.
+    #[must_use]
+    pub fn partial_text(text: impl Into<String>, failures: Vec<ToolFailure>) -> Self {
+        Self {
+            outcome: ToolOutcome::Partial {
+                content: ToolContent::text(text.into()),
+                failures,
+                continuation: None,
+            },
+            artifacts: Vec::new(),
+            attachments: Vec::new(),
+            observations: Vec::new(),
+            display: ToolDisplay::Auto,
+            follow_up: ToolFollowUp::None,
+            usage: ToolUsage::default(),
+            sensitivity: ToolSensitivity::Workspace,
+        }
+    }
+
     #[must_use]
     pub fn legacy(content: String, is_error: bool) -> Self {
         if is_error {
@@ -435,6 +454,16 @@ impl ToolHandlerResult {
                     }
                     super::args::ToolError::External(_) => {
                         (ToolFailureCode::External, ToolRetryability::Unknown)
+                    }
+                    super::args::ToolError::PartialExternal(message) => {
+                        return Self::partial_text(
+                            message.clone(),
+                            vec![ToolFailure::new(
+                                ToolFailureCode::External,
+                                message.clone(),
+                                ToolRetryability::Unknown,
+                            )],
+                        );
                     }
                     super::args::ToolError::Other(_) => {
                         (ToolFailureCode::Internal, ToolRetryability::Unknown)

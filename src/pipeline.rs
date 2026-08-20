@@ -2571,35 +2571,6 @@ pub fn normalize_message_tool_arguments_for_history(messages: &mut [Value]) -> u
     changed
 }
 
-/// Return the effective path that the pipeline should pre-check with
-/// guardrails before read/search tool execution.
-///
-/// Write-like tools intentionally return `None` here because their handlers
-/// already call `guardrails::check_file_access` at the mutation boundary.
-fn guardrail_path_for_tool_call(tool_name: &str, args: &Value) -> Option<String> {
-    let args = args.as_object()?;
-
-    match tool_name {
-        "read_file" => args.get("path").and_then(Value::as_str).map(str::to_string),
-        "list_files" | "glob" | "grep" => Some(
-            args.get("path")
-                .and_then(Value::as_str)
-                .unwrap_or(".")
-                .to_string(),
-        ),
-        _ => None,
-    }
-}
-
-fn guardrail_block_for_tool_call(
-    run: &crate::tools::ToolRunContext,
-    tool_name: &str,
-    args: &Value,
-) -> Option<String> {
-    let path = guardrail_path_for_tool_call(tool_name, args)?;
-    crate::guardrails::check_file_access(run, &path).err()
-}
-
 fn emit_failed_quality_gate_events(
     run_context: &Arc<tools::ToolRunContext>,
     tx: &mpsc::Sender<AppEvent>,
@@ -2721,28 +2692,6 @@ async fn execute_tool_calls_for_tui(
                 Err(()) => break,
             },
         };
-
-        // Check read/search blast radius guardrails against the effective
-        // filesystem path, not the raw JSON argument envelope.
-        if let Some(msg) = guardrail_block_for_tool_call(&run_context, tool_name, &tool_args) {
-            send_event_or_break!(
-                tx,
-                AppEvent::ToolDone {
-                    name: tool_name.clone(),
-                    success: false,
-                    content: format!("Blocked by guardrails: {msg}"),
-                }
-            );
-            let result_json = serde_json::json!({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": format!("[BLOCKED] {msg}"),
-                "is_error": true
-            });
-            observe_tool_result_json(session_id, tool_name, &result_json);
-            results.push(result_json);
-            continue;
-        }
 
         if let Err(err) = crate::services::tool_executor::ToolExecutor::check_policy_before_prompt(
             policy_enforcer.as_deref(),
@@ -3071,64 +3020,6 @@ mod tests {
             .any(|finding| finding.contains("quality gate 'unit' failed")));
         assert!(findings.iter().any(|finding| finding.contains("stdout:")));
         assert!(findings.iter().any(|finding| finding.contains("stderr:")));
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_uses_actual_read_path() {
-        let args = serde_json::json!({"path":"src/main.rs"});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("read_file", &args),
-            Some("src/main.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_defaults_read_search_paths() {
-        let args = serde_json::json!({});
-
-        for tool_name in ["list_files", "glob", "grep"] {
-            assert_eq!(
-                guardrail_path_for_tool_call(tool_name, &args),
-                Some(".".to_string()),
-                "{tool_name} should precheck its executor's default path"
-            );
-        }
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_matches_optional_path_type_semantics() {
-        let args = serde_json::json!({"path":42});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("list_files", &args),
-            Some(".".to_string())
-        );
-        assert_eq!(guardrail_path_for_tool_call("read_file", &args), None);
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_skips_non_object_arguments() {
-        let args = serde_json::json!([]);
-
-        assert_eq!(guardrail_path_for_tool_call("list_files", &args), None);
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_skips_write_tools_checked_by_handlers() {
-        let write_args = serde_json::json!({"path":"src/main.rs","content":"new"});
-        let edit_args = serde_json::json!({"path":"src/main.rs"});
-        let notebook_args = serde_json::json!({"notebook_path":"nb.ipynb"});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("write_file", &write_args),
-            None
-        );
-        assert_eq!(guardrail_path_for_tool_call("edit_file", &edit_args), None);
-        assert_eq!(
-            guardrail_path_for_tool_call("notebook_edit", &notebook_args),
-            None
-        );
     }
 
     #[test]

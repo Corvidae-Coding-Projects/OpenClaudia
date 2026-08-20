@@ -1,7 +1,7 @@
 //! Guardrails module for coding safety enforcement
 //!
 //! Provides three guardrail mechanisms:
-//! - **Blast radius limiting**: constrains file/scope access per request
+//! - **Blast radius limiting**: atomically constrains effects/resources per run
 //! - **Diff size monitoring**: flags when changes exceed expected scope
 //! - **Quality gates**: automated code quality checks
 //!
@@ -9,8 +9,8 @@
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -102,14 +102,22 @@ fn config_has_active_guards(config: &GuardrailsConfig) -> bool {
 /// If the state is poisoned, this function does NOT reconfigure — the
 /// poisoned state is sticky on purpose so a panic during a write-policy
 /// evaluation cannot be papered over by a subsequent `configure()`.
-pub fn configure(run: &crate::tools::ToolRunContext, config: &GuardrailsConfig) {
-    // Build the new state OUTSIDE the lock. `GuardrailsEngine::from_config`
+///
+/// # Errors
+///
+/// Returns an error when policy compilation fails, the registry is poisoned,
+/// or policy is already immutably bound to this exact run generation.
+pub fn configure(
+    run: &crate::tools::ToolRunContext,
+    config: &GuardrailsConfig,
+) -> Result<(), String> {
+    // Build the new state OUTSIDE the lock. `GuardrailsEngine::try_from_config`
     // walks regex / glob compilation and emits structured `info!` events;
     // none of that needs the guardrails mutex held. Tightening the critical
     // section to the swap also lets concurrent `check_file_access` calls
     // make progress while a startup `configure` is mid-flight.
+    let engine = GuardrailsEngine::try_from_config(config)?;
     let (new_state, log_msg) = if config_has_active_guards(config) {
-        let engine = GuardrailsEngine::from_config(config);
         (
             GuardrailsState::Enabled(Box::new(engine)),
             "Guardrails engine configured",
@@ -125,7 +133,14 @@ pub fn configure(run: &crate::tools::ToolRunContext, config: &GuardrailsConfig) 
         let mut guard = lock_or_poison();
         if guard.poisoned {
             error!("Refusing to (re)configure guardrails: state is poisoned");
-            return;
+            return Err(POISON_ERR.to_string());
+        }
+        if guard.runs.contains_key(&run_key(run)) {
+            return Err(format!(
+                "Guardrails are already bound to run {} generation {}; derive a new run generation to change policy",
+                run.run_id(),
+                run.generation()
+            ));
         }
         guard.runs.insert(run_key(run), new_state);
         // Drop the guard at the end of this block (before the `info!`
@@ -133,6 +148,7 @@ pub fn configure(run: &crate::tools::ToolRunContext, config: &GuardrailsConfig) 
         // log line. Per `clippy::significant_drop_tightening`.
     }
     info!("{}", log_msg);
+    Ok(())
 }
 
 /// Check if a file path is allowed by blast radius rules.
@@ -147,22 +163,432 @@ pub fn configure(run: &crate::tools::ToolRunContext, config: &GuardrailsConfig) 
 /// nothing to enforce. This is the QA-mandated separation between
 /// "no policy" (allow) and "cannot evaluate policy" (deny).
 ///
-/// This function is the security boundary for file-write dispatch and
-/// MUST fail closed on poison. See crosslink #749.
+/// Compatibility boundary for host-mediated file operations. Model tool
+/// dispatch uses [`reserve_tool_effect`] so all effect families share one
+/// atomic admission path. This function still fails closed on poison.
 pub fn check_file_access(run: &crate::tools::ToolRunContext, path: &str) -> Result<(), String> {
+    let blast_radius = blast_radius_for_run(run)?;
+    let Some(blast_radius) = blast_radius else {
+        return Ok(());
+    };
+    let (resource, policy_path) = normalize_capability_path(run, path)?;
+    let resources = if blast_radius.tracks_resources() {
+        HashSet::from([resource])
+    } else {
+        HashSet::new()
+    };
+    let mut reservation = blast_radius.reserve(
+        PendingReservation {
+            tool_calls: 0,
+            mutations: 0,
+            lines: 0,
+            resources,
+        },
+        Some(&policy_path),
+    )?;
+    reservation.commit();
+    Ok(())
+}
+
+fn blast_radius_for_run(
+    run: &crate::tools::ToolRunContext,
+) -> Result<Option<Arc<BlastRadiusGuard>>, String> {
     let guard = lock_or_poison();
     if guard.poisoned {
         error!(
-            path = path,
             session_id = run.session_id(),
-            "check_file_access: guardrails registry poisoned — denying"
+            "Blast radius lookup found poisoned registry — denying"
         );
         return Err(POISON_ERR.to_string());
     }
-    match guard.runs.get(&run_key(run)) {
-        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().check_file_access(path),
-        Some(GuardrailsState::Disabled) | None => Ok(()),
+    Ok(match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.blast_radius.clone(),
+        Some(GuardrailsState::Disabled) | None => None,
+    })
+}
+
+fn normalize_capability_path(
+    run: &crate::tools::ToolRunContext,
+    target: &str,
+) -> Result<(PathBuf, String), String> {
+    let canonical = crate::tools::resolve_capability_path(run, target)?;
+    let policy_path = canonical.strip_prefix(run.project_root()).map_or_else(
+        |_| normalize_path(&canonical.to_string_lossy()),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                normalize_path(&relative.to_string_lossy())
+            }
+        },
+    );
+    Ok((canonical, policy_path))
+}
+
+/// Pending admission for one classified tool invocation.
+///
+/// Dropping without [`Self::commit`] releases the reservation, which covers
+/// policy denial, cancellation, handler errors, and early returns. Successful
+/// and typed-partial results commit before the token leaves the executor.
+pub(crate) struct EffectReservation {
+    inner: Option<LedgerReservation>,
+    run_id: crate::runtime::RunId,
+    generation: crate::runtime::CapabilityGeneration,
+    effect: crate::tools::effect::ToolEffect,
+    canonical: String,
+    target: String,
+}
+
+impl EffectReservation {
+    /// Commit the effect after a successful or explicitly partial outcome.
+    pub(crate) fn commit(&mut self) {
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        let reservation_id = inner.id();
+        inner.commit();
+        tracing::info!(
+            target: "openclaudia::guardrails",
+            event = "blast_radius_reservation_committed",
+            run_id = %self.run_id,
+            generation = %self.generation,
+            reservation_id,
+            effect = self.effect.as_str(),
+            capability = self.canonical,
+            resource = self.target,
+            "Committed run-scoped blast radius reservation"
+        );
     }
+}
+
+impl Drop for EffectReservation {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        tracing::info!(
+            target: "openclaudia::guardrails",
+            event = "blast_radius_reservation_released",
+            run_id = %self.run_id,
+            generation = %self.generation,
+            reservation_id = inner.id(),
+            effect = self.effect.as_str(),
+            capability = self.canonical,
+            resource = self.target,
+            "Released uncommitted run-scoped blast radius reservation"
+        );
+    }
+}
+
+/// Reserve one mandatory effect classification before handler dispatch.
+///
+/// # Errors
+///
+/// Returns a denial when the exact run policy is unavailable, the path target
+/// cannot be capability-normalized, path policy refuses the canonical target,
+/// or any atomic quota would be exceeded.
+pub(crate) fn reserve_tool_effect(
+    run: &crate::tools::ToolRunContext,
+    resolved: &crate::tools::effect::ResolvedEffect,
+) -> Result<EffectReservation, String> {
+    let blast_radius = blast_radius_for_run(run)?;
+    let Some(blast_radius) = blast_radius else {
+        return Ok(EffectReservation {
+            inner: None,
+            run_id: run.run_id(),
+            generation: run.generation(),
+            effect: resolved.effect,
+            canonical: resolved.canonical.clone(),
+            target: resolved.target.clone(),
+        });
+    };
+
+    let (resources, policy_path, trace_target) = if matches!(
+        resolved.target_kind,
+        crate::tools::effect::ToolTargetKind::Path
+            | crate::tools::effect::ToolTargetKind::PathScope
+    ) {
+        let (resource, policy_path) = normalize_capability_path(run, &resolved.target)?;
+        let trace_target = resource.to_string_lossy().into_owned();
+        let resources = if resolved.target_kind == crate::tools::effect::ToolTargetKind::Path
+            && blast_radius.tracks_resources()
+        {
+            HashSet::from([resource])
+        } else {
+            HashSet::new()
+        };
+        (resources, Some(policy_path), trace_target)
+    } else {
+        (HashSet::new(), None, resolved.target.clone())
+    };
+    let pending = PendingReservation {
+        tool_calls: 1,
+        mutations: u64::from(resolved.effect.is_mutation()),
+        lines: 0,
+        resources,
+    };
+    let inner = if resolved.target_kind == crate::tools::effect::ToolTargetKind::PathScope {
+        if let Some(path) = policy_path.as_deref() {
+            blast_radius.check_scope(path)?;
+        }
+        blast_radius.reserve(pending, None)?
+    } else {
+        blast_radius.reserve(pending, policy_path.as_deref())?
+    };
+    let reservation_id = inner.id();
+    tracing::info!(
+        target: "openclaudia::guardrails",
+        event = "blast_radius_effect_reserved",
+        run_id = %run.run_id(),
+        generation = %run.generation(),
+        reservation_id,
+        effect = resolved.effect.as_str(),
+        capability = resolved.canonical,
+        resource = trace_target,
+        "Reserved classified effect against exact run quota"
+    );
+    Ok(EffectReservation {
+        inner: Some(inner),
+        run_id: run.run_id(),
+        generation: run.generation(),
+        effect: resolved.effect,
+        canonical: resolved.canonical.clone(),
+        target: trace_target,
+    })
+}
+
+/// Reserve one host-mediated workspace mutation that occurs below a tool
+/// handler (for example, creating the exact run's plan file).
+pub(crate) fn reserve_workspace_mutation(
+    run: &crate::tools::ToolRunContext,
+    path: &str,
+) -> Result<EffectReservation, String> {
+    let blast_radius = blast_radius_for_run(run)?;
+    let Some(blast_radius) = blast_radius else {
+        return Ok(EffectReservation {
+            inner: None,
+            run_id: run.run_id(),
+            generation: run.generation(),
+            effect: crate::tools::effect::ToolEffect::WorkspaceMutation,
+            canonical: "HostWorkspaceWrite".to_string(),
+            target: path.to_string(),
+        });
+    };
+    let (resource, policy_path) = normalize_capability_path(run, path)?;
+    let trace_target = resource.to_string_lossy().into_owned();
+    let resources = if blast_radius.tracks_resources() {
+        HashSet::from([resource])
+    } else {
+        HashSet::new()
+    };
+    let inner = blast_radius.reserve(
+        PendingReservation {
+            mutations: 1,
+            resources,
+            ..PendingReservation::default()
+        },
+        Some(&policy_path),
+    )?;
+    Ok(EffectReservation {
+        inner: Some(inner),
+        run_id: run.run_id(),
+        generation: run.generation(),
+        effect: crate::tools::effect::ToolEffect::WorkspaceMutation,
+        canonical: "HostWorkspaceWrite".to_string(),
+        target: trace_target,
+    })
+}
+
+/// Reservation for exact changed-line impact prepared by a file handler.
+pub(crate) struct ChangedLineReservation {
+    inner: Option<LedgerReservation>,
+}
+
+impl ChangedLineReservation {
+    /// Commit after the descriptor-backed write succeeds.
+    pub(crate) fn commit(&mut self) {
+        if let Some(mut inner) = self.inner.take() {
+            inner.commit();
+        }
+    }
+
+    /// Replace the predicted line impact with the observable partial effect,
+    /// then commit it even if the write itself returned a failure.
+    pub(crate) fn reconcile_and_commit(&mut self, changed_lines: u64) {
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        inner.reconcile_lines(changed_lines);
+        inner.commit();
+    }
+}
+
+/// Atomically reserve exact inserted-plus-deleted line impact before writing.
+///
+/// # Errors
+///
+/// Returns a denial if the exact run ledger is poisoned or the concurrent
+/// projected changed-line total would exceed the configured per-run limit.
+pub(crate) fn reserve_changed_lines(
+    run: &crate::tools::ToolRunContext,
+    changed_lines: u64,
+) -> Result<ChangedLineReservation, String> {
+    let Some(blast_radius) = blast_radius_for_run(run)? else {
+        return Ok(ChangedLineReservation { inner: None });
+    };
+    let inner = blast_radius.reserve(
+        PendingReservation {
+            lines: changed_lines,
+            ..PendingReservation::default()
+        },
+        None,
+    )?;
+    Ok(ChangedLineReservation { inner: Some(inner) })
+}
+
+/// One atomic batch of concrete file identities discovered by a recursive
+/// read/search handler.
+///
+/// The root argument is classified as a
+/// [`crate::tools::effect::ToolTargetKind::PathScope`] and
+/// checked by the canonical executor without consuming a file slot. Each leaf
+/// that the handler will disclose or read is added here before access. The
+/// whole batch commits only when the handler succeeds; denial or early return
+/// drops one ledger reservation and releases every pending identity together.
+pub(crate) struct PathResourceBatch {
+    inner: Option<LedgerReservation>,
+    guard: Option<Arc<BlastRadiusGuard>>,
+    run_id: crate::runtime::RunId,
+    generation: crate::runtime::CapabilityGeneration,
+    resource_count: u64,
+}
+
+impl PathResourceBatch {
+    fn ensure_run(&self, run: &crate::tools::ToolRunContext) -> Result<(), String> {
+        if self.run_id == run.run_id() && self.generation == run.generation() {
+            Ok(())
+        } else {
+            Err("Blast radius: resource batch used with a different run generation".to_string())
+        }
+    }
+
+    /// Check one directory/path scope against canonical policy without
+    /// charging it as a file identity.
+    pub(crate) fn check_scope(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        target: &Path,
+    ) -> Result<(), String> {
+        self.ensure_run(run)?;
+        let Some(guard) = self.guard.as_ref() else {
+            return Ok(());
+        };
+        let (_, policy_path) = normalize_capability_path(run, &target.to_string_lossy())?;
+        guard.check_scope(&policy_path)
+    }
+
+    /// Check a directory identity before returning its name to the caller.
+    /// This is stricter than traversal admission: a traversal may pass through
+    /// a wildcard-bearing branch to reach an allowed leaf, but `list_files`
+    /// must not disclose an unrelated directory merely because it was opened.
+    pub(crate) fn check_disclosed_scope(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        target: &Path,
+    ) -> Result<(), String> {
+        self.ensure_run(run)?;
+        let Some(guard) = self.guard.as_ref() else {
+            return Ok(());
+        };
+        let (_, policy_path) = normalize_capability_path(run, &target.to_string_lossy())?;
+        guard.check_disclosed_scope(&policy_path)
+    }
+
+    /// Atomically add one concrete file identity before the handler discloses
+    /// or reads it.
+    pub(crate) fn reserve_file(
+        &mut self,
+        run: &crate::tools::ToolRunContext,
+        target: &Path,
+    ) -> Result<(), String> {
+        self.ensure_run(run)?;
+        let Some(guard) = self.guard.as_ref() else {
+            return Ok(());
+        };
+        let (resource, policy_path) = normalize_capability_path(run, &target.to_string_lossy())?;
+        let Some(inner) = self.inner.as_ref() else {
+            guard.check_path(&policy_path)?;
+            return Ok(());
+        };
+        let inserted = guard.add_resource(inner.id(), resource.clone(), &policy_path)?;
+        if inserted {
+            self.resource_count = self.resource_count.saturating_add(1);
+            tracing::info!(
+                target: "openclaudia::guardrails",
+                event = "blast_radius_resource_reserved",
+                run_id = %self.run_id,
+                generation = %self.generation,
+                reservation_id = inner.id(),
+                resource = %resource.display(),
+                "Reserved concrete file identity in run-scoped batch"
+            );
+        }
+        Ok(())
+    }
+
+    /// Commit all concrete identities after the enclosing handler succeeds.
+    pub(crate) fn commit(&mut self) {
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        let reservation_id = inner.id();
+        inner.commit();
+        tracing::info!(
+            target: "openclaudia::guardrails",
+            event = "blast_radius_resource_batch_committed",
+            run_id = %self.run_id,
+            generation = %self.generation,
+            reservation_id,
+            resource_count = self.resource_count,
+            "Committed concrete file identities for recursive tool"
+        );
+    }
+}
+
+impl Drop for PathResourceBatch {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        tracing::info!(
+            target: "openclaudia::guardrails",
+            event = "blast_radius_resource_batch_released",
+            run_id = %self.run_id,
+            generation = %self.generation,
+            reservation_id = inner.id(),
+            resource_count = self.resource_count,
+            "Released concrete file identities for failed recursive tool"
+        );
+    }
+}
+
+/// Begin an empty concrete-resource batch for one exact run.
+pub(crate) fn begin_path_resource_batch(
+    run: &crate::tools::ToolRunContext,
+) -> Result<PathResourceBatch, String> {
+    let guard = blast_radius_for_run(run)?;
+    let inner = guard
+        .as_ref()
+        .filter(|guard| guard.tracks_resources())
+        .map(|guard| guard.reserve(PendingReservation::default(), None))
+        .transpose()?;
+    Ok(PathResourceBatch {
+        inner,
+        guard,
+        run_id: run.run_id(),
+        generation: run.generation(),
+        resource_count: 0,
+    })
 }
 
 /// Record a file modification for diff monitoring.
@@ -217,19 +643,6 @@ pub fn run_quality_gates(
     match guard.runs.get(&run_key(run)) {
         Some(GuardrailsState::Enabled(engine)) => engine.as_ref().run_quality_gates(run),
         Some(GuardrailsState::Disabled) | None => Vec::new(),
-    }
-}
-
-/// Reset per-turn tracking (blast radius file count).
-pub fn reset_turn(run: &crate::tools::ToolRunContext) {
-    let guard = lock_or_poison();
-    if guard.poisoned {
-        error!("reset_turn: registry poisoned — skipping");
-        return;
-    }
-    match guard.runs.get(&run_key(run)) {
-        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().reset_turn(),
-        Some(GuardrailsState::Disabled) | None => {}
     }
 }
 
@@ -378,23 +791,41 @@ pub enum ShellResult {
 // ==========================================================================
 
 struct GuardrailsEngine {
-    blast_radius: Option<BlastRadiusGuard>,
+    blast_radius: Option<Arc<BlastRadiusGuard>>,
     diff_monitor: Option<DiffMonitor>,
     quality_gates: Option<QualityGateRunner>,
 }
 
 impl GuardrailsEngine {
-    fn from_config(config: &GuardrailsConfig) -> Self {
-        let blast_radius = config.blast_radius.as_ref().filter(|c| c.enabled).map(|c| {
+    fn try_from_config(config: &GuardrailsConfig) -> Result<Self, String> {
+        // Compile even a disabled supplied section. A malformed policy must
+        // never sit latent until a later reload enables it.
+        let compiled_blast = config
+            .blast_radius
+            .as_ref()
+            .map(|guard| BlastRadiusGuard::try_new(guard.clone()))
+            .transpose()?;
+        let blast_radius = compiled_blast
+            .filter(|_| {
+                config
+                    .blast_radius
+                    .as_ref()
+                    .is_some_and(|guard| guard.enabled)
+            })
+            .map(Arc::new);
+
+        if let Some(guard) = config.blast_radius.as_ref().filter(|guard| guard.enabled) {
             info!(
-                mode = %c.mode,
-                allowed = c.allowed_paths.len(),
-                denied = c.denied_paths.len(),
-                max_files = c.max_files_per_turn,
-                "Blast radius guard enabled"
+                mode = %guard.mode,
+                allowed = guard.allowed_paths.len(),
+                denied = guard.denied_paths.len(),
+                max_files = ?guard.max_files_per_run,
+                max_lines = ?guard.max_lines_per_run,
+                max_tools = ?guard.max_tool_calls_per_run,
+                max_mutations = ?guard.max_mutations_per_run,
+                "Run-scoped blast radius guard enabled"
             );
-            BlastRadiusGuard::new(c.clone())
-        });
+        }
 
         let diff_monitor = config.diff_monitor.as_ref().filter(|c| c.enabled).map(|c| {
             info!(
@@ -419,19 +850,11 @@ impl GuardrailsEngine {
                 QualityGateRunner::new(c.clone())
             });
 
-        Self {
+        Ok(Self {
             blast_radius,
             diff_monitor,
             quality_gates,
-        }
-    }
-
-    fn check_file_access(&self, path: &str) -> Result<(), String> {
-        if let Some(br) = &self.blast_radius {
-            br.check_path(path)?;
-            br.record_access(path)?;
-        }
-        Ok(())
+        })
     }
 
     fn record_modification(&self, path: &str, lines_added: u32, lines_removed: u32) {
@@ -456,12 +879,6 @@ impl GuardrailsEngine {
             .unwrap_or_default()
     }
 
-    fn reset_turn(&self) {
-        if let Some(br) = &self.blast_radius {
-            br.reset_turn();
-        }
-    }
-
     fn get_diff_stats(&self) -> Option<DiffStats> {
         self.diff_monitor.as_ref().map(DiffMonitor::get_stats)
     }
@@ -473,68 +890,45 @@ impl GuardrailsEngine {
 
 struct BlastRadiusGuard {
     config: BlastRadiusConfig,
-    allowed_patterns: Vec<Regex>,
-    denied_patterns: Vec<Regex>,
-    files_this_turn: Mutex<HashSet<String>>,
+    allowed_patterns: Vec<CompiledPathPattern>,
+    denied_patterns: Vec<CompiledPathPattern>,
+    ledger: Mutex<ReservationLedger>,
 }
 
 impl BlastRadiusGuard {
-    fn new(config: BlastRadiusConfig) -> Self {
-        let allowed_patterns = config
-            .allowed_paths
-            .iter()
-            .filter_map(|p| {
-                glob_to_regex(p)
-                    .map_err(|e| warn!("Invalid allowed glob '{}': {}", p, e))
-                    .ok()
-            })
-            .collect();
+    fn try_new(config: BlastRadiusConfig) -> Result<Self, String> {
+        let allowed_patterns = compile_path_patterns("allowed", &config.allowed_paths)?;
+        let denied_patterns = compile_path_patterns("denied", &config.denied_paths)?;
 
-        let denied_patterns = config
-            .denied_paths
-            .iter()
-            .filter_map(|p| {
-                glob_to_regex(p)
-                    .map_err(|e| warn!("Invalid denied glob '{}': {}", p, e))
-                    .ok()
-            })
-            .collect();
-
-        Self {
+        Ok(Self {
             config,
             allowed_patterns,
             denied_patterns,
-            files_this_turn: Mutex::new(HashSet::new()),
-        }
-    }
-
-    fn files_guard(
-        &self,
-        operation: &'static str,
-    ) -> Result<MutexGuard<'_, HashSet<String>>, String> {
-        self.files_this_turn.lock().map_err(|err| {
-            error!(operation, error = %err, "Blast radius file tracker lock poisoned");
-            format!("Blast radius: file access tracker lock poisoned: {err}")
+            ledger: Mutex::new(ReservationLedger::default()),
         })
     }
 
-    fn check_path(&self, path: &str) -> Result<(), String> {
-        let normalized = normalize_path(path);
+    fn ledger_guard(
+        &self,
+        operation: &'static str,
+    ) -> Result<MutexGuard<'_, ReservationLedger>, String> {
+        self.ledger.lock().map_err(|err| {
+            error!(operation, error = %err, "Blast radius reservation ledger lock poisoned");
+            format!("Blast radius: reservation ledger lock poisoned: {err}")
+        })
+    }
 
+    const fn tracks_resources(&self) -> bool {
+        self.config.max_files_per_run.is_some()
+    }
+
+    fn check_path(&self, normalized: &str) -> Result<(), String> {
         // Denied paths take priority
         for pattern in &self.denied_patterns {
-            if pattern.is_match(&normalized) {
-                let msg = format!("Blast radius: path '{path}' matches deny list pattern");
-                return match self.config.mode {
-                    GuardrailMode::Strict => {
-                        warn!("{} (BLOCKED)", msg);
-                        Err(msg)
-                    }
-                    GuardrailMode::Advisory => {
-                        warn!("{} (advisory)", msg);
-                        Ok(())
-                    }
-                };
+            if pattern.regex.is_match(normalized) {
+                return self.violation(format!(
+                    "Blast radius: canonical path '{normalized}' matches deny list pattern"
+                ));
             }
         }
 
@@ -543,87 +937,315 @@ impl BlastRadiusGuard {
             let allowed = self
                 .allowed_patterns
                 .iter()
-                .any(|p| p.is_match(&normalized));
+                .any(|pattern| pattern.regex.is_match(normalized));
             if !allowed {
-                let msg = format!("Blast radius: path '{path}' not in allowed list");
-                return match self.config.mode {
-                    GuardrailMode::Strict => {
-                        warn!("{} (BLOCKED)", msg);
-                        Err(msg)
-                    }
-                    GuardrailMode::Advisory => {
-                        warn!("{} (advisory)", msg);
-                        Ok(())
-                    }
-                };
+                return self.violation(format!(
+                    "Blast radius: canonical path '{normalized}' not in allowed list"
+                ));
             }
         }
 
         Ok(())
     }
 
-    fn record_access(&self, path: &str) -> Result<(), String> {
-        if self.config.max_files_per_turn == 0 {
+    fn check_scope(&self, normalized: &str) -> Result<(), String> {
+        // A recursive root is a traversal scope, not a concrete file. Permit
+        // ancestors and wildcard-bearing branches that may reach an allowed
+        // leaf, but prune a statically denied subtree before opening it.
+        for pattern in &self.denied_patterns {
+            if pattern.denies_scope(normalized) {
+                return self.violation(format!(
+                    "Blast radius: canonical scope '{normalized}' matches deny list pattern"
+                ));
+            }
+        }
+        if !self.allowed_patterns.is_empty()
+            && !self
+                .allowed_patterns
+                .iter()
+                .any(|pattern| pattern.may_reach_from(normalized))
+        {
+            return self.violation(format!(
+                "Blast radius: canonical scope '{normalized}' cannot reach the allowed list"
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_disclosed_scope(&self, normalized: &str) -> Result<(), String> {
+        for pattern in &self.denied_patterns {
+            if pattern.denies_scope(normalized) {
+                return self.violation(format!(
+                    "Blast radius: canonical scope '{normalized}' matches deny list pattern"
+                ));
+            }
+        }
+        if !self.allowed_patterns.is_empty()
+            && !self
+                .allowed_patterns
+                .iter()
+                .any(|pattern| pattern.covers_disclosed_scope(normalized))
+        {
+            return self.violation(format!(
+                "Blast radius: canonical scope '{normalized}' not in allowed list"
+            ));
+        }
+        Ok(())
+    }
+
+    fn violation(&self, message: String) -> Result<(), String> {
+        match self.config.mode {
+            GuardrailMode::Strict => {
+                warn!("{} (BLOCKED)", message);
+                Err(message)
+            }
+            GuardrailMode::Advisory => {
+                warn!("{} (advisory)", message);
+                Ok(())
+            }
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        pending: PendingReservation,
+        policy_path: Option<&str>,
+    ) -> Result<LedgerReservation, String> {
+        if let Some(path) = policy_path {
+            self.check_path(path)?;
+        }
+
+        let mut ledger = self.ledger_guard("reserve")?;
+        let projected_tools = ledger.projected_tool_calls(&pending)?;
+        let projected_mutations = ledger.projected_mutations(&pending)?;
+        let projected_lines = ledger.projected_lines(&pending)?;
+        let projected_files = ledger.projected_files(&pending);
+
+        self.check_limit(
+            "tool calls",
+            projected_tools,
+            self.config
+                .max_tool_calls_per_run
+                .map(std::num::NonZeroU32::get),
+        )?;
+        self.check_limit(
+            "mutations",
+            projected_mutations,
+            self.config
+                .max_mutations_per_run
+                .map(std::num::NonZeroU32::get),
+        )?;
+        self.check_limit(
+            "changed lines",
+            projected_lines,
+            self.config.max_lines_per_run.map(std::num::NonZeroU32::get),
+        )?;
+        self.check_limit(
+            "files",
+            projected_files,
+            self.config.max_files_per_run.map(std::num::NonZeroU32::get),
+        )?;
+
+        let id = ledger.next_reservation_id()?;
+        ledger.pending.insert(id, pending);
+        drop(ledger);
+        Ok(LedgerReservation {
+            guard: Arc::clone(self),
+            id: Some(id),
+        })
+    }
+
+    fn check_limit(&self, label: &str, projected: u64, limit: Option<u32>) -> Result<(), String> {
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        if projected <= u64::from(limit) {
             return Ok(());
         }
-
-        let normalized = normalize_path(path);
-        let mut files = match self.files_guard("record_access") {
-            Ok(files) => files,
-            Err(msg) => {
-                return match self.config.mode {
-                    GuardrailMode::Strict => {
-                        warn!("{} (BLOCKED)", msg);
-                        Err(msg)
-                    }
-                    GuardrailMode::Advisory => {
-                        warn!("{} (advisory)", msg);
-                        Ok(())
-                    }
-                };
-            }
-        };
-        files.insert(normalized);
-        // Crosslink #840: previously `u32::try_from(files.len()).unwrap_or(u32::MAX)`
-        // silently saturated when `files.len() > u32::MAX`. The comparison
-        // against `max_files_per_turn` (also `u32`) would still trigger
-        // — but a single combined "exceeded max" message can't tell an
-        // operator whether the cap was breached by a representable count
-        // (the normal case) or by a count so absurd it required pinning
-        // to `u32::MAX` (a likely bug or attack signal). Surface the
-        // overflow distinctly so monitoring dashboards can flag it.
-        let count = files.len();
-        drop(files);
-        let cap = self.config.max_files_per_turn;
-        let overflowed = u32::try_from(count).is_err();
-        let breached = overflowed || u32::try_from(count).is_ok_and(|n| n > cap);
-
-        if breached {
-            let msg = if overflowed {
-                format!(
-                    "Blast radius: file count {count} overflowed u32 \
-                     (cap {cap}/turn) — likely a bug or attack signal"
-                )
-            } else {
-                format!("Blast radius: exceeded max files per turn ({count}/{cap})")
-            };
-            return match self.config.mode {
-                GuardrailMode::Strict => {
-                    warn!("{} (BLOCKED)", msg);
-                    Err(msg)
-                }
-                GuardrailMode::Advisory => {
-                    warn!("{} (advisory)", msg);
-                    Ok(())
-                }
-            };
-        }
-        Ok(())
+        self.violation(format!(
+            "Blast radius: run-scoped {label} limit exceeded ({projected}/{limit})"
+        ))
     }
 
-    fn reset_turn(&self) {
-        if let Ok(mut files) = self.files_guard("reset_turn") {
-            files.clear();
+    fn add_resource(
+        &self,
+        reservation_id: u64,
+        resource: PathBuf,
+        policy_path: &str,
+    ) -> Result<bool, String> {
+        self.check_path(policy_path)?;
+        let mut ledger = self.ledger_guard("reserve_batch_resource")?;
+        let Some(pending) = ledger.pending.get(&reservation_id) else {
+            return Err(format!(
+                "Blast radius: resource batch reservation {reservation_id} is unavailable"
+            ));
+        };
+        if pending.resources.contains(&resource) {
+            return Ok(false);
+        }
+        let candidate = PendingReservation {
+            resources: HashSet::from([resource.clone()]),
+            ..PendingReservation::default()
+        };
+        let projected_files = ledger.projected_files(&candidate);
+        self.check_limit(
+            "files",
+            projected_files,
+            self.config.max_files_per_run.map(std::num::NonZeroU32::get),
+        )?;
+        let Some(pending) = ledger.pending.get_mut(&reservation_id) else {
+            return Err(format!(
+                "Blast radius: resource batch reservation {reservation_id} disappeared"
+            ));
+        };
+        pending.resources.insert(resource);
+        drop(ledger);
+        Ok(true)
+    }
+
+    fn commit(&self, id: u64) {
+        let Ok(mut ledger) = self.ledger_guard("commit") else {
+            return;
+        };
+        let Some(pending) = ledger.pending.remove(&id) else {
+            error!(
+                reservation_id = id,
+                "Blast radius reservation missing at commit"
+            );
+            return;
+        };
+        ledger.committed_tool_calls = ledger
+            .committed_tool_calls
+            .saturating_add(pending.tool_calls);
+        ledger.committed_mutations = ledger.committed_mutations.saturating_add(pending.mutations);
+        ledger.committed_lines = ledger.committed_lines.saturating_add(pending.lines);
+        ledger.committed_resources.extend(pending.resources);
+    }
+
+    fn release(&self, id: u64) {
+        let Ok(mut ledger) = self.ledger_guard("release") else {
+            return;
+        };
+        ledger.pending.remove(&id);
+    }
+}
+
+#[derive(Default)]
+struct ReservationLedger {
+    next_id: u64,
+    committed_tool_calls: u64,
+    committed_mutations: u64,
+    committed_lines: u64,
+    committed_resources: HashSet<PathBuf>,
+    pending: HashMap<u64, PendingReservation>,
+}
+
+#[derive(Default)]
+struct PendingReservation {
+    tool_calls: u64,
+    mutations: u64,
+    lines: u64,
+    resources: HashSet<PathBuf>,
+}
+
+impl ReservationLedger {
+    fn pending_sum(&self, field: impl Fn(&PendingReservation) -> u64) -> Result<u64, String> {
+        self.pending.values().try_fold(0_u64, |total, pending| {
+            total.checked_add(field(pending)).ok_or_else(|| {
+                "Blast radius: pending reservation accounting overflowed".to_string()
+            })
+        })
+    }
+
+    fn projected_tool_calls(&self, candidate: &PendingReservation) -> Result<u64, String> {
+        self.committed_tool_calls
+            .checked_add(self.pending_sum(|pending| pending.tool_calls)?)
+            .and_then(|value| value.checked_add(candidate.tool_calls))
+            .ok_or_else(|| "Blast radius: tool-call accounting overflowed".to_string())
+    }
+
+    fn projected_mutations(&self, candidate: &PendingReservation) -> Result<u64, String> {
+        self.committed_mutations
+            .checked_add(self.pending_sum(|pending| pending.mutations)?)
+            .and_then(|value| value.checked_add(candidate.mutations))
+            .ok_or_else(|| "Blast radius: mutation accounting overflowed".to_string())
+    }
+
+    fn projected_lines(&self, candidate: &PendingReservation) -> Result<u64, String> {
+        self.committed_lines
+            .checked_add(self.pending_sum(|pending| pending.lines)?)
+            .and_then(|value| value.checked_add(candidate.lines))
+            .ok_or_else(|| "Blast radius: changed-line accounting overflowed".to_string())
+    }
+
+    fn projected_files(&self, candidate: &PendingReservation) -> u64 {
+        let mut resources = self.committed_resources.clone();
+        for pending in self.pending.values() {
+            resources.extend(pending.resources.iter().cloned());
+        }
+        resources.extend(candidate.resources.iter().cloned());
+        u64::try_from(resources.len()).unwrap_or(u64::MAX)
+    }
+
+    fn next_reservation_id(&mut self) -> Result<u64, String> {
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| "Blast radius: reservation ID space exhausted".to_string())?;
+        Ok(self.next_id)
+    }
+}
+
+struct LedgerReservation {
+    guard: Arc<BlastRadiusGuard>,
+    id: Option<u64>,
+}
+
+impl LedgerReservation {
+    fn id(&self) -> u64 {
+        self.id.unwrap_or(0)
+    }
+
+    fn commit(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.guard.commit(id);
+        }
+    }
+
+    fn reconcile_lines(&self, changed_lines: u64) {
+        let Ok(mut ledger) = self.guard.ledger_guard("reconcile_partial_lines") else {
+            return;
+        };
+        let Some(pending) = ledger.pending.get_mut(&self.id()) else {
+            error!(
+                reservation_id = self.id(),
+                "Blast radius reservation missing during partial-effect reconciliation"
+            );
+            return;
+        };
+        pending.lines = changed_lines;
+        let projected = ledger
+            .projected_lines(&PendingReservation::default())
+            .unwrap_or(u64::MAX);
+        if self
+            .guard
+            .config
+            .max_lines_per_run
+            .is_some_and(|limit| projected > u64::from(limit.get()))
+        {
+            warn!(
+                reservation_id = self.id(),
+                projected_lines = projected,
+                "A partial file effect exceeded its pre-execution line reservation; reconciled actual impact after the effect"
+            );
+        }
+    }
+}
+
+impl Drop for LedgerReservation {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.guard.release(id);
         }
     }
 }
@@ -1338,6 +1960,86 @@ pub fn get_auto_detected_commands(
 // Glob Pattern Matching Utilities
 // ==========================================================================
 
+struct CompiledPathPattern {
+    regex: Regex,
+    literal_prefix: String,
+    denied_subtree_root: Option<String>,
+}
+
+impl CompiledPathPattern {
+    fn denies_scope(&self, scope: &str) -> bool {
+        self.regex.is_match(scope)
+            || self.denied_subtree_root.as_ref().is_some_and(|root| {
+                scope == root
+                    || scope
+                        .strip_prefix(root)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+    }
+
+    fn may_reach_from(&self, scope: &str) -> bool {
+        if self.regex.is_match(scope) || scope == "." || self.literal_prefix.is_empty() {
+            return true;
+        }
+        path_is_same_or_descendant(&self.literal_prefix, scope)
+            || path_is_same_or_descendant(scope, &self.literal_prefix)
+    }
+
+    fn covers_disclosed_scope(&self, scope: &str) -> bool {
+        self.regex.is_match(scope)
+            || (!self.literal_prefix.is_empty()
+                && path_is_same_or_descendant(&self.literal_prefix, scope))
+    }
+}
+
+fn path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn compile_path_patterns(
+    kind: &str,
+    patterns: &[String],
+) -> Result<Vec<CompiledPathPattern>, String> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            let normalized = normalize_path(pattern.trim());
+            if normalized.is_empty() {
+                return Err(format!(
+                    "Blast radius: {kind} path pattern must not be empty"
+                ));
+            }
+            if normalized.split('/').any(|component| component == "..") {
+                return Err(format!(
+                    "Blast radius: {kind} path pattern '{pattern}' contains ambiguous parent traversal"
+                ));
+            }
+            let regex = glob_to_regex(&normalized).map_err(|error| {
+                format!("Blast radius: invalid {kind} path pattern '{pattern}': {error}")
+            })?;
+            let wildcard_offset = normalized
+                .char_indices()
+                .find_map(|(offset, character)| matches!(character, '*' | '?').then_some(offset))
+                .unwrap_or(normalized.len());
+            let literal_prefix = normalized[..wildcard_offset]
+                .trim_end_matches('/')
+                .to_string();
+            let denied_subtree_root = normalized
+                .strip_suffix("/**")
+                .filter(|root| !root.is_empty() && !root.contains(['*', '?']))
+                .map(str::to_string);
+            Ok(CompiledPathPattern {
+                regex,
+                literal_prefix,
+                denied_subtree_root,
+            })
+        })
+        .collect()
+}
+
 /// Convert a glob pattern to a regex.
 fn glob_to_regex(pattern: &str) -> Result<Regex, regex::Error> {
     let mut regex = String::from("^");
@@ -1550,9 +2252,9 @@ mod tests {
             mode: GuardrailMode::Strict,
             allowed_paths: vec![],
             denied_paths: vec![".env*".to_string(), ".git/**".to_string()],
-            max_files_per_turn: 0,
+            ..BlastRadiusConfig::default()
         };
-        let guard = BlastRadiusGuard::new(config);
+        let guard = BlastRadiusGuard::try_new(config).expect("valid strict policy");
 
         assert!(guard.check_path("src/main.rs").is_ok());
         assert!(guard.check_path(".env").is_err());
@@ -1567,9 +2269,9 @@ mod tests {
             mode: GuardrailMode::Strict,
             allowed_paths: vec!["src/**".to_string(), "tests/**".to_string()],
             denied_paths: vec![],
-            max_files_per_turn: 0,
+            ..BlastRadiusConfig::default()
         };
-        let guard = BlastRadiusGuard::new(config);
+        let guard = BlastRadiusGuard::try_new(config).expect("valid allow policy");
 
         assert!(guard.check_path("src/main.rs").is_ok());
         assert!(guard.check_path("tests/test.rs").is_ok());
@@ -1583,9 +2285,9 @@ mod tests {
             mode: GuardrailMode::Advisory,
             allowed_paths: vec!["src/**".to_string()],
             denied_paths: vec![],
-            max_files_per_turn: 0,
+            ..BlastRadiusConfig::default()
         };
-        let guard = BlastRadiusGuard::new(config);
+        let guard = BlastRadiusGuard::try_new(config).expect("valid advisory policy");
 
         // Advisory mode warns but doesn't block
         assert!(guard.check_path("config.yaml").is_ok());
@@ -1596,60 +2298,128 @@ mod tests {
         let config = BlastRadiusConfig {
             enabled: true,
             mode: GuardrailMode::Strict,
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            max_files_per_turn: 2,
+            max_files_per_run: std::num::NonZeroU32::new(2),
+            ..BlastRadiusConfig::default()
         };
-        let guard = BlastRadiusGuard::new(config);
+        let guard = Arc::new(BlastRadiusGuard::try_new(config).expect("valid quota"));
 
-        assert!(guard.record_access("file1.rs").is_ok());
-        assert!(guard.record_access("file2.rs").is_ok());
-        assert!(guard.record_access("file3.rs").is_err());
-    }
-
-    /// Crosslink #840: when the breach is by a representable count, the
-    /// error message is the plain `(count/cap)` form — not the overflow
-    /// form — so monitoring dashboards can distinguish the two cases.
-    #[test]
-    fn blast_radius_breach_reports_distinct_message_for_representable_count() {
-        let config = BlastRadiusConfig {
-            enabled: true,
-            mode: GuardrailMode::Strict,
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            max_files_per_turn: 1,
-        };
-        let guard = BlastRadiusGuard::new(config);
-        assert!(guard.record_access("a.rs").is_ok());
-        let err = guard
-            .record_access("b.rs")
-            .expect_err("must reject second file under cap=1");
-        assert!(
-            err.contains("exceeded max files per turn"),
-            "representable breach must use the plain message; got: {err}"
-        );
-        assert!(
-            !err.contains("overflowed"),
-            "representable breach must NOT use the overflow message; got: {err}"
-        );
+        for file in ["file1.rs", "file2.rs"] {
+            let mut reservation = guard
+                .reserve(
+                    PendingReservation {
+                        resources: HashSet::from([PathBuf::from(file)]),
+                        ..PendingReservation::default()
+                    },
+                    Some(file),
+                )
+                .expect("within unique-file cap");
+            reservation.commit();
+        }
+        assert!(guard
+            .reserve(
+                PendingReservation {
+                    resources: HashSet::from([PathBuf::from("file3.rs")]),
+                    ..PendingReservation::default()
+                },
+                Some("file3.rs")
+            )
+            .is_err());
     }
 
     #[test]
-    fn test_blast_radius_reset_turn() {
+    fn denied_reservation_does_not_consume_run_quota() {
         let config = BlastRadiusConfig {
             enabled: true,
             mode: GuardrailMode::Strict,
-            allowed_paths: vec![],
-            denied_paths: vec![],
-            max_files_per_turn: 1,
+            max_files_per_run: std::num::NonZeroU32::new(1),
+            ..BlastRadiusConfig::default()
         };
-        let guard = BlastRadiusGuard::new(config);
+        let guard = Arc::new(BlastRadiusGuard::try_new(config).expect("valid quota"));
+        let pending = guard
+            .reserve(
+                PendingReservation {
+                    resources: HashSet::from([PathBuf::from("a.rs")]),
+                    ..PendingReservation::default()
+                },
+                Some("a.rs"),
+            )
+            .expect("first pending reservation");
+        assert!(guard
+            .reserve(
+                PendingReservation {
+                    resources: HashSet::from([PathBuf::from("b.rs")]),
+                    ..PendingReservation::default()
+                },
+                Some("b.rs")
+            )
+            .is_err());
+        drop(pending);
+        assert!(guard
+            .reserve(
+                PendingReservation {
+                    resources: HashSet::from([PathBuf::from("b.rs")]),
+                    ..PendingReservation::default()
+                },
+                Some("b.rs")
+            )
+            .is_ok());
+    }
 
-        assert!(guard.record_access("file1.rs").is_ok());
-        assert!(guard.record_access("file2.rs").is_err());
+    #[test]
+    fn concurrent_reservations_cannot_oversubscribe_one_run() {
+        let config = BlastRadiusConfig {
+            enabled: true,
+            mode: GuardrailMode::Strict,
+            max_tool_calls_per_run: std::num::NonZeroU32::new(1),
+            ..BlastRadiusConfig::default()
+        };
+        let guard = Arc::new(BlastRadiusGuard::try_new(config).expect("valid quota"));
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let finish = Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let guard = Arc::clone(&guard);
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let mut reservation = guard.reserve(
+                    PendingReservation {
+                        tool_calls: 1,
+                        ..PendingReservation::default()
+                    },
+                    None,
+                );
+                // The winning reservation remains pending until both threads
+                // have attempted admission, so the loser cannot slip through
+                // between reserve and commit.
+                finish.wait();
+                reservation.as_mut().is_ok_and(|reservation| {
+                    reservation.commit();
+                    true
+                })
+            }));
+        }
+        let admitted = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("reservation worker"))
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 1, "atomic quota must admit exactly one caller");
+    }
 
-        guard.reset_turn();
-        assert!(guard.record_access("file3.rs").is_ok());
+    #[test]
+    fn invalid_policy_patterns_fail_compilation() {
+        let config = BlastRadiusConfig {
+            enabled: true,
+            mode: GuardrailMode::Strict,
+            allowed_paths: vec!["src/../secrets/**".to_string()],
+            ..BlastRadiusConfig::default()
+        };
+        let Err(error) = BlastRadiusGuard::try_new(config) else {
+            panic!("ambiguous traversal policy must fail closed");
+        };
+        assert!(error.contains("parent traversal"), "{error}");
     }
 
     // ====== Diff monitor tests ======
@@ -2040,9 +2810,8 @@ mod tests {
     // they must serialize against one another. We use a dedicated
     // mutex because each test wants to start from a known state.
     //
-    // Every #749 test restores the state to `Disabled` on the way
-    // out so concurrent tools tests (write.rs / edit.rs / notebook.rs)
-    // that call `check_file_access` against the global keep observing
+    // Every #749 test restores the state to `Disabled` on the way out so
+    // concurrent canonical-executor and file-reservation tests keep observing
     // the "no policy" allow path.
 
     static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2060,12 +2829,12 @@ mod tests {
                 mode: GuardrailMode::Strict,
                 allowed_paths: vec![],
                 denied_paths: vec![deny_glob.to_string()],
-                max_files_per_turn: 0,
+                ..BlastRadiusConfig::default()
             }),
             diff_monitor: None,
             quality_gates: None,
         };
-        GuardrailsEngine::from_config(&cfg)
+        GuardrailsEngine::try_from_config(&cfg).expect("valid test guardrails")
     }
 
     fn isolated_run(root: &Path) -> std::sync::Arc<crate::tools::ToolRunContext> {
@@ -2103,7 +2872,7 @@ mod tests {
                 mode: GuardrailMode::Strict,
                 allowed_paths: Vec::new(),
                 denied_paths: vec!["**/secret.txt".to_string()],
-                max_files_per_turn: 0,
+                ..BlastRadiusConfig::default()
             }),
             diff_monitor: Some(DiffMonitorConfig {
                 enabled: true,
@@ -2117,7 +2886,7 @@ mod tests {
                 mode: GuardrailMode::Strict,
                 allowed_paths: Vec::new(),
                 denied_paths: Vec::new(),
-                max_files_per_turn: 0,
+                ..BlastRadiusConfig::default()
             }),
             diff_monitor: Some(DiffMonitorConfig {
                 enabled: true,
@@ -2125,8 +2894,8 @@ mod tests {
             }),
             quality_gates: None,
         };
-        configure(&run_a, &config_a);
-        configure(&run_b, &config_b);
+        configure(&run_a, &config_a).expect("first run config");
+        configure(&run_b, &config_b).expect("second run config");
 
         assert!(check_file_access(&run_a, "nested/secret.txt").is_err());
         assert!(check_file_access(&run_b, "nested/secret.txt").is_ok());
@@ -2153,7 +2922,7 @@ mod tests {
                 mode: GuardrailMode::Strict,
                 allowed_paths: Vec::new(),
                 denied_paths: vec!["**/generation-secret.txt".to_string()],
-                max_files_per_turn: 0,
+                ..BlastRadiusConfig::default()
             }),
             diff_monitor: None,
             quality_gates: None,
@@ -2164,13 +2933,13 @@ mod tests {
                 mode: GuardrailMode::Strict,
                 allowed_paths: Vec::new(),
                 denied_paths: Vec::new(),
-                max_files_per_turn: 0,
+                ..BlastRadiusConfig::default()
             }),
             diff_monitor: None,
             quality_gates: None,
         };
-        configure(&run_a, &denied);
-        configure(&run_b, &allowed);
+        configure(&run_a, &denied).expect("denied generation config");
+        configure(&run_b, &allowed).expect("allowed generation config");
 
         assert!(check_file_access(&run_a, "generation-secret.txt").is_err());
         assert!(check_file_access(&run_b, "generation-secret.txt").is_ok());
@@ -2258,7 +3027,7 @@ mod tests {
         set_poisoned_for_test();
 
         let cfg = GuardrailsConfig::default();
-        configure(test_run(), &cfg);
+        assert!(configure(test_run(), &cfg).is_err());
 
         assert_eq!(
             current_state_kind(test_run()),
@@ -2279,7 +3048,6 @@ mod tests {
         assert!(run_quality_gates(test_run()).is_empty());
         assert!(get_diff_summary(test_run()).is_none());
         record_file_modification(test_run(), "any.rs", 1, 0);
-        reset_turn(test_run());
 
         set_state_for_test(test_run(), GuardrailsState::Disabled);
     }
@@ -2291,8 +3059,8 @@ mod tests {
         // not allocate a real engine. This is what makes the global
         // API safe for the existing tools tests.
         let _serialize = lock_global_for_test();
-        set_state_for_test(test_run(), GuardrailsState::Disabled);
-        configure(test_run(), &GuardrailsConfig::default());
+        release_run(test_run());
+        configure(test_run(), &GuardrailsConfig::default()).expect("disabled config");
         assert_eq!(current_state_kind(test_run()), "disabled");
         assert!(check_file_access(test_run(), "any/file.rs").is_ok());
     }

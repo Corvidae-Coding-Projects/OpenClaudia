@@ -1409,7 +1409,26 @@ pub async fn run_subagent(
     app_config: &AppConfig,
     client: &Client,
 ) -> SubagentResult {
-    run_subagent_inner(parent_run, config, app_config, client, None).await
+    run_subagent_inner(parent_run, config, app_config, client, None, None).await
+}
+
+async fn run_subagent_with_effect_receipt(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    config: &SubagentConfig,
+    app_config: &AppConfig,
+    client: &Client,
+) -> (SubagentResult, bool) {
+    let effect_started = AtomicBool::new(false);
+    let result = run_subagent_inner(
+        parent_run,
+        config,
+        app_config,
+        client,
+        None,
+        Some(&effect_started),
+    )
+    .await;
+    (result, effect_started.load(Ordering::SeqCst))
 }
 
 fn validate_and_render_subagent_final_response(
@@ -1429,6 +1448,7 @@ async fn run_subagent_inner(
     app_config: &AppConfig,
     client: &Client,
     preallocated_agent_id: Option<&str>,
+    effect_receipt: Option<&AtomicBool>,
 ) -> SubagentResult {
     // Handle resume: reuse the *original* agent_id and load transcript.
     //
@@ -1522,6 +1542,9 @@ async fn run_subagent_inner(
         })];
         (id, msgs)
     };
+    if let Some(receipt) = effect_receipt {
+        receipt.store(true, Ordering::SeqCst);
+    }
     let task_obs = crate::grounded_loop::observe_session_user_task(
         &agent_id,
         &format!("Subagent task: {}\n\n{}", config.task, config.prompt),
@@ -1630,6 +1653,16 @@ async fn run_subagent_inner(
             };
         }
     };
+    if let Err(error) = crate::guardrails::configure(&subagent_run, &app_config.guardrails) {
+        return SubagentResult {
+            agent_id,
+            success: false,
+            output: format!("Cannot bind subagent guardrails: {error}"),
+            turns_used: 0,
+            is_background: config.run_in_background,
+            worktree,
+        };
+    }
 
     let mut subagent_context = vec![crate::context::ContextItem::host_instruction(
         "subagent.role_policy",
@@ -2503,32 +2536,36 @@ fn observe_subagent_tool_result(
 
 // === Tool Execution ===
 
-/// Execute the Task tool
+fn no_task_effect((content, is_error): (String, bool)) -> (String, bool, bool) {
+    (content, is_error, false)
+}
+
+/// Execute the Task tool and retain whether registration made a real effect.
 #[allow(clippy::too_many_lines)]
-pub fn execute_task_tool<S: BuildHasher>(
+fn execute_task_tool_with_receipt<S: BuildHasher>(
     parent_run: &Arc<crate::tools::ToolRunContext>,
     args: &HashMap<String, Value, S>,
     app_config: &AppConfig,
-) -> (String, bool) {
+) -> (String, bool, bool) {
     let description = match args.arg_str_strict("description") {
         Ok(description) => description,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let prompt = match args.arg_str_strict("prompt") {
         Ok(prompt) => prompt,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     // Handle resume: if resume ID is provided, load previous transcript
     let resume_id = match args.arg_str_opt_strict("resume") {
         Ok(resume) => resume.map(String::from),
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let subagent_type_str = match args.arg_str_strict("subagent_type") {
         Ok(subagent_type) => subagent_type,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let Some(agent_type) = AgentType::parse_task_type(subagent_type_str) else {
@@ -2538,23 +2575,24 @@ pub fn execute_task_tool<S: BuildHasher>(
                 "Unsupported task subagent_type '{subagent_type_str}'. Valid types: {valid_types}"
             ),
             true,
+            false,
         );
     };
 
     let run_in_background = match args.arg_bool_or_strict("run_in_background", false) {
         Ok(value) => value,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     // Resolve model: map friendly names to actual model IDs
     let model_override = match args.arg_str_opt_strict("model") {
         Ok(model) => model.map(|m| resolve_model_name(m, &app_config.proxy.target)),
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let isolation = match args.arg_str_opt_strict("isolation") {
         Ok(isolation) => isolation.map(String::from),
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let config = SubagentConfig {
@@ -2584,12 +2622,12 @@ pub fn execute_task_tool<S: BuildHasher>(
             match BACKGROUND_AGENTS.register_with_id(parent_run, agent_type, description, resume_id)
             {
                 Ok(_) => resume_id.clone(),
-                Err(error) => return (error, true),
+                Err(error) => return (error, true, false),
             }
         } else {
             match BACKGROUND_AGENTS.register(parent_run, agent_type, description) {
                 Ok(id) => id,
-                Err(error) => return (error, true),
+                Err(error) => return (error, true, false),
             }
         };
 
@@ -2614,6 +2652,7 @@ pub fn execute_task_tool<S: BuildHasher>(
             return (
                 "Background task requires an active tokio runtime".to_string(),
                 true,
+                true,
             );
         };
         let join_handle = handle.spawn(async move {
@@ -2623,6 +2662,7 @@ pub fn execute_task_tool<S: BuildHasher>(
                 &app_config_bg,
                 &client_bg,
                 preallocated_agent_id_bg.as_deref(),
+                None,
             )
             .await;
 
@@ -2644,11 +2684,52 @@ pub fn execute_task_tool<S: BuildHasher>(
             "Background agent started with ID: {agent_id}\nTask: {description}\nType: {agent_type:?}\n\nUse agent_output with this agent_id to retrieve results."
         );
 
-        (message, false)
+        (message, false, true)
     } else {
         // Run synchronously via defensive runtime dispatch (#719).
         dispatch_subagent_sync(parent_run, &config, app_config, &client)
     }
+}
+
+fn bind_subagent_legacy_result(
+    content: String,
+    is_error: bool,
+    effect_observed: bool,
+) -> crate::tools::ToolHandlerResult {
+    if !is_error {
+        return crate::tools::ToolHandlerResult::success_text(content);
+    }
+    let failure = crate::tools::ToolFailure::new(
+        crate::tools::ToolFailureCode::External,
+        content.clone(),
+        crate::tools::ToolRetryability::Unknown,
+    );
+    if effect_observed {
+        crate::tools::ToolHandlerResult::partial_text(content, vec![failure])
+    } else {
+        crate::tools::ToolHandlerResult::error(failure)
+    }
+}
+
+/// Legacy task-tool projection retained for direct compatibility tests.
+pub fn execute_task_tool<S: BuildHasher>(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    args: &HashMap<String, Value, S>,
+    app_config: &AppConfig,
+) -> (String, bool) {
+    let (content, is_error, _) = execute_task_tool_with_receipt(parent_run, args, app_config);
+    (content, is_error)
+}
+
+/// Canonical task-tool adapter retaining an explicit causal effect receipt.
+pub fn execute_task_tool_typed<S: BuildHasher>(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    args: &HashMap<String, Value, S>,
+    app_config: &AppConfig,
+) -> crate::tools::ToolHandlerResult {
+    let (content, is_error, effect_started) =
+        execute_task_tool_with_receipt(parent_run, args, app_config);
+    bind_subagent_legacy_result(content, is_error, effect_started)
 }
 
 /// Synchronous-call-from-tool-dispatch path for `run_subagent`.
@@ -2673,11 +2754,13 @@ fn dispatch_subagent_sync(
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
-) -> (String, bool) {
-    let result = match Handle::try_current() {
+) -> (String, bool, bool) {
+    let (result, effect_started) = match Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
-                handle.block_on(run_subagent(parent_run, config, app_config, client))
+                handle.block_on(run_subagent_with_effect_receipt(
+                    parent_run, config, app_config, client,
+                ))
             }),
             _ => {
                 return (
@@ -2686,13 +2769,16 @@ fn dispatch_subagent_sync(
                      a multi_thread runtime or from the async tool dispatcher."
                         .to_string(),
                     true,
+                    false,
                 );
             }
         },
         Err(_) => match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(run_subagent(parent_run, config, app_config, client)),
+            Ok(rt) => rt.block_on(run_subagent_with_effect_receipt(
+                parent_run, config, app_config, client,
+            )),
             Err(e) => {
-                return (format!("Failed to create runtime: {e}"), true);
+                return (format!("Failed to create runtime: {e}"), true, false);
             }
         },
     };
@@ -2710,24 +2796,29 @@ fn dispatch_subagent_sync(
                 wt.branch_name
             );
         }
-        (message, false)
+        (message, false, effect_started)
     } else {
-        (format!("Agent failed: {}", result.output), true)
+        (
+            format!("Agent failed: {}", result.output),
+            true,
+            effect_started,
+        )
     }
 }
 
-/// Execute the `AgentOutput` tool
-pub fn execute_agent_output_tool<S: BuildHasher>(
+/// Execute the `AgentOutput` tool and retain whether a finished entry was
+/// consumed from the exact-run manager.
+fn execute_agent_output_tool_with_receipt<S: BuildHasher>(
     owner: &crate::tools::ToolRunContext,
     args: &HashMap<String, Value, S>,
-) -> (String, bool) {
+) -> (String, bool, bool) {
     let agent_id = match args.arg_str_opt_strict("agent_id") {
         Ok(Some(agent_id)) => agent_id,
         Ok(None) => {
             // List all agents if no ID provided
             let agents = BACKGROUND_AGENTS.list_for_run(owner);
             if agents.is_empty() {
-                return ("No background agents running.".to_string(), false);
+                return ("No background agents running.".to_string(), false, false);
             }
             let mut result = format!("Background agents ({}):\n", agents.len());
             for (id, agent_type, task, finished) in agents {
@@ -2739,18 +2830,18 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
                 };
                 let _ = writeln!(result, "  {id} [{agent_type:?}] [{status}]: {task_preview}");
             }
-            return (result, false);
+            return (result, false, false);
         }
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let block = match args.arg_bool_or_strict("block", false) {
         Ok(value) => value,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let Some(agent) = BACKGROUND_AGENTS.get_for_run(owner, agent_id) else {
-        return (format!("Agent '{agent_id}' not found"), true);
+        return (format!("Agent '{agent_id}' not found"), true, false);
     };
 
     if block && !agent.finished.load(Ordering::SeqCst) {
@@ -2813,7 +2904,7 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
         drop(agent);
         let _ = BACKGROUND_AGENTS.remove_for_run(owner, agent_id);
 
-        error.map_or_else(
+        let (content, is_error) = error.map_or_else(
             || {
                 result.map_or_else(
                     || {
@@ -2836,7 +2927,8 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
                     true,
                 )
             },
-        )
+        );
+        (content, is_error, true)
     } else {
         (
             format!(
@@ -2844,8 +2936,31 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
                 agent.task
             ),
             false,
+            false,
         )
     }
+}
+
+/// Legacy output projection retained for compatibility tests.
+pub fn execute_agent_output_tool<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    let (content, is_error, _) = execute_agent_output_tool_with_receipt(owner, args);
+    (content, is_error)
+}
+
+/// Canonical output adapter.
+///
+/// Consuming a finished failed agent removes its manager entry; preserve that
+/// mutation as partial rather than releasing the enclosing effect reservation
+/// merely because the agent itself failed.
+pub fn execute_agent_output_tool_typed<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> crate::tools::ToolHandlerResult {
+    let (content, is_error, effect_started) = execute_agent_output_tool_with_receipt(owner, args);
+    bind_subagent_legacy_result(content, is_error, effect_started)
 }
 
 /// Execute the `TaskStop` tool.
@@ -3149,6 +3264,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subagent_binds_guardrails_before_any_provider_turn() {
+        let mut app_config = issue719_app_config();
+        app_config.guardrails.blast_radius = Some(crate::config::BlastRadiusConfig {
+            enabled: true,
+            mode: crate::config::GuardrailMode::Strict,
+            allowed_paths: vec!["src/../forbidden/**".to_string()],
+            ..crate::config::BlastRadiusConfig::default()
+        });
+        let config = SubagentConfig {
+            agent_type: AgentType::GeneralPurpose,
+            task: "Must fail before provider dispatch".to_string(),
+            prompt: "No request should leave the process".to_string(),
+            run_in_background: false,
+            model_override: None,
+            resume_agent_id: None,
+            isolation: None,
+        };
+
+        let result = run_subagent(test_run(), &config, &app_config, &Client::new()).await;
+
+        assert!(!result.success);
+        assert_eq!(result.turns_used, 0);
+        assert!(
+            result.output.contains("Cannot bind subagent guardrails"),
+            "unexpected child-startup failure: {}",
+            result.output
+        );
+        assert!(result.output.contains("parent traversal"));
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &result.agent_id);
+    }
+
+    #[test]
+    fn task_tool_receipt_distinguishes_validation_error_from_started_failure() {
+        let empty = HashMap::<String, Value>::new();
+        let validation = execute_task_tool_typed(test_run(), &empty, &issue719_app_config());
+        assert!(matches!(
+            validation.outcome,
+            crate::tools::ToolOutcome::Error { .. }
+        ));
+
+        let marker = "s-021-invalid-child-guardrail-receipt";
+        let mut app_config = issue719_app_config();
+        app_config.guardrails.blast_radius = Some(crate::config::BlastRadiusConfig {
+            enabled: true,
+            mode: crate::config::GuardrailMode::Strict,
+            allowed_paths: vec!["src/../forbidden/**".to_string()],
+            ..crate::config::BlastRadiusConfig::default()
+        });
+        let args = HashMap::from([
+            ("description".to_string(), json!(marker)),
+            ("prompt".to_string(), json!("fail before provider dispatch")),
+            ("subagent_type".to_string(), json!("explore")),
+        ]);
+
+        let started = execute_task_tool_typed(test_run(), &args, &app_config);
+
+        assert!(
+            matches!(&started.outcome, crate::tools::ToolOutcome::Partial { .. }),
+            "registered child failure must retain a partial receipt: {}",
+            started.content()
+        );
+        assert!(started
+            .content()
+            .contains("Cannot bind subagent guardrails"));
+        for (id, _, task, _) in BACKGROUND_AGENTS.list_for_run(test_run()) {
+            if task == marker {
+                let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &id);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_output_failed_consumption_is_typed_partial() {
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Explore, "s-021-failed-output")
+            .expect("register failed output fixture");
+        BACKGROUND_AGENTS.fail(test_run(), &id, "provider failed".to_string());
+        let args = HashMap::from([("agent_id".to_string(), json!(id))]);
+
+        let result = execute_agent_output_tool_typed(test_run(), &args);
+
+        assert!(
+            matches!(&result.outcome, crate::tools::ToolOutcome::Partial { .. }),
+            "failed output removal is a real effect"
+        );
+        assert!(result.content().contains("provider failed"));
+    }
+
+    #[tokio::test]
     async fn subagent_no_tool_plain_final_is_allowed() {
         let agent_id = "subagent-no-tool-final-allowed";
         let ledger_path =
@@ -3170,8 +3374,15 @@ mod tests {
         };
         let client = Client::new();
 
-        let result =
-            run_subagent_inner(test_run(), &config, &app_config, &client, Some(agent_id)).await;
+        let result = run_subagent_inner(
+            test_run(),
+            &config,
+            &app_config,
+            &client,
+            Some(agent_id),
+            None,
+        )
+        .await;
         let server_result = server.join().expect("mock provider thread joined");
 
         assert!(
@@ -3211,8 +3422,15 @@ mod tests {
         };
         let client = Client::new();
 
-        let result =
-            run_subagent_inner(test_run(), &config, &app_config, &client, Some(agent_id)).await;
+        let result = run_subagent_inner(
+            test_run(),
+            &config,
+            &app_config,
+            &client,
+            Some(agent_id),
+            None,
+        )
+        .await;
         let server_result = server.join().expect("mock provider thread joined");
 
         assert!(

@@ -11,8 +11,10 @@ pub use edit::execute_edit_file;
 pub use glob::execute_glob;
 pub use grep::execute_grep;
 pub use list::execute_list_files;
-#[allow(unused_imports)] // used by tests in tools::mod
-pub use notebook::{execute_notebook_edit, source_to_line_array};
+#[cfg(test)]
+pub use notebook::execute_notebook_edit;
+pub use notebook::execute_notebook_edit_typed;
+pub use notebook::source_to_line_array;
 #[allow(unused_imports)] // used by tests in tools::mod
 pub use read::{
     detect_file_type, parse_page_range, read_image_file, read_notebook_file, read_text_file,
@@ -248,7 +250,7 @@ fn project_root(run: &super::security::ToolRunContext) -> Result<PathBuf, String
     Ok(run.project_root().to_path_buf())
 }
 
-fn resolve_path(run: &super::security::ToolRunContext, path: &str) -> Result<PathBuf, String> {
+pub fn resolve_path(run: &super::security::ToolRunContext, path: &str) -> Result<PathBuf, String> {
     run.require(super::security::ToolResource::WorkspaceRead)
         .map_err(|error| error.to_string())?;
     let security = run;
@@ -391,18 +393,45 @@ pub fn create_capability_text_file(
 ) -> Result<PathBuf, String> {
     let resolved = resolve_path(run, user_path)?;
     let open_path = resolve_open_path(run, user_path)?;
-    crate::guardrails::check_file_access(run, &resolved.to_string_lossy())?;
+    let mut effect_reservation =
+        crate::guardrails::reserve_workspace_mutation(run, &resolved.to_string_lossy())?;
+    let (lines_added, lines_removed) = changed_line_counts("", content);
+    let mut line_reservation = crate::guardrails::reserve_changed_lines(
+        run,
+        u64::from(lines_added) + u64::from(lines_removed),
+    )?;
     let (mut file, existed) = secure_fs::open_regular_update_or_create(run, &open_path)?;
     if existed {
         return Err(format!("File '{}' already exists", resolved.display()));
     }
-    file.write_all(content.as_bytes())
-        .map_err(|error| format!("Failed to write '{}': {error}", resolved.display()))?;
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        // `existed == false` proves the descriptor open created the target, so
+        // this is a partial mutation even if zero payload bytes were durable.
+        // Reconcile what can be observed and conservatively commit both
+        // reservations before returning the legacy error surface.
+        if let Ok(actual_content) = secure_fs::read_to_string(&mut file, &resolved) {
+            let (actual_added, actual_removed) = changed_line_counts("", &actual_content);
+            line_reservation
+                .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
+            crate::guardrails::record_file_modification(
+                run,
+                &resolved.to_string_lossy(),
+                actual_added,
+                actual_removed,
+            );
+        } else {
+            line_reservation.commit();
+        }
+        effect_reservation.commit();
+        return Err(format!("Failed to write '{}': {error}", resolved.display()));
+    }
+    line_reservation.commit();
+    effect_reservation.commit();
     crate::guardrails::record_file_modification(
         run,
         &resolved.to_string_lossy(),
-        u32::try_from(content.lines().count()).unwrap_or(u32::MAX),
-        0,
+        lines_added,
+        lines_removed,
     );
     Ok(resolved)
 }
@@ -761,6 +790,24 @@ fn count_display_lines(text: &str) -> usize {
     text.lines().count().max(1)
 }
 
+/// Count inserted and deleted lines in the exact before/after payload.
+///
+/// This is shared by file writers, blast-radius reservations, diff-monitor
+/// accounting, and reality-ledger output so all four boundaries use the same
+/// unit instead of estimating from input fragments.
+pub(super) fn changed_line_counts(before: &str, after: &str) -> (u32, u32) {
+    let mut added = 0_u32;
+    let mut removed = 0_u32;
+    for change in TextDiff::from_lines(before, after).iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => added = added.saturating_add(1),
+            similar::ChangeTag::Delete => removed = removed.saturating_add(1),
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (added, removed)
+}
+
 pub(super) fn record_active_diff_observation(
     run: &super::security::ToolRunContext,
     path: &str,
@@ -829,6 +876,18 @@ mod tests {
         // previously allowed concurrent corruption of READ_TRACKER
         // state across sibling test modules.
         super::shared_tracker_lock()
+    }
+
+    #[test]
+    fn changed_line_counts_use_the_exact_before_after_diff() {
+        assert_eq!(changed_line_counts("", "one\ntwo\n"), (2, 0));
+        assert_eq!(changed_line_counts("one\ntwo\n", "one\nthree\n"), (1, 1));
+        assert_eq!(changed_line_counts("same\n", "same\n"), (0, 0));
+        assert_eq!(
+            changed_line_counts("same\n", "same"),
+            (1, 1),
+            "trailing-newline changes must not disappear from line accounting"
+        );
     }
 
     #[cfg(unix)]

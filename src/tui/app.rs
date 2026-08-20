@@ -964,6 +964,14 @@ impl App {
             }
         };
         let permission_bypass = self.chat_session.permission_bypass_enabled();
+        if let Some(config) = self.app_config.as_ref() {
+            if let Err(error) = crate::guardrails::configure(&next_run, &config.guardrails) {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Session guardrails configuration is invalid: {error}"
+                )));
+                return false;
+            }
+        }
 
         // Flush the old snapshot before replacement. Subscribers stay attached
         // because `apply_loaded` replaces the shared store in place.
@@ -974,9 +982,6 @@ impl App {
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
         self.run_context = Ok(std::sync::Arc::clone(&next_run));
-        if let Some(config) = self.app_config.as_ref() {
-            crate::guardrails::configure(&next_run, &config.guardrails);
-        }
         self.rebind_permission_manager(&next_run);
         self.refresh_prompt_context_for_run();
         self.rebind_mcp_runtime(&next_run);
@@ -1311,6 +1316,15 @@ impl App {
             }
         };
 
+        if let Some(config) = self.app_config.as_ref() {
+            if let Err(error) = crate::guardrails::configure(&next_run, &config.guardrails) {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Provider guardrails configuration is invalid: {error}"
+                )));
+                return;
+            }
+        }
+
         crate::tools::retire_run(&current_run);
         self.run_context = Ok(std::sync::Arc::clone(&next_run));
         self.provider = provider;
@@ -1319,9 +1333,6 @@ impl App {
         self.chat_session.model.clone_from(&self.model);
         self.chat_session.touch();
         self.refresh_app_config_target();
-        if let Some(config) = self.app_config.as_ref() {
-            crate::guardrails::configure(&next_run, &config.guardrails);
-        }
         self.rebind_permission_manager(&next_run);
 
         self.set_api_config(
@@ -3031,9 +3042,6 @@ impl App {
             "content": expanded
         }));
 
-        if let Ok(run) = &self.run_context {
-            crate::guardrails::reset_turn(run);
-        }
         self.is_waiting = true;
         self.spawn_api_turn();
     }

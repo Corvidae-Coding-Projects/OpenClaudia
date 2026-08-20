@@ -103,6 +103,9 @@ blast_radius:
   denied_paths:
     - '.env'
   max_files_per_turn: 5
+  max_lines_per_run: 200
+  max_tool_calls_per_run: 50
+  max_mutations_per_run: 20
 diff_monitor:
   enabled: true
   max_lines_changed: 200
@@ -124,7 +127,19 @@ quality_gates:
     assert_eq!(br.mode, GuardrailMode::Strict);
     assert_eq!(br.allowed_paths, vec!["src/**".to_string()]);
     assert_eq!(br.denied_paths, vec![".env".to_string()]);
-    assert_eq!(br.max_files_per_turn, 5);
+    assert_eq!(br.max_files_per_run.map(std::num::NonZeroU32::get), Some(5));
+    assert_eq!(
+        br.max_lines_per_run.map(std::num::NonZeroU32::get),
+        Some(200)
+    );
+    assert_eq!(
+        br.max_tool_calls_per_run.map(std::num::NonZeroU32::get),
+        Some(50)
+    );
+    assert_eq!(
+        br.max_mutations_per_run.map(std::num::NonZeroU32::get),
+        Some(20)
+    );
 
     let dm = cfg.diff_monitor.expect("diff_monitor");
     assert!(dm.enabled);
@@ -148,13 +163,31 @@ quality_gates:
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn blast_radius_default_is_disabled_advisory_and_unlimited() {
+fn blast_radius_default_is_disabled_advisory_and_has_no_run_limits() {
     let cfg = BlastRadiusConfig::default();
     assert!(!cfg.enabled);
     assert_eq!(cfg.mode, GuardrailMode::Advisory);
     assert!(cfg.allowed_paths.is_empty());
     assert!(cfg.denied_paths.is_empty());
-    assert_eq!(cfg.max_files_per_turn, 0);
+    assert!(cfg.max_files_per_run.is_none());
+    assert!(cfg.max_lines_per_run.is_none());
+    assert!(cfg.max_tool_calls_per_run.is_none());
+    assert!(cfg.max_mutations_per_run.is_none());
+}
+
+#[test]
+fn blast_radius_zero_and_ambiguous_legacy_limits_fail_deserialization() {
+    let zero = serde_yaml::from_str::<BlastRadiusConfig>("max_files_per_run: 0")
+        .expect_err("zero must not ambiguously mean unlimited");
+    assert!(zero.to_string().contains("nonzero"), "{zero}");
+
+    let duplicate =
+        serde_yaml::from_str::<BlastRadiusConfig>("max_files_per_run: 2\nmax_files_per_turn: 3\n")
+            .expect_err("legacy and canonical keys together are ambiguous");
+    assert!(
+        duplicate.to_string().contains("duplicate field"),
+        "{duplicate}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

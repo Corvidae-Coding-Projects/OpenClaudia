@@ -1560,6 +1560,7 @@ async fn proxy_chat_completions(
 /// permission is refused, if the MCP server is not connected, or if the tool
 /// call fails.
 pub async fn handle_mcp_tool_call(
+    run: &Arc<crate::tools::ToolRunContext>,
     mcp_manager: &Arc<RwLock<McpManager>>,
     permission_mgr: &crate::permissions::PermissionManager,
     tool_name: &str,
@@ -1609,8 +1610,21 @@ pub async fn handle_mcp_tool_call(
             ))
         })?;
 
-    // Call the tool
-    match mcp.call_tool(tool_name, arguments).await {
+    let resolved = crate::tools::effect::resolve_for_call(tool_name, &arguments)
+        .map_err(|error| ProxyError::InvalidBody(error.reason()))?;
+    let mut guardrail_reservation = crate::guardrails::reserve_tool_effect(run, &resolved)
+        .map_err(|reason| {
+            ProxyError::InvalidBody(format!("Blocked by blast radius guardrails: {reason}"))
+        })?;
+
+    // Crossing into the remote call is the irreversible dispatch boundary: a
+    // transport/protocol error or cancellation while awaiting the response
+    // cannot prove that the server performed no effect. Commit immediately
+    // before polling that future; failures before this boundary still release.
+    guardrail_reservation.commit();
+    let result = mcp.call_tool(tool_name, arguments).await;
+    drop(mcp);
+    match result {
         Ok(result) => Ok(result),
         Err(e) => Err(ProxyError::InvalidBody(format!(
             "MCP tool call failed: {e}"
@@ -2416,7 +2430,7 @@ async fn build_proxy_state_with_loop_control(
     let mcp_manager = Arc::new(RwLock::new(McpManager::new(Arc::clone(&run_context))));
     connect_mcp_servers(&mcp_manager, &plugin_manager).await;
     let _ = crate::mcp::install_manager(&run_context, &mcp_manager);
-    crate::guardrails::configure(&run_context, &config.guardrails);
+    crate::guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
 
     // Initialize OAuth store for Claude Max authentication
     let oauth_store = Arc::new(OAuthStore::new());
@@ -2851,9 +2865,15 @@ mod tests {
     async fn dynamic_mcp_dispatch_denies_malformed_name_before_manager_access() {
         let mcp = Arc::new(RwLock::new(McpManager::new(Arc::clone(test_run()))));
         let permissions = crate::permissions::PermissionManager::unrestricted();
-        let error = handle_mcp_tool_call(&mcp, &permissions, "mcp__", serde_json::json!({}))
-            .await
-            .expect_err("malformed dynamic name must deny");
+        let error = handle_mcp_tool_call(
+            test_run(),
+            &mcp,
+            &permissions,
+            "mcp__",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("malformed dynamic name must deny");
         assert!(error.to_string().contains("no effect classification"));
     }
 
@@ -2862,6 +2882,7 @@ mod tests {
         let mcp = Arc::new(RwLock::new(McpManager::new(Arc::clone(test_run()))));
         let (permissions, _dir) = mcp_permission_manager(None);
         let error = handle_mcp_tool_call(
+            test_run(),
             &mcp,
             &permissions,
             "mcp__server__delete",
@@ -2882,9 +2903,15 @@ mod tests {
         let mcp = Arc::new(RwLock::new(McpManager::new(Arc::clone(test_run()))));
         let target = "mcp__server__delete";
         let (permissions, _dir) = mcp_permission_manager(Some(target));
-        let error = handle_mcp_tool_call(&mcp, &permissions, target, serde_json::json!({"id": 1}))
-            .await
-            .expect_err("test manager has no connected server");
+        let error = handle_mcp_tool_call(
+            test_run(),
+            &mcp,
+            &permissions,
+            target,
+            serde_json::json!({"id": 1}),
+        )
+        .await
+        .expect_err("test manager has no connected server");
         assert!(error.to_string().contains("not connected"));
     }
 

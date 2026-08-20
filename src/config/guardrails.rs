@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::fmt;
+use std::num::NonZeroU32;
 
 use super::default_true;
 
@@ -98,9 +99,23 @@ pub struct BlastRadiusConfig {
     /// Glob patterns for denied file paths (takes priority over allowed)
     #[serde(default)]
     pub denied_paths: Vec<String>,
-    /// Maximum files the agent can modify per turn (0 = unlimited)
+    /// Maximum distinct capability-resolved paths admitted during one run.
+    ///
+    /// `max_files_per_turn` remains a deserialization alias so existing
+    /// non-zero configurations migrate without silently changing which value
+    /// wins. Supplying both names is a duplicate-field error, and zero is
+    /// rejected by [`NonZeroU32`] instead of ambiguously meaning "unlimited".
+    #[serde(default, alias = "max_files_per_turn")]
+    pub max_files_per_run: Option<NonZeroU32>,
+    /// Maximum changed lines committed by file mutations during one run.
     #[serde(default)]
-    pub max_files_per_turn: u32,
+    pub max_lines_per_run: Option<NonZeroU32>,
+    /// Maximum classified tool calls committed during one run.
+    #[serde(default)]
+    pub max_tool_calls_per_run: Option<NonZeroU32>,
+    /// Maximum state-mutating tool calls committed during one run.
+    #[serde(default)]
+    pub max_mutations_per_run: Option<NonZeroU32>,
 }
 
 impl Default for BlastRadiusConfig {
@@ -110,7 +125,10 @@ impl Default for BlastRadiusConfig {
             mode: GuardrailMode::Advisory,
             allowed_paths: Vec::new(),
             denied_paths: Vec::new(),
-            max_files_per_turn: 0,
+            max_files_per_run: None,
+            max_lines_per_run: None,
+            max_tool_calls_per_run: None,
+            max_mutations_per_run: None,
         }
     }
 }

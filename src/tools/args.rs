@@ -168,6 +168,12 @@ pub enum ToolError {
     /// An external operation failed (subprocess, filesystem, HTTP, …).
     /// The message is the upstream error rendered for human consumption.
     External(String),
+    /// An external operation produced an observable effect before failing.
+    ///
+    /// The legacy tuple projection remains `(message, true)`, while the
+    /// canonical handler adapter preserves this as `ToolOutcome::Partial` so
+    /// effect accounting cannot mistake a failed completion for no effect.
+    PartialExternal(String),
     /// The permissions layer rejected the call. Distinct from
     /// `InvalidInput` so policy-enforcement code can surface the rejection
     /// distinctly from a user typo.
@@ -185,6 +191,7 @@ impl std::fmt::Display for ToolError {
             Self::InvalidInput(msg)
             | Self::Unavailable(msg)
             | Self::External(msg)
+            | Self::PartialExternal(msg)
             | Self::PermissionDenied(msg)
             | Self::Other(msg) => write!(f, "{msg}"),
         }

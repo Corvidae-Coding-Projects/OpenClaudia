@@ -487,7 +487,7 @@ impl ToolHandler for ReadFileHandler {
         }
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::read_only_arg("Read", "path")
+        ToolEffectSpec::read_only_path("Read", "path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -590,7 +590,7 @@ impl ToolHandler for WriteFileHandler {
         REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Write", "path")
+        ToolEffectSpec::effectful_path(ToolEffect::WorkspaceMutation, "Write", "path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -615,12 +615,12 @@ impl ToolHandler for WriteFileHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
+    ) -> ToolHandlerResult {
         file::execute_write_file(ctx.run, args)
     }
 }
@@ -637,7 +637,7 @@ impl ToolHandler for EditFileHandler {
         REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Edit", "path")
+        ToolEffectSpec::effectful_path(ToolEffect::WorkspaceMutation, "Edit", "path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -692,7 +692,7 @@ impl ToolHandler for NotebookEditHandler {
         REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Edit", "notebook_path")
+        ToolEffectSpec::effectful_path(ToolEffect::WorkspaceMutation, "Edit", "notebook_path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -735,13 +735,13 @@ impl ToolHandler for NotebookEditHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        file::execute_notebook_edit(ctx.run, args)
+    ) -> ToolHandlerResult {
+        file::execute_notebook_edit_typed(ctx.run, args)
     }
 }
 
@@ -751,7 +751,7 @@ impl ToolHandler for ListFilesHandler {
         "list_files"
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::read_only_arg_or_default("Read", "path", ".")
+        ToolEffectSpec::read_only_path_scope_or_default("Read", "path", ".")
     }
     fn definition(&self) -> Value {
         json!({
@@ -788,7 +788,7 @@ impl ToolHandler for GlobHandler {
         "glob"
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::read_only_arg_or_default("Read", "path", ".")
+        ToolEffectSpec::read_only_path_scope_or_default("Read", "path", ".")
     }
     fn definition(&self) -> Value {
         json!({
@@ -829,7 +829,7 @@ impl ToolHandler for GrepHandler {
         "grep"
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::read_only_arg_or_default("Read", "path", ".")
+        ToolEffectSpec::read_only_path_scope_or_default("Read", "path", ".")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1119,7 +1119,7 @@ impl ToolHandler for LspHandler {
         REQUIRES_PROCESS
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "Lsp", "file_path")
+        ToolEffectSpec::effectful_path(ToolEffect::ExternalMutation, "Lsp", "file_path")
     }
     fn definition(&self) -> Value {
         json!({
@@ -1418,7 +1418,7 @@ impl ToolHandler for ExitWorktreeHandler {
         REQUIRES_PROCESS_AND_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::typed_operation(ToolEffect::Destructive, "Worktree")
+        ToolEffectSpec::typed_operation_path(ToolEffect::Destructive, "Worktree")
     }
     /// `exit_worktree` is two different operations behind one name.
     ///

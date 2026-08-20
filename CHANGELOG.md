@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Implement and fully verify remediation slice S-021 (#1036)
 - Restore changelog to Crosslink close-event output (#1034)
 - Finalize S-020 publication closure audit (#1032)
 - Finalize S-020 publication closure audit (#1032)

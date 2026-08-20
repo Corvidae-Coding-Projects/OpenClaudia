@@ -772,11 +772,11 @@ pub(crate) fn find_git_bash(run: &crate::tools::ToolRunContext) -> Option<std::p
 /// A non-zero process exit still counts as a successful tool invocation —
 /// the renderer surfaces the stdout/stderr and the boolean exit-error flag
 /// has historically been encoded into the `(String, bool)` shape's bool.
-/// To preserve byte-identical output for downstream consumers (and the
-/// 80+ pinning tests), we return `Err(ToolError::External(...))` on
-/// non-zero exit so the collapsed tuple stays `(text, true)`. This is
-/// the load-bearing observable: do not "fix" it without updating the
-/// tests that pin the prior behaviour.
+/// To preserve byte-identical legacy output for downstream consumers (and the
+/// pinning tests), a non-zero exit returns
+/// `Err(ToolError::PartialExternal(...))`: its tuple projection remains
+/// `(text, true)`, while canonical dispatch retains the fact that the process
+/// ran and may already have changed state.
 ///
 /// # Errors
 ///
@@ -787,9 +787,10 @@ pub(crate) fn find_git_bash(run: &crate::tools::ToolRunContext) -> Option<std::p
 /// - [`ToolError::Unavailable`] when the run has no process capability.
 /// - [`ToolError::External`] when:
 ///   * the spawned process fails to start (no shell, permission denied,
-///     OS resource exhaustion), or
-///   * a non-zero exit status is returned (the message carries the
-///     captured stdout / stderr so the legacy renderer keeps working).
+///     OS resource exhaustion).
+/// - [`ToolError::PartialExternal`] when a started process times out,
+///   cannot be waited, or exits non-zero. The command may already have
+///   changed state, so canonical dispatch must commit its reservation.
 /// - [`ToolError::Other`] when the background shell manager refuses the
 ///   spawn (e.g. cap reached). Preserves the existing message verbatim.
 #[allow(clippy::too_many_lines)] // Validation, dispatch, capture, and rendering form one tool result.
@@ -888,8 +889,22 @@ pub fn try_execute_bash(
         )
     };
 
-    let output =
-        output.map_err(|e| ToolError::External(format!("Failed to execute command: {e}")))?;
+    let output = match output {
+        Ok(output) => output,
+        Err(super::command::CommandError::SpawnFailed { program, source }) => {
+            return Err(ToolError::External(format!(
+                "Failed to execute command: Failed to spawn {program}: {source}"
+            )));
+        }
+        Err(
+            error @ (super::command::CommandError::TimedOut { .. }
+            | super::command::CommandError::WaitFailed { .. }),
+        ) => {
+            return Err(ToolError::PartialExternal(format!(
+                "Failed to execute command after it started: {error}"
+            )));
+        }
+    };
     record_active_command_observation(run.session_id(), &cwd, command, &output);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -922,10 +937,9 @@ pub fn try_execute_bash(
     if output.status.success() {
         Ok(ToolOutput::text(result))
     } else {
-        // Non-zero exit collapses to `(message, true)` via `ToolError::External`
-        // so the legacy tuple shape stays byte-identical to the pre-migration
-        // executor. The message *is* the captured stdout+stderr.
-        Err(ToolError::External(result))
+        // The tuple projection stays `(message, true)`, but canonical dispatch
+        // must retain that the process ran and may have mutated state.
+        Err(ToolError::PartialExternal(result))
     }
 }
 

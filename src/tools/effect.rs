@@ -94,6 +94,19 @@ impl ToolEffect {
     pub const fn requires_authorization(self) -> bool {
         !matches!(self, Self::ReadOnly)
     }
+
+    /// Whether this effect changes user-, workspace-, session-, or
+    /// externally visible state.
+    #[must_use]
+    pub const fn is_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::SessionMutation
+                | Self::WorkspaceMutation
+                | Self::ExternalMutation
+                | Self::Destructive
+        )
+    }
 }
 
 /// How the concrete target of an invocation is recovered from its arguments.
@@ -142,6 +155,8 @@ pub struct ToolEffectSpec {
     pub canonical: &'static str,
     /// How to recover the per-call target string.
     pub target: ToolTarget,
+    /// How the recovered target must be normalized for resource policy.
+    pub target_kind: ToolTargetKind,
 }
 
 impl ToolEffectSpec {
@@ -152,6 +167,7 @@ impl ToolEffectSpec {
             effect: ToolEffect::ReadOnly,
             canonical,
             target: ToolTarget::ToolScope,
+            target_kind: ToolTargetKind::Tool,
         }
     }
 
@@ -162,6 +178,18 @@ impl ToolEffectSpec {
             effect: ToolEffect::ReadOnly,
             canonical,
             target: ToolTarget::Arg(arg_key),
+            target_kind: ToolTargetKind::Opaque,
+        }
+    }
+
+    /// Declare a read-only tool whose target is a workspace path.
+    #[must_use]
+    pub const fn read_only_path(canonical: &'static str, arg_key: &'static str) -> Self {
+        Self {
+            effect: ToolEffect::ReadOnly,
+            canonical,
+            target: ToolTarget::Arg(arg_key),
+            target_kind: ToolTargetKind::Path,
         }
     }
 
@@ -179,6 +207,45 @@ impl ToolEffectSpec {
                 key: arg_key,
                 default,
             },
+            target_kind: ToolTargetKind::Opaque,
+        }
+    }
+
+    /// Declare a read-only tool with an optional workspace-path target.
+    #[must_use]
+    pub const fn read_only_path_or_default(
+        canonical: &'static str,
+        arg_key: &'static str,
+        default: &'static str,
+    ) -> Self {
+        Self {
+            effect: ToolEffect::ReadOnly,
+            canonical,
+            target: ToolTarget::ArgOrDefault {
+                key: arg_key,
+                default,
+            },
+            target_kind: ToolTargetKind::Path,
+        }
+    }
+
+    /// Declare a read-only recursive/enumerating tool whose argument is the
+    /// root policy scope while concrete file identities are reserved by the
+    /// handler as they are discovered.
+    #[must_use]
+    pub const fn read_only_path_scope_or_default(
+        canonical: &'static str,
+        arg_key: &'static str,
+        default: &'static str,
+    ) -> Self {
+        Self {
+            effect: ToolEffect::ReadOnly,
+            canonical,
+            target: ToolTarget::ArgOrDefault {
+                key: arg_key,
+                default,
+            },
+            target_kind: ToolTargetKind::PathScope,
         }
     }
 
@@ -197,6 +264,7 @@ impl ToolEffectSpec {
                 key: arg_key,
                 default,
             },
+            target_kind: ToolTargetKind::Opaque,
         }
     }
 
@@ -211,6 +279,22 @@ impl ToolEffectSpec {
             effect,
             canonical,
             target: ToolTarget::Arg(arg_key),
+            target_kind: ToolTargetKind::Opaque,
+        }
+    }
+
+    /// Declare an effectful tool whose target is a workspace path.
+    #[must_use]
+    pub const fn effectful_path(
+        effect: ToolEffect,
+        canonical: &'static str,
+        arg_key: &'static str,
+    ) -> Self {
+        Self {
+            effect,
+            canonical,
+            target: ToolTarget::Arg(arg_key),
+            target_kind: ToolTargetKind::Path,
         }
     }
 
@@ -221,6 +305,7 @@ impl ToolEffectSpec {
             effect,
             canonical,
             target: ToolTarget::ToolScope,
+            target_kind: ToolTargetKind::Tool,
         }
     }
 
@@ -234,6 +319,19 @@ impl ToolEffectSpec {
             effect: ceiling,
             canonical,
             target: ToolTarget::TypedOperation,
+            target_kind: ToolTargetKind::Opaque,
+        }
+    }
+
+    /// Declare a multiplexed tool whose typed resolver returns a workspace
+    /// path target for every operation.
+    #[must_use]
+    pub const fn typed_operation_path(ceiling: ToolEffect, canonical: &'static str) -> Self {
+        Self {
+            effect: ceiling,
+            canonical,
+            target: ToolTarget::TypedOperation,
+            target_kind: ToolTargetKind::Path,
         }
     }
 
@@ -269,6 +367,18 @@ impl ToolEffectSpec {
                 ));
             }
         }
+        match (self.target, self.target_kind) {
+            (ToolTarget::ToolScope, ToolTargetKind::Tool)
+            | (
+                ToolTarget::Arg(_) | ToolTarget::ArgOrDefault { .. } | ToolTarget::TypedOperation,
+                ToolTargetKind::Path | ToolTargetKind::PathScope | ToolTargetKind::Opaque,
+            ) => {}
+            _ => {
+                return Err(format!(
+                    "tool '{tool_name}' declares an incompatible target shape and target kind"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -283,9 +393,30 @@ pub struct ResolvedEffect {
     pub canonical: String,
     /// Concrete target string for rule matching.
     pub target: String,
+    /// How the target must be normalized before resource-policy evaluation.
+    pub target_kind: ToolTargetKind,
     /// Operation label when the tool multiplexes several operations, used for
     /// the generated matrix and traces.
     pub operation: Option<String>,
+}
+
+/// Semantic kind of a declared tool target.
+///
+/// Path targets are resolved through the exact run capability before policy
+/// matching and quota admission. Opaque identifiers (commands, URLs, task
+/// IDs, remote handles) must never be guessed to be paths merely because a
+/// string happens to contain a slash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolTargetKind {
+    /// The canonical tool surface itself is the resource.
+    Tool,
+    /// A workspace path requiring capability-root normalization.
+    Path,
+    /// A directory/root policy scope. The canonical executor checks the root,
+    /// while the handler reserves each concrete file it discloses or reads.
+    PathScope,
+    /// A non-filesystem target whose spelling is already authoritative.
+    Opaque,
 }
 
 /// Why a tool invocation could not be classified.
@@ -360,6 +491,7 @@ pub fn resolve(
             effect: spec.effect,
             canonical: spec.canonical.to_string(),
             target: tool_name.to_string(),
+            target_kind: spec.target_kind,
             operation: None,
         }),
         ToolTarget::Arg(arg_key) => match args.get(arg_key) {
@@ -368,6 +500,7 @@ pub fn resolve(
                     effect: spec.effect,
                     canonical: spec.canonical.to_string(),
                     target: value.clone(),
+                    target_kind: spec.target_kind,
                     operation: None,
                 })
             }
@@ -385,6 +518,7 @@ pub fn resolve(
                 effect: spec.effect,
                 canonical: spec.canonical.to_string(),
                 target: default.to_string(),
+                target_kind: spec.target_kind,
                 operation: None,
             }),
             Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
@@ -392,6 +526,7 @@ pub fn resolve(
                     effect: spec.effect,
                     canonical: spec.canonical.to_string(),
                     target: value.clone(),
+                    target_kind: spec.target_kind,
                     operation: None,
                 })
             }
@@ -405,6 +540,7 @@ pub fn resolve(
                 effect: resolved.effect,
                 canonical: spec.canonical.to_string(),
                 target: resolved.target,
+                target_kind: spec.target_kind,
                 operation: Some(resolved.operation),
             }),
             Some(Err(reason)) => Err(EffectResolutionError::UnclassifiableOperation {
@@ -621,6 +757,7 @@ pub fn resolve_for_call(
             effect: spec.effect,
             canonical: spec.canonical.to_string(),
             target: tool_name.to_string(),
+            target_kind: spec.target_kind,
             operation: None,
         });
     }

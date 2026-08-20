@@ -87,6 +87,13 @@ pub fn execute_glob(
     let mut matches: Vec<String> = Vec::new();
     let mut visited: usize = 0;
     let mut truncated = false;
+    let mut resource_batch = match crate::guardrails::begin_path_resource_batch(run) {
+        Ok(batch) => batch,
+        Err(error) => return (format!("Blocked by blast radius guardrails: {error}"), true),
+    };
+    if let Err(error) = resource_batch.check_scope(run, &root) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
 
     let directory = match secure_fs::open_directory(run, &root) {
         Ok(directory) => directory,
@@ -100,7 +107,9 @@ pub fn execute_glob(
             );
         }
     };
-    walk(
+    if let Err(error) = walk(
+        run,
+        &root,
         &directory,
         Path::new(""),
         &regex,
@@ -108,7 +117,10 @@ pub fn execute_glob(
         &mut matches,
         &mut visited,
         &mut truncated,
-    );
+        &mut resource_batch,
+    ) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
 
     matches.sort();
 
@@ -126,10 +138,14 @@ pub fn execute_glob(
     } else {
         format!("{header}\n{body}")
     };
+    resource_batch.commit();
     (out, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
+    run: &crate::tools::ToolRunContext,
+    root: &Path,
     dir: &secure_fs::SecureDirectory,
     relative_dir: &Path,
     regex: &Regex,
@@ -137,9 +153,10 @@ fn walk(
     matches: &mut Vec<String>,
     visited: &mut usize,
     truncated: &mut bool,
-) {
+    resource_batch: &mut crate::guardrails::PathResourceBatch,
+) -> Result<(), String> {
     if matches.len() >= MAX_RESULTS || *visited >= MAX_WALK_ENTRIES {
-        return;
+        return Ok(());
     }
     let entries = match dir.entries() {
         Ok(e) => e,
@@ -149,7 +166,7 @@ fn walk(
                 error = %e,
                 "glob: skipping unreadable directory",
             );
-            return;
+            return Ok(());
         }
     };
     let mut subdirs: Vec<(secure_fs::SecureDirectory, PathBuf)> = Vec::new();
@@ -161,9 +178,10 @@ fn walk(
                 "glob: visited-entry cap reached; results may be incomplete",
             );
             *truncated = true;
-            return;
+            return Ok(());
         }
         let path = relative_dir.join(&entry.name);
+        let absolute = root.join(&path);
         if entry.kind == secure_fs::SecureFileType::Directory {
             let name = entry.name;
             let name_str = name.to_string_lossy();
@@ -174,6 +192,7 @@ fn walk(
             {
                 continue;
             }
+            resource_batch.check_scope(run, &absolute)?;
             match dir.open_child_directory(&name) {
                 Ok(child) => subdirs.push((child, path)),
                 Err(error) => {
@@ -187,23 +206,33 @@ fn walk(
         } else if entry.kind == secure_fs::SecureFileType::Regular {
             let rel_str = path.to_string_lossy();
             if regex.is_match(&rel_str) {
+                resource_batch.reserve_file(run, &absolute)?;
                 matches.push(path.display().to_string());
                 if matches.len() >= MAX_RESULTS {
                     *truncated = true;
-                    return;
+                    return Ok(());
                 }
             }
         }
     }
     for (sub, relative) in subdirs {
         walk(
-            &sub, &relative, regex, false, // descend with default hidden-skip behaviour
-            matches, visited, truncated,
-        );
+            run,
+            root,
+            &sub,
+            &relative,
+            regex,
+            false, // descend with default hidden-skip behaviour
+            matches,
+            visited,
+            truncated,
+            resource_batch,
+        )?;
         if matches.len() >= MAX_RESULTS || *visited >= MAX_WALK_ENTRIES {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 /// Translate a glob pattern into an anchored regex.

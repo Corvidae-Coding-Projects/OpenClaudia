@@ -734,7 +734,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         claude_code_token,
     );
     app.memory_db = memory_db.map(std::sync::Arc::new);
-    guardrails::configure(&run_context, &config.guardrails);
+    guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
     let plugin_manager = std::sync::Arc::new(init_plugin_manager(run_context.project_root()));
     let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
         openclaudia::mcp::McpManager::new(std::sync::Arc::clone(&run_context)),

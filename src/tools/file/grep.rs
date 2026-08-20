@@ -106,7 +106,16 @@ pub fn execute_grep(
     let mut total_matches: usize = 0;
     let mut files_scanned: usize = 0;
     let mut truncated = false;
-    grep_directory(
+    let mut resource_batch = match crate::guardrails::begin_path_resource_batch(run) {
+        Ok(batch) => batch,
+        Err(error) => return (format!("Blocked by blast radius guardrails: {error}"), true),
+    };
+    if let Err(error) = resource_batch.check_scope(run, &root) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
+    if let Err(error) = grep_directory(
+        run,
+        &root,
         &directory,
         Path::new(""),
         &regex,
@@ -116,7 +125,10 @@ pub fn execute_grep(
         &mut files_scanned,
         &mut visited,
         &mut truncated,
-    );
+        &mut resource_batch,
+    ) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
 
     let header = if truncated {
         format!(
@@ -131,6 +143,7 @@ pub fn execute_grep(
     } else {
         format!("{header}\n{body}")
     };
+    resource_batch.commit();
     (out, false)
 }
 
@@ -196,6 +209,8 @@ fn grep_one(file: File, regex: &Regex, context: usize) -> std::io::Result<Vec<Hi
 
 #[allow(clippy::too_many_arguments)]
 fn grep_directory(
+    run: &crate::tools::ToolRunContext,
+    root: &Path,
     dir: &secure_fs::SecureDirectory,
     relative_dir: &Path,
     regex: &Regex,
@@ -205,10 +220,11 @@ fn grep_directory(
     files_scanned: &mut usize,
     visited: &mut usize,
     truncated: &mut bool,
-) {
+    resource_batch: &mut crate::guardrails::PathResourceBatch,
+) -> Result<(), String> {
     if *visited >= MAX_WALK_ENTRIES || *total_matches >= MAX_MATCHES {
         *truncated = true;
-        return;
+        return Ok(());
     }
     let entries = match dir.entries() {
         Ok(e) => e,
@@ -218,7 +234,7 @@ fn grep_directory(
                 error = %e,
                 "grep: skipping unreadable dir"
             );
-            return;
+            return Ok(());
         }
     };
     let mut subdirs: Vec<(secure_fs::SecureDirectory, PathBuf)> = Vec::new();
@@ -226,15 +242,17 @@ fn grep_directory(
         *visited += 1;
         if *visited >= MAX_WALK_ENTRIES {
             *truncated = true;
-            return;
+            return Ok(());
         }
         let name = entry.name;
         let name_str = name.to_string_lossy();
         let relative = relative_dir.join(&name);
+        let absolute = root.join(&relative);
         if entry.kind == secure_fs::SecureFileType::Directory {
             if name_str.starts_with('.') || SKIP_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
+            resource_batch.check_scope(run, &absolute)?;
             match dir.open_child_directory(&name) {
                 Ok(child) => subdirs.push((child, relative)),
                 Err(error) => tracing::warn!(
@@ -245,22 +263,26 @@ fn grep_directory(
             }
         } else if entry.kind == secure_fs::SecureFileType::Regular {
             *files_scanned += 1;
+            resource_batch.check_scope(run, &absolute)?;
             match dir.open_child_regular(&name) {
-                Ok(file) => match grep_one(file, regex, context) {
-                    Ok(hits) => append_hits(
-                        &relative.display().to_string(),
-                        hits,
-                        context,
-                        output,
-                        total_matches,
-                        truncated,
-                    ),
-                    Err(error) => tracing::warn!(
-                        file = %relative.display(),
-                        %error,
-                        "grep: confined file read failed"
-                    ),
-                },
+                Ok(file) => {
+                    resource_batch.reserve_file(run, &absolute)?;
+                    match grep_one(file, regex, context) {
+                        Ok(hits) => append_hits(
+                            &relative.display().to_string(),
+                            hits,
+                            context,
+                            output,
+                            total_matches,
+                            truncated,
+                        ),
+                        Err(error) => tracing::warn!(
+                            file = %relative.display(),
+                            %error,
+                            "grep: confined file read failed"
+                        ),
+                    }
+                }
                 Err(error) => tracing::warn!(
                     file = %relative.display(),
                     %error,
@@ -269,12 +291,14 @@ fn grep_directory(
             }
             if *total_matches >= MAX_MATCHES {
                 *truncated = true;
-                return;
+                return Ok(());
             }
         }
     }
     for (sub, relative) in subdirs {
         grep_directory(
+            run,
+            root,
             &sub,
             &relative,
             regex,
@@ -284,11 +308,13 @@ fn grep_directory(
             files_scanned,
             visited,
             truncated,
-        );
+            resource_batch,
+        )?;
         if *truncated {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 fn append_hits(

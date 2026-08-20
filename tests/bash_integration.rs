@@ -1163,9 +1163,8 @@ fn b7c_host_filesystem_write_is_blocked() {
     );
 
     assert!(
-        result.is_error(),
-        "B7c: writing a host temp path must fail; got: {}",
-        result.content(),
+        result.is_partial(),
+        "B7c: the started process must report typed partial completion when the sandbox blocks its write; got: {result:?}",
     );
     assert!(!file_path.exists(), "B7c: host file escaped the sandbox");
 }
@@ -1197,7 +1196,10 @@ fn b7d_symlink_to_host_file_is_blocked() {
         ),
     );
 
-    assert!(result.is_error(), "B7d: symlink read must fail: {result:?}");
+    assert!(
+        result.is_partial(),
+        "B7d: the started process must report typed partial completion when the sandbox blocks its read: {result:?}"
+    );
     assert!(
         !result.content().contains("B7D_HOST_SECRET"),
         "B7d: host secret crossed the sandbox: {} (target {})",
@@ -1226,9 +1228,8 @@ fn b7e_host_network_is_unreachable() {
     );
 
     assert!(
-        result.is_error(),
-        "B7e: sandbox connected to a host socket: {}",
-        result.content()
+        result.is_partial(),
+        "B7e: the started process must report typed partial completion when networking is denied: {result:?}"
     );
     listener
         .set_nonblocking(true)
@@ -1274,8 +1275,8 @@ fn b7f_project_is_writable_but_control_state_is_protected() {
         &json!({ "command": "touch .git/openclaudia-sandbox-probe" }),
     ));
     assert!(
-        control_write.is_error(),
-        "B7f: .git write escaped protection: {control_write:?}"
+        control_write.is_partial(),
+        "B7f: the started process must report typed partial completion when the .git write is denied: {control_write:?}"
     );
     assert!(!git_probe.exists(), "B7f: sandbox mutated .git");
 
@@ -1310,8 +1311,8 @@ fn b7g_nested_user_namespace_is_blocked() {
         ),
     );
     assert!(
-        result.is_error(),
-        "B7g: nested user namespace unexpectedly succeeded: {result:?}"
+        result.is_partial(),
+        "B7g: the started process must report typed partial completion when namespace creation is denied: {result:?}"
     );
 }
 
