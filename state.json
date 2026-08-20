@@ -19305,11 +19305,12 @@
       "uuid": "c6d96b42-301a-4edf-a428-1e92c1db159b",
       "display_id": 1047,
       "title": "Audit remediation backlog for safe parallel execution lanes",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T21:51:28.006414024Z",
-      "updated_at": "2026-08-20T21:54:12.835857969Z",
+      "updated_at": "2026-08-20T21:54:20.390481202Z",
+      "closed_at": "2026-08-20T21:54:20.390479792Z",
       "labels": [
         "audit"
       ],
@@ -26901,11 +26902,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 479,
       "timestamp": "2026-08-20T21:54:12.835857969Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 480,
+      "timestamp": "2026-08-20T21:54:20.390481202Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T21:54:12.835857969Z",
+    "timestamp": "2026-08-20T21:54:20.390481202Z",
     "agent_id": "6Vw9",
-    "agent_seq": 479
+    "agent_seq": 480
   }
 }
