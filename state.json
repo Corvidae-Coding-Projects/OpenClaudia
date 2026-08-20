@@ -1,6 +1,6 @@
 {
   "next_display_id": 1045,
-  "next_comment_id": 903,
+  "next_comment_id": 904,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6354,7 +6354,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:09:55.024359Z",
-      "updated_at": "2026-08-20T19:18:27.661283457Z",
+      "updated_at": "2026-08-20T20:17:24.344092738Z",
       "labels": [
         "remediation"
       ],
@@ -6370,6 +6370,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "2789cb3e-19ee-4a2b-8d64-db344cd12ea7": {
+          "display_id": 903,
+          "author": "6Vw9",
+          "content": "[action] S-031 implementation/QA: descriptor-pinned Unix storage now validates root/parents/targets/sidecars, bounds file classes and lock waits, generation-checks cooperating writers, verifies staged content/metadata and lock/parent identity at publication, and returns typed durable/uncertain/recovered outcomes. Adversarial real-I/O tests cover read/write symlink swaps, parent mode/namespace races, lock/stage mutation, FIFO nonblocking, hardlinks, bounds, ENOSPC/rename/fsync faults, crash windows, concurrency, retry and traces. Focused tests and Linux strict Clippy pass; Windows target check compiles fail-closed stub; Miri unavailable on installed stable toolchain.",
+          "created_at": "2026-08-20T20:17:24.341037437Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAH6911D460IpRQA572mlrtfKfJGUOMJ/1FRRWdsWtfGpjbKS8ompoJ34IK7njwtHarVuTMPyypGNcCzNREuBaBg=="
         },
         "340895a3-bfbb-42ac-a82f-ab6f907d42e6": {
           "display_id": 902,
@@ -26498,11 +26507,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 441,
       "timestamp": "2026-08-20T19:18:27.661283457Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 442,
+      "timestamp": "2026-08-20T20:17:24.344092738Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T19:18:27.661283457Z",
+    "timestamp": "2026-08-20T20:17:24.344092738Z",
     "agent_id": "6Vw9",
-    "agent_seq": 441
+    "agent_seq": 442
   }
 }
