@@ -1,6 +1,6 @@
 {
   "next_display_id": 1037,
-  "next_comment_id": 844,
+  "next_comment_id": 845,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4807,7 +4807,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T02:55:47.605967098Z",
-      "updated_at": "2026-08-20T03:59:16.235382997Z",
+      "updated_at": "2026-08-20T03:59:20.493761019Z",
       "labels": [
         "remediation"
       ],
@@ -4829,6 +4829,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAnA8SCOd78nBs/2AGAh4klNcqa14rV4Vp0u1te8CeY+vKldKj4EJ+1aClpnFcWVmwzTNCEjZxtcjGFYqZpyBdCQ=="
+        },
+        "439936f1-c521-4bbc-8be9-7a9256463692": {
+          "display_id": 844,
+          "author": "6Vw9",
+          "content": "QA review found and fixed four in-scope defects beyond the first implementation: (1) non-zero/timeout/wait-failed Bash commands had real effects but released reservations; canonical dispatch now preserves them as typed partial outcomes while legacy tuple output remains stable, with a real copy-then-fail acceptance test; (2) MCP cancellation/transport errors could release after remote dispatch, so the reservation commits at the irreversible remote boundary; (3) write_file could recreate a target that disappeared after observation, so observed-existing writes now use no-create reopen and a regression test proves absence is preserved; (4) LSP file_path and exit_worktree path were still opaque metadata, so both now require canonical path normalization. Host-mediated new-file write errors also reconcile/commit their observed partial mutation. Focused config, acceptance, guardrail, effect-matrix, registry-invariant, typed-result, and dispatch suites pass under CARGO_BUILD_JOBS=1 and --test-threads=1.",
+          "created_at": "2026-08-20T03:59:20.491289208Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAvZ+5Pqk2aZRT9kKMGHyJNKLHvUSS/CP1HxhJTmtoSstN7aybv/v4lYzmGWLtrlHHpZUvxfhXTO9C68VB/8HsCw=="
         },
         "9029ca1d-2574-4c02-8727-d2beb00239db": {
           "display_id": 841,
@@ -25138,11 +25147,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 307,
       "timestamp": "2026-08-20T03:59:16.235382997Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 308,
+      "timestamp": "2026-08-20T03:59:20.493761019Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T03:59:16.235382997Z",
+    "timestamp": "2026-08-20T03:59:20.493761019Z",
     "agent_id": "6Vw9",
-    "agent_seq": 307
+    "agent_seq": 308
   }
 }
