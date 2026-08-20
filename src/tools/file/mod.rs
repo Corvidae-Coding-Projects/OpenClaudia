@@ -700,6 +700,7 @@ fn record_active_file_read_observation(
         err.into_inner()
     });
     if let Err(err) = ledger.observe_file_read_bytes(
+        run,
         resolved.to_string_lossy().to_string(),
         &bytes,
         start_line,
@@ -730,7 +731,8 @@ pub(super) fn require_fresh_file_observation_if_ledger_active(
             err.into_inner()
         });
         ledger.observations_chronological().into_iter().any(|obs| {
-            obs.authority == crate::ledger::Authority::Filesystem
+            obs.provenance.trust == crate::ledger::EvidenceTrust::RuntimeObserved
+                && obs.provenance.is_bound_to(run)
                 && !ledger.is_stale(obs.id)
                 && matches!(
                     &obs.kind,
@@ -830,7 +832,7 @@ pub(super) fn record_active_diff_observation(
         tracing::error!("active reality ledger lock poisoned; recovering inner state");
         err.into_inner()
     });
-    if let Err(err) = ledger.observe_diff(vec![path.to_string()], diff_patch) {
+    if let Err(err) = ledger.observe_diff(run, vec![path.to_string()], diff_patch) {
         tracing::warn!(
             path,
             error = %err,

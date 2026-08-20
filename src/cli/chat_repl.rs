@@ -87,6 +87,7 @@ fn execute_tool_with_memory_after_permission(
 }
 
 fn observe_cli_model_visible_tool_result(
+    run: &tools::ToolRunContext,
     session_id: &str,
     tool_call: &tools::ToolCall,
     tool_call_id: &str,
@@ -100,23 +101,16 @@ fn observe_cli_model_visible_tool_result(
         &tool_call.function.name,
         tools::ToolHandlerResult::legacy(content.to_string(), is_error),
     );
-    openclaudia::grounded_loop::observe_tool_result_for_session(
-        session_id,
-        &tool_call.function.name,
-        &result,
-    );
+    openclaudia::grounded_loop::observe_tool_result_for_session(run, session_id, &result);
 }
 
 fn push_observed_cli_typed_tool_result_message(
+    run: &tools::ToolRunContext,
     session: &mut Session,
-    tool_call: &tools::ToolCall,
+    _tool_call: &tools::ToolCall,
     result: &tools::ToolResult,
 ) {
-    openclaudia::grounded_loop::observe_tool_result_for_session(
-        &session.id(),
-        &tool_call.function.name,
-        result,
-    );
+    openclaudia::grounded_loop::observe_tool_result_for_session(run, &session.id(), result);
     push_chat_session_message_and_persist(
         session,
         result.openai_message(),
@@ -125,6 +119,7 @@ fn push_observed_cli_typed_tool_result_message(
 }
 
 fn push_observed_cli_tool_result_message(
+    run: &tools::ToolRunContext,
     session: &mut Session,
     tool_call: &tools::ToolCall,
     tool_call_id: &str,
@@ -132,6 +127,7 @@ fn push_observed_cli_tool_result_message(
     final_is_error: bool,
 ) {
     observe_cli_model_visible_tool_result(
+        run,
         &session.id(),
         tool_call,
         tool_call_id,
@@ -306,7 +302,6 @@ struct OpenAiLoopState {
 struct SseFrameCtx<'a> {
     full_content: &'a mut String,
     reasoning_content: &'a mut String,
-    md_renderer: &'a mut tui::StreamingMarkdownRenderer,
     tool_accumulator: &'a mut tools::ToolCallAccumulator,
     anthropic_accumulator: &'a mut tools::AnthropicToolAccumulator,
     stream_usage: &'a mut openclaudia::session::TokenUsage,
@@ -335,16 +330,22 @@ fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
         .and_then(|message| message.get("content").and_then(|content| content.as_str()))
 }
 
-fn observe_cli_user_task(session_id: &str, content: &str) -> Option<openclaudia::ledger::ObsId> {
-    openclaudia::grounded_loop::observe_session_user_task(session_id, content)
+fn observe_cli_user_task(
+    run: &tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+) -> Option<openclaudia::ledger::ObsId> {
+    openclaudia::grounded_loop::observe_session_user_task(run, session_id, content)
 }
 
 fn request_messages_with_cli_grounding(
+    run: &tools::ToolRunContext,
     session_id: &str,
     task_obs: Option<openclaudia::ledger::ObsId>,
     session_messages: &[serde_json::Value],
 ) -> Result<Vec<serde_json::Value>, String> {
     openclaudia::grounded_loop::request_messages_with_grounding(
+        run,
         session_id,
         task_obs,
         session_messages,
@@ -352,14 +353,19 @@ fn request_messages_with_cli_grounding(
 }
 
 fn cli_grounding_system_content(
+    run: &tools::ToolRunContext,
     session_id: &str,
     task_obs: openclaudia::ledger::ObsId,
 ) -> Option<String> {
-    openclaudia::grounded_loop::session_grounding_system_content(session_id, task_obs)
+    openclaudia::grounded_loop::session_grounding_system_content(run, session_id, task_obs)
 }
 
-fn validate_cli_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
-    openclaudia::grounded_loop::validate_agentic_final_response(session_id, content)
+fn validate_and_render_cli_agentic_final_response(
+    run: &tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+) -> Result<String, String> {
+    openclaudia::grounded_loop::validate_and_render_agentic_final_response(run, session_id, content)
 }
 
 fn final_response_requires_grounding(content: &str, cancelled: bool) -> bool {
@@ -717,6 +723,7 @@ impl ChatRepl {
                     &mut self.permissions,
                 ) {
                     openclaudia::grounded_loop::observe_shell_command_for_session(
+                        &self.run_context,
                         &self.chat_session.id(),
                         &execution.cwd,
                         &execution.command,
@@ -741,12 +748,14 @@ impl ChatRepl {
         }
 
         let task_messages = self.chat_session.messages_snapshot();
-        self.current_task_obs = latest_user_message_content(&task_messages)
-            .and_then(|content| observe_cli_user_task(&self.chat_session.id(), content));
+        self.current_task_obs = latest_user_message_content(&task_messages).and_then(|content| {
+            observe_cli_user_task(&self.run_context, &self.chat_session.id(), content)
+        });
 
         let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
         let request_state = self.chat_session.messages_snapshot();
         let request_messages = match request_messages_with_cli_grounding(
+            &self.run_context,
             &self.chat_session.id(),
             self.current_task_obs,
             &request_state,
@@ -1384,6 +1393,7 @@ impl ChatRepl {
     fn request_messages_with_grounding(&self) -> Result<Vec<serde_json::Value>, String> {
         let session_messages = self.chat_session.messages_snapshot();
         let mut messages = request_messages_with_cli_grounding(
+            &self.run_context,
             &self.chat_session.id(),
             self.current_task_obs,
             &session_messages,
@@ -1420,8 +1430,9 @@ impl ChatRepl {
     }
 
     fn current_grounding_system_content(&self) -> Option<String> {
-        self.current_task_obs
-            .and_then(|task_obs| cli_grounding_system_content(&self.chat_session.id(), task_obs))
+        self.current_task_obs.and_then(|task_obs| {
+            cli_grounding_system_content(&self.run_context, &self.chat_session.id(), task_obs)
+        })
     }
 
     fn policy_denied_tool_result(&self, tool_call: &tools::ToolCall) -> Option<tools::ToolResult> {
@@ -1460,15 +1471,19 @@ impl ChatRepl {
         .map(|blocked| blocked.into_tool_result(tool_call))
     }
 
-    fn final_response_allowed(&self, content: &str, cancelled: bool) -> bool {
+    fn render_final_response(&self, content: &str, cancelled: bool) -> Option<String> {
         if !final_response_requires_grounding(content, cancelled) {
-            return true;
+            return Some(content.to_string());
         }
-        match validate_cli_agentic_final_response(&self.chat_session.id(), content.trim()) {
-            Ok(()) => true,
+        match validate_and_render_cli_agentic_final_response(
+            &self.run_context,
+            &self.chat_session.id(),
+            content.trim(),
+        ) {
+            Ok(rendered) => Some(rendered),
             Err(reason) => {
                 eprintln!("\n\x1b[31mFinal answer failed grounding gate: {reason}\x1b[0m");
-                false
+                None
             }
         }
     }
@@ -1721,18 +1736,15 @@ impl ChatRepl {
         }
     }
 
-    /// Print the initial Gemini text (if any) and return the assembled
-    /// `(full_content, tool_calls)` pair for the tool loop.
+    /// Return the assembled Gemini `(full_content, tool_calls)` pair.
+    /// Terminal text stays buffered until the final evidence gate runs.
     fn emit_gemini_initial_text_and_calls(
         gemini_json: &serde_json::Value,
     ) -> Result<(String, Vec<tools::ToolCall>), String> {
-        use std::io::Write;
         let mut full_content = String::new();
         let text = gemini_extract_text(gemini_json)?;
         let tool_calls = gemini_extract_tool_calls(gemini_json)?;
         if !text.is_empty() {
-            print!("{text}");
-            std::io::stdout().flush().ok();
             full_content.push_str(&text);
         }
         Ok((full_content, tool_calls))
@@ -1748,7 +1760,6 @@ impl ChatRepl {
         memory_db: Option<&memory::MemoryDb>,
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
-        use std::io::Write;
         let max_iterations = self.config.session.max_turns;
         let mut iteration: u32 = 0;
         while !state.tool_calls.is_empty() && (max_iterations == 0 || iteration < max_iterations) {
@@ -1778,11 +1789,6 @@ impl ChatRepl {
                 .await
             {
                 Some((next_text, next_calls)) => {
-                    if !next_text.is_empty() {
-                        println!();
-                        print!("{next_text}");
-                        std::io::stdout().flush().ok();
-                    }
                     state.full_content = next_text;
                     state.tool_calls = next_calls;
                 }
@@ -1814,19 +1820,23 @@ impl ChatRepl {
         input_tokens: u64,
         output_tokens: u64,
     ) {
-        if !full_content.trim().is_empty() {
-            if !self.final_response_allowed(full_content.trim(), false) {
+        let rendered_content = if full_content.trim().is_empty() {
+            String::new()
+        } else {
+            let Some(rendered) = self.render_final_response(full_content.trim(), false) else {
                 return;
-            }
+            };
+            println!("{rendered}");
             push_chat_session_message_and_persist(
                 &mut self.chat_session,
                 serde_json::json!({
                     "role": "assistant",
-                    "content": full_content.trim()
+                    "content": rendered
                 }),
                 "gemini final assistant response",
             );
-        }
+            rendered
+        };
 
         if let Some(ref engine) = self.vdd_engine {
             let original = self.chat_session.messages_snapshot();
@@ -1834,7 +1844,7 @@ impl ChatRepl {
             run_vdd_review(
                 engine,
                 &self.run_context,
-                full_content,
+                &rendered_content,
                 &mut messages,
                 &self.config.proxy.target,
                 self.api_key.as_ref(),
@@ -1846,7 +1856,7 @@ impl ChatRepl {
             }
         }
 
-        let tokens = estimate_session_tokens(&self.chat_session) + full_content.len() / 4;
+        let tokens = estimate_session_tokens(&self.chat_session) + rendered_content.len() / 4;
         // `draw_status_bar` accepts `Option<f64>` and elides the cost
         // segment when None; an unknown model therefore renders as a
         // blank cost rather than $0.00.
@@ -1854,7 +1864,7 @@ impl ChatRepl {
             &self.model,
             &openclaudia::session::TokenUsage {
                 input_tokens: input_tokens.max(tokens as u64),
-                output_tokens: output_tokens.max(full_content.len() as u64 / 4),
+                output_tokens: output_tokens.max(rendered_content.len() as u64 / 4),
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -1971,6 +1981,7 @@ impl ChatRepl {
             tool_call.function.name
         );
         push_observed_cli_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
             &tool_call.id,
@@ -1995,6 +2006,7 @@ impl ChatRepl {
             Ok(args) => args,
             Err(msg) => {
                 push_observed_cli_tool_result_message(
+                    &self.run_context,
                     &mut self.chat_session,
                     tool_call,
                     &tool_call.id,
@@ -2008,11 +2020,21 @@ impl ChatRepl {
             .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
             .await
         {
-            push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
+            push_observed_cli_typed_tool_result_message(
+                &self.run_context,
+                &mut self.chat_session,
+                tool_call,
+                &result,
+            );
             return Err(gemini_tool_error_response(tool_call, result.content()));
         }
         if let Some(result) = self.policy_denied_tool_result(tool_call) {
-            push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
+            push_observed_cli_typed_tool_result_message(
+                &self.run_context,
+                &mut self.chat_session,
+                tool_call,
+                &result,
+            );
             return Err(gemini_tool_error_response(tool_call, result.content()));
         }
         let result = check_tool_permission_interactive(
@@ -2025,6 +2047,7 @@ impl ChatRepl {
             ToolPermissionResult::Allowed { authorization } => Ok(authorization),
             ToolPermissionResult::Denied(msg) => {
                 push_observed_cli_tool_result_message(
+                    &self.run_context,
                     &mut self.chat_session,
                     tool_call,
                     &tool_call.id,
@@ -2098,6 +2121,7 @@ impl ChatRepl {
         .await;
         display_tool_result(&final_result);
         push_observed_cli_typed_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
             &final_result,
@@ -2386,8 +2410,8 @@ impl ChatRepl {
         println!();
     }
 
-    /// Consume the initial SSE stream, push deltas into the markdown
-    /// renderer + accumulators, and return the assembled state.
+    /// Consume the initial SSE stream into bounded accumulators and return the
+    /// assembled state. Terminal text stays buffered until final validation.
     async fn consume_initial_stream(
         &self,
         response: reqwest::Response,
@@ -2406,7 +2430,6 @@ impl ChatRepl {
         let mut in_thinking_block = false;
         let mut thinking_start_time: Option<std::time::Instant> = None;
         let mut reasoning_started = false;
-        let mut md_state = tui::StreamingMarkdownRenderer::new().into_state();
         let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
 
         loop {
@@ -2426,9 +2449,7 @@ impl ChatRepl {
                     break;
                 }
             };
-            let mut md_renderer = tui::StreamingMarkdownRenderer::from_state(md_state);
             if sse.data == "[DONE]" {
-                md_state = md_renderer.into_state();
                 break;
             }
 
@@ -2436,7 +2457,6 @@ impl ChatRepl {
                 let mut ctx = SseFrameCtx {
                     full_content: &mut full_content,
                     reasoning_content: &mut reasoning_content,
-                    md_renderer: &mut md_renderer,
                     tool_accumulator,
                     anthropic_accumulator,
                     stream_usage,
@@ -2446,15 +2466,10 @@ impl ChatRepl {
                 };
                 Self::route_sse_frame(&json, &mut ctx);
             }
-            md_state = md_renderer.into_state();
         }
         if reasoning_started {
             let elapsed = thinking_start_time.map_or(0.0, |t| t.elapsed().as_secs_f64());
             tui::print_thinking_end(elapsed);
-        }
-        {
-            let mut md_renderer = tui::StreamingMarkdownRenderer::from_state(md_state);
-            md_renderer.flush();
         }
         InitialStreamResult {
             full_content,
@@ -2539,7 +2554,6 @@ impl ChatRepl {
                     *ctx.reasoning_started = false;
                     *ctx.thinking_start_time = None;
                 }
-                ctx.md_renderer.push(&text);
                 ctx.full_content.push_str(&text);
             }
             openclaudia::pipeline::SseAction::Thinking(text) => {
@@ -2650,17 +2664,19 @@ impl ChatRepl {
         }
 
         if !full_content.trim().is_empty() {
-            if !self.final_response_allowed(full_content.trim(), false) {
+            let Some(rendered) = self.render_final_response(full_content.trim(), false) else {
                 return String::new();
-            }
+            };
+            println!("{rendered}");
             push_chat_session_message_and_persist(
                 &mut self.chat_session,
                 serde_json::json!({
                     "role": "assistant",
-                    "content": full_content.trim()
+                    "content": rendered
                 }),
                 "anthropic final assistant response",
             );
+            full_content = rendered;
         }
         full_content
     }
@@ -2767,6 +2783,7 @@ impl ChatRepl {
         .await;
         display_tool_result(&final_result);
         push_observed_cli_typed_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
             &final_result,
@@ -2788,6 +2805,7 @@ impl ChatRepl {
             tool_call.function.name
         );
         push_observed_cli_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
             &tool_call.id,
@@ -2808,6 +2826,7 @@ impl ChatRepl {
             Ok(args) => args,
             Err(msg) => {
                 push_observed_cli_tool_result_message(
+                    &self.run_context,
                     &mut self.chat_session,
                     tool_call,
                     &tool_call.id,
@@ -2821,11 +2840,21 @@ impl ChatRepl {
             .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
             .await
         {
-            push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
+            push_observed_cli_typed_tool_result_message(
+                &self.run_context,
+                &mut self.chat_session,
+                tool_call,
+                &result,
+            );
             return None;
         }
         if let Some(result) = self.policy_denied_tool_result(tool_call) {
-            push_observed_cli_typed_tool_result_message(&mut self.chat_session, tool_call, &result);
+            push_observed_cli_typed_tool_result_message(
+                &self.run_context,
+                &mut self.chat_session,
+                tool_call,
+                &result,
+            );
             return None;
         }
         let result = check_tool_permission_interactive(
@@ -2837,6 +2866,7 @@ impl ChatRepl {
         match result {
             ToolPermissionResult::Denied(msg) => {
                 push_observed_cli_tool_result_message(
+                    &self.run_context,
                     &mut self.chat_session,
                     tool_call,
                     &tool_call.id,
@@ -2925,7 +2955,6 @@ impl ChatRepl {
         full_content: &mut String,
     ) -> bool {
         use futures::StreamExt;
-        use std::io::Write;
 
         let mut req = self.client.post(transport.endpoint).json(&followup_req);
         for (key, value) in transport.headers {
@@ -2935,7 +2964,6 @@ impl ChatRepl {
             Ok(response) if response.status().is_success() => {
                 let mut stream = response.bytes_stream().eventsource();
                 let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
-                println!();
                 loop {
                     let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
                         Ok(Some(Ok(sse))) => sse,
@@ -2954,8 +2982,6 @@ impl ChatRepl {
                     }
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse.data) {
                         if let Some(text) = anthropic_accumulator.process_event(&json) {
-                            print!("{text}");
-                            std::io::stdout().flush().ok();
                             full_content.push_str(&text);
                         }
                     }
@@ -3116,12 +3142,18 @@ impl ChatRepl {
         if (!current_content.is_empty() || !reasoning_content.is_empty())
             && !tool_accumulator.has_tool_calls()
         {
-            if !self.final_response_allowed(current_content.trim(), cancelled) {
+            if cancelled {
+                self.record_failed_turn("provider response was cancelled before final validation");
                 return false;
             }
+            let Some(rendered) = self.render_final_response(current_content.trim(), cancelled)
+            else {
+                return false;
+            };
+            println!("{rendered}");
             let mut message = serde_json::json!({
                 "role": "assistant",
-                "content": current_content
+                "content": rendered
             });
             attach_reasoning_content(&mut message, reasoning_content);
             push_chat_session_message_and_persist(
@@ -3215,7 +3247,6 @@ impl ChatRepl {
         current_reasoning_content: &mut String,
     ) {
         use futures::StreamExt;
-        use std::io::Write;
 
         let mut req = self.client.post(transport.endpoint).json(&request_body);
         for (key, value) in transport.headers {
@@ -3264,8 +3295,6 @@ impl ChatRepl {
                             reasoning_started = false;
                             thinking_start_time = None;
                         }
-                        print!("{text}");
-                        std::io::stdout().flush().ok();
                         current_content.push_str(&text);
                     }
                     openclaudia::pipeline::SseAction::Thinking(text) => {
@@ -3306,7 +3335,6 @@ impl ChatRepl {
                 thinking_start_time.map_or(0.0, |started| started.elapsed().as_secs_f64());
             tui::print_thinking_end(elapsed);
         }
-        println!();
     }
 
     /// Execute a single tool call from the OpenAI-style loop (matches
@@ -3351,6 +3379,7 @@ impl ChatRepl {
         .await;
         display_tool_result(&final_result);
         push_observed_cli_typed_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
             &final_result,
@@ -3419,26 +3448,28 @@ impl ChatRepl {
         self.record_quality_gate_verifications(&qg_results);
         let mut injected_failure = false;
         for qg in &qg_results {
-            if qg.passed {
-                tracing::debug!(name = %qg.name, "Quality gate passed");
+            if qg.passed() {
+                tracing::debug!(name = %qg.name(), "Quality gate passed");
                 continue;
             }
-            let severity = if qg.required { "FAILED" } else { "warning" };
+            let severity = if qg.required() { "FAILED" } else { "warning" };
             eprintln!(
                 "\x1b[33m⚠ Quality gate '{}' {} (exit {})\x1b[0m",
-                qg.name, severity, qg.exit_code
+                qg.name(),
+                severity,
+                qg.exit_code()
             );
-            if !qg.stderr.is_empty() {
-                let preview: String = qg.stderr.lines().take(3).collect::<Vec<_>>().join("\n");
+            if !qg.stderr().is_empty() {
+                let preview: String = qg.stderr().lines().take(3).collect::<Vec<_>>().join("\n");
                 eprintln!("  {preview}");
             }
             self.chat_session.push_message(serde_json::json!({
                 "role": "system",
                 "content": format!(
                     "[Quality Gate '{}' {}] exit code {}\nstdout: {}\nstderr: {}",
-                    qg.name, severity, qg.exit_code,
-                    if qg.stdout.len() > 500 { safe_truncate(&qg.stdout, 500) } else { &qg.stdout },
-                    if qg.stderr.len() > 500 { safe_truncate(&qg.stderr, 500) } else { &qg.stderr }
+                    qg.name(), severity, qg.exit_code(),
+                    if qg.stdout().len() > 500 { safe_truncate(qg.stdout(), 500) } else { qg.stdout() },
+                    if qg.stderr().len() > 500 { safe_truncate(qg.stderr(), 500) } else { qg.stderr() }
                 ),
                 "metadata": {
                     "openclaudia_context_source": "reality"
@@ -3476,7 +3507,7 @@ impl ChatRepl {
             ) {
                 tracing::warn!(
                     session_id = %self.chat_session.id(),
-                    gate = %gate.name,
+                    gate = %gate.name(),
                     error = %err,
                     "failed to append CLI quality-gate observations to reality ledger"
                 );
@@ -3884,6 +3915,23 @@ mod tests {
         })
     }
 
+    fn isolated_test_run() -> Arc<openclaudia::tools::ToolRunContext> {
+        openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("chat-repl-isolated-test")
+        .build()
+        .expect("isolated chat REPL test run")
+    }
+
     fn test_session_at(root: &std::path::Path, provider: &str) -> Session {
         let session = Session::new("test-model", provider);
         session.update_state(|state, _| {
@@ -4064,38 +4112,19 @@ providers: {}
     }
 
     #[test]
-    fn cli_plain_final_records_allow_decision() {
-        let mut ledger = openclaudia::ledger::RealityLedger::new();
+    fn cli_plain_final_is_denied_and_records_policy_decision() {
+        let session_id = format!("cli-plain-final-{}", uuid::Uuid::new_v4());
+        let path = openclaudia::ledger::project_session_ledger_path(&session_id)
+            .expect("safe test session");
         let content = "Verified with cargo test.";
 
-        openclaudia::grounded_loop::validate_final_against_ledger(&mut ledger, content)
-            .expect("plain assistant text should render");
+        let err = validate_and_render_cli_agentic_final_response(test_run(), &session_id, content)
+            .expect_err("plain assistant text must not bypass the claim gate");
 
-        assert!(ledger
-            .observations_chronological()
-            .iter()
-            .any(|obs| matches!(
-                &obs.kind,
-                openclaudia::ledger::ObservationKind::PolicyDecision { allowed: true, .. }
-            )));
-    }
+        assert_eq!(err, "final answer must use the typed final claim envelope");
 
-    #[test]
-    fn cli_structured_final_gate_rejects_missing_verification() {
-        let mut ledger = openclaudia::ledger::RealityLedger::new();
-        let task = ledger.observe_user_task("Audit CLI loop.").expect("task");
-        let content = serde_json::json!({
-            "kind": "final",
-            "summary": "Verified with cargo test.",
-            "evidence": [task],
-            "verification": [],
-        })
-        .to_string();
-
-        let err = openclaudia::grounded_loop::validate_final_against_ledger(&mut ledger, &content)
-            .expect_err("structured final without verification must be denied");
-
-        assert_eq!(err, "final answer requires verification observation");
+        let ledger = openclaudia::ledger::RealityLedger::open_project_session(&session_id)
+            .expect("reopen CLI ledger");
         assert!(ledger
             .observations_chronological()
             .iter()
@@ -4103,27 +4132,95 @@ providers: {}
                 &obs.kind,
                 openclaudia::ledger::ObservationKind::PolicyDecision { allowed: false, .. }
             )));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_structured_final_gate_rejects_missing_verification() {
+        let session_id = format!("cli-ungrounded-final-{}", uuid::Uuid::new_v4());
+        let path = openclaudia::ledger::project_session_ledger_path(&session_id)
+            .expect("safe test session");
+        let content = serde_json::json!({
+            "kind": "final",
+            "claims": [{
+                "claim_type": "file_change",
+                "path": "src/cli/chat_repl.rs",
+                "evidence": []
+            }]
+        })
+        .to_string();
+
+        let err = validate_and_render_cli_agentic_final_response(test_run(), &session_id, &content)
+            .expect_err("supported runtime claim without verification must be denied");
+
+        assert_eq!(
+            err,
+            "supported runtime claims require a trusted verification claim"
+        );
+        let ledger = openclaudia::ledger::RealityLedger::open_project_session(&session_id)
+            .expect("reopen CLI ledger");
+        assert!(ledger
+            .observations_chronological()
+            .iter()
+            .any(|obs| matches!(
+                &obs.kind,
+                openclaudia::ledger::ObservationKind::PolicyDecision { allowed: false, .. }
+            )));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_structured_final_renders_typed_uncertainty_not_raw_json() {
+        let session_id = format!("cli-typed-final-{}", uuid::Uuid::new_v4());
+        let path = openclaudia::ledger::project_session_ledger_path(&session_id)
+            .expect("safe test session");
+        let content = serde_json::json!({
+            "kind": "final",
+            "claims": [{
+                "claim_type": "unsupported",
+                "statement": "The remote deployment is healthy.",
+                "reason": "No deployment receipt is available."
+            }]
+        })
+        .to_string();
+
+        let rendered =
+            validate_and_render_cli_agentic_final_response(test_run(), &session_id, &content)
+                .expect("typed uncertainty should pass");
+
+        assert_eq!(
+            rendered,
+            "Unsupported claim \"The remote deployment is healthy.\"; reason \"No deployment receipt is available.\"."
+        );
+        assert!(!rendered.contains("claim_type"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn cli_quality_gate_result_records_command_and_verification_observations() {
+        let run = isolated_test_run();
         let mut ledger = openclaudia::ledger::RealityLedger::new();
-        let gate = guardrails::QualityCheckResult {
-            name: "fmt".to_string(),
-            command: "cargo fmt --check".to_string(),
-            passed: false,
-            exit_code: 1,
-            stdout: "format drift".to_string(),
-            stderr: "run cargo fmt".to_string(),
-            required: true,
+        let config = openclaudia::config::GuardrailsConfig {
+            quality_gates: Some(openclaudia::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![openclaudia::config::QualityCheck {
+                    name: "deliberate-failure".to_string(),
+                    command: "sh -c 'printf format-drift; exit 1'".to_string(),
+                    required: true,
+                }],
+                ..openclaudia::config::QualityGatesConfig::default()
+            }),
+            ..openclaudia::config::GuardrailsConfig::default()
         };
+        guardrails::configure(&run, &config).expect("configure quality gate");
+        let gate = guardrails::run_quality_gates(&run)
+            .into_iter()
+            .next()
+            .expect("configured quality gate result");
 
-        let ids = openclaudia::grounded_loop::append_quality_gate_observations(
-            test_run(),
-            &mut ledger,
-            &gate,
-        )
-        .expect("quality gate should ledger command and verification");
+        let ids =
+            openclaudia::grounded_loop::append_quality_gate_observations(&run, &mut ledger, &gate)
+                .expect("quality gate should ledger command and verification");
 
         let command_obs = ledger
             .get(ids.command)
@@ -4137,9 +4234,9 @@ providers: {}
         assert_eq!(
             argv,
             &vec![
-                "cargo".to_string(),
-                "fmt".to_string(),
-                "--check".to_string()
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf format-drift; exit 1".to_string()
             ]
         );
         assert_eq!(*exit_code, 1);
@@ -4156,11 +4253,22 @@ providers: {}
             panic!("expected verification observation");
         };
         assert!(!passed);
-        assert_eq!(command.as_deref(), Some("cargo fmt --check"));
-        assert!(findings.iter().any(|finding| finding.contains("fmt")));
+        assert_eq!(
+            command.as_deref(),
+            Some("sh -c 'printf format-drift; exit 1'")
+        );
         assert!(findings
             .iter()
-            .any(|finding| finding.contains("run cargo fmt")));
+            .any(|finding| finding.contains("deliberate-failure")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("format-drift")));
+        assert_eq!(
+            obs.provenance.trust,
+            openclaudia::ledger::EvidenceTrust::TrustedVerifier
+        );
+        assert!(obs.provenance.is_bound_to(&run));
+        assert!(obs.provenance.verification_method.is_some());
     }
 
     fn chat_session_with_turns(turns: usize) -> Session {
@@ -4487,6 +4595,7 @@ providers: {}
         };
 
         push_observed_cli_tool_result_message(
+            test_run(),
             &mut session,
             &tool_call,
             &tool_call.id,
@@ -4513,7 +4622,20 @@ providers: {}
                 .cloned()
         }
         .expect("tool result observation");
-        assert_eq!(observation.authority, openclaudia::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            openclaudia::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(test_run()));
+        assert_eq!(
+            observation
+                .provenance
+                .tool_call
+                .as_ref()
+                .expect("tool-call provenance")
+                .call_id,
+            "call_denied"
+        );
         let openclaudia::ledger::ObservationKind::ToolResult { tool, result } = &observation.kind
         else {
             panic!("expected tool result observation");

@@ -171,9 +171,18 @@ fn bash_records_command_observation_when_session_ledger_is_active() {
     assert_eq!(stdout, "ledger-bash");
     assert_eq!(stderr, "");
     assert_eq!(
-        observation.authority,
-        openclaudia::ledger::Authority::Command
+        observation.provenance.trust,
+        openclaudia::ledger::EvidenceTrust::RuntimeObserved
     );
+    assert_eq!(
+        observation.provenance.source,
+        openclaudia::ledger::EvidenceSource::CommandExecution
+    );
+    assert!(observation.provenance.is_bound_to(&run));
+    assert!(matches!(
+        observation.provenance.artifact,
+        Some(openclaudia::ledger::ArtifactBinding::Command { .. })
+    ));
 }
 
 #[test]

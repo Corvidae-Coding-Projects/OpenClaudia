@@ -166,7 +166,19 @@ fn write_file_records_diff_observation_when_session_ledger_is_active() {
         &vec![path.canonicalize().unwrap().to_string_lossy().to_string()]
     );
     assert!(patch.contains("+created"));
-    assert_eq!(observation.authority, openclaudia::ledger::Authority::Git);
+    assert_eq!(
+        observation.provenance.trust,
+        openclaudia::ledger::EvidenceTrust::RuntimeObserved
+    );
+    assert_eq!(
+        observation.provenance.source,
+        openclaudia::ledger::EvidenceSource::WorkspaceDiff
+    );
+    assert!(observation.provenance.is_bound_to(&run));
+    assert!(matches!(
+        observation.provenance.artifact,
+        Some(openclaudia::ledger::ArtifactBinding::Diff { .. })
+    ));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -193,9 +193,18 @@ fn read_file_records_observation_when_session_ledger_is_active() {
     );
     assert!(excerpt.contains("alpha"));
     assert_eq!(
-        observation.authority,
-        openclaudia::ledger::Authority::Filesystem
+        observation.provenance.trust,
+        openclaudia::ledger::EvidenceTrust::RuntimeObserved
     );
+    assert_eq!(
+        observation.provenance.source,
+        openclaudia::ledger::EvidenceSource::FilesystemRead
+    );
+    assert!(observation.provenance.is_bound_to(&run));
+    assert!(matches!(
+        observation.provenance.artifact,
+        Some(openclaudia::ledger::ArtifactBinding::File { .. })
+    ));
 }
 
 #[test]

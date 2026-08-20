@@ -867,8 +867,8 @@ pub fn overload_fallback_for(model: &str) -> &'static str {
 /// per crosslink #595/#596/#597. Each retry emits a structured
 /// `tracing::warn!` (`target="openclaudia::retry"`, `event="api_retry"`)
 /// so log consumers can bucket retry pressure programmatically. The
-/// user-facing `AppEvent::StreamText` retry marker is preserved for
-/// REPL/TUI compatibility.
+/// user-facing retry state is emitted through [`AppEvent::ApiRetry`] so host
+/// status cannot be confused with model-authored stream content.
 ///
 /// When the loop exhausts [`MAX_API_RETRIES`] on a 529 ("service
 /// overloaded") status, the function additionally emits
@@ -2068,13 +2068,19 @@ fn permission_denied_with_result(
     }))
 }
 
-fn observe_policy_decision_json(session_id: Option<&str>, allowed: bool, reason: &str) {
+fn observe_policy_decision_json(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    allowed: bool,
+    reason: &str,
+) {
     if let Some(session_id) = session_id {
-        crate::grounded_loop::observe_policy_decision_for_session(session_id, allowed, reason);
+        crate::grounded_loop::observe_policy_decision_for_session(run, session_id, allowed, reason);
     }
 }
 
 fn policy_denied_tool_result(
+    run: &crate::tools::ToolRunContext,
     tool_name: &str,
     tool_call_id: &str,
     error: &PolicyError,
@@ -2082,7 +2088,7 @@ fn policy_denied_tool_result(
     tx: &mpsc::Sender<AppEvent>,
 ) -> Value {
     let reason = error.to_string();
-    observe_policy_decision_json(session_id, false, &reason);
+    observe_policy_decision_json(run, session_id, false, &reason);
     let _ = tx.send(AppEvent::ToolDone {
         name: tool_name.to_string(),
         success: false,
@@ -2578,20 +2584,33 @@ fn emit_failed_quality_gate_events(
 ) {
     for gate in crate::guardrails::run_quality_gates(run_context) {
         record_quality_gate_verification(run_context, session_id, &gate);
-        if gate.passed {
+        if gate.passed() {
             continue;
         }
-        if tx
-            .send(AppEvent::StreamText(format!(
-                "\n⚠ Quality gate '{}': {}\n",
-                gate.name,
-                gate.stdout.lines().next().unwrap_or("failed")
-            )))
-            .is_err()
-        {
+        if tx.send(failed_quality_gate_event(&gate)).is_err() {
             tracing::warn!("TUI channel closed during tool execution");
             break;
         }
+    }
+}
+
+fn failed_quality_gate_event(gate: &crate::guardrails::QualityCheckResult) -> AppEvent {
+    let detail = gate
+        .stdout()
+        .lines()
+        .next()
+        .filter(|line| !line.trim().is_empty())
+        .or_else(|| {
+            gate.stderr()
+                .lines()
+                .next()
+                .filter(|line| !line.trim().is_empty())
+        })
+        .unwrap_or("failed");
+    AppEvent::ToolDone {
+        name: format!("quality_gate:{}", gate.name()),
+        success: false,
+        content: format!("Quality gate '{}' failed: {detail}", gate.name()),
     }
 }
 
@@ -2608,7 +2627,7 @@ fn record_quality_gate_verification(
         Err(err) => {
             tracing::warn!(
                 session_id,
-                gate = %gate.name,
+                gate = %gate.name(),
                 error = %err,
                 "failed to open session reality ledger for quality-gate verification"
             );
@@ -2619,7 +2638,7 @@ fn record_quality_gate_verification(
     {
         tracing::warn!(
             session_id,
-            gate = %gate.name,
+            gate = %gate.name(),
             error = %err,
             "failed to append quality-gate observations to reality ledger"
         );
@@ -2670,7 +2689,7 @@ async fn execute_tool_calls_for_tui(
             {
                 break;
             }
-            observe_tool_result(session_id, &tool_call.function.name, &result);
+            observe_tool_result(&run_context, session_id, &result);
             results.push(result.openai_message());
         }
         return (results, true);
@@ -2685,7 +2704,7 @@ async fn execute_tool_calls_for_tui(
             Ok(args) => args,
             Err(msg) => match malformed_tool_arguments_result(tool_call, &msg, tx) {
                 Ok(result_json) => {
-                    observe_tool_result_json(session_id, tool_name, &result_json);
+                    observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
                     results.push(result_json);
                     continue;
                 }
@@ -2698,9 +2717,15 @@ async fn execute_tool_calls_for_tui(
             session_id,
             tool_name,
         ) {
-            let result_json =
-                policy_denied_tool_result(tool_name, &tool_call.id, &err, session_id, tx);
-            observe_tool_result_json(session_id, tool_name, &result_json);
+            let result_json = policy_denied_tool_result(
+                &run_context,
+                tool_name,
+                &tool_call.id,
+                &err,
+                session_id,
+                tx,
+            );
+            observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
             results.push(result_json);
             continue;
         }
@@ -2729,7 +2754,7 @@ async fn execute_tool_calls_for_tui(
                     "content": format!("[BLOCKED] {}", blocked.content),
                     "is_error": true
                 });
-                observe_tool_result_json(session_id, tool_name, &result_json);
+                observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
                 results.push(result_json);
                 continue;
             }
@@ -2752,7 +2777,7 @@ async fn execute_tool_calls_for_tui(
         {
             PermissionOutcome::Allowed { authorization } => authorization,
             PermissionOutcome::DeniedWithResult(result_json) => {
-                observe_tool_result_json(session_id, tool_name, &result_json);
+                observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
                 results.push(result_json);
                 continue;
             }
@@ -2793,7 +2818,7 @@ async fn execute_tool_calls_for_tui(
                 if resolve_tui_follow_up(&mut result, tx).await.is_err() {
                     break;
                 }
-                observe_tool_result(session_id, tool_name, &result);
+                observe_tool_result(&run_context, session_id, &result);
                 results.push(result.openai_message());
             }
         }
@@ -2804,7 +2829,12 @@ async fn execute_tool_calls_for_tui(
     (results, true)
 }
 
-fn observe_tool_result_json(session_id: Option<&str>, tool_name: &str, result_json: &Value) {
+fn observe_tool_result_json(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    tool_name: &str,
+    result_json: &Value,
+) {
     let Some(session_id) = session_id else {
         return;
     };
@@ -2835,16 +2865,20 @@ fn observe_tool_result_json(session_id: Option<&str>, tool_name: &str, result_js
                 .unwrap_or(false),
         ),
     );
-    observe_tool_result(Some(session_id), tool_name, &result);
+    observe_tool_result(run, Some(session_id), &result);
 }
 
-fn observe_tool_result(session_id: Option<&str>, tool_name: &str, result: &tools::ToolResult) {
+fn observe_tool_result(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    result: &tools::ToolResult,
+) {
     let Some(session_id) = session_id else {
         return;
     };
     crate::services::tool_executor::ToolExecutor::observe_tool_result(
+        run,
         Some(session_id),
-        tool_name,
         result,
     );
 }
@@ -2966,25 +3000,50 @@ mod tests {
 
     #[test]
     fn quality_gate_records_command_and_failed_gate_findings() {
+        let run = crate::tools::security::test_run_context_for(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )));
         let mut ledger = crate::ledger::RealityLedger::new();
-        let gate = crate::guardrails::QualityCheckResult {
-            name: "unit".to_string(),
-            command: "cargo test --lib".to_string(),
-            passed: false,
-            exit_code: 101,
-            stdout: "running tests".to_string(),
-            stderr: "one failed".to_string(),
-            required: true,
+        let config = crate::config::GuardrailsConfig {
+            quality_gates: Some(crate::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![crate::config::QualityCheck {
+                    name: "unit".to_string(),
+                    command: "sh -c 'printf running-tests; printf one-failed >&2; exit 7'"
+                        .to_string(),
+                    required: true,
+                }],
+                ..crate::config::QualityGatesConfig::default()
+            }),
+            ..crate::config::GuardrailsConfig::default()
         };
+        crate::guardrails::configure(&run, &config).expect("configure gate");
+        let gate = crate::guardrails::run_quality_gates(&run)
+            .into_iter()
+            .next()
+            .expect("gate result");
 
-        let ids =
-            crate::grounded_loop::append_quality_gate_observations(&test_run(), &mut ledger, &gate)
-                .expect("append");
+        let event = failed_quality_gate_event(&gate);
+        let AppEvent::ToolDone {
+            name,
+            success,
+            content,
+        } = event
+        else {
+            panic!("failed quality gate must not enter the model-text stream");
+        };
+        assert_eq!(name, "quality_gate:unit");
+        assert!(!success);
+        assert!(content.contains("running-tests"));
+
+        let ids = crate::grounded_loop::append_quality_gate_observations(&run, &mut ledger, &gate)
+            .expect("append");
         let command_observation = ledger.get(ids.command).expect("command observation");
         assert_eq!(
-            command_observation.authority,
-            crate::ledger::Authority::Command
+            command_observation.provenance.trust,
+            crate::ledger::EvidenceTrust::RuntimeObserved
         );
+        assert!(command_observation.provenance.is_bound_to(&run));
         let crate::ledger::ObservationKind::CommandRun {
             argv,
             exit_code,
@@ -2997,14 +3056,23 @@ mod tests {
         };
         assert_eq!(
             argv,
-            &vec!["cargo".to_string(), "test".to_string(), "--lib".to_string()]
+            &vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf running-tests; printf one-failed >&2; exit 7".to_string()
+            ]
         );
-        assert_eq!(*exit_code, 101);
-        assert_eq!(stdout, "running tests");
-        assert_eq!(stderr, "one failed");
+        assert_eq!(*exit_code, 7);
+        assert_eq!(stdout, "running-tests");
+        assert_eq!(stderr, "one-failed");
 
         let observation = ledger.get(ids.verification).expect("observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Verifier);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::TrustedVerifier
+        );
+        assert!(observation.provenance.is_bound_to(&run));
+        assert!(observation.provenance.verification_method.is_some());
         let crate::ledger::ObservationKind::Verification {
             passed,
             command,
@@ -3014,7 +3082,10 @@ mod tests {
             panic!("expected verification observation");
         };
         assert!(!passed);
-        assert_eq!(command.as_deref(), Some("cargo test --lib"));
+        assert_eq!(
+            command.as_deref(),
+            Some("sh -c 'printf running-tests; printf one-failed >&2; exit 7'")
+        );
         assert!(findings
             .iter()
             .any(|finding| finding.contains("quality gate 'unit' failed")));
@@ -3239,9 +3310,10 @@ mod tests {
         .expect("exact session denial");
         let (tx, _rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let run_context = test_run();
 
         let (results, has_tools) = execute_tool_calls_for_tui(
-            test_run(),
+            Arc::clone(&run_context),
             &[tool_call],
             None,
             None,
@@ -3275,7 +3347,11 @@ mod tests {
                 .cloned()
         }
         .expect("denied tool result observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run_context));
         let crate::ledger::ObservationKind::ToolResult { tool, result } = &observation.kind else {
             panic!("expected tool result observation");
         };
@@ -3477,9 +3553,10 @@ mod tests {
         let (tx, _rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
         let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
+        let run_context = test_run();
 
         let (results, has_tools) = execute_tool_calls_for_tui(
-            test_run(),
+            Arc::clone(&run_context),
             &[tool_call],
             None,
             None,
@@ -3506,7 +3583,11 @@ mod tests {
                 .cloned()
         }
         .expect("tool result observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run_context));
         let crate::ledger::ObservationKind::ToolResult { tool, result } = &observation.kind else {
             panic!("expected tool result observation");
         };
@@ -3529,7 +3610,8 @@ mod tests {
             "is_error": false
         });
 
-        observe_tool_result_json(Some(session_id), "ask_user_question", &result_json);
+        let run = test_run();
+        observe_tool_result_json(&run, Some(session_id), "ask_user_question", &result_json);
 
         let observation = {
             let ledger = ledger.lock().expect("ledger lock");
@@ -3546,6 +3628,11 @@ mod tests {
         assert_eq!(tool, "ask_user_question");
         assert_eq!(result["tool_call_id"], "call_question");
         assert_eq!(result["content"], "{\"answer\":\"use the SSD\"}");
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run));
     }
 
     #[test]

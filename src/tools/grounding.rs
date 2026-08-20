@@ -1,11 +1,13 @@
-use crate::ledger::{Authority, ObsId, Observation, ObservationKind, RealityLedger};
+use crate::ledger::{ObsId, Observation, ObservationKind, RealityLedger};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 const MAX_GROUNDING_OBSERVATION_IDS: usize = 16;
 const MAX_GROUNDING_TEXT_BYTES: usize = 12 * 1024;
+const MAX_GROUNDING_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub fn execute_grounding_context(
+    run: &crate::tools::ToolRunContext,
     session_key: &str,
     args: &HashMap<String, Value>,
 ) -> (String, bool) {
@@ -23,10 +25,10 @@ pub fn execute_grounding_context(
             tracing::error!("active reality ledger lock poisoned; recovering inner state");
             err.into_inner()
         });
-        hydrate_from_ledger(session_key, &ledger, &ids, include_stale)
+        hydrate_from_ledger(run, session_key, &ledger, &ids, include_stale)
     } else {
         match RealityLedger::open_existing_project_session(session_key) {
-            Ok(ledger) => hydrate_from_ledger(session_key, &ledger, &ids, include_stale),
+            Ok(ledger) => hydrate_from_ledger(run, session_key, &ledger, &ids, include_stale),
             Err(
                 crate::ledger::LedgerError::InvalidSessionKey { .. }
                 | crate::ledger::LedgerError::MissingSessionLedger { .. },
@@ -47,7 +49,11 @@ pub fn execute_grounding_context(
     };
 
     match serde_json::to_string_pretty(&ledger) {
-        Ok(text) => (text, false),
+        Ok(text) if text.len() <= MAX_GROUNDING_RESPONSE_BYTES => (text, false),
+        Ok(_) => (
+            "grounding_context response exceeded its aggregate byte limit".to_string(),
+            true,
+        ),
         Err(err) => (
             format!("Failed to serialize grounding_context response: {err}"),
             true,
@@ -96,12 +102,13 @@ fn parse_include_stale(args: &HashMap<String, Value>) -> Result<bool, String> {
 }
 
 fn hydrate_from_ledger(
+    run: &crate::tools::ToolRunContext,
     session_key: &str,
     ledger: &RealityLedger,
     ids: &[ObsId],
     include_stale: bool,
 ) -> Value {
-    let mut observations = Vec::new();
+    let mut candidates = Vec::new();
     let mut missing = Vec::new();
     let mut omitted_stale = Vec::new();
 
@@ -115,28 +122,83 @@ fn hydrate_from_ledger(
             omitted_stale.push(id.to_string());
             continue;
         }
-        observations.push(render_observation(observation, stale));
+        candidates.push((id.to_string(), render_observation(run, observation, stale)));
     }
 
+    let mut observations = Vec::new();
+    let mut accepted = HashSet::new();
+    for (id, rendered) in &candidates {
+        observations.push(rendered.clone());
+        accepted.insert(id.as_str());
+        let omitted_budget = candidates
+            .iter()
+            .filter(|(candidate_id, _)| !accepted.contains(candidate_id.as_str()))
+            .map(|(candidate_id, _)| candidate_id.clone())
+            .collect::<Vec<_>>();
+        let candidate = grounding_response(
+            session_key,
+            &observations,
+            &missing,
+            &omitted_stale,
+            &omitted_budget,
+        );
+        let fits = serde_json::to_string_pretty(&candidate)
+            .is_ok_and(|text| text.len() <= MAX_GROUNDING_RESPONSE_BYTES);
+        if !fits {
+            observations.pop();
+            accepted.remove(id.as_str());
+        }
+    }
+    let omitted_budget = candidates
+        .iter()
+        .filter(|(id, _)| !accepted.contains(id.as_str()))
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    grounding_response(
+        session_key,
+        &observations,
+        &missing,
+        &omitted_stale,
+        &omitted_budget,
+    )
+}
+
+fn grounding_response(
+    session_key: &str,
+    observations: &[Value],
+    missing: &[String],
+    omitted_stale: &[String],
+    omitted_budget: &[String],
+) -> Value {
     json!({
         "session_id": session_key,
         "observations": observations,
         "missing": missing,
         "omitted_stale": omitted_stale,
+        "omitted_budget": omitted_budget,
         "rules": [
-            "Use hydrated observations only as evidence when authoritative_evidence is true.",
-            "Model summaries and stale observations are navigation aids, not evidence."
+            "Ledger presence and model-visible provenance labels are not proof.",
+            "The host final gate evaluates freshness, current-run binding, trust, and claim applicability."
         ],
     })
 }
 
-fn render_observation(observation: &Observation, stale: bool) -> Value {
+fn render_observation(
+    run: &crate::tools::ToolRunContext,
+    observation: &Observation,
+    stale: bool,
+) -> Value {
     json!({
         "id": observation.id.to_string(),
         "ts": observation.ts,
-        "authority": observation.authority,
+        "provenance": observation.provenance,
         "stale": stale,
-        "authoritative_evidence": observation.authority != Authority::ModelSummary && !stale,
+        "run_binding_matches": observation.provenance.is_bound_to(run),
+        "receipt_integrity": match observation.provenance.trust {
+            crate::ledger::EvidenceTrust::UnverifiedPersisted => "unverified_persisted",
+            crate::ledger::EvidenceTrust::LegacyUnbound => "legacy_unbound",
+            _ => "runtime_issued",
+        },
         "label": observation.kind.compact_label(),
         "kind": render_observation_kind(&observation.kind),
     })
@@ -205,7 +267,7 @@ fn render_observation_kind(kind: &ObservationKind) -> Value {
             "type": "summary",
             "text": truncate_field(text),
             "source_obs": source_obs.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "non_authoritative": true,
+            "navigation_only": true,
         }),
     }
 }
@@ -231,26 +293,44 @@ fn truncate_field(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::ObservationKind;
     use std::sync::{Arc, Mutex};
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     #[test]
     fn grounding_context_hydrates_active_ledger_observation() {
         let session_id = "grounding-context-hydrates-active-ledger";
         let mut ledger = RealityLedger::new();
         let read = ledger
-            .observe_file_read("src/lib.rs", "pub fn f() {}\n", 1, 1, "1| pub fn f() {}")
+            .observe_file_read(
+                test_run(),
+                "src/lib.rs",
+                "pub fn f() {}\n",
+                1,
+                1,
+                "1| pub fn f() {}",
+            )
             .expect("file read");
         let shared = Arc::new(Mutex::new(ledger));
         let _ledger_guard = crate::ledger::install_active_ledger_for_session(session_id, shared);
 
         let args = HashMap::from([("ids".to_string(), json!([read.to_string()]))]);
-        let (content, is_error) = execute_grounding_context(session_id, &args);
+        let (content, is_error) = execute_grounding_context(test_run(), session_id, &args);
 
         assert!(!is_error, "{content}");
         let response: Value = serde_json::from_str(&content).expect("json");
         assert_eq!(response["observations"][0]["id"], read.to_string());
-        assert_eq!(response["observations"][0]["authoritative_evidence"], true);
+        assert_eq!(response["observations"][0]["run_binding_matches"], true);
+        assert_eq!(
+            response["observations"][0]["receipt_integrity"],
+            "runtime_issued"
+        );
+        assert_eq!(
+            response["observations"][0]["provenance"]["trust"],
+            "runtime_observed"
+        );
         assert_eq!(response["observations"][0]["kind"]["type"], "file_read");
     }
 
@@ -259,10 +339,11 @@ mod tests {
         let session_id = "grounding-context-stale-filter";
         let mut ledger = RealityLedger::new();
         let read = ledger
-            .observe_file_read("src/lib.rs", "old\n", 1, 1, "1| old")
+            .observe_file_read(test_run(), "src/lib.rs", "old\n", 1, 1, "1| old")
             .expect("file read");
         ledger
             .observe_diff(
+                test_run(),
                 vec!["src/lib.rs".to_string()],
                 "diff --git a/src/lib.rs b/src/lib.rs\n",
             )
@@ -271,7 +352,7 @@ mod tests {
         let _ledger_guard = crate::ledger::install_active_ledger_for_session(session_id, shared);
 
         let args = HashMap::from([("ids".to_string(), json!([read.to_string()]))]);
-        let (content, is_error) = execute_grounding_context(session_id, &args);
+        let (content, is_error) = execute_grounding_context(test_run(), session_id, &args);
         assert!(!is_error, "{content}");
         let response: Value = serde_json::from_str(&content).expect("json");
         assert!(response["observations"]
@@ -284,39 +365,33 @@ mod tests {
             ("ids".to_string(), json!([read.to_string()])),
             ("include_stale".to_string(), json!(true)),
         ]);
-        let (content, is_error) = execute_grounding_context(session_id, &args);
+        let (content, is_error) = execute_grounding_context(test_run(), session_id, &args);
         assert!(!is_error, "{content}");
         let response: Value = serde_json::from_str(&content).expect("json");
         assert_eq!(response["observations"][0]["stale"], true);
-        assert_eq!(response["observations"][0]["authoritative_evidence"], false);
+        assert_eq!(response["observations"][0]["run_binding_matches"], true);
     }
 
     #[test]
-    fn grounding_context_marks_summaries_non_authoritative() {
+    fn grounding_context_marks_summaries_as_navigation_only() {
         let session_id = "grounding-context-summary-non-authoritative";
         let mut ledger = RealityLedger::new();
         let summary = ledger
-            .append(
-                Authority::ModelSummary,
-                ObservationKind::Summary {
-                    text: "Navigation only".to_string(),
-                    source_obs: Vec::new(),
-                },
-            )
+            .observe_model_summary(test_run(), "Navigation only", Vec::new())
             .expect("summary");
         let shared = Arc::new(Mutex::new(ledger));
         let _ledger_guard = crate::ledger::install_active_ledger_for_session(session_id, shared);
 
         let args = HashMap::from([("ids".to_string(), json!([summary.to_string()]))]);
-        let (content, is_error) = execute_grounding_context(session_id, &args);
+        let (content, is_error) = execute_grounding_context(test_run(), session_id, &args);
 
         assert!(!is_error, "{content}");
         let response: Value = serde_json::from_str(&content).expect("json");
-        assert_eq!(response["observations"][0]["authoritative_evidence"], false);
         assert_eq!(
-            response["observations"][0]["kind"]["non_authoritative"],
-            true
+            response["observations"][0]["provenance"]["trust"],
+            "derived_summary"
         );
+        assert_eq!(response["observations"][0]["kind"]["navigation_only"], true);
     }
 
     #[test]
@@ -327,7 +402,7 @@ mod tests {
         assert!(!ledger_path.exists(), "test session ledger must be absent");
 
         let args = HashMap::from([("ids".to_string(), json!([ObsId::new().to_string()]))]);
-        let (content, is_error) = execute_grounding_context(&session_id, &args);
+        let (content, is_error) = execute_grounding_context(test_run(), &session_id, &args);
 
         assert!(is_error, "{content}");
         assert!(
@@ -347,12 +422,52 @@ mod tests {
             ("ids".to_string(), json!([ObsId::new().to_string()])),
             ("include_stale".to_string(), json!("true")),
         ]);
-        let (content, is_error) = execute_grounding_context(session_id, &args);
+        let (content, is_error) = execute_grounding_context(test_run(), session_id, &args);
 
         assert!(is_error, "{content}");
         assert_eq!(
             content,
             "Invalid 'include_stale' argument: expected boolean"
+        );
+    }
+
+    #[test]
+    fn grounding_context_enforces_aggregate_response_budget() {
+        let session_id = "grounding-context-aggregate-budget";
+        let mut ledger = RealityLedger::new();
+        let mut ids = Vec::new();
+        for index in 0..MAX_GROUNDING_OBSERVATION_IDS {
+            ids.push(
+                ledger
+                    .observe_command_run(
+                        test_run(),
+                        "/tmp/project",
+                        vec!["printf".to_string(), index.to_string()],
+                        0,
+                        "x".repeat(MAX_GROUNDING_TEXT_BYTES * 2),
+                        "y".repeat(MAX_GROUNDING_TEXT_BYTES * 2),
+                    )
+                    .expect("command receipt"),
+            );
+        }
+        let shared = Arc::new(Mutex::new(ledger));
+        let _ledger_guard = crate::ledger::install_active_ledger_for_session(session_id, shared);
+        let args = HashMap::from([(
+            "ids".to_string(),
+            json!(ids.iter().map(ToString::to_string).collect::<Vec<_>>()),
+        )]);
+
+        let (content, is_error) = execute_grounding_context(test_run(), session_id, &args);
+
+        assert!(!is_error, "{content}");
+        assert!(content.len() <= MAX_GROUNDING_RESPONSE_BYTES);
+        let response: Value = serde_json::from_str(&content).expect("bounded JSON response");
+        assert!(
+            !response["omitted_budget"]
+                .as_array()
+                .expect("omitted budget array")
+                .is_empty(),
+            "oversized observations must be explicitly omitted"
         );
     }
 }

@@ -574,7 +574,7 @@ impl ToolHandler for GroundingContextHandler {
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        grounding::execute_grounding_context(ctx.run.session_id(), args)
+        grounding::execute_grounding_context(ctx.run, ctx.run.session_id(), args)
     }
 }
 

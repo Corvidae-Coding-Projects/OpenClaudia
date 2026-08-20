@@ -1432,13 +1432,14 @@ async fn run_subagent_with_effect_receipt(
 }
 
 fn validate_and_render_subagent_final_response(
+    run: &crate::tools::ToolRunContext,
     agent_id: &str,
     final_output: &str,
 ) -> Result<String, String> {
     if final_output.trim().is_empty() {
         return Ok(String::new());
     }
-    crate::grounded_loop::validate_and_render_agentic_final_response(agent_id, final_output)
+    crate::grounded_loop::validate_and_render_agentic_final_response(run, agent_id, final_output)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1545,10 +1546,7 @@ async fn run_subagent_inner(
     if let Some(receipt) = effect_receipt {
         receipt.store(true, Ordering::SeqCst);
     }
-    let task_obs = crate::grounded_loop::observe_session_user_task(
-        &agent_id,
-        &format!("Subagent task: {}\n\n{}", config.task, config.prompt),
-    );
+    let task_content = format!("Subagent task: {}\n\n{}", config.task, config.prompt);
 
     // Set up worktree isolation if requested
     let worktree = if config.isolation.as_deref() == Some("worktree") {
@@ -1663,6 +1661,8 @@ async fn run_subagent_inner(
             worktree,
         };
     }
+    let task_obs =
+        crate::grounded_loop::observe_session_user_task(&subagent_run, &agent_id, &task_content);
 
     let mut subagent_context = vec![crate::context::ContextItem::host_instruction(
         "subagent.role_policy",
@@ -1805,7 +1805,10 @@ async fn run_subagent_inner(
         // it helps the provider navigate the current ledger, but it is
         // not persisted into the resumable transcript.
         let request_messages = match crate::grounded_loop::request_messages_with_grounding(
-            &agent_id, task_obs, &messages,
+            &subagent_run,
+            &agent_id,
+            task_obs,
+            &messages,
         ) {
             Ok(messages) => messages,
             Err(e) => {
@@ -1931,7 +1934,11 @@ async fn run_subagent_inner(
             .unwrap_or_default();
 
         if tool_calls.is_empty() {
-            match validate_and_render_subagent_final_response(&agent_id, &final_output) {
+            match validate_and_render_subagent_final_response(
+                &subagent_run,
+                &agent_id,
+                &final_output,
+            ) {
                 Ok(rendered) => {
                     final_output = rendered;
                 }
@@ -1987,14 +1994,16 @@ async fn run_subagent_inner(
                 continue;
             }
 
-            if let Err(content) = validate_subagent_tool_decision_for_session(&agent_id, &tc) {
+            if let Err(content) =
+                validate_subagent_tool_decision_for_session(&subagent_run, &agent_id, &tc)
+            {
                 let result = crate::tools::ToolResult::failure(
                     &tc,
                     crate::tools::ToolFailureCode::PolicyDenied,
                     format!("Error: {content}"),
                     crate::tools::ToolRetryability::Never,
                 );
-                observe_subagent_tool_result(&agent_id, &tc.function.name, &result);
+                observe_subagent_tool_result(&subagent_run, &agent_id, &result);
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -2024,7 +2033,7 @@ async fn run_subagent_inner(
                     policy_enforcer: Some(&policy_enforcer),
                 },
             );
-            observe_subagent_tool_result(&agent_id, &executable_tc.function.name, &result);
+            observe_subagent_tool_result(&subagent_run, &agent_id, &result);
 
             messages.push(json!({
                 "role": "tool",
@@ -2238,6 +2247,7 @@ fn subagent_typed_decision_schema(tool_name: &str) -> Value {
 }
 
 fn validate_subagent_tool_decision_for_session(
+    run: &crate::tools::ToolRunContext,
     agent_id: &str,
     tool_call: &ToolCall,
 ) -> Result<(), String> {
@@ -2250,9 +2260,15 @@ fn validate_subagent_tool_decision_for_session(
         &tool_call.function.name,
         &tool_call.function.arguments,
     )?;
-    match validate_subagent_tool_decision_against_ledger(&tool_call.function.name, &args, &ledger) {
+    match validate_subagent_tool_decision_against_ledger(
+        run,
+        &tool_call.function.name,
+        &args,
+        &ledger,
+    ) {
         Ok(()) => {
             crate::grounded_loop::observe_policy_decision_for_session(
+                run,
                 agent_id,
                 true,
                 &format!(
@@ -2263,13 +2279,14 @@ fn validate_subagent_tool_decision_for_session(
             Ok(())
         }
         Err(err) => {
-            crate::grounded_loop::observe_policy_decision_for_session(agent_id, false, &err);
+            crate::grounded_loop::observe_policy_decision_for_session(run, agent_id, false, &err);
             Err(err)
         }
     }
 }
 
 fn validate_subagent_tool_decision_against_ledger(
+    run: &crate::tools::ToolRunContext,
     tool_name: &str,
     args: &Value,
     ledger: &crate::ledger::RealityLedger,
@@ -2283,7 +2300,7 @@ fn validate_subagent_tool_decision_against_ledger(
     let decision = serde_json::from_value::<crate::decision::AgentDecision>(decision_value.clone())
         .map_err(|err| format!("Invalid typed decision for tool '{tool_name}': {err}"))?;
     validate_subagent_tool_decision_shape(tool_name, args, &decision)?;
-    crate::decision::validate_decision(&decision, ledger)
+    crate::decision::validate_decision(&decision, ledger, run)
         .map(|_| ())
         .map_err(|denial| {
             format!(
@@ -2527,11 +2544,11 @@ fn parse_subagent_tool_call(tool_call: &Value, index: usize) -> Result<ToolCall,
 }
 
 fn observe_subagent_tool_result(
+    run: &crate::tools::ToolRunContext,
     agent_id: &str,
-    tool_name: &str,
     result: &crate::tools::ToolResult,
 ) {
-    crate::grounded_loop::observe_tool_result_for_session(agent_id, tool_name, result);
+    crate::grounded_loop::observe_tool_result_for_session(run, agent_id, result);
 }
 
 // === Tool Execution ===
@@ -3121,7 +3138,7 @@ mod tests {
             crate::tools::ToolHandlerResult::success_text("model-visible tool output"),
         );
 
-        observe_subagent_tool_result(agent_id, "list_files", &result);
+        observe_subagent_tool_result(test_run(), agent_id, &result);
 
         let observations = {
             let ledger = ledger.lock().expect("ledger lock");
@@ -3353,8 +3370,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_no_tool_plain_final_is_allowed() {
-        let agent_id = "subagent-no-tool-final-allowed";
+    async fn subagent_no_tool_plain_final_is_denied() {
+        let agent_id = "subagent-no-tool-final-denied";
         let ledger_path =
             crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
         let _ = std::fs::remove_file(&ledger_path);
@@ -3390,20 +3407,22 @@ mod tests {
             "mock provider failed: {:?}",
             server_result.err()
         );
+        assert!(!result.success, "plain no-tool final must fail");
         assert!(
-            result.success,
-            "plain no-tool final should pass; output={}",
+            result
+                .output
+                .contains("final answer must use the typed final claim envelope"),
+            "unexpected grounding denial: {}",
             result.output
         );
-        assert_eq!(result.output, final_content);
 
         let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
         let _ = std::fs::remove_file(ledger_path);
     }
 
     #[tokio::test]
-    async fn subagent_no_tool_conversational_final_is_allowed() {
-        let agent_id = "subagent-no-tool-greeting-final-allowed";
+    async fn subagent_no_tool_conversational_final_is_denied() {
+        let agent_id = "subagent-no-tool-greeting-final-denied";
         let ledger_path =
             crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
         let _ = std::fs::remove_file(&ledger_path);
@@ -3438,12 +3457,14 @@ mod tests {
             "mock provider failed: {:?}",
             server_result.err()
         );
+        assert!(!result.success, "plain conversational final must fail");
         assert!(
-            result.success,
-            "plain no-tool final should pass; output={}",
+            result
+                .output
+                .contains("final answer must use the typed final claim envelope"),
+            "unexpected grounding denial: {}",
             result.output
         );
-        assert_eq!(result.output, "Good morning!");
 
         let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
         let _ = std::fs::remove_file(ledger_path);
@@ -3702,8 +3723,9 @@ mod tests {
         let ledger = crate::ledger::RealityLedger::new();
         let args = json!({"command": "cargo test"});
 
-        let err = validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
-            .expect_err("missing decision must be rejected");
+        let err =
+            validate_subagent_tool_decision_against_ledger(test_run(), "bash", &args, &ledger)
+                .expect_err("missing decision must be rejected");
 
         assert!(
             err.contains("requires arguments.decision"),
@@ -3715,7 +3737,7 @@ mod tests {
     fn subagent_tool_decision_accepts_grounded_command_decision() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task("Run the focused test command")
+            .observe_user_task(test_run(), "Run the focused test command")
             .expect("task observation");
         let args = json!({
             "command": "cargo test --lib subagent_tool_decision",
@@ -3727,7 +3749,7 @@ mod tests {
             }
         });
 
-        validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
+        validate_subagent_tool_decision_against_ledger(test_run(), "bash", &args, &ledger)
             .expect("grounded command decision must be accepted");
     }
 
@@ -3735,7 +3757,7 @@ mod tests {
     fn subagent_tool_decision_rejects_mismatched_command_argv() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task("Run tests")
+            .observe_user_task(test_run(), "Run tests")
             .expect("task observation");
         let args = json!({
             "command": "cargo test",
@@ -3747,8 +3769,9 @@ mod tests {
             }
         });
 
-        let err = validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
-            .expect_err("mismatched argv must be rejected");
+        let err =
+            validate_subagent_tool_decision_against_ledger(test_run(), "bash", &args, &ledger)
+                .expect_err("mismatched argv must be rejected");
 
         assert!(err.contains("argv must match"), "unexpected error: {err}");
     }
@@ -3757,7 +3780,7 @@ mod tests {
     fn subagent_tool_decision_accepts_grounded_edit_decision() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let read = ledger
-            .observe_file_read("src/lib.rs", "old\n", 1, 1, "old")
+            .observe_file_read(test_run(), "src/lib.rs", "old\n", 1, 1, "old")
             .expect("file observation");
         let args = json!({
             "path": "src/lib.rs",
@@ -3771,7 +3794,7 @@ mod tests {
             }
         });
 
-        validate_subagent_tool_decision_against_ledger("edit_file", &args, &ledger)
+        validate_subagent_tool_decision_against_ledger(test_run(), "edit_file", &args, &ledger)
             .expect("grounded edit decision must be accepted");
     }
 
@@ -3779,7 +3802,7 @@ mod tests {
     fn subagent_tool_decision_rejects_edit_patch_for_different_path() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let read = ledger
-            .observe_file_read("src/lib.rs", "old\n", 1, 1, "old")
+            .observe_file_read(test_run(), "src/lib.rs", "old\n", 1, 1, "old")
             .expect("file observation");
         let args = json!({
             "path": "src/lib.rs",
@@ -3793,8 +3816,9 @@ mod tests {
             }
         });
 
-        let err = validate_subagent_tool_decision_against_ledger("edit_file", &args, &ledger)
-            .expect_err("path mismatch must be rejected");
+        let err =
+            validate_subagent_tool_decision_against_ledger(test_run(), "edit_file", &args, &ledger)
+                .expect_err("path mismatch must be rejected");
 
         assert!(err.contains("tool path"), "unexpected error: {err}");
     }

@@ -798,8 +798,7 @@ pub struct App {
     pub is_waiting: bool,
     spinner_frame: usize,
     /// Full assistant text as received from streaming deltas. The visible
-    /// streaming text may be suppressed while a structured final envelope is
-    /// still incomplete.
+    /// Assistant text is buffered until the terminal evidence gate runs.
     streaming_raw_text: String,
     /// Sender for pushing API events into the event loop's channel.
     api_event_tx: Option<std::sync::mpsc::Sender<AppEvent>>,
@@ -1523,6 +1522,10 @@ impl App {
                 self.messages.scroll_to_bottom();
             }
             Ok(AppEvent::ToolStart { name, description }) => {
+                // Any buffered model text belonged to a tool-bearing turn,
+                // not a validated terminal response.
+                self.messages.finish_streaming();
+                self.streaming_raw_text.clear();
                 self.messages.add(DisplayMessage {
                     kind: MessageKind::ToolStart { name },
                     content: description,
@@ -1719,7 +1722,15 @@ impl App {
         } else {
             self.streaming_raw_text.clone()
         };
-        match render_live_final_response_for_display(&self.chat_session.id(), &content) {
+        let Ok(run_context) = self.tool_run_context() else {
+            self.messages.streaming_text.clear();
+            return;
+        };
+        match render_live_final_response_for_display(
+            &run_context,
+            &self.chat_session.id(),
+            &content,
+        ) {
             Some(rendered) => self.messages.streaming_text = rendered,
             None => self.messages.streaming_text.clear(),
         }
@@ -1727,18 +1738,11 @@ impl App {
 
     fn append_streaming_for_display(&mut self, text: &str) {
         self.streaming_raw_text.push_str(text);
-        if may_be_structured_final_stream(&self.streaming_raw_text) {
-            if let Ok(Some(summary)) =
-                crate::grounded_loop::structured_final_summary(&self.streaming_raw_text)
-            {
-                self.messages.streaming_text = summary;
-            } else {
-                self.messages.streaming_text.clear();
-            }
-            self.messages.is_streaming = true;
-            return;
-        }
-        self.messages.append_streaming(text);
+        // Terminal-vs-tool-bearing output is unknown during streaming. Buffer
+        // it until ResponseDone can run the evidence gate; ToolStart discards
+        // text from a non-terminal iteration.
+        self.messages.streaming_text.clear();
+        self.messages.is_streaming = true;
     }
 
     /// Render the result of a backgrounded shell call dispatched via
@@ -3227,6 +3231,7 @@ impl App {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 crate::grounded_loop::observe_shell_command_for_session(
+                    &run_context,
                     &session_id,
                     &cwd,
                     displayed,
@@ -3697,6 +3702,7 @@ struct ApiTurnParams {
 }
 
 struct InitialTurnRequest<'a> {
+    run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     session_id: &'a str,
     session_messages: &'a [serde_json::Value],
     policy_enforcer: &'a std::sync::Arc<crate::services::policy::PolicyEnforcer>,
@@ -3755,19 +3761,22 @@ fn latest_assistant_message_content(messages: &[serde_json::Value]) -> Option<&s
 }
 
 fn observe_turn_user_task(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
     messages: &[serde_json::Value],
 ) -> Option<crate::ledger::ObsId> {
     let content = latest_user_message_content(messages)?;
-    crate::grounded_loop::observe_session_user_task(session_id, content)
+    crate::grounded_loop::observe_session_user_task(run, session_id, content)
 }
 
 fn request_messages_with_grounding(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
     task_obs: Option<crate::ledger::ObsId>,
     session_messages: &[serde_json::Value],
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut messages = crate::grounded_loop::request_messages_with_grounding(
+        run,
         session_id,
         task_obs,
         session_messages,
@@ -3784,63 +3793,44 @@ fn request_messages_with_grounding(
 }
 
 fn validate_and_render_agentic_final_response(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
 ) -> Result<String, String> {
-    crate::grounded_loop::validate_and_render_agentic_final_response(session_id, content)
+    crate::grounded_loop::validate_and_render_agentic_final_response(run, session_id, content)
 }
 
-fn render_final_response_for_history(session_id: &str, content: &str) -> Option<String> {
+fn render_final_response_for_history(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+) -> Result<String, String> {
     if content.trim().is_empty() {
-        return Some(String::new());
+        return Ok(String::new());
     }
-    match validate_and_render_agentic_final_response(session_id, content.trim()) {
-        Ok(rendered) => Some(rendered),
+    match validate_and_render_agentic_final_response(run, session_id, content.trim()) {
+        Ok(rendered) => Ok(rendered),
         Err(reason) => {
             tracing::warn!(
                 session_id,
-                reason,
+                reason = %reason,
                 "final answer rejected by grounding gate"
             );
-            None
+            Err(reason)
         }
     }
 }
 
-fn render_live_final_response_for_display(session_id: &str, content: &str) -> Option<String> {
+fn render_live_final_response_for_display(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+) -> Option<String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Some(String::new());
     }
-    match crate::grounded_loop::structured_final_summary(trimmed) {
-        Ok(Some(summary)) => return Some(summary),
-        Ok(None) => {}
-        Err(reason) => {
-            tracing::warn!(
-                session_id,
-                reason,
-                "structured final answer rejected before display"
-            );
-            return None;
-        }
-    }
-    render_final_response_for_history(session_id, trimmed)
-}
-
-fn may_be_structured_final_stream(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    if trimmed.starts_with('{') {
-        return true;
-    }
-    if let Some(fenced) = trimmed.strip_prefix("```") {
-        let fenced = fenced
-            .strip_prefix("json")
-            .or_else(|| fenced.strip_prefix("JSON"))
-            .unwrap_or(fenced)
-            .trim_start();
-        return fenced.starts_with('{');
-    }
-    false
+    render_final_response_for_history(run, session_id, trimmed).ok()
 }
 
 fn check_provider_request_policy_for_messages(
@@ -4236,6 +4226,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             break;
         }
         let request_messages = match request_messages_with_grounding(
+            ctx.run_context,
             ctx.session_id,
             ctx.task_obs,
             session_messages,
@@ -4313,10 +4304,22 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                         .as_deref()
                         .filter(|text| !text.is_empty());
                     if !followup.content.is_empty() || reasoning.is_some() {
-                        let Some(rendered_content) =
-                            render_final_response_for_history(ctx.session_id, &followup.content)
-                        else {
-                            break;
+                        let rendered_content = match render_final_response_for_history(
+                            ctx.run_context,
+                            ctx.session_id,
+                            &followup.content,
+                        ) {
+                            Ok(rendered) => rendered,
+                            Err(reason) => {
+                                send_or_warn(
+                                    ctx.tx,
+                                    super::events::AppEvent::ApiError(format!(
+                                        "Final answer failed grounding gate: {reason}"
+                                    )),
+                                    ctx.session_id,
+                                );
+                                break;
+                            }
                         };
                         let mut message = serde_json::json!({
                             "role": "assistant",
@@ -4344,15 +4347,19 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
 }
 
 fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInitialTurn> {
-    let task_obs = observe_turn_user_task(p.session_id, p.session_messages);
-    let request_messages =
-        match request_messages_with_grounding(p.session_id, task_obs, p.session_messages) {
-            Ok(messages) => messages,
-            Err(e) => {
-                send_or_warn(p.tx, super::events::AppEvent::ApiError(e), p.session_id);
-                return None;
-            }
-        };
+    let task_obs = observe_turn_user_task(p.run_context, p.session_id, p.session_messages);
+    let request_messages = match request_messages_with_grounding(
+        p.run_context,
+        p.session_id,
+        task_obs,
+        p.session_messages,
+    ) {
+        Ok(messages) => messages,
+        Err(e) => {
+            send_or_warn(p.tx, super::events::AppEvent::ApiError(e), p.session_id);
+            return None;
+        }
+    };
     if !check_provider_request_policy_for_messages(
         p.policy_enforcer,
         p.model,
@@ -4414,7 +4421,8 @@ async fn run_api_turn_async(p: ApiTurnParams) {
             return;
         }
     }
-    let initial_request = InitialTurnRequest {
+    let Some(initial_turn) = build_initial_turn_request(&InitialTurnRequest {
+        run_context: &run_context,
         session_id: &session_id,
         session_messages: &session_messages,
         policy_enforcer: &policy_enforcer,
@@ -4425,8 +4433,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         claude_code_token: claude_code_token.as_deref(),
         prompt_blocks: prompt_blocks.as_ref(),
         tx: &tx,
-    };
-    let Some(initial_turn) = build_initial_turn_request(&initial_request) else {
+    }) else {
         return;
     };
     match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
@@ -4582,15 +4589,27 @@ async fn handle_turn_result(
             ctx.session_id,
         );
     } else if !turn_result.content.is_empty() {
-        let Some(rendered_content) =
-            render_final_response_for_history(ctx.session_id, &turn_result.content)
-        else {
-            send_or_warn(
-                ctx.tx,
-                super::events::AppEvent::ResponseDone,
-                ctx.session_id,
-            );
-            return;
+        let rendered_content = match render_final_response_for_history(
+            ctx.run_context,
+            ctx.session_id,
+            &turn_result.content,
+        ) {
+            Ok(rendered) => rendered,
+            Err(reason) => {
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::ApiError(format!(
+                        "Final answer failed grounding gate: {reason}"
+                    )),
+                    ctx.session_id,
+                );
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::ResponseDone,
+                    ctx.session_id,
+                );
+                return;
+            }
         };
         let mut message = serde_json::json!({ "role": "assistant", "content": rendered_content });
         if let Some(reasoning) = turn_result
@@ -5144,32 +5163,45 @@ mod tests {
         path
     }
 
-    fn seed_valid_final_ledger(session_id: &str) -> String {
+    fn seed_valid_final_ledger(session_id: &str) -> (String, Arc<crate::tools::ToolRunContext>) {
+        let run = crate::tools::security::test_run_context_for(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )));
         let mut ledger = crate::ledger::RealityLedger::open_project_session(session_id)
             .expect("open test ledger");
-        let task = ledger
-            .observe_user_task("Audit direct TUI final.")
-            .expect("task");
-        let command = ledger
-            .observe_command_run(
-                "/repo",
-                vec!["cargo".to_string(), "check".to_string()],
-                0,
-                "ok",
-                "",
-            )
-            .expect("command");
-        let verification = ledger
-            .append(
-                crate::ledger::Authority::Verifier,
-                crate::ledger::ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        format!("Verified direct TUI final using [{task}] [{command}] [{verification}].")
+        let diff = ledger
+            .observe_diff(&run, vec!["src/tui/app.rs".to_string()], "patch")
+            .expect("diff");
+        let config = crate::config::GuardrailsConfig {
+            quality_gates: Some(crate::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![crate::config::QualityCheck {
+                    name: "tui-check".to_string(),
+                    command: "sh -c 'exit 0'".to_string(),
+                    required: true,
+                }],
+                ..crate::config::QualityGatesConfig::default()
+            }),
+            ..crate::config::GuardrailsConfig::default()
+        };
+        crate::guardrails::configure(&run, &config).expect("configure gate");
+        let gate = crate::guardrails::run_quality_gates(&run)
+            .into_iter()
+            .next()
+            .expect("gate result");
+        let verification =
+            crate::grounded_loop::append_quality_gate_observations(&run, &mut ledger, &gate)
+                .expect("gate receipts")
+                .verification;
+        let content = serde_json::json!({
+            "kind":"final",
+            "claims":[
+                {"claim_type":"file_change", "path":"src/tui/app.rs", "evidence":[diff]},
+                {"claim_type":"verification", "check":"tui-check", "passed":true, "evidence":[verification]}
+            ]
+        })
+        .to_string();
+        (content, run)
     }
 
     fn direct_turn_result(content: String) -> crate::pipeline::TurnResult {
@@ -5185,27 +5217,33 @@ mod tests {
     }
 
     #[test]
-    fn live_structured_final_display_renders_summary_only() {
+    fn live_structured_final_display_validates_before_claim_projection() {
+        let session_id = "tui-live-structured-final-summary";
+        let ledger_path = reset_project_ledger(session_id);
         let content = serde_json::json!({
             "kind": "final",
-            "summary": "Hello - I'm Claudia. What would you like to work on?",
-            "evidence": ["a20e1686-5990-4f06-a09d-226c5e6778ac"],
-            "verification": []
+            "claims": [{
+                "claim_type":"unsupported",
+                "statement":"Hello - I'm Claudia. What would you like to work on?",
+                "reason":"Greeting does not assert an observed runtime fact."
+            }]
         })
         .to_string();
 
         let rendered = super::render_live_final_response_for_display(
-            "tui-live-structured-final-summary",
+            crate::tools::security::test_run_context(),
+            session_id,
             &content,
         )
-        .expect("structured final summary should render");
+        .expect("validated structured final should render");
 
         assert_eq!(
             rendered,
-            "Hello - I'm Claudia. What would you like to work on?"
+            "Unsupported claim \"Hello - I'm Claudia. What would you like to work on?\"; reason \"Greeting does not assert an observed runtime fact.\"."
         );
         assert!(!rendered.contains("\"evidence\""));
         assert!(!rendered.contains("\"verification\""));
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     #[test]
@@ -5214,26 +5252,35 @@ mod tests {
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
         let mut app = App::new("gpt-5.5", "openai");
         app.is_waiting = true;
-        app.messages.append_streaming(
+        app.append_streaming_for_display(
             &serde_json::json!({
                 "kind": "final",
-                "summary": "Hello - I'm Claudia.",
-                "evidence": ["a20e1686-5990-4f06-a09d-226c5e6778ac"],
-                "verification": []
+                "claims": [{
+                    "claim_type":"unsupported",
+                    "statement":"Hello - I'm Claudia.",
+                    "reason":"Greeting."
+                }]
             })
             .to_string(),
+        );
+        assert!(
+            app.messages.streaming_text.is_empty(),
+            "unvalidated structured claims must stay hidden while streaming"
         );
 
         app.handle_response_done();
 
         let last = app.messages.messages.last().expect("assistant message");
         assert_eq!(last.kind, MessageKind::Assistant);
-        assert_eq!(last.content, "Hello - I'm Claudia.");
+        assert_eq!(
+            last.content,
+            "Unsupported claim \"Hello - I'm Claudia.\"; reason \"Greeting.\"."
+        );
         assert!(!last.content.contains("\"kind\""));
     }
 
     #[test]
-    fn streamed_structured_final_never_displays_raw_json() {
+    fn streamed_structured_final_stays_hidden_until_response_done() {
         let mut app = App::new("gpt-5.5", "openai");
         app.append_streaming_for_display("{\"kind\"");
 
@@ -5242,11 +5289,26 @@ mod tests {
         assert!(app.streaming_raw_text.contains("\"kind\""));
 
         app.append_streaming_for_display(
-            ":\"final\",\"summary\":\"Hello - I'm Claudia.\",\"evidence\":[\"a20e1686-5990-4f06-a09d-226c5e6778ac\"],\"verification\":[]}",
+            ":\"final\",\"claims\":[{\"claim_type\":\"unsupported\",\"statement\":\"Hello - I'm Claudia.\",\"reason\":\"Greeting.\"}]}",
         );
 
-        assert_eq!(app.messages.streaming_text, "Hello - I'm Claudia.");
-        assert!(!app.messages.streaming_text.contains("\"evidence\""));
+        assert!(app.messages.streaming_text.is_empty());
+        assert!(app.streaming_raw_text.contains("unsupported"));
+    }
+
+    #[test]
+    fn streamed_plain_final_stays_hidden_and_is_removed_at_response_done() {
+        let mut app = App::new("gpt-5.5", "openai");
+        app.is_waiting = true;
+        app.append_streaming_for_display("Verified with cargo test.");
+
+        assert!(app.messages.streaming_text.is_empty());
+        app.handle_response_done();
+
+        assert!(app.messages.messages.iter().all(|message| {
+            message.kind != MessageKind::Assistant
+                || !message.content.contains("Verified with cargo test")
+        }));
     }
 
     #[test]
@@ -5267,7 +5329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tui_direct_plain_final_syncs_without_grounding_citations() {
+    async fn tui_direct_plain_final_denial_is_surfaced_and_not_persisted() {
         let session_id = "tui-direct-final-plain-text";
         let ledger_path = reset_project_ledger(session_id);
         let (tx, rx) = mpsc::channel();
@@ -5319,11 +5381,10 @@ mod tests {
         }
         let _ = std::fs::remove_file(ledger_path);
 
-        assert!(!saw_error, "plain direct final must not be rejected");
-        let messages = synced_messages.expect("plain direct final should sync messages");
-        assert_eq!(
-            messages.last().and_then(|msg| msg.get("content")),
-            Some(&serde_json::json!("Verified with cargo check."))
+        assert!(saw_error, "final gate denial must be surfaced to the user");
+        assert!(
+            synced_messages.is_none(),
+            "plain direct final must not be persisted as an assistant result"
         );
     }
 
@@ -5331,7 +5392,7 @@ mod tests {
     async fn tui_direct_final_accepts_cited_evidence_and_verification() {
         let session_id = "tui-direct-final-accepted";
         let ledger_path = reset_project_ledger(session_id);
-        let content = seed_valid_final_ledger(session_id);
+        let (content, run) = seed_valid_final_ledger(session_id);
         let (tx, rx) = mpsc::channel();
         let client = reqwest::Client::new();
         let headers: Vec<(String, String)> = Vec::new();
@@ -5344,7 +5405,7 @@ mod tests {
             direct_turn_result(content.clone()),
             vec![serde_json::json!({"role":"user","content":"verify this"})],
             TurnContext {
-                run_context: crate::tools::security::test_run_context(),
+                run_context: &run,
                 client: &client,
                 endpoint: "https://example.invalid",
                 headers: &headers,
@@ -5389,7 +5450,9 @@ mod tests {
         );
         assert_eq!(
             messages.last().and_then(|msg| msg.get("content")),
-            Some(&serde_json::json!(content))
+            Some(&serde_json::json!(
+                "Changed file \"src/tui/app.rs\".\nVerification check \"tui-check\": passed."
+            ))
         );
     }
 

@@ -1441,7 +1441,8 @@ impl AcpServer {
             "role": "user",
             "content": prompt.clone(),
         }));
-        let task_obs = crate::grounded_loop::observe_session_user_task(&oc_session_id, &prompt);
+        let task_obs =
+            crate::grounded_loop::observe_session_user_task(&run_context, &oc_session_id, &prompt);
 
         // Run the agentic loop
         let stop_reason = self
@@ -1521,6 +1522,7 @@ impl AcpServer {
             let ide_state = self.ide_state();
             let prompt_context = build_acp_prompt_context(run, &ide_state);
             let grounded_messages = match crate::grounded_loop::request_messages_with_grounding(
+                run,
                 oc_session_id,
                 task_obs,
                 &self.messages,
@@ -1662,14 +1664,14 @@ impl AcpServer {
 
             match stream_result {
                 StreamResult::EndTurn { content } => {
-                    let rendered_content =
-                        match crate::grounded_loop::validate_and_render_agentic_final_response(
-                            oc_session_id,
-                            &content,
-                        ) {
-                            Ok(rendered) => rendered,
-                            Err(reason) => {
-                                self.send_session_update(
+                    let rendered_content = match validate_and_render_acp_final_response(
+                        run,
+                        oc_session_id,
+                        &content,
+                    ) {
+                        Ok(rendered) => rendered,
+                        Err(reason) => {
+                            self.send_session_update(
                                 acp_session_id,
                                 "agent_message_chunk",
                                 &json!({
@@ -1677,11 +1679,16 @@ impl AcpServer {
                                     "text": format!("\nFinal answer failed grounding gate: {reason}"),
                                 }),
                             );
-                                return "error".to_string();
-                            }
-                        };
+                            return "error".to_string();
+                        }
+                    };
                     // No tool calls — we're done
                     if !rendered_content.is_empty() {
+                        self.send_session_update(
+                            acp_session_id,
+                            "agent_message_chunk",
+                            &json!({"type": "text", "text": rendered_content}),
+                        );
                         self.messages.push(json!({
                             "role": "assistant",
                             "content": rendered_content,
@@ -1693,6 +1700,13 @@ impl AcpServer {
                     content,
                     tool_calls,
                 } => {
+                    if !content.is_empty() {
+                        self.send_session_update(
+                            acp_session_id,
+                            "agent_message_chunk",
+                            &json!({"type": "text", "text": content}),
+                        );
+                    }
                     // Add assistant message with tool calls
                     let tool_calls_json: Vec<Value> = tool_calls
                         .iter()
@@ -1733,6 +1747,7 @@ impl AcpServer {
                             .execute_tool_via_acp(run, oc_session_id, &tc.name, &tc.arguments)
                             .await;
                         record_acp_tool_result_observation(
+                            run,
                             oc_session_id,
                             &tc.name,
                             &tc.id,
@@ -1852,11 +1867,6 @@ impl AcpServer {
                         // Text content
                         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                             full_content.push_str(text);
-                            self.send_session_update(
-                                acp_session_id,
-                                "agent_message_chunk",
-                                &json!({"type": "text", "text": text}),
-                            );
                         }
 
                         // Tool calls
@@ -1953,11 +1963,6 @@ impl AcpServer {
                                 "text_delta" => {
                                     if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                                         full_content.push_str(text);
-                                        self.send_session_update(
-                                            acp_session_id,
-                                            "agent_message_chunk",
-                                            &json!({"type": "text", "text": text}),
-                                        );
                                     }
                                 }
                                 "thinking_delta" => {
@@ -2445,6 +2450,14 @@ impl Drop for AcpServer {
     }
 }
 
+fn validate_and_render_acp_final_response(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+) -> Result<String, String> {
+    crate::grounded_loop::validate_and_render_agentic_final_response(run, session_id, content)
+}
+
 fn execute_local_tool_with_permission(
     run: &Arc<crate::tools::ToolRunContext>,
     permission_mgr: &PermissionManager,
@@ -2488,7 +2501,12 @@ const ACP_BACKGROUND_COMMAND_PENDING_STDERR: &str =
     "background command started; completion pending via bash_output";
 
 #[cfg(test)]
-fn record_acp_background_command_start(session_id: &str, cwd: &std::path::Path, command: &str) {
+fn record_acp_background_command_start(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+) {
     let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
         Ok(ledger) => ledger,
         Err(err) => {
@@ -2502,6 +2520,7 @@ fn record_acp_background_command_start(session_id: &str, cwd: &std::path::Path, 
         }
     };
     if let Err(err) = ledger.observe_command_run(
+        run,
         cwd.to_string_lossy().to_string(),
         vec!["bash".to_string(), "-c".to_string(), command.to_string()],
         -1,
@@ -2518,6 +2537,7 @@ fn record_acp_background_command_start(session_id: &str, cwd: &std::path::Path, 
 }
 
 fn record_acp_tool_result_observation(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
     tool_name: &str,
     tool_call_id: &str,
@@ -2549,7 +2569,7 @@ fn record_acp_tool_result_observation(
         }
     };
     if let Err(err) =
-        crate::grounded_loop::append_tool_result_observation(&mut ledger, tool_name, &tool_result)
+        crate::grounded_loop::append_tool_result_observation(run, &mut ledger, &tool_result)
     {
         tracing::warn!(
             session_id,
@@ -3506,9 +3526,32 @@ mod search_security_tests {
 #[cfg(test)]
 mod acp_ledger_helper_tests {
     use super::{
-        record_acp_background_command_start, record_acp_tool_result_observation, AcpToolResult,
+        record_acp_background_command_start, record_acp_tool_result_observation,
+        validate_and_render_acp_final_response, AcpToolResult,
         ACP_BACKGROUND_COMMAND_PENDING_STDERR,
     };
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
+    #[test]
+    fn acp_plain_final_is_denied_by_frontend_boundary() {
+        let session_id = "acp-plain-final-grounding-denial";
+        let path = crate::ledger::project_session_ledger_path(session_id)
+            .expect("test session id must be ledger safe");
+        let _ = std::fs::remove_file(&path);
+
+        let err = validate_and_render_acp_final_response(
+            test_run(),
+            session_id,
+            "Verified with cargo test.",
+        )
+        .expect_err("ACP plain final must not bypass typed claims");
+
+        assert_eq!(err, "final answer must use the typed final claim envelope");
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn acp_tool_result_observer_records_bounded_result_envelope() {
@@ -3521,7 +3564,13 @@ mod acp_ledger_helper_tests {
             content: "x".repeat(crate::grounded_loop::TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES + 128),
             is_error: true,
         };
-        record_acp_tool_result_observation(session_id, "read_file", "call_acp", &result);
+        record_acp_tool_result_observation(
+            test_run(),
+            session_id,
+            "read_file",
+            "call_acp",
+            &result,
+        );
 
         let ledger = crate::ledger::RealityLedger::open_project_session(session_id)
             .expect("reopen session ledger");
@@ -3535,7 +3584,11 @@ mod acp_ledger_helper_tests {
                 )
             })
             .expect("tool result observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(test_run()));
         let crate::ledger::ObservationKind::ToolResult { result, .. } = &observation.kind else {
             panic!("expected tool result observation");
         };
@@ -3558,13 +3611,17 @@ mod acp_ledger_helper_tests {
         let _ = std::fs::remove_file(&path);
         let cwd = std::env::current_dir().expect("cwd");
 
-        record_acp_background_command_start(session_id, &cwd, "cargo test");
+        record_acp_background_command_start(test_run(), session_id, &cwd, "cargo test");
 
         let ledger = crate::ledger::RealityLedger::open_project_session(session_id)
             .expect("reopen session ledger");
         let observations = ledger.observations_chronological();
         assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].authority, crate::ledger::Authority::Command);
+        assert_eq!(
+            observations[0].provenance.trust,
+            crate::ledger::EvidenceTrust::RuntimeObserved
+        );
+        assert!(observations[0].provenance.is_bound_to(test_run()));
         let crate::ledger::ObservationKind::CommandRun {
             cwd: observed_cwd,
             argv,

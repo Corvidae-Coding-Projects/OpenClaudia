@@ -184,9 +184,13 @@ impl ToolExecutor {
     }
 
     /// Append a bounded tool-result observation to the active session ledger.
-    pub fn observe_tool_result(session_id: Option<&str>, tool_name: &str, result: &ToolResult) {
+    pub fn observe_tool_result(
+        run: &crate::tools::ToolRunContext,
+        session_id: Option<&str>,
+        result: &ToolResult,
+    ) {
         if let Some(session_id) = session_id {
-            crate::grounded_loop::observe_tool_result_for_session(session_id, tool_name, result);
+            crate::grounded_loop::observe_tool_result_for_session(run, session_id, result);
         }
     }
 

@@ -1,29 +1,34 @@
-//! Authoritative observation ledger for grounded agent decisions.
+//! Provenance-bound observation ledger for grounded agent decisions.
 //!
 //! Chat history, memory, and compaction summaries are useful navigation
-//! aids, but they are not facts. `RealityLedger` records observations from
-//! authoritative boundaries such as the user, filesystem, commands, git, and
-//! verifiers. The decision gate can then require model actions to cite ledger
-//! IDs instead of relying on provider chat history.
+//! aids, but they are not facts. `RealityLedger` stores observations issued by
+//! typed runtime producers. The decision gate evaluates the provenance and
+//! claim applicability of those records; presence in this ledger is not, by
+//! itself, proof.
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::runtime::{CapabilityGeneration, RunId};
+
 const SCHEMA_VERSION: i64 = 1;
 const SESSION_LEDGER_DIR: &str = ".openclaudia/reality-ledgers";
+const MAX_RUNTIME_ISSUED_RECEIPTS: usize = 65_536;
 
 pub type SharedRealityLedger = Arc<Mutex<RealityLedger>>;
 
 static ACTIVE_REALITY_LEDGERS: LazyLock<Mutex<HashMap<String, SharedRealityLedger>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static RUNTIME_ISSUED_RECEIPTS: LazyLock<Mutex<IssuedReceiptRegistry>> =
+    LazyLock::new(|| Mutex::new(IssuedReceiptRegistry::default()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObsId(Uuid);
@@ -65,29 +70,172 @@ impl std::str::FromStr for ObsId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Observation {
     pub id: ObsId,
     pub ts: DateTime<Utc>,
     pub kind: ObservationKind,
-    pub authority: Authority,
+    pub provenance: EvidenceProvenance,
 }
 
 impl Observation {
-    #[must_use]
-    pub fn new(authority: Authority, kind: ObservationKind) -> Self {
+    fn new(provenance: EvidenceProvenance, kind: ObservationKind) -> Self {
         Self {
             id: ObsId::new(),
             ts: Utc::now(),
             kind,
-            authority,
+            provenance,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Authority {
+pub enum EvidenceTrust {
+    UserInput,
+    RuntimeObserved,
+    UntrustedContent,
+    HostPolicy,
+    TrustedVerifier,
+    DerivedSummary,
+    /// Typed provenance loaded from mutable persistence without a matching
+    /// process-issued receipt remains useful for navigation, never proof.
+    UnverifiedPersisted,
+    /// Rows written before the provenance schema cannot authorize decisions.
+    LegacyUnbound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EvidenceSource {
+    UserInput,
+    FilesystemRead,
+    CommandExecution,
+    WorkspaceDiff,
+    ToolResult,
+    HostPolicy { policy: String },
+    QualityGate { check: String },
+    ModelSummary,
+    Legacy { claimed_authority: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RunBinding {
+    pub run_id: RunId,
+    pub capability_generation: CapabilityGeneration,
+}
+
+impl RunBinding {
+    #[must_use]
+    pub(crate) fn from_run(run: &crate::tools::ToolRunContext) -> Self {
+        Self {
+            run_id: run.run_id(),
+            capability_generation: run.generation(),
+        }
+    }
+
+    #[must_use]
+    pub fn matches(&self, run: &crate::tools::ToolRunContext) -> bool {
+        self.run_id == run.run_id() && self.capability_generation == run.generation()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolCallBinding {
+    pub call_id: String,
+    pub handler: String,
+    pub arguments_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ArtifactBinding {
+    File {
+        path: String,
+        sha256: String,
+    },
+    Diff {
+        files: Vec<String>,
+        patch_sha256: String,
+    },
+    Command {
+        cwd: String,
+        argv_sha256: String,
+    },
+    Executable {
+        path: String,
+        sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VerificationMethod {
+    GuardrailsQualityGateDirectExec {
+        normalized_argv: Vec<String>,
+        resolved_executable: Option<String>,
+        executable_sha256: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EvidenceProvenance {
+    pub trust: EvidenceTrust,
+    pub source: EvidenceSource,
+    pub run: Option<RunBinding>,
+    pub tool_call: Option<ToolCallBinding>,
+    pub artifact: Option<ArtifactBinding>,
+    pub verification_method: Option<VerificationMethod>,
+}
+
+impl EvidenceProvenance {
+    fn for_run(
+        run: &crate::tools::ToolRunContext,
+        trust: EvidenceTrust,
+        source: EvidenceSource,
+    ) -> Self {
+        Self::for_binding(RunBinding::from_run(run), trust, source)
+    }
+
+    const fn for_binding(run: RunBinding, trust: EvidenceTrust, source: EvidenceSource) -> Self {
+        Self {
+            trust,
+            source,
+            run: Some(run),
+            tool_call: None,
+            artifact: None,
+            verification_method: None,
+        }
+    }
+
+    fn legacy_unbound(authority: LegacyAuthority) -> Self {
+        Self::legacy_unbound_label(authority.as_str())
+    }
+
+    fn legacy_unbound_label(claimed_authority: &str) -> Self {
+        Self {
+            trust: EvidenceTrust::LegacyUnbound,
+            source: EvidenceSource::Legacy {
+                claimed_authority: claimed_authority.to_string(),
+            },
+            run: None,
+            tool_call: None,
+            artifact: None,
+            verification_method: None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_bound_to(&self, run: &crate::tools::ToolRunContext) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|binding| binding.matches(run))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyAuthority {
     User,
     Tool,
     Filesystem,
@@ -95,8 +243,57 @@ pub enum Authority {
     Git,
     Policy,
     Verifier,
-    /// Model summaries are retained for navigation, but never for proof.
     ModelSummary,
+}
+
+impl LegacyAuthority {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Tool => "tool",
+            Self::Filesystem => "filesystem",
+            Self::Command => "command",
+            Self::Git => "git",
+            Self::Policy => "policy",
+            Self::Verifier => "verifier",
+            Self::ModelSummary => "model_summary",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ObservationWire {
+    id: ObsId,
+    ts: DateTime<Utc>,
+    kind: ObservationKind,
+    #[serde(default)]
+    provenance: Option<EvidenceProvenance>,
+    #[serde(default)]
+    authority: Option<LegacyAuthority>,
+}
+
+impl<'de> Deserialize<'de> for Observation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ObservationWire::deserialize(deserializer)?;
+        let provenance = match (wire.provenance, wire.authority) {
+            (Some(provenance), _) => provenance,
+            (None, Some(authority)) => EvidenceProvenance::legacy_unbound(authority),
+            (None, None) => {
+                return Err(serde::de::Error::missing_field(
+                    "provenance (or legacy authority)",
+                ))
+            }
+        };
+        Ok(Self {
+            id: wire.id,
+            ts: wire.ts,
+            kind: wire.kind,
+            provenance,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +396,8 @@ impl ObservationKind {
 pub struct ObservationIndexEntry {
     pub id: ObsId,
     pub ts: DateTime<Utc>,
-    pub authority: Authority,
+    pub trust: EvidenceTrust,
+    pub source: EvidenceSource,
     pub stale: bool,
     pub label: String,
 }
@@ -208,6 +406,39 @@ pub struct ObservationIndexEntry {
 struct ObservationRecord {
     observation: Observation,
     stale: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IssuedReceiptState {
+    observation_sha256: [u8; 32],
+    stale: bool,
+}
+
+#[derive(Default)]
+struct IssuedReceiptRegistry {
+    states: HashMap<ObsId, IssuedReceiptState>,
+    issuance_order: VecDeque<ObsId>,
+}
+
+impl IssuedReceiptRegistry {
+    fn insert(&mut self, id: ObsId, state: IssuedReceiptState) {
+        if !self.states.contains_key(&id) {
+            while self.states.len() >= MAX_RUNTIME_ISSUED_RECEIPTS {
+                let Some(evicted) = self.issuance_order.pop_front() else {
+                    break;
+                };
+                self.states.remove(&evicted);
+            }
+            self.issuance_order.push_back(id);
+        }
+        self.states.insert(id, state);
+    }
+
+    fn mark_stale(&mut self, id: ObsId) {
+        if let Some(state) = self.states.get_mut(&id) {
+            state.stale = true;
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -231,6 +462,8 @@ pub enum LedgerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("invalid evidence provenance: {0}")]
+    InvalidEvidenceProvenance(String),
 }
 
 #[must_use = "dropping the guard restores the previous active ledger"]
@@ -396,13 +629,6 @@ impl RealityLedger {
         self.records.get(&id).is_some_and(|record| record.stale)
     }
 
-    #[must_use]
-    pub fn is_authoritative(&self, id: ObsId) -> bool {
-        self.records.get(&id).is_some_and(|record| {
-            !record.stale && record.observation.authority != Authority::ModelSummary
-        })
-    }
-
     /// Return all observations in chronological order.
     ///
     /// This hydrates the in-memory cache, not the `SQLite` connection directly.
@@ -420,13 +646,7 @@ impl RealityLedger {
         observations
     }
 
-    /// Append a fully-formed observation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the observation id already exists or persistence
-    /// fails.
-    pub fn append_observation(&mut self, observation: Observation) -> Result<ObsId, LedgerError> {
+    fn append_observation(&mut self, observation: Observation) -> Result<ObsId, LedgerError> {
         let id = observation.id;
         if self.records.contains_key(&id) {
             return Err(LedgerError::DuplicateObservation(id));
@@ -436,21 +656,17 @@ impl RealityLedger {
             stale: false,
         };
         self.persist_record(&record)?;
+        register_runtime_issued(&record)?;
         self.records.insert(id, record);
         Ok(id)
     }
 
-    /// Append a new observation with the current timestamp.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if persistence fails.
-    pub fn append(
+    fn append(
         &mut self,
-        authority: Authority,
+        provenance: EvidenceProvenance,
         kind: ObservationKind,
     ) -> Result<ObsId, LedgerError> {
-        self.append_observation(Observation::new(authority, kind))
+        self.append_observation(Observation::new(provenance, kind))
     }
 
     /// Record the user's task as the root task specification evidence.
@@ -458,9 +674,13 @@ impl RealityLedger {
     /// # Errors
     ///
     /// Returns an error if persistence fails.
-    pub fn observe_user_task(&mut self, content: impl Into<String>) -> Result<ObsId, LedgerError> {
+    pub fn observe_user_task(
+        &mut self,
+        run: &crate::tools::ToolRunContext,
+        content: impl Into<String>,
+    ) -> Result<ObsId, LedgerError> {
         self.append(
-            Authority::User,
+            EvidenceProvenance::for_run(run, EvidenceTrust::UserInput, EvidenceSource::UserInput),
             ObservationKind::UserTask {
                 content: content.into(),
             },
@@ -475,6 +695,7 @@ impl RealityLedger {
     /// Returns an error if persistence fails.
     pub fn observe_file_read(
         &mut self,
+        run: &crate::tools::ToolRunContext,
         path: impl Into<String>,
         full_contents: &str,
         start_line: usize,
@@ -482,6 +703,7 @@ impl RealityLedger {
         excerpt: impl Into<String>,
     ) -> Result<ObsId, LedgerError> {
         self.observe_file_read_bytes(
+            run,
             path,
             full_contents.as_bytes(),
             start_line,
@@ -497,17 +719,29 @@ impl RealityLedger {
     /// Returns an error if persistence fails.
     pub fn observe_file_read_bytes(
         &mut self,
+        run: &crate::tools::ToolRunContext,
         path: impl Into<String>,
         full_contents: &[u8],
         start_line: usize,
         end_line: usize,
         excerpt: impl Into<String>,
     ) -> Result<ObsId, LedgerError> {
+        let path = path.into();
+        let sha256 = sha256_hex(full_contents);
+        let mut provenance = EvidenceProvenance::for_run(
+            run,
+            EvidenceTrust::RuntimeObserved,
+            EvidenceSource::FilesystemRead,
+        );
+        provenance.artifact = Some(ArtifactBinding::File {
+            path: path.clone(),
+            sha256: sha256.clone(),
+        });
         self.append(
-            Authority::Filesystem,
+            provenance,
             ObservationKind::FileRead {
-                path: path.into(),
-                sha256: sha256_hex(full_contents),
+                path,
+                sha256,
                 start_line,
                 end_line,
                 excerpt: excerpt.into(),
@@ -522,16 +756,48 @@ impl RealityLedger {
     /// Returns an error if persistence fails.
     pub fn observe_command_run(
         &mut self,
+        run: &crate::tools::ToolRunContext,
         cwd: impl Into<String>,
         argv: Vec<String>,
         exit_code: i32,
         stdout: impl Into<String>,
         stderr: impl Into<String>,
     ) -> Result<ObsId, LedgerError> {
+        self.observe_command_run_for_binding(
+            RunBinding::from_run(run),
+            cwd,
+            argv,
+            exit_code,
+            stdout,
+            stderr,
+        )
+    }
+
+    pub(crate) fn observe_command_run_for_binding(
+        &mut self,
+        run: RunBinding,
+        cwd: impl Into<String>,
+        argv: Vec<String>,
+        exit_code: i32,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+    ) -> Result<ObsId, LedgerError> {
+        let cwd = cwd.into();
+        let mut provenance = EvidenceProvenance::for_binding(
+            run,
+            EvidenceTrust::RuntimeObserved,
+            EvidenceSource::CommandExecution,
+        );
+        provenance.artifact = Some(ArtifactBinding::Command {
+            cwd: cwd.clone(),
+            argv_sha256: sha256_hex(
+                &serde_json::to_vec(&argv).expect("command argv serialization cannot fail"),
+            ),
+        });
         self.append(
-            Authority::Command,
+            provenance,
             ObservationKind::CommandRun {
-                cwd: cwd.into(),
+                cwd,
                 argv,
                 exit_code,
                 stdout: stdout.into(),
@@ -543,7 +809,7 @@ impl RealityLedger {
     /// Record a tool result envelope.
     ///
     /// Tool-specific observers such as file reads and command runs remain the
-    /// authoritative source for detailed filesystem/command facts. This
+    /// typed source for detailed filesystem/command facts. This
     /// generic observation records that a model-visible tool result was
     /// produced, including bounded result metadata for later grounding.
     ///
@@ -552,16 +818,144 @@ impl RealityLedger {
     /// Returns an error if persistence fails.
     pub fn observe_tool_result(
         &mut self,
-        tool: impl Into<String>,
-        result: serde_json::Value,
+        run: &crate::tools::ToolRunContext,
+        tool_result: &crate::tools::ToolResult,
+        result_payload: serde_json::Value,
     ) -> Result<ObsId, LedgerError> {
+        let invocation = tool_result.invocation();
+        let tool = invocation.handler.clone();
+        let mut provenance = EvidenceProvenance::for_run(
+            run,
+            EvidenceTrust::UntrustedContent,
+            EvidenceSource::ToolResult,
+        );
+        provenance.tool_call = Some(ToolCallBinding {
+            call_id: invocation.call_id.clone(),
+            handler: invocation.handler.clone(),
+            arguments_sha256: sha256_hex(invocation.raw_arguments.as_bytes()),
+        });
         self.append(
-            Authority::Tool,
+            provenance,
             ObservationKind::ToolResult {
-                tool: tool.into(),
-                result,
+                tool,
+                result: result_payload,
             },
         )
+    }
+
+    pub(crate) fn observe_policy_decision(
+        &mut self,
+        run: &crate::tools::ToolRunContext,
+        policy: impl Into<String>,
+        allowed: bool,
+        reason: impl Into<String>,
+    ) -> Result<ObsId, LedgerError> {
+        self.append(
+            EvidenceProvenance::for_run(
+                run,
+                EvidenceTrust::HostPolicy,
+                EvidenceSource::HostPolicy {
+                    policy: policy.into(),
+                },
+            ),
+            ObservationKind::PolicyDecision {
+                allowed,
+                reason: reason.into(),
+            },
+        )
+    }
+
+    pub(crate) fn observe_model_summary(
+        &mut self,
+        run: &crate::tools::ToolRunContext,
+        text: impl Into<String>,
+        source_obs: Vec<ObsId>,
+    ) -> Result<ObsId, LedgerError> {
+        self.append(
+            EvidenceProvenance::for_run(
+                run,
+                EvidenceTrust::DerivedSummary,
+                EvidenceSource::ModelSummary,
+            ),
+            ObservationKind::Summary {
+                text: text.into(),
+                source_obs,
+            },
+        )
+    }
+
+    pub(crate) fn observe_quality_gate(
+        &mut self,
+        run: &crate::tools::ToolRunContext,
+        gate: &crate::guardrails::QualityCheckResult,
+        findings: Vec<String>,
+    ) -> Result<ObsId, LedgerError> {
+        Self::validate_quality_gate_result(run, gate)?;
+        let proof = gate.evidence();
+
+        let mut provenance = EvidenceProvenance::for_run(
+            run,
+            EvidenceTrust::TrustedVerifier,
+            EvidenceSource::QualityGate {
+                check: gate.name().to_string(),
+            },
+        );
+        provenance.artifact = proof
+            .resolved_executable
+            .as_ref()
+            .zip(proof.executable_sha256.as_ref())
+            .map(|(path, sha256)| ArtifactBinding::Executable {
+                path: path.clone(),
+                sha256: sha256.clone(),
+            });
+        provenance.verification_method =
+            Some(VerificationMethod::GuardrailsQualityGateDirectExec {
+                normalized_argv: proof.normalized_argv.clone(),
+                resolved_executable: proof.resolved_executable.clone(),
+                executable_sha256: proof.executable_sha256.clone(),
+            });
+        self.append(
+            provenance,
+            ObservationKind::Verification {
+                passed: gate.passed(),
+                command: Some(gate.command().to_string()),
+                findings,
+            },
+        )
+    }
+
+    pub(crate) fn validate_quality_gate_result(
+        run: &crate::tools::ToolRunContext,
+        gate: &crate::guardrails::QualityCheckResult,
+    ) -> Result<(), LedgerError> {
+        let proof = gate.evidence();
+        if proof.run_id != run.run_id() || proof.capability_generation != run.generation() {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality-gate result belongs to a different run generation".to_string(),
+            ));
+        }
+        let normalized = shlex::split(gate.command())
+            .filter(|argv| !argv.is_empty())
+            .unwrap_or_default();
+        if normalized != proof.normalized_argv {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality-gate command does not match its runner-minted argv".to_string(),
+            ));
+        }
+        if gate.passed() != (gate.exit_code() == 0) {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality-gate pass state does not match its exit code".to_string(),
+            ));
+        }
+        if gate.passed()
+            && (proof.resolved_executable.is_none() || proof.executable_sha256.is_none())
+        {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "passing quality gate lacks a resolved executable artifact".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Record a diff and stale prior file reads for every touched path.
@@ -571,16 +965,22 @@ impl RealityLedger {
     /// Returns an error if persistence fails.
     pub fn observe_diff(
         &mut self,
+        run: &crate::tools::ToolRunContext,
         files: Vec<String>,
         patch: impl Into<String>,
     ) -> Result<ObsId, LedgerError> {
-        let observation = Observation::new(
-            Authority::Git,
-            ObservationKind::DiffObserved {
-                files,
-                patch: patch.into(),
-            },
+        let patch = patch.into();
+        let mut provenance = EvidenceProvenance::for_run(
+            run,
+            EvidenceTrust::RuntimeObserved,
+            EvidenceSource::WorkspaceDiff,
         );
+        provenance.artifact = Some(ArtifactBinding::Diff {
+            files: files.clone(),
+            patch_sha256: sha256_hex(patch.as_bytes()),
+        });
+        let observation =
+            Observation::new(provenance, ObservationKind::DiffObserved { files, patch });
         let id = observation.id;
         if self.records.contains_key(&id) {
             return Err(LedgerError::DuplicateObservation(id));
@@ -630,6 +1030,8 @@ impl RealityLedger {
             tx.commit()?;
         }
 
+        register_runtime_issued(&record)?;
+        mark_runtime_receipts_stale(&stale_ids);
         self.records.insert(id, record);
         for stale_id in stale_ids {
             if let Some(record) = self.records.get_mut(&stale_id) {
@@ -643,7 +1045,7 @@ impl RealityLedger {
     ///
     /// This is the primitive write/edit paths should call after mutating a
     /// file. A stale read can still be inspected for history, but cannot be
-    /// used as authoritative evidence for a new decision.
+    /// used as fresh evidence for a new decision.
     ///
     /// # Errors
     ///
@@ -672,6 +1074,7 @@ impl RealityLedger {
             tx.commit()?;
         }
 
+        mark_runtime_receipts_stale(&stale_ids);
         for id in &stale_ids {
             if let Some(record) = self.records.get_mut(id) {
                 record.stale = true;
@@ -693,7 +1096,8 @@ impl RealityLedger {
             .map(|record| ObservationIndexEntry {
                 id: record.observation.id,
                 ts: record.observation.ts,
-                authority: record.observation.authority,
+                trust: record.observation.provenance.trust,
+                source: record.observation.provenance.source.clone(),
                 stale: record.stale,
                 label: record.observation.kind.compact_label(),
             })
@@ -768,7 +1172,16 @@ fn load_records(conn: &Connection) -> Result<HashMap<ObsId, ObservationRecord>, 
     while let Some(row) = rows.next()? {
         let json: String = row.get(0)?;
         let stale: i64 = row.get(1)?;
-        let observation: Observation = serde_json::from_str(&json)?;
+        let mut observation: Observation = serde_json::from_str(&json)?;
+        let record = ObservationRecord {
+            observation: observation.clone(),
+            stale: stale != 0,
+        };
+        if !was_issued_by_this_runtime(&record)?
+            && observation.provenance.trust != EvidenceTrust::LegacyUnbound
+        {
+            observation.provenance.trust = EvidenceTrust::UnverifiedPersisted;
+        }
         records.insert(
             observation.id,
             ObservationRecord {
@@ -780,6 +1193,38 @@ fn load_records(conn: &Connection) -> Result<HashMap<ObsId, ObservationRecord>, 
     Ok(records)
 }
 
+fn register_runtime_issued(record: &ObservationRecord) -> Result<(), LedgerError> {
+    let state = IssuedReceiptState {
+        observation_sha256: observation_digest(&record.observation)?,
+        stale: record.stale,
+    };
+    issued_receipts_guard("register_runtime_issued").insert(record.observation.id, state);
+    Ok(())
+}
+
+fn was_issued_by_this_runtime(record: &ObservationRecord) -> Result<bool, LedgerError> {
+    let state = IssuedReceiptState {
+        observation_sha256: observation_digest(&record.observation)?,
+        stale: record.stale,
+    };
+    Ok(issued_receipts_guard("validate_runtime_issued")
+        .states
+        .get(&record.observation.id)
+        .is_some_and(|issued| *issued == state))
+}
+
+fn mark_runtime_receipts_stale(ids: &[ObsId]) {
+    let mut issued = issued_receipts_guard("mark_runtime_receipts_stale");
+    for id in ids {
+        issued.mark_stale(*id);
+    }
+}
+
+fn observation_digest(observation: &Observation) -> Result<[u8; 32], LedgerError> {
+    let bytes = serde_json::to_vec(observation)?;
+    Ok(Sha256::digest(bytes).into())
+}
+
 fn insert_record(conn: &Connection, record: &ObservationRecord) -> Result<(), LedgerError> {
     let observation = &record.observation;
     let json = serde_json::to_string(observation)?;
@@ -789,7 +1234,7 @@ fn insert_record(conn: &Connection, record: &ObservationRecord) -> Result<(), Le
         params![
             observation.id.to_string(),
             observation.ts.to_rfc3339(),
-            format!("{:?}", observation.authority),
+            format!("{:?}", observation.provenance.trust),
             i64::from(record.stale),
             json
         ],
@@ -844,6 +1289,16 @@ fn active_ledgers_guard(
         tracing::error!(
             operation,
             "active reality ledger registry lock poisoned; recovering inner state"
+        );
+        err.into_inner()
+    })
+}
+
+fn issued_receipts_guard(operation: &'static str) -> MutexGuard<'static, IssuedReceiptRegistry> {
+    RUNTIME_ISSUED_RECEIPTS.lock().unwrap_or_else(|err| {
+        tracing::error!(
+            operation,
+            "runtime-issued receipt registry lock poisoned; recovering inner state"
         );
         err.into_inner()
     })

@@ -1159,7 +1159,7 @@ impl ContextCompactor {
             saved = analysis.current_tokens.saturating_sub(new_tokens),
             "Context compacted"
         );
-        record_compaction_summary_observation(session_id, &summary);
+        record_compaction_summary_observation(run_context, session_id, &summary);
 
         Ok(CompactionResult {
             compacted: true,
@@ -1497,7 +1497,7 @@ impl ContextCompactor {
             });
         }
 
-        record_compaction_summary_observation(session_id, &summary);
+        record_compaction_summary_observation(run_context, session_id, &summary);
 
         Ok(CompactionResult {
             compacted: true,
@@ -1533,7 +1533,11 @@ impl ContextCompactor {
     }
 }
 
-fn record_compaction_summary_observation(session_id: Option<&str>, summary: &str) {
+fn record_compaction_summary_observation(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    summary: &str,
+) {
     let Some(session_id) = session_id else {
         return;
     };
@@ -1553,7 +1557,7 @@ fn record_compaction_summary_observation(session_id: Option<&str>, summary: &str
         .into_iter()
         .map(|entry| entry.id)
         .collect::<Vec<_>>();
-    if let Err(err) = append_compaction_summary_observation(&mut ledger, summary, source_obs) {
+    if let Err(err) = append_compaction_summary_observation(run, &mut ledger, summary, source_obs) {
         tracing::warn!(
             session_id,
             error = %err,
@@ -1563,17 +1567,12 @@ fn record_compaction_summary_observation(session_id: Option<&str>, summary: &str
 }
 
 fn append_compaction_summary_observation(
+    run: &crate::tools::ToolRunContext,
     ledger: &mut crate::ledger::RealityLedger,
     summary: &str,
     source_obs: Vec<crate::ledger::ObsId>,
 ) -> Result<crate::ledger::ObsId, crate::ledger::LedgerError> {
-    ledger.append(
-        crate::ledger::Authority::ModelSummary,
-        crate::ledger::ObservationKind::Summary {
-            text: summary.to_string(),
-            source_obs,
-        },
-    )
+    ledger.observe_model_summary(run, summary, source_obs)
 }
 
 /// Archive a slice of messages into [`MemoryDb`] archival memory before they
@@ -1902,12 +1901,13 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summary_observation_is_model_summary_authority() {
+    fn compaction_summary_observation_is_run_bound_navigation_data() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task("Summarize older context.")
+            .observe_user_task(test_run(), "Summarize older context.")
             .expect("task observation");
         let id = append_compaction_summary_observation(
+            test_run(),
             &mut ledger,
             "<context-summary>x</context-summary>",
             vec![task],
@@ -1915,18 +1915,15 @@ mod tests {
         .expect("summary observation");
         let observation = ledger.get(id).expect("observation");
         assert_eq!(
-            observation.authority,
-            crate::ledger::Authority::ModelSummary
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::DerivedSummary
         );
+        assert!(observation.provenance.is_bound_to(test_run()));
         let crate::ledger::ObservationKind::Summary { text, source_obs } = &observation.kind else {
             panic!("expected summary observation");
         };
         assert_eq!(text, "<context-summary>x</context-summary>");
         assert_eq!(source_obs, &vec![task]);
-        assert!(
-            !ledger.is_authoritative(id),
-            "summary observations must not be authoritative evidence"
-        );
     }
 
     #[test]
@@ -1940,10 +1937,11 @@ mod tests {
             let mut ledger = crate::ledger::RealityLedger::open_project_session(session_id)
                 .expect("open project ledger");
             let task = ledger
-                .observe_user_task("Compact older messages.")
+                .observe_user_task(test_run(), "Compact older messages.")
                 .expect("task observation");
             let command = ledger
                 .observe_command_run(
+                    test_run(),
                     "/repo",
                     vec!["cargo".to_string(), "check".to_string()],
                     0,
@@ -1955,6 +1953,7 @@ mod tests {
         };
 
         record_compaction_summary_observation(
+            test_run(),
             Some(session_id),
             "<context-summary>prior work</context-summary>",
         );
@@ -1966,15 +1965,15 @@ mod tests {
             .into_iter()
             .find(|obs| matches!(obs.kind, crate::ledger::ObservationKind::Summary { .. }))
             .expect("summary observation");
-        assert_eq!(summary.authority, crate::ledger::Authority::ModelSummary);
+        assert_eq!(
+            summary.provenance.trust,
+            crate::ledger::EvidenceTrust::DerivedSummary
+        );
+        assert!(summary.provenance.is_bound_to(test_run()));
         let crate::ledger::ObservationKind::Summary { source_obs, .. } = &summary.kind else {
             panic!("expected summary observation");
         };
         assert_eq!(source_obs, &vec![task, command]);
-        assert!(
-            !ledger.is_authoritative(summary.id),
-            "compaction summary must remain non-authoritative"
-        );
 
         let _ = std::fs::remove_file(path);
     }

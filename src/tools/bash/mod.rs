@@ -33,29 +33,6 @@ const MAX_BACKGROUND_SHELLS: usize = 50;
 const LEDGER_COMMAND_OUTPUT_MAX_BYTES: usize = 100_000;
 const BACKGROUND_OUTPUT_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
 const FOREGROUND_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
-const VERIFICATION_COMMAND_NEEDLES: &[&str] = &[
-    "cargo test",
-    "cargo check",
-    "cargo clippy",
-    "cargo fmt",
-    "cargo nextest",
-    "npm test",
-    "npm run test",
-    "pnpm test",
-    "pnpm run test",
-    "yarn test",
-    "yarn run test",
-    "bun test",
-    "pytest",
-    "python -m pytest",
-    "go test",
-    "zig test",
-    "swift test",
-    "mvn test",
-    "gradle test",
-    "make test",
-    "ctest",
-];
 
 fn bash_bin(run: &crate::tools::ToolRunContext) -> Result<PathBuf, String> {
     run.resolve_executable("bash")
@@ -384,6 +361,7 @@ impl BackgroundShellManager {
         let stdout_ledger_for_wait = Arc::clone(&stdout_ledger_buffer);
         let stderr_ledger_for_wait = Arc::clone(&stderr_ledger_buffer);
         let owner_for_ledger = owner_label.clone();
+        let run_for_ledger = crate::ledger::RunBinding::from_run(run);
         let cwd_for_ledger = cwd;
         let command_for_ledger = command.to_string();
         let mut child_for_wait = child;
@@ -422,6 +400,7 @@ impl BackgroundShellManager {
                 )
                 .clone();
                 record_command_observation_for_session(
+                    &run_for_ledger,
                     &owner_for_ledger,
                     &cwd_for_ledger,
                     &command_for_ledger,
@@ -905,7 +884,7 @@ pub fn try_execute_bash(
             )));
         }
     };
-    record_active_command_observation(run.session_id(), &cwd, command, &output);
+    record_active_command_observation(run, &cwd, command, &output);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -944,7 +923,7 @@ pub fn try_execute_bash(
 }
 
 fn record_active_command_observation(
-    session_key: &str,
+    run: &super::security::ToolRunContext,
     cwd: &Path,
     command: &str,
     output: &std::process::Output,
@@ -952,10 +931,20 @@ fn record_active_command_observation(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = output.status.code().unwrap_or(-1);
-    record_command_observation_for_session(session_key, cwd, command, exit_code, &stdout, &stderr);
+    let binding = crate::ledger::RunBinding::from_run(run);
+    record_command_observation_for_session(
+        &binding,
+        run.session_id(),
+        cwd,
+        command,
+        exit_code,
+        &stdout,
+        &stderr,
+    );
 }
 
 pub fn record_command_observation_for_session(
+    run: &crate::ledger::RunBinding,
     session_key: &str,
     cwd: &Path,
     command: &str,
@@ -968,7 +957,7 @@ pub fn record_command_observation_for_session(
             tracing::error!("active reality ledger lock poisoned; recovering inner state");
             err.into_inner()
         });
-        append_command_observation(&mut ledger, cwd, command, exit_code, stdout, stderr);
+        append_command_observation(run, &mut ledger, cwd, command, exit_code, stdout, stderr);
         return;
     }
 
@@ -984,10 +973,11 @@ pub fn record_command_observation_for_session(
             return;
         }
     };
-    append_command_observation(&mut ledger, cwd, command, exit_code, stdout, stderr);
+    append_command_observation(run, &mut ledger, cwd, command, exit_code, stdout, stderr);
 }
 
 fn append_command_observation(
+    run: &crate::ledger::RunBinding,
     ledger: &mut crate::ledger::RealityLedger,
     cwd: &Path,
     command: &str,
@@ -995,7 +985,8 @@ fn append_command_observation(
     stdout: &str,
     stderr: &str,
 ) {
-    if let Err(err) = ledger.observe_command_run(
+    if let Err(err) = ledger.observe_command_run_for_binding(
+        run.clone(),
         cwd.to_string_lossy().to_string(),
         vec!["bash".to_string(), "-c".to_string(), command.to_string()],
         exit_code,
@@ -1008,63 +999,6 @@ fn append_command_observation(
             "failed to append bash command observation to reality ledger"
         );
     }
-    let Some(findings) = verification_findings_for_command(command, exit_code, stdout, stderr)
-    else {
-        return;
-    };
-    if let Err(err) = ledger.append(
-        crate::ledger::Authority::Verifier,
-        crate::ledger::ObservationKind::Verification {
-            passed: exit_code == 0,
-            command: Some(command.to_string()),
-            findings,
-        },
-    ) {
-        tracing::warn!(
-            command = %command,
-            error = %err,
-            "failed to append bash verification observation to reality ledger"
-        );
-    }
-}
-
-fn verification_findings_for_command(
-    command: &str,
-    exit_code: i32,
-    stdout: &str,
-    stderr: &str,
-) -> Option<Vec<String>> {
-    if !is_likely_verification_command(command) {
-        return None;
-    }
-
-    let mut findings = vec![format!("verification command exited with code {exit_code}")];
-    if exit_code != 0 {
-        if !stdout.trim().is_empty() {
-            findings.push(format!(
-                "stdout: {}",
-                safe_truncate(stdout, LEDGER_COMMAND_OUTPUT_MAX_BYTES)
-            ));
-        }
-        if !stderr.trim().is_empty() {
-            findings.push(format!(
-                "stderr: {}",
-                safe_truncate(stderr, LEDGER_COMMAND_OUTPUT_MAX_BYTES)
-            ));
-        }
-    }
-    Some(findings)
-}
-
-fn is_likely_verification_command(command: &str) -> bool {
-    let normalized = command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    VERIFICATION_COMMAND_NEEDLES
-        .iter()
-        .any(|needle| normalized.contains(needle))
 }
 
 /// Execute a bash command, returning the legacy `(content, is_error)` tuple.
@@ -1143,9 +1077,11 @@ mod tests {
     }
 
     #[test]
-    fn verification_commands_append_verifier_observation() {
+    fn verification_shaped_shell_text_only_appends_command_observation() {
         let mut ledger = crate::ledger::RealityLedger::new();
+        let binding = crate::ledger::RunBinding::from_run(test_run());
         append_command_observation(
+            &binding,
             &mut ledger,
             Path::new("/tmp/project"),
             "cargo check --all-targets",
@@ -1155,37 +1091,25 @@ mod tests {
         );
 
         let index = ledger.observation_index(8);
-        assert_eq!(index.len(), 2);
-        let verification = index
-            .iter()
-            .filter_map(|entry| ledger.get(entry.id))
-            .find(|obs| {
-                matches!(
-                    obs.kind,
-                    crate::ledger::ObservationKind::Verification { .. }
-                )
-            })
-            .expect("verification observation");
-        assert_eq!(verification.authority, crate::ledger::Authority::Verifier);
-        let crate::ledger::ObservationKind::Verification {
-            passed,
-            command,
-            findings,
-        } = &verification.kind
-        else {
-            panic!("expected verification observation");
-        };
-        assert!(*passed);
-        assert_eq!(command.as_deref(), Some("cargo check --all-targets"));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("exited with code 0")));
+        assert_eq!(index.len(), 1);
+        let command = ledger.get(index[0].id).expect("command observation");
+        assert!(matches!(
+            command.kind,
+            crate::ledger::ObservationKind::CommandRun { .. }
+        ));
+        assert_eq!(
+            command.provenance.trust,
+            crate::ledger::EvidenceTrust::RuntimeObserved
+        );
+        assert!(command.provenance.is_bound_to(test_run()));
     }
 
     #[test]
     fn non_verification_commands_only_append_command_observation() {
         let mut ledger = crate::ledger::RealityLedger::new();
+        let binding = crate::ledger::RunBinding::from_run(test_run());
         append_command_observation(
+            &binding,
             &mut ledger,
             Path::new("/tmp/project"),
             "printf hello",

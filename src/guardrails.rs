@@ -8,7 +8,10 @@
 //! Also provides language detection utilities shared with the VDD engine.
 
 use regex::Regex;
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -732,13 +735,65 @@ pub struct DiffStats {
 /// Result of running a single quality gate check
 #[derive(Debug, Clone)]
 pub struct QualityCheckResult {
-    pub name: String,
-    pub command: String,
-    pub passed: bool,
-    pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
-    pub required: bool,
+    name: String,
+    command: String,
+    passed: bool,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    required: bool,
+    evidence: QualityGateEvidence,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct QualityGateEvidence {
+    pub(crate) run_id: crate::runtime::RunId,
+    pub(crate) capability_generation: crate::runtime::CapabilityGeneration,
+    pub(crate) normalized_argv: Vec<String>,
+    pub(crate) resolved_executable: Option<String>,
+    pub(crate) executable_sha256: Option<String>,
+}
+
+impl QualityCheckResult {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn passed(&self) -> bool {
+        self.passed
+    }
+
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    #[must_use]
+    pub fn stdout(&self) -> &str {
+        &self.stdout
+    }
+
+    #[must_use]
+    pub fn stderr(&self) -> &str {
+        &self.stderr
+    }
+
+    #[must_use]
+    pub const fn required(&self) -> bool {
+        self.required
+    }
+
+    #[must_use]
+    pub(crate) const fn evidence(&self) -> &QualityGateEvidence {
+        &self.evidence
+    }
 }
 
 /// Outcome of dispatching a quality-gate command via
@@ -1377,6 +1432,7 @@ impl QualityGateRunner {
             info!(name = %check.name, "Running quality gate");
 
             let outcome = run_shell_command_sync(run, &check.command, self.config.timeout_seconds);
+            let evidence = quality_gate_evidence(run, &check.command);
 
             // Translate the typed enum into the (passed, exit_code,
             // stdout, stderr) shape that `QualityCheckResult` still
@@ -1420,11 +1476,48 @@ impl QualityGateRunner {
                 stdout,
                 stderr,
                 required: check.required,
+                evidence,
             });
         }
 
         results
     }
+}
+
+fn quality_gate_evidence(run: &crate::tools::ToolRunContext, command: &str) -> QualityGateEvidence {
+    let normalized_argv = shlex::split(command)
+        .filter(|argv| !argv.is_empty())
+        .unwrap_or_default();
+    let resolved = normalized_argv
+        .first()
+        .and_then(|program| run.resolve_executable(program).ok());
+    let executable_sha256 = resolved.as_deref().and_then(sha256_file);
+    QualityGateEvidence {
+        run_id: run.run_id(),
+        capability_generation: run.generation(),
+        normalized_argv,
+        resolved_executable: resolved.map(|path| path.to_string_lossy().to_string()),
+        executable_sha256,
+    }
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let digest = digest.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(hex)
 }
 
 /// Run a quality-gate command synchronously and return a typed

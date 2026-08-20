@@ -1,1001 +1,301 @@
-//! Final-answer validation for grounded agent turns.
+//! Typed final-answer validation for grounded agent turns.
 
-use crate::evidence::{authoritative_evidence, Denial};
-use crate::ledger::{Authority, ObsId, ObservationKind, RealityLedger};
-use std::collections::HashSet;
+use crate::decision::FinalClaim;
+use crate::evidence::{evidence_for_requirement, Denial, EvidenceRequirement};
+use crate::ledger::{ObsId, RealityLedger};
 
-const UUID_LEN: usize = 36;
-const KNOWN_FILE_NAMES: &[&str] = &[
-    "cargo.toml",
-    "cargo.lock",
-    "readme.md",
-    "license",
-    "makefile",
-    "dockerfile",
-];
-const FILE_EXTENSIONS: &[&str] = &[
-    ".rs", ".toml", ".lock", ".md", ".json", ".yaml", ".yml", ".ts", ".tsx", ".js", ".jsx", ".mjs",
-    ".cjs", ".py", ".go", ".java", ".kt", ".swift", ".zig", ".c", ".h", ".cpp", ".hpp", ".sh",
-    ".sql", ".html", ".css", ".scss", ".xml",
-];
+const MAX_FINAL_CLAIMS: usize = 64;
+const MAX_CLAIM_TEXT_BYTES: usize = 8 * 1024;
+const MAX_COMMAND_ARGV_TOKENS: usize = 256;
+const MAX_COMMAND_ARGV_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimSupport {
+    Supported,
+    Unsupported,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimTrace {
+    pub support: ClaimSupport,
+    pub evidence: Vec<ObsId>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalGateReport {
-    pub evidence: Vec<ObsId>,
-    pub verification: Vec<ObsId>,
+    pub claims: Vec<ClaimTrace>,
 }
 
-/// Validate that a final answer cites reality and verification.
-///
-/// A final can report failed verification, but it cannot omit verification.
-/// If it mentions tests, it must also cite a concrete command observation.
+/// Validate typed final claims against current-run, claim-specific receipts.
 ///
 /// # Errors
 ///
-/// Returns [`Denial`] when the final answer is empty, lacks authoritative
-/// evidence, lacks verifier observations, cites the wrong observation type, or
-/// makes test/file/verification claims not backed by cited observations.
+/// Returns [`Denial`] when the claim set is empty or oversized, claim text is
+/// empty/oversized, a supported claim lacks an exact receipt, or promoted
+/// runtime claims omit a trusted verification claim.
 pub fn validate_final_answer(
-    summary: &str,
-    evidence: &[ObsId],
-    verification: &[ObsId],
+    claims: &[FinalClaim],
     ledger: &RealityLedger,
+    run: &crate::tools::ToolRunContext,
 ) -> Result<FinalGateReport, Denial> {
-    if summary.trim().is_empty() {
-        return Err(Denial::new("final answer requires a non-empty summary"));
-    }
-
-    let hydrated_evidence =
-        authoritative_evidence(evidence, ledger, "final answer requires evidence")?;
-    if !hydrated_evidence
-        .iter()
-        .any(|obs| is_final_evidence_observation(obs))
-    {
+    if claims.is_empty() {
         return Err(Denial::new(
-            "final answer requires non-verification evidence",
+            "final answer requires at least one typed claim",
         ));
     }
-
-    if verification.is_empty() {
-        return Err(Denial::new(
-            "final answer requires verification observation",
-        ));
+    if claims.len() > MAX_FINAL_CLAIMS {
+        return Err(Denial::new(format!(
+            "final answer exceeds the {MAX_FINAL_CLAIMS}-claim limit"
+        )));
     }
 
-    let hydrated_verification = authoritative_evidence(
-        verification,
-        ledger,
-        "final answer requires verification observation",
-    )?;
-    if !hydrated_verification
-        .iter()
-        .all(|obs| matches!(obs.kind, ObservationKind::Verification { .. }))
-    {
-        return Err(Denial::new(
-            "final verification ids must reference verification observations",
-        ));
-    }
-    if !hydrated_verification
-        .iter()
-        .all(|obs| obs.authority == Authority::Verifier)
-    {
-        return Err(Denial::new(
-            "final verification ids must reference verifier observations",
-        ));
-    }
-    if summary_claims_verification_success(summary)
-        && !hydrated_verification
-            .iter()
-            .any(|obs| matches!(obs.kind, ObservationKind::Verification { passed: true, .. }))
-    {
-        return Err(Denial::new(
-            "final successful verification claims require a passing verifier observation",
-        ));
-    }
-
-    if summary_mentions_tests(summary)
-        && !hydrated_evidence
-            .iter()
-            .any(|obs| matches!(obs.kind, ObservationKind::CommandRun { .. }))
-    {
-        return Err(Denial::new(
-            "final test claims require a command observation",
-        ));
-    }
-    if summary_claims_test_success(summary)
-        && !hydrated_evidence.iter().any(|obs| {
-            matches!(obs.kind, ObservationKind::CommandRun { .. })
-                && command_observation_is_passing_test_command(obs)
-        })
-    {
-        return Err(Denial::new(
-            "final test success claims require a successful test command observation",
-        ));
-    }
-    if summary_claims_verification_success(summary)
-        && !hydrated_evidence
-            .iter()
-            .any(|obs| command_observation_exit_code(obs) == Some(0))
-    {
-        return Err(Denial::new(
-            "final successful verification claims require a successful command observation",
-        ));
-    }
-
-    validate_command_claims(
-        summary,
-        &hydrated_evidence,
-        summary_claims_verification_success(summary),
-    )?;
-
-    let file_claims = extract_file_claims(summary);
-    for claim in file_claims {
-        let backed_by_file_observation = hydrated_evidence.iter().any(|obs| {
-            obs.kind
-                .touched_files()
-                .iter()
-                .any(|observed| observed_path_matches_claim(observed, &claim))
-        });
-        if !backed_by_file_observation {
-            return Err(Denial::new(format!(
-                "final file claim requires fresh file or diff observation: {claim}"
-            )));
-        }
-    }
-
-    Ok(FinalGateReport {
-        evidence: evidence.to_vec(),
-        verification: verification.to_vec(),
-    })
-}
-
-/// Validate a final answer by extracting cited observation ids from text.
-///
-/// # Errors
-///
-/// Returns [`Denial`] when extracted citations do not satisfy
-/// [`validate_final_answer`].
-pub fn validate_cited_final_answer(
-    summary: &str,
-    ledger: &RealityLedger,
-) -> Result<FinalGateReport, Denial> {
-    let evidence = extract_cited_obs_ids(summary);
-    let verification = evidence
-        .iter()
-        .copied()
-        .filter(|id| {
-            ledger.get(*id).is_some_and(|obs| {
-                matches!(obs.kind, ObservationKind::Verification { .. })
-                    && obs.authority == Authority::Verifier
-            })
-        })
-        .collect::<Vec<_>>();
-    validate_final_answer(summary, &evidence, &verification, ledger)
-}
-
-#[must_use]
-pub fn extract_cited_obs_ids(text: &str) -> Vec<ObsId> {
-    let mut seen = HashSet::new();
-    let mut ids = Vec::new();
-    for (start, _) in text.char_indices() {
-        let end = start + UUID_LEN;
-        if end > text.len() || !text.is_char_boundary(end) {
-            continue;
-        }
-        let Ok(id) = text[start..end].parse::<ObsId>() else {
-            continue;
-        };
-        if seen.insert(id) {
-            ids.push(id);
-        }
-    }
-    ids
-}
-
-fn summary_mentions_tests(summary: &str) -> bool {
-    let lower = summary.to_ascii_lowercase();
-    lower.contains("cargo check")
-        || lower.contains("cargo test")
-        || lower.contains("cargo nextest")
-        || lower
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|token| matches!(token, "test" | "tests" | "tested" | "testing"))
-}
-
-fn summary_claims_verification_success(summary: &str) -> bool {
-    let tokens = summary
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-
-    tokens.iter().enumerate().any(|(idx, token)| {
+    let has_promoted_runtime_claim = claims.iter().any(|claim| {
         matches!(
-            token.as_str(),
-            "pass"
-                | "passed"
-                | "passes"
-                | "passing"
-                | "succeed"
-                | "succeeded"
-                | "succeeds"
-                | "successful"
-                | "successfully"
-                | "clean"
-                | "green"
-                | "ok"
-                | "okay"
-                | "verified"
-        ) && !has_recent_negation(&tokens, idx)
-    })
+            claim,
+            FinalClaim::FileChange { .. } | FinalClaim::CommandResult { .. }
+        )
+    });
+    let has_verification_claim = claims
+        .iter()
+        .any(|claim| matches!(claim, FinalClaim::Verification { .. }));
+    if has_promoted_runtime_claim && !has_verification_claim {
+        return Err(Denial::new(
+            "supported runtime claims require a trusted verification claim",
+        ));
+    }
+
+    let mut traces = Vec::with_capacity(claims.len());
+    for claim in claims {
+        traces.push(validate_claim(claim, ledger, run)?);
+    }
+    Ok(FinalGateReport { claims: traces })
 }
 
-fn summary_claims_test_success(summary: &str) -> bool {
-    let lower = summary.to_ascii_lowercase();
-    lower.contains("test") && summary_claims_verification_success(summary)
-}
-
-const fn command_observation_exit_code(observation: &crate::ledger::Observation) -> Option<i32> {
-    let ObservationKind::CommandRun { exit_code, .. } = &observation.kind else {
-        return None;
-    };
-    Some(*exit_code)
-}
-
-const fn is_final_evidence_observation(observation: &crate::ledger::Observation) -> bool {
-    matches!(
-        &observation.kind,
-        ObservationKind::UserTask { .. }
-            | ObservationKind::FileRead { .. }
-            | ObservationKind::CommandRun { .. }
-            | ObservationKind::DiffObserved { .. }
-            | ObservationKind::ToolResult { .. }
-    )
-}
-
-fn command_observation_is_passing_test_command(observation: &crate::ledger::Observation) -> bool {
-    let ObservationKind::CommandRun {
-        argv, exit_code, ..
-    } = &observation.kind
-    else {
-        return false;
-    };
-    *exit_code == 0 && is_test_command_text(&argv.join(" ").to_ascii_lowercase())
-}
-
-fn is_test_command_text(command: &str) -> bool {
-    const NEEDLES: &[&str] = &[
-        "cargo test",
-        "cargo nextest",
-        "npm test",
-        "npm run test",
-        "pnpm test",
-        "pnpm run test",
-        "yarn test",
-        "yarn run test",
-        "bun test",
-        "pytest",
-        "python -m pytest",
-        "go test",
-        "zig test",
-        "swift test",
-        "mvn test",
-        "gradle test",
-        "make test",
-        "ctest",
-    ];
-    NEEDLES.iter().any(|needle| command.contains(needle))
-}
-
-fn validate_command_claims(
-    summary: &str,
-    evidence: &[&crate::ledger::Observation],
-    require_success: bool,
-) -> Result<(), Denial> {
-    for command in extract_command_claims(summary) {
-        let backed_by_command_observation = evidence
-            .iter()
-            .any(|obs| command_observation_matches_claim(obs, command, require_success));
-        if !backed_by_command_observation {
-            let requirement = if require_success {
-                "matching successful command observation"
-            } else {
-                "matching command observation"
-            };
-            return Err(Denial::new(format!(
-                "final command claim requires {requirement}: {command}"
-            )));
+fn validate_claim(
+    claim: &FinalClaim,
+    ledger: &RealityLedger,
+    run: &crate::tools::ToolRunContext,
+) -> Result<ClaimTrace, Denial> {
+    match claim {
+        FinalClaim::FileChange { path, evidence } => {
+            validate_text("file-change path", path)?;
+            evidence_for_requirement(
+                evidence,
+                ledger,
+                run,
+                "file-change claim requires evidence",
+                &EvidenceRequirement::FileChange { path },
+            )?;
+            Ok(supported(evidence))
         }
+        FinalClaim::CommandResult {
+            argv,
+            exit_code,
+            evidence,
+        } => {
+            if argv.is_empty() || argv.iter().any(String::is_empty) {
+                return Err(Denial::new(
+                    "command-result claim requires non-empty argv tokens",
+                ));
+            }
+            if argv.len() > MAX_COMMAND_ARGV_TOKENS {
+                return Err(Denial::new(format!(
+                    "command-result claim exceeds the {MAX_COMMAND_ARGV_TOKENS}-token argv limit"
+                )));
+            }
+            let argv_bytes = argv
+                .iter()
+                .try_fold(0_usize, |total, argument| total.checked_add(argument.len()))
+                .unwrap_or(usize::MAX);
+            if argv_bytes > MAX_COMMAND_ARGV_BYTES {
+                return Err(Denial::new(format!(
+                    "command-result claim exceeds the {MAX_COMMAND_ARGV_BYTES}-byte argv limit"
+                )));
+            }
+            evidence_for_requirement(
+                evidence,
+                ledger,
+                run,
+                "command-result claim requires evidence",
+                &EvidenceRequirement::CommandResult {
+                    argv,
+                    exit_code: *exit_code,
+                },
+            )?;
+            Ok(supported(evidence))
+        }
+        FinalClaim::Verification {
+            check,
+            passed,
+            evidence,
+        } => {
+            validate_text("verification check", check)?;
+            evidence_for_requirement(
+                evidence,
+                ledger,
+                run,
+                "verification claim requires evidence",
+                &EvidenceRequirement::Verification {
+                    check,
+                    passed: *passed,
+                },
+            )?;
+            Ok(supported(evidence))
+        }
+        FinalClaim::Unsupported { statement, reason } => {
+            validate_text("unsupported claim statement", statement)?;
+            validate_text("unsupported claim reason", reason)?;
+            Ok(ClaimTrace {
+                support: ClaimSupport::Unsupported,
+                evidence: Vec::new(),
+            })
+        }
+        FinalClaim::Unresolved { statement, reason } => {
+            validate_text("unresolved claim statement", statement)?;
+            validate_text("unresolved claim reason", reason)?;
+            Ok(ClaimTrace {
+                support: ClaimSupport::Unresolved,
+                evidence: Vec::new(),
+            })
+        }
+    }
+}
+
+fn validate_text(label: &str, text: &str) -> Result<(), Denial> {
+    if text.trim().is_empty() {
+        return Err(Denial::new(format!("{label} cannot be empty")));
+    }
+    if text.len() > MAX_CLAIM_TEXT_BYTES {
+        return Err(Denial::new(format!(
+            "{label} exceeds the {MAX_CLAIM_TEXT_BYTES}-byte limit"
+        )));
     }
     Ok(())
 }
 
-fn extract_command_claims(summary: &str) -> Vec<&'static str> {
-    const COMMANDS: &[&str] = &[
-        "cargo fmt --check",
-        "cargo nextest",
-        "cargo clippy",
-        "cargo check",
-        "cargo test",
-        "npm run test",
-        "npm test",
-        "pnpm run test",
-        "pnpm test",
-        "yarn run test",
-        "yarn test",
-        "bun test",
-        "python -m pytest",
-        "pytest",
-        "go test",
-        "zig test",
-        "swift test",
-        "mvn test",
-        "gradle test",
-        "make test",
-        "ctest",
-    ];
-    let lower = summary.to_ascii_lowercase();
-    let mut claims = Vec::new();
-    for command in COMMANDS {
-        if lower.contains(command) && !claims.iter().any(|existing| command.starts_with(existing)) {
-            claims.push(*command);
-        }
+fn supported(evidence: &[ObsId]) -> ClaimTrace {
+    ClaimTrace {
+        support: ClaimSupport::Supported,
+        evidence: evidence.to_vec(),
     }
+}
+
+#[must_use]
+pub fn render_final_claims(claims: &[FinalClaim]) -> String {
     claims
+        .iter()
+        .map(render_claim)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn command_observation_matches_claim(
-    observation: &crate::ledger::Observation,
-    claimed_command: &str,
-    require_success: bool,
-) -> bool {
-    let ObservationKind::CommandRun {
-        argv, exit_code, ..
-    } = &observation.kind
-    else {
-        return false;
-    };
-    if require_success && *exit_code != 0 {
-        return false;
-    }
-    argv.join(" ")
-        .to_ascii_lowercase()
-        .contains(claimed_command)
-}
-
-fn has_recent_negation(tokens: &[String], idx: usize) -> bool {
-    let start = idx.saturating_sub(3);
-    tokens[start..idx].iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "not"
-                | "no"
-                | "never"
-                | "without"
-                | "fail"
-                | "failed"
-                | "fails"
-                | "failing"
-                | "failure"
-        )
-    })
-}
-
-fn extract_file_claims(summary: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut claims = Vec::new();
-
-    for raw in summary.split_whitespace() {
-        let Some(candidate) = normalize_claim_token(raw) else {
-            continue;
-        };
-        if !looks_like_file_path(&candidate) {
-            continue;
+fn render_claim(claim: &FinalClaim) -> String {
+    match claim {
+        FinalClaim::FileChange { path, .. } => {
+            format!("Changed file {}.", quoted(path.trim()))
         }
-        if seen.insert(candidate.clone()) {
-            claims.push(candidate);
-        }
-    }
-
-    claims
-}
-
-fn normalize_claim_token(raw: &str) -> Option<String> {
-    let mut token = raw.trim_matches(|c: char| {
-        c.is_ascii_whitespace()
-            || matches!(
-                c,
-                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+        FinalClaim::CommandResult {
+            argv, exit_code, ..
+        } => format!(
+            "Command argv {} exited with code {exit_code}.",
+            quoted_argv(argv)
+        ),
+        FinalClaim::Verification { check, passed, .. } => format!(
+            "Verification check {}: {}.",
+            quoted(check.trim()),
+            if *passed { "passed" } else { "failed" }
+        ),
+        FinalClaim::Unsupported { statement, reason } => {
+            format!(
+                "Unsupported claim {}; reason {}.",
+                quoted(statement.trim()),
+                quoted(reason.trim())
             )
-    });
-    if let Some((label, _target)) = token.split_once("](") {
-        token = label.trim_matches(|c: char| {
-            c.is_ascii_whitespace()
-                || matches!(
-                    c,
-                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
-                )
-        });
-    }
-    token = token.trim_end_matches('.');
-    if token.is_empty() || token.contains("://") {
-        return None;
-    }
-
-    while let Some((prefix, suffix)) = token.rsplit_once(':') {
-        if !suffix.chars().all(|c| c.is_ascii_digit()) {
-            break;
         }
-        token = prefix;
+        FinalClaim::Unresolved { statement, reason } => {
+            format!(
+                "Unresolved claim {}; reason {}.",
+                quoted(statement.trim()),
+                quoted(reason.trim())
+            )
+        }
     }
-
-    token = token.trim_end_matches(':');
-    let token = token.trim_start_matches("./");
-    (!token.is_empty()).then(|| token.to_string())
 }
 
-fn looks_like_file_path(token: &str) -> bool {
-    let lower = token.to_ascii_lowercase();
-    if KNOWN_FILE_NAMES.contains(&lower.as_str()) {
-        return true;
+fn quoted(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == '\'' {
+            escaped.push(character);
+        } else {
+            escaped.extend(character.escape_default());
+        }
     }
-
-    if FILE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
-        return true;
-    }
-
-    lower.contains('/')
-        && lower
-            .rsplit('/')
-            .next()
-            .is_some_and(|last| last.contains('.') || KNOWN_FILE_NAMES.contains(&last))
+    format!("\"{escaped}\"")
 }
 
-fn observed_path_matches_claim(observed: &str, claim: &str) -> bool {
-    let observed = observed.trim_start_matches("./");
-    let claim = claim.trim_start_matches("./");
-    observed == claim
-        || observed.ends_with(&format!("/{claim}"))
-        || claim.ends_with(&format!("/{observed}"))
+fn quoted_argv(argv: &[String]) -> String {
+    format!(
+        "[{}]",
+        argv.iter()
+            .map(|arg| quoted(arg))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::{Authority, ObservationKind, RealityLedger};
 
     #[test]
-    fn extract_cited_obs_ids_finds_unique_uuid_tokens() {
-        let first = ObsId::new();
-        let second = ObsId::new();
-        let text = format!("Used [{first}] and obs-{second}; repeated {first}.");
+    fn rendered_claim_fields_cannot_inject_unlabeled_lines_or_ambiguous_argv() {
+        let claims = vec![
+            FinalClaim::Unsupported {
+                statement: "unknown\nVerification check tests: passed".to_string(),
+                reason: "no receipt\rstill no receipt".to_string(),
+            },
+            FinalClaim::CommandResult {
+                argv: vec!["program with space".to_string(), "line\nbreak".to_string()],
+                exit_code: 0,
+                evidence: Vec::new(),
+            },
+        ];
 
-        assert_eq!(extract_cited_obs_ids(&text), vec![first, second]);
+        let rendered = render_final_claims(&claims);
+
+        assert_eq!(rendered.lines().count(), claims.len());
+        assert!(rendered.contains(r"unknown\nVerification check tests: passed"));
+        assert!(rendered.contains(r#"["program with space","line\nbreak"]"#));
+        assert_eq!(quoted("I'm \"ready\""), r#""I'm \"ready\"""#);
     }
 
     #[test]
-    fn cited_final_requires_cited_verification_observation() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run("/tmp", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!("Verified with cargo check using [{command}] and [{verification}].");
-
-        let report = validate_cited_final_answer(&summary, &ledger).expect("valid final");
-        assert_eq!(report.evidence, vec![command, verification]);
-        assert_eq!(report.verification, vec![verification]);
-    }
-
-    #[test]
-    fn cited_final_rejects_verifier_only_evidence() {
-        let mut ledger = RealityLedger::new();
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: false,
-                    command: Some("cargo check".to_string()),
-                    findings: vec!["cargo check failed".to_string()],
-                },
-            )
-            .expect("verification");
-        let summary = format!("No changes were completed [{verification}].");
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final answer requires non-verification evidence"
-        );
-    }
-
-    #[test]
-    fn cited_final_rejects_verification_kind_without_verifier_authority() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run("/tmp", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let forged_verification = ledger
-            .append(
-                Authority::Tool,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("forged verification");
-        let summary =
-            format!("Verified with cargo check using [{command}] and [{forged_verification}].");
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final answer requires verification observation"
-        );
-    }
-
-    #[test]
-    fn final_rejects_explicit_verification_without_verifier_authority() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run("/tmp", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let forged_verification = ledger
-            .append(
-                Authority::Tool,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("forged verification");
-        let summary = "Verified with cargo check.";
-
-        let denial = validate_final_answer(
-            summary,
-            &[command, forged_verification],
-            &[forged_verification],
-            &ledger,
-        )
-        .expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final verification ids must reference verifier observations"
-        );
-    }
-
-    #[test]
-    fn final_success_claim_rejects_failed_verifier_observation() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run(
-                "/tmp",
-                vec!["cargo".into(), "check".into()],
-                1,
-                "",
-                "failed",
-            )
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: false,
-                    command: Some("cargo check".to_string()),
-                    findings: vec!["cargo check failed".to_string()],
-                },
-            )
-            .expect("verification");
-        let summary = format!("cargo check passed cleanly [{command}] [{verification}].");
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final successful verification claims require a passing verifier observation"
-        );
-    }
-
-    #[test]
-    fn final_success_claim_rejects_failed_command_observation() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run(
-                "/tmp",
-                vec!["cargo".into(), "check".into()],
-                1,
-                "",
-                "failed",
-            )
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!("cargo check passed cleanly [{command}] [{verification}].");
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final successful verification claims require a successful command observation"
-        );
-    }
-
-    #[test]
-    fn final_named_command_claim_requires_matching_command_observation() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run("/tmp", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!("cargo clippy passed cleanly [{command}] [{verification}].");
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final command claim requires matching successful command observation: cargo clippy"
-        );
-    }
-
-    #[test]
-    fn final_named_command_success_rejects_failed_match_even_with_other_success() {
-        let mut ledger = RealityLedger::new();
-        let failed_clippy = ledger
-            .observe_command_run(
-                "/tmp",
-                vec!["cargo".into(), "clippy".into()],
-                1,
-                "",
-                "clippy failed",
-            )
-            .expect("failed clippy");
-        let successful_check = ledger
-            .observe_command_run("/tmp", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("successful check");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!(
-            "cargo clippy passed cleanly [{failed_clippy}] [{successful_check}] [{verification}]."
-        );
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final command claim requires matching successful command observation: cargo clippy"
-        );
-    }
-
-    #[test]
-    fn final_named_command_claim_accepts_matching_command_observation() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run(
-                "/tmp",
-                vec![
-                    "cargo".into(),
-                    "clippy".into(),
-                    "--all-targets".into(),
-                    "--all-features".into(),
-                ],
-                0,
-                "",
-                "",
-            )
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo clippy --all-targets --all-features".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!("cargo clippy passed cleanly [{command}] [{verification}].");
-
-        validate_cited_final_answer(&summary, &ledger)
-            .expect("matching command observation grounds named command claim");
-    }
-
-    #[test]
-    fn final_failed_verification_summary_accepts_failed_verifier_observation() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run(
-                "/tmp",
-                vec!["cargo".into(), "check".into()],
-                1,
-                "",
-                "failed",
-            )
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: false,
-                    command: Some("cargo check".to_string()),
-                    findings: vec!["cargo check failed".to_string()],
-                },
-            )
-            .expect("verification");
-        let summary = format!("cargo check failed [{command}] [{verification}].");
-
-        validate_cited_final_answer(&summary, &ledger)
-            .expect("honest failed verification summary is allowed");
-    }
-
-    #[test]
-    fn final_test_success_claim_requires_test_command_observation() {
-        let mut ledger = RealityLedger::new();
-        let check = ledger
-            .observe_command_run("/tmp", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!("Tests passed cleanly [{check}] [{verification}].");
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final test success claims require a successful test command observation"
-        );
-    }
-
-    #[test]
-    fn final_test_success_claim_rejects_failed_test_command_observation() {
-        let mut ledger = RealityLedger::new();
-        let test = ledger
-            .observe_command_run("/tmp", vec!["cargo".into(), "test".into()], 1, "", "failed")
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo test".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!("Tests passed cleanly [{test}] [{verification}].");
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final test success claims require a successful test command observation"
-        );
-    }
-
-    #[test]
-    fn final_test_success_claim_accepts_test_command_observation() {
-        let mut ledger = RealityLedger::new();
-        let test = ledger
-            .observe_command_run(
-                "/tmp",
-                vec![
-                    "cargo".into(),
-                    "test".into(),
-                    "--test".into(),
-                    "ledger_decision_e2e".into(),
-                ],
-                0,
-                "",
-                "",
-            )
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo test --test ledger_decision_e2e".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!("Tests passed cleanly [{test}] [{verification}].");
-
-        validate_cited_final_answer(&summary, &ledger).expect("test command grounds test success");
-    }
-
-    #[test]
-    fn cited_final_rejects_uncited_summary() {
+    fn claim_receipts_and_command_argv_are_bounded_before_hydration() {
+        let run = crate::tools::security::test_run_context();
         let ledger = RealityLedger::new();
-        let denial =
-            validate_cited_final_answer("Verified with cargo check.", &ledger).expect_err("denied");
-        assert_eq!(denial.reason(), "final answer requires evidence");
-    }
+        let oversized_evidence = FinalClaim::Verification {
+            check: "tests".to_string(),
+            passed: true,
+            evidence: (0..=crate::evidence::MAX_EVIDENCE_RECEIPTS_PER_REQUIREMENT)
+                .map(|_| ObsId::new())
+                .collect(),
+        };
+        let denial = validate_claim(&oversized_evidence, &ledger, run)
+            .expect_err("oversized receipt list must be rejected");
+        assert_eq!(denial.reason(), "evidence exceeds the 16-receipt limit");
 
-    #[test]
-    fn final_file_claim_requires_file_or_diff_evidence() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run("/repo", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!(
-            "Updated src/pipeline.rs and verified with cargo check [{command}] [{verification}]."
-        );
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("file denied");
-
+        let oversized_argv = FinalClaim::CommandResult {
+            argv: vec!["x".repeat(MAX_COMMAND_ARGV_BYTES + 1)],
+            exit_code: 0,
+            evidence: vec![ObsId::new()],
+        };
+        let denial = validate_claim(&oversized_argv, &ledger, run)
+            .expect_err("oversized argv must be rejected before evidence lookup");
         assert_eq!(
             denial.reason(),
-            "final file claim requires fresh file or diff observation: src/pipeline.rs"
-        );
-    }
-
-    #[test]
-    fn final_file_claim_accepts_fresh_diff_evidence() {
-        let mut ledger = RealityLedger::new();
-        let diff = ledger
-            .observe_diff(
-                vec!["src/pipeline.rs".to_string()],
-                "diff --git a/src/pipeline.rs b/src/pipeline.rs",
-            )
-            .expect("diff");
-        let command = ledger
-            .observe_command_run("/repo", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!(
-            "Updated src/pipeline.rs:12 and verified with cargo check [{diff}] [{command}] [{verification}]."
-        );
-
-        validate_cited_final_answer(&summary, &ledger).expect("fresh diff grounds file claim");
-    }
-
-    #[test]
-    fn final_latest_file_claim_does_not_count_as_test_claim() {
-        let mut ledger = RealityLedger::new();
-        let diff = ledger
-            .observe_diff(
-                vec!["src/providers/mod.rs".to_string()],
-                "diff --git a/src/providers/mod.rs b/src/providers/mod.rs",
-            )
-            .expect("diff");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: false,
-                    command: None,
-                    findings: vec!["tests were not run".to_string()],
-                },
-            )
-            .expect("verification");
-        let summary = format!(
-            "Updated the latest model list in src/providers/mod.rs [{diff}] [{verification}]."
-        );
-
-        validate_cited_final_answer(&summary, &ledger)
-            .expect("latest must not be parsed as a test claim");
-    }
-
-    #[test]
-    fn final_file_claim_accepts_markdown_link_with_fresh_diff_evidence() {
-        let mut ledger = RealityLedger::new();
-        let diff = ledger
-            .observe_diff(
-                vec!["src/final_gate.rs".to_string()],
-                "diff --git a/src/final_gate.rs b/src/final_gate.rs",
-            )
-            .expect("diff");
-        let command = ledger
-            .observe_command_run("/repo", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary = format!(
-            "Updated [src/final_gate.rs](/repo/src/final_gate.rs:120) and verified with cargo check [{diff}] [{command}] [{verification}]."
-        );
-
-        validate_cited_final_answer(&summary, &ledger)
-            .expect("fresh diff grounds markdown file claim");
-    }
-
-    #[test]
-    fn final_known_file_claim_with_trailing_colon_requires_evidence() {
-        let mut ledger = RealityLedger::new();
-        let command = ledger
-            .observe_command_run("/repo", vec!["cargo".into(), "check".into()], 0, "", "")
-            .expect("command");
-        let verification = ledger
-            .append(
-                Authority::Verifier,
-                ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let summary =
-            format!("Updated README.md: verified with cargo check [{command}] [{verification}].");
-
-        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("file denied");
-
-        assert_eq!(
-            denial.reason(),
-            "final file claim requires fresh file or diff observation: README.md"
+            "command-result claim exceeds the 16384-byte argv limit"
         );
     }
 }
