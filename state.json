@@ -972,12 +972,7 @@
     "ff144525-a494-49cc-8aef-0f85c74f5172": 634,
     "ff2170c9-4fd0-4648-ac71-f2a3b0ef0d5f": 602
   },
-  "locks": {
-    "1043": {
-      "agent_id": "6Vw9",
-      "claimed_at": "2026-08-20T19:06:37.836080551Z"
-    }
-  },
+  "locks": {},
   "issues": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": {
       "uuid": "003a29eb-1abc-4c93-b4d8-ac2000f8a74d",
@@ -26412,11 +26407,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 433,
       "timestamp": "2026-08-20T19:07:58.320079562Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 434,
+      "timestamp": "2026-08-20T19:08:04.568418908Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T19:07:58.320079562Z",
+    "timestamp": "2026-08-20T19:08:04.568418908Z",
     "agent_id": "6Vw9",
-    "agent_seq": 433
+    "agent_seq": 434
   }
 }
