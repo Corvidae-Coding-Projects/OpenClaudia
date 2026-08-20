@@ -1,6 +1,6 @@
 {
   "next_display_id": 1056,
-  "next_comment_id": 933,
+  "next_comment_id": 934,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13229,11 +13229,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:09:48.149662321Z",
-      "updated_at": "2026-08-20T22:32:54.187024176Z",
+      "updated_at": "2026-08-20T23:12:20.134854297Z",
       "labels": [
         "orchestration"
       ],
       "comments": {
+        "3aac26b2-63db-4dda-998e-68b76028f2ec": {
+          "display_id": 933,
+          "author": "6Vw9",
+          "content": "[action] S-005 owns serialized Cargo slot; reviewing corrected S-001 evidence and effect-proof contract while S-004 awaits corrective final gates",
+          "created_at": "2026-08-20T23:12:20.131528127Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQGEgX4cAF9LA0UGyHxQN+lKl6YlhXUM6jHEcZ0VTdT8X/njRDFQtVbmoAYBdE1/n7kdJ3HnteI7Ybzp6hjXODw=="
+        },
         "4a907ec2-c2bc-4faf-a10f-92c6c5a747f5": {
           "display_id": 927,
           "author": "6Vw9",
@@ -27344,11 +27353,16 @@
       "agent_id": "s001-wave",
       "agent_seq": 2,
       "timestamp": "2026-08-20T23:10:31.470916406Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 507,
+      "timestamp": "2026-08-20T23:12:20.134854297Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T23:10:31.470916406Z",
-    "agent_id": "s001-wave",
-    "agent_seq": 2
+    "timestamp": "2026-08-20T23:12:20.134854297Z",
+    "agent_id": "6Vw9",
+    "agent_seq": 507
   }
 }
