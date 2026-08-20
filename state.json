@@ -1,6 +1,6 @@
 {
   "next_display_id": 1035,
-  "next_comment_id": 836,
+  "next_comment_id": 837,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -2964,10 +2964,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:59:48.372882571Z",
-      "updated_at": "2026-08-19T23:59:52.371265115Z",
+      "updated_at": "2026-08-20T00:05:03.217724420Z",
       "labels": [
         "workflow"
-      ]
+      ],
+      "comments": {
+        "c085342c-ca0d-43f5-ad2c-7e37217f0437": {
+          "display_id": 836,
+          "author": "6Vw9",
+          "content": "Reconstruction plan: use the last pre-rewrite CHANGELOG blob (00eb0161^), replay signed StatusChanged->closed events in timestamp order through Crosslink 0.9.0-beta.1 lifecycle.rs exact category/insertion algorithm, and exclude only close commands proven by local transcripts to have used --no-changelog. Preserve repeated normal-close entries exactly; do not editorialize, deduplicate, rewrap, or retain later hand-written substitutions.",
+          "created_at": "2026-08-20T00:05:03.214189988Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKoVBS/iJM9aHm4EUN+drq25C3I9S5ebunFSkON/FwkB+5xHINMhwltfPZJ3fN6j7AI1HYZ+TgvLIJB+5csHBCA=="
+        }
+      }
     },
     "15b5e459-b5e5-48ba-8cdc-1c88e38f1732": {
       "uuid": "15b5e459-b5e5-48ba-8cdc-1c88e38f1732",
@@ -24939,11 +24950,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 289,
       "timestamp": "2026-08-19T23:59:57.296403521Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 290,
+      "timestamp": "2026-08-20T00:05:03.217724420Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-19T23:59:57.296403521Z",
+    "timestamp": "2026-08-20T00:05:03.217724420Z",
     "agent_id": "6Vw9",
-    "agent_seq": 289
+    "agent_seq": 290
   }
 }
