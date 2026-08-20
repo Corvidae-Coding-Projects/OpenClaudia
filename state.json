@@ -1,6 +1,6 @@
 {
   "next_display_id": 1055,
-  "next_comment_id": 930,
+  "next_comment_id": 931,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18275,10 +18275,21 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:36.514810569Z",
-      "updated_at": "2026-08-20T22:12:48.969658585Z",
+      "updated_at": "2026-08-20T22:50:39.097528222Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "61773e12-6e41-4880-b464-4ddd02bbe9b1": {
+          "display_id": 930,
+          "author": "s005-wave",
+          "content": "S-005 architecture decision: replace config::Environment underscore rewriting and ad-hoc API-key repair with one finite typed registry. Canonical OPENCLAUDIA names use __ between typed nesting levels and _ inside field/provider segments; exact legacy single-underscore names warn as deprecated, ecosystem provider-key names remain compatibility aliases, and multiple aliases for one field are rejected as ambiguous. Each descriptor carries parser, secrecy, source precedence, deprecation, and security relevance. Values are bounded, parsed, and installed as final builder overrides after project/home files and before explicit CLI mutation so a valid higher-precedence environment value can replace malformed lower-precedence file state. OPENCLAUDIA names owned by other subsystems are explicitly allowlisted; all other prefixed names fail closed. ACP max_iterations adopts the same canonical/legacy rule without expanding into the broader W14 loader-unification work.",
+          "created_at": "2026-08-20T22:50:39.070535515Z",
+          "kind": "decision",
+          "signed_by": "SHA256:GnnQNPlvNEZp35JadXiNDA+I/8ohf5UCKkSJrMb/gew",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgSjog0F9LUCbKsv62g2BnSf4fH0D7kCW68xbgp+h6bYUAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAI1jmqU4Oqw7ekZGi/UKdX3gVFF1LrrICpCqFKU5pK7m3HVXVh4CG8UAxZBsxkxJRqTVfqJyslhXmx9MWvwHuAA=="
+        }
+      }
     },
     "ba9ccb18-bbec-47ab-8c87-8a06f64e8525": {
       "uuid": "ba9ccb18-bbec-47ab-8c87-8a06f64e8525",
@@ -27273,11 +27284,16 @@
       "agent_id": "s004-wave",
       "agent_seq": 5,
       "timestamp": "2026-08-20T22:37:23.123889724Z"
+    },
+    {
+      "agent_id": "s005-wave",
+      "agent_seq": 2,
+      "timestamp": "2026-08-20T22:50:39.097528222Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:37:23.123889724Z",
-    "agent_id": "s004-wave",
-    "agent_seq": 5
+    "timestamp": "2026-08-20T22:50:39.097528222Z",
+    "agent_id": "s005-wave",
+    "agent_seq": 2
   }
 }
