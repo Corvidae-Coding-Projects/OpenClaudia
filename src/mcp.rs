@@ -7,7 +7,7 @@
 //! Handles tool discovery, schema translation, and request routing.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -326,15 +326,15 @@ fn spawn_stderr_drain(mut stderr: ChildStderr, buf: Arc<Mutex<Vec<u8>>>) -> Join
 }
 
 /// Format the trailing [`STDERR_SNIPPET_BYTES`] of the stderr ring buffer.
-async fn stderr_snippet(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+async fn stderr_snippet(buf: &Arc<Mutex<Vec<u8>>>) -> zeroize::Zeroizing<String> {
     let guard = buf.lock().await;
     if guard.is_empty() {
-        return String::new();
+        return zeroize::Zeroizing::new(String::new());
     }
     let start = guard.len().saturating_sub(STDERR_SNIPPET_BYTES);
     let text = String::from_utf8_lossy(&guard[start..]).into_owned();
     drop(guard);
-    format!(" (server stderr tail: {text})")
+    zeroize::Zeroizing::new(format!(" (server stderr tail: {text})"))
 }
 
 impl StdioTransport {
@@ -349,7 +349,12 @@ impl StdioTransport {
         command: &str,
         args: &[&str],
     ) -> Result<Self, McpError> {
-        Self::spawn_with_env(run, command, args, &HashMap::new())
+        Self::spawn_with_protected_env(
+            run,
+            command,
+            args,
+            &crate::secrets::EnvironmentGrants::new(),
+        )
     }
 
     /// Spawn a new MCP server process with extra environment variables.
@@ -364,8 +369,22 @@ impl StdioTransport {
         args: &[&str],
         env: &HashMap<String, String>,
     ) -> Result<Self, McpError> {
-        let resolved_command = resolve_trusted_mcp_executable(run, command)?;
         validate_mcp_child_environment(run, env)?;
+        let env =
+            crate::secrets::EnvironmentGrants::from_validated(env.clone()).map_err(|error| {
+                McpError::Transport(format!("Invalid MCP child environment value: {error}"))
+            })?;
+        Self::spawn_with_protected_env(run, command, args, &env)
+    }
+
+    pub(crate) fn spawn_with_protected_env(
+        run: &Arc<crate::tools::ToolRunContext>,
+        command: &str,
+        args: &[&str],
+        env: &crate::secrets::EnvironmentGrants,
+    ) -> Result<Self, McpError> {
+        let resolved_command = resolve_trusted_mcp_executable(run, command)?;
+        validate_protected_mcp_child_environment(run, env)?;
         let process_run = derive_mcp_stdio_run(run, env)?;
         let sandbox_args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let command = crate::tools::sandboxed_process_command(
@@ -479,16 +498,24 @@ impl StdioTransport {
 
             if bytes_read == 0 {
                 let snippet = stderr_snippet(&self.stderr_buf).await;
-                return Err(McpError::Transport(format!(
-                    "MCP server closed stdout before responding{snippet}"
-                )));
+                let raw = zeroize::Zeroizing::new(format!(
+                    "MCP server closed stdout before responding{}",
+                    snippet.as_str()
+                ));
+                return Err(McpError::Transport(
+                    self.run_context.sanitize_diagnostic(&raw).to_string(),
+                ));
             }
 
             if buf.len() > MAX_RESPONSE_SIZE && !buf.ends_with(b"\n") {
                 let snippet = stderr_snippet(&self.stderr_buf).await;
-                return Err(McpError::Transport(format!(
-                    "MCP response exceeded {MAX_RESPONSE_SIZE} bytes without newline; rejecting{snippet}"
-                )));
+                let raw = zeroize::Zeroizing::new(format!(
+                    "MCP response exceeded {MAX_RESPONSE_SIZE} bytes without newline; rejecting{}",
+                    snippet.as_str()
+                ));
+                return Err(McpError::Transport(
+                    self.run_context.sanitize_diagnostic(&raw).to_string(),
+                ));
             }
             buf
         };
@@ -515,7 +542,7 @@ impl StdioTransport {
 
 fn derive_mcp_stdio_run(
     parent: &Arc<crate::tools::ToolRunContext>,
-    extra_environment: &HashMap<String, String>,
+    extra_environment: &crate::secrets::EnvironmentGrants,
 ) -> Result<Arc<crate::tools::ToolRunContext>, McpError> {
     parent
         .require(crate::tools::ToolResource::Process)
@@ -541,7 +568,7 @@ fn derive_mcp_stdio_run(
         .cloned()
         .collect();
     let mut environment_grants = parent.environment_grants().clone();
-    environment_grants.extend(extra_environment.clone());
+    environment_grants.extend(extra_environment);
     let workspace_access = if parent.grants_resource(crate::tools::ToolResource::WorkspaceWrite) {
         crate::tools::WorkspaceAccess::ReadWrite
     } else {
@@ -553,8 +580,8 @@ fn derive_mcp_stdio_run(
         .read_only_roots(read_only_roots)
         .read_write_roots(read_write_roots)
         .project_secret_masks(parent.project_secret_masks().to_vec())
-        .environment_grants(environment_grants)
-        .mcp_environment_grants(parent.mcp_environment_grants().clone())
+        .protected_environment_grants(environment_grants)
+        .protected_mcp_environment_grants(parent.mcp_environment_grants().clone())
         .executable_search_path(parent.executable_search_path())
         .host_home(parent.host_home().map(Path::to_path_buf))
         .workspace_access(workspace_access)
@@ -599,7 +626,7 @@ fn validate_mcp_child_environment(
                     ))
                 })?;
             match run.mcp_environment_grants().get(key) {
-                Some(granted) if granted == value => {}
+                Some(granted) if granted.matches(value) => {}
                 Some(_) => {
                     return Err(McpError::Transport(format!(
                         "Refusing MCP secret environment grant '{key}' because its value does not \
@@ -616,6 +643,53 @@ fn validate_mcp_child_environment(
         }
     }
     Ok(())
+}
+
+fn validate_protected_mcp_child_environment(
+    run: &crate::tools::ToolRunContext,
+    environment: &crate::secrets::EnvironmentGrants,
+) -> Result<(), McpError> {
+    for key in environment.keys() {
+        validate_mcp_env_name_for_child(key)?;
+        if is_host_loader_environment(key) {
+            return Err(McpError::Transport(format!(
+                "Refusing MCP environment variable '{key}' because it can alter the host sandbox launcher's dynamic loader"
+            )));
+        }
+        if crate::tools::is_sensitive_env(key) {
+            run.require(crate::tools::ToolResource::Secrets)
+                .map_err(|error| McpError::Transport(error.to_string()))?;
+            match (run.mcp_environment_grants().get(key), environment.get(key)) {
+                (Some(granted), Some(requested)) if granted == requested => {}
+                (Some(_), Some(_)) => {
+                    return Err(McpError::Transport(format!(
+                        "Refusing MCP secret environment grant '{key}' because its value does not match the immutable run capability snapshot"
+                    )));
+                }
+                _ => {
+                    return Err(McpError::Transport(format!(
+                        "Refusing undeclared-sensitive MCP environment grant '{key}'. The host operator must name it in OPENCLAUDIA_MCP_ENV_GRANTS before the run starts."
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_env_name_for_child(name: &str) -> Result<(), McpError> {
+    let mut characters = name.chars();
+    let valid = characters
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if valid {
+        Ok(())
+    } else {
+        Err(McpError::Transport(format!(
+            "Refusing invalid MCP environment variable name '{name}'"
+        )))
+    }
 }
 
 fn resolve_trusted_mcp_executable(
@@ -810,14 +884,18 @@ impl McpTransport for StdioTransport {
             }
             seen_messages += 1;
 
-            let line = self.read_stdout_line().await?;
+            let line = zeroize::Zeroizing::new(self.read_stdout_line().await?);
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(e) => {
                     let snippet = stderr_snippet(&self.stderr_buf).await;
-                    return Err(McpError::Protocol(format!(
-                        "Failed to parse response: {e}{snippet}"
-                    )));
+                    let raw = zeroize::Zeroizing::new(format!(
+                        "Failed to parse response: {e}{}",
+                        snippet.as_str()
+                    ));
+                    return Err(McpError::Protocol(
+                        self.run_context.sanitize_diagnostic(&raw).to_string(),
+                    ));
                 }
             };
 
@@ -850,10 +928,13 @@ impl McpTransport for StdioTransport {
                 .as_ref()
                 .map(|d| format!(" (data: {d})"))
                 .unwrap_or_default();
-            return Err(McpError::Protocol(format!(
+            let raw = zeroize::Zeroizing::new(format!(
                 "RPC error {}: {}{}",
                 error.code, error.message, data_info
-            )));
+            ));
+            return Err(McpError::Protocol(
+                self.run_context.sanitize_diagnostic(&raw).to_string(),
+            ));
         }
 
         Ok(response.result.unwrap_or(Value::Null))
@@ -877,7 +958,7 @@ impl McpTransport for StdioTransport {
 /// MCP servers builds the connection pool once, not N times.
 pub struct HttpTransport {
     base_url: String,
-    headers: HeaderMap,
+    headers: crate::secrets::SensitiveHeaders,
     request_id: AtomicU64,
     /// MCP Streamable HTTP session id (crosslink #631).
     ///
@@ -889,16 +970,14 @@ pub struct HttpTransport {
     session_id: std::sync::RwLock<Option<String>>,
 }
 
-fn parse_static_headers(headers: &HashMap<String, String>) -> Result<HeaderMap, McpError> {
-    let mut parsed = HeaderMap::new();
+fn protect_static_headers(
+    headers: &HashMap<String, String>,
+) -> Result<crate::secrets::SensitiveHeaders, McpError> {
+    let mut parsed = crate::secrets::SensitiveHeaders::new();
     for (name, value) in headers {
-        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
-            McpError::Transport(format!("Invalid MCP HTTP header name {name:?}: {err}"))
-        })?;
-        let header_value = HeaderValue::from_str(value).map_err(|err| {
-            McpError::Transport(format!("Invalid MCP HTTP header value for {name:?}: {err}"))
-        })?;
-        parsed.insert(header_name, header_value);
+        parsed
+            .insert_literal(name, value.clone())
+            .map_err(|err| McpError::Transport(format!("Invalid MCP HTTP header: {err}")))?;
     }
     Ok(parsed)
 }
@@ -933,7 +1012,7 @@ impl HttpTransport {
     /// so call sites and tests can distinguish a validation failure
     /// from a runtime transport error.
     pub fn new(base_url: &str) -> Result<Self, McpError> {
-        Self::new_with_headers(base_url, &HashMap::new())
+        Self::new_with_sensitive_headers(base_url, crate::secrets::SensitiveHeaders::new())
     }
 
     /// Create a new HTTP transport with static request headers.
@@ -946,13 +1025,18 @@ impl HttpTransport {
         base_url: &str,
         headers: &HashMap<String, String>,
     ) -> Result<Self, McpError> {
+        Self::new_with_sensitive_headers(base_url, protect_static_headers(headers)?)
+    }
+
+    fn new_with_sensitive_headers(
+        base_url: &str,
+        headers: crate::secrets::SensitiveHeaders,
+    ) -> Result<Self, McpError> {
         // SSRF guard. Mirrors `web::fetch_url`'s entry check (#368) and
         // satisfies the perimeter contract spelled out in #677.
         crate::web::validate_url(base_url).map_err(|reason| {
             McpError::Transport(format!("SSRF guard rejected MCP base URL: {reason}"))
         })?;
-        let headers = parse_static_headers(headers)?;
-
         // Touch the static so the client is eagerly built on first
         // construction. Cheap, idempotent, and surfaces a build error
         // at transport-creation time rather than first-request time.
@@ -979,7 +1063,10 @@ impl HttpTransport {
     #[doc(hidden)]
     #[must_use]
     pub fn __test_new_unchecked(base_url: &str) -> Self {
-        Self::__test_new_unchecked_with_headers(base_url, &HashMap::new())
+        Self::__test_new_unchecked_with_sensitive_headers(
+            base_url,
+            crate::secrets::SensitiveHeaders::new(),
+        )
     }
 
     /// Test-only constructor with static headers and no SSRF guard.
@@ -989,9 +1076,17 @@ impl HttpTransport {
         base_url: &str,
         headers: &HashMap<String, String>,
     ) -> Self {
+        let headers = protect_static_headers(headers).unwrap_or_default();
+        Self::__test_new_unchecked_with_sensitive_headers(base_url, headers)
+    }
+
+    fn __test_new_unchecked_with_sensitive_headers(
+        base_url: &str,
+        headers: crate::secrets::SensitiveHeaders,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            headers: parse_static_headers(headers).unwrap_or_default(),
+            headers,
             request_id: AtomicU64::new(1),
             session_id: std::sync::RwLock::new(None),
         }
@@ -1065,13 +1160,13 @@ async fn parse_http_json_rpc_response(
     response: reqwest::Response,
 ) -> Result<JsonRpcResponse, McpError> {
     let is_event_stream = response_content_type_is_event_stream(response.headers());
-    let body = response.text().await.map_err(|err| {
+    let body = zeroize::Zeroizing::new(response.text().await.map_err(|err| {
         if is_event_stream {
             McpError::Protocol(format!("Failed to read SSE response: {err}"))
         } else {
             McpError::Protocol(format!("Failed to read response: {err}"))
         }
-    })?;
+    })?);
 
     if is_event_stream || body_looks_like_sse(&body) {
         parse_sse_json_rpc_response(&body)
@@ -1169,7 +1264,7 @@ impl McpTransport for HttpTransport {
             params,
         };
 
-        debug!(method = %method, url = %self.base_url, "Sending HTTP MCP request");
+        debug!(method = %method, "Sending HTTP MCP request");
 
         // Fix #490 — share the process-wide client and apply a
         // per-request timeout cap. The shared client carries no
@@ -1182,9 +1277,10 @@ impl McpTransport for HttpTransport {
         //   (servers MAY respond with either; both branches are parsed below).
         // * Echo any captured `Mcp-Session-Id` so the server can route
         //   subsequent requests to the same logical session.
-        let mut builder = Self::client()?
-            .post(&self.base_url)
-            .headers(self.headers.clone())
+        let mut builder = self
+            .headers
+            .apply(Self::client()?.post(&self.base_url))
+            .map_err(|error| McpError::Transport(format!("Invalid MCP HTTP header: {error}")))?
             .timeout(HTTP_REQUEST_TIMEOUT)
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json")
@@ -1256,10 +1352,13 @@ impl McpTransport for HttpTransport {
                 .as_ref()
                 .map(|d| format!(" (data: {d})"))
                 .unwrap_or_default();
-            return Err(McpError::Protocol(format!(
+            let raw = zeroize::Zeroizing::new(format!(
                 "RPC error {}: {}{}",
                 error.code, error.message, data_info
-            )));
+            ));
+            return Err(McpError::Protocol(
+                self.headers.sanitize_diagnostic(&raw).to_string(),
+            ));
         }
 
         Ok(response.result.unwrap_or(Value::Null))
@@ -1858,11 +1957,11 @@ enum ConnectionSpec {
     Stdio {
         command: String,
         args: Vec<String>,
-        env: HashMap<String, String>,
+        env: crate::secrets::EnvironmentGrants,
     },
     Http {
         url: String,
-        headers: HashMap<String, String>,
+        headers: crate::secrets::SensitiveHeaders,
         headers_helper: Option<String>,
         server_name: String,
     },
@@ -1876,7 +1975,7 @@ impl ConnectionSpec {
         match self {
             Self::Stdio { command, args, env } => {
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                Ok(Box::new(StdioTransport::spawn_with_env(
+                Ok(Box::new(StdioTransport::spawn_with_protected_env(
                     run, command, &argv, env,
                 )?))
             }
@@ -1893,7 +1992,9 @@ impl ConnectionSpec {
                     headers,
                     headers_helper.as_deref(),
                 )?;
-                Ok(Box::new(HttpTransport::new_with_headers(url, &headers)?))
+                Ok(Box::new(HttpTransport::new_with_sensitive_headers(
+                    url, headers,
+                )?))
             }
         }
     }
@@ -1903,28 +2004,22 @@ fn resolve_http_headers(
     run: &Arc<crate::tools::ToolRunContext>,
     server_name: &str,
     url: &str,
-    static_headers: &HashMap<String, String>,
+    static_headers: &crate::secrets::SensitiveHeaders,
     headers_helper: Option<&str>,
-) -> Result<HashMap<String, String>, McpError> {
+) -> Result<crate::secrets::SensitiveHeaders, McpError> {
     let mut headers = static_headers.clone();
     if let Some(helper) = headers_helper {
         let dynamic = run_headers_helper(run, helper, server_name, url)?;
-        merge_dynamic_headers(&mut headers, dynamic);
+        merge_dynamic_headers(&mut headers, &dynamic);
     }
     Ok(headers)
 }
 
-fn merge_dynamic_headers(headers: &mut HashMap<String, String>, dynamic: HashMap<String, String>) {
-    for (key, value) in dynamic {
-        if let Some(existing_key) = headers
-            .keys()
-            .find(|existing| existing.eq_ignore_ascii_case(&key))
-            .cloned()
-        {
-            headers.remove(&existing_key);
-        }
-        headers.insert(key, value);
-    }
+fn merge_dynamic_headers(
+    headers: &mut crate::secrets::SensitiveHeaders,
+    dynamic: &crate::secrets::SensitiveHeaders,
+) {
+    headers.extend(dynamic);
 }
 
 fn run_headers_helper(
@@ -1932,7 +2027,7 @@ fn run_headers_helper(
     command: &str,
     server_name: &str,
     url: &str,
-) -> Result<HashMap<String, String>, McpError> {
+) -> Result<crate::secrets::SensitiveHeaders, McpError> {
     if command.trim().is_empty() {
         return Err(McpError::Transport(format!(
             "MCP headersHelper for server '{server_name}' is empty"
@@ -1974,7 +2069,8 @@ fn run_headers_helper(
         )));
     }
 
-    parse_headers_helper_stdout(server_name, &output.stdout)
+    let stdout = zeroize::Zeroizing::new(output.stdout);
+    parse_headers_helper_stdout(server_name, &stdout)
 }
 
 fn shell_command(command: &str) -> (&'static str, Vec<String>) {
@@ -1991,29 +2087,12 @@ fn shell_command(command: &str) -> (&'static str, Vec<String>) {
 fn parse_headers_helper_stdout(
     server_name: &str,
     stdout: &[u8],
-) -> Result<HashMap<String, String>, McpError> {
-    let value: Value = serde_json::from_slice(stdout).map_err(|e| {
+) -> Result<crate::secrets::SensitiveHeaders, McpError> {
+    serde_json::from_slice(stdout).map_err(|e| {
         McpError::Protocol(format!(
             "MCP headersHelper for server '{server_name}' did not emit valid JSON: {e}"
         ))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        McpError::Protocol(format!(
-            "MCP headersHelper for server '{server_name}' must emit a JSON object"
-        ))
-    })?;
-
-    let mut headers = HashMap::with_capacity(object.len());
-    for (key, value) in object {
-        let Some(value) = value.as_str() else {
-            return Err(McpError::Protocol(format!(
-                "MCP headersHelper for server '{server_name}' emitted non-string value for header \
-                 '{key}'"
-            )));
-        };
-        headers.insert(key.clone(), value.to_string());
-    }
-    Ok(headers)
+    })
 }
 
 /// Max reconnect attempts before [`McpError::ServerUnreachable`] (fix #629).
@@ -2203,10 +2282,28 @@ impl McpManager {
         env: &HashMap<String, String>,
         tool_timeout: Option<Duration>,
     ) -> Result<(), McpError> {
+        validate_mcp_child_environment(&self.run_context, env)?;
+        let env =
+            crate::secrets::EnvironmentGrants::from_validated(env.clone()).map_err(|error| {
+                McpError::Transport(format!("Invalid MCP child environment value: {error}"))
+            })?;
+        self.connect_stdio_with_protected_env_and_timeout(name, command, args, env, tool_timeout)
+            .await
+    }
+
+    pub(crate) async fn connect_stdio_with_protected_env_and_timeout(
+        &self,
+        name: &str,
+        command: &str,
+        args: &[&str],
+        env: crate::secrets::EnvironmentGrants,
+        tool_timeout: Option<Duration>,
+    ) -> Result<(), McpError> {
+        validate_protected_mcp_child_environment(&self.run_context, &env)?;
         let spec = ConnectionSpec::Stdio {
             command: command.to_string(),
             args: args.iter().map(|s| (*s).to_string()).collect(),
-            env: env.clone(),
+            env,
         };
         let transport = spec.build_transport(&self.run_context)?;
         let server = McpServer::new(name, transport).await?;
@@ -2274,12 +2371,31 @@ impl McpManager {
         headers_helper: Option<&str>,
         tool_timeout: Option<Duration>,
     ) -> Result<(), McpError> {
+        let headers = protect_static_headers(headers)?;
+        self.connect_http_with_sensitive_headers_helper_and_timeout(
+            name,
+            url,
+            headers,
+            headers_helper,
+            tool_timeout,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_http_with_sensitive_headers_helper_and_timeout(
+        &self,
+        name: &str,
+        url: &str,
+        headers: crate::secrets::SensitiveHeaders,
+        headers_helper: Option<&str>,
+        tool_timeout: Option<Duration>,
+    ) -> Result<(), McpError> {
         self.run_context
             .require(crate::tools::ToolResource::Network)
             .map_err(|error| McpError::Transport(error.to_string()))?;
         let spec = ConnectionSpec::Http {
             url: url.to_string(),
-            headers: headers.clone(),
+            headers,
             headers_helper: headers_helper.map(str::to_string),
             server_name: name.to_string(),
         };
@@ -2316,9 +2432,10 @@ impl McpManager {
         url: &str,
         headers: &HashMap<String, String>,
     ) -> Result<(), McpError> {
+        let protected_headers = protect_static_headers(headers)?;
         let spec = ConnectionSpec::Http {
             url: url.to_string(),
-            headers: headers.clone(),
+            headers: protected_headers,
             headers_helper: None,
             server_name: name.to_string(),
         };
@@ -2666,6 +2783,26 @@ impl McpManager {
 mod tests {
     use super::*;
 
+    fn protected_env(values: &[(&str, &str)]) -> crate::secrets::EnvironmentGrants {
+        crate::secrets::EnvironmentGrants::from_validated(
+            values
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+        )
+        .expect("environment")
+    }
+
+    fn protected_headers(values: &[(&str, &str)]) -> crate::secrets::SensitiveHeaders {
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        for (name, value) in values {
+            headers
+                .insert_literal(name, (*value).to_string())
+                .expect("header");
+        }
+        headers
+    }
+
     fn test_run() -> &'static Arc<crate::tools::ToolRunContext> {
         crate::tools::security::test_run_context()
     }
@@ -2737,20 +2874,16 @@ mod tests {
     #[test]
     fn mcp_stdio_environment_is_bound_to_a_derived_run_generation() {
         let parent = test_run();
-        let child = derive_mcp_stdio_run(
-            parent,
-            &HashMap::from([("S019_MCP_ENV".to_string(), "exact".to_string())]),
-        )
-        .expect("derive MCP stdio run");
+        let environment = protected_env(&[("S019_MCP_ENV", "exact")]);
+        let child = derive_mcp_stdio_run(parent, &environment).expect("derive MCP stdio run");
 
         assert_ne!(child.run_id(), parent.run_id());
         assert_ne!(child.generation(), parent.generation());
         assert_eq!(child.session_id(), parent.session_id());
         assert_eq!(child.project_root(), parent.project_root());
-        assert_eq!(
-            child.environment_grants().get("S019_MCP_ENV"),
-            Some(&"exact".to_string())
-        );
+        assert!(child
+            .environment_grants()
+            .matches_value("S019_MCP_ENV", "exact"));
         assert!(!parent.environment_grants().contains_key("S019_MCP_ENV"));
         assert_ne!(
             child.runtime().descriptor().capabilities.manifest_digest,
@@ -2818,46 +2951,29 @@ mod tests {
     fn headers_helper_stdout_must_be_json_object_with_string_values() {
         let headers =
             parse_headers_helper_stdout("svc", br#"{"Authorization":"Bearer dynamic"}"#).unwrap();
-        assert_eq!(
-            headers.get("Authorization").map(String::as_str),
-            Some("Bearer dynamic")
-        );
+        assert!(headers.matches_value("Authorization", "Bearer dynamic"));
 
         let non_object = parse_headers_helper_stdout("svc", br#"["not-an-object"]"#).unwrap_err();
-        assert!(
-            non_object.to_string().contains("must emit a JSON object"),
-            "unexpected error: {non_object}"
-        );
+        assert!(non_object.to_string().contains("did not emit valid JSON"));
 
         let non_string =
             parse_headers_helper_stdout("svc", br#"{"Authorization":42}"#).unwrap_err();
-        assert!(
-            non_string.to_string().contains("non-string value"),
-            "unexpected error: {non_string}"
-        );
+        assert!(non_string.to_string().contains("did not emit valid JSON"));
     }
 
     #[test]
     fn headers_helper_dynamic_headers_override_static_case_insensitively() {
-        let mut headers = HashMap::from([
-            ("Authorization".to_string(), "Bearer static".to_string()),
-            ("X-Static".to_string(), "kept".to_string()),
-        ]);
-        let dynamic = HashMap::from([
-            ("authorization".to_string(), "Bearer dynamic".to_string()),
-            ("X-Dynamic".to_string(), "added".to_string()),
-        ]);
+        let mut headers =
+            protected_headers(&[("Authorization", "Bearer static"), ("X-Static", "kept")]);
+        let dynamic =
+            protected_headers(&[("authorization", "Bearer dynamic"), ("X-Dynamic", "added")]);
 
-        merge_dynamic_headers(&mut headers, dynamic);
+        merge_dynamic_headers(&mut headers, &dynamic);
 
         assert_eq!(headers.len(), 3);
-        assert!(!headers.contains_key("Authorization"));
-        assert_eq!(
-            headers.get("authorization").map(String::as_str),
-            Some("Bearer dynamic")
-        );
-        assert_eq!(headers.get("X-Static").map(String::as_str), Some("kept"));
-        assert_eq!(headers.get("X-Dynamic").map(String::as_str), Some("added"));
+        assert!(headers.matches_value("authorization", "Bearer dynamic"));
+        assert!(headers.matches_value("X-Static", "kept"));
+        assert!(headers.matches_value("X-Dynamic", "added"));
     }
 
     #[cfg(unix)]
@@ -2875,23 +2991,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            headers.get("X-Server").map(String::as_str),
-            Some("internal-api")
-        );
-        assert_eq!(
-            headers.get("X-Url").map(String::as_str),
-            Some("https://mcp.example.test/mcp")
-        );
+        assert!(headers.matches_value("X-Server", "internal-api"));
+        assert!(headers.matches_value("X-Url", "https://mcp.example.test/mcp"));
     }
 
     #[cfg(unix)]
     #[test]
     fn resolve_http_headers_merges_static_and_helper_headers() {
-        let static_headers = HashMap::from([
-            ("Authorization".to_string(), "Bearer static".to_string()),
-            ("X-Static".to_string(), "kept".to_string()),
-        ]);
+        let static_headers =
+            protected_headers(&[("Authorization", "Bearer static"), ("X-Static", "kept")]);
         let command = "printf '{\"authorization\":\"Bearer dynamic\",\"X-Helper\":\"added\"}'";
 
         let headers = resolve_http_headers(
@@ -2903,13 +3011,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            headers.get("authorization").map(String::as_str),
-            Some("Bearer dynamic")
-        );
-        assert!(!headers.contains_key("Authorization"));
-        assert_eq!(headers.get("X-Static").map(String::as_str), Some("kept"));
-        assert_eq!(headers.get("X-Helper").map(String::as_str), Some("added"));
+        assert!(headers.matches_value("authorization", "Bearer dynamic"));
+        assert!(headers.matches_value("X-Static", "kept"));
+        assert!(headers.matches_value("X-Helper", "added"));
     }
 
     #[test]
@@ -3904,7 +4008,7 @@ sys.stdout.flush()
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::secrets::EnvironmentGrants::new(),
         };
         let entry = ServerEntry::new(spec, server);
         manager
@@ -3944,7 +4048,7 @@ sys.stdout.flush()
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::secrets::EnvironmentGrants::new(),
         };
         let entry = ServerEntry {
             spec,
@@ -3982,7 +4086,7 @@ sys.stdout.flush()
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::secrets::EnvironmentGrants::new(),
         };
         // Freshly disconnected (failed_attempts = 0), last_failure
         // = now ⇒ BACKOFF[0] = 1 s has NOT elapsed.
@@ -4047,7 +4151,7 @@ sys.stdout.flush()
         let spec = ConnectionSpec::Stdio {
             command: "/this/path/definitely/does/not/exist/__fix629__".to_string(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::secrets::EnvironmentGrants::new(),
         };
         let entry = ServerEntry {
             spec,
@@ -4100,7 +4204,7 @@ sys.stdout.flush()
         let spec2 = ConnectionSpec::Stdio {
             command: "/bin/true".to_string(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::secrets::EnvironmentGrants::new(),
         };
         manager
             .servers
@@ -4171,11 +4275,12 @@ sys.stdout.flush()
     /// task exits after the single exchange so the test can be run
     /// without external coordination. Returns the bound `127.0.0.1:N`
     /// URL so the caller can point an `HttpTransport` at it.
-    async fn spawn_one_shot_http_mock(response_body: &'static str) -> String {
+    async fn spawn_one_shot_http_mock(response_body: impl Into<String>) -> String {
         use tokio::io::AsyncReadExt as _;
         use tokio::io::AsyncWriteExt as _;
         use tokio::net::TcpListener;
 
+        let response_body = response_body.into();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         tokio::spawn(async move {
@@ -4724,6 +4829,36 @@ sys.stdout.flush()
             }
             other => panic!("expected Protocol error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn http_transport_redacts_static_header_echoes_from_rpc_errors() {
+        const SECRET: &str = "s025-mcp-header-secret-d732e1";
+        let url = spawn_one_shot_http_mock(format!(
+            r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":-32000,"message":"echo {SECRET}","data":{{"authorization":"Bearer {SECRET}"}}}}}}"#,
+        ))
+        .await;
+        let headers = HashMap::from([("Authorization".to_string(), format!("Bearer {SECRET}"))]);
+        let transport = HttpTransport::__test_new_unchecked_with_headers(&url, &headers);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), transport.request("call", None))
+            .await
+            .expect("request did not deadlock")
+            .expect_err("JSON-RPC error response must surface as Err");
+        let message = match error {
+            McpError::Protocol(message) => message,
+            other => panic!("expected Protocol error, got {other:?}"),
+        };
+
+        assert!(
+            !message.contains(SECRET),
+            "MCP error leaked header: {message}"
+        );
+        assert!(
+            message.contains(crate::secrets::REDACTED_SECRET),
+            "{message}"
+        );
+        assert!(message.len() <= crate::secrets::MAX_DIAGNOSTIC_BYTES);
     }
 
     /// Fix #626: when the server omits `error.data`, the message must

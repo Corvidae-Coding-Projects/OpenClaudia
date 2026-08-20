@@ -69,7 +69,7 @@ impl CodexAuthSource {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CodexResponsesAuth {
-    pub access_token: String,
+    pub access_token: crate::secrets::OAuthToken,
     pub account_id: Option<String>,
     pub is_fedramp_account: bool,
     pub source: CodexAuthSource,
@@ -89,22 +89,27 @@ impl std::fmt::Debug for CodexResponsesAuth {
 }
 
 impl CodexResponsesAuth {
-    #[must_use]
-    pub fn headers(&self) -> Vec<(String, String)> {
-        let mut headers = vec![
-            (
-                "Authorization".to_string(),
-                format!("Bearer {}", self.access_token),
-            ),
-            ("Accept".to_string(), "text/event-stream".to_string()),
-        ];
+    /// Build the sensitive request headers for the Responses API.
+    ///
+    /// # Errors
+    /// Returns an error if a caller-constructed account identifier is not a
+    /// legal HTTP header value.
+    pub fn headers(
+        &self,
+    ) -> Result<crate::secrets::SensitiveHeaders, crate::secrets::SensitiveHeaderError> {
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_bearer(reqwest::header::AUTHORIZATION, self.access_token.secret());
+        headers.insert_static_literal(reqwest::header::ACCEPT, "text/event-stream");
         if let Some(account_id) = &self.account_id {
-            headers.push(("ChatGPT-Account-ID".to_string(), account_id.clone()));
+            headers.insert_literal("ChatGPT-Account-ID", account_id.clone())?;
         }
         if self.is_fedramp_account {
-            headers.push(("X-OpenAI-Fedramp".to_string(), "true".to_string()));
+            headers.insert_static_literal(
+                reqwest::header::HeaderName::from_static("x-openai-fedramp"),
+                "true",
+            );
         }
-        headers
+        Ok(headers)
     }
 
     #[must_use]
@@ -120,7 +125,7 @@ impl CodexResponsesAuth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexAuthMaterial {
     ApiKey {
-        api_key: String,
+        api_key: crate::providers::ApiKey,
         source: CodexAuthSource,
     },
     Responses(CodexResponsesAuth),
@@ -145,39 +150,43 @@ impl CodexAuthMaterial {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AuthDotJson {
     #[serde(default)]
     auth_mode: Option<String>,
-    #[serde(default, rename = "OPENAI_API_KEY")]
-    openai_api_key: Option<String>,
+    #[serde(
+        default,
+        rename = "OPENAI_API_KEY",
+        deserialize_with = "deserialize_optional_api_key"
+    )]
+    openai_api_key: Option<crate::providers::ApiKey>,
     #[serde(default)]
     tokens: Option<TokenData>,
     #[serde(default)]
     agent_identity: Option<Value>,
-    #[serde(default)]
-    personal_access_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_oauth_token")]
+    personal_access_token: Option<crate::secrets::OAuthToken>,
     #[serde(default)]
     bedrock_api_key: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenData {
     #[serde(default)]
     id_token: Option<IdToken>,
-    #[serde(default)]
-    access_token: String,
+    #[serde(default, deserialize_with = "deserialize_optional_oauth_token")]
+    access_token: Option<crate::secrets::OAuthToken>,
     #[serde(default)]
     account_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum IdToken {
-    Raw(String),
+    Raw(crate::secrets::OAuthToken),
     Object {
         #[serde(default)]
-        raw_jwt: Option<String>,
+        raw_jwt: Option<crate::secrets::OAuthToken>,
         #[serde(default)]
         chatgpt_account_id: Option<String>,
         #[serde(default)]
@@ -191,17 +200,48 @@ struct JwtClaims {
     is_fedramp_account: bool,
 }
 
-fn trimmed_nonempty(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
+fn deserialize_optional_api_key<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::providers::ApiKey>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?.map(zeroize::Zeroizing::new);
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    crate::providers::ApiKey::try_from_string(trimmed.to_string())
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
-fn raw_id_token(id_token: Option<&IdToken>) -> Option<&str> {
+fn deserialize_optional_oauth_token<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::secrets::OAuthToken>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?.map(zeroize::Zeroizing::new);
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    crate::secrets::OAuthToken::try_from_string(trimmed.to_string())
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+const fn raw_id_token(id_token: Option<&IdToken>) -> Option<&crate::secrets::OAuthToken> {
     match id_token {
-        Some(IdToken::Raw(raw)) => Some(raw.as_str()),
-        Some(IdToken::Object { raw_jwt, .. }) => raw_jwt.as_deref(),
+        Some(IdToken::Raw(raw)) => Some(raw),
+        Some(IdToken::Object { raw_jwt, .. }) => raw_jwt.as_ref(),
         None => None,
     }
 }
@@ -226,7 +266,11 @@ fn id_token_claims(id_token: Option<&IdToken>) -> JwtClaims {
     claims
 }
 
-fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
+fn parse_jwt_claims(token: &crate::secrets::OAuthToken) -> Option<JwtClaims> {
+    token.expose(parse_jwt_claims_raw)
+}
+
+fn parse_jwt_claims_raw(token: &str) -> Option<JwtClaims> {
     let payload = token.split('.').nth(1)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
@@ -252,21 +296,13 @@ fn resolved_mode(auth: &AuthDotJson) -> Option<CodexAuthMode> {
     if let Some(mode) = auth.auth_mode.as_deref().and_then(CodexAuthMode::parse) {
         return Some(mode);
     }
-    if auth
-        .personal_access_token
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    if auth.personal_access_token.as_ref().is_some() {
         return Some(CodexAuthMode::PersonalAccessToken);
     }
     if auth.bedrock_api_key.is_some() {
         return Some(CodexAuthMode::BedrockApiKey);
     }
-    if auth
-        .openai_api_key
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    if auth.openai_api_key.as_ref().is_some() {
         return Some(CodexAuthMode::ApiKey);
     }
     if auth.agent_identity.is_some() {
@@ -275,7 +311,7 @@ fn resolved_mode(auth: &AuthDotJson) -> Option<CodexAuthMode> {
     if auth
         .tokens
         .as_ref()
-        .is_some_and(|t| !t.access_token.trim().is_empty())
+        .is_some_and(|t| t.access_token.is_some())
     {
         return Some(CodexAuthMode::Chatgpt);
     }
@@ -286,7 +322,7 @@ fn load_from_auth_json(auth: AuthDotJson) -> Option<CodexAuthMaterial> {
     let mode = resolved_mode(&auth)?;
     match mode {
         CodexAuthMode::ApiKey => {
-            let Some(api_key) = trimmed_nonempty(auth.openai_api_key) else {
+            let Some(api_key) = auth.openai_api_key else {
                 return Some(CodexAuthMaterial::Unsupported {
                     mode,
                     source: CodexAuthSource::AuthJson,
@@ -304,13 +340,12 @@ fn load_from_auth_json(auth: AuthDotJson) -> Option<CodexAuthMaterial> {
                     source: CodexAuthSource::AuthJson,
                 });
             };
-            let access_token = tokens.access_token.trim().to_string();
-            if access_token.is_empty() {
+            let Some(access_token) = tokens.access_token else {
                 return Some(CodexAuthMaterial::Unsupported {
                     mode,
                     source: CodexAuthSource::AuthJson,
                 });
-            }
+            };
             let claims = id_token_claims(tokens.id_token.as_ref());
             let token_claims = parse_jwt_claims(&access_token).unwrap_or_default();
             Some(CodexAuthMaterial::Responses(CodexResponsesAuth {
@@ -325,7 +360,7 @@ fn load_from_auth_json(auth: AuthDotJson) -> Option<CodexAuthMaterial> {
             }))
         }
         CodexAuthMode::PersonalAccessToken => {
-            let Some(access_token) = trimmed_nonempty(auth.personal_access_token) else {
+            let Some(access_token) = auth.personal_access_token else {
                 return Some(CodexAuthMaterial::Unsupported {
                     mode,
                     source: CodexAuthSource::AuthJson,
@@ -378,11 +413,14 @@ pub fn has_codex_auth_json() -> bool {
 /// cannot be parsed as Codex auth material.
 pub fn load_codex_auth() -> Result<Option<CodexAuthMaterial>, String> {
     if let Ok(token) = std::env::var(CODEX_ACCESS_TOKEN_ENV_VAR) {
+        let token = zeroize::Zeroizing::new(token);
         let token = token.trim();
         if !token.is_empty() {
-            let claims = parse_jwt_claims(token).unwrap_or_default();
+            let access_token = crate::secrets::OAuthToken::try_from_string(token.to_string())
+                .map_err(|error| format!("{CODEX_ACCESS_TOKEN_ENV_VAR} is invalid: {error}"))?;
+            let claims = parse_jwt_claims(&access_token).unwrap_or_default();
             return Ok(Some(CodexAuthMaterial::Responses(CodexResponsesAuth {
-                access_token: token.to_string(),
+                access_token,
                 account_id: claims.account_id,
                 is_fedramp_account: claims.is_fedramp_account,
                 source: CodexAuthSource::EnvAccessToken,
@@ -412,8 +450,10 @@ pub fn load_codex_auth_from_path(path: &Path) -> Result<Option<CodexAuthMaterial
     if metadata.file_type().is_symlink() {
         return Err(format!("refusing to read symlinked {}", path.display()));
     }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let raw = zeroize::Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|err| format!("failed to read {}: {err}", path.display()))?,
+    );
     let auth: AuthDotJson = serde_json::from_str(&raw)
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
     Ok(load_from_auth_json(auth))
@@ -445,10 +485,38 @@ mod tests {
         assert_eq!(
             auth,
             CodexAuthMaterial::ApiKey {
-                api_key: "sk-test".to_string(),
+                api_key: crate::providers::ApiKey::try_from_string("sk-test".to_string())
+                    .expect("key"),
                 source: CodexAuthSource::AuthJson
             }
         );
+    }
+
+    #[test]
+    fn auth_json_preserves_credential_whitespace_normalization() {
+        let (_dir, path) = write_auth_json(&json!({
+            "auth_mode": "api_key",
+            "OPENAI_API_KEY": "  sk-trimmed-test  "
+        }));
+        let auth = load_codex_auth_from_path(&path)
+            .expect("load")
+            .expect("auth");
+        let CodexAuthMaterial::ApiKey { api_key, .. } = auth else {
+            panic!("expected API-key auth");
+        };
+        assert!(api_key.matches("sk-trimmed-test"));
+
+        let (_dir, path) = write_auth_json(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "  access-trimmed-test  "}
+        }));
+        let auth = load_codex_auth_from_path(&path)
+            .expect("load")
+            .expect("auth");
+        let CodexAuthMaterial::Responses(auth) = auth else {
+            panic!("expected Responses auth");
+        };
+        assert!(auth.access_token.matches("access-trimmed-test"));
     }
 
     #[test]
@@ -472,10 +540,33 @@ mod tests {
         let CodexAuthMaterial::Responses(auth) = auth else {
             panic!("expected responses auth");
         };
-        assert_eq!(auth.access_token, "access-token");
+        assert!(auth.access_token.matches("access-token"));
         assert_eq!(auth.account_id.as_deref(), Some("account-123"));
         assert!(auth.is_fedramp_account);
         assert_eq!(auth.mode, CodexAuthMode::Chatgpt);
+    }
+
+    #[test]
+    fn responses_headers_reject_invalid_account_id_without_panicking_or_leaking_token() {
+        let secret = "s025-codex-token-4e2ac9";
+        let auth = CodexResponsesAuth {
+            access_token: crate::secrets::OAuthToken::try_from_string(secret.to_string())
+                .expect("token"),
+            account_id: Some("account\r\ninjected: value".to_string()),
+            is_fedramp_account: false,
+            source: CodexAuthSource::AuthJson,
+            mode: CodexAuthMode::Chatgpt,
+        };
+
+        let error = auth
+            .headers()
+            .expect_err("invalid account identifier must fail during header construction");
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains(secret),
+            "header error leaked token: {rendered}"
+        );
+        assert!(!format!("{auth:?}").contains(secret));
     }
 
     #[test]

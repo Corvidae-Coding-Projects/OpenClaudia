@@ -381,7 +381,7 @@ async fn auth_device_submit(
     let client = OAuthClient::new()
         .map_err(|e| ProxyError::InvalidBody(format!("OAuth client init failed: {e}")))?;
     let token_response = client
-        .exchange_code(&code, &pkce)
+        .exchange_code(code, &pkce)
         .await
         .map_err(|e| ProxyError::InvalidBody(format!("Token exchange failed: {e}")))?;
 
@@ -517,11 +517,7 @@ async fn model_list_json_for_state(state: &ProxyState) -> Value {
 
     if adapter.supports_model_listing() {
         if let Some(provider_config) = state.config.active_provider() {
-            let extra_headers: Vec<(String, String)> = provider_config
-                .headers
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
+            let extra_headers = provider_config.headers.clone();
             match providers::fetch_models_with_headers(
                 &provider_config.base_url,
                 provider_config.api_key.as_ref(),
@@ -1307,9 +1303,13 @@ fn resolve_provider<'a>(
 fn adapter_headers(
     adapter: &dyn ProviderAdapter,
     api_key: Option<&ApiKey>,
-) -> Vec<(String, String)> {
+) -> crate::secrets::SensitiveHeaders {
     api_key.map_or_else(
-        || vec![("content-type".to_string(), "application/json".to_string())],
+        || {
+            let mut headers = crate::secrets::SensitiveHeaders::new();
+            headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
+            headers
+        },
         |key| adapter.get_headers(key),
     )
 }
@@ -1363,7 +1363,7 @@ async fn transform_and_forward(
     api_key: Option<&ApiKey>,
     request: &ChatCompletionRequest,
     is_stream: bool,
-) -> Result<reqwest::Response, ProxyError> {
+) -> Result<UpstreamResponse, ProxyError> {
     // Crosslink #433: get_adapter now returns Result<&'static dyn …>; an
     // unknown provider name surfaces as a 400 instead of a silent OpenAI
     // fallback. The error string already lists the supported set so the
@@ -1794,14 +1794,22 @@ async fn send_oauth_anthropic_messages(
     crate::claude_credentials::strip_cache_control_ttl(request);
 
     let url = format!("{}/v1/messages", normalize_base_url(&provider.base_url));
-    let mut builder = client.post(&url).json(request);
-    for (name, value) in
-        crate::providers::AnthropicAdapter::oauth_headers(&session.credentials.access_token)
-    {
-        builder = builder.header(name.as_str(), value.as_str());
-    }
+    let headers =
+        crate::providers::AnthropicAdapter::oauth_headers(&session.credentials.access_token);
+    let mut merged = headers;
+    merged.extend(&provider.headers);
+    let builder = merged
+        .apply(client.post(&url).json(request))
+        .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
     let response = builder.send().await?;
-    convert_response(response, max_bytes).await
+    convert_response(
+        UpstreamResponse {
+            response,
+            request_headers: merged,
+        },
+        max_bytes,
+    )
+    .await
 }
 
 /// Send an Anthropic `/v1/messages` request authenticated by an API
@@ -1900,7 +1908,7 @@ async fn proxy_passthrough(
     }
 
     let url = format!("{}{}", normalize_base_url(&provider.base_url), path);
-    debug!(url = %url, "Passthrough request");
+    debug!("Passthrough request");
 
     let mut req_builder = state.client.request(request.method().clone(), &url);
 
@@ -1924,12 +1932,21 @@ async fn proxy_passthrough(
     // fall back to OpenAIAdapter; the failure was invisible.
     let adapter = crate::providers::get_adapter(&state.config.proxy.target)
         .map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
-    for (k, v) in adapter_headers(adapter, api_key.as_ref()) {
-        req_builder = req_builder.header(k.as_str(), v.as_str());
-    }
+    let mut provider_headers = adapter_headers(adapter, api_key.as_ref());
+    provider_headers.extend(&provider.headers);
+    req_builder = provider_headers
+        .apply(req_builder)
+        .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
 
     let response = req_builder.send().await?;
-    convert_response(response, state.config.proxy.max_response_bytes).await
+    convert_response(
+        UpstreamResponse {
+            response,
+            request_headers: provider_headers,
+        },
+        state.config.proxy.max_response_bytes,
+    )
+    .await
 }
 
 /// Determine which provider to use based on model name.
@@ -2046,10 +2063,14 @@ async fn read_body_capped(
 /// `state.config.proxy.max_response_bytes` (default 50 MiB). A response body
 /// that exceeds the limit returns [`ProxyError::InvalidBody`].
 async fn convert_response_with_usage(
-    response: reqwest::Response,
+    upstream: UpstreamResponse,
     max_bytes: usize,
     provider_name: &str,
 ) -> Result<(Response, Option<TokenUsage>), ProxyError> {
+    let UpstreamResponse {
+        response,
+        request_headers,
+    } = upstream;
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -2070,8 +2091,12 @@ async fn convert_response_with_usage(
     let body = read_body_capped(response, max_bytes).await?;
 
     if !status.is_success() {
+        let body = zeroize::Zeroizing::new(body);
+        let diagnostic = request_headers
+            .sanitize_diagnostic(&String::from_utf8_lossy(&body))
+            .to_string();
         let response = builder
-            .body(Body::from(body))
+            .body(Body::from(diagnostic))
             .map_err(|e| ProxyError::InvalidBody(format!("Failed to build response body: {e}")))?;
         return Ok((response, None));
     }
@@ -2260,11 +2285,11 @@ async fn forward_to_provider<T: Serialize + Sync>(
     path: &str,
     body: &T,
     is_stream: bool,
-) -> Result<reqwest::Response, ProxyError> {
+) -> Result<UpstreamResponse, ProxyError> {
     let url = format!("{}{}", normalize_base_url(&provider.base_url), path);
-    debug!(url = %url, stream = is_stream, "Forwarding to provider");
+    debug!(stream = is_stream, "Forwarding to provider");
 
-    let mut req = client.post(&url).json(body);
+    let req = client.post(&url).json(body);
 
     // Provider-owned auth and protocol headers.
     //
@@ -2275,17 +2300,16 @@ async fn forward_to_provider<T: Serialize + Sync>(
     // with Bearer auth pointed at the wrong endpoint).
     let adapter = crate::providers::get_adapter(provider_name)
         .map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
-    for (key, value) in adapter_headers(adapter, api_key) {
-        req = req.header(key.as_str(), value.as_str());
-    }
+    let mut headers = adapter_headers(adapter, api_key);
+    headers.extend(&provider.headers);
+    let req = headers
+        .apply(req)
+        .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
 
-    // Operator-supplied passthrough headers from config (these override
-    // the adapter's defaults — reqwest uses last-write-wins semantics).
-    for (key, value) in &provider.headers {
-        req = req.header(key.as_str(), value.as_str());
-    }
-
-    Ok(req.send().await?)
+    Ok(UpstreamResponse {
+        response: req.send().await?,
+        request_headers: headers,
+    })
 }
 
 /// Forward request to upstream provider with raw Value body and custom headers.
@@ -2296,22 +2320,28 @@ async fn forward_to_provider_raw_reqwest(
     path: &str,
     body: &Value,
     is_stream: bool,
-    custom_headers: Vec<(String, String)>,
-) -> Result<reqwest::Response, ProxyError> {
+    custom_headers: crate::secrets::SensitiveHeaders,
+) -> Result<UpstreamResponse, ProxyError> {
     let url = format!("{}{}", normalize_base_url(&provider.base_url), path);
-    debug!(url = %url, stream = is_stream, "Forwarding to provider (raw/reqwest)");
+    debug!(stream = is_stream, "Forwarding to provider (raw/reqwest)");
 
-    let mut req = client.post(&url).json(body);
+    let mut headers = custom_headers;
+    headers.extend(&provider.headers);
+    let req = headers
+        .apply(client.post(&url).json(body))
+        .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
 
-    for (key, value) in custom_headers {
-        req = req.header(key.as_str(), value.as_str());
-    }
+    Ok(UpstreamResponse {
+        response: req.send().await?,
+        request_headers: headers,
+    })
+}
 
-    for (key, value) in &provider.headers {
-        req = req.header(key.as_str(), value.as_str());
-    }
-
-    Ok(req.send().await?)
+/// Provider response paired with the opaque request credentials needed to
+/// sanitize a failure body before it reaches the proxy client.
+struct UpstreamResponse {
+    response: reqwest::Response,
+    request_headers: crate::secrets::SensitiveHeaders,
 }
 
 /// Convert reqwest response to axum response.
@@ -2320,9 +2350,13 @@ async fn forward_to_provider_raw_reqwest(
 /// `state.config.proxy.max_response_bytes` (default 50 MiB). A response body
 /// that exceeds the limit returns [`ProxyError::InvalidBody`].
 async fn convert_response(
-    response: reqwest::Response,
+    upstream: UpstreamResponse,
     max_bytes: usize,
 ) -> Result<Response, ProxyError> {
+    let UpstreamResponse {
+        response,
+        request_headers,
+    } = upstream;
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -2343,6 +2377,7 @@ async fn convert_response(
     // If the response is HTML (error page from CDN/proxy), convert to a
     // clean JSON error instead of dumping raw HTML to the terminal.
     if !status.is_success() {
+        let body = zeroize::Zeroizing::new(body);
         let body_str = String::from_utf8_lossy(&body);
         if body_str.trim_start().starts_with('<') || body_str.contains("<!DOCTYPE") {
             let clean_error = serde_json::json!({
@@ -2358,6 +2393,11 @@ async fn convert_response(
                 .body(Body::from(json_body))
                 .map_err(|e| ProxyError::InvalidBody(format!("Failed to build error body: {e}")));
         }
+
+        let diagnostic = request_headers.sanitize_diagnostic(&body_str);
+        return builder
+            .body(Body::from(diagnostic.to_string()))
+            .map_err(|e| ProxyError::InvalidBody(format!("Failed to build error body: {e}")));
     }
 
     builder
@@ -2561,11 +2601,11 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                         .map(std::string::String::as_str)
                         .collect();
                     match mcp
-                        .connect_stdio_with_env_and_timeout(
+                        .connect_stdio_with_protected_env_and_timeout(
                             &server.name,
                             command,
                             &args,
-                            &server.env,
+                            server.env.clone(),
                             tool_timeout,
                         )
                         .await
@@ -2589,10 +2629,10 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                         );
                     }
                     match mcp
-                        .connect_http_with_headers_helper_and_timeout(
+                        .connect_http_with_sensitive_headers_helper_and_timeout(
                             &server.name,
                             url,
-                            &server.headers,
+                            server.headers.clone(),
                             server.headers_helper.as_deref(),
                             tool_timeout,
                         )
@@ -2931,7 +2971,7 @@ mod tests {
             api_key: None,
             base_url,
             model: None,
-            headers: std::collections::HashMap::new(),
+            headers: crate::secrets::SensitiveHeaders::new(),
             thinking: crate::config::ThinkingConfig::default(),
         }
     }
@@ -3205,6 +3245,85 @@ mod tests {
         serde_json::from_slice(&bytes).expect("response body must be JSON")
     }
 
+    async fn response_text(response: Response) -> String {
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("read response body");
+        String::from_utf8(bytes.to_vec()).expect("response body must be UTF-8")
+    }
+
+    fn seeded_request_headers(secret: &str) -> crate::secrets::SensitiveHeaders {
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_bearer(
+            reqwest::header::AUTHORIZATION,
+            crate::secrets::SecretString::try_from_string(secret.to_string())
+                .expect("seeded secret"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn proxy_error_conversion_redacts_request_secret_and_bounds_body() {
+        const SECRET: &str = "s025-proxy-error-secret-93d5b7";
+        let body = serde_json::json!({
+            "error": {
+                "message": format!("upstream echoed Bearer {SECRET}"),
+                "padding": "x".repeat(crate::secrets::MAX_DIAGNOSTIC_BYTES * 2)
+            }
+        })
+        .to_string();
+        let upstream = upstream_response(StatusCode::UNAUTHORIZED, "application/json", body).await;
+
+        let response = convert_response(
+            UpstreamResponse {
+                response: upstream,
+                request_headers: seeded_request_headers(SECRET),
+            },
+            1024 * 1024,
+        )
+        .await
+        .expect("error response should be converted");
+        let body = response_text(response).await;
+
+        assert!(
+            !body.contains(SECRET),
+            "proxy leaked request secret: {body}"
+        );
+        assert!(body.contains(crate::secrets::REDACTED_SECRET), "{body}");
+        assert!(body.len() <= crate::secrets::MAX_DIAGNOSTIC_BYTES);
+    }
+
+    #[tokio::test]
+    async fn usage_conversion_redacts_non_success_provider_body() {
+        const SECRET: &str = "s025-proxy-usage-secret-c814f2";
+        let upstream = upstream_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            serde_json::json!({"error": {"message": format!("echo {SECRET}")}}).to_string(),
+        )
+        .await;
+
+        let (response, usage) = convert_response_with_usage(
+            UpstreamResponse {
+                response: upstream,
+                request_headers: seeded_request_headers(SECRET),
+            },
+            1024 * 1024,
+            "openai",
+        )
+        .await
+        .expect("provider failure should remain an HTTP response");
+        let body = response_text(response).await;
+
+        assert!(usage.is_none());
+        assert!(
+            !body.contains(SECRET),
+            "proxy leaked request secret: {body}"
+        );
+        assert!(body.contains(crate::secrets::REDACTED_SECRET), "{body}");
+    }
+
     #[tokio::test]
     async fn convert_response_with_usage_transforms_anthropic_chat_completion() {
         let raw = serde_json::json!({
@@ -3225,9 +3344,16 @@ mod tests {
         });
         let upstream = upstream_response(StatusCode::OK, "application/json", raw.to_string()).await;
 
-        let (response, usage) = convert_response_with_usage(upstream, 1024 * 1024, "anthropic")
-            .await
-            .expect("valid Anthropic response should transform");
+        let (response, usage) = convert_response_with_usage(
+            UpstreamResponse {
+                response: upstream,
+                request_headers: crate::secrets::SensitiveHeaders::new(),
+            },
+            1024 * 1024,
+            "anthropic",
+        )
+        .await
+        .expect("valid Anthropic response should transform");
 
         assert_eq!(response.status(), StatusCode::OK);
         let usage = usage.expect("raw Anthropic usage should be preserved");
@@ -3255,9 +3381,16 @@ mod tests {
         )
         .await;
 
-        let err = convert_response_with_usage(upstream, 1024 * 1024, "openai")
-            .await
-            .expect_err("empty choices must fail at provider boundary");
+        let err = convert_response_with_usage(
+            UpstreamResponse {
+                response: upstream,
+                request_headers: crate::secrets::SensitiveHeaders::new(),
+            },
+            1024 * 1024,
+            "openai",
+        )
+        .await
+        .expect_err("empty choices must fail at provider boundary");
 
         match err {
             ProxyError::InvalidBody(msg) => {

@@ -32,29 +32,54 @@
 //!   rejected with [`WebhookError::InvalidScheme`].
 
 use std::collections::HashMap;
+use std::fmt;
+
+/// Canonical webhook URL kept opaque because signed webhook URLs commonly
+/// carry credentials in their path, query, or user-info components.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WebhookUrl(crate::secrets::SecretString);
+
+impl WebhookUrl {
+    fn from_validated(url: String) -> Result<Self, WebhookError> {
+        crate::secrets::SecretString::try_from_string(url)
+            .map(Self)
+            .map_err(|_| WebhookError::Malformed {})
+    }
+
+    /// Compare a canonical URL without returning its bytes.
+    #[must_use]
+    pub fn matches(&self, candidate: &str) -> bool {
+        self.0.matches(candidate)
+    }
+}
+
+impl fmt::Debug for WebhookUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WebhookUrl([REDACTED])")
+    }
+}
+
+impl fmt::Display for WebhookUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(crate::secrets::REDACTED_SECRET)
+    }
+}
 
 /// Errors registering or invoking a webhook.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WebhookError {
     /// URL parsed but uses a scheme other than `http` / `https`.
-    #[error("webhook URL uses unsupported scheme '{scheme}'; expected https (or http with explicit opt-in)")]
-    InvalidScheme {
-        /// Offending scheme, lowercase.
-        scheme: String,
-    },
+    #[error(
+        "webhook URL uses an unsupported scheme; expected https (or http with explicit opt-in)"
+    )]
+    InvalidScheme {},
     /// URL uses `http://` and the registry was built with the strict
     /// default that rejects plaintext.
-    #[error("webhook URL '{url}' uses insecure http://; build the registry with new_allow_plaintext() to opt in")]
-    InsecureScheme {
-        /// The offending URL (for log diagnostics).
-        url: String,
-    },
+    #[error("webhook URL uses insecure http://; build the registry with new_allow_plaintext() to opt in")]
+    InsecureScheme {},
     /// URL is empty or could not be parsed as a host-bearing URL.
-    #[error("webhook URL '{url}' is not a valid absolute URL with a host")]
-    Malformed {
-        /// Offending raw input.
-        url: String,
-    },
+    #[error("webhook URL is not a valid absolute URL with a host")]
+    Malformed {},
     /// Caller asked to invoke a name that was never registered.
     #[error("no webhook registered under name '{name}'")]
     UnknownWebhook {
@@ -68,6 +93,13 @@ pub enum WebhookError {
         /// The name that collided.
         name: String,
     },
+    /// A configured header name or value cannot be represented safely on the
+    /// outbound HTTP request.
+    #[error("invalid webhook headers: {reason}")]
+    InvalidHeaders {
+        /// Validation detail that never contains the rejected value.
+        reason: String,
+    },
 }
 
 /// One registered webhook endpoint.
@@ -75,12 +107,10 @@ pub enum WebhookError {
 pub struct WebhookEndpoint {
     /// Final, validated URL — always carries an explicit scheme
     /// (https by default, http only when explicitly opted in).
-    pub url: String,
-    /// Extra headers to include on the outbound request. Header
-    /// values are stored as plain strings here; nothing in this
-    /// module sends the request, so secret-handling is the caller's
-    /// responsibility.
-    pub headers: HashMap<String, String>,
+    pub url: WebhookUrl,
+    /// Extra headers to include on the outbound request. Values remain opaque
+    /// until a future sender applies them at its HTTP transport boundary.
+    pub headers: crate::secrets::SensitiveHeaders,
 }
 
 /// Webhook registry — name → endpoint.
@@ -121,11 +151,9 @@ impl WebhookRegistry {
     /// # Errors
     ///
     /// See [`WebhookError`] for the cases.
-    pub fn validate_url(&self, raw: &str) -> Result<String, WebhookError> {
+    pub fn validate_url(&self, raw: &str) -> Result<WebhookUrl, WebhookError> {
         if raw.trim().is_empty() {
-            return Err(WebhookError::Malformed {
-                url: raw.to_string(),
-            });
+            return Err(WebhookError::Malformed {});
         }
 
         // Decide whether the caller supplied a scheme. We deliberately
@@ -135,39 +163,29 @@ impl WebhookRegistry {
         // reject it.
         let (with_scheme, was_implicit) = scheme_with_default(raw);
 
-        let parsed = url::Url::parse(&with_scheme).map_err(|_| WebhookError::Malformed {
-            url: raw.to_string(),
-        })?;
+        let parsed = url::Url::parse(&with_scheme).map_err(|_| WebhookError::Malformed {})?;
 
         if parsed.host_str().is_none_or(str::is_empty) {
-            return Err(WebhookError::Malformed {
-                url: raw.to_string(),
-            });
+            return Err(WebhookError::Malformed {});
         }
 
         match parsed.scheme() {
-            "https" => Ok(parsed.into()),
+            "https" => WebhookUrl::from_validated(parsed.into()),
             "http" => {
                 if self.allow_plaintext {
-                    Ok(parsed.into())
+                    WebhookUrl::from_validated(parsed.into())
                 } else if was_implicit {
                     // `was_implicit` means the caller never wrote
                     // "http://" explicitly — we'd have upgraded to
                     // https. This branch is unreachable in practice
                     // because `scheme_with_default` prepends https.
                     // Surface it as Malformed for defence-in-depth.
-                    Err(WebhookError::Malformed {
-                        url: raw.to_string(),
-                    })
+                    Err(WebhookError::Malformed {})
                 } else {
-                    Err(WebhookError::InsecureScheme {
-                        url: raw.to_string(),
-                    })
+                    Err(WebhookError::InsecureScheme {})
                 }
             }
-            other => Err(WebhookError::InvalidScheme {
-                scheme: other.to_string(),
-            }),
+            _ => Err(WebhookError::InvalidScheme {}),
         }
     }
 
@@ -188,6 +206,7 @@ impl WebhookRegistry {
             return Err(WebhookError::Duplicate { name });
         }
         let url = self.validate_url(url)?;
+        let headers = protect_headers(headers)?;
         self.entries.insert(name, WebhookEndpoint { url, headers });
         Ok(())
     }
@@ -204,6 +223,7 @@ impl WebhookRegistry {
         headers: HashMap<String, String>,
     ) -> Result<(), WebhookError> {
         let url = self.validate_url(url)?;
+        let headers = protect_headers(headers)?;
         self.entries
             .insert(name.into(), WebhookEndpoint { url, headers });
         Ok(())
@@ -237,6 +257,16 @@ impl WebhookRegistry {
     pub const fn allows_plaintext(&self) -> bool {
         self.allow_plaintext
     }
+}
+
+fn protect_headers(
+    headers: HashMap<String, String>,
+) -> Result<crate::secrets::SensitiveHeaders, WebhookError> {
+    crate::secrets::SensitiveHeaders::try_from(headers).map_err(|error| {
+        WebhookError::InvalidHeaders {
+            reason: error.to_string(),
+        }
+    })
 }
 
 impl Default for WebhookRegistry {
@@ -281,14 +311,14 @@ mod tests {
     fn https_url_is_accepted_verbatim() {
         let reg = WebhookRegistry::new();
         let url = reg.validate_url("https://example.com/hook").unwrap();
-        assert_eq!(url, "https://example.com/hook");
+        assert!(url.matches("https://example.com/hook"));
     }
 
     #[test]
     fn scheme_less_url_is_upgraded_to_https() {
         let reg = WebhookRegistry::new();
         let url = reg.validate_url("example.com/hook").unwrap();
-        assert_eq!(url, "https://example.com/hook");
+        assert!(url.matches("https://example.com/hook"));
     }
 
     #[test]
@@ -298,7 +328,7 @@ mod tests {
         // against.
         let reg = WebhookRegistry::new();
         let url = reg.validate_url("example.com").unwrap();
-        assert_eq!(url, "https://example.com/");
+        assert!(url.matches("https://example.com/"));
     }
 
     #[test]
@@ -317,7 +347,7 @@ mod tests {
     fn http_is_accepted_with_explicit_opt_in() {
         let reg = WebhookRegistry::new_allow_plaintext();
         let url = reg.validate_url("http://localhost:1234/hook").unwrap();
-        assert_eq!(url, "http://localhost:1234/hook");
+        assert!(url.matches("http://localhost:1234/hook"));
     }
 
     #[test]
@@ -364,8 +394,9 @@ mod tests {
         )
         .unwrap();
         let ep = reg.get("deploy").unwrap();
-        assert_eq!(ep.url, "https://hooks.example.com/deploy");
-        assert_eq!(ep.headers, headers);
+        assert!(ep.url.matches("https://hooks.example.com/deploy"));
+        assert!(ep.headers.matches_value("X-Auth", "tok-123"));
+        assert!(!format!("{ep:?}").contains("tok-123"));
     }
 
     #[test]
@@ -386,7 +417,11 @@ mod tests {
             .unwrap();
         reg.replace("a", "https://z.example.com/new", HashMap::new())
             .unwrap();
-        assert_eq!(reg.get("a").unwrap().url, "https://z.example.com/new");
+        assert!(reg
+            .get("a")
+            .unwrap()
+            .url
+            .matches("https://z.example.com/new"));
     }
 
     #[test]

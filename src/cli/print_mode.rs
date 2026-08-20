@@ -66,7 +66,7 @@ fn build_print_request(
     adapter: &dyn ProviderAdapter,
     request: &openclaudia::proxy::ChatCompletionRequest,
     thinking: &openclaudia::config::ThinkingConfig,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
 ) -> Result<serde_json::Value, String> {
     let mut body = adapter
         .transform_request_with_thinking(request, thinking)
@@ -129,7 +129,7 @@ fn resolve_print_endpoint(
     model: &str,
     provider: &openclaudia::config::ProviderConfig,
     adapter: &dyn ProviderAdapter,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
 ) -> String {
     if claude_code_token.is_some() {
         return openclaudia::claude_credentials::get_oauth_endpoint(model);
@@ -312,33 +312,29 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         adapter,
         &chat_request,
         &provider.thinking,
-        claude_code_token.as_deref(),
+        claude_code_token.as_ref(),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
-    let endpoint = resolve_print_endpoint(&model, provider, adapter, claude_code_token.as_deref());
-    let extra_headers: Vec<(String, String)> = provider
-        .headers
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let endpoint = resolve_print_endpoint(&model, provider, adapter, claude_code_token.as_ref());
+    let extra_headers = provider.headers.clone();
     let headers = openclaudia::pipeline::resolve_headers(
         &config.proxy.target,
         api_key.as_ref(),
-        claude_code_token.as_deref(),
+        claude_code_token.as_ref(),
         &extra_headers,
     )?;
 
     let client = reqwest::Client::new();
-    let mut request = client.post(endpoint).json(&request_body);
-    for (key, value) in &headers {
-        request = request.header(key.as_str(), value.as_str());
-    }
+    let request = headers.apply(client.post(endpoint).json(&request_body))?;
 
     let response = request.send().await?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| String::new());
-        anyhow::bail!("API error {}: {body}", status.as_u16());
+        let body = openclaudia::secrets::read_bounded_diagnostic_body(response)
+            .await
+            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+        let diagnostic = headers.sanitize_diagnostic(&body);
+        anyhow::bail!("API error {}: {diagnostic}", status.as_u16());
     }
 
     if response_is_json(&response) {
@@ -549,7 +545,7 @@ mod tests {
             api_key: None,
             base_url: "https://generativelanguage.googleapis.com".to_string(),
             model: None,
-            headers: std::collections::HashMap::new(),
+            headers: openclaudia::secrets::SensitiveHeaders::new(),
             thinking: openclaudia::config::ThinkingConfig::default(),
         };
         let endpoint = resolve_print_endpoint("gemini-3.5-flash", &provider, adapter, None);

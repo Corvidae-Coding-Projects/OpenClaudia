@@ -427,7 +427,7 @@ fn lookup_tui_slash(text: &str) -> Option<TuiSlashHandler> {
 #[derive(Debug)]
 struct ProviderSwitchAuth {
     api_key: Option<crate::providers::ApiKey>,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<crate::secrets::OAuthToken>,
     codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
 }
 
@@ -472,8 +472,6 @@ async fn resolve_provider_switch_auth(
     if target.eq_ignore_ascii_case("openai") {
         match crate::codex_credentials::load_codex_auth() {
             Ok(Some(crate::codex_credentials::CodexAuthMaterial::ApiKey { api_key, .. })) => {
-                let api_key = crate::providers::ApiKey::try_from_string(api_key)
-                    .map_err(|e| format!("Codex OpenAI API key is invalid: {e}"))?;
                 return Ok(ProviderSwitchAuth {
                     api_key: Some(api_key),
                     claude_code_token: None,
@@ -531,11 +529,7 @@ async fn resolve_provider_switch(
         .model
         .clone()
         .unwrap_or_else(|| crate::providers::default_model_for_target(&target).to_string());
-    let extra_headers: Vec<(String, String)> = provider
-        .headers
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let extra_headers = provider.headers.clone();
     let wire_api = if auth.codex_responses_auth.is_some() {
         crate::pipeline::WireApi::OpenAiResponses
     } else {
@@ -550,8 +544,8 @@ async fn resolve_provider_switch(
             None,
         )
         .map_err(|e| e.to_string())?;
-        let mut headers = codex_auth.headers();
-        headers.extend(extra_headers);
+        let mut headers = codex_auth.headers().map_err(|e| e.to_string())?;
+        headers.extend(&extra_headers);
         (endpoint, headers)
     } else {
         let endpoint = crate::pipeline::resolve_endpoint_for_wire(
@@ -559,13 +553,13 @@ async fn resolve_provider_switch(
             &target,
             &model,
             &provider.base_url,
-            auth.claude_code_token.as_deref(),
+            auth.claude_code_token.as_ref(),
         )
         .map_err(|e| e.to_string())?;
         let headers = crate::pipeline::resolve_headers(
             &target,
             auth.api_key.as_ref(),
-            auth.claude_code_token.as_deref(),
+            auth.claude_code_token.as_ref(),
             &extra_headers,
         )
         .map_err(|e| e.to_string())?;
@@ -691,12 +685,12 @@ pub struct ApiClient {
     /// The provider endpoint URL the proxy will POST to.
     pub endpoint: String,
     /// Wire-level headers carried on every request (auth, anthropic-version, …).
-    pub headers: Vec<(String, String)>,
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Wire protocol carried by the endpoint.
     pub wire_api: crate::pipeline::WireApi,
     /// OAuth bearer used by the claude-code-token flow. `None` when the
     /// raw `ANTHROPIC_API_KEY` path is taken.
-    pub claude_code_token: Option<String>,
+    pub claude_code_token: Option<crate::secrets::OAuthToken>,
     /// Pre-split system-prompt blocks the Anthropic adapter uses to get
     /// cache hits on the long static tail. `None` when no split has been
     /// computed (non-Anthropic providers).
@@ -713,7 +707,7 @@ impl ApiClient {
         Self {
             client: reqwest::Client::new(),
             endpoint: String::new(),
-            headers: Vec::new(),
+            headers: crate::secrets::SensitiveHeaders::new(),
             wire_api: crate::pipeline::WireApi::ChatCompletions,
             claude_code_token: None,
             prompt_blocks: None,
@@ -1249,10 +1243,10 @@ impl App {
     pub fn set_api_config(
         &mut self,
         endpoint: String,
-        headers: Vec<(String, String)>,
+        headers: crate::secrets::SensitiveHeaders,
         wire_api: crate::pipeline::WireApi,
         prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
-        claude_code_token: Option<String>,
+        claude_code_token: Option<crate::secrets::OAuthToken>,
     ) {
         self.api_client.endpoint = endpoint;
         self.api_client.headers = headers;
@@ -2755,11 +2749,7 @@ impl App {
 
         let provider = self.provider.clone();
         let current_model = self.model.clone();
-        let extra_headers: Vec<(String, String)> = provider_config
-            .headers
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        let extra_headers = provider_config.headers.clone();
         self.messages.add(DisplayMessage::system(format!(
             "Fetching models for {provider} from the configured /models endpoint..."
         )));
@@ -3240,13 +3230,13 @@ impl App {
                         .current_dir(&cwd)
                         .kill_on_drop(true)
                         .env_clear()
-                        .envs(&environment_grants)
                         .env("HOME", &private_temp)
                         .env("TMPDIR", &private_temp)
                         .env("TMP", &private_temp)
                         .env("TEMP", &private_temp)
                         .env("PATH", &executable_search_path)
                         .env("CLAUDE_PROJECT_DIR", &cwd);
+                    environment_grants.apply_tokio(&mut command);
                     command.output().await
                 }
                 Err(error) => Err(std::io::Error::new(
@@ -3349,9 +3339,9 @@ impl App {
             Err(error) => {
                 send_or_warn(
                     &tx,
-                    super::events::AppEvent::ApiError(format!(
-                        "Tool execution is unavailable: {error}"
-                    )),
+                    super::events::AppEvent::ApiError(
+                        format!("Tool execution is unavailable: {error}").into(),
+                    ),
                     &session_id_for_task,
                 );
                 self.is_waiting = false;
@@ -3721,12 +3711,12 @@ struct ApiTurnParams {
     session_messages: Vec<serde_json::Value>,
     client: reqwest::Client,
     endpoint: String,
-    headers: Vec<(String, String)>,
+    headers: crate::secrets::SensitiveHeaders,
     provider: String,
     model: String,
     effort_level: EffortLevel,
     wire_api: crate::pipeline::WireApi,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<crate::secrets::OAuthToken>,
     prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
@@ -3750,7 +3740,7 @@ struct InitialTurnRequest<'a> {
     wire_api: crate::pipeline::WireApi,
     provider: &'a str,
     effort_level: EffortLevel,
-    claude_code_token: Option<&'a str>,
+    claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
 }
@@ -3765,12 +3755,12 @@ struct AgenticCtx<'a> {
     run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     client: &'a reqwest::Client,
     endpoint: &'a str,
-    headers: &'a [(String, String)],
+    headers: &'a crate::secrets::SensitiveHeaders,
     provider: &'a str,
     model: &'a str,
     effort_level: &'a str,
     wire_api: crate::pipeline::WireApi,
-    claude_code_token: Option<&'a str>,
+    claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
@@ -3899,7 +3889,7 @@ fn check_provider_request_policy_for_messages(
         Err(e) => {
             send_or_warn(
                 tx,
-                super::events::AppEvent::ApiError(format!("Request build error: {e}")),
+                super::events::AppEvent::ApiError(format!("Request build error: {e}").into()),
                 session_id,
             );
             return false;
@@ -3917,7 +3907,7 @@ fn check_provider_request_policy_for_messages(
         Err(err) => {
             send_or_warn(
                 tx,
-                super::events::AppEvent::ApiError(format!("Blocked by policy: {err}")),
+                super::events::AppEvent::ApiError(format!("Blocked by policy: {err}").into()),
                 session_id,
             );
             false
@@ -3951,9 +3941,9 @@ async fn run_preturn_hooks(
             || "Hook blocked the request".to_string(),
             std::string::ToString::to_string,
         );
-        let _ = tx.send(super::events::AppEvent::ApiError(format!(
-            "Blocked by hook: {reason}"
-        )));
+        let _ = tx.send(super::events::AppEvent::ApiError(
+            format!("Blocked by hook: {reason}").into(),
+        ));
         return false;
     }
     let hook_items =
@@ -4001,6 +3991,18 @@ fn send_or_warn(
             persist_orphan_messages(session_id, &msgs);
         }
     }
+}
+
+fn send_api_error(
+    tx: &std::sync::mpsc::Sender<super::events::AppEvent>,
+    error: String,
+    session_id: &str,
+) {
+    send_or_warn(
+        tx,
+        super::events::AppEvent::ApiError(error.into()),
+        session_id,
+    );
 }
 
 /// Build the line list for the `ask_user_question` modal overlay.
@@ -4146,7 +4148,7 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         }
         super::events::AppEvent::ResponseDone => "ResponseDone".to_string(),
         super::events::AppEvent::ApiError(e) => {
-            let snippet: String = e.chars().take(80).collect();
+            let snippet: String = e.as_str().chars().take(80).collect();
             format!("ApiError({snippet:?})")
         }
         super::events::AppEvent::ApiRetry {
@@ -4272,9 +4274,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
         if iteration > MAX_ITER {
             send_or_warn(
                 ctx.tx,
-                super::events::AppEvent::ApiError(
-                    "Reached maximum tool iterations (25)".to_string(),
-                ),
+                super::events::AppEvent::ApiError("Reached maximum tool iterations (25)".into()),
                 ctx.session_id,
             );
             break;
@@ -4288,7 +4288,11 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             Ok(messages) => messages,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to build grounded agentic follow-up request");
-                send_or_warn(ctx.tx, super::events::AppEvent::ApiError(e), ctx.session_id);
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::ApiError(e.into()),
+                    ctx.session_id,
+                );
                 break;
             }
         };
@@ -4313,7 +4317,11 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             Ok(body) => body,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to build agentic follow-up request");
-                send_or_warn(ctx.tx, super::events::AppEvent::ApiError(e), ctx.session_id);
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::ApiError(e.into()),
+                    ctx.session_id,
+                );
                 break;
             }
         };
@@ -4369,9 +4377,10 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                             Err(reason) => {
                                 send_or_warn(
                                     ctx.tx,
-                                    super::events::AppEvent::ApiError(format!(
-                                        "Final answer failed grounding gate: {reason}"
-                                    )),
+                                    super::events::AppEvent::ApiError(
+                                        format!("Final answer failed grounding gate: {reason}")
+                                            .into(),
+                                    ),
                                     ctx.session_id,
                                 );
                                 break;
@@ -4392,7 +4401,11 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             }
             Err(e) => {
                 tracing::error!(error = %e, "Agentic follow-up failed");
-                send_or_warn(ctx.tx, super::events::AppEvent::ApiError(e), ctx.session_id);
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::ApiError(e.into()),
+                    ctx.session_id,
+                );
                 // The caller's `SyncMessages` send after the loop will trigger
                 // recovery persistence if the channel is closed — no extra
                 // action needed here for partial-state capture.
@@ -4412,7 +4425,11 @@ fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInit
     ) {
         Ok(messages) => messages,
         Err(e) => {
-            send_or_warn(p.tx, super::events::AppEvent::ApiError(e), p.session_id);
+            send_or_warn(
+                p.tx,
+                super::events::AppEvent::ApiError(e.into()),
+                p.session_id,
+            );
             return None;
         }
     };
@@ -4439,7 +4456,11 @@ fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInit
             request_body,
         }),
         Err(e) => {
-            send_or_warn(p.tx, super::events::AppEvent::ApiError(e), p.session_id);
+            send_or_warn(
+                p.tx,
+                super::events::AppEvent::ApiError(e.into()),
+                p.session_id,
+            );
             None
         }
     }
@@ -4486,7 +4507,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         wire_api,
         provider: &provider,
         effort_level,
-        claude_code_token: claude_code_token.as_deref(),
+        claude_code_token: claude_code_token.as_ref(),
         prompt_blocks: prompt_blocks.as_ref(),
         tx: &tx,
     }) else {
@@ -4525,7 +4546,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
                     model: &model,
                     effort_level,
                     wire_api,
-                    claude_code_token: claude_code_token.as_deref(),
+                    claude_code_token: claude_code_token.as_ref(),
                     prompt_blocks: prompt_blocks.as_ref(),
                     memory_db,
                     app_config,
@@ -4543,7 +4564,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
             )
             .await;
         }
-        Err(e) => send_or_warn(&tx, super::events::AppEvent::ApiError(e), &session_id),
+        Err(e) => send_api_error(&tx, e, &session_id),
     }
 }
 
@@ -4554,12 +4575,12 @@ struct TurnContext<'a> {
     run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     client: &'a reqwest::Client,
     endpoint: &'a str,
-    headers: &'a [(String, String)],
+    headers: &'a crate::secrets::SensitiveHeaders,
     provider: &'a str,
     model: &'a str,
     effort_level: EffortLevel,
     wire_api: crate::pipeline::WireApi,
-    claude_code_token: Option<&'a str>,
+    claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
@@ -4654,9 +4675,9 @@ async fn handle_turn_result(
             Err(reason) => {
                 send_or_warn(
                     ctx.tx,
-                    super::events::AppEvent::ApiError(format!(
-                        "Final answer failed grounding gate: {reason}"
-                    )),
+                    super::events::AppEvent::ApiError(
+                        format!("Final answer failed grounding gate: {reason}").into(),
+                    ),
                     ctx.session_id,
                 );
                 send_or_warn(
@@ -5207,7 +5228,7 @@ mod tests {
             api_key: None,
             base_url: base_url.to_string(),
             model: None,
-            headers: std::collections::HashMap::new(),
+            headers: crate::secrets::SensitiveHeaders::new(),
             thinking: crate::config::ThinkingConfig::default(),
         }
     }
@@ -5391,7 +5412,7 @@ mod tests {
         let ledger_path = reset_project_ledger(session_id);
         let (tx, rx) = mpsc::channel();
         let client = reqwest::Client::new();
-        let headers: Vec<(String, String)> = Vec::new();
+        let headers = crate::secrets::SensitiveHeaders::new();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
         let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             crate::services::policy::EnterprisePolicy::default(),
@@ -5452,7 +5473,7 @@ mod tests {
         let (content, run) = seed_valid_final_ledger(session_id);
         let (tx, rx) = mpsc::channel();
         let client = reqwest::Client::new();
-        let headers: Vec<(String, String)> = Vec::new();
+        let headers = crate::secrets::SensitiveHeaders::new();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
         let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             crate::services::policy::EnterprisePolicy::default(),
@@ -5547,23 +5568,28 @@ mod tests {
     #[test]
     fn set_api_config_threads_through_api_client() {
         let mut app = App::new("test-model", "anthropic");
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers
+            .insert_literal("x-api-key", "secret".to_string())
+            .expect("test header");
         app.set_api_config(
             "https://example.com/v1".to_string(),
-            vec![("x-api-key".to_string(), "secret".to_string())],
+            headers,
             crate::pipeline::WireApi::OpenAiResponses,
             None,
-            Some("oauth-token".to_string()),
+            Some(
+                crate::secrets::OAuthToken::try_from_string("oauth-token".to_string())
+                    .expect("test token"),
+            ),
         );
         assert_eq!(app.api_client.endpoint, "https://example.com/v1");
-        assert_eq!(
-            app.api_client.headers,
-            vec![("x-api-key".to_string(), "secret".to_string())]
-        );
+        assert!(app.api_client.headers.matches_value("x-api-key", "secret"));
         assert!(app.api_client.prompt_blocks.is_none());
-        assert_eq!(
-            app.api_client.claude_code_token.as_deref(),
-            Some("oauth-token")
-        );
+        assert!(app
+            .api_client
+            .claude_code_token
+            .as_ref()
+            .is_some_and(|token| token.matches("oauth-token")));
         assert_eq!(
             app.api_client.wire_api,
             crate::pipeline::WireApi::OpenAiResponses
@@ -5596,19 +5622,29 @@ mod tests {
             ],
             crate::context::ContextBudget::default(),
         );
+        let mut old_headers = crate::secrets::SensitiveHeaders::new();
+        old_headers
+            .insert_literal("x-api-key", "old-key".to_string())
+            .expect("header");
+        let old_token =
+            crate::secrets::OAuthToken::try_from_string("oauth-token".to_string()).expect("token");
         app.set_api_config(
             "https://old.example/v1/messages".to_string(),
-            vec![("x-api-key".to_string(), "old-key".to_string())],
+            old_headers,
             crate::pipeline::WireApi::ChatCompletions,
             Some(blocks.clone()),
-            Some("oauth-token".to_string()),
+            Some(old_token),
         );
 
+        let mut switched_headers = crate::secrets::SensitiveHeaders::new();
+        switched_headers
+            .insert_literal("Authorization", "Bearer kimi-key".to_string())
+            .expect("header");
         app.apply_provider_switch(ProviderSwitch {
             provider: "kimi".to_string(),
             model: "kimi-k2.7-code".to_string(),
             endpoint: "https://api.moonshot.ai/v1/chat/completions".to_string(),
-            headers: vec![("Authorization".to_string(), "Bearer kimi-key".to_string())],
+            headers: switched_headers.clone(),
             wire_api: crate::pipeline::WireApi::ChatCompletions,
             claude_code_token: None,
             vdd_builder_auth: crate::vdd::VddProviderAuth::None,
@@ -5628,10 +5664,7 @@ mod tests {
             app.api_client.endpoint,
             "https://api.moonshot.ai/v1/chat/completions"
         );
-        assert_eq!(
-            app.api_client.headers,
-            vec![("Authorization".to_string(), "Bearer kimi-key".to_string())]
-        );
+        assert_eq!(app.api_client.headers, switched_headers);
         assert!(app.api_client.claude_code_token.is_none());
         assert_eq!(app.vdd_builder_auth, crate::vdd::VddProviderAuth::None);
         assert_eq!(

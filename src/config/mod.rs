@@ -234,12 +234,13 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     // sources below remain ordinary host configuration.
     let project_config = PathBuf::from(".openclaudia/config.yaml");
     if project_config.exists() {
-        let content = std::fs::read_to_string(&project_config).map_err(|error| {
-            ConfigError::Message(format!(
-                "failed to read project config {}: {error}",
-                project_config.display()
-            ))
-        })?;
+        let content =
+            zeroize::Zeroizing::new(std::fs::read_to_string(&project_config).map_err(|error| {
+                ConfigError::Message(format!(
+                    "failed to read project config {}: {error}",
+                    project_config.display()
+                ))
+            })?);
         let mut document: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|error| {
             ConfigError::Message(format!(
                 "failed to parse project config {}: {error}",
@@ -482,7 +483,7 @@ mod tests {
                 api_key: Some(test_api_key("key")),
                 base_url: "https://api.anthropic.com".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -507,10 +508,11 @@ mod tests {
 
         let active = config.active_provider();
         assert!(active.is_some());
-        assert_eq!(
-            active.unwrap().api_key.as_ref().map(ApiKey::as_str),
-            Some("key-0000000000")
-        );
+        assert!(active
+            .unwrap()
+            .api_key
+            .as_ref()
+            .is_some_and(|key| key.matches("key-0000000000")));
     }
 
     #[test]
@@ -522,7 +524,7 @@ mod tests {
                 api_key: Some(test_api_key("openai-key")),
                 base_url: "https://api.openai.com".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -532,7 +534,7 @@ mod tests {
                 api_key: Some(test_api_key("anthropic-key")),
                 base_url: "https://api.anthropic.com".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -566,7 +568,7 @@ mod tests {
                 api_key: Some(test_api_key("kimi-key")),
                 base_url: "https://api.moonshot.ai/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -589,13 +591,10 @@ mod tests {
             managed_settings_path: None,
         };
 
-        assert_eq!(
-            config
-                .active_provider()
-                .and_then(|provider| provider.api_key.as_ref())
-                .map(ApiKey::as_str),
-            Some("kimi-key-0000000000")
-        );
+        assert!(config
+            .active_provider()
+            .and_then(|provider| provider.api_key.as_ref())
+            .is_some_and(|key| key.matches("kimi-key-0000000000")));
         assert!(config.get_provider("MOONSHOT").is_some());
     }
 
@@ -608,7 +607,7 @@ mod tests {
                 api_key: Some(test_api_key("opencode")),
                 base_url: "https://opencode.ai/zen/go/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -618,7 +617,7 @@ mod tests {
                 api_key: Some(test_api_key("router")),
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -638,13 +637,10 @@ mod tests {
             managed_settings_path: None,
         };
 
-        assert_eq!(
-            config
-                .get_provider("opencode-go")
-                .and_then(|provider| provider.api_key.as_ref())
-                .map(ApiKey::as_str),
-            Some("opencode-0000000000")
-        );
+        assert!(config
+            .get_provider("opencode-go")
+            .and_then(|provider| provider.api_key.as_ref())
+            .is_some_and(|key| key.matches("opencode-0000000000")));
         assert!(config.get_provider("OPENROUTER").is_some());
     }
 
@@ -657,7 +653,7 @@ mod tests {
                 api_key: Some(test_api_key("canonical")),
                 base_url: "https://api.moonshot.ai/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -667,7 +663,7 @@ mod tests {
                 api_key: Some(test_api_key("alias")),
                 base_url: "https://proxy.example.com/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -690,13 +686,10 @@ mod tests {
             managed_settings_path: None,
         };
 
-        assert_eq!(
-            config
-                .active_provider()
-                .and_then(|provider| provider.api_key.as_ref())
-                .map(ApiKey::as_str),
-            Some("alias-0000000000")
-        );
+        assert!(config
+            .active_provider()
+            .and_then(|provider| provider.api_key.as_ref())
+            .is_some_and(|key| key.matches("alias-0000000000")));
     }
 
     #[test]
@@ -717,7 +710,7 @@ mod tests {
                     api_key: None,
                     base_url: base_url.to_string(),
                     model: None,
-                    headers: HashMap::new(),
+                    headers: crate::secrets::SensitiveHeaders::new(),
                     thinking: ThinkingConfig::default(),
                 },
             );

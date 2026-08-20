@@ -19,6 +19,7 @@
 use openclaudia::plugins::manifest::{
     AgentsSpec, LspServerConfig, McpServerConfig, PluginAuthor, SkillsSpec,
 };
+use openclaudia::secrets::{EnvironmentGrants, SensitiveHeaders};
 use std::collections::HashMap;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -113,7 +114,7 @@ fn mcp_server_config_http_transport_with_url_round_trips() {
 }
 
 #[test]
-fn mcp_server_config_type_alias_http_with_headers_round_trips() {
+fn mcp_server_config_type_alias_http_protects_headers_on_parse() {
     let json = r#"{
         "type": "http",
         "url": "https://api.example.com/mcp",
@@ -121,10 +122,13 @@ fn mcp_server_config_type_alias_http_with_headers_round_trips() {
     }"#;
     let config: McpServerConfig = serde_json::from_str(json).expect("de");
     assert_eq!(config.transport, "http");
-    assert_eq!(
-        config.headers.get("Authorization").map(String::as_str),
-        Some("Bearer token")
-    );
+    assert!(config
+        .headers
+        .matches_value("Authorization", "Bearer token"));
+    assert!(!format!("{config:?}").contains("Bearer token"));
+    assert!(!serde_json::to_string(&config)
+        .expect("ser")
+        .contains("Bearer token"));
 }
 
 #[test]
@@ -138,18 +142,19 @@ fn mcp_server_config_streamable_http_type_normalizes_to_http() {
 }
 
 #[test]
-fn mcp_server_config_env_vars_round_trip() {
+fn mcp_server_config_env_vars_are_protected_on_parse() {
     let json = r#"{
         "command": "node",
         "env": {"API_KEY": "secret", "DEBUG": "1"}
     }"#;
     let config: McpServerConfig = serde_json::from_str(json).expect("de");
     assert_eq!(config.env.len(), 2);
-    assert_eq!(
-        config.env.get("API_KEY").map(String::as_str),
-        Some("secret")
-    );
-    assert_eq!(config.env.get("DEBUG").map(String::as_str), Some("1"));
+    assert!(config.env.matches_value("API_KEY", "secret"));
+    assert!(config.env.matches_value("DEBUG", "1"));
+    assert!(!format!("{config:?}").contains("secret"));
+    assert!(!serde_json::to_string(&config)
+        .expect("ser")
+        .contains("secret"));
 }
 
 #[test]
@@ -157,10 +162,10 @@ fn mcp_server_config_omits_empty_args_and_env_on_serialize() {
     let config = McpServerConfig {
         command: Some("cmd".to_string()),
         args: Vec::new(),
-        env: HashMap::new(),
+        env: EnvironmentGrants::new(),
         transport: "stdio".to_string(),
         url: None,
-        headers: HashMap::new(),
+        headers: SensitiveHeaders::new(),
         headers_helper: None,
         timeout: None,
         always_load: None,
@@ -192,7 +197,7 @@ fn lsp_server_config_required_command_field() {
 }
 
 #[test]
-fn lsp_server_config_full_shape_round_trips() {
+fn lsp_server_config_full_shape_protects_environment() {
     let json = r#"{
         "command": "rust-analyzer",
         "args": ["--no-log-buffering"],
@@ -202,7 +207,11 @@ fn lsp_server_config_full_shape_round_trips() {
     let config: LspServerConfig = serde_json::from_str(json).expect("de");
     assert_eq!(config.command, "rust-analyzer");
     assert_eq!(config.args, vec!["--no-log-buffering"]);
-    assert_eq!(config.env.get("RUST_LOG").map(String::as_str), Some("info"));
+    assert!(config.env.matches_value("RUST_LOG", "info"));
+    assert!(!format!("{config:?}").contains("info"));
+    assert!(!serde_json::to_string(&config)
+        .expect("ser")
+        .contains("info"));
     assert_eq!(config.extensions, vec!["rs"]);
 }
 
@@ -211,7 +220,7 @@ fn lsp_server_config_partial_eq_holds_for_equal_configs() {
     let a = LspServerConfig {
         command: "ls".to_string(),
         args: vec!["x".to_string()],
-        env: HashMap::new(),
+        env: EnvironmentGrants::new(),
         extensions: vec!["a".to_string()],
     };
     let b = a.clone();
@@ -223,13 +232,13 @@ fn lsp_server_config_partial_eq_distinguishes_different_commands() {
     let a = LspServerConfig {
         command: "ls".to_string(),
         args: Vec::new(),
-        env: HashMap::new(),
+        env: EnvironmentGrants::new(),
         extensions: Vec::new(),
     };
     let b = LspServerConfig {
         command: "other".to_string(),
         args: Vec::new(),
-        env: HashMap::new(),
+        env: EnvironmentGrants::new(),
         extensions: Vec::new(),
     };
     assert_ne!(a, b);
@@ -240,7 +249,7 @@ fn lsp_server_config_empty_extensions_omitted_on_serialize() {
     let config = LspServerConfig {
         command: "x".to_string(),
         args: Vec::new(),
-        env: HashMap::new(),
+        env: EnvironmentGrants::new(),
         extensions: Vec::new(),
     };
     let json = serde_json::to_string(&config).expect("ser");
@@ -359,14 +368,15 @@ fn mcp_server_config_clone_preserves_all_fields() {
     let original = McpServerConfig {
         command: Some("cmd".to_string()),
         args: vec!["a".to_string()],
-        env: {
-            let mut m = HashMap::new();
-            m.insert("K".to_string(), "V".to_string());
-            m
-        },
+        env: EnvironmentGrants::try_from(HashMap::from([("K".to_string(), "V".to_string())]))
+            .expect("valid test environment"),
         transport: "http".to_string(),
         url: Some("https://x".to_string()),
-        headers: HashMap::from([("Authorization".to_string(), "Bearer token".to_string())]),
+        headers: SensitiveHeaders::try_from(HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer token".to_string(),
+        )]))
+        .expect("valid test headers"),
         headers_helper: Some("/bin/headers".to_string()),
         timeout: Some(5000),
         always_load: Some(true),
@@ -388,7 +398,7 @@ fn lsp_server_config_clone_preserves_all_fields() {
     let original = LspServerConfig {
         command: "x".to_string(),
         args: vec!["a".to_string()],
-        env: HashMap::new(),
+        env: EnvironmentGrants::new(),
         extensions: vec!["rs".to_string()],
     };
     let cloned = original.clone();

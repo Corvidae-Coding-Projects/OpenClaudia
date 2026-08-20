@@ -952,9 +952,7 @@ impl HookEngine {
         project_dir: &std::path::Path,
     ) {
         cmd.env_clear();
-        for (key, value) in run.environment_grants() {
-            cmd.env(key, value);
-        }
+        run.environment_grants().apply_tokio(cmd);
         cmd.env("HOME", run.private_temp_root())
             .env("TMPDIR", run.private_temp_root())
             .env("TMP", run.private_temp_root())

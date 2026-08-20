@@ -39,8 +39,7 @@ fn register_then_get_round_trips_url() {
     reg.register("ci", "https://ci.example.com/hook", no_headers())
         .expect("register");
     let ep = reg.get("ci").expect("get");
-    // URL canonicalized through url::Url; substring check.
-    assert!(ep.url.starts_with("https://ci.example.com/hook"));
+    assert!(ep.url.matches("https://ci.example.com/hook"));
     assert!(ep.headers.is_empty());
 }
 
@@ -51,16 +50,10 @@ fn register_with_headers_round_trips_full_endpoint_shape() {
     reg.register("ci", "https://ci.example.com/hook", hdrs)
         .expect("register");
     let ep = reg.get("ci").expect("get");
-    assert!(ep.url.starts_with("https://ci.example.com/hook"));
+    assert!(ep.url.matches("https://ci.example.com/hook"));
     assert_eq!(ep.headers.len(), 2);
-    assert_eq!(
-        ep.headers.get("Authorization").map(String::as_str),
-        Some("Bearer token")
-    );
-    assert_eq!(
-        ep.headers.get("X-Custom").map(String::as_str),
-        Some("value")
-    );
+    assert!(ep.headers.matches_value("Authorization", "Bearer token"));
+    assert!(ep.headers.matches_value("X-Custom", "value"));
 }
 
 #[test]
@@ -69,11 +62,7 @@ fn register_upgrades_scheme_less_url_to_https_in_strict_registry() {
     reg.register("ci", "ci.example.com/hook", no_headers())
         .expect("register");
     let ep = reg.get("ci").expect("get");
-    assert!(
-        ep.url.starts_with("https://"),
-        "scheme-less MUST upgrade to https; got {url:?}",
-        url = ep.url
-    );
+    assert!(ep.url.matches("https://ci.example.com/hook"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -116,7 +105,11 @@ fn register_with_http_in_plaintext_registry_succeeds() {
     let mut reg = WebhookRegistry::new_allow_plaintext();
     reg.register("plain", "http://ci.example.com/hook", no_headers())
         .expect("plaintext registry MUST accept http");
-    assert_eq!(reg.get("plain").unwrap().url, "http://ci.example.com/hook");
+    assert!(reg
+        .get("plain")
+        .unwrap()
+        .url
+        .matches("http://ci.example.com/hook"));
 }
 
 #[test]
@@ -135,8 +128,7 @@ fn register_duplicate_name_returns_duplicate_error_and_keeps_original() {
         .get("ci")
         .unwrap()
         .url
-        .starts_with("https://first.example.com"));
-    assert!(!reg.get("ci").unwrap().url.contains("second"));
+        .matches("https://first.example.com/"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -155,9 +147,8 @@ fn replace_overwrites_existing_entry() {
     )
     .expect("replace");
     let ep = reg.get("ci").expect("get");
-    assert!(ep.url.starts_with("https://new.example.com"));
-    assert!(!ep.url.contains("old"));
-    assert_eq!(ep.headers.get("X-New").map(String::as_str), Some("header"));
+    assert!(ep.url.matches("https://new.example.com/"));
+    assert!(ep.headers.matches_value("X-New", "header"));
 }
 
 #[test]
@@ -182,8 +173,7 @@ fn replace_with_invalid_url_does_not_clobber_existing_entry() {
         .get("ci")
         .unwrap()
         .url
-        .starts_with("https://existing.example.com"));
-    assert!(!reg.get("ci").unwrap().url.contains("other"));
+        .matches("https://existing.example.com/"));
 }
 
 #[test]
@@ -203,8 +193,8 @@ fn replace_drops_old_headers_when_new_headers_provided() {
     .expect("replace");
     let ep = reg.get("ci").unwrap();
     assert_eq!(ep.headers.len(), 1);
-    assert!(ep.headers.contains_key("X-New"));
-    assert!(!ep.headers.contains_key("X-Old"));
+    assert!(ep.headers.contains_name("X-New"));
+    assert!(!ep.headers.contains_name("X-Old"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

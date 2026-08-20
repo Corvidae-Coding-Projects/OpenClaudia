@@ -58,13 +58,8 @@ pub enum OAuthError {
     Malformed(String),
     /// The `state` returned by the redirect did not match the value we sent
     /// in the authorize URL. CSRF or response-mixing — flow MUST abort.
-    #[error("state-token mismatch: expected `{expected}`, got `{actual}`")]
-    StateMismatch {
-        /// The state we generated and sent.
-        expected: String,
-        /// The state the redirect returned.
-        actual: String,
-    },
+    #[error("state-token mismatch")]
+    StateMismatch {},
 }
 
 /// OAuth token bundle.
@@ -75,11 +70,11 @@ pub enum OAuthError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenBundle {
     /// Bearer access token (the value that goes in `Authorization: Bearer`).
-    pub access_token: String,
+    pub access_token: crate::secrets::OAuthToken,
     /// Refresh token, present when the server issued one. Absent for
     /// flows that opted out of refresh (`offline_access` not requested).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
+    pub refresh_token: Option<crate::secrets::OAuthToken>,
     /// Token lifetime in seconds, as reported by the token endpoint.
     pub expires_in_secs: u64,
     /// UNIX epoch seconds at which this bundle was obtained — combined with
@@ -144,7 +139,7 @@ pub struct OAuthConfig {
     /// Optional client secret. Modern public clients (single-tenant MCP
     /// servers, `IdP` confidential clients running outside this process)
     /// usually omit it and rely on PKCE.
-    pub client_secret: Option<String>,
+    pub client_secret: Option<crate::secrets::SecretString>,
     /// `IdP` authorization-endpoint URL.
     pub authorize_url: String,
     /// `IdP` token-endpoint URL.
@@ -161,7 +156,7 @@ pub struct OAuthConfig {
 #[derive(Debug, Clone)]
 pub struct PkcePair {
     /// Opaque high-entropy string the `IdP` echoes back at the token endpoint.
-    pub code_verifier: String,
+    pub code_verifier: crate::secrets::SecretString,
     /// `BASE64URL(SHA256(code_verifier))` — sent in the authorize URL.
     pub code_challenge: String,
     /// Always `"S256"` in this codebase; `plain` is forbidden.
@@ -178,7 +173,7 @@ pub enum OAuthFlow {
     /// returns: `state` nonce, `code_verifier`, original config.
     AwaitingAuthorization {
         config: OAuthConfig,
-        state: String,
+        state: crate::secrets::SecretString,
         pkce: PkcePair,
     },
     /// `accept_redirect` has been called — we have the authorization code
@@ -186,7 +181,7 @@ pub enum OAuthFlow {
     Exchanging {
         config: OAuthConfig,
         pkce: PkcePair,
-        code: String,
+        code: crate::secrets::SecretString,
     },
     /// Token-endpoint exchange succeeded.
     Authorized {
@@ -195,7 +190,9 @@ pub enum OAuthFlow {
     },
     /// Terminal failure state. The error is preserved so callers can render
     /// it to the user; the flow is consumed (no further transitions).
-    Failed { reason: String },
+    Failed {
+        reason: crate::secrets::SafeDiagnostic,
+    },
 }
 
 impl OAuthFlow {
@@ -222,7 +219,8 @@ impl OAuthFlow {
     /// # Errors
     ///
     /// Returns [`OAuthError::InvalidTransition`] when called on any state
-    /// other than `Idle`.
+    /// other than `Idle`, or [`OAuthError::Malformed`] when the state token is
+    /// structurally invalid.
     ///
     /// The caller supplies the `state` nonce and PKCE pair — generation of
     /// those values lives in the (forthcoming) transport submodule because
@@ -235,6 +233,8 @@ impl OAuthFlow {
                 action: "start_authorization",
             });
         };
+        let state = crate::secrets::SecretString::try_from_string(state)
+            .map_err(|error| OAuthError::Malformed(format!("invalid state token: {error}")))?;
         Ok(Self::AwaitingAuthorization {
             config,
             state,
@@ -267,12 +267,12 @@ impl OAuthFlow {
                 action: "accept_redirect",
             });
         };
-        if state != returned_state {
-            return Err(OAuthError::StateMismatch {
-                expected: state,
-                actual: returned_state.to_string(),
-            });
+        if !state.matches(returned_state) {
+            return Err(OAuthError::StateMismatch {});
         }
+        let code = crate::secrets::SecretString::try_from_string(code).map_err(|error| {
+            OAuthError::Malformed(format!("invalid authorization code: {error}"))
+        })?;
         Ok(Self::Exchanging { config, pkce, code })
     }
 
@@ -296,14 +296,10 @@ impl OAuthFlow {
                 action: "complete_exchange",
             });
         };
-        if token.access_token.is_empty() {
-            return Err(OAuthError::Malformed("access_token was empty".to_string()));
-        }
         if !token.token_type.eq_ignore_ascii_case("Bearer") {
-            return Err(OAuthError::Malformed(format!(
-                "unsupported token_type `{}` (only Bearer is accepted)",
-                token.token_type
-            )));
+            return Err(OAuthError::Malformed(
+                "unsupported token_type (only Bearer is accepted)".to_string(),
+            ));
         }
         if token.expires_in_secs == 0 {
             return Err(OAuthError::Malformed(
@@ -317,9 +313,44 @@ impl OAuthFlow {
     /// Idempotent on `Failed`.
     #[must_use]
     pub fn fail(self, reason: impl Into<String>) -> Self {
-        Self::Failed {
-            reason: reason.into(),
+        let reason = reason.into();
+        let reason = self.sanitize_failure_reason(&reason);
+        Self::Failed { reason }
+    }
+
+    fn sanitize_failure_reason(&self, reason: &str) -> crate::secrets::SafeDiagnostic {
+        let mut secrets = Vec::new();
+        match self {
+            Self::Idle { config } => {
+                secrets.extend(config.client_secret.iter().cloned());
+            }
+            Self::AwaitingAuthorization {
+                config,
+                state,
+                pkce,
+            } => {
+                secrets.extend(config.client_secret.iter().cloned());
+                secrets.push(state.clone());
+                secrets.push(pkce.code_verifier.clone());
+            }
+            Self::Exchanging { config, pkce, code } => {
+                secrets.extend(config.client_secret.iter().cloned());
+                secrets.push(pkce.code_verifier.clone());
+                secrets.push(code.clone());
+            }
+            Self::Authorized { config, token } => {
+                secrets.extend(config.client_secret.iter().cloned());
+                secrets.push(token.access_token.secret());
+                secrets.extend(
+                    token
+                        .refresh_token
+                        .iter()
+                        .map(crate::secrets::OAuthToken::secret),
+                );
+            }
+            Self::Failed { .. } => {}
         }
+        crate::secrets::sanitize_diagnostic(reason, secrets.iter())
     }
 
     /// Borrow the authorized token bundle, if any.
@@ -336,6 +367,14 @@ impl OAuthFlow {
 mod tests {
     use super::*;
 
+    fn secret(value: &str) -> crate::secrets::SecretString {
+        crate::secrets::SecretString::try_from_string(value.to_string()).expect("secret")
+    }
+
+    fn token(value: &str) -> crate::secrets::OAuthToken {
+        crate::secrets::OAuthToken::try_from_string(value.to_string()).expect("token")
+    }
+
     fn cfg() -> OAuthConfig {
         OAuthConfig {
             client_id: "cid".into(),
@@ -349,7 +388,7 @@ mod tests {
 
     fn pkce() -> PkcePair {
         PkcePair {
-            code_verifier: "verifier".into(),
+            code_verifier: secret("verifier"),
             code_challenge: "challenge".into(),
             method: "S256",
         }
@@ -357,8 +396,8 @@ mod tests {
 
     fn good_token() -> TokenBundle {
         TokenBundle {
-            access_token: "at".into(),
-            refresh_token: Some("rt".into()),
+            access_token: token("at"),
+            refresh_token: Some(token("rt")),
             expires_in_secs: 3600,
             obtained_at: 1_000_000,
             token_type: "Bearer".into(),
@@ -389,12 +428,15 @@ mod tests {
     #[test]
     fn rejects_state_mismatch() {
         let flow = OAuthFlow::new(cfg())
-            .start_authorization("nonce".into(), pkce())
+            .start_authorization("expected-state-secret".into(), pkce())
             .unwrap();
         let err = flow
-            .accept_redirect("DIFFERENT", "code".into())
+            .accept_redirect("attacker-state-secret", "code".into())
             .unwrap_err();
         assert!(matches!(err, OAuthError::StateMismatch { .. }));
+        let rendered = format!("{err:?} {err}");
+        assert!(!rendered.contains("expected-state-secret"), "{rendered}");
+        assert!(!rendered.contains("attacker-state-secret"), "{rendered}");
     }
 
     #[test]
@@ -407,16 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn complete_exchange_rejects_empty_access_token() {
-        let flow = OAuthFlow::new(cfg())
-            .start_authorization("n".into(), pkce())
-            .unwrap()
-            .accept_redirect("n", "c".into())
-            .unwrap();
-        let mut bad = good_token();
-        bad.access_token.clear();
-        let err = flow.complete_exchange(bad).unwrap_err();
-        assert!(matches!(err, OAuthError::Malformed(_)));
+    fn token_bundle_deserialization_rejects_empty_access_token() {
+        let json = r#"{"access_token":"","expires_in_secs":60,"obtained_at":0}"#;
+        assert!(serde_json::from_str::<TokenBundle>(json).is_err());
     }
 
     #[test]
@@ -427,9 +462,10 @@ mod tests {
             .accept_redirect("n", "c".into())
             .unwrap();
         let mut bad = good_token();
-        bad.token_type = "MAC".into();
+        bad.token_type = "mcp-token-type-secret-sentinel".into();
         let err = flow.complete_exchange(bad).unwrap_err();
         assert!(matches!(err, OAuthError::Malformed(_)));
+        assert!(!err.to_string().contains("mcp-token-type-secret-sentinel"));
     }
 
     #[test]
@@ -452,9 +488,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_state_redacts_active_credentials_from_retained_reason() {
+        let secret = "mcp-active-token-secret-sentinel";
+        let mut bundle = good_token();
+        bundle.access_token = token(secret);
+        let flow = OAuthFlow::Authorized {
+            config: cfg(),
+            token: bundle,
+        }
+        .fail(format!("provider echoed {secret}"));
+
+        let OAuthFlow::Failed { reason } = flow else {
+            panic!("expected failed state");
+        };
+        assert!(!reason.as_str().contains(secret), "{reason}");
+        assert!(reason.as_str().contains(crate::secrets::REDACTED_SECRET));
+    }
+
+    #[test]
     fn token_bundle_expiry_math() {
         let bundle = TokenBundle {
-            access_token: "a".into(),
+            access_token: token("a"),
             refresh_token: None,
             expires_in_secs: 100,
             obtained_at: TokenBundle::now_epoch().saturating_sub(50),
@@ -468,7 +522,7 @@ mod tests {
         assert!(!bundle.needs_refresh(Duration::from_secs(10)));
 
         let stale = TokenBundle {
-            access_token: "a".into(),
+            access_token: token("a"),
             refresh_token: None,
             expires_in_secs: 1,
             obtained_at: TokenBundle::now_epoch().saturating_sub(3600),
@@ -479,11 +533,12 @@ mod tests {
     }
 
     #[test]
-    fn token_bundle_roundtrips_json() {
+    fn token_bundle_generic_json_is_redacted_and_not_reloadable() {
         let bundle = good_token();
         let s = serde_json::to_string(&bundle).unwrap();
-        let back: TokenBundle = serde_json::from_str(&s).unwrap();
-        assert_eq!(bundle, back);
+        assert!(!s.contains("\"at\""));
+        assert!(!s.contains("\"rt\""));
+        assert!(serde_json::from_str::<TokenBundle>(&s).is_err());
     }
 
     #[test]

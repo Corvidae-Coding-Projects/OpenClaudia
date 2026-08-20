@@ -325,13 +325,13 @@ fn zai_does_not_advertise_model_listing() {
 #[test]
 fn apikey_accepts_typical_anthropic_format() {
     let key = ApiKey::try_from_string("sk-ant-abc123def456".to_string()).expect("valid");
-    assert_eq!(key.as_str(), "sk-ant-abc123def456");
+    assert!(key.matches("sk-ant-abc123def456"));
 }
 
 #[test]
 fn apikey_accepts_typical_openai_format() {
     let key = ApiKey::try_from_string("sk-1234567890ABCDEFghij".to_string()).expect("valid");
-    assert_eq!(key.as_str(), "sk-1234567890ABCDEFghij");
+    assert!(key.matches("sk-1234567890ABCDEFghij"));
 }
 
 #[test]
@@ -430,10 +430,9 @@ fn apikey_serde_serializes_as_redacted_placeholder() {
 }
 
 #[test]
-fn apikey_as_str_returns_real_value_for_header_use() {
-    // The single deliberate audit point — callers MUST go
-    // through as_str() to get the raw value (e.g. for HTTP
-    // header construction).
+fn apikey_candidate_comparison_confirms_value_without_public_exposure() {
+    // The public compatibility probe confirms equality without returning a
+    // raw borrow that production callers could log or retain.
     let key = ApiKey::try_from_string("sk-REAL".to_string()).unwrap();
-    assert_eq!(key.as_str(), "sk-REAL");
+    assert!(key.matches("sk-REAL"));
 }

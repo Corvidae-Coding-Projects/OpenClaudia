@@ -1632,8 +1632,8 @@ async fn run_subagent_inner(
         .read_only_roots(child_read_only_roots)
         .read_write_roots(child_read_write_roots)
         .project_secret_masks(parent_run.project_secret_masks().to_vec())
-        .environment_grants(parent_run.environment_grants().clone())
-        .mcp_environment_grants(parent_run.mcp_environment_grants().clone())
+        .protected_environment_grants(parent_run.environment_grants().clone())
+        .protected_mcp_environment_grants(parent_run.mcp_environment_grants().clone())
         .executable_search_path(parent_run.executable_search_path())
         .host_home(parent_run.host_home().map(Path::to_path_buf))
         .workspace_access(workspace_access)
@@ -2441,20 +2441,16 @@ async fn make_api_call(
     // ensure a content-type header is set in all cases so providers
     // without an explicit content-type contribution still receive
     // valid JSON.
-    let mut headers: Vec<(String, String)> =
-        api_key.map(|k| adapter.get_headers(k)).unwrap_or_default();
-    if !headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-    {
-        headers.push(("content-type".to_string(), "application/json".to_string()));
+    let mut headers = api_key
+        .map(|key| adapter.get_headers(key))
+        .unwrap_or_default();
+    if !headers.contains_name("content-type") {
+        headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
     }
 
-    let mut req = client.post(&endpoint);
-    for (key, value) in headers {
-        req = req.header(&key, &value);
-    }
-    req = req.json(&body);
+    let req = headers
+        .apply(client.post(&endpoint).json(&body))
+        .map_err(|error| format!("invalid provider headers: {error}"))?;
 
     let response = req
         .send()
@@ -2463,11 +2459,13 @@ async fn make_api_call(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response
-            .text()
+        let text = crate::secrets::read_bounded_diagnostic_body(response)
             .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("API error ({status}): {text}"));
+            .unwrap_or_else(|_| zeroize::Zeroizing::new("Unknown error".to_string()));
+        return Err(format!(
+            "API error ({status}): {}",
+            headers.sanitize_diagnostic(&text)
+        ));
     }
 
     let json: Value = response
@@ -3282,11 +3280,49 @@ mod tests {
                 base_url,
                 api_key: None,
                 model: Some("gpt-5.5".to_string()),
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
         app_config
+    }
+
+    #[tokio::test]
+    async fn subagent_provider_failure_redacts_seeded_api_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SECRET: &str = "s025-subagent-api-key-e1f85c";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "message": format!("provider echoed {SECRET}"),
+                    "api_key": SECRET,
+                }
+            })))
+            .mount(&server)
+            .await;
+        let key = crate::providers::ApiKey::try_from_string(SECRET.to_string()).expect("API key");
+        let request = serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let error = make_api_call(
+            &reqwest::Client::new(),
+            "openai",
+            &server.uri(),
+            Some(&key),
+            &request,
+        )
+        .await
+        .expect_err("provider failure must surface as an error");
+
+        assert!(!error.contains(SECRET), "subagent leaked API key: {error}");
+        assert!(error.contains(crate::secrets::REDACTED_SECRET), "{error}");
+        assert!(error.len() <= crate::secrets::MAX_DIAGNOSTIC_BYTES + 64);
     }
 
     #[tokio::test]
@@ -4973,7 +5009,7 @@ mod tests {
                     crate::providers::ApiKey::try_from_string("test-key".to_string()).unwrap(),
                 ),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );

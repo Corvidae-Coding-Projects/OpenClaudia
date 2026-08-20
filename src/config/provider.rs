@@ -1,6 +1,7 @@
 use serde::Deserialize;
-use std::collections::HashMap;
 use url::Url;
+
+use crate::secrets::SensitiveHeaders;
 
 // Re-export `ApiKey` so `crate::config::provider::ApiKey` resolves for
 // the ProviderConfig field type declaration below. The free-function
@@ -24,7 +25,7 @@ pub use crate::providers::api_key::ApiKey;
 /// Returns `Err(String)` with a human-readable explanation when the URL is
 /// malformed, uses a forbidden scheme, or points to a non-public address.
 pub fn validate_base_url(url: &str) -> Result<(), String> {
-    crate::web::validate_url(url).map_err(|e| format!("provider base_url '{url}' rejected: {e}"))
+    crate::web::validate_url(url).map_err(|e| format!("provider base_url rejected: {e}"))
 }
 
 /// Validate a provider `base_url`, allowing private/loopback hosts only for
@@ -59,20 +60,19 @@ pub fn is_local_provider_name(provider_name: &str) -> bool {
 }
 
 fn validate_local_provider_base_url(provider_name: &str, url: &str) -> Result<(), String> {
-    let parsed = Url::parse(url).map_err(|e| {
-        format!("provider '{provider_name}' base_url '{url}' rejected: invalid URL: {e}")
-    })?;
+    let parsed = Url::parse(url)
+        .map_err(|e| format!("provider '{provider_name}' base_url rejected: invalid URL: {e}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "provider '{provider_name}' base_url '{url}' rejected: scheme '{scheme}' is not allowed; use http or https"
+                "provider '{provider_name}' base_url rejected: scheme '{scheme}' is not allowed; use http or https"
             ));
         }
     }
     if parsed.host_str().is_none() {
         return Err(format!(
-            "provider '{provider_name}' base_url '{url}' rejected: missing host"
+            "provider '{provider_name}' base_url rejected: missing host"
         ));
     }
     Ok(())
@@ -194,9 +194,9 @@ impl Default for ThinkingConfig {
 /// `api_key` is an [`ApiKey`] newtype whose own `Debug`/`Display` redact
 /// the value and whose `Deserialize` impl validates the structure
 /// (rejects empty / CRLF / non-ASCII). We keep the derived `Debug` on
-/// this struct because the redaction guarantee is now structural on the
-/// field type — one less place to regress. See crosslink #256.
-#[derive(Debug, Deserialize, Clone)]
+/// `headers` uses the same structural secret boundary, so custom auth,
+/// cookie, routing, and signed values cannot leak through diagnostics.
+#[derive(Deserialize, Clone)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub api_key: Option<ApiKey>,
@@ -204,9 +204,22 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: SensitiveHeaders,
     #[serde(default)]
     pub thinking: ThinkingConfig,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderConfig")
+            .field("api_key", &self.api_key)
+            .field("base_url", &crate::secrets::REDACTED_SECRET)
+            .field("model", &self.model)
+            .field("headers", &self.headers)
+            .field("thinking", &self.thinking)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -365,12 +378,12 @@ mod tests {
 
         let config: ProviderConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.base_url, "https://api.example.com");
-        assert_eq!(
-            config.api_key.as_ref().map(ApiKey::as_str),
-            Some("sk-test123")
-        );
+        assert!(config
+            .api_key
+            .as_ref()
+            .is_some_and(|key| key.matches("sk-test123")));
         assert_eq!(config.model, Some("gpt-4".to_string()));
-        assert_eq!(config.headers.get("X-Custom"), Some(&"value".to_string()));
+        assert!(config.headers.matches_value("X-Custom", "value"));
         assert!(config.thinking.enabled);
         assert_eq!(config.thinking.budget_tokens, Some(5000));
     }
@@ -386,7 +399,7 @@ mod tests {
             ),
             base_url: "https://api.anthropic.com".to_string(),
             model: None,
-            headers: HashMap::new(),
+            headers: SensitiveHeaders::new(),
             thinking: ThinkingConfig::default(),
         };
         let s = format!("{cfg:?}");
@@ -395,10 +408,24 @@ mod tests {
             !s.contains("sk-ant-api03-SECRET"),
             "Debug leaked prefix-middle: {s}"
         );
-        assert!(
-            s.contains("sk-a") || s.contains("…"),
-            "no redaction fingerprint: {s}"
-        );
+        assert!(s.contains("[REDACTED]"), "no redaction marker: {s}");
+    }
+
+    #[test]
+    fn provider_config_debug_and_validation_errors_do_not_leak_signed_base_url() {
+        let sentinel = "provider-url-secret-sentinel";
+        let url = format!("file:///tmp/{sentinel}");
+        let cfg = ProviderConfig {
+            api_key: None,
+            base_url: url.clone(),
+            model: None,
+            headers: SensitiveHeaders::new(),
+            thinking: ThinkingConfig::default(),
+        };
+
+        assert!(!format!("{cfg:?}").contains(sentinel));
+        let error = validate_base_url(&url).expect_err("file URL must be rejected");
+        assert!(!error.contains(sentinel), "{error}");
     }
 
     #[test]

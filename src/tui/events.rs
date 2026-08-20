@@ -55,11 +55,11 @@ pub struct ProviderSwitch {
     /// Fully resolved chat endpoint used by subsequent API turns.
     pub endpoint: String,
     /// Fully resolved request headers, including auth and custom provider headers.
-    pub headers: Vec<(String, String)>,
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Wire protocol used for subsequent API turns.
     pub wire_api: crate::pipeline::WireApi,
     /// Claude Code OAuth bearer for Anthropic subscription auth.
-    pub claude_code_token: Option<String>,
+    pub claude_code_token: Option<crate::secrets::OAuthToken>,
     /// Runtime auth used by VDD's builder-side verifier after switching.
     pub vdd_builder_auth: crate::vdd::VddProviderAuth,
     /// Existing split system prompt blocks, preserved for Anthropic cache efficiency.
@@ -100,7 +100,7 @@ pub enum AppEvent {
     /// API response completed
     ResponseDone,
     /// API error
-    ApiError(String),
+    ApiError(crate::secrets::SafeDiagnostic),
     /// The upstream API request will be retried after a transient failure.
     ApiRetry {
         kind: ApiRetryKind,

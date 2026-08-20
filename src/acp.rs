@@ -131,7 +131,7 @@ pub struct AcpServer {
     /// This mirrors the TUI/chat auth path: provider adapters stay transport
     /// translators, while the ACP loop selects OAuth headers/endpoints above
     /// that layer.
-    claude_code_token: Option<String>,
+    claude_code_token: Option<crate::secrets::OAuthToken>,
     /// Session-scoped enterprise policy enforcer for model/token/tool caps.
     policy_enforcer: Arc<crate::services::policy::PolicyEnforcer>,
     /// Cancellation flag for in-flight prompts
@@ -830,7 +830,7 @@ impl AcpServer {
         config: AppConfig,
         model: String,
         api_key: Option<crate::providers::ApiKey>,
-        claude_code_token: Option<String>,
+        claude_code_token: Option<crate::secrets::OAuthToken>,
         stdout_tx: mpsc::UnboundedSender<String>,
         launch_root: std::path::PathBuf,
     ) -> Result<Self, String> {
@@ -1585,7 +1585,7 @@ impl AcpServer {
                 return self
                     .fail_prompt_with_update(acp_session_id, "No active provider configured");
             };
-            let claude_code_token = self.claude_code_token.as_deref();
+            let claude_code_token = self.claude_code_token.as_ref();
             if claude_code_token.is_some()
                 && self.config.proxy.target.eq_ignore_ascii_case("anthropic")
             {
@@ -1605,11 +1605,7 @@ impl AcpServer {
             };
 
             // Build HTTP request with headers
-            let extra_headers: Vec<(String, String)> = provider
-                .headers
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
+            let extra_headers = provider.headers.clone();
             let headers = match crate::pipeline::resolve_headers(
                 &self.config.proxy.target,
                 self.api_key.as_ref(),
@@ -1623,13 +1619,18 @@ impl AcpServer {
                 }
             };
 
-            let mut req = client.post(&endpoint).json(&transformed);
-            for (key, value) in &headers {
-                req = req.header(key, value);
-            }
+            let req = match headers.apply(client.post(&endpoint).json(&transformed)) {
+                Ok(request) => request,
+                Err(error) => {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Provider header error: {error}"),
+                    );
+                }
+            };
 
             // Send request
-            debug!(endpoint = %endpoint, iteration = iteration, "Sending provider request");
+            debug!(iteration, "Sending provider request");
             let response = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1646,11 +1647,13 @@ impl AcpServer {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let body = response.text().await.unwrap_or_default();
+                let body = crate::secrets::read_bounded_diagnostic_body(response)
+                    .await
+                    .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
                 let error_msg = if content_type.contains("text/html") {
                     format!("Error {status}: (HTML response — check provider configuration)")
                 } else {
-                    format!("Error {status}: {body}")
+                    format!("Error {status}: {}", headers.sanitize_diagnostic(&body))
                 };
                 self.send_session_update(
                     acp_session_id,
@@ -2916,7 +2919,7 @@ pub async fn run_acp_server(
     config: AppConfig,
     model: String,
     api_key: Option<crate::providers::ApiKey>,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<crate::secrets::OAuthToken>,
 ) -> Result<()> {
     let launch_root = std::env::current_dir()
         .map_err(|error| anyhow::anyhow!("Cannot resolve ACP workspace: {error}"))?;

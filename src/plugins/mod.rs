@@ -390,9 +390,9 @@ pub struct PluginMcpServer {
     /// URL (for http)
     pub url: Option<String>,
     /// Environment variables
-    pub env: HashMap<String, String>,
+    pub env: crate::secrets::EnvironmentGrants,
     /// Static HTTP headers
-    pub headers: HashMap<String, String>,
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Dynamic header helper command
     pub headers_helper: Option<String>,
     /// Per-server tool execution timeout in milliseconds
@@ -422,9 +422,13 @@ fn validate_mcp_env_var_name(name: &str) -> Result<(), String> {
     }
 }
 
-fn expand_mcp_env_vars_with<F>(value: &str, lookup: &F) -> Result<String, String>
+fn expand_mcp_env_vars_with<F>(
+    value: &str,
+    lookup: &F,
+    allow_protected_value: bool,
+) -> Result<String, String>
 where
-    F: Fn(&str) -> Result<Option<String>, String>,
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
 {
     let mut expanded = String::with_capacity(value.len());
     let mut rest = value;
@@ -444,7 +448,14 @@ where
         validate_mcp_env_var_name(name)?;
 
         match lookup(name)? {
-            Some(value) => expanded.push_str(&value),
+            Some(value) => {
+                if !allow_protected_value {
+                    return Err(format!(
+                        "protected environment variable {name} may only be expanded into an MCP environment value or HTTP header"
+                    ));
+                }
+                value.expose(|raw| expanded.push_str(raw));
+            }
             None => match default_value {
                 Some(value) => expanded.push_str(value),
                 None => return Err(format!("required environment variable {name} is not set")),
@@ -458,30 +469,61 @@ where
     Ok(expanded)
 }
 
-fn expand_mcp_config_value_with<F>(field: &str, value: &str, lookup: &F) -> Result<String, String>
+fn expand_mcp_config_value_with<F>(
+    field: &str,
+    value: &str,
+    lookup: &F,
+    allow_protected_value: bool,
+) -> Result<String, String>
 where
-    F: Fn(&str) -> Result<Option<String>, String>,
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
 {
-    expand_mcp_env_vars_with(value, lookup).map_err(|err| format!("{field}: {err}"))
+    expand_mcp_env_vars_with(value, lookup, allow_protected_value)
+        .map_err(|err| format!("{field}: {err}"))
 }
 
-fn expand_mcp_config_map_with<F>(
-    field: &str,
-    values: &HashMap<String, String>,
+fn expand_mcp_environment_map_with<F>(
+    values: &crate::secrets::EnvironmentGrants,
     lookup: &F,
-) -> Result<HashMap<String, String>, String>
+) -> Result<crate::secrets::EnvironmentGrants, String>
 where
-    F: Fn(&str) -> Result<Option<String>, String>,
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
 {
-    let expand_entry = |key: &String, value: &String| {
-        expand_mcp_config_value_with(&format!("{field}.{key}"), value, lookup)
-            .map(|expanded| (key.clone(), expanded))
-    };
+    let mut expanded = crate::secrets::EnvironmentGrants::new();
+    for key in values.keys() {
+        validate_mcp_env_var_name(key)?;
+        let value = values
+            .with_value(key, |value| {
+                expand_mcp_config_value_with(&format!("env.{key}"), value, lookup, true)
+            })
+            .ok_or_else(|| format!("env.{key}: template disappeared during expansion"))??;
+        expanded
+            .insert_validated(key.clone(), value)
+            .map_err(|error| format!("env.{key}: {error}"))?;
+    }
+    Ok(expanded)
+}
 
-    values
-        .iter()
-        .map(|(key, value)| expand_entry(key, value))
-        .collect()
+fn expand_mcp_header_map_with<F>(
+    values: &crate::secrets::SensitiveHeaders,
+    lookup: &F,
+) -> Result<crate::secrets::SensitiveHeaders, String>
+where
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
+{
+    let mut expanded = crate::secrets::SensitiveHeaders::new();
+    for key in values.names() {
+        let key = key.as_str();
+        let value = values
+            .with_value(key, |value| {
+                expand_mcp_config_value_with(&format!("headers.{key}"), value, lookup, true)
+            })
+            .ok_or_else(|| format!("headers.{key}: template disappeared during expansion"))??;
+        expanded
+            .insert_literal(key, value)
+            .map_err(|error| format!("headers.{key}: {error}"))?;
+    }
+    Ok(expanded)
 }
 
 fn resolved_mcp_server_from_config_with<F>(
@@ -490,7 +532,7 @@ fn resolved_mcp_server_from_config_with<F>(
     lookup: &F,
 ) -> Result<PluginMcpServer, String>
 where
-    F: Fn(&str) -> Result<Option<String>, String>,
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
 {
     Ok(PluginMcpServer {
         name: name.to_string(),
@@ -498,23 +540,23 @@ where
         command: config
             .command
             .as_deref()
-            .map(|value| expand_mcp_config_value_with("command", value, lookup))
+            .map(|value| expand_mcp_config_value_with("command", value, lookup, false))
             .transpose()?,
         args: config
             .args
             .iter()
             .enumerate()
             .map(|(index, value)| {
-                expand_mcp_config_value_with(&format!("args[{index}]"), value, lookup)
+                expand_mcp_config_value_with(&format!("args[{index}]"), value, lookup, false)
             })
             .collect::<Result<Vec<_>, _>>()?,
         url: config
             .url
             .as_deref()
-            .map(|value| expand_mcp_config_value_with("url", value, lookup))
+            .map(|value| expand_mcp_config_value_with("url", value, lookup, false))
             .transpose()?,
-        env: expand_mcp_config_map_with("env", &config.env, lookup)?,
-        headers: expand_mcp_config_map_with("headers", &config.headers, lookup)?,
+        env: expand_mcp_environment_map_with(&config.env, lookup)?,
+        headers: expand_mcp_header_map_with(&config.headers, lookup)?,
         headers_helper: config.headers_helper.clone(),
         timeout: config.timeout,
         always_load: config.always_load,
@@ -672,10 +714,10 @@ impl Plugin {
                                     .collect()
                             })
                             .unwrap_or_default(),
-                        env: HashMap::new(),
+                        env: crate::secrets::EnvironmentGrants::new(),
                         transport,
                         url: server["url"].as_str().map(String::from),
-                        headers: HashMap::new(),
+                        headers: crate::secrets::SensitiveHeaders::new(),
                         headers_helper: None,
                         timeout: None,
                         always_load: None,
@@ -1359,7 +1401,7 @@ impl Plugin {
 
     fn resolved_mcp_servers_with_lookup<F>(&self, lookup: &F) -> Vec<PluginMcpServer>
     where
-        F: Fn(&str) -> Result<Option<String>, String>,
+        F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
     {
         self.mcp_configs
             .iter()
@@ -1395,6 +1437,10 @@ mod tests {
         value.push_str(name);
         value.push('}');
         value
+    }
+
+    fn protected(value: &str) -> crate::secrets::SecretString {
+        crate::secrets::SecretString::try_from_string(value.to_string()).expect("secret")
     }
 
     fn mcp_env_default(name: &str, default_value: &str) -> String {
@@ -1876,10 +1922,10 @@ mod tests {
 
     #[test]
     fn mcp_env_expansion_supports_required_vars_defaults_and_repeats() {
-        let lookup = |name: &str| -> Result<Option<String>, String> {
+        let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
             Ok(match name {
-                "TOKEN" => Some("secret".to_string()),
-                "EMPTY" => Some(String::new()),
+                "TOKEN" => Some(protected("secret")),
+                "EMPTY" => Some(protected("")),
                 _ => None,
             })
         };
@@ -1891,7 +1937,7 @@ mod tests {
             mcp_env_ref("EMPTY"),
         ]
         .join(":");
-        let expanded = expand_mcp_env_vars_with(&template, &lookup).unwrap();
+        let expanded = expand_mcp_env_vars_with(&template, &lookup, true).unwrap();
 
         assert_eq!(expanded, "secret:fallback:secret:");
     }
@@ -1938,16 +1984,17 @@ mod tests {
 
         let resolved_a = plugin.resolved_mcp_servers_for_run(&run_a);
         let resolved_b = plugin.resolved_mcp_servers_for_run(&run_b);
-        assert_eq!(resolved_a[0].env["SNAPSHOT_TOKEN"], "run-a");
-        assert_eq!(resolved_b[0].env["SNAPSHOT_TOKEN"], "run-b");
+        assert!(resolved_a[0].env.matches_value("SNAPSHOT_TOKEN", "run-a"));
+        assert!(resolved_b[0].env.matches_value("SNAPSHOT_TOKEN", "run-b"));
     }
 
     #[test]
     fn mcp_env_expansion_rejects_unset_required_vars() {
-        let lookup = |_name: &str| -> Result<Option<String>, String> { Ok(None) };
+        let lookup =
+            |_name: &str| -> Result<Option<crate::secrets::SecretString>, String> { Ok(None) };
 
         let template = format!("Bearer {}", mcp_env_ref("MISSING_TOKEN"));
-        let err = expand_mcp_env_vars_with(&template, &lookup).unwrap_err();
+        let err = expand_mcp_env_vars_with(&template, &lookup, true).unwrap_err();
 
         assert!(
             err.contains("MISSING_TOKEN"),
@@ -1957,15 +2004,16 @@ mod tests {
 
     #[test]
     fn mcp_env_expansion_rejects_malformed_expressions() {
-        let lookup = |_name: &str| -> Result<Option<String>, String> { Ok(None) };
+        let lookup =
+            |_name: &str| -> Result<Option<crate::secrets::SecretString>, String> { Ok(None) };
 
-        let unterminated = expand_mcp_env_vars_with("${TOKEN", &lookup).unwrap_err();
+        let unterminated = expand_mcp_env_vars_with("${TOKEN", &lookup, true).unwrap_err();
         assert!(
             unterminated.contains("unterminated"),
             "unterminated expression should be explicit; got: {unterminated}"
         );
 
-        let invalid_name = expand_mcp_env_vars_with("${TOKEN-NAME}", &lookup).unwrap_err();
+        let invalid_name = expand_mcp_env_vars_with("${TOKEN-NAME}", &lookup, true).unwrap_err();
         assert!(
             invalid_name.contains("may only contain"),
             "invalid variable name should be explicit; got: {invalid_name}"
@@ -1974,30 +2022,34 @@ mod tests {
 
     #[test]
     fn resolved_mcp_server_expands_documented_fields_only() {
-        let lookup = |name: &str| -> Result<Option<String>, String> {
+        let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
             Ok(match name {
-                "HOST" => Some("mcp.example.test".to_string()),
-                "TOKEN" => Some("secret".to_string()),
+                "TOKEN" => Some(protected("secret")),
                 _ => None,
             })
         };
 
-        let mut env = HashMap::new();
-        env.insert("AUTH_TOKEN".to_string(), mcp_env_ref("TOKEN"));
-        env.insert("MODE".to_string(), mcp_env_default("MODE", "production"));
+        let env = crate::secrets::EnvironmentGrants::try_from(HashMap::from([
+            ("AUTH_TOKEN".to_string(), mcp_env_ref("TOKEN")),
+            ("MODE".to_string(), mcp_env_default("MODE", "production")),
+        ]))
+        .expect("valid environment templates");
 
-        let mut headers = HashMap::new();
-        headers.insert(
+        let headers = crate::secrets::SensitiveHeaders::try_from(HashMap::from([(
             "Authorization".to_string(),
             format!("Bearer {}", mcp_env_ref("TOKEN")),
-        );
+        )]))
+        .expect("valid header templates");
 
         let config = McpServerConfig {
             command: Some(mcp_env_default("BIN", "node")),
-            args: vec![format!("--token={}", mcp_env_ref("TOKEN"))],
+            args: vec![mcp_env_default("MODE", "safe")],
             env,
             transport: "http".to_string(),
-            url: Some(format!("https://{}/mcp", mcp_env_ref("HOST"))),
+            url: Some(format!(
+                "https://{}/mcp",
+                mcp_env_default("HOST", "mcp.example.test")
+            )),
             headers,
             headers_helper: Some(format!("printf '%s' '{}'", mcp_env_ref("TOKEN"))),
             timeout: Some(250),
@@ -2007,23 +2059,38 @@ mod tests {
         let server = resolved_mcp_server_from_config_with("remote", &config, &lookup).unwrap();
 
         assert_eq!(server.command.as_deref(), Some("node"));
-        assert_eq!(server.args, vec!["--token=secret"]);
+        assert_eq!(server.args, vec!["safe"]);
         assert_eq!(server.url.as_deref(), Some("https://mcp.example.test/mcp"));
-        assert_eq!(
-            server.env.get("AUTH_TOKEN").map(String::as_str),
-            Some("secret")
-        );
-        assert_eq!(
-            server.env.get("MODE").map(String::as_str),
-            Some("production")
-        );
-        assert_eq!(
-            server.headers.get("Authorization").map(String::as_str),
-            Some("Bearer secret")
-        );
+        assert!(server.env.matches_value("AUTH_TOKEN", "secret"));
+        assert!(server.env.matches_value("MODE", "production"));
+        assert!(server
+            .headers
+            .matches_value("Authorization", "Bearer secret"));
         assert_eq!(server.headers_helper, config.headers_helper);
         assert_eq!(server.timeout, Some(250));
         assert_eq!(server.always_load, Some(true));
+    }
+
+    #[test]
+    fn resolved_mcp_server_rejects_protected_values_in_process_arguments() {
+        let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
+            Ok((name == "TOKEN").then(|| protected("secret")))
+        };
+        let config = McpServerConfig {
+            command: Some("runner".to_string()),
+            args: vec![format!("--token={}", mcp_env_ref("TOKEN"))],
+            env: crate::secrets::EnvironmentGrants::new(),
+            transport: "stdio".to_string(),
+            url: None,
+            headers: crate::secrets::SensitiveHeaders::new(),
+            headers_helper: None,
+            timeout: None,
+            always_load: None,
+        };
+        let Err(error) = resolved_mcp_server_from_config_with("unsafe", &config, &lookup) else {
+            panic!("protected values must not enter observable argv");
+        };
+        assert!(error.contains("may only be expanded"));
     }
 
     #[test]

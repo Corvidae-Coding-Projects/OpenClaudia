@@ -836,7 +836,7 @@ impl PluginManager {
         let manifest: MarketplaceManifest = serde_json::from_str(&content)
             .map_err(|e| PluginError::InvalidManifest(e.to_string()))?;
 
-        info!(name = %manifest.name, url = %url, plugins = manifest.plugins.len(), "Added git marketplace");
+        info!(name = %manifest.name, plugins = manifest.plugins.len(), "Added git marketplace");
         Ok(manifest)
     }
 
@@ -1317,7 +1317,7 @@ impl PluginManager {
                     warn!("Failed to save install tracking: {}", e);
                 }
                 let _ = self.reload();
-                info!(plugin = %actual_name, url = %url, "Installed plugin from git");
+                info!(plugin = %actual_name, "Installed plugin from git");
                 Ok(actual_name)
             }
             Err(e) => {

@@ -1,7 +1,7 @@
 //! End-to-end tests for `providers::api_key::ApiKey`
 //! constructor validation paths + `MAX_API_KEY_LEN` cap +
 //! `Deserialize` impl (mirrors `try_from_string`) +
-//! `REDACTED_PLACEHOLDER` round-trip semantics.
+//! `REDACTED_PLACEHOLDER` rejection semantics.
 //!
 //! Sprint 96 of the verification effort. Sprint 50
 //! (`api_key_redaction_e2e`) covered the redaction Display /
@@ -40,27 +40,27 @@ fn redacted_placeholder_is_documented_sentinel_string() {
 fn try_from_string_accepts_typical_anthropic_format() {
     let raw = "sk-ant-api03-AAAAABBBBCCCCDDDD_EEEE-FFFF-GGGG-1234567890";
     let key = ApiKey::try_from_string(raw.to_string()).expect("valid");
-    assert_eq!(key.as_str(), raw);
+    assert!(key.matches(raw));
 }
 
 #[test]
 fn try_from_string_accepts_typical_openai_format() {
     let raw = "sk-proj-AAAAABBBBCCCCDDDD-EEEE-FFFF1234567890ABCDEF";
     let key = ApiKey::try_from_string(raw.to_string()).expect("valid");
-    assert_eq!(key.as_str(), raw);
+    assert!(key.matches(raw));
 }
 
 #[test]
 fn try_from_string_accepts_minimal_non_empty_input() {
     let key = ApiKey::try_from_string("a".to_string()).expect("valid");
-    assert_eq!(key.as_str(), "a");
+    assert!(key.matches("a"));
 }
 
 #[test]
 fn try_from_string_accepts_at_max_length() {
     let raw = "a".repeat(MAX_API_KEY_LEN);
     let key = ApiKey::try_from_string(raw.clone()).expect("at-max MUST validate");
-    assert_eq!(key.as_str(), raw);
+    assert!(key.matches(&raw));
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn try_from_string_accepts_ascii_special_characters() {
     // Documented contract: any ASCII non-control character is fine.
     let raw = "key-with_special.chars+slash/and=equals";
     let key = ApiKey::try_from_string(raw.to_string()).expect("valid");
-    assert_eq!(key.as_str(), raw);
+    assert!(key.matches(raw));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -206,7 +206,7 @@ fn deserialize_accepts_valid_key_from_json_string() {
     let raw = "sk-test-key-12345abc";
     let json = format!("\"{raw}\"");
     let key: ApiKey = serde_json::from_str(&json).expect("valid");
-    assert_eq!(key.as_str(), raw);
+    assert!(key.matches(raw));
 }
 
 #[test]
@@ -240,27 +240,19 @@ fn deserialize_rejects_string_over_max_length() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section F — Round-trip via REDACTED_PLACEHOLDER
+// Section F — REDACTED_PLACEHOLDER is output-only
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn serialize_then_deserialize_round_trip_yields_redacted_placeholder_value() {
-    // PINS DOCUMENTED CONTRACT: Serialize emits [REDACTED];
-    // deserializing that placeholder produces an ApiKey whose
-    // .as_str() == "[REDACTED]" (i.e. the serializer ROUND-TRIPS
-    // through the redaction sentinel — explicit lossy contract).
+fn serialize_then_deserialize_refuses_to_activate_redacted_placeholder() {
     let raw = "sk-real-secret-key";
     let original = ApiKey::try_from_string(raw.to_string()).expect("valid");
     let json = serde_json::to_string(&original).expect("ser");
     assert!(json.contains(REDACTED_PLACEHOLDER));
-    let round_tripped: ApiKey = serde_json::from_str(&json).expect("de");
-    // KEY INSIGHT: round-trip is LOSSY — secret is replaced
-    // with the placeholder. Audit-greppable contract: the
-    // raw key never round-trips through plain serde.
-    assert_eq!(
-        round_tripped.as_str(),
-        REDACTED_PLACEHOLDER,
-        "round-trip MUST yield the sentinel, not the original secret"
+    let outcome = serde_json::from_str::<ApiKey>(&json);
+    assert!(
+        outcome.is_err(),
+        "redacted output must never become a live key"
     );
 }
 
@@ -270,41 +262,31 @@ fn serialize_then_deserialize_round_trip_yields_redacted_placeholder_value() {
 
 #[test]
 fn redact_short_keys_collapse_to_redacted_marker() {
-    // Documented threshold: < 10 chars → "<redacted>".
     for input in &["", "a", "short", "123456789"] {
         let r = redact_api_key(input);
-        assert_eq!(r, "<redacted>", "len {} input MUST collapse", input.len());
+        assert_eq!(r, REDACTED_PLACEHOLDER);
     }
 }
 
 #[test]
-fn redact_keys_at_10_chars_show_head_and_tail() {
+fn redact_keys_at_10_chars_reveals_no_fingerprint() {
     let input = "0123456789"; // exactly 10
     let r = redact_api_key(input);
-    // head 4 chars + … + tail 4 chars
-    assert!(r.starts_with("0123"));
-    assert!(r.ends_with("6789"));
-    assert!(r.contains('…'));
+    assert_eq!(r, REDACTED_PLACEHOLDER);
 }
 
 #[test]
-fn redact_keys_long_form_preserves_only_4_head_4_tail() {
+fn redact_keys_long_form_reveals_no_fingerprint() {
     let input = "abcdefghijklmnopqrstuvwxyz1234567890";
     let r = redact_api_key(input);
-    assert!(r.starts_with("abcd"));
-    assert!(r.ends_with("7890"));
-    // Middle chars MUST NOT appear in output.
-    assert!(!r.contains("lmnop"));
-    assert!(!r.contains("efghi"));
+    assert_eq!(r, REDACTED_PLACEHOLDER);
+    assert!(!r.contains("abcd"));
+    assert!(!r.contains("7890"));
 }
 
 #[test]
-fn redact_handles_non_ascii_chars_via_char_iteration() {
-    // 10+ chars including unicode — head/tail use char iteration.
+fn redact_non_ascii_input_still_reveals_nothing() {
     let input = "日本語キーprefix1234suffix";
     let r = redact_api_key(input);
-    // First 4 chars + … + last 4 chars (char-wise).
-    assert!(r.contains('…'));
-    // Should not contain the FULL input.
-    assert_ne!(r, input);
+    assert_eq!(r, REDACTED_PLACEHOLDER);
 }

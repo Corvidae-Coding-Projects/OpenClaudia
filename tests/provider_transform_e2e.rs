@@ -317,26 +317,23 @@ fn anthropic_headers_use_xapikey_and_anthropic_version() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
     let key = ApiKey::try_from_string("sk-ant-test-PROD".to_string()).unwrap();
     let headers = adapter.get_headers(&key);
-    let header_names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
     assert!(
-        header_names
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case("x-api-key")),
-        "anthropic must use x-api-key header; got {header_names:?}"
+        headers.contains_name("x-api-key"),
+        "anthropic must use x-api-key header; got {headers:?}"
     );
     assert!(
-        header_names
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case("anthropic-version")),
-        "anthropic must include anthropic-version header; got {header_names:?}"
+        headers.contains_name("anthropic-version"),
+        "anthropic must include anthropic-version header; got {headers:?}"
     );
-    // No header value contains CRLF (header-injection defence).
-    for (k, v) in &headers {
-        assert!(
-            !v.contains('\n') && !v.contains('\r'),
-            "header {k:?} value must NOT contain CRLF; got {v:?}"
-        );
-    }
+    let request = headers
+        .apply(reqwest::Client::new().get("https://example.com"))
+        .expect("all values must pass HeaderValue validation")
+        .build()
+        .expect("request");
+    assert!(request
+        .headers()
+        .values()
+        .all(reqwest::header::HeaderValue::is_sensitive));
 }
 
 #[test]
@@ -346,14 +343,9 @@ fn openai_compat_headers_use_authorization_bearer() {
         let adapter = get_adapter(provider).unwrap_or_else(|_| panic!("{provider} adapter"));
         let key = ApiKey::try_from_string("sk-test-PRODUCTION-KEY".to_string()).unwrap();
         let headers = adapter.get_headers(&key);
-        let authz = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-            .unwrap_or_else(|| panic!("{provider} must include Authorization header"));
         assert!(
-            authz.1.starts_with("Bearer "),
-            "{provider}: Authorization must use Bearer scheme; got {:?}",
-            authz.1
+            headers.matches_value("authorization", "Bearer sk-test-PRODUCTION-KEY"),
+            "{provider}: Authorization must use Bearer scheme; got {headers:?}"
         );
     }
 }

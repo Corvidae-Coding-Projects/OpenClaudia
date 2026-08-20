@@ -70,6 +70,11 @@ pub enum ToolExecutableError {
 }
 
 /// Builder for a host-created [`ToolRunContext`].
+enum EnvironmentGrantSource {
+    Raw(HashMap<String, String>),
+    Protected(crate::secrets::EnvironmentGrants),
+}
+
 pub struct ToolRunContextBuilder {
     session_id: SessionId,
     project_root: PathBuf,
@@ -77,8 +82,8 @@ pub struct ToolRunContextBuilder {
     read_only_roots: Option<Vec<PathBuf>>,
     read_write_roots: Option<Vec<PathBuf>>,
     project_secret_masks: Option<Vec<PathBuf>>,
-    environment_grants: Option<HashMap<String, String>>,
-    mcp_environment_grants: Option<HashMap<String, String>>,
+    environment_grants: Option<EnvironmentGrantSource>,
+    mcp_environment_grants: Option<EnvironmentGrantSource>,
     executable_search_path: Option<OsString>,
     host_home: Option<PathBuf>,
     inherit_host_startup_grants: bool,
@@ -171,7 +176,18 @@ impl ToolRunContextBuilder {
     /// may instead opt into [`Self::host_startup_grants`].
     #[must_use]
     pub fn environment_grants(mut self, grants: HashMap<String, String>) -> Self {
-        self.environment_grants = Some(grants);
+        self.environment_grants = Some(EnvironmentGrantSource::Raw(grants));
+        self
+    }
+
+    /// Inherit an already-protected environment capability without copying
+    /// any secret bytes.
+    #[must_use]
+    pub(crate) fn protected_environment_grants(
+        mut self,
+        grants: crate::secrets::EnvironmentGrants,
+    ) -> Self {
+        self.environment_grants = Some(EnvironmentGrantSource::Protected(grants));
         self
     }
 
@@ -185,7 +201,17 @@ impl ToolRunContextBuilder {
     /// parent instead of rereading mutable process state.
     #[must_use]
     pub fn mcp_environment_grants(mut self, grants: HashMap<String, String>) -> Self {
-        self.mcp_environment_grants = Some(grants);
+        self.mcp_environment_grants = Some(EnvironmentGrantSource::Raw(grants));
+        self
+    }
+
+    /// Inherit an already-protected MCP-only environment capability.
+    #[must_use]
+    pub(crate) fn protected_mcp_environment_grants(
+        mut self,
+        grants: crate::secrets::EnvironmentGrants,
+    ) -> Self {
+        self.mcp_environment_grants = Some(EnvironmentGrantSource::Protected(grants));
         self
     }
 
@@ -276,8 +302,8 @@ pub struct ToolRunContext {
     denied_paths: Vec<PathBuf>,
     agent_plan_file: PathBuf,
     project_secret_masks: Vec<PathBuf>,
-    environment_grants: HashMap<String, String>,
-    mcp_environment_grants: HashMap<String, String>,
+    environment_grants: crate::secrets::EnvironmentGrants,
+    mcp_environment_grants: crate::secrets::EnvironmentGrants,
     executable_search_path: OsString,
     host_home: Option<PathBuf>,
     network_policy: AgentNetworkPolicy,
@@ -482,17 +508,37 @@ impl ToolRunContext {
         let agent_plan_file = project_plan_file(&project_root, session_id.as_str());
         let environment_grants =
             match environment_grants {
-                Some(grants) => validate_environment_grants(grants)?,
-                None if inherit_host_startup_grants => startup_environment_grants()?,
+                Some(EnvironmentGrantSource::Raw(grants)) => {
+                    protect_environment_grants(validate_environment_grants(grants)?)?
+                }
+                Some(EnvironmentGrantSource::Protected(grants)) => {
+                    for name in grants.keys() {
+                        validate_environment_grant_name(name)?;
+                    }
+                    grants
+                }
+                None if inherit_host_startup_grants => {
+                    protect_environment_grants(startup_environment_grants()?)?
+                }
                 None => return Err(
                     "Run construction requires explicit environment grants or host startup grants"
                         .to_string(),
                 ),
             };
         let mcp_environment_grants = match mcp_environment_grants {
-            Some(grants) => validate_mcp_environment_grants(grants)?,
-            None if inherit_host_startup_grants => startup_mcp_environment_grants()?,
-            None => HashMap::new(),
+            Some(EnvironmentGrantSource::Raw(grants)) => {
+                protect_environment_grants(validate_mcp_environment_grants(grants)?)?
+            }
+            Some(EnvironmentGrantSource::Protected(grants)) => {
+                for name in grants.keys() {
+                    validate_mcp_environment_grant_name(name)?;
+                }
+                grants
+            }
+            None if inherit_host_startup_grants => {
+                protect_environment_grants(startup_mcp_environment_grants()?)?
+            }
+            None => crate::secrets::EnvironmentGrants::new(),
         };
         let executable_search_path = match executable_search_path {
             Some(path) => path,
@@ -874,8 +920,8 @@ impl ToolRunContext {
             .read_only_roots(read_only_roots)
             .read_write_roots(read_write_roots)
             .project_secret_masks(self.project_secret_masks.clone())
-            .environment_grants(self.environment_grants.clone())
-            .mcp_environment_grants(self.mcp_environment_grants.clone())
+            .protected_environment_grants(self.environment_grants.clone())
+            .protected_mcp_environment_grants(self.mcp_environment_grants.clone())
             .executable_search_path(&self.executable_search_path)
             .host_home(self.host_home.clone())
             .workspace_access(workspace_access)
@@ -945,15 +991,24 @@ impl ToolRunContext {
 
     /// Exact host-approved environment values inherited by agent processes.
     #[must_use]
-    pub const fn environment_grants(&self) -> &HashMap<String, String> {
+    pub const fn environment_grants(&self) -> &crate::secrets::EnvironmentGrants {
         &self.environment_grants
     }
 
     /// Exact host-approved values available only to trusted MCP server
     /// configuration for this run generation.
     #[must_use]
-    pub const fn mcp_environment_grants(&self) -> &HashMap<String, String> {
+    pub const fn mcp_environment_grants(&self) -> &crate::secrets::EnvironmentGrants {
         &self.mcp_environment_grants
+    }
+
+    /// Sanitize untrusted process/provider diagnostics against every secret
+    /// capability bound to this run generation.
+    #[must_use]
+    pub fn sanitize_diagnostic(&self, raw: &str) -> crate::secrets::SafeDiagnostic {
+        let environment_safe = self.environment_grants.sanitize_diagnostic(raw);
+        self.mcp_environment_grants
+            .sanitize_diagnostic(environment_safe.as_str())
     }
 
     /// Exact executable search path captured when this run was constructed.
@@ -1144,8 +1199,8 @@ fn capability_manifest_digest(
     read_write_roots: &[PathBuf],
     denied_paths: &[PathBuf],
     agent_plan_file: &Path,
-    environment_grants: &HashMap<String, String>,
-    mcp_environment_grants: &HashMap<String, String>,
+    environment_grants: &crate::secrets::EnvironmentGrants,
+    mcp_environment_grants: &crate::secrets::EnvironmentGrants,
     executable_search_path: &OsStr,
     host_home: Option<&Path>,
     network_policy: AgentNetworkPolicy,
@@ -1179,23 +1234,18 @@ fn capability_manifest_digest(
     manifest.push_str("agent_plan_file=");
     manifest.push_str(&agent_plan_file.to_string_lossy());
     manifest.push('\n');
-    let mut environment_names: Vec<&String> = environment_grants.keys().collect();
-    environment_names.sort_unstable();
-    for name in environment_names {
+    for (name, digest) in environment_grants.sorted_name_digests() {
         manifest.push_str("environment=");
         manifest.push_str(name);
         manifest.push(':');
-        manifest.push_str(&ContentDigest::sha256(environment_grants[name].as_bytes()).to_string());
+        manifest.push_str(&digest);
         manifest.push('\n');
     }
-    let mut mcp_environment_names: Vec<&String> = mcp_environment_grants.keys().collect();
-    mcp_environment_names.sort_unstable();
-    for name in mcp_environment_names {
+    for (name, digest) in mcp_environment_grants.sorted_name_digests() {
         manifest.push_str("mcp_environment=");
         manifest.push_str(name);
         manifest.push(':');
-        manifest
-            .push_str(&ContentDigest::sha256(mcp_environment_grants[name].as_bytes()).to_string());
+        manifest.push_str(&digest);
         manifest.push('\n');
     }
     manifest.push_str("executable_search_path=");
@@ -1370,6 +1420,13 @@ fn validate_mcp_environment_grants(
         }
     }
     Ok(grants)
+}
+
+fn protect_environment_grants(
+    grants: HashMap<String, String>,
+) -> Result<crate::secrets::EnvironmentGrants, String> {
+    crate::secrets::EnvironmentGrants::from_validated(grants)
+        .map_err(|error| format!("Invalid environment grant value: {error}"))
 }
 
 fn validate_mcp_environment_grant_name(name: &str) -> Result<(), String> {
@@ -1894,13 +1951,9 @@ mod tests {
         assert_eq!(child.project_root(), child_root.canonicalize().unwrap());
         assert_ne!(child.run_id(), parent.run_id());
         assert_ne!(child.generation(), parent.generation());
-        assert_eq!(
-            child
-                .environment_grants()
-                .get("S019_DERIVED_ENV")
-                .map(String::as_str),
-            Some("immutable")
-        );
+        assert!(child
+            .environment_grants()
+            .matches_value("S019_DERIVED_ENV", "immutable"));
         assert_eq!(child.host_home(), parent.host_home());
         assert_eq!(
             child.host_home(),
@@ -2019,10 +2072,9 @@ mod tests {
             .secrets(false)
             .build()
             .expect("explicit environment grant");
-        assert_eq!(
-            context.environment_grants().get("S019_TEST_MARKER"),
-            Some(&"run-specific".to_string())
-        );
+        assert!(context
+            .environment_grants()
+            .matches_value("S019_TEST_MARKER", "run-specific"));
 
         let rejected = ToolRunContext::builder(SessionId::new(), root.path())
             .read_only_roots(Vec::new())
@@ -2126,6 +2178,17 @@ mod tests {
         let generation = CapabilityGeneration::new(7).expect("generation");
         let grants = BTreeSet::from([CapabilityKind::WorkspaceRead]);
         let roots = vec![root.path().to_path_buf()];
+        let first_environment =
+            crate::secrets::EnvironmentGrants::from_validated(HashMap::from([(
+                "S019_MARKER".to_string(),
+                "first".to_string(),
+            )]))
+            .expect("environment");
+        let second_environment = crate::secrets::EnvironmentGrants::from_validated(HashMap::from(
+            [("S019_MARKER".to_string(), "second".to_string())],
+        ))
+        .expect("environment");
+        let empty_environment = crate::secrets::EnvironmentGrants::new();
         let first = capability_manifest_digest(
             run_id,
             generation,
@@ -2136,8 +2199,8 @@ mod tests {
             &roots,
             &[],
             &root.path().join(".openclaudia/plans/run.md"),
-            &HashMap::from([("S019_MARKER".to_string(), "first".to_string())]),
-            &HashMap::new(),
+            &first_environment,
+            &empty_environment,
             OsStr::new("/usr/bin"),
             None,
             AgentNetworkPolicy::Denied,
@@ -2154,8 +2217,8 @@ mod tests {
             &roots,
             &[],
             &root.path().join(".openclaudia/plans/run.md"),
-            &HashMap::from([("S019_MARKER".to_string(), "second".to_string())]),
-            &HashMap::new(),
+            &second_environment,
+            &empty_environment,
             OsStr::new("/usr/bin"),
             None,
             AgentNetworkPolicy::Denied,
@@ -2180,7 +2243,9 @@ mod tests {
             .secrets(true)
             .build()
             .expect("MCP secret-authorized run");
-        assert_eq!(context.mcp_environment_grants(), &grants);
+        assert!(context
+            .mcp_environment_grants()
+            .matches_value("SERVICE_API_KEY", "first"));
         context.validate_binding().expect("manifest remains exact");
 
         let error = ToolRunContext::builder(SessionId::new(), root.path())

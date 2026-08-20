@@ -185,7 +185,7 @@ pub struct ChatRepl {
     client: reqwest::Client,
     hook_engine: openclaudia::hooks::HookEngine,
     api_key: Option<openclaudia::providers::ApiKey>,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<openclaudia::secrets::OAuthToken>,
     permission_mgr: PermissionManager,
     policy_enforcer: std::sync::Arc<openclaudia::services::policy::PolicyEnforcer>,
     run_context: std::sync::Arc<tools::ToolRunContext>,
@@ -230,7 +230,7 @@ enum SlashOutcome {
 #[derive(Clone, Copy)]
 struct TurnTransport<'a> {
     endpoint: &'a str,
-    headers: &'a [(String, String)],
+    headers: &'a openclaudia::secrets::SensitiveHeaders,
 }
 
 fn derive_repl_session_run(
@@ -798,7 +798,7 @@ impl ChatRepl {
             &self.model,
             &prompt_blocks,
             effort.as_str(),
-            self.claude_code_token.as_deref(),
+            self.claude_code_token.as_ref(),
         ) {
             Ok(request_body) => request_body,
             Err(err) => {
@@ -823,7 +823,7 @@ impl ChatRepl {
             provider,
             self.adapter,
             self.api_key.as_ref(),
-            self.claude_code_token.as_deref(),
+            self.claude_code_token.as_ref(),
         );
 
         let transport = TurnTransport {
@@ -1612,16 +1612,25 @@ impl ChatRepl {
         spinner.set_message("Connecting...");
         spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        let mut req = self.client.post(transport.endpoint).json(&request_body);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
+        let req = match transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(&request_body))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                spinner.finish_and_clear();
+                eprintln!("\nProvider header error: {error}\n");
+                self.record_failed_turn(&format!("provider header error: {error}"));
+                return false;
+            }
+        };
 
         match req.send().await {
             Ok(response) => {
                 spinner.finish_and_clear();
                 if !response.status().is_success() {
-                    self.handle_failed_response(response).await;
+                    self.handle_failed_response(response, transport.headers)
+                        .await;
                     return false;
                 }
                 if self.config.proxy.target == "google" {
@@ -1656,7 +1665,11 @@ impl ChatRepl {
 
     /// Read body of a non-2xx response, print user-friendly error, and
     /// record a failed-turn marker.
-    async fn handle_failed_response(&mut self, response: reqwest::Response) {
+    async fn handle_failed_response(
+        &mut self,
+        response: reqwest::Response,
+        headers: &openclaudia::secrets::SensitiveHeaders,
+    ) {
         let status = response.status();
         let content_type = response
             .headers()
@@ -1664,15 +1677,18 @@ impl ChatRepl {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = response.text().await.unwrap_or_default();
+        let body = openclaudia::secrets::read_bounded_diagnostic_body(response)
+            .await
+            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
         if content_type.contains("text/html") {
             eprintln!("\nError {status}: (HTML response — check your provider configuration)\n");
             self.record_failed_turn(&format!(
                 "HTTP {status}: HTML response; check provider configuration"
             ));
         } else {
-            eprintln!("\nError {status}: {body}\n");
-            self.record_failed_turn(&format!("HTTP {status}: {body}"));
+            let diagnostic = headers.sanitize_diagnostic(&body);
+            eprintln!("\nError {status}: {diagnostic}\n");
+            self.record_failed_turn(&format!("HTTP {status}: {diagnostic}"));
         }
     }
 
@@ -1687,8 +1703,8 @@ impl ChatRepl {
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         println!();
-        let body = response.text().await.unwrap_or_default();
-        let Some(gemini_json) = self.parse_gemini_initial_body(&body) else {
+        let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
+        let Some(gemini_json) = self.parse_gemini_initial_body(&body, transport.headers) else {
             return;
         };
 
@@ -1696,8 +1712,9 @@ impl ChatRepl {
             match Self::emit_gemini_initial_text_and_calls(&gemini_json) {
                 Ok(parsed) => parsed,
                 Err(e) => {
-                    eprintln!("\nInvalid Gemini response: {e}");
-                    self.record_failed_turn(&format!("invalid Gemini response: {e}"));
+                    let diagnostic = transport.headers.sanitize_diagnostic(&e);
+                    eprintln!("\nInvalid Gemini response: {diagnostic}");
+                    self.record_failed_turn(&format!("invalid Gemini response: {diagnostic}"));
                     return;
                 }
             };
@@ -1737,12 +1754,16 @@ impl ChatRepl {
 
     /// Parse the Gemini HTTP body to JSON, or print an error and record
     /// a failed-turn marker on failure.
-    fn parse_gemini_initial_body(&mut self, body: &str) -> Option<serde_json::Value> {
+    fn parse_gemini_initial_body(
+        &mut self,
+        body: &str,
+        headers: &openclaudia::secrets::SensitiveHeaders,
+    ) -> Option<serde_json::Value> {
         match serde_json::from_str::<serde_json::Value>(body) {
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("\nFailed to parse Gemini response: {e}");
-                eprintln!("Raw body: {}", &body[..body.len().min(500)]);
+                eprintln!("Response body: {}", headers.sanitize_diagnostic(body));
                 self.record_failed_turn(&format!("failed to parse Gemini response: {e}"));
                 None
             }
@@ -2202,13 +2223,19 @@ impl ChatRepl {
             followup_req["systemInstruction"] = sys.clone();
         }
 
-        let mut req = self.client.post(transport.endpoint).json(&followup_req);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
+        let req = match transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(&followup_req))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("\nProvider header error: {error}");
+                return None;
+            }
+        };
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                let resp_body = resp.text().await.unwrap_or_default();
+                let resp_body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
                 let Ok(resp_json) = serde_json::from_str::<serde_json::Value>(&resp_body) else {
                     eprintln!("\nFailed to parse Gemini follow-up response");
                     return None;
@@ -2216,14 +2243,20 @@ impl ChatRepl {
                 let text = match gemini_extract_text(&resp_json) {
                     Ok(text) => text,
                     Err(e) => {
-                        eprintln!("\nInvalid Gemini follow-up response: {e}");
+                        eprintln!(
+                            "\nInvalid Gemini follow-up response: {}",
+                            transport.headers.sanitize_diagnostic(&e)
+                        );
                         return None;
                     }
                 };
                 let calls = match gemini_extract_tool_calls(&resp_json) {
                     Ok(calls) => calls,
                     Err(e) => {
-                        eprintln!("\nInvalid Gemini follow-up tool call response: {e}");
+                        eprintln!(
+                            "\nInvalid Gemini follow-up tool call response: {}",
+                            transport.headers.sanitize_diagnostic(&e)
+                        );
                         return None;
                     }
                 };
@@ -2231,8 +2264,11 @@ impl ChatRepl {
             }
             Ok(resp) => {
                 let status = resp.status();
-                let err_body = resp.text().await.unwrap_or_default();
-                eprintln!("\nGemini follow-up failed: {status} {err_body}");
+                let err_body = openclaudia::secrets::read_bounded_diagnostic_body(resp)
+                    .await
+                    .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+                let diagnostic = transport.headers.sanitize_diagnostic(&err_body);
+                eprintln!("\nGemini follow-up failed: {status} {diagnostic}");
                 None
             }
             Err(e) => {
@@ -2969,10 +3005,16 @@ impl ChatRepl {
     ) -> bool {
         use futures::StreamExt;
 
-        let mut req = self.client.post(transport.endpoint).json(&followup_req);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
+        let req = match transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(&followup_req))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("\nProvider header error: {error}");
+                return false;
+            }
+        };
         match req.send().await {
             Ok(response) if response.status().is_success() => {
                 let mut stream = response.bytes_stream().eventsource();
@@ -3261,10 +3303,12 @@ impl ChatRepl {
     ) {
         use futures::StreamExt;
 
-        let mut req = self.client.post(transport.endpoint).json(&request_body);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
+        let Ok(req) = transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(&request_body))
+        else {
+            return;
+        };
         let Ok(response) = req.send().await else {
             return;
         };

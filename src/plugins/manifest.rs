@@ -300,8 +300,11 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Environment variables
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env: HashMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::secrets::EnvironmentGrants::is_empty"
+    )]
+    pub env: crate::secrets::EnvironmentGrants,
     /// Transport type (stdio or http)
     #[serde(
         default = "default_transport",
@@ -313,8 +316,11 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Static HTTP headers for remote MCP transports.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub headers: HashMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::secrets::SensitiveHeaders::is_empty"
+    )]
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Dynamic header helper command. Parsed so the connection layer can
     /// explicitly reject unsupported dynamic auth instead of silently
     /// dropping it.
@@ -372,8 +378,11 @@ pub struct LspServerConfig {
     /// The standard LSP env-scrub allowlist (see `tools::lsp`) still
     /// applies — credentials that fail the allowlist are dropped with a
     /// `warn!` log.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env: HashMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::secrets::EnvironmentGrants::is_empty"
+    )]
+    pub env: crate::secrets::EnvironmentGrants,
     /// File extensions the server claims (e.g. `["rs"]`). Empty means
     /// the server is invocation-only — it does not auto-register against
     /// any extension.

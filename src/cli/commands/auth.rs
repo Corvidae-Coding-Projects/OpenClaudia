@@ -55,7 +55,7 @@ fn native_oauth_session_store_status() -> NativeOAuthSessionStoreStatus {
     };
 
     let content = match std::io::read_to_string(file) {
-        Ok(content) => content,
+        Ok(content) => zeroize::Zeroizing::new(content),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return NativeOAuthSessionStoreStatus::Missing;
         }
@@ -243,7 +243,7 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
 
     let expected_state = &pkce.state;
     if let Some(ref state) = parsed_state {
-        if state != expected_state {
+        if !expected_state.matches(state) {
             eprintln!("State mismatch! This could be a CSRF attack. Authentication cancelled.");
             anyhow::bail!("authentication cancelled: OAuth state mismatch");
         }
@@ -252,7 +252,7 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
     println!("\nExchanging code for tokens...");
 
     let client = OAuthClient::new()?;
-    let token_response = client.exchange_code(&code, &pkce).await?;
+    let token_response = client.exchange_code(code, &pkce).await?;
 
     let mut session = openclaudia::oauth::OAuthSession::from_token_response(token_response);
 
@@ -284,7 +284,7 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
     {
         match openclaudia::claude_credentials::store_credentials(
             &session.credentials.access_token,
-            session.credentials.refresh_token.as_deref(),
+            session.credentials.refresh_token.as_ref(),
             session.credentials.expires_at.timestamp_millis(),
             session.granted_scopes.clone(),
             None,

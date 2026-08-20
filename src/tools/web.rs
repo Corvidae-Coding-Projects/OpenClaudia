@@ -267,7 +267,7 @@ fn optional_web_fetch_prompt(args: &HashMap<String, Value>) -> Result<Option<&st
 struct DistillationCall {
     provider: String,
     endpoint: String,
-    headers: Vec<(String, String)>,
+    headers: crate::secrets::SensitiveHeaders,
     body: Value,
     adapter: &'static dyn ProviderAdapter,
 }
@@ -311,11 +311,7 @@ fn build_distillation_call(
     let adapter = get_adapter(provider_name).map_err(|e| e.to_string())?;
     let endpoint = pipeline::resolve_endpoint(provider_name, model, &provider.base_url, None)
         .map_err(|e| e.to_string())?;
-    let extra_headers: Vec<(String, String)> = provider
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let extra_headers = provider.headers.clone();
     let headers = pipeline::resolve_headers(
         provider_name,
         provider.api_key.as_ref(),
@@ -396,22 +392,25 @@ fn build_distillation_request(
 
 async fn execute_distillation_call(call: DistillationCall) -> Result<String, String> {
     let client = web::shared_http_client()?;
-    let mut request = client
-        .post(&call.endpoint)
-        .timeout(WEB_FETCH_DISTILLATION_TIMEOUT)
-        .json(&call.body);
-    for (name, value) in &call.headers {
-        request = request.header(name, value);
-    }
+    let request = call
+        .headers
+        .apply(
+            client
+                .post(&call.endpoint)
+                .timeout(WEB_FETCH_DISTILLATION_TIMEOUT)
+                .json(&call.body),
+        )
+        .map_err(|error| format!("distillation headers are invalid: {error}"))?;
 
     let response = request
         .send()
         .await
         .map_err(|e| format!("distillation request failed: {e}"))?;
     let status = response.status();
-    let body = web::read_bounded_text(response, web::MAX_WEB_FETCH_BYTES, &call.endpoint).await?;
+    let body =
+        zeroize::Zeroizing::new(web::read_bounded_text(response, web::MAX_WEB_FETCH_BYTES).await?);
     if !status.is_success() {
-        let body = safe_truncate(&body, 1_000);
+        let body = call.headers.sanitize_diagnostic(&body);
         return Err(format!(
             "distillation provider '{}' returned HTTP {status}: {body}",
             call.provider
@@ -718,7 +717,7 @@ mod tests {
                 ),
                 base_url: base_url.to_string(),
                 model: Some("gpt-provider-configured".to_string()),
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );

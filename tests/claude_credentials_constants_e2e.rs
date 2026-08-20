@@ -18,7 +18,12 @@ use openclaudia::claude_credentials::{
     strip_cache_control_ttl, ClaudeAiOauth, CredentialsFile, CLAUDE_CODE_BETA_HEADER,
     FINE_GRAINED_TOOL_STREAMING_BETA, INTERLEAVED_THINKING_BETA, OAUTH_BETA_HEADER,
 };
+use openclaudia::secrets::OAuthToken;
 use serde_json::json;
+
+fn token(value: &str) -> OAuthToken {
+    OAuthToken::try_from_string(value.to_string()).expect("valid token")
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — Versioned beta-header constants
@@ -197,8 +202,11 @@ fn credentials_file_deserializes_with_claude_ai_oauth_field() {
     }"#;
     let creds: CredentialsFile = serde_json::from_str(json).expect("de");
     let oauth = creds.claude_ai_oauth.expect("Some");
-    assert_eq!(oauth.access_token, "sk-ant-oat01-abc");
-    assert_eq!(oauth.refresh_token.as_deref(), Some("sk-ant-ort01-def"));
+    assert!(oauth.access_token.matches("sk-ant-oat01-abc"));
+    assert!(oauth
+        .refresh_token
+        .as_ref()
+        .is_some_and(|token| token.matches("sk-ant-ort01-def")));
     assert_eq!(oauth.expires_at, 1_700_000_000_000);
     assert_eq!(oauth.scopes, vec!["user:inference"]);
 }
@@ -213,7 +221,7 @@ fn credentials_file_with_missing_oauth_field_yields_none() {
 #[test]
 fn claude_ai_oauth_serde_uses_camelcase_wire_field_names() {
     let oauth = ClaudeAiOauth {
-        access_token: "at".to_string(),
+        access_token: token("at"),
         refresh_token: None,
         expires_at: 12345,
         scopes: Vec::new(),
@@ -231,23 +239,20 @@ fn claude_ai_oauth_serde_uses_camelcase_wire_field_names() {
 }
 
 #[test]
-fn claude_ai_oauth_with_subscription_type_round_trips() {
+fn claude_ai_oauth_with_subscription_type_serializes_only_redactions() {
     let original = ClaudeAiOauth {
-        access_token: "at".to_string(),
-        refresh_token: Some("rt".to_string()),
+        access_token: token("at"),
+        refresh_token: Some(token("rt")),
         expires_at: 1_700_000_000_000,
         scopes: vec!["scope-a".to_string(), "scope-b".to_string()],
         subscription_type: Some("max-5x".to_string()),
         rate_limit_tier: Some("standard".to_string()),
     };
     let json = serde_json::to_string(&original).expect("ser");
-    let back: ClaudeAiOauth = serde_json::from_str(&json).expect("de");
-    assert_eq!(back.access_token, original.access_token);
-    assert_eq!(back.refresh_token, original.refresh_token);
-    assert_eq!(back.expires_at, original.expires_at);
-    assert_eq!(back.scopes, original.scopes);
-    assert_eq!(back.subscription_type, original.subscription_type);
-    assert_eq!(back.rate_limit_tier, original.rate_limit_tier);
+    assert!(!json.contains("\"at\""));
+    assert!(!json.contains("\"rt\""));
+    assert!(json.contains("[REDACTED]"));
+    assert!(serde_json::from_str::<ClaudeAiOauth>(&json).is_err());
 }
 
 #[test]
@@ -258,7 +263,7 @@ fn claude_ai_oauth_deserializes_with_minimal_required_fields() {
         "scopes": []
     }"#;
     let oauth: ClaudeAiOauth = serde_json::from_str(json).expect("de");
-    assert_eq!(oauth.access_token, "x");
+    assert!(oauth.access_token.matches("x"));
     assert_eq!(oauth.expires_at, 0);
     assert!(oauth.refresh_token.is_none());
     assert!(oauth.subscription_type.is_none());
@@ -268,8 +273,8 @@ fn claude_ai_oauth_deserializes_with_minimal_required_fields() {
 #[test]
 fn claude_ai_oauth_clone_preserves_all_fields() {
     let original = ClaudeAiOauth {
-        access_token: "a".to_string(),
-        refresh_token: Some("r".to_string()),
+        access_token: token("a"),
+        refresh_token: Some(token("r")),
         expires_at: 100,
         scopes: vec!["s".to_string()],
         subscription_type: Some("t".to_string()),

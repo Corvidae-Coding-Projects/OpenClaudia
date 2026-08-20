@@ -18,13 +18,6 @@ fn key() -> ApiKey {
     ApiKey::try_from_string("sk-test-key-160".to_string()).expect("valid")
 }
 
-fn header(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.clone())
-}
-
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — Anthropic
 // ───────────────────────────────────────────────────────────────────────────
@@ -43,38 +36,29 @@ fn anthropic_headers_use_xapikey_not_authorization() {
     let api_key = key();
     let headers = adapter.get_headers(&api_key);
     // PINS WIRE: Anthropic uses x-api-key, NOT Authorization Bearer.
-    assert!(header(&headers, "x-api-key").is_some());
-    assert!(header(&headers, "authorization").is_none());
+    assert!(headers.contains_name("x-api-key"));
+    assert!(!headers.contains_name("authorization"));
 }
 
 #[test]
 fn anthropic_headers_include_anthropic_version_2023_06_01() {
     let adapter = get_adapter("anthropic").expect("anthropic");
     let headers = adapter.get_headers(&key());
-    assert_eq!(
-        header(&headers, "anthropic-version").as_deref(),
-        Some("2023-06-01")
-    );
+    assert!(headers.matches_value("anthropic-version", "2023-06-01"));
 }
 
 #[test]
 fn anthropic_headers_include_content_type_application_json() {
     let adapter = get_adapter("anthropic").expect("anthropic");
     let headers = adapter.get_headers(&key());
-    assert_eq!(
-        header(&headers, "content-type").as_deref(),
-        Some("application/json")
-    );
+    assert!(headers.matches_value("content-type", "application/json"));
 }
 
 #[test]
 fn anthropic_headers_carry_exact_api_key_value() {
     let adapter = get_adapter("anthropic").expect("anthropic");
     let headers = adapter.get_headers(&key());
-    assert_eq!(
-        header(&headers, "x-api-key").as_deref(),
-        Some("sk-test-key-160")
-    );
+    assert!(headers.matches_value("x-api-key", "sk-test-key-160"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -91,12 +75,7 @@ fn openai_chat_endpoint_is_v1_chat_completions() {
 fn openai_headers_use_authorization_bearer() {
     let adapter = get_adapter("openai").expect("openai");
     let headers = adapter.get_headers(&key());
-    let auth = header(&headers, "authorization").expect("Authorization");
-    assert!(
-        auth.starts_with("Bearer "),
-        "Authorization MUST be Bearer-prefixed; got {auth:?}"
-    );
-    assert!(auth.ends_with("sk-test-key-160"));
+    assert!(headers.matches_value("authorization", "Bearer sk-test-key-160"));
 }
 
 #[test]
@@ -104,7 +83,7 @@ fn openai_headers_do_not_use_xapikey() {
     let adapter = get_adapter("openai").expect("openai");
     let headers = adapter.get_headers(&key());
     assert!(
-        header(&headers, "x-api-key").is_none(),
+        !headers.contains_name("x-api-key"),
         "openai MUST NOT use x-api-key"
     );
 }
@@ -136,19 +115,16 @@ fn google_headers_use_x_goog_api_key_not_authorization() {
     let adapter = get_adapter("google").expect("google");
     let headers = adapter.get_headers(&key());
     // PINS WIRE: Google uses x-goog-api-key (NOT Bearer).
-    assert!(header(&headers, "x-goog-api-key").is_some());
-    assert!(header(&headers, "authorization").is_none());
-    assert!(header(&headers, "x-api-key").is_none());
+    assert!(headers.contains_name("x-goog-api-key"));
+    assert!(!headers.contains_name("authorization"));
+    assert!(!headers.contains_name("x-api-key"));
 }
 
 #[test]
 fn google_x_goog_api_key_carries_exact_value() {
     let adapter = get_adapter("google").expect("google");
     let headers = adapter.get_headers(&key());
-    assert_eq!(
-        header(&headers, "x-goog-api-key").as_deref(),
-        Some("sk-test-key-160")
-    );
+    assert!(headers.matches_value("x-goog-api-key", "sk-test-key-160"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -166,19 +142,16 @@ fn ollama_headers_have_no_auth_header() {
     let adapter = get_adapter("ollama").expect("ollama");
     let headers = adapter.get_headers(&key());
     // PINS DOC: Ollama doesn't require auth by default.
-    assert!(header(&headers, "authorization").is_none());
-    assert!(header(&headers, "x-api-key").is_none());
-    assert!(header(&headers, "x-goog-api-key").is_none());
+    assert!(!headers.contains_name("authorization"));
+    assert!(!headers.contains_name("x-api-key"));
+    assert!(!headers.contains_name("x-goog-api-key"));
 }
 
 #[test]
 fn ollama_headers_include_only_content_type() {
     let adapter = get_adapter("ollama").expect("ollama");
     let headers = adapter.get_headers(&key());
-    assert_eq!(
-        header(&headers, "content-type").as_deref(),
-        Some("application/json")
-    );
+    assert!(headers.matches_value("content-type", "application/json"));
     // Only content-type header.
     assert_eq!(headers.len(), 1);
 }
@@ -255,40 +228,35 @@ fn zai_chat_endpoint_uses_no_v1_prefix_distinct_from_openai() {
 fn deepseek_headers_use_bearer_like_openai() {
     let adapter = get_adapter("deepseek").expect("deepseek");
     let headers = adapter.get_headers(&key());
-    let auth = header(&headers, "authorization").expect("auth");
-    assert!(auth.starts_with("Bearer "));
+    assert!(headers.matches_value("authorization", "Bearer sk-test-key-160"));
 }
 
 #[test]
 fn qwen_headers_use_bearer_like_openai() {
     let adapter = get_adapter("qwen").expect("qwen");
     let headers = adapter.get_headers(&key());
-    let auth = header(&headers, "authorization").expect("auth");
-    assert!(auth.starts_with("Bearer "));
+    assert!(headers.matches_value("authorization", "Bearer sk-test-key-160"));
 }
 
 #[test]
 fn zai_headers_use_bearer_like_openai() {
     let adapter = get_adapter("zai").expect("zai");
     let headers = adapter.get_headers(&key());
-    let auth = header(&headers, "authorization").expect("auth");
-    assert!(auth.starts_with("Bearer "));
+    assert!(headers.matches_value("authorization", "Bearer sk-test-key-160"));
 }
 
 #[test]
 fn kimi_headers_use_bearer_like_openai() {
     let adapter = get_adapter("kimi").expect("kimi");
     let headers = adapter.get_headers(&key());
-    let auth = header(&headers, "authorization").expect("auth");
-    assert!(auth.starts_with("Bearer "));
+    assert!(headers.matches_value("authorization", "Bearer sk-test-key-160"));
 }
 
 #[test]
 fn minimax_headers_use_bearer_like_openai() {
     let adapter = get_adapter("minimax").expect("minimax");
     let headers = adapter.get_headers(&key());
-    let auth = header(&headers, "authorization").expect("auth");
-    assert!(auth.starts_with("Bearer "));
+    assert!(headers.matches_value("authorization", "Bearer sk-test-key-160"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -383,11 +351,11 @@ fn anthropic_google_openai_use_distinct_auth_header_names() {
     let anth = get_adapter("anthropic").unwrap().get_headers(&key());
     let google = get_adapter("google").unwrap().get_headers(&key());
     let openai = get_adapter("openai").unwrap().get_headers(&key());
-    assert!(header(&anth, "x-api-key").is_some());
-    assert!(header(&google, "x-goog-api-key").is_some());
-    assert!(header(&openai, "authorization").is_some());
+    assert!(anth.contains_name("x-api-key"));
+    assert!(google.contains_name("x-goog-api-key"));
+    assert!(openai.contains_name("authorization"));
     // Cross-checks: each set lacks the others' auth header.
-    assert!(header(&anth, "x-goog-api-key").is_none());
-    assert!(header(&google, "x-api-key").is_none());
-    assert!(header(&openai, "x-goog-api-key").is_none());
+    assert!(!anth.contains_name("x-goog-api-key"));
+    assert!(!google.contains_name("x-api-key"));
+    assert!(!openai.contains_name("x-goog-api-key"));
 }

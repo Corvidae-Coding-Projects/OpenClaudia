@@ -603,11 +603,13 @@ fn environment_sha256(run: &ToolRunContext) -> String {
         &mut digest,
         run.working_directory().as_os_str().as_encoded_bytes(),
     );
-    let mut variables = run.environment_grants().iter().collect::<Vec<_>>();
-    variables.sort_by(|left, right| left.0.cmp(right.0));
-    for (name, value) in variables {
+    let mut names = run.environment_grants().keys().collect::<Vec<_>>();
+    names.sort_unstable();
+    for name in names {
         update_field(&mut digest, name.as_bytes());
-        update_field(&mut digest, value.as_bytes());
+        run.environment_grants()
+            .with_value(name, |value| update_field(&mut digest, value.as_bytes()))
+            .expect("name came from environment capability");
     }
     update_field(&mut digest, run.executable_search_path().as_encoded_bytes());
     digest_hex(digest.finalize().as_slice())

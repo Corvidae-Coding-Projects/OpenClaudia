@@ -133,9 +133,9 @@ pub fn execute_shell_command_internal(
 
     #[cfg(windows)]
     let output = resolved_process_command(run, "cmd").and_then(|mut command| {
+        command.env_clear();
+        run.environment_grants().apply_std(&mut command);
         command
-            .env_clear()
-            .envs(run.environment_grants())
             .env("PATH", run.executable_search_path())
             .current_dir(&cwd)
             .args(["/C", cmd])
@@ -145,9 +145,9 @@ pub fn execute_shell_command_internal(
 
     #[cfg(not(windows))]
     let output = resolved_process_command(run, "sh").and_then(|mut command| {
+        command.env_clear();
+        run.environment_grants().apply_std(&mut command);
         command
-            .env_clear()
-            .envs(run.environment_grants())
             .env("PATH", run.executable_search_path())
             .current_dir(&cwd)
             .args(["-c", cmd])

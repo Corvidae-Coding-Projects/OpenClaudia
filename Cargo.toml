@@ -87,6 +87,7 @@ rand = "0.10"
 url = "2"
 ed25519-dalek = "3"
 urlencoding = "2"
+zeroize = "1.9"
 
 # CLI enhancements
 rustyline = { version = "18", features = ["derive"] }

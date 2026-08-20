@@ -348,14 +348,11 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         self.chat_path.to_string()
     }
 
-    fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
-        vec![
-            (
-                "Authorization".to_string(),
-                format!("Bearer {}", api_key.as_str()),
-            ),
-            ("content-type".to_string(), "application/json".to_string()),
-        ]
+    fn get_headers(&self, api_key: &ApiKey) -> crate::secrets::SensitiveHeaders {
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_bearer(reqwest::header::AUTHORIZATION, api_key.secret());
+        headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
+        headers
     }
 
     fn supports_model_listing(&self) -> bool {
@@ -369,20 +366,20 @@ fn validate_openai_chat_response(provider: &str, response: &Value) -> Result<(),
         .and_then(Value::as_array)
         .ok_or_else(|| {
             ProviderError::InvalidResponse(format!(
-                "{provider} response missing required 'choices' array: {response}"
+                "{provider} response missing required 'choices' array"
             ))
         })?;
 
     if choices.is_empty() {
         return Err(ProviderError::InvalidResponse(format!(
-            "{provider} response contains empty 'choices' array: {response}"
+            "{provider} response contains empty 'choices' array"
         )));
     }
 
     for (choice_index, choice) in choices.iter().enumerate() {
         if !choice.is_object() {
             return Err(ProviderError::InvalidResponse(format!(
-                "{provider} response choices[{choice_index}] must be an object: {choice}"
+                "{provider} response choices[{choice_index}] must be an object"
             )));
         }
 
@@ -391,7 +388,7 @@ fn validate_openai_chat_response(provider: &str, response: &Value) -> Result<(),
             .filter(|message| message.is_object())
             .ok_or_else(|| {
                 ProviderError::InvalidResponse(format!(
-                    "{provider} response choices[{choice_index}] missing object 'message': {choice}"
+                    "{provider} response choices[{choice_index}] missing object 'message'"
                 ))
             })?;
 
@@ -402,7 +399,7 @@ fn validate_openai_chat_response(provider: &str, response: &Value) -> Result<(),
             .ok_or_else(|| {
                 ProviderError::InvalidResponse(format!(
                     "{provider} response choices[{choice_index}].message.role must be a \
-                     non-empty string: {message}"
+                     non-empty string"
                 ))
             })?;
 
@@ -411,7 +408,7 @@ fn validate_openai_chat_response(provider: &str, response: &Value) -> Result<(),
             Some(Value::Null) | None => false,
             Some(_) => {
                 return Err(ProviderError::InvalidResponse(format!(
-                    "{provider} response choices[{choice_index}].message.content must be a string or null: {message}"
+                    "{provider} response choices[{choice_index}].message.content must be a string or null"
                 )));
             }
         };
@@ -420,7 +417,7 @@ fn validate_openai_chat_response(provider: &str, response: &Value) -> Result<(),
             Some(tool_calls) if tool_calls.is_array() => true,
             Some(_) => {
                 return Err(ProviderError::InvalidResponse(format!(
-                    "{provider} response choices[{choice_index}].message.tool_calls must be an array: {message}"
+                    "{provider} response choices[{choice_index}].message.tool_calls must be an array"
                 )));
             }
             None => false,
@@ -434,14 +431,14 @@ fn validate_openai_chat_response(provider: &str, response: &Value) -> Result<(),
         if !has_content && !has_tool_calls && !has_refusal {
             return Err(ProviderError::InvalidResponse(format!(
                 "{provider} response choices[{choice_index}].message must contain string \
-                 content, tool_calls, or a non-empty refusal: {message}"
+                 content, tool_calls, or a non-empty refusal"
             )));
         }
 
         if let Some(finish_reason) = choice.get("finish_reason") {
             if !finish_reason.is_string() && !finish_reason.is_null() {
                 return Err(ProviderError::InvalidResponse(format!(
-                    "{provider} response choices[{choice_index}].finish_reason must be a string or null: {choice}"
+                    "{provider} response choices[{choice_index}].finish_reason must be a string or null"
                 )));
             }
         }
@@ -730,10 +727,8 @@ mod tests {
         let key = ApiKey::try_from_string("sk-test-key".to_string()).unwrap();
         let headers = a.get_headers(&key);
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0].0, "Authorization");
-        assert_eq!(headers[0].1, "Bearer sk-test-key");
-        assert_eq!(headers[1].0, "content-type");
-        assert_eq!(headers[1].1, "application/json");
+        assert!(headers.matches_value("Authorization", "Bearer sk-test-key"));
+        assert!(headers.matches_value("content-type", "application/json"));
     }
 
     #[test]

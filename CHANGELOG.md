@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Implement and fully verify remediation slice S-025 (#1040)
 - Implement and fully verify remediation slice S-024 (#1038)
 - Implement and fully verify remediation slice S-023 (#1037)
 - Implement and fully verify remediation slice S-021 (#1036)

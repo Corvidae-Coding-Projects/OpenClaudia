@@ -30,9 +30,9 @@ pub fn run_external_editor(
     {
         let target = target_file.to_string_lossy();
         resolved_process_command(run, "cmd").and_then(|mut command| {
+            command.env_clear();
+            run.environment_grants().apply_std(&mut command);
             command
-                .env_clear()
-                .envs(run.environment_grants())
                 .env("PATH", run.executable_search_path())
                 .current_dir(run.working_directory())
                 .args(["/C", editor, target.as_ref()])
@@ -48,9 +48,10 @@ pub fn run_external_editor(
         let program = run
             .resolve_executable(&program)
             .map_err(|error| error.to_string())?;
-        std::process::Command::new(program)
-            .env_clear()
-            .envs(run.environment_grants())
+        let mut command = std::process::Command::new(program);
+        command.env_clear();
+        run.environment_grants().apply_std(&mut command);
+        command
             .env("PATH", run.executable_search_path())
             .current_dir(run.working_directory())
             .args(tokens)
@@ -189,29 +190,34 @@ pub fn handle_user_questions(questions: &[serde_json::Value]) -> String {
 
 /// Open external editor for composing a message
 pub fn open_external_editor(run: &openclaudia::tools::ToolRunContext) -> Option<String> {
-    let editor = run
-        .environment_grants()
-        .get("VISUAL")
-        .or_else(|| run.environment_grants().get("EDITOR"))
-        .cloned()
-        .unwrap_or_else(|| {
-            #[cfg(windows)]
-            {
-                "notepad".to_string()
-            }
-            #[cfg(not(windows))]
-            {
-                "vim".to_string()
-            }
-        });
-
     let temp_file = run
         .private_temp_root()
         .join(format!("openclaudia_{}.txt", uuid::Uuid::new_v4()));
 
-    println!("\nOpening {editor}...");
-
-    let status = run_external_editor(run, &editor, &temp_file);
+    let configured = run
+        .environment_grants()
+        .with_value("VISUAL", |editor| {
+            run_external_editor(run, editor, &temp_file)
+        })
+        .or_else(|| {
+            run.environment_grants().with_value("EDITOR", |editor| {
+                run_external_editor(run, editor, &temp_file)
+            })
+        });
+    let status = configured.map_or_else(
+        || {
+            #[cfg(windows)]
+            let editor = "notepad";
+            #[cfg(not(windows))]
+            let editor = "vim";
+            println!("\nOpening {editor}...");
+            run_external_editor(run, editor, &temp_file)
+        },
+        |status| {
+            println!("\nOpening configured editor...");
+            status
+        },
+    );
 
     match status {
         Ok(s) if s.success() => fs::read_to_string(&temp_file).map_or_else(
@@ -236,7 +242,8 @@ pub fn open_external_editor(run: &openclaudia::tools::ToolRunContext) -> Option<
             None
         }
         Err(e) => {
-            eprintln!("Failed to open editor '{editor}': {e}\n");
+            let safe = run.environment_grants().sanitize_diagnostic(&e);
+            eprintln!("Failed to open editor: {safe}\n");
             None
         }
     }

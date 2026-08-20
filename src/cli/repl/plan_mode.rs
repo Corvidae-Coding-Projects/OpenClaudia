@@ -98,13 +98,19 @@ fn handle_plan_edit(
     allowed_prompts: &[tools::ToolAllowedPrompt],
 ) -> (String, bool) {
     use std::io::{self, Write};
-    let editor = run
-        .environment_grants()
-        .get("EDITOR")
-        .cloned()
-        .unwrap_or_else(|| "vi".to_string());
-    println!("\n\x1b[90mOpening plan in {editor}...\x1b[0m");
-    let edit_result = run_external_editor(run, &editor, &plan_state.plan_file);
+    let configured = run.environment_grants().with_value("EDITOR", |editor| {
+        run_external_editor(run, editor, &plan_state.plan_file)
+    });
+    let edit_result = configured.map_or_else(
+        || {
+            println!("\n\x1b[90mOpening plan in vi...\x1b[0m");
+            run_external_editor(run, "vi", &plan_state.plan_file)
+        },
+        |result| {
+            println!("\n\x1b[90mOpening plan in configured editor...\x1b[0m");
+            result
+        },
+    );
     match edit_result {
         Ok(status) if status.success() => {
             let edited_content = match tools::read_capability_text_attachment(
@@ -166,7 +172,8 @@ fn handle_plan_edit(
             false,
         ),
         Err(e) => {
-            println!("\x1b[31mFailed to open editor '{editor}': {e}\x1b[0m");
+            let safe = run.environment_grants().sanitize_diagnostic(&e);
+            println!("\x1b[31mFailed to open editor: {safe}\x1b[0m");
             (
                 "Failed to open editor. Still in plan mode.".to_string(),
                 false,

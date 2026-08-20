@@ -21,6 +21,7 @@
 //!   match on it without taking a plugin-layer dependency.
 
 use crate::plugins::manifest::McpServerConfig;
+use crate::secrets::{EnvironmentGrants, SensitiveHeaders};
 use std::collections::HashMap;
 
 /// Transport-neutral description of one MCP server, derived from a
@@ -32,13 +33,13 @@ pub struct McpServerSpec {
     /// Arguments to the executable (`stdio` transport).
     pub args: Vec<String>,
     /// Environment variables injected on spawn.
-    pub env: HashMap<String, String>,
+    pub env: EnvironmentGrants,
     /// `"stdio"` or `"http"`.
     pub transport: String,
     /// Endpoint URL (`http` transport) or absent for `stdio`.
     pub url: Option<String>,
     /// Static HTTP headers for remote transports.
-    pub headers: HashMap<String, String>,
+    pub headers: SensitiveHeaders,
     /// Dynamic header helper command.
     pub headers_helper: Option<String>,
     /// Per-server tool timeout in milliseconds.
@@ -140,10 +141,10 @@ mod tests {
             spec: McpServerSpec {
                 command: Some("foo".into()),
                 args: vec![],
-                env: HashMap::new(),
+                env: EnvironmentGrants::new(),
                 transport: "stdio".into(),
                 url: None,
-                headers: HashMap::new(),
+                headers: SensitiveHeaders::new(),
                 headers_helper: None,
                 timeout: None,
                 always_load: None,
@@ -193,10 +194,11 @@ mod tests {
         let cfg = McpServerConfig {
             command: Some("python".into()),
             args: vec!["-m".into(), "server".into()],
-            env: HashMap::from([("X".to_string(), "1".to_string())]),
+            env: EnvironmentGrants::try_from(HashMap::from([("X".to_string(), "1".to_string())]))
+                .expect("valid test environment"),
             transport: "stdio".into(),
             url: None,
-            headers: HashMap::new(),
+            headers: SensitiveHeaders::new(),
             headers_helper: None,
             timeout: None,
             always_load: None,
@@ -204,7 +206,7 @@ mod tests {
         let spec = McpServerSpec::from_plugin_config(&cfg);
         assert_eq!(spec.command.as_deref(), Some("python"));
         assert_eq!(spec.args, vec!["-m", "server"]);
-        assert_eq!(spec.env.get("X").map(String::as_str), Some("1"));
+        assert!(spec.env.matches_value("X", "1"));
         assert_eq!(spec.transport, "stdio");
         assert!(spec.url.is_none());
     }

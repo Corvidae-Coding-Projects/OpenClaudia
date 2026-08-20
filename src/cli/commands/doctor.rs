@@ -22,7 +22,7 @@ enum ActiveProviderAuthRequirement {
 
 struct DoctorResolvedAuth {
     auth_ok: bool,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<openclaudia::secrets::OAuthToken>,
 }
 
 fn lookup_doctor_adapter(
@@ -127,7 +127,7 @@ fn doctor_model_for_provider(provider_name: &str, provider: &config::ProviderCon
 fn resolve_doctor_endpoint(
     provider_name: &str,
     provider: &config::ProviderConfig,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
 ) -> Result<String, ProviderError> {
     let model = doctor_model_for_provider(provider_name, provider);
     pipeline::resolve_endpoint(provider_name, &model, &provider.base_url, claude_code_token)
@@ -238,28 +238,20 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
                 match resolve_doctor_endpoint(
                     &config.proxy.target,
                     provider,
-                    auth.claude_code_token.as_deref(),
+                    auth.claude_code_token.as_ref(),
                 ) {
                     Ok(endpoint) => {
-                        let extra_headers: Vec<(String, String)> = provider
-                            .headers
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect();
                         match pipeline::resolve_headers(
                             &config.proxy.target,
                             provider.api_key.as_ref(),
-                            auth.claude_code_token.as_deref(),
-                            &extra_headers,
+                            auth.claude_code_token.as_ref(),
+                            &provider.headers,
                         ) {
                             Ok(headers) => {
                                 let client = reqwest::Client::builder()
                                     .timeout(Duration::from_secs(5))
                                     .build()?;
-                                let mut request = client.get(&endpoint);
-                                for (key, value) in &headers {
-                                    request = request.header(key, value);
-                                }
+                                let request = headers.apply(client.get(&endpoint))?;
                                 match request.send().await {
                                     Ok(response) => {
                                         let status = response.status();
@@ -517,14 +509,13 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use openclaudia::providers::ApiKey;
-    use std::collections::HashMap;
 
     fn provider_with_key(api_key: Option<ApiKey>) -> config::ProviderConfig {
         config::ProviderConfig {
             api_key,
             base_url: "https://api.example.com".to_string(),
             model: None,
-            headers: HashMap::new(),
+            headers: openclaudia::secrets::SensitiveHeaders::new(),
             thinking: config::ThinkingConfig::default(),
         }
     }
@@ -639,8 +630,10 @@ mod tests {
     fn resolve_doctor_endpoint_uses_oauth_endpoint_when_token_present() {
         let mut provider = provider_with_key(None);
         provider.model = Some("claude-opus-4-8".to_string());
+        let token =
+            openclaudia::secrets::OAuthToken::try_from_string("token".to_string()).expect("token");
         let endpoint =
-            resolve_doctor_endpoint("anthropic", &provider, Some("token")).expect("oauth endpoint");
+            resolve_doctor_endpoint("anthropic", &provider, Some(&token)).expect("oauth endpoint");
         assert_eq!(endpoint, "https://api.anthropic.com/v1/messages");
     }
 

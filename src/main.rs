@@ -589,11 +589,7 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
     // error here, instead of being silently mapped to `OpenAIAdapter` and
     // producing 4xx responses from the upstream that the user can't
     // attribute to a config typo.
-    let provider_headers = provider
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect::<Vec<_>>();
+    let provider_headers = provider.headers.clone();
     let (endpoint, headers) = if let Some(auth) = codex_responses_auth.as_ref() {
         let endpoint = openclaudia::pipeline::resolve_endpoint_for_wire(
             wire_api,
@@ -602,8 +598,8 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
             openclaudia::codex_credentials::CODEX_CHATGPT_BASE_URL,
             None,
         )?;
-        let mut headers = auth.headers();
-        headers.extend(provider_headers);
+        let mut headers = auth.headers()?;
+        headers.extend(&provider_headers);
         (endpoint, headers)
     } else {
         let endpoint = openclaudia::pipeline::resolve_endpoint_for_wire(
@@ -611,12 +607,12 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
             &config.proxy.target,
             &model,
             &provider.base_url,
-            claude_code_token.as_deref(),
+            claude_code_token.as_ref(),
         )?;
         let headers = openclaudia::pipeline::resolve_headers(
             &config.proxy.target,
             api_key.as_ref(),
-            claude_code_token.as_deref(),
+            claude_code_token.as_ref(),
             &provider_headers,
         )?;
         (endpoint, headers)
@@ -647,10 +643,10 @@ struct TuiLaunchOptions<'a> {
     config: &'a config::AppConfig,
     model: &'a str,
     endpoint: String,
-    headers: Vec<(String, String)>,
+    headers: openclaudia::secrets::SensitiveHeaders,
     wire_api: openclaudia::pipeline::WireApi,
     codex_responses_backend: bool,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<openclaudia::secrets::OAuthToken>,
     builder_vdd_auth: openclaudia::vdd::VddProviderAuth,
     vdd_adversary_auth: Option<openclaudia::vdd::VddProviderAuth>,
     behavior_mode: &'a openclaudia::modes::BehaviorMode,
@@ -713,7 +709,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
             &config.proxy.target,
             &app.model,
             base_url,
-            claude_code_token.as_deref(),
+            claude_code_token.as_ref(),
         )?
     };
     // MCP subprocesses/reconnects retain this exact resumed-session
@@ -1275,7 +1271,7 @@ struct ChatAuth {
     api_key: Option<openclaudia::providers::ApiKey>,
     /// Claude Code OAuth Bearer token, when auth came from the
     /// `~/.claude/.credentials.json` store.
-    claude_code_token: Option<String>,
+    claude_code_token: Option<openclaudia::secrets::OAuthToken>,
     /// Codex ChatGPT/PAT bearer auth. This must be sent to the Codex
     /// Responses backend, not `OpenAI` Chat Completions.
     codex_responses_auth: Option<openclaudia::codex_credentials::CodexResponsesAuth>,
@@ -1612,11 +1608,9 @@ fn collect_current_target_startup_auth_candidate(
 fn collect_openai_startup_auth_candidates(
     _config: &config::AppConfig,
     candidates: &mut Vec<TuiStartupAuthCandidate>,
-) -> anyhow::Result<()> {
+) {
     match openclaudia::codex_credentials::load_codex_auth() {
         Ok(Some(openclaudia::codex_credentials::CodexAuthMaterial::ApiKey { api_key, source })) => {
-            let api_key = openclaudia::providers::ApiKey::try_from_string(api_key)
-                .map_err(|e| anyhow::anyhow!("Codex OpenAI API key is invalid: {e}"))?;
             candidates.push(TuiStartupAuthCandidate::OpenAi(
                 OpenAiAuthCandidate::ApiKey {
                     api_key,
@@ -1642,8 +1636,6 @@ fn collect_openai_startup_auth_candidates(
         Ok(None) => {}
         Err(e) => eprintln!("Ignoring unusable Codex auth: {e}"),
     }
-
-    Ok(())
 }
 
 fn canonical_startup_provider(provider: &str) -> &str {
@@ -1773,7 +1765,7 @@ fn push_manual_api_key_candidate(
 fn collect_tui_startup_vdd_auth_candidates(
     config: &config::AppConfig,
     chat_target: &str,
-) -> anyhow::Result<Vec<TuiStartupAuthCandidate>> {
+) -> Vec<TuiStartupAuthCandidate> {
     let mut candidates = Vec::new();
 
     let preferred = config.vdd.adversary.provider.trim();
@@ -1797,17 +1789,15 @@ fn collect_tui_startup_vdd_auth_candidates(
     }
 
     if !same_startup_provider("openai", chat_target) {
-        collect_openai_startup_auth_candidates(config, &mut candidates)?;
+        collect_openai_startup_auth_candidates(config, &mut candidates);
     }
 
     push_manual_api_key_candidate(config, &mut candidates, Some(chat_target));
 
-    Ok(candidates)
+    candidates
 }
 
-fn collect_tui_startup_auth_candidates(
-    config: &config::AppConfig,
-) -> anyhow::Result<Vec<TuiStartupAuthCandidate>> {
+fn collect_tui_startup_auth_candidates(config: &config::AppConfig) -> Vec<TuiStartupAuthCandidate> {
     let mut candidates = Vec::new();
 
     if let Some(candidate) = collect_current_target_startup_auth_candidate(config) {
@@ -1823,11 +1813,11 @@ fn collect_tui_startup_auth_candidates(
         );
     }
 
-    collect_openai_startup_auth_candidates(config, &mut candidates)?;
+    collect_openai_startup_auth_candidates(config, &mut candidates);
 
     push_manual_api_key_candidate(config, &mut candidates, None);
 
-    Ok(candidates)
+    candidates
 }
 
 fn prompt_tui_startup_auth_choice(candidates: &[TuiStartupAuthCandidate]) -> anyhow::Result<usize> {
@@ -1935,7 +1925,7 @@ async fn select_tui_startup_auth(
         return Ok(None);
     }
 
-    let mut candidates = collect_tui_startup_auth_candidates(config)?;
+    let mut candidates = collect_tui_startup_auth_candidates(config);
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -1945,7 +1935,7 @@ async fn select_tui_startup_auth(
     let chat = candidates.remove(selected).into_selection().await?;
     eprintln!("✓ Starting with {label}");
 
-    let mut vdd_candidates = collect_tui_startup_vdd_auth_candidates(config, &chat.target)?;
+    let mut vdd_candidates = collect_tui_startup_vdd_auth_candidates(config, &chat.target);
     let vdd = match prompt_tui_startup_vdd_auth_choice(
         &vdd_candidates,
         &chat.target,
@@ -2006,8 +1996,6 @@ fn resolve_openai_chat_auth(
 
     match openclaudia::codex_credentials::load_codex_auth() {
         Ok(Some(openclaudia::codex_credentials::CodexAuthMaterial::ApiKey { api_key, source })) => {
-            let api_key = openclaudia::providers::ApiKey::try_from_string(api_key)
-                .map_err(|e| anyhow::anyhow!("Codex OpenAI API key is invalid: {e}"))?;
             candidates.push(OpenAiAuthCandidate::ApiKey {
                 api_key,
                 label: format!("OpenAI API key via {}", source.display_name()),
@@ -2209,7 +2197,7 @@ fn build_chat_request_body(
     model: &str,
     prompt_blocks: &openclaudia::prompt::SystemPromptBlocks,
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
 ) -> Result<serde_json::Value, String> {
     openclaudia::pipeline::build_request(
         target,
@@ -2233,8 +2221,8 @@ fn build_chat_endpoint_and_headers(
     provider: &config::ProviderConfig,
     adapter: &dyn openclaudia::providers::ProviderAdapter,
     api_key: Option<&openclaudia::providers::ApiKey>,
-    claude_code_token: Option<&str>,
-) -> (String, Vec<(String, String)>) {
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
+) -> (String, openclaudia::secrets::SensitiveHeaders) {
     let _ = target; // used only for documentation clarity; routing is on claude_code_token
     let endpoint = if claude_code_token.is_some() {
         openclaudia::claude_credentials::get_oauth_endpoint(model)
@@ -2246,12 +2234,16 @@ fn build_chat_endpoint_and_headers(
         )
     };
 
-    let mut headers: Vec<(String, String)> = claude_code_token.map_or_else(
-        || api_key.map_or_else(Vec::new, |key| adapter.get_headers(key)),
+    let mut headers = claude_code_token.map_or_else(
+        || {
+            api_key.map_or_else(openclaudia::secrets::SensitiveHeaders::new, |key| {
+                adapter.get_headers(key)
+            })
+        },
         openclaudia::claude_credentials::get_oauth_headers,
     );
     // Merge in any custom headers from provider config
-    headers.extend(provider.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+    headers.extend(&provider.headers);
     (endpoint, headers)
 }
 
@@ -2403,7 +2395,7 @@ mod tests {
             api_key: key,
             base_url: base_url.to_string(),
             model: None,
-            headers: std::collections::HashMap::new(),
+            headers: openclaudia::secrets::SensitiveHeaders::new(),
             thinking: config::ThinkingConfig::default(),
         }
     }
@@ -2596,8 +2588,7 @@ mod tests {
     #[test]
     fn vdd_startup_candidates_exclude_selected_chat_provider() {
         let config = startup_vdd_config();
-        let candidates =
-            collect_tui_startup_vdd_auth_candidates(&config, "anthropic").expect("candidates");
+        let candidates = collect_tui_startup_vdd_auth_candidates(&config, "anthropic");
 
         assert!(
             candidates.iter().any(|candidate| candidate
@@ -2616,7 +2607,7 @@ mod tests {
     #[test]
     fn startup_candidates_include_configured_provider_api_keys() {
         let config = startup_vdd_config();
-        let candidates = collect_tui_startup_auth_candidates(&config).expect("candidates");
+        let candidates = collect_tui_startup_auth_candidates(&config);
 
         assert!(
             candidates.iter().any(|candidate| candidate

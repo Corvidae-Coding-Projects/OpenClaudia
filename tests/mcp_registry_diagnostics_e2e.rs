@@ -7,6 +7,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+use openclaudia::secrets::{EnvironmentGrants, SensitiveHeaders};
 use openclaudia::services::lsp_diagnostics::DEFAULT_PER_FILE_CAP;
 use openclaudia::services::{
     DefaultDiagnosticInjector, Diagnostic, DiagnosticInjector, DiagnosticRegistry,
@@ -22,10 +23,10 @@ fn make_spec(transport: &str) -> McpServerSpec {
     McpServerSpec {
         command: Some("test-bin".to_string()),
         args: vec!["--flag".to_string()],
-        env: HashMap::new(),
+        env: EnvironmentGrants::new(),
         transport: transport.to_string(),
         url: None,
-        headers: HashMap::new(),
+        headers: SensitiveHeaders::new(),
         headers_helper: None,
         timeout: None,
         always_load: None,

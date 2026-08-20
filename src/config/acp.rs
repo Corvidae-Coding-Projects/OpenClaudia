@@ -104,7 +104,7 @@ impl AcpConfig {
     /// file exists. Missing files or absent `acp:` blocks resolve to defaults.
     fn load_from_yaml_path(path: &Path) -> Result<Self, String> {
         let raw = match std::fs::read_to_string(path) {
-            Ok(raw) => raw,
+            Ok(raw) => zeroize::Zeroizing::new(raw),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
         };

@@ -401,9 +401,7 @@ fn unsandboxed_process_command(
         .env("TMP", run.private_temp_root())
         .env("TEMP", run.private_temp_root())
         .env("PATH", run.executable_search_path());
-    for (key, value) in run.environment_grants() {
-        cmd.env(key, value);
-    }
+    run.environment_grants().apply_std(&mut cmd);
     Ok(cmd)
 }
 
@@ -592,9 +590,7 @@ fn linux_bubblewrap_command(
         .args(args)
         .current_dir(&cwd);
     super::apply_env_scrub(&mut cmd);
-    for (key, value) in security.environment_grants() {
-        cmd.env(key, value);
-    }
+    security.environment_grants().apply_std(&mut cmd);
     let inherited_bind_fds = pinned_bind_roots
         .into_iter()
         .map(|root| root.directory)

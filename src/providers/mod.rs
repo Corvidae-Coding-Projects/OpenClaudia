@@ -33,6 +33,7 @@ use thiserror::Error;
 
 use crate::config::ThinkingConfig;
 use crate::proxy::ChatCompletionRequest;
+use crate::secrets::SensitiveHeaders;
 use crate::session::TokenUsage;
 
 // Re-export all adapter types and public functions
@@ -174,11 +175,10 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// Get required headers for this provider.
     ///
-    /// The key is passed as an [`ApiKey`] rather than `&str` so that the
-    /// only way to reach the raw secret is an explicit `.as_str()` call
-    /// at the HTTP-header construction site — `Debug`/`Display` of an
-    /// `ApiKey` always redact. See crosslink #256.
-    fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)>;
+    /// Raw key bytes stay inside [`SensitiveHeaders`] and are materialized
+    /// only when that collection is applied to a request at the transport
+    /// boundary.
+    fn get_headers(&self, api_key: &ApiKey) -> SensitiveHeaders;
 
     /// Check if this provider supports model listing
     fn supports_model_listing(&self) -> bool {
@@ -606,7 +606,7 @@ pub async fn fetch_models(
     api_key: Option<&ApiKey>,
     adapter: &dyn ProviderAdapter,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
-    fetch_models_with_headers(base_url, api_key, &[], adapter).await
+    fetch_models_with_headers(base_url, api_key, &SensitiveHeaders::new(), adapter).await
 }
 
 /// Fetch available models with optional operator-supplied headers.
@@ -620,7 +620,7 @@ pub async fn fetch_models(
 pub async fn fetch_models_with_headers(
     base_url: &str,
     api_key: Option<&ApiKey>,
-    extra_headers: &[(String, String)],
+    extra_headers: &SensitiveHeaders,
     adapter: &dyn ProviderAdapter,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
     if !adapter.supports_model_listing() {
@@ -639,18 +639,17 @@ pub async fn fetch_models_with_headers(
     let normalized_base = crate::proxy::normalize_base_url(base_url);
     let url = format!("{}{}", normalized_base, adapter.models_endpoint());
 
-    let mut request = client.get(&url);
+    let mut headers = SensitiveHeaders::new();
 
     // Use the adapter's auth contract rather than assuming every provider
     // authenticates model-list requests with a Bearer token.
     if let Some(key) = api_key {
-        for (header, value) in adapter.get_headers(key) {
-            request = request.header(header, value);
-        }
+        headers.extend(&adapter.get_headers(key));
     }
-    for (key, value) in extra_headers {
-        request = request.header(key.as_str(), value.as_str());
-    }
+    headers.extend(extra_headers);
+    let request = headers
+        .apply(client.get(&url))
+        .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
 
     let response = request
         .send()
@@ -704,8 +703,13 @@ mod tests {
             "/v1/chat/completions".to_string()
         }
 
-        fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
-            vec![("x-api-key".to_string(), api_key.as_str().to_string())]
+        fn get_headers(&self, api_key: &ApiKey) -> SensitiveHeaders {
+            let mut headers = SensitiveHeaders::new();
+            headers.insert_header_secret(
+                reqwest::header::HeaderName::from_static("x-api-key"),
+                api_key.secret(),
+            );
+            headers
         }
 
         fn supports_model_listing(&self) -> bool {
@@ -1089,7 +1093,10 @@ mod tests {
         });
 
         let key = ApiKey::try_from_string("sk-test-model-key".to_string()).expect("valid key");
-        let headers = vec![("X-Custom-Route".to_string(), "test-value".to_string())];
+        let mut headers = SensitiveHeaders::new();
+        headers
+            .insert_literal("X-Custom-Route", "test-value".to_string())
+            .expect("valid custom header");
         let models = fetch_models_with_headers(
             &format!("http://{addr}/api/v1"),
             Some(&key),

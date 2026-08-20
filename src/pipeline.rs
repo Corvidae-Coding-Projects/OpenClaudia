@@ -110,7 +110,7 @@ pub fn build_anthropic_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
     let anthropic_messages =
@@ -551,7 +551,7 @@ pub fn build_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
     build_request_for_wire(
@@ -577,7 +577,7 @@ pub fn build_request_for_wire(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
     // Resolve ultrathink keyword / env override against the base effort
@@ -620,7 +620,7 @@ pub fn resolve_endpoint(
     provider: &str,
     model: &str,
     base_url: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
 ) -> Result<String, crate::providers::ProviderError> {
     resolve_endpoint_for_wire(
         WireApi::ChatCompletions,
@@ -642,7 +642,7 @@ pub fn resolve_endpoint_for_wire(
     provider: &str,
     model: &str,
     base_url: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
 ) -> Result<String, crate::providers::ProviderError> {
     if wire_api == WireApi::OpenAiResponses {
         return Ok(format!("{}/responses", normalize_base_url(base_url)));
@@ -676,18 +676,18 @@ pub fn resolve_endpoint_for_wire(
 pub fn resolve_headers(
     provider: &str,
     api_key: Option<&crate::providers::ApiKey>,
-    claude_code_token: Option<&str>,
-    extra_headers: &[(String, String)],
-) -> Result<Vec<(String, String)>, crate::providers::ProviderError> {
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    extra_headers: &crate::secrets::SensitiveHeaders,
+) -> Result<crate::secrets::SensitiveHeaders, crate::providers::ProviderError> {
     let mut headers = if let Some(token) = claude_code_token {
         crate::claude_credentials::get_oauth_headers(token)
     } else if let Some(key) = api_key {
         let adapter = get_adapter(provider)?;
         adapter.get_headers(key)
     } else {
-        Vec::new()
+        crate::secrets::SensitiveHeaders::new()
     };
-    headers.extend(extra_headers.iter().cloned());
+    headers.extend(extra_headers);
     Ok(headers)
 }
 
@@ -699,7 +699,7 @@ pub struct RunTurnParams<'a> {
     pub run_context: Arc<tools::ToolRunContext>,
     pub client: &'a reqwest::Client,
     pub endpoint: &'a str,
-    pub headers: &'a [(String, String)],
+    pub headers: &'a crate::secrets::SensitiveHeaders,
     pub request_body: &'a Value,
     pub provider: &'a str,
     pub model_identity: &'a str,
@@ -879,16 +879,15 @@ pub fn overload_fallback_for(model: &str) -> &'static str {
 async fn send_with_retry(
     client: &reqwest::Client,
     endpoint: &str,
-    headers: &[(String, String)],
+    headers: &crate::secrets::SensitiveHeaders,
     request_body: &Value,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<reqwest::Response, String> {
     let mut response = None;
     for attempt in 0..=MAX_API_RETRIES {
-        let mut req = client.post(endpoint).json(request_body);
-        for (key, value) in headers {
-            req = req.header(key, value);
-        }
+        let req = headers
+            .apply(client.post(endpoint).json(request_body))
+            .map_err(|error| error.to_string())?;
 
         let resp = match req.send().await {
             Ok(r) => r,
@@ -975,8 +974,11 @@ async fn send_with_retry(
                     model_hint: hint.to_string(),
                 });
             }
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("API error {status}: {body}"));
+            let body = crate::secrets::read_bounded_diagnostic_body(resp)
+                .await
+                .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+            let diagnostic = headers.sanitize_diagnostic(&body);
+            return Err(format!("API error {status}: {diagnostic}"));
         }
 
         response = Some(resp);
@@ -1051,6 +1053,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             task_mgr.clone(),
             session_id.clone(),
             model_identity,
+            headers,
             &tx,
         )
         .await;
@@ -1060,6 +1063,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         return stream_responses_sse_response(SseStreamParams {
             run_context,
             response,
+            headers,
             provider,
             model_identity,
             memory_db,
@@ -1079,6 +1083,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     stream_sse_response(SseStreamParams {
         run_context,
         response,
+        headers,
         provider,
         model_identity,
         memory_db,
@@ -1291,9 +1296,10 @@ async fn handle_google_response(
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
     model_identity: &str,
+    headers: &crate::secrets::SensitiveHeaders,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
-    let body = response.text().await.unwrap_or_default();
+    let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
     let gemini_json: Value =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
 
@@ -1304,17 +1310,26 @@ async fn handle_google_response(
             .and_then(Value::as_str)
             .filter(|message| !message.is_empty())
             .ok_or_else(|| {
-                format!("Gemini API error missing non-empty string 'message': {error}")
+                headers
+                    .sanitize_diagnostic(&format!(
+                        "Gemini API error missing non-empty string 'message': {error}"
+                    ))
+                    .to_string()
             })?;
         let code = error
             .get("code")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        return Err(format!("Gemini API error ({code}): {msg}"));
+        return Err(format!(
+            "Gemini API error ({code}): {}",
+            headers.sanitize_diagnostic(msg)
+        ));
     }
 
-    let parts = google_response_parts(&gemini_json)?;
-    let text = extract_google_text(parts)?;
+    let parts = google_response_parts(&gemini_json)
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+    let text = extract_google_text(parts)
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
 
     // #788: surface Gemini SAFETY / RECITATION / BLOCKLIST blocks via the pure helper.
     let GoogleFinishClassification {
@@ -1322,14 +1337,15 @@ async fn handle_google_response(
         user_error,
     } = classify_google_finish_reason(&gemini_json, text.len());
     if let Some(msg) = user_error {
-        send_event!(tx, AppEvent::ApiError(msg));
+        send_event!(tx, AppEvent::ApiError(headers.sanitize_diagnostic(&msg)));
     }
 
     if !text.is_empty() {
         send_event!(tx, AppEvent::StreamText(text.clone()));
     }
 
-    let tool_calls = extract_google_tool_calls_from_parts(parts)?;
+    let tool_calls = extract_google_tool_calls_from_parts(parts)
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
     let (input_tokens, output_tokens) = extract_google_usage(&gemini_json);
 
     // Execute tool calls if any
@@ -1448,6 +1464,7 @@ fn handle_sse_timeout(
 struct SseStreamParams<'a> {
     run_context: Arc<tools::ToolRunContext>,
     response: reqwest::Response,
+    headers: &'a crate::secrets::SensitiveHeaders,
     provider: &'a str,
     model_identity: &'a str,
     memory_db: Option<Arc<MemoryDb>>,
@@ -1465,6 +1482,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
     let SseStreamParams {
         run_context,
         response,
+        headers: _,
         provider,
         model_identity,
         memory_db,
@@ -1491,7 +1509,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
-                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}")));
+                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}").into()));
                 break;
             }
             Ok(None) => break,
@@ -1816,12 +1834,12 @@ fn parse_responses_function_call(item: &Value) -> Result<Option<ToolCall>, Strin
         .and_then(Value::as_str)
         .or_else(|| item.get("id").and_then(Value::as_str))
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| format!("Responses function_call missing call_id: {item}"))?;
+        .ok_or_else(|| "Responses function_call missing call_id".to_string())?;
     let name = item
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| format!("Responses function_call missing name: {item}"))?;
+        .ok_or_else(|| "Responses function_call missing name".to_string())?;
     let arguments = item
         .get("arguments")
         .and_then(Value::as_str)
@@ -1914,6 +1932,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
     let SseStreamParams {
         run_context,
         response,
+        headers,
         model_identity,
         memory_db,
         app_config,
@@ -1938,7 +1957,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
-                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}")));
+                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}").into()));
                 break;
             }
             Ok(None) => break,
@@ -1955,14 +1974,17 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
 
         let json = serde_json::from_str::<Value>(&sse.data)
             .map_err(|err| format!("Failed to parse Responses SSE event: {err}"))?;
+        let action = process_responses_sse_event(&json)
+            .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
         let done = dispatch_responses_action(
-            process_responses_sse_event(&json)?,
+            action,
             &mut full_content,
             &mut reasoning_content,
             &mut tool_calls,
             &mut stream_usage,
             tx,
-        )?;
+        )
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
         if done {
             break;
         }

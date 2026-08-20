@@ -13,6 +13,15 @@
 
 use chrono::{Duration, Utc};
 use openclaudia::oauth::{AuthMode, OAuthCredentials, OAuthSession, OAuthStore, PkceParams};
+use openclaudia::secrets::OAuthToken;
+
+fn authorization_state(pkce: &PkceParams) -> String {
+    url::Url::parse(&pkce.build_auth_url())
+        .expect("authorization URL")
+        .query_pairs()
+        .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+        .expect("state query parameter")
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — Challenge store/take round-trip
@@ -22,12 +31,12 @@ use openclaudia::oauth::{AuthMode, OAuthCredentials, OAuthSession, OAuthStore, P
 fn store_and_take_challenge_roundtrip_by_state() {
     let store = OAuthStore::new();
     let pkce = PkceParams::generate();
-    let state = pkce.state.clone();
+    let state = authorization_state(&pkce);
     let verifier = pkce.verifier.clone();
     store.store_challenge(pkce);
 
     let taken = store.take_challenge(&state).expect("present");
-    assert_eq!(taken.state, state);
+    assert!(taken.state.matches(&state));
     assert_eq!(taken.verifier, verifier);
 }
 
@@ -44,7 +53,7 @@ fn take_challenge_consumes_entry_so_second_take_returns_none() {
     // call returns None (CSRF state is single-use).
     let store = OAuthStore::new();
     let pkce = PkceParams::generate();
-    let state = pkce.state.clone();
+    let state = authorization_state(&pkce);
     store.store_challenge(pkce);
 
     let first = store.take_challenge(&state);
@@ -58,8 +67,8 @@ fn multiple_challenges_for_distinct_states_coexist() {
     let store = OAuthStore::new();
     let p1 = PkceParams::generate();
     let p2 = PkceParams::generate();
-    let s1 = p1.state.clone();
-    let s2 = p2.state.clone();
+    let s1 = authorization_state(&p1);
+    let s2 = authorization_state(&p2);
     assert_ne!(s1, s2, "PKCE states MUST be distinct");
     store.store_challenge(p1);
     store.store_challenge(p2);
@@ -75,8 +84,8 @@ fn fresh_session(id: &str) -> OAuthSession {
     OAuthSession {
         id: id.to_string(),
         credentials: OAuthCredentials {
-            access_token: "test-token-167".to_string(),
-            refresh_token: Some("refresh-167".to_string()),
+            access_token: OAuthToken::try_from_string("test-token-167".to_string()).unwrap(),
+            refresh_token: Some(OAuthToken::try_from_string("refresh-167".to_string()).unwrap()),
             expires_at: Utc::now() + Duration::hours(1),
         },
         api_key: None,
@@ -123,15 +132,15 @@ fn store_session_with_same_id_overwrites() {
     // PINS UPSERT: store_session with same id replaces prior.
     let store = OAuthStore::new();
     let mut s1 = fresh_session("session-167-c");
-    s1.credentials.access_token = "token-v1".to_string();
+    s1.credentials.access_token = OAuthToken::try_from_string("token-v1".to_string()).unwrap();
     store.store_session(s1);
 
     let mut s2 = fresh_session("session-167-c");
-    s2.credentials.access_token = "token-v2".to_string();
+    s2.credentials.access_token = OAuthToken::try_from_string("token-v2".to_string()).unwrap();
     store.store_session(s2);
 
     let retrieved = store.get_session("session-167-c").expect("present");
-    assert_eq!(retrieved.credentials.access_token, "token-v2");
+    assert!(retrieved.credentials.access_token.matches("token-v2"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -141,7 +150,7 @@ fn store_session_with_same_id_overwrites() {
 #[test]
 fn credentials_expired_when_expires_at_in_past() {
     let creds = OAuthCredentials {
-        access_token: "x".to_string(),
+        access_token: OAuthToken::try_from_string("x".to_string()).unwrap(),
         refresh_token: None,
         expires_at: Utc::now() - Duration::hours(1),
     };
@@ -151,7 +160,7 @@ fn credentials_expired_when_expires_at_in_past() {
 #[test]
 fn credentials_not_expired_when_expires_at_in_future() {
     let creds = OAuthCredentials {
-        access_token: "x".to_string(),
+        access_token: OAuthToken::try_from_string("x".to_string()).unwrap(),
         refresh_token: None,
         expires_at: Utc::now() + Duration::hours(1),
     };
@@ -161,7 +170,7 @@ fn credentials_not_expired_when_expires_at_in_future() {
 #[test]
 fn credentials_far_future_not_expired() {
     let creds = OAuthCredentials {
-        access_token: "x".to_string(),
+        access_token: OAuthToken::try_from_string("x".to_string()).unwrap(),
         refresh_token: None,
         expires_at: Utc::now() + Duration::days(365),
     };
@@ -171,7 +180,7 @@ fn credentials_far_future_not_expired() {
 #[test]
 fn credentials_far_past_expired() {
     let creds = OAuthCredentials {
-        access_token: "x".to_string(),
+        access_token: OAuthToken::try_from_string("x".to_string()).unwrap(),
         refresh_token: None,
         expires_at: Utc::now() - Duration::days(365),
     };
@@ -234,7 +243,7 @@ fn distinct_stores_have_independent_challenge_state() {
     let store_a = OAuthStore::new();
     let store_b = OAuthStore::new();
     let pkce = PkceParams::generate();
-    let state = pkce.state.clone();
+    let state = authorization_state(&pkce);
     store_a.store_challenge(pkce);
     // store_b knows nothing about it.
     assert!(store_b.take_challenge(&state).is_none());

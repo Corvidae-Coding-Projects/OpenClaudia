@@ -49,18 +49,14 @@ pub(crate) const MAX_WEB_FETCH_BYTES: usize = 10 * 1024 * 1024;
 ///    aborts the moment the running total would exceed `cap`. This catches
 ///    servers that lie about (or omit) `Content-Length`.
 ///
-/// The error message names the configured cap and the offending URL so the
-/// failure is greppable in production logs.
-pub(crate) async fn read_bounded_text(
-    response: Response,
-    cap: usize,
-    url: &str,
-) -> Result<String, String> {
+/// The error message names the observed size and configured cap without
+/// retaining the requested URL, which may contain signed query credentials.
+pub(crate) async fn read_bounded_text(response: Response, cap: usize) -> Result<String, String> {
     // Pre-flight: trust server-advertised Content-Length when present.
     if let Some(advertised) = response.content_length() {
         if advertised > cap as u64 {
             return Err(format!(
-                "Response too large: {advertised} bytes exceeds cap {cap} at URL {url}"
+                "Response too large: {advertised} bytes exceeds cap {cap}"
             ));
         }
     }
@@ -73,7 +69,7 @@ pub(crate) async fn read_bounded_text(
         total = total.saturating_add(chunk.len());
         if total > cap {
             return Err(format!(
-                "Response too large: {total} bytes exceeds cap {cap} at URL {url}"
+                "Response too large: {total} bytes exceeds cap {cap}"
             ));
         }
         buf.extend_from_slice(&chunk);
@@ -560,7 +556,7 @@ pub async fn fetch_url(
     let direct_err = match fetch_url_direct(url).await {
         Ok(result) => return Ok(result),
         Err(e) => {
-            tracing::info!("direct fetch failed for {url}: {e}; falling back to headless browser");
+            tracing::info!("direct fetch failed: {e}; falling back to headless browser");
             e
         }
     };
@@ -638,7 +634,7 @@ async fn fetch_url_direct(url: &str) -> Result<FetchResult, String> {
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("text/html") || ct.contains("application/xhtml"));
 
-    let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES, url).await?;
+    let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES).await?;
 
     let (content, title) = if is_html {
         let title = extract_html_title(&body);
@@ -792,10 +788,9 @@ pub fn search_bing(
 
     if html.len() > MAX_WEB_FETCH_BYTES {
         return Err(format!(
-            "Response too large: {} bytes exceeds cap {} at URL {}",
+            "Response too large: {} bytes exceeds cap {}",
             html.len(),
-            MAX_WEB_FETCH_BYTES,
-            search_url
+            MAX_WEB_FETCH_BYTES
         ));
     }
 
@@ -853,7 +848,7 @@ pub fn parse_bing_results_from_html(html: &str, limit: usize) -> Result<Vec<Sear
         let url = decode_bing_ck_url(&raw_href);
         // SSRF guard — same threat model as the DDG path.
         if let Err(reason) = validate_url(&url) {
-            tracing::debug!(url = %url, reason = %reason, "Bing result URL dropped by SSRF guard");
+            tracing::debug!(reason = %reason, "Bing result URL dropped by SSRF guard");
             continue;
         }
         let snippet = el
@@ -981,10 +976,9 @@ pub fn search_duckduckgo(
     // materialize multi-GB DOMs from hostile pages; refuse to propagate that.
     if html.len() > MAX_WEB_FETCH_BYTES {
         return Err(format!(
-            "Response too large: {} bytes exceeds cap {} at URL {}",
+            "Response too large: {} bytes exceeds cap {}",
             html.len(),
-            MAX_WEB_FETCH_BYTES,
-            search_url
+            MAX_WEB_FETCH_BYTES
         ));
     }
 
@@ -1077,7 +1071,6 @@ pub fn parse_duckduckgo_results_from_html(
             // could embed private-IP / metadata URLs in result hrefs.
             if let Err(reason) = validate_url(&url) {
                 tracing::debug!(
-                    url = %url,
                     reason = %reason,
                     "DDG result URL dropped by SSRF guard"
                 );
@@ -1175,10 +1168,9 @@ pub fn fetch_with_browser(url: &str, browser_scratch_root: &Path) -> Result<Fetc
     // DOM through headless Chrome, so refuse anything past the configured cap.
     if html.len() > MAX_WEB_FETCH_BYTES {
         return Err(format!(
-            "Response too large: {} bytes exceeds cap {} at URL {}",
+            "Response too large: {} bytes exceeds cap {}",
             html.len(),
-            MAX_WEB_FETCH_BYTES,
-            url
+            MAX_WEB_FETCH_BYTES
         ));
     }
 
@@ -1726,7 +1718,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let out = read_bounded_text(response, 8 * 1024, &url).await.unwrap();
+        let out = read_bounded_text(response, 8 * 1024).await.unwrap();
         assert_eq!(out, body, "small body must be returned verbatim");
     }
 
@@ -1764,7 +1756,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let err = read_bounded_text(response, MAX_WEB_FETCH_BYTES, &url)
+        let err = read_bounded_text(response, MAX_WEB_FETCH_BYTES)
             .await
             .expect_err("11 MiB body must trip the 10 MiB cap");
         assert!(
@@ -1776,8 +1768,8 @@ mod tests {
             "error must name the cap ({MAX_WEB_FETCH_BYTES}): {err}"
         );
         assert!(
-            err.contains(&url),
-            "error must include the offending URL ({url}): {err}"
+            !err.contains(&url),
+            "error must not retain URL {url}: {err}"
         );
     }
 
@@ -1808,7 +1800,7 @@ mod tests {
             .unwrap();
         // Cap > body so the streaming accumulator drains every chunk; the test
         // proves the running total stays accurate across multiple chunks.
-        let out = read_bounded_text(response, MAX_WEB_FETCH_BYTES, &url)
+        let out = read_bounded_text(response, MAX_WEB_FETCH_BYTES)
             .await
             .unwrap();
         assert_eq!(
@@ -1853,7 +1845,7 @@ mod tests {
             "wiremock did not honor the advertised Content-Length header"
         );
         let cap: usize = 1024 * 1024; // 1 MiB cap, well under the advertised size.
-        let err = read_bounded_text(response, cap, &url)
+        let err = read_bounded_text(response, cap)
             .await
             .expect_err("pre-flight Content-Length check must reject");
         assert!(
@@ -1869,8 +1861,8 @@ mod tests {
             "pre-flight error must echo the cap ({cap}): {err}"
         );
         assert!(
-            err.contains(&url),
-            "pre-flight error must echo the URL ({url}): {err}"
+            !err.contains(&url),
+            "error must not retain URL {url}: {err}"
         );
     }
 

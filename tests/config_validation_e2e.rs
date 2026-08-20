@@ -257,18 +257,18 @@ fn validate_base_url_refuses_non_http_schemes() {
 }
 
 #[test]
-fn validate_base_url_message_carries_url_for_diagnostics() {
-    // The error message must include the offending URL string so
-    // log consumers can pivot on it without re-deriving from
-    // context.
-    let url = "http://127.0.0.1/";
-    let Err(msg) = validate_base_url(url) else {
+fn validate_base_url_message_is_actionable_without_echoing_signed_url() {
+    let sentinel = "provider-url-query-secret-sentinel";
+    let url = format!("http://127.0.0.1/private?signature={sentinel}");
+    let Err(msg) = validate_base_url(&url) else {
         panic!("loopback must be refused");
     };
     assert!(
-        msg.contains(url),
-        "error message must include offending URL; got {msg:?}"
+        msg.contains("provider base_url rejected") && msg.contains("reserved/internal"),
+        "error message must retain the rejection class; got {msg:?}"
     );
+    assert!(!msg.contains(sentinel), "signed query leaked: {msg:?}");
+    assert!(!msg.contains(&url), "full provider URL leaked: {msg:?}");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -790,7 +790,7 @@ fn load_config_accepts_provider_api_key_env_aliases() {
             .api_key
             .as_ref()
             .unwrap_or_else(|| panic!("{provider} alias key must be discovered"));
-        assert_eq!(actual_key.as_str(), expected_key);
+        assert!(actual_key.matches(expected_key));
     }
 }
 
@@ -833,7 +833,7 @@ fn load_config_accepts_advertised_prefixed_provider_api_keys() {
             .api_key
             .as_ref()
             .unwrap_or_else(|| panic!("{provider} prefixed key must be discovered"));
-        assert_eq!(actual_key.as_str(), expected_key);
+        assert!(actual_key.matches(expected_key));
     }
 }
 
