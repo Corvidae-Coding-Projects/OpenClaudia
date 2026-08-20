@@ -8532,21 +8532,6 @@
         }
       }
     },
-    "56dbec07-0948-4ee0-acf8-bedcb9b330e5": {
-      "uuid": "56dbec07-0948-4ee0-acf8-bedcb9b330e5",
-      "display_id": 1052,
-      "title": "S-005: Replace generic environment-key rewriting",
-      "description": "Implement only docs/remediation-slices/005-typed-environment-config-loading.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
-      "status": "open",
-      "priority": "high",
-      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
-      "created_by": "6Vw9",
-      "created_at": "2026-08-20T22:12:40.483882778Z",
-      "updated_at": "2026-08-20T22:12:45.114302208Z",
-      "labels": [
-        "remediation"
-      ]
-    },
     "56ea4dfe-2e7e-49cf-849c-5fa766bfb291": {
       "uuid": "56ea4dfe-2e7e-49cf-849c-5fa766bfb291",
       "display_id": 372,
@@ -24644,6 +24629,9 @@
       }
     }
   },
+  "deleted_issues": [
+    "56dbec07-0948-4ee0-acf8-bedcb9b330e5"
+  ],
   "next_milestone_id": 1,
   "unsigned_event_warnings": [
     {
@@ -27185,11 +27173,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 501,
       "timestamp": "2026-08-20T22:13:04.163267838Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 502,
+      "timestamp": "2026-08-20T22:13:27.622627705Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:13:04.163267838Z",
+    "timestamp": "2026-08-20T22:13:27.622627705Z",
     "agent_id": "6Vw9",
-    "agent_seq": 501
+    "agent_seq": 502
   }
 }
