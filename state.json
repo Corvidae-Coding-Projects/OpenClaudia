@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1055,
+  "next_display_id": 1056,
   "next_comment_id": 931,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -251,6 +251,7 @@
     "41e1f98b-c3f6-4417-a3c8-4bdd5eba3b3d": 613,
     "42726f25-85f0-4b31-972d-735853de0f6a": 387,
     "43265524-414f-4c00-9711-6e353b637950": 623,
+    "433d299e-564b-4493-9c25-83782587c66e": 1055,
     "437da932-14ad-476d-85d5-f8342043107b": 203,
     "43b5fb1a-e89f-4f0d-8401-8bc1622b2b81": 309,
     "4487296f-3515-465c-89da-e48d899bb322": 338,
@@ -7129,6 +7130,17 @@
         "cc-parity",
         "feature"
       ]
+    },
+    "433d299e-564b-4493-9c25-83782587c66e": {
+      "uuid": "433d299e-564b-4493-9c25-83782587c66e",
+      "display_id": 1055,
+      "title": "Make sandboxed worktree tests support linked checkout git metadata",
+      "description": "Running the locked all-feature/all-target suite from a linked worktree deterministically fails six src/tools/worktree.rs unit tests. ToolRunContext::test_run_context roots the GitWorktree sandbox at env!(CARGO_MANIFEST_DIR), while a linked worktree .git file points to the common gitdir outside that capability. Sandboxed git therefore reports not inside a repository although host git rev-parse succeeds. Observed from /home/doll/OpenClaudia/.worktrees/s004-startup-migrations at baseline 9194ac26 during S-004 verification: 2637 library tests passed, 6 failed, 1 ignored. Fix should preserve sandbox authority and add linked-worktree runtime coverage; do not broaden the sandbox to arbitrary host paths.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "s004-wave",
+      "created_at": "2026-08-20T22:59:13.451175121Z",
+      "updated_at": "2026-08-20T22:59:13.451175121Z"
     },
     "437da932-14ad-476d-85d5-f8342043107b": {
       "uuid": "437da932-14ad-476d-85d5-f8342043107b",
@@ -27289,11 +27301,16 @@
       "agent_id": "s005-wave",
       "agent_seq": 2,
       "timestamp": "2026-08-20T22:50:39.097528222Z"
+    },
+    {
+      "agent_id": "s004-wave",
+      "agent_seq": 6,
+      "timestamp": "2026-08-20T22:59:13.451175121Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:50:39.097528222Z",
-    "agent_id": "s005-wave",
-    "agent_seq": 2
+    "timestamp": "2026-08-20T22:59:13.451175121Z",
+    "agent_id": "s004-wave",
+    "agent_seq": 6
   }
 }
