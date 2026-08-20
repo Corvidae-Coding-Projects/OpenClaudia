@@ -1,6 +1,6 @@
 {
   "next_display_id": 1037,
-  "next_comment_id": 849,
+  "next_comment_id": 850,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4807,7 +4807,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T02:55:47.605967098Z",
-      "updated_at": "2026-08-20T04:59:33.248692214Z",
+      "updated_at": "2026-08-20T04:59:49.373103849Z",
       "labels": [
         "remediation"
       ],
@@ -4847,6 +4847,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAvZ+5Pqk2aZRT9kKMGHyJNKLHvUSS/CP1HxhJTmtoSstN7aybv/v4lYzmGWLtrlHHpZUvxfhXTO9C68VB/8HsCw=="
+        },
+        "74ec98b7-3a04-4071-be68-a27329dfedce": {
+          "display_id": 849,
+          "author": "6Vw9",
+          "content": "Bookkeeping: the normal close generated the canonical CHANGELOG entry and released the active lock before the repository commit hook ran. Reopened only to let the verified commit remain associated with its owning issue; after recording the commit result, this issue will be reclosed with --no-changelog so the machine-generated entry is neither duplicated nor hand-edited.",
+          "created_at": "2026-08-20T04:59:49.370435974Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKlZD7Rh9rrdWFt8Y2KAj7K/GjTa3q7su5Fy8NnqTWx4LgC3R8B07gYrlAwCDZjUkLbknzCw05r3XjynEMTXcDg=="
         },
         "7cbe9912-68ed-468d-9527-857ba928e8c4": {
           "display_id": 847,
@@ -25228,11 +25237,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 316,
       "timestamp": "2026-08-20T04:59:40.286819424Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 317,
+      "timestamp": "2026-08-20T04:59:49.373103849Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T04:59:40.286819424Z",
+    "timestamp": "2026-08-20T04:59:49.373103849Z",
     "agent_id": "6Vw9",
-    "agent_seq": 316
+    "agent_seq": 317
   }
 }
