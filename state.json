@@ -1,6 +1,6 @@
 {
   "next_display_id": 1045,
-  "next_comment_id": 900,
+  "next_comment_id": 901,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6354,10 +6354,24 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:09:55.024359Z",
-      "updated_at": "2026-08-20T19:10:00.465414662Z",
+      "updated_at": "2026-08-20T19:10:19.564171872Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "1c318c3c-dc2b-4c49-a82e-fd6d76380c3e": {
+          "display_id": 900,
+          "author": "6Vw9",
+          "content": "Blocked: no active issue",
+          "created_at": "2026-08-20T19:10:19.561743368Z",
+          "kind": "intervention",
+          "trigger_type": "tool_blocked",
+          "intervention_context": "Starting S-031 preflight: locate AGENTS.md, the slice document, and applicable skill files.",
+          "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        }
+      }
     },
     "39d0cba4-ed67-4af6-9888-8cae54d06979": {
       "uuid": "39d0cba4-ed67-4af6-9888-8cae54d06979",
@@ -26451,11 +26465,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 438,
       "timestamp": "2026-08-20T19:10:07.256886981Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 439,
+      "timestamp": "2026-08-20T19:10:19.564171872Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T19:10:07.256886981Z",
+    "timestamp": "2026-08-20T19:10:19.564171872Z",
     "agent_id": "6Vw9",
-    "agent_seq": 438
+    "agent_seq": 439
   }
 }
