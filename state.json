@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1053,
+  "next_display_id": 1054,
   "next_comment_id": 924,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -918,6 +918,7 @@
     "f0d12bc0-8efa-4a9c-8773-3bcc683dab49": 216,
     "f0e05f57-17ac-4549-8b68-dd24de4bb185": 444,
     "f0ea2e8a-0ec0-48a7-adaf-f8ba79a5dcdd": 995,
+    "f0fcde99-6fa2-49f3-8864-11024b80aa91": 1053,
     "f125cf3e-3542-4e1e-b217-a2f1e7a8f5b9": 734,
     "f127347b-fb63-4d7b-99da-95b218e24856": 592,
     "f12ffba4-e3aa-4ea2-82dd-8fc35466685c": 648,
@@ -18220,7 +18221,10 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:36.514810569Z",
-      "updated_at": "2026-08-20T22:12:36.514810569Z"
+      "updated_at": "2026-08-20T22:12:48.969658585Z",
+      "labels": [
+        "remediation"
+      ]
     },
     "ba9ccb18-bbec-47ab-8c87-8a06f64e8525": {
       "uuid": "ba9ccb18-bbec-47ab-8c87-8a06f64e8525",
@@ -23231,6 +23235,18 @@
         }
       }
     },
+    "f0fcde99-6fa2-49f3-8864-11024b80aa91": {
+      "uuid": "f0fcde99-6fa2-49f3-8864-11024b80aa91",
+      "display_id": 1053,
+      "title": "S-001: Build the capability evidence registry",
+      "description": "Implement only docs/remediation-slices/001-capability-evidence-registry.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T22:12:49.070729979Z",
+      "updated_at": "2026-08-20T22:12:49.070729979Z"
+    },
     "f125cf3e-3542-4e1e-b217-a2f1e7a8f5b9": {
       "uuid": "f125cf3e-3542-4e1e-b217-a2f1e7a8f5b9",
       "display_id": 734,
@@ -27125,11 +27141,21 @@
       "agent_id": "6Vw9",
       "agent_seq": 499,
       "timestamp": "2026-08-20T22:12:45.114302208Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 498,
+      "timestamp": "2026-08-20T22:12:48.969658585Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 498,
+      "timestamp": "2026-08-20T22:12:49.070729979Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:12:45.114302208Z",
+    "timestamp": "2026-08-20T22:12:49.070729979Z",
     "agent_id": "6Vw9",
-    "agent_seq": 499
+    "agent_seq": 498
   }
 }
