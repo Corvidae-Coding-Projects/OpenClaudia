@@ -1,6 +1,6 @@
 {
   "next_display_id": 1057,
-  "next_comment_id": 944,
+  "next_comment_id": 945,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11440,7 +11440,7 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:26.926561528Z",
-      "updated_at": "2026-08-20T23:49:33.546054589Z",
+      "updated_at": "2026-08-20T23:52:09.149590267Z",
       "labels": [
         "remediation"
       ],
@@ -11462,6 +11462,15 @@
           "kind": "decision",
           "signed_by": "SHA256:aYyc+2g0o8C/BrTc8XRSOz9rn0QmRPd7Yf3dQfWyvZ4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg91tlCd5BDW96nHQ90mDKp3ek6NoO80GC7KGanAji4wIAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAbei20bND8/D0Gage19aN/of4KxJn+WlFc/rQTh37vpSNlP5dciXIpt81CD8CsrzPbDY+3DklvqpzPcekUMM0Aw=="
+        },
+        "78aadc71-0dfa-4761-b241-79f17b9a7c88": {
+          "display_id": 944,
+          "author": "s004-wave",
+          "content": "type=result; slice=S-004; commit=8676953fbbdadc426c95e1aa22af769607661343; subject=fix(migrations): fail closed at startup; signature=verified_good_ssh_ED25519_SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A; files=9_scoped_only; status=clean; hook_cargo=false; focused_lib=19_passed_0_failed; focused_e2e=5_passed_0_failed; locked_check=pass; strict_clippy=pass; full_suite=2638_passed_6_known_1055_failed_1_ignored_no_new_or_S004_failures; windows_gnu=pass; artifact_manifest_sha256=1fec41e64efd88edcc57f2529d90fd1a7da4cf71b05c4fb09d8520d7dfe435fe; terminal=implemented_adversarially_reviewed_VDD_pending; issue=remain_open; push=false",
+          "created_at": "2026-08-20T23:52:09.147083731Z",
+          "kind": "result",
+          "signed_by": "SHA256:aYyc+2g0o8C/BrTc8XRSOz9rn0QmRPd7Yf3dQfWyvZ4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg91tlCd5BDW96nHQ90mDKp3ek6NoO80GC7KGanAji4wIAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAx6wk7X73qKNs77yntsSBZ+UxLX3Vi5GG6eP7M5BaME2PrlaTi7f/bIX241LqDjHY0MooBiHzP4jhKMzHW4ptBA=="
         },
         "963f0cf4-42a8-4c0b-94d1-7b4addaa0c44": {
           "display_id": 926,
@@ -27523,11 +27532,16 @@
       "agent_id": "s004-wave",
       "agent_seq": 11,
       "timestamp": "2026-08-20T23:52:05.016302597Z"
+    },
+    {
+      "agent_id": "s004-wave",
+      "agent_seq": 12,
+      "timestamp": "2026-08-20T23:52:09.149590267Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T23:52:05.016302597Z",
+    "timestamp": "2026-08-20T23:52:09.149590267Z",
     "agent_id": "s004-wave",
-    "agent_seq": 11
+    "agent_seq": 12
   }
 }
