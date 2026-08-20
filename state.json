@@ -1,6 +1,6 @@
 {
   "next_display_id": 1056,
-  "next_comment_id": 931,
+  "next_comment_id": 932,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18290,11 +18290,20 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:36.514810569Z",
-      "updated_at": "2026-08-20T22:50:39.097528222Z",
+      "updated_at": "2026-08-20T23:02:06.940282464Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "0fe4b106-150c-431b-a921-23404785cab4": {
+          "display_id": 931,
+          "author": "s005-wave",
+          "content": "S-005 decision amendment: do not use ConfigBuilder::set_override for typed environment tables. config 0.15 deep-merges table overrides, which would retain lower-precedence headers/MCP grants/tool caps and violate whole-field precedence. Files/defaults are built into untyped Config first; the finite registry then replaces the exact cache field (with exact env-name origin) before AppConfig deserialization. This still lets valid environment leaves repair malformed lower-file leaves, while arrays/maps replace rather than merge. The earlier receipt wording final builder overrides is superseded by this exact pre-deserialization replacement.",
+          "created_at": "2026-08-20T23:02:06.936205405Z",
+          "kind": "decision",
+          "signed_by": "SHA256:GnnQNPlvNEZp35JadXiNDA+I/8ohf5UCKkSJrMb/gew",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgSjog0F9LUCbKsv62g2BnSf4fH0D7kCW68xbgp+h6bYUAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwO8xQUV/jT/N9g0+ytdFb7wmpZcIqGWIpBc8/9dPexq9NtebHYhdTQuQF8AYZ5nswiP3Ajyt6JKIfrTQeRcuAw=="
+        },
         "61773e12-6e41-4880-b464-4ddd02bbe9b1": {
           "display_id": 930,
           "author": "s005-wave",
@@ -27314,11 +27323,16 @@
       "agent_id": "s004-wave",
       "agent_seq": 7,
       "timestamp": "2026-08-20T22:59:18.073500549Z"
+    },
+    {
+      "agent_id": "s005-wave",
+      "agent_seq": 3,
+      "timestamp": "2026-08-20T23:02:06.940282464Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:59:18.073500549Z",
-    "agent_id": "s004-wave",
-    "agent_seq": 7
+    "timestamp": "2026-08-20T23:02:06.940282464Z",
+    "agent_id": "s005-wave",
+    "agent_seq": 3
   }
 }
