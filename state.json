@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1054,
+  "next_display_id": 1055,
   "next_comment_id": 924,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -551,6 +551,7 @@
     "92ed36bf-348d-429d-b8ee-2ac246fe9be7": 686,
     "945f612e-8551-4eac-901b-6e0ed7502443": 211,
     "94959489-5f9d-4d7a-91fb-051d5bf091b5": 246,
+    "94b073f3-de76-44ad-9f8b-3602f664d056": 1054,
     "9516998e-c489-4d6e-9db6-2fd859d957f7": 139,
     "9519f539-5008-4db4-b5c1-594f946a52cb": 839,
     "954b6a50-e1c4-4762-ac37-ed854410ea1b": 605,
@@ -14207,6 +14208,18 @@
         "refactor"
       ]
     },
+    "94b073f3-de76-44ad-9f8b-3602f664d056": {
+      "uuid": "94b073f3-de76-44ad-9f8b-3602f664d056",
+      "display_id": 1054,
+      "title": "S-004: Make startup migrations fail closed",
+      "description": "Implement only docs/remediation-slices/004-startup-migrations-fail-closed.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T22:13:00.153079217Z",
+      "updated_at": "2026-08-20T22:13:00.153079217Z"
+    },
     "9516998e-c489-4d6e-9db6-2fd859d957f7": {
       "uuid": "9516998e-c489-4d6e-9db6-2fd859d957f7",
       "display_id": 139,
@@ -27159,11 +27172,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 499,
       "timestamp": "2026-08-20T22:12:51.062078582Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 500,
+      "timestamp": "2026-08-20T22:13:00.153079217Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:12:51.062078582Z",
+    "timestamp": "2026-08-20T22:13:00.153079217Z",
     "agent_id": "6Vw9",
-    "agent_seq": 499
+    "agent_seq": 500
   }
 }
