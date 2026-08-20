@@ -1,6 +1,6 @@
 {
   "next_display_id": 1036,
-  "next_comment_id": 837,
+  "next_comment_id": 838,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -2965,7 +2965,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:59:48.372882571Z",
-      "updated_at": "2026-08-20T00:05:03.217724420Z",
+      "updated_at": "2026-08-20T00:06:46.950070349Z",
       "labels": [
         "workflow"
       ],
@@ -2978,6 +2978,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKoVBS/iJM9aHm4EUN+drq25C3I9S5ebunFSkON/FwkB+5xHINMhwltfPZJ3fN6j7AI1HYZ+TgvLIJB+5csHBCA=="
+        },
+        "f1719d48-b635-42ad-a1bd-b4eefc370157": {
+          "display_id": 837,
+          "author": "6Vw9",
+          "content": "Restored CHANGELOG.md to the last pre-rewrite machine-maintained blob and replayed 23 proven normal Crosslink close events with exact titles, categories, chronological insertion order, and repeated-close multiplicity. Nine events whose actual commands used --no-changelog were omitted. Independent removal of the replayed lines reproduces the base blob byte-for-byte; git diff --check passes. #1035 owns the closure-generated entry and commit.",
+          "created_at": "2026-08-20T00:06:46.947472941Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAs6LcDApXiqUETE7XaiNwu+NX2r34jkq1A1zL3VVP3QAY8rOQOpWdMSbnKn55s4uJbUzHYibK7Ak5y+v+AJB9CQ=="
         }
       }
     },
@@ -24980,11 +24989,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 292,
       "timestamp": "2026-08-20T00:06:37.209509302Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 293,
+      "timestamp": "2026-08-20T00:06:46.950070349Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T00:06:37.209509302Z",
+    "timestamp": "2026-08-20T00:06:46.950070349Z",
     "agent_id": "6Vw9",
-    "agent_seq": 292
+    "agent_seq": 293
   }
 }
