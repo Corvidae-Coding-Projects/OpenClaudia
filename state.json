@@ -1,6 +1,6 @@
 {
   "next_display_id": 1046,
-  "next_comment_id": 910,
+  "next_comment_id": 911,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6355,7 +6355,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:09:55.024359Z",
-      "updated_at": "2026-08-20T21:22:44.186265784Z",
+      "updated_at": "2026-08-20T21:22:50.533490663Z",
       "labels": [
         "remediation"
       ],
@@ -6398,6 +6398,15 @@
           "kind": "action",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVJWLL1uTc5zBluTSIEQt2TetLrN8hiCM2rwtf1TApTSpqGIbGaM2tDUu1GKwC+AYDvDNjExO5VeMWCkF2PjmDg=="
+        },
+        "2a807237-e5bf-43b2-af5a-44aa467628de": {
+          "display_id": 910,
+          "author": "6Vw9",
+          "content": "Commit 9194ac2 (feat(persistence): add descriptor-safe storage) delivers verified S031-G1. Checks: fmt/diff, Linux all-target check, strict all-target Clippy, full all-feature/all-target tests with zero failures, Windows GNU fail-closed check. Artifact and risks recorded in the slice.",
+          "created_at": "2026-08-20T21:22:50.531078953Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAu4qPfPEU4xYw/00nwP+bQOXzvkZhgn0/05JN42ywLOGVht/Gh93bIR11GxXV8vzxF1ogiMKIvgApgQbFOVM1Dg=="
         },
         "340895a3-bfbb-42ac-a82f-ab6f907d42e6": {
           "display_id": 902,
@@ -26646,11 +26655,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 455,
       "timestamp": "2026-08-20T21:22:44.186265784Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 456,
+      "timestamp": "2026-08-20T21:22:50.533490663Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T21:22:44.186265784Z",
+    "timestamp": "2026-08-20T21:22:50.533490663Z",
     "agent_id": "6Vw9",
-    "agent_seq": 455
+    "agent_seq": 456
   }
 }
