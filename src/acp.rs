@@ -1496,7 +1496,8 @@ impl AcpServer {
         // value). Operators raising the cap to support long-horizon
         // agents no longer need to recompile — set it via the
         // `acp.max_iterations` YAML key or the
-        // `OPENCLAUDIA_ACP_MAX_ITERATIONS` env var.
+        // `OPENCLAUDIA_ACP__MAX_ITERATIONS` env var (the exact legacy
+        // single-underscore alias remains accepted with a warning).
         let max_iterations = match crate::config::AcpConfig::load() {
             Ok(cfg) => cfg.max_iterations,
             Err(e) => {

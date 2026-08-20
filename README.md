@@ -161,6 +161,29 @@ digest-bound proposal visible in `/permissions`. Put host-selected grants in
 `--dangerously-skip-permissions` launch flag. Effect classification and hard
 host safety remain active even when prompts are disabled.
 
+Environment configuration uses `OPENCLAUDIA_`, with `__` between configuration
+levels and `_` between words inside one level. Names are matched against an
+explicit typed registry; unknown names and duplicate aliases for one field are
+startup errors. Exact pre-0.5 single-underscore names remain deprecated aliases
+for migration. Array and map values use JSON. Environment values override both
+project and trusted-home files; explicit CLI arguments override the
+environment.
+
+| Typed field | Canonical environment variable | Parse / sensitivity |
+|---|---|---|
+| `proxy.port` | `OPENCLAUDIA_PROXY__PORT` | unsigned 16-bit integer / public |
+| `session.timeout_minutes` | `OPENCLAUDIA_SESSION__TIMEOUT_MINUTES` | unsigned integer / public |
+| `session.persist_path` | `OPENCLAUDIA_SESSION__PERSIST_PATH` | non-empty path string / sensitive |
+| `vdd.tracking.log_adversary_responses` | `OPENCLAUDIA_VDD__TRACKING__LOG_ADVERSARY_RESPONSES` | `true` or `false` / sensitive |
+| `providers.openai-compatible.base_url` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__BASE_URL` | non-empty URL string / sensitive |
+| `providers.openai-compatible.api_key` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__API_KEY` | validated API key / secret |
+| `memory.team_memory_path` | `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` | non-empty path string / sensitive |
+| `web_fetch.preapproved_domains` | `OPENCLAUDIA_WEB_FETCH__PREAPPROVED_DOMAINS` | JSON string array / authority-sensitive |
+
+The complete supported-name matrix, including provider aliases, parser,
+secrecy, precedence, and deprecation metadata, is exposed by
+`openclaudia::config::environment_variable_metadata()`.
+
 ### Config File
 
 ```yaml

@@ -24,10 +24,12 @@ use std::path::Path;
 /// see no behavioural change after this module lands.
 const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
-/// Env-var override for [`AcpConfig::max_iterations`]. A non-empty,
-/// parseable `u32` wins over both the default and any value read from
-/// the YAML config file.
-pub const MAX_ITERATIONS_ENV_VAR: &str = "OPENCLAUDIA_ACP_MAX_ITERATIONS";
+/// Canonical env-var override for [`AcpConfig::max_iterations`]. The double
+/// underscore separates the `acp` namespace from the multiword field name.
+pub const MAX_ITERATIONS_ENV_VAR: &str = "OPENCLAUDIA_ACP__MAX_ITERATIONS";
+
+/// Exact pre-S-005 spelling retained as a deprecated compatibility alias.
+pub const LEGACY_MAX_ITERATIONS_ENV_VAR: &str = "OPENCLAUDIA_ACP_MAX_ITERATIONS";
 
 const fn default_max_iterations() -> u32 {
     DEFAULT_MAX_ITERATIONS
@@ -90,38 +92,97 @@ impl AcpConfig {
     /// var override is present but invalid. Missing files and absent `acp:`
     /// blocks still resolve to defaults.
     pub fn load() -> Result<Self, String> {
-        let cfg = Self::load_from_yaml_path(Path::new(".openclaudia/config.yaml"))?;
-        match std::env::var(MAX_ITERATIONS_ENV_VAR) {
-            Ok(raw) => Self::apply_env_override(cfg, &raw),
-            Err(std::env::VarError::NotPresent) => Ok(cfg),
-            Err(std::env::VarError::NotUnicode(_)) => {
+        let environment_override = Self::environment_override()?;
+        Self::load_from_yaml_path_with_override(
+            Path::new(".openclaudia/config.yaml"),
+            environment_override,
+        )
+    }
+
+    fn environment_override() -> Result<Option<u32>, String> {
+        let canonical = std::env::var(MAX_ITERATIONS_ENV_VAR);
+        let legacy = std::env::var(LEGACY_MAX_ITERATIONS_ENV_VAR);
+        match (canonical, legacy) {
+            (Ok(_), Ok(_)) => Err(format!(
+                "{MAX_ITERATIONS_ENV_VAR} and {LEGACY_MAX_ITERATIONS_ENV_VAR} ambiguously configure acp.max_iterations"
+            )),
+            (Ok(raw), Err(std::env::VarError::NotPresent)) => Self::parse_env_override(
+                MAX_ITERATIONS_ENV_VAR,
+                &raw,
+            )
+            .map(Some),
+            (Err(std::env::VarError::NotPresent), Ok(raw)) => {
+                tracing::warn!(
+                    variable = LEGACY_MAX_ITERATIONS_ENV_VAR,
+                    replacement = MAX_ITERATIONS_ENV_VAR,
+                    "deprecated OpenClaudia environment variable spelling"
+                );
+                Self::parse_env_override(LEGACY_MAX_ITERATIONS_ENV_VAR, &raw).map(Some)
+            }
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => Ok(None),
+            (Err(std::env::VarError::NotUnicode(_)), _) => {
                 Err(format!("{MAX_ITERATIONS_ENV_VAR} must be valid UTF-8"))
+            }
+            (_, Err(std::env::VarError::NotUnicode(_))) => {
+                Err(format!("{LEGACY_MAX_ITERATIONS_ENV_VAR} must be valid UTF-8"))
             }
         }
     }
 
-    /// Read the `acp:` block out of `.openclaudia/config.yaml` if the
-    /// file exists. Missing files or absent `acp:` blocks resolve to defaults.
-    fn load_from_yaml_path(path: &Path) -> Result<Self, String> {
+    fn load_from_yaml_path_with_override(
+        path: &Path,
+        environment_override: Option<u32>,
+    ) -> Result<Self, String> {
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => zeroize::Zeroizing::new(raw),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(environment_override
+                    .map_or_else(Self::default, |max_iterations| Self { max_iterations }));
+            }
             Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
         };
-        Self::load_from_yaml_str(&raw)
+        Self::load_from_yaml_str_with_override(&raw, environment_override)
     }
 
+    #[cfg(test)]
     fn load_from_yaml_str(raw: &str) -> Result<Self, String> {
-        let root: serde_yaml::Value =
+        Self::load_from_yaml_str_with_override(raw, None)
+    }
+
+    fn load_from_yaml_str_with_override(
+        raw: &str,
+        environment_override: Option<u32>,
+    ) -> Result<Self, String> {
+        let mut root: serde_yaml::Value =
             serde_yaml::from_str(raw).map_err(|e| format!("invalid YAML: {e}"))?;
         if root.is_null() {
-            return Ok(Self::default());
+            return Ok(environment_override
+                .map_or_else(Self::default, |max_iterations| Self { max_iterations }));
         }
         if !root.is_mapping() {
             return Err(format!(
                 "expected config root to be a mapping, got {}",
                 yaml_value_type_name(&root)
             ));
+        }
+        if let Some(max_iterations) = environment_override {
+            let Some(root_mapping) = root.as_mapping_mut() else {
+                return Err("expected config root to remain a mapping".to_string());
+            };
+            let acp_key = serde_yaml::Value::String("acp".to_string());
+            let acp = root_mapping
+                .entry(acp_key)
+                .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+            if !acp.is_mapping() {
+                *acp = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+            }
+            let Some(acp_mapping) = acp.as_mapping_mut() else {
+                return Err("acp config block did not remain a mapping".to_string());
+            };
+            acp_mapping.insert(
+                serde_yaml::Value::String("max_iterations".to_string()),
+                serde_yaml::Value::Number(serde_yaml::Number::from(max_iterations)),
+            );
         }
         let Some(acp) = root.get("acp") else {
             return Ok(Self::default());
@@ -131,19 +192,30 @@ impl AcpConfig {
         cfg.validate()
     }
 
-    fn apply_env_override(mut cfg: Self, raw: &str) -> Result<Self, String> {
+    #[cfg(test)]
+    fn apply_env_override(mut cfg: Self, name: &str, raw: &str) -> Result<Self, String> {
+        cfg.max_iterations = Self::parse_env_override(name, raw)?;
+        Ok(cfg)
+    }
+
+    fn parse_env_override(name: &str, raw: &str) -> Result<u32, String> {
+        if raw.len() > super::environment::MAX_ENVIRONMENT_VALUE_BYTES {
+            return Err(format!(
+                "{name} exceeds the {}-byte environment value limit",
+                super::environment::MAX_ENVIRONMENT_VALUE_BYTES
+            ));
+        }
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Ok(cfg);
+            return Err(format!("{name} must be a positive integer"));
         }
-        let parsed = trimmed.parse::<u32>().map_err(|e| {
-            format!("{MAX_ITERATIONS_ENV_VAR} must be a positive integer, got {trimmed:?}: {e}")
-        })?;
+        let parsed = trimmed
+            .parse::<u32>()
+            .map_err(|e| format!("{name} must be a positive integer: {e}"))?;
         if parsed == 0 {
-            return Err(format!("{MAX_ITERATIONS_ENV_VAR} must be at least 1"));
+            return Err(format!("{name} must be at least 1"));
         }
-        cfg.max_iterations = parsed;
-        Ok(cfg)
+        Ok(parsed)
     }
 
     fn validate(self) -> Result<Self, String> {
@@ -249,17 +321,33 @@ mod tests {
     }
 
     #[test]
+    fn environment_override_replaces_invalid_lower_precedence_file_value() {
+        let cfg = AcpConfig::load_from_yaml_str_with_override(
+            "acp:\n  max_iterations: invalid\n",
+            Some(88),
+        )
+        .expect("valid environment value must replace invalid file value");
+
+        assert_eq!(cfg.max_iterations, 88);
+    }
+
+    #[test]
     fn env_override_wins_when_positive_integer() {
-        let cfg = AcpConfig::apply_env_override(AcpConfig { max_iterations: 10 }, "200")
-            .expect("valid env override should apply");
+        let cfg = AcpConfig::apply_env_override(
+            AcpConfig { max_iterations: 10 },
+            MAX_ITERATIONS_ENV_VAR,
+            "200",
+        )
+        .expect("valid env override should apply");
 
         assert_eq!(cfg.max_iterations, 200);
     }
 
     #[test]
     fn env_override_rejects_invalid_value() {
-        let err = AcpConfig::apply_env_override(AcpConfig::default(), "many")
-            .expect_err("invalid env override must fail");
+        let err =
+            AcpConfig::apply_env_override(AcpConfig::default(), MAX_ITERATIONS_ENV_VAR, "many")
+                .expect_err("invalid env override must fail");
 
         assert!(err.contains(MAX_ITERATIONS_ENV_VAR), "{err}");
         assert!(err.contains("positive integer"), "{err}");
@@ -267,7 +355,7 @@ mod tests {
 
     #[test]
     fn env_override_rejects_zero() {
-        let err = AcpConfig::apply_env_override(AcpConfig::default(), "0")
+        let err = AcpConfig::apply_env_override(AcpConfig::default(), MAX_ITERATIONS_ENV_VAR, "0")
             .expect_err("zero env override must fail");
 
         assert!(err.contains(MAX_ITERATIONS_ENV_VAR), "{err}");
@@ -275,11 +363,25 @@ mod tests {
     }
 
     #[test]
-    fn env_override_empty_string_is_ignored() {
-        let cfg = AcpConfig::apply_env_override(AcpConfig { max_iterations: 25 }, "   ")
-            .expect("empty env override should be ignored");
+    fn env_override_empty_string_is_rejected() {
+        let error = AcpConfig::apply_env_override(
+            AcpConfig { max_iterations: 25 },
+            MAX_ITERATIONS_ENV_VAR,
+            "   ",
+        )
+        .expect_err("empty security-relevant override must fail");
 
-        assert_eq!(cfg.max_iterations, 25);
+        assert!(error.contains("positive integer"));
+    }
+
+    #[test]
+    fn env_override_is_bounded_before_parsing() {
+        let oversized = "7".repeat(super::super::environment::MAX_ENVIRONMENT_VALUE_BYTES + 1);
+        let error = AcpConfig::parse_env_override(MAX_ITERATIONS_ENV_VAR, &oversized)
+            .expect_err("oversized environment input must fail");
+
+        assert!(error.contains(MAX_ITERATIONS_ENV_VAR));
+        assert!(error.contains("environment value limit"));
     }
 
     #[test]
@@ -287,6 +389,10 @@ mod tests {
         // Guard against accidental rename: the env var is documented in
         // the module docstring above. Keep the OPENCLAUDIA_ prefix so
         // it aligns with the prefix used by the main config builder.
-        assert_eq!(MAX_ITERATIONS_ENV_VAR, "OPENCLAUDIA_ACP_MAX_ITERATIONS");
+        assert_eq!(MAX_ITERATIONS_ENV_VAR, "OPENCLAUDIA_ACP__MAX_ITERATIONS");
+        assert_eq!(
+            LEGACY_MAX_ITERATIONS_ENV_VAR,
+            "OPENCLAUDIA_ACP_MAX_ITERATIONS"
+        );
     }
 }
