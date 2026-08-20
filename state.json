@@ -1,6 +1,6 @@
 {
   "next_display_id": 1037,
-  "next_comment_id": 851,
+  "next_comment_id": 852,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4807,7 +4807,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T02:55:47.605967098Z",
-      "updated_at": "2026-08-20T05:00:03.593563208Z",
+      "updated_at": "2026-08-20T05:00:14.898737397Z",
       "labels": [
         "remediation"
       ],
@@ -4874,6 +4874,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAm2GaGjsvkp87LfgO4uKbyZnFZjO0OLUbqvUzoKycOsZ5hzF31RBBz7BH1/ZvVvtwSpyi/GYHiVwM/VMlyd7WCw=="
+        },
+        "ad1225e8-4cf9-49e5-bed8-4fec1796fc64": {
+          "display_id": 851,
+          "author": "6Vw9",
+          "content": "Commit 79d2371 refactor(guardrails): enforce run-scoped blast radius. Delivered exact-run atomic effect, mutation, changed-line, and canonical-resource reservations; mandatory target kinds; recursive traversal/disclosure enforcement; typed partial receipts for started/remote effects; lifecycle binding; config migration; and adversarial acceptance coverage. Verification: cargo fmt check, all-features/all-targets check, strict Clippy, complete all-features test suite with one build job and one test thread, and git diff check all passed. S021-G1 digest d2c9232b14b01c107bbba0ad69ef04571753ca88603a64207facc24ab970e07e.",
+          "created_at": "2026-08-20T05:00:14.896298744Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAz75y89ymfvUb5mWkuGpf9fjEHVE/933+MXHoPdWG8aJwz1CnQwc9svRpJEOx1y/tPCUJYgz+D918u+c+//jFCA=="
         },
         "b94fe85d-47a8-46fc-a25a-5373e57df480": {
           "display_id": 850,
@@ -25256,11 +25265,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 318,
       "timestamp": "2026-08-20T05:00:03.593563208Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 319,
+      "timestamp": "2026-08-20T05:00:14.898737397Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T05:00:03.593563208Z",
+    "timestamp": "2026-08-20T05:00:14.898737397Z",
     "agent_id": "6Vw9",
-    "agent_seq": 318
+    "agent_seq": 319
   }
 }
