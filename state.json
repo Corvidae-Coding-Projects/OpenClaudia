@@ -1,6 +1,6 @@
 {
   "next_display_id": 1043,
-  "next_comment_id": 896,
+  "next_comment_id": 897,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3843,7 +3843,7 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T13:48:15.060297800Z",
-      "updated_at": "2026-08-20T13:50:14.357255863Z",
+      "updated_at": "2026-08-20T19:04:20.298403425Z",
       "labels": [
         "workflow"
       ],
@@ -3868,6 +3868,18 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABApQv2aLjuQd1fUYeSRWzcpg1pZ2LRkAX5x9Er29BjuAizshlmLRSeZp2QKHIovtU9LAOJvM64h0zJUHHaRVYZDQ=="
+        },
+        "467c4c38-6ffa-482e-b6ae-005bcc845031": {
+          "display_id": 896,
+          "author": "6Vw9",
+          "content": "Attempted: final immutable S-025 artifact/diff/ancestry audit including git merge-base --is-ancestor",
+          "created_at": "2026-08-20T19:04:20.295902381Z",
+          "kind": "intervention",
+          "trigger_type": "tool_blocked",
+          "intervention_context": "Proving the published S-025 source/test/manifest artifact matches the recorded digest and that only the generated changelog changed afterward; the hook conservatively classified the read-only merge-base token as a mutation.",
+          "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2985V7X+rFsZlgDw7MvZLGLg2ZRjSqLDBP5Wabdu8XlRUYwyF9iiNg6rTS/ciBBZlOklB2zNRJ0uij/gfv08Ag=="
         },
         "745b4a76-fd16-4007-a91d-7bd7467da1e1": {
           "display_id": 892,
@@ -26302,11 +26314,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 423,
       "timestamp": "2026-08-20T19:03:31.517044749Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 424,
+      "timestamp": "2026-08-20T19:04:20.298403425Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T19:03:31.517044749Z",
+    "timestamp": "2026-08-20T19:04:20.298403425Z",
     "agent_id": "6Vw9",
-    "agent_seq": 423
+    "agent_seq": 424
   }
 }
