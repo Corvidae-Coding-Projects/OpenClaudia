@@ -6350,8 +6350,8 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:09:55.024359Z",
-      "updated_at": "2026-08-20T21:20:48.367715333Z",
-      "closed_at": "2026-08-20T21:20:36.787984304Z",
+      "updated_at": "2026-08-20T21:20:53.075234891Z",
+      "closed_at": "2026-08-20T21:20:53.075233861Z",
       "labels": [
         "remediation"
       ],
@@ -26585,11 +26585,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 449,
       "timestamp": "2026-08-20T21:20:48.367715333Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 450,
+      "timestamp": "2026-08-20T21:20:53.075234891Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T21:20:48.367715333Z",
+    "timestamp": "2026-08-20T21:20:53.075234891Z",
     "agent_id": "6Vw9",
-    "agent_seq": 449
+    "agent_seq": 450
   }
 }
