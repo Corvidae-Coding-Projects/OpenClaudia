@@ -2961,11 +2961,12 @@
       "uuid": "15a123cf-4c84-44a2-8f2c-936821bfa789",
       "display_id": 1034,
       "title": "Restore changelog to Crosslink close-event output",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:59:48.372882571Z",
-      "updated_at": "2026-08-20T00:06:46.950070349Z",
+      "updated_at": "2026-08-20T00:06:54.875157166Z",
+      "closed_at": "2026-08-20T00:06:54.875153147Z",
       "labels": [
         "workflow"
       ],
@@ -24994,11 +24995,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 293,
       "timestamp": "2026-08-20T00:06:46.950070349Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 294,
+      "timestamp": "2026-08-20T00:06:54.875157166Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T00:06:46.950070349Z",
+    "timestamp": "2026-08-20T00:06:54.875157166Z",
     "agent_id": "6Vw9",
-    "agent_seq": 293
+    "agent_seq": 294
   }
 }
