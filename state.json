@@ -1,6 +1,6 @@
 {
   "next_display_id": 1041,
-  "next_comment_id": 882,
+  "next_comment_id": 883,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13406,7 +13406,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T10:22:37.908405433Z",
-      "updated_at": "2026-08-20T13:15:12.661369730Z",
+      "updated_at": "2026-08-20T13:42:28.952999483Z",
       "labels": [
         "remediation"
       ],
@@ -13464,6 +13464,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJoCBe8b26bCyCH/vbKW5fSw8+WlgsY5gB4S3b9imZFcBHfA9FsrNiCuZVwiD3db6aODQRaA7t0zy4JJm4gGlAw=="
+        },
+        "7646d6ec-4c68-4420-b238-f00875127cd9": {
+          "display_id": 882,
+          "author": "6Vw9",
+          "content": "Implemented S-025 as artifact generation S025-G1 from baseline 4c851558987f92b378464bf55265ed8e41f2eeef. Added zeroizing typed SecretString/OAuthToken/ApiKey, SensitiveHeaders, EnvironmentGrants, SafeDiagnostic and bounded diagnostic bodies; migrated config/auth/OAuth/MCP/provider/proxy/TUI/ACP/subagent/VDD/plugin/tool boundaries; made persistence explicit and generic serialization lossy; removed payload/URL/token echoes; typed both OAuth PKCE state paths; added adversarial end-to-end coverage; and patched h2 to 0.4.16 for RUSTSEC-2026-0258. Final staged source/test/manifest digest is 22022117f2de4c29ff7c2e9834c622d4c93de32dd9a1a26847770d1c324a133a. Final gates: fmt, diff check, locked all-target check, strict Clippy, and locked all-features/all-targets tests with CARGO_BUILD_JOBS=1 and test-threads=1; 2615 library tests plus every integration/binary target passed. Skeptical review fixed unsafe positive tests and real signed-URL/PKCE-state defects. Canonical VDD remains queued to S-088; known bincode/yaml-rust unmaintained policy remains S-002.",
+          "created_at": "2026-08-20T13:42:28.948707748Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwHX0IQu+DibOixzZ4cmkY+go5jagUobI47wwxrJ/gbgQTQGYWbWYejrbarXXxRMN5l08NskqlJfG+2cxCA4uCQ=="
         },
         "9e8be278-b781-4fdb-9874-2d4e0b040ea6": {
           "display_id": 878,
@@ -25975,11 +25984,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 391,
       "timestamp": "2026-08-20T13:15:12.661369730Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 392,
+      "timestamp": "2026-08-20T13:42:28.952999483Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T13:15:12.661369730Z",
+    "timestamp": "2026-08-20T13:42:28.952999483Z",
     "agent_id": "6Vw9",
-    "agent_seq": 391
+    "agent_seq": 392
   }
 }
