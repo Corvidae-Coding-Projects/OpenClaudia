@@ -23236,21 +23236,6 @@
         }
       }
     },
-    "f0fcde99-6fa2-49f3-8864-11024b80aa91": {
-      "uuid": "f0fcde99-6fa2-49f3-8864-11024b80aa91",
-      "display_id": 1053,
-      "title": "S-001: Build the capability evidence registry",
-      "description": "Implement only docs/remediation-slices/001-capability-evidence-registry.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
-      "status": "open",
-      "priority": "high",
-      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
-      "created_by": "6Vw9",
-      "created_at": "2026-08-20T22:12:49.070729979Z",
-      "updated_at": "2026-08-20T22:12:51.062078582Z",
-      "labels": [
-        "remediation"
-      ]
-    },
     "f125cf3e-3542-4e1e-b217-a2f1e7a8f5b9": {
       "uuid": "f125cf3e-3542-4e1e-b217-a2f1e7a8f5b9",
       "display_id": 734,
@@ -24630,7 +24615,8 @@
     }
   },
   "deleted_issues": [
-    "56dbec07-0948-4ee0-acf8-bedcb9b330e5"
+    "56dbec07-0948-4ee0-acf8-bedcb9b330e5",
+    "f0fcde99-6fa2-49f3-8864-11024b80aa91"
   ],
   "next_milestone_id": 1,
   "unsigned_event_warnings": [
@@ -27178,11 +27164,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 502,
       "timestamp": "2026-08-20T22:13:27.622627705Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 503,
+      "timestamp": "2026-08-20T22:13:31.686359132Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:13:27.622627705Z",
+    "timestamp": "2026-08-20T22:13:31.686359132Z",
     "agent_id": "6Vw9",
-    "agent_seq": 502
+    "agent_seq": 503
   }
 }
