@@ -1,6 +1,6 @@
 {
   "next_display_id": 1056,
-  "next_comment_id": 932,
+  "next_comment_id": 933,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18341,10 +18341,21 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:18.214462612Z",
-      "updated_at": "2026-08-20T22:12:22.676122924Z",
+      "updated_at": "2026-08-20T23:10:31.470916406Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "ccd9cbe3-13c7-44bb-a3ef-3d6f3e5262f2": {
+          "display_id": 932,
+          "author": "s001-wave",
+          "content": "S-001 architecture decision: capability maturity is release data, not prose. Schema v1 validates typed maturity/entrypoint/effect/provenance/evidence records; operational maturity requires executable success and declared failure receipts for every reachable entrypoint. Required effects are grader-derived: must_occur needs an occurrence proof, must_not_occur needs absence in every linked scenario, and may_occur is disclosure-only. Receipts bind final-environment, effect-observation, and versioned trace-envelope digests. Trace envelopes include schema, scenario, actual success/rejection code, and ordered events. Public parsing is byte/count/string bounded. Current path grading is admitted only for in-process/no-child scenarios; concurrent/child scenarios require descriptor-safe traversal. User matrix is a deterministic registry projection. Canonical VDD remains pending S-088.",
+          "created_at": "2026-08-20T23:10:31.468322733Z",
+          "kind": "decision",
+          "signed_by": "SHA256:2Btvvp76wqPqtAO/kRlrhxJu+d2812XJLx6HIAY6Bjk",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgrR/vjQNg+dG653t49ZEccNJsea1ahJuGKbTAm5G9ejQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAd8VuiEh/NQPwzZkjmQhtePoHfGGreljCG8fmR/qmXx7kOAB61qpgucA3PtBm+eC8igqymBg++MV0jf5iuP0/DA=="
+        }
+      }
     },
     "bb3148a2-3b00-43a2-aae6-e77139dc71a3": {
       "uuid": "bb3148a2-3b00-43a2-aae6-e77139dc71a3",
@@ -27328,11 +27339,16 @@
       "agent_id": "s005-wave",
       "agent_seq": 3,
       "timestamp": "2026-08-20T23:02:06.940282464Z"
+    },
+    {
+      "agent_id": "s001-wave",
+      "agent_seq": 2,
+      "timestamp": "2026-08-20T23:10:31.470916406Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T23:02:06.940282464Z",
-    "agent_id": "s005-wave",
-    "agent_seq": 3
+    "timestamp": "2026-08-20T23:10:31.470916406Z",
+    "agent_id": "s001-wave",
+    "agent_seq": 2
   }
 }
