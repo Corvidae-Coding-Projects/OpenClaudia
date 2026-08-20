@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1049,
+  "next_display_id": 1050,
   "next_comment_id": 924,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -712,6 +712,7 @@
     "b971f4a6-d70e-43d4-b956-2ce6e5d972a3": 901,
     "b98f88b6-b944-47e2-b15f-b08e3d6b7800": 136,
     "ba9ccb18-bbec-47ab-8c87-8a06f64e8525": 789,
+    "bb0a33ca-c8fd-4773-949a-ac6b30c20346": 1049,
     "bb3148a2-3b00-43a2-aae6-e77139dc71a3": 63,
     "bb997dcf-7f32-4943-b2d3-9d886676204c": 586,
     "bbd517d2-39cc-4ccc-8834-019ad215809f": 306,
@@ -18192,6 +18193,18 @@
         "qa-review"
       ]
     },
+    "bb0a33ca-c8fd-4773-949a-ac6b30c20346": {
+      "uuid": "bb0a33ca-c8fd-4773-949a-ac6b30c20346",
+      "display_id": 1049,
+      "title": "S-001: Build the capability evidence registry",
+      "description": "Implement only docs/remediation-slices/001-capability-evidence-registry.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T22:12:18.214462612Z",
+      "updated_at": "2026-08-20T22:12:18.214462612Z"
+    },
     "bb3148a2-3b00-43a2-aae6-e77139dc71a3": {
       "uuid": "bb3148a2-3b00-43a2-aae6-e77139dc71a3",
       "display_id": 63,
@@ -27029,11 +27042,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 492,
       "timestamp": "2026-08-20T22:12:13.969541887Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 493,
+      "timestamp": "2026-08-20T22:12:18.214462612Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:12:13.969541887Z",
+    "timestamp": "2026-08-20T22:12:18.214462612Z",
     "agent_id": "6Vw9",
-    "agent_seq": 492
+    "agent_seq": 493
   }
 }
