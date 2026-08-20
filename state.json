@@ -14193,21 +14193,6 @@
         "refactor"
       ]
     },
-    "94b073f3-de76-44ad-9f8b-3602f664d056": {
-      "uuid": "94b073f3-de76-44ad-9f8b-3602f664d056",
-      "display_id": 1054,
-      "title": "S-004: Make startup migrations fail closed",
-      "description": "Implement only docs/remediation-slices/004-startup-migrations-fail-closed.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
-      "status": "open",
-      "priority": "high",
-      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
-      "created_by": "6Vw9",
-      "created_at": "2026-08-20T22:13:00.153079217Z",
-      "updated_at": "2026-08-20T22:13:04.163267838Z",
-      "labels": [
-        "remediation"
-      ]
-    },
     "9516998e-c489-4d6e-9db6-2fd859d957f7": {
       "uuid": "9516998e-c489-4d6e-9db6-2fd859d957f7",
       "display_id": 139,
@@ -24616,6 +24601,7 @@
   },
   "deleted_issues": [
     "56dbec07-0948-4ee0-acf8-bedcb9b330e5",
+    "94b073f3-de76-44ad-9f8b-3602f664d056",
     "f0fcde99-6fa2-49f3-8864-11024b80aa91"
   ],
   "next_milestone_id": 1,
@@ -27169,11 +27155,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 503,
       "timestamp": "2026-08-20T22:13:31.686359132Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 504,
+      "timestamp": "2026-08-20T22:13:36.038716507Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:13:31.686359132Z",
+    "timestamp": "2026-08-20T22:13:36.038716507Z",
     "agent_id": "6Vw9",
-    "agent_seq": 503
+    "agent_seq": 504
   }
 }
