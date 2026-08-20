@@ -15448,11 +15448,12 @@
       "display_id": 1008,
       "title": "Crosslink PostToolUse hook times out running cargo clippy",
       "description": "The generated .crosslink/integrations/hooks/post-edit-check.py treats only agent.json role=agent or provider worktree paths as agent context. This repository's active Crosslink identity has role=driver, so every Rust Write/Edit enters the non-agent branch and synchronously runs cargo clippy with subprocess timeout=30s. Claude's generated .claude/settings.json gives that PostToolUse hook only timeout=5s, causing 'PostToolUse hook (failed): hook timed out after 5s'. crosslink workflow diff confirms the hook matches the shipped default, so this is not local hook drift. Fix should keep PostToolUse bounded below the provider budget: do not run project-wide clippy synchronously, or correctly recognize managed driver sessions and defer heavyweight validation.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T02:28:35.724435440Z",
-      "updated_at": "2026-08-20T22:08:23.256976732Z",
+      "updated_at": "2026-08-20T22:08:27.198072591Z",
+      "closed_at": "2026-08-20T22:08:27.198070959Z",
       "comments": {
         "3b99c41f-c880-4c4f-8a50-e30e8ad7c9e5": {
           "display_id": 921,
@@ -26947,11 +26948,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 484,
       "timestamp": "2026-08-20T22:08:23.256976732Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 485,
+      "timestamp": "2026-08-20T22:08:27.198072591Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:08:23.256976732Z",
+    "timestamp": "2026-08-20T22:08:27.198072591Z",
     "agent_id": "6Vw9",
-    "agent_seq": 484
+    "agent_seq": 485
   }
 }
