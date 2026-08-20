@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1051,
+  "next_display_id": 1052,
   "next_comment_id": 924,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -712,6 +712,7 @@
     "b95f65d9-80d5-4c03-83be-e72784312e74": 904,
     "b971f4a6-d70e-43d4-b956-2ce6e5d972a3": 901,
     "b98f88b6-b944-47e2-b15f-b08e3d6b7800": 136,
+    "ba37e7f4-6064-4b09-9f2e-33fb320d2dcf": 1051,
     "ba9ccb18-bbec-47ab-8c87-8a06f64e8525": 789,
     "bb0a33ca-c8fd-4773-949a-ac6b30c20346": 1049,
     "bb3148a2-3b00-43a2-aae6-e77139dc71a3": 63,
@@ -18193,6 +18194,18 @@
         "qa"
       ]
     },
+    "ba37e7f4-6064-4b09-9f2e-33fb320d2dcf": {
+      "uuid": "ba37e7f4-6064-4b09-9f2e-33fb320d2dcf",
+      "display_id": 1051,
+      "title": "S-005: Replace generic environment-key rewriting",
+      "description": "Implement only docs/remediation-slices/005-typed-environment-config-loading.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T22:12:36.514810569Z",
+      "updated_at": "2026-08-20T22:12:36.514810569Z"
+    },
     "ba9ccb18-bbec-47ab-8c87-8a06f64e8525": {
       "uuid": "ba9ccb18-bbec-47ab-8c87-8a06f64e8525",
       "display_id": 789,
@@ -27081,11 +27094,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 496,
       "timestamp": "2026-08-20T22:12:30.870363389Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 497,
+      "timestamp": "2026-08-20T22:12:36.514810569Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:12:30.870363389Z",
+    "timestamp": "2026-08-20T22:12:36.514810569Z",
     "agent_id": "6Vw9",
-    "agent_seq": 496
+    "agent_seq": 497
   }
 }
