@@ -9353,11 +9353,12 @@
       "display_id": 1041,
       "title": "Commit S-025 repeated-close changelog output",
       "description": "Commit only the second machine-generated S-025 CHANGELOG.md entry emitted when #1040 was reopened for the mandatory active-issue commit hook and then normally re-closed. Preserve repeated normal-close multiplicity exactly per the established #1034/#1035 reconstruction decision; close this bookkeeping issue with --no-changelog to prevent recursion.",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T13:46:27.804922918Z",
-      "updated_at": "2026-08-20T13:47:12.387945451Z",
+      "updated_at": "2026-08-20T13:47:16.807034163Z",
+      "closed_at": "2026-08-20T13:47:16.807030740Z",
       "labels": [
         "docs"
       ],
@@ -26122,11 +26123,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 406,
       "timestamp": "2026-08-20T13:47:12.387945451Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 407,
+      "timestamp": "2026-08-20T13:47:16.807034163Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T13:47:12.387945451Z",
+    "timestamp": "2026-08-20T13:47:16.807034163Z",
     "agent_id": "6Vw9",
-    "agent_seq": 406
+    "agent_seq": 407
   }
 }
