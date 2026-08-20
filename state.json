@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1039,
+  "next_display_id": 1040,
   "next_comment_id": 870,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -808,6 +808,7 @@
     "da1ef574-8f92-4d4a-92fb-00fc4b952edc": 939,
     "da357261-d89b-4112-a776-3e8d4d055824": 402,
     "db556d7f-56ec-4c8f-80ba-e080f7f5b113": 28,
+    "db560147-e69e-4ece-a442-9f44c60bc86a": 1039,
     "db977c88-77d7-4638-ab3a-112f6ecfe4b7": 549,
     "dba4012d-f3d5-4b95-9b34-c70454fd5ae0": 53,
     "dbd81851-7e7e-481e-bf5f-7cfe66af0e5d": 627,
@@ -20053,6 +20054,17 @@
         "feature"
       ]
     },
+    "db560147-e69e-4ece-a442-9f44c60bc86a": {
+      "uuid": "db560147-e69e-4ece-a442-9f44c60bc86a",
+      "display_id": 1039,
+      "title": "Make SSRF hostname-resolution tests deterministic",
+      "description": "Several URL-validation tests exercise the synchronous system DNS resolver with public hostnames such as example.com and assert success. They can fail when CI or the developer machine has unavailable or intermittent DNS even though production correctly fails closed. S-024 removed DNS dependence from the two public-HTTPS construction tests that failed in a full run, but positive hostname-resolution coverage still needs an injectable resolver or equivalent deterministic seam. Preserve checks that every resolved address is validated and that DNS failures remain fail-closed; do not weaken SSRF policy.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T09:00:02.824842603Z",
+      "updated_at": "2026-08-20T09:00:02.824842603Z"
+    },
     "db977c88-77d7-4638-ab3a-112f6ecfe4b7": {
       "uuid": "db977c88-77d7-4638-ab3a-112f6ecfe4b7",
       "display_id": 549,
@@ -25715,11 +25727,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 367,
       "timestamp": "2026-08-20T08:00:53.612505459Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 368,
+      "timestamp": "2026-08-20T09:00:02.824842603Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T08:00:53.612505459Z",
+    "timestamp": "2026-08-20T09:00:02.824842603Z",
     "agent_id": "6Vw9",
-    "agent_seq": 367
+    "agent_seq": 368
   }
 }
