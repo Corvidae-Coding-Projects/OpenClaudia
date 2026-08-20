@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1052,
+  "next_display_id": 1053,
   "next_comment_id": 924,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -316,6 +316,7 @@
     "56beed38-7241-4119-921a-c2380b0f2926": 720,
     "56d164fd-b4d2-4723-8101-3f90d43015c2": 142,
     "56d879c7-8696-43ba-a3f6-be95b6508506": 695,
+    "56dbec07-0948-4ee0-acf8-bedcb9b330e5": 1052,
     "56ea4dfe-2e7e-49cf-849c-5fa766bfb291": 372,
     "56ef6e6e-8f37-450f-8e2c-cff01808c859": 678,
     "56f05f88-270b-405d-9eed-d1d1dec78ede": 506,
@@ -8528,6 +8529,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqUgLzZYI48Ix8dS+jkqRsh31KZ7VvfzvzUAofe4IeE5BZBLlJGU7wEk2WVNPxW/y3GGfyLzfECH2a9duRYW3BQ=="
         }
       }
+    },
+    "56dbec07-0948-4ee0-acf8-bedcb9b330e5": {
+      "uuid": "56dbec07-0948-4ee0-acf8-bedcb9b330e5",
+      "display_id": 1052,
+      "title": "S-005: Replace generic environment-key rewriting",
+      "description": "Implement only docs/remediation-slices/005-typed-environment-config-loading.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T22:12:40.483882778Z",
+      "updated_at": "2026-08-20T22:12:40.483882778Z"
     },
     "56ea4dfe-2e7e-49cf-849c-5fa766bfb291": {
       "uuid": "56ea4dfe-2e7e-49cf-849c-5fa766bfb291",
@@ -27099,11 +27112,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 497,
       "timestamp": "2026-08-20T22:12:36.514810569Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 498,
+      "timestamp": "2026-08-20T22:12:40.483882778Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:12:36.514810569Z",
+    "timestamp": "2026-08-20T22:12:40.483882778Z",
     "agent_id": "6Vw9",
-    "agent_seq": 497
+    "agent_seq": 498
   }
 }
