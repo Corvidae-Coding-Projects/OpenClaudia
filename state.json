@@ -1,6 +1,6 @@
 {
   "next_display_id": 1038,
-  "next_comment_id": 853,
+  "next_comment_id": 854,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -21522,10 +21522,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T05:12:54.104996671Z",
-      "updated_at": "2026-08-20T05:12:58.311171188Z",
+      "updated_at": "2026-08-20T05:18:34.173620865Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "148c168a-5f38-4cec-a0f3-3d758f5c05d1": {
+          "display_id": 853,
+          "author": "6Vw9",
+          "content": "S-023 implementation plan: (1) replace caller-selected Authority/append APIs with run-bound EvidenceProvenance and typed recorder producers; deserialize pre-S-023 rows only as legacy_unbound, never as proof. (2) Keep shell/tool/model content untrusted; ordinary Bash creates only a command receipt. Give QualityCheckResult a private run-bound execution proof minted only by QualityGateRunner, and accept verifier evidence only when that proof matches the current ToolRunContext. (3) Replace prose heuristics with typed final claims: outcome, file_change, command_result, verification, unsupported, or unresolved. Supported claims use claim-specific current-run receipts; deterministic rendering exposes unsupported/unresolved states. Require the structured final envelope on ACP, REPL, TUI, and subagent paths, so plain assistant prose cannot bypass the gate. (4) Preserve S-024 ownership of post-mutation artifact-generation invalidation; this slice records artifact/source bindings but does not implement dependency-closure freshness. (5) Add adversarial producer, persistence-migration, arbitrary-shell, current-run, claim-policy, and every-frontend tests; then serialized fmt/check/clippy/focused/full verification under the RAM constraints.",
+          "created_at": "2026-08-20T05:18:34.170241190Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGUYXIsirUTvGlFdRQ+1C4NiP04u6oN/daNnSRVKGQVSfs8cDx0sLAn4Edsbfi85w2a1v/NE37AaWTfofd/wBDg=="
+        }
+      }
     },
     "ea3a343a-7b22-4745-946f-49c8ee3cb3ab": {
       "uuid": "ea3a343a-7b22-4745-946f-49c8ee3cb3ab",
@@ -25327,11 +25338,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 325,
       "timestamp": "2026-08-20T05:13:03.122940070Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 326,
+      "timestamp": "2026-08-20T05:18:34.173620865Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T05:13:03.122940070Z",
+    "timestamp": "2026-08-20T05:18:34.173620865Z",
     "agent_id": "6Vw9",
-    "agent_seq": 325
+    "agent_seq": 326
   }
 }
