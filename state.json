@@ -1,6 +1,6 @@
 {
   "next_display_id": 1037,
-  "next_comment_id": 846,
+  "next_comment_id": 847,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4807,7 +4807,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T02:55:47.605967098Z",
-      "updated_at": "2026-08-20T04:34:43.782739007Z",
+      "updated_at": "2026-08-20T04:34:48.369289167Z",
       "labels": [
         "remediation"
       ],
@@ -4865,6 +4865,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQODk/DL57kz/y75F695Xi63GTJccYQGiovFM6pLVOHNynU/2f8VZodzx2QWe7O1uYEbmPZ6KRGcP/vc0KGykBg=="
+        },
+        "f992179f-4c83-4b2f-bd47-8869dd8314a2": {
+          "display_id": 846,
+          "author": "6Vw9",
+          "content": "[action] Full suite exposed stale Bash sandbox outcome assertions; updated B7c-B7g to require typed Partial and concrete blocked effects; targeted binary passes 40/40",
+          "created_at": "2026-08-20T04:34:48.366885820Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmgoOYZ4cdM+r4qpt2+MuaGt7bb23PJNeKb5TB/fJWwggX7yrJyrY1T/zFKNisBDigFsj6IcUidUlDSRedKhZDQ=="
         }
       }
     },
@@ -25166,11 +25175,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 309,
       "timestamp": "2026-08-20T04:34:43.782739007Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 310,
+      "timestamp": "2026-08-20T04:34:48.369289167Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T04:34:43.782739007Z",
+    "timestamp": "2026-08-20T04:34:48.369289167Z",
     "agent_id": "6Vw9",
-    "agent_seq": 309
+    "agent_seq": 310
   }
 }
