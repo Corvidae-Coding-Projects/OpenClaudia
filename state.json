@@ -1,6 +1,6 @@
 {
   "next_display_id": 1046,
-  "next_comment_id": 909,
+  "next_comment_id": 910,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6355,7 +6355,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:09:55.024359Z",
-      "updated_at": "2026-08-20T21:22:10.626819019Z",
+      "updated_at": "2026-08-20T21:22:44.186265784Z",
       "labels": [
         "remediation"
       ],
@@ -6434,6 +6434,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUs3ZQLMvgsyX4/hpkIJ5yKFIQAO94LG8fqZZvDbfcaIUZT9hntZyOiUMeMlJb/YNjuJ5YXU1SJEXGXRcYy/DDQ=="
+        },
+        "6a2ab0fa-868d-45db-a507-87c7c4207562": {
+          "display_id": 909,
+          "author": "6Vw9",
+          "content": "Implement one host-selected, descriptor-pinned storage capability rather than repairing path-based helpers independently: validate relative targets/classes/generations, serialize cooperating writers with bounded locks, verify staged bytes and every namespace binding, separate rename publication from directory durability, preserve current session callers through a narrow adapter, and fail closed where the secure backend is not yet implemented.",
+          "created_at": "2026-08-20T21:22:44.183840413Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAvfx8k+00fXH28GtZXbqOaZGBvZSK9rd2C7sCCJpTMLbzulZKKCRy8+T01S7ZoEjL9etUDDx2y7sHfcIJErt0BA=="
         },
         "89d66e89-ee0e-478e-9e12-1b3f3ef712a3": {
           "display_id": 908,
@@ -26632,11 +26641,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 454,
       "timestamp": "2026-08-20T21:22:10.626819019Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 455,
+      "timestamp": "2026-08-20T21:22:44.186265784Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T21:22:10.626819019Z",
+    "timestamp": "2026-08-20T21:22:44.186265784Z",
     "agent_id": "6Vw9",
-    "agent_seq": 454
+    "agent_seq": 455
   }
 }
