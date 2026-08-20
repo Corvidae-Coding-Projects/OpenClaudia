@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1042,
+  "next_display_id": 1043,
   "next_comment_id": 889,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -123,6 +123,7 @@
     "21371662-2722-4f5e-b80a-0fe8fcc1b6d4": 189,
     "214129e3-bc77-4d6d-904e-1dd9248bfaea": 890,
     "214a0a02-6c41-4888-92e5-5f63f51f9da8": 152,
+    "21d57899-92a9-4751-b4c5-76ccc394f85e": 1042,
     "21e13dad-6fac-4ae8-9f1c-62788c0392cb": 538,
     "229161ac-804a-46d0-bd0f-7db135965396": 457,
     "229c6659-0de7-4d63-b0f5-04fde1b686a0": 676,
@@ -3828,6 +3829,16 @@
       "labels": [
         "qa"
       ]
+    },
+    "21d57899-92a9-4751-b4c5-76ccc394f85e": {
+      "uuid": "21d57899-92a9-4751-b4c5-76ccc394f85e",
+      "display_id": 1042,
+      "title": "Verify S-025 remote publication and draft PR state",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T13:48:15.060297800Z",
+      "updated_at": "2026-08-20T13:48:15.060297800Z"
     },
     "21e13dad-6fac-4ae8-9f1c-62788c0392cb": {
       "uuid": "21e13dad-6fac-4ae8-9f1c-62788c0392cb",
@@ -26145,11 +26156,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 409,
       "timestamp": "2026-08-20T13:47:47.865559153Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 410,
+      "timestamp": "2026-08-20T13:48:15.060297800Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T13:47:47.865559153Z",
+    "timestamp": "2026-08-20T13:48:15.060297800Z",
     "agent_id": "6Vw9",
-    "agent_seq": 409
+    "agent_seq": 410
   }
 }
