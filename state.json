@@ -1,6 +1,6 @@
 {
   "next_display_id": 1055,
-  "next_comment_id": 927,
+  "next_comment_id": 928,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13196,11 +13196,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:09:48.149662321Z",
-      "updated_at": "2026-08-20T22:13:44.787039099Z",
+      "updated_at": "2026-08-20T22:32:54.187024176Z",
       "labels": [
         "orchestration"
       ],
       "comments": {
+        "4a907ec2-c2bc-4faf-a10f-92c6c5a747f5": {
+          "display_id": 927,
+          "author": "6Vw9",
+          "content": "Wave incident: the direct Codex workers load the installed plugin cache hook at /home/doll/.codex/plugins/cache/personal/crosslink-codex/0.9.0-beta.1/hooks/post-edit-check.py, not only the repository-generated hook. Its stale lint_pending = not is_agent launched implicit repository-wide Clippy in a worker target. All workers were interrupted; no worker intentionally invoked Cargo and no OpenClaudia Cargo process remained. Applied the same temporary local lint_pending = False override to the installed cached hook. py_compile passed; strace of S-001/S-004/S-005 PostToolUse events completed in 0.05/0.06/0.05s with Python/Git only and no cargo exec. Workers then resumed with Cargo still withheld. Canonical Crosslink fix remains external.",
+          "created_at": "2026-08-20T22:32:54.184386361Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzd5bHPmYR4WeL5MiVEfi7Z+Rd3WYhg5FE6srNSei4ktGhQV2Ir9S3wbzy0BqmqZQphKQ0/VyU0iutOTFknHeDA=="
+        },
         "dce8665a-291e-42e6-96fb-de9c0bbcd5fd": {
           "display_id": 922,
           "author": "6Vw9",
@@ -27231,11 +27240,16 @@
       "agent_id": "s004-wave",
       "agent_seq": 3,
       "timestamp": "2026-08-20T22:19:52.261630823Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 506,
+      "timestamp": "2026-08-20T22:32:54.187024176Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:19:52.261630823Z",
-    "agent_id": "s004-wave",
-    "agent_seq": 3
+    "timestamp": "2026-08-20T22:32:54.187024176Z",
+    "agent_id": "6Vw9",
+    "agent_seq": 506
   }
 }
