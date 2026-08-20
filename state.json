@@ -1,6 +1,6 @@
 {
   "next_display_id": 1041,
-  "next_comment_id": 881,
+  "next_comment_id": 882,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13406,11 +13406,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T10:22:37.908405433Z",
-      "updated_at": "2026-08-20T12:59:43.168831740Z",
+      "updated_at": "2026-08-20T13:15:12.661369730Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "213cfd0f-b60f-43cf-8ca2-386f9e669a55": {
+          "display_id": 881,
+          "author": "6Vw9",
+          "content": "[action] S-025 full serialized verification passed after fixing production URL retention and three families of unsafe legacy assertions (API-key fingerprints, full provider URLs, untrusted provider content types); proceeding to final static gates and evidence recording.",
+          "created_at": "2026-08-20T13:15:12.658694919Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABANLUk6t766ofY6HJkHw/V8MxYVABQJpopNFC84jCM3DTEGSkvWLbUOZbAulHHc/l0kC1ZsVofrDLoVlB0Z9KvCA=="
+        },
         "28e4c14d-58e4-47cd-82e3-59923a0bbfe6": {
           "display_id": 875,
           "author": "6Vw9",
@@ -25961,11 +25970,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 390,
       "timestamp": "2026-08-20T12:59:43.168831740Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 391,
+      "timestamp": "2026-08-20T13:15:12.661369730Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T12:59:43.168831740Z",
+    "timestamp": "2026-08-20T13:15:12.661369730Z",
     "agent_id": "6Vw9",
-    "agent_seq": 390
+    "agent_seq": 391
   }
 }
