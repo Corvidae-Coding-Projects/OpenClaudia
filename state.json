@@ -1,6 +1,6 @@
 {
   "next_display_id": 1038,
-  "next_comment_id": 864,
+  "next_comment_id": 865,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -21522,7 +21522,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T05:12:54.104996671Z",
-      "updated_at": "2026-08-20T07:13:00.774073273Z",
+      "updated_at": "2026-08-20T07:13:29.295542153Z",
       "labels": [
         "remediation"
       ],
@@ -21580,6 +21580,18 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAiFt/Q01Jo/2/jPwX8r+PdBi0WQ3KLLmmZI3eJceop14o5lrg5MMeLqfgxKa4qS0i337U/iI7JVb50GPUDwPYCQ=="
+        },
+        "aeed1304-4d35-4af2-8950-a11a7381c6cf": {
+          "display_id": 864,
+          "author": "6Vw9",
+          "content": "Attempted: final local/remote ancestry audit",
+          "created_at": "2026-08-20T07:13:29.293242211Z",
+          "kind": "intervention",
+          "trigger_type": "tool_blocked",
+          "intervention_context": "Tried to prove that committed S-023 SHA 5d9c8ef7 is present on the refreshed origin branch; the combined read-only probe included git merge-base, which repository policy classified with forbidden Git mutation commands",
+          "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAijMj3daqlih08opR5LM9U6QHcs4Wgr9+JOkGlMSjleN/r/3wSujQYLwOtbGLZkv89ZsKjcIynxhNFHQ5dF71Aw=="
         },
         "b57e0ff8-411d-41b6-9f79-4916ae75658e": {
           "display_id": 858,
@@ -25546,11 +25558,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 348,
       "timestamp": "2026-08-20T07:13:05.799372972Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 349,
+      "timestamp": "2026-08-20T07:13:29.295542153Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T07:13:05.799372972Z",
+    "timestamp": "2026-08-20T07:13:29.295542153Z",
     "agent_id": "6Vw9",
-    "agent_seq": 348
+    "agent_seq": 349
   }
 }
