@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1045,
+  "next_display_id": 1046,
   "next_comment_id": 904,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -922,6 +922,7 @@
     "f33dcbc3-9d41-4ee1-8018-dac1ea381161": 714,
     "f3460072-e88d-40d9-8f9a-23ac352b96d3": 19,
     "f35bc0f5-8596-4f66-ac3f-59e33f8450f1": 260,
+    "f35e864a-2979-4fca-8b41-1ca1de9a043e": 1045,
     "f3b25009-eac3-4e74-a9f0-6d85c92c24b2": 262,
     "f3f2bcac-1a55-4e81-988a-34f15d31a64a": 783,
     "f41ac73a-0391-4b5e-9156-57583f54500a": 486,
@@ -23164,6 +23165,17 @@
         "qa-review-2026-04"
       ]
     },
+    "f35e864a-2979-4fca-8b41-1ca1de9a043e": {
+      "uuid": "f35e864a-2979-4fca-8b41-1ca1de9a043e",
+      "display_id": 1045,
+      "title": "Make repository rustdoc pass with warnings denied",
+      "description": "Repository-wide RUSTDOCFLAGS=-D warnings cargo doc --locked --all-features --no-deps fails on many pre-existing private or broken intra-doc links and invalid HTML tags across modules outside S-031. Repair public documentation links and add a stable rustdoc gate without weakening warnings. Discovered during S-031 verification on 2026-08-20; S-031's new persistence docs did not appear among the failures.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T20:24:13.200124039Z",
+      "updated_at": "2026-08-20T20:24:13.200124039Z"
+    },
     "f3b25009-eac3-4e74-a9f0-6d85c92c24b2": {
       "uuid": "f3b25009-eac3-4e74-a9f0-6d85c92c24b2",
       "display_id": 262,
@@ -26512,11 +26524,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 442,
       "timestamp": "2026-08-20T20:17:24.344092738Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 443,
+      "timestamp": "2026-08-20T20:24:13.200124039Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T20:17:24.344092738Z",
+    "timestamp": "2026-08-20T20:24:13.200124039Z",
     "agent_id": "6Vw9",
-    "agent_seq": 442
+    "agent_seq": 443
   }
 }
