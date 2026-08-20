@@ -1,6 +1,6 @@
 {
   "next_display_id": 1041,
-  "next_comment_id": 880,
+  "next_comment_id": 881,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13406,7 +13406,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T10:22:37.908405433Z",
-      "updated_at": "2026-08-20T12:22:30.956588150Z",
+      "updated_at": "2026-08-20T12:59:43.168831740Z",
       "labels": [
         "remediation"
       ],
@@ -13446,6 +13446,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA28+KX2I/7tEmBTc44EK9WRgHLrFaB4zjoBqjsl3FnY2FL6oIYz2xWCAUEKa8tw0nztXQLqhP4FATRy9W4gF6DA=="
+        },
+        "6a07dfee-8d4d-46a8-974b-01a7e4e65d46": {
+          "display_id": 880,
+          "author": "6Vw9",
+          "content": "[action] Full serialized all-target suite reached api_key_redaction_e2e and exposed four stale tests that require partial API-key fingerprints; auditing and correcting those unsafe expectations before resuming verification.",
+          "created_at": "2026-08-20T12:59:43.165068654Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJoCBe8b26bCyCH/vbKW5fSw8+WlgsY5gB4S3b9imZFcBHfA9FsrNiCuZVwiD3db6aODQRaA7t0zy4JJm4gGlAw=="
         },
         "9e8be278-b781-4fdb-9874-2d4e0b040ea6": {
           "display_id": 878,
@@ -25947,11 +25956,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 389,
       "timestamp": "2026-08-20T12:22:50.952633165Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 390,
+      "timestamp": "2026-08-20T12:59:43.168831740Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T12:22:50.952633165Z",
+    "timestamp": "2026-08-20T12:59:43.168831740Z",
     "agent_id": "6Vw9",
-    "agent_seq": 389
+    "agent_seq": 390
   }
 }
