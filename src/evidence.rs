@@ -75,6 +75,11 @@ pub fn evidence_for_requirement<'a>(
                     "receipt {id} does not belong to the current run generation"
                 )));
             }
+            if observation.provenance.freshness.is_none() {
+                return Err(Denial::new(format!(
+                    "receipt {id} lacks a runtime freshness stamp"
+                )));
+            }
             match observation.provenance.trust {
                 EvidenceTrust::UntrustedContent => {
                     return Err(Denial::new(format!(
@@ -104,6 +109,15 @@ pub fn evidence_for_requirement<'a>(
                     "receipt {id} is not applicable to {}",
                     requirement_label(requirement)
                 )));
+            }
+            if matches!(requirement, EvidenceRequirement::Verification { .. }) {
+                ledger
+                    .validate_verification_freshness(*id, run)
+                    .map_err(|error| {
+                        Denial::new(format!(
+                            "verification receipt {id} is no longer fresh: {error}"
+                        ))
+                    })?;
             }
             Ok(observation)
         })

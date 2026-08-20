@@ -1904,7 +1904,7 @@ mod tests {
     fn compaction_summary_observation_is_run_bound_navigation_data() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task(test_run(), "Summarize older context.")
+            .observe_user_task(test_run(), "Summarize older context.", "test-model")
             .expect("task observation");
         let id = append_compaction_summary_observation(
             test_run(),
@@ -1937,7 +1937,7 @@ mod tests {
             let mut ledger = crate::ledger::RealityLedger::open_project_session(session_id)
                 .expect("open project ledger");
             let task = ledger
-                .observe_user_task(test_run(), "Compact older messages.")
+                .observe_user_task(test_run(), "Compact older messages.", "test-model")
                 .expect("task observation");
             let command = ledger
                 .observe_command_run(

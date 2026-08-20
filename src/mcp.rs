@@ -3789,14 +3789,13 @@ sys.stdout.flush()
 
     /// Fix #677: a valid public HTTPS URL passes validation and
     /// returns a usable transport. Proves the guard does NOT
-    /// regress legitimate traffic — `example.com` resolves to a
-    /// public address that is NOT in any RFC 1918 / link-local /
-    /// metadata range.
+    /// regress legitimate traffic. A public IP literal keeps this
+    /// construction test independent from the host's DNS availability.
     #[test]
     fn fix677_valid_public_https_accepted() {
-        let transport =
-            HttpTransport::new("https://example.com/mcp").expect("public HTTPS URL must validate");
-        assert_eq!(transport.base_url, "https://example.com/mcp");
+        let transport = HttpTransport::new("https://1.1.1.1/mcp")
+            .expect("public HTTPS URL must validate without DNS");
+        assert_eq!(transport.base_url, "https://1.1.1.1/mcp");
     }
 
     /// Fix #677: `connect_http` propagates the validator error rather

@@ -702,6 +702,7 @@ pub struct RunTurnParams<'a> {
     pub headers: &'a [(String, String)],
     pub request_body: &'a Value,
     pub provider: &'a str,
+    pub model_identity: &'a str,
     pub memory_db: Option<Arc<MemoryDb>>,
     pub app_config: Option<Arc<AppConfig>>,
     pub permission_mgr: Option<Arc<PermissionManager>>,
@@ -1000,6 +1001,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         headers,
         request_body,
         provider,
+        model_identity,
         memory_db,
         app_config,
         permission_mgr,
@@ -1048,6 +1050,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             policy_enforcer.clone(),
             task_mgr.clone(),
             session_id.clone(),
+            model_identity,
             &tx,
         )
         .await;
@@ -1058,6 +1061,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             run_context,
             response,
             provider,
+            model_identity,
             memory_db,
             app_config,
             permission_mgr,
@@ -1076,6 +1080,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         run_context,
         response,
         provider,
+        model_identity,
         memory_db,
         app_config,
         permission_mgr,
@@ -1285,6 +1290,7 @@ async fn handle_google_response(
     policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
+    model_identity: &str,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
     let body = response.text().await.unwrap_or_default();
@@ -1338,6 +1344,7 @@ async fn handle_google_response(
         policy_enforcer,
         task_mgr,
         session_id.as_deref(),
+        model_identity,
         tx,
     )
     .await;
@@ -1442,6 +1449,7 @@ struct SseStreamParams<'a> {
     run_context: Arc<tools::ToolRunContext>,
     response: reqwest::Response,
     provider: &'a str,
+    model_identity: &'a str,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
     permission_mgr: Option<Arc<PermissionManager>>,
@@ -1458,6 +1466,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         run_context,
         response,
         provider,
+        model_identity,
         memory_db,
         app_config,
         permission_mgr,
@@ -1524,6 +1533,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
     finalize_sse_stream(SseFinalize {
         run_context,
         provider,
+        model_identity,
         full_content,
         reasoning_content,
         tool_accumulator,
@@ -1591,6 +1601,7 @@ fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<
 struct SseFinalize<'a> {
     run_context: Arc<tools::ToolRunContext>,
     provider: &'a str,
+    model_identity: &'a str,
     full_content: String,
     reasoning_content: String,
     tool_accumulator: ToolCallAccumulator,
@@ -1632,6 +1643,7 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
         f.policy_enforcer,
         f.task_mgr,
         f.session_id.as_deref(),
+        f.model_identity,
         f.tx,
     )
     .await;
@@ -1902,6 +1914,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
     let SseStreamParams {
         run_context,
         response,
+        model_identity,
         memory_db,
         app_config,
         permission_mgr,
@@ -1966,6 +1979,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         policy_enforcer,
         task_mgr,
         session_id.as_deref(),
+        model_identity,
         tx,
     )
     .await;
@@ -2581,8 +2595,9 @@ fn emit_failed_quality_gate_events(
     run_context: &Arc<tools::ToolRunContext>,
     tx: &mpsc::Sender<AppEvent>,
     session_id: Option<&str>,
+    model_identity: &str,
 ) {
-    for gate in crate::guardrails::run_quality_gates(run_context) {
+    for gate in crate::guardrails::run_quality_gates(run_context, model_identity) {
         record_quality_gate_verification(run_context, session_id, &gate);
         if gate.passed() {
             continue;
@@ -2663,6 +2678,7 @@ async fn execute_tool_calls_for_tui(
     policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<&str>,
+    model_identity: &str,
     tx: &mpsc::Sender<AppEvent>,
 ) -> (Vec<Value>, bool) {
     // Session-level "always allow/deny" cache (lives for this agentic loop)
@@ -2824,7 +2840,7 @@ async fn execute_tool_calls_for_tui(
         }
     }
 
-    emit_failed_quality_gate_events(&run_context, tx, session_id);
+    emit_failed_quality_gate_events(&run_context, tx, session_id, model_identity);
 
     (results, true)
 }
@@ -3018,7 +3034,7 @@ mod tests {
             ..crate::config::GuardrailsConfig::default()
         };
         crate::guardrails::configure(&run, &config).expect("configure gate");
-        let gate = crate::guardrails::run_quality_gates(&run)
+        let gate = crate::guardrails::run_quality_gates(&run, "test-model")
             .into_iter()
             .next()
             .expect("gate result");
@@ -3143,6 +3159,7 @@ mod tests {
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3239,6 +3256,7 @@ mod tests {
                     None,
                     task_mgr,
                     Some("s"),
+                    "test-model",
                     &tx,
                 )
                 .await
@@ -3323,6 +3341,7 @@ mod tests {
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3402,6 +3421,7 @@ mod tests {
             Some(policy_enforcer),
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3499,6 +3519,7 @@ mod tests {
             None,
             task_mgr,
             Some("tui-prehook-session"),
+            "test-model",
             &tx,
         )
         .await;
@@ -3566,6 +3587,7 @@ mod tests {
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;

@@ -1,11 +1,11 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::num::NonZeroU32;
 
 use super::default_true;
 
 /// Top-level guardrails configuration
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct GuardrailsConfig {
     /// Blast radius limiting: constrain file access per request
     #[serde(default)]
@@ -19,7 +19,7 @@ pub struct GuardrailsConfig {
 }
 
 /// Guardrail enforcement mode
-#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GuardrailMode {
     /// Block operations that violate the guardrail
@@ -39,7 +39,7 @@ impl fmt::Display for GuardrailMode {
 }
 
 /// Action to take when a guardrail threshold is exceeded
-#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailAction {
     /// Log a warning
@@ -62,7 +62,7 @@ impl fmt::Display for GuardrailAction {
 }
 
 /// When to run quality gate checks
-#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunAfter {
     /// After every file edit
@@ -85,7 +85,7 @@ impl fmt::Display for RunAfter {
 }
 
 /// Blast radius limiting configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BlastRadiusConfig {
     /// Enable blast radius limiting
     #[serde(default)]
@@ -134,7 +134,7 @@ impl Default for BlastRadiusConfig {
 }
 
 /// Diff size monitoring configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DiffMonitorConfig {
     /// Enable diff monitoring
     #[serde(default)]
@@ -170,7 +170,7 @@ impl Default for DiffMonitorConfig {
 }
 
 /// Quality gates configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct QualityGatesConfig {
     /// Enable quality gates
     #[serde(default)]
@@ -206,7 +206,7 @@ impl Default for QualityGatesConfig {
 }
 
 /// A single quality check definition
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct QualityCheck {
     /// Human-readable name for the check
     pub name: String,

@@ -1441,8 +1441,12 @@ impl AcpServer {
             "role": "user",
             "content": prompt.clone(),
         }));
-        let task_obs =
-            crate::grounded_loop::observe_session_user_task(&run_context, &oc_session_id, &prompt);
+        let task_obs = crate::grounded_loop::observe_session_user_task(
+            &run_context,
+            &oc_session_id,
+            &prompt,
+            &self.model,
+        );
 
         // Run the agentic loop
         let stop_reason = self
@@ -1668,6 +1672,7 @@ impl AcpServer {
                         run,
                         oc_session_id,
                         &content,
+                        &self.model,
                     ) {
                         Ok(rendered) => rendered,
                         Err(reason) => {
@@ -2454,8 +2459,14 @@ fn validate_and_render_acp_final_response(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
-    crate::grounded_loop::validate_and_render_agentic_final_response(run, session_id, content)
+    crate::grounded_loop::validate_and_render_agentic_final_response(
+        run,
+        session_id,
+        content,
+        model_identity,
+    )
 }
 
 fn execute_local_tool_with_permission(
@@ -3546,6 +3557,7 @@ mod acp_ledger_helper_tests {
             test_run(),
             session_id,
             "Verified with cargo test.",
+            "test-model",
         )
         .expect_err("ACP plain final must not bypass typed claims");
 

@@ -120,6 +120,7 @@ pub fn configure(
     // section to the swap also lets concurrent `check_file_access` calls
     // make progress while a startup `configure` is mid-flight.
     let engine = GuardrailsEngine::try_from_config(config)?;
+    let policy_sha256 = guardrails_policy_sha256(config)?;
     let (new_state, log_msg) = if config_has_active_guards(config) {
         (
             GuardrailsState::Enabled(Box::new(engine)),
@@ -145,6 +146,10 @@ pub fn configure(
                 run.generation()
             ));
         }
+        let policy_changed = crate::evidence_freshness::bind_policy(run, policy_sha256)?;
+        if policy_changed {
+            crate::ledger::invalidate_verification_receipts_for_run(run);
+        }
         guard.runs.insert(run_key(run), new_state);
         // Drop the guard at the end of this block (before the `info!`
         // below) so concurrent readers do not block while we format the
@@ -152,6 +157,20 @@ pub fn configure(
     }
     info!("{}", log_msg);
     Ok(())
+}
+
+fn guardrails_policy_sha256(config: &GuardrailsConfig) -> Result<String, String> {
+    let encoded = serde_json::to_vec(config)
+        .map_err(|error| format!("cannot serialize guardrails policy identity: {error}"))?;
+    let mut digest = Sha256::new();
+    digest.update(crate::evidence_freshness::VERIFICATION_POLICY_VERSION.to_le_bytes());
+    digest.update(encoded);
+    let digest = digest.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
 }
 
 /// Check if a file path is allowed by blast radius rules.
@@ -235,6 +254,7 @@ fn normalize_capability_path(
 /// and typed-partial results commit before the token leaves the executor.
 pub(crate) struct EffectReservation {
     inner: Option<LedgerReservation>,
+    freshness: Option<crate::evidence_freshness::MutationReservation>,
     run_id: crate::runtime::RunId,
     generation: crate::runtime::CapabilityGeneration,
     effect: crate::tools::effect::ToolEffect,
@@ -245,22 +265,36 @@ pub(crate) struct EffectReservation {
 impl EffectReservation {
     /// Commit the effect after a successful or explicitly partial outcome.
     pub(crate) fn commit(&mut self) {
-        let Some(mut inner) = self.inner.take() else {
-            return;
-        };
-        let reservation_id = inner.id();
-        inner.commit();
-        tracing::info!(
-            target: "openclaudia::guardrails",
-            event = "blast_radius_reservation_committed",
-            run_id = %self.run_id,
-            generation = %self.generation,
-            reservation_id,
-            effect = self.effect.as_str(),
-            capability = self.canonical,
-            resource = self.target,
-            "Committed run-scoped blast radius reservation"
-        );
+        if let Some(mut freshness) = self.freshness.take() {
+            if let Err(error) = freshness.commit() {
+                tracing::error!(
+                    target: "openclaudia::guardrails",
+                    run_id = %self.run_id,
+                    generation = %self.generation,
+                    %error,
+                    "Failed to advance evidence freshness after a completed mutation"
+                );
+            }
+            crate::ledger::invalidate_verification_receipts_for_binding(
+                self.run_id,
+                self.generation,
+            );
+        }
+        if let Some(mut inner) = self.inner.take() {
+            let reservation_id = inner.id();
+            inner.commit();
+            tracing::info!(
+                target: "openclaudia::guardrails",
+                event = "blast_radius_reservation_committed",
+                run_id = %self.run_id,
+                generation = %self.generation,
+                reservation_id,
+                effect = self.effect.as_str(),
+                capability = self.canonical,
+                resource = self.target,
+                "Committed run-scoped blast radius reservation"
+            );
+        }
     }
 }
 
@@ -296,8 +330,10 @@ pub(crate) fn reserve_tool_effect(
 ) -> Result<EffectReservation, String> {
     let blast_radius = blast_radius_for_run(run)?;
     let Some(blast_radius) = blast_radius else {
+        let freshness = crate::evidence_freshness::reserve_mutation(run, resolved.effect)?;
         return Ok(EffectReservation {
             inner: None,
+            freshness,
             run_id: run.run_id(),
             generation: run.generation(),
             effect: resolved.effect,
@@ -339,6 +375,7 @@ pub(crate) fn reserve_tool_effect(
         blast_radius.reserve(pending, policy_path.as_deref())?
     };
     let reservation_id = inner.id();
+    let freshness = crate::evidence_freshness::reserve_mutation(run, resolved.effect)?;
     tracing::info!(
         target: "openclaudia::guardrails",
         event = "blast_radius_effect_reserved",
@@ -352,6 +389,7 @@ pub(crate) fn reserve_tool_effect(
     );
     Ok(EffectReservation {
         inner: Some(inner),
+        freshness,
         run_id: run.run_id(),
         generation: run.generation(),
         effect: resolved.effect,
@@ -368,8 +406,13 @@ pub(crate) fn reserve_workspace_mutation(
 ) -> Result<EffectReservation, String> {
     let blast_radius = blast_radius_for_run(run)?;
     let Some(blast_radius) = blast_radius else {
+        let freshness = crate::evidence_freshness::reserve_mutation(
+            run,
+            crate::tools::effect::ToolEffect::WorkspaceMutation,
+        )?;
         return Ok(EffectReservation {
             inner: None,
+            freshness,
             run_id: run.run_id(),
             generation: run.generation(),
             effect: crate::tools::effect::ToolEffect::WorkspaceMutation,
@@ -392,8 +435,13 @@ pub(crate) fn reserve_workspace_mutation(
         },
         Some(&policy_path),
     )?;
+    let freshness = crate::evidence_freshness::reserve_mutation(
+        run,
+        crate::tools::effect::ToolEffect::WorkspaceMutation,
+    )?;
     Ok(EffectReservation {
         inner: Some(inner),
+        freshness,
         run_id: run.run_id(),
         generation: run.generation(),
         effect: crate::tools::effect::ToolEffect::WorkspaceMutation,
@@ -637,16 +685,24 @@ pub fn check_diff_thresholds(run: &crate::tools::ToolRunContext) -> Option<DiffW
 /// Run quality gate checks. Returns results for each configured check.
 pub fn run_quality_gates(
     run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    model_identity: &str,
 ) -> Vec<QualityCheckResult> {
     let guard = lock_or_poison();
     if guard.poisoned {
         error!("run_quality_gates: registry poisoned — returning empty");
         return Vec::new();
     }
-    match guard.runs.get(&run_key(run)) {
-        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().run_quality_gates(run),
-        Some(GuardrailsState::Disabled) | None => Vec::new(),
-    }
+    let config = match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine
+            .quality_gates
+            .as_ref()
+            .map(|runner| runner.config.clone()),
+        Some(GuardrailsState::Disabled) | None => None,
+    };
+    drop(guard);
+    config.map_or_else(Vec::new, |config| {
+        QualityGateRunner::new(config).run(run, model_identity)
+    })
 }
 
 /// Get current diff stats summary.
@@ -706,8 +762,11 @@ fn current_state_kind(run: &crate::tools::ToolRunContext) -> &'static str {
 /// not retain stale policy buckets or accidentally associate them with a
 /// resumed session generation.
 pub(crate) fn release_run(run: &crate::tools::ToolRunContext) {
-    let mut guard = lock_or_poison();
-    guard.runs.remove(&run_key(run));
+    {
+        let mut guard = lock_or_poison();
+        guard.runs.remove(&run_key(run));
+    }
+    crate::evidence_freshness::release_run(run);
 }
 
 // ==========================================================================
@@ -752,6 +811,9 @@ pub(crate) struct QualityGateEvidence {
     pub(crate) normalized_argv: Vec<String>,
     pub(crate) resolved_executable: Option<String>,
     pub(crate) executable_sha256: Option<String>,
+    pub(crate) verification_binding:
+        Option<crate::evidence_freshness::VerificationFreshnessBinding>,
+    pub(crate) freshness_error: Option<String>,
 }
 
 impl QualityCheckResult {
@@ -922,16 +984,6 @@ impl GuardrailsEngine {
         self.diff_monitor
             .as_ref()
             .and_then(DiffMonitor::check_thresholds)
-    }
-
-    fn run_quality_gates(
-        &self,
-        run: &std::sync::Arc<crate::tools::ToolRunContext>,
-    ) -> Vec<QualityCheckResult> {
-        self.quality_gates
-            .as_ref()
-            .map(|runner| runner.run(run))
-            .unwrap_or_default()
     }
 
     fn get_diff_stats(&self) -> Option<DiffStats> {
@@ -1425,39 +1477,95 @@ impl QualityGateRunner {
         Self { config }
     }
 
-    fn run(&self, run: &std::sync::Arc<crate::tools::ToolRunContext>) -> Vec<QualityCheckResult> {
+    fn run(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        model_identity: &str,
+    ) -> Vec<QualityCheckResult> {
         let mut results = Vec::new();
+
+        let model_error = crate::ledger::sync_model_identity(run, model_identity).err();
 
         for check in &self.config.checks {
             info!(name = %check.name, "Running quality gate");
 
-            let outcome = run_shell_command_sync(run, &check.command, self.config.timeout_seconds);
-            let evidence = quality_gate_evidence(run, &check.command);
+            let prepared = model_error.as_ref().map_or_else(
+                || quality_gate_seed(run, &check.name, &check.command),
+                |error| Err(error.to_string()),
+            );
+            let (outcome, evidence) = match prepared {
+                Ok(seed) => {
+                    let outcome =
+                        run_shell_command_sync(run, &check.command, self.config.timeout_seconds);
+                    match quality_gate_seed(run, &check.name, &check.command) {
+                        Ok(after) if after == seed => {
+                            let evidence = QualityGateEvidence {
+                                run_id: run.run_id(),
+                                capability_generation: run.generation(),
+                                normalized_argv: seed.normalized_argv,
+                                resolved_executable: Some(seed.resolved_executable),
+                                executable_sha256: Some(seed.executable_sha256),
+                                verification_binding: Some(seed.binding),
+                                freshness_error: None,
+                            };
+                            (Some(outcome), evidence)
+                        }
+                        Ok(_) => (
+                            None,
+                            failed_quality_gate_evidence(
+                                run,
+                                &check.command,
+                                "workspace, environment, model, policy, or verifier changed while the quality gate ran",
+                            ),
+                        ),
+                        Err(error) => (
+                            None,
+                            failed_quality_gate_evidence(run, &check.command, &error),
+                        ),
+                    }
+                }
+                Err(error) => (
+                    None,
+                    failed_quality_gate_evidence(run, &check.command, &error),
+                ),
+            };
 
             // Translate the typed enum into the (passed, exit_code,
             // stdout, stderr) shape that `QualityCheckResult` still
             // exposes to downstream callers. Every variant is handled
             // explicitly so a future addition forces a recompile.
             let (passed, exit_code, stdout, stderr) = match outcome {
-                ShellResult::Success { stdout, stderr } => (true, 0, stdout, stderr),
-                ShellResult::ExitFailed {
+                Some(ShellResult::Success { stdout, stderr }) => (true, 0, stdout, stderr),
+                Some(ShellResult::ExitFailed {
                     code,
                     stdout,
                     stderr,
-                } => (false, code, stdout, stderr),
-                ShellResult::ShellMissing { tried } => (
+                }) => (false, code, stdout, stderr),
+                Some(ShellResult::ShellMissing { tried }) => (
                     false,
                     -1,
                     String::new(),
                     format!("Program not found on PATH: tried {tried:?}"),
                 ),
-                ShellResult::Timeout => (
+                Some(ShellResult::Timeout) => (
                     false,
                     -1,
                     String::new(),
                     format!(
                         "Quality gate timed out after {}s (wall-clock supervisor killed child)",
                         self.config.timeout_seconds
+                    ),
+                ),
+                None => (
+                    false,
+                    -1,
+                    String::new(),
+                    format!(
+                        "Quality gate evidence rejected: {}",
+                        evidence
+                            .freshness_error
+                            .as_deref()
+                            .unwrap_or("freshness proof unavailable")
                     ),
                 ),
             };
@@ -1484,20 +1592,64 @@ impl QualityGateRunner {
     }
 }
 
-fn quality_gate_evidence(run: &crate::tools::ToolRunContext, command: &str) -> QualityGateEvidence {
+#[derive(Debug, PartialEq, Eq)]
+struct QualityGateSeed {
+    normalized_argv: Vec<String>,
+    resolved_executable: String,
+    executable_sha256: String,
+    binding: crate::evidence_freshness::VerificationFreshnessBinding,
+}
+
+fn quality_gate_seed(
+    run: &crate::tools::ToolRunContext,
+    check: &str,
+    command: &str,
+) -> Result<QualityGateSeed, String> {
+    let normalized_argv = shlex::split(command)
+        .filter(|argv| !argv.is_empty())
+        .ok_or_else(|| "quality-gate command is empty or has invalid quoting".to_string())?;
+    let resolved_executable = normalized_argv
+        .first()
+        .ok_or_else(|| "quality-gate command has no executable".to_string())
+        .and_then(|program| {
+            run.resolve_executable(program)
+                .map_err(|error| error.to_string())
+        })?;
+    let executable_sha256 = sha256_file(&resolved_executable)
+        .ok_or_else(|| "quality-gate executable could not be hashed".to_string())?;
+    let resolved_executable = resolved_executable.to_string_lossy().to_string();
+    let verifier_identity_sha256 = crate::evidence_freshness::verifier_identity_sha256(
+        check,
+        &normalized_argv,
+        Some(&resolved_executable),
+        Some(&executable_sha256),
+    );
+    let binding =
+        crate::evidence_freshness::capture_verification_binding(run, verifier_identity_sha256)?;
+    Ok(QualityGateSeed {
+        normalized_argv,
+        resolved_executable,
+        executable_sha256,
+        binding,
+    })
+}
+
+fn failed_quality_gate_evidence(
+    run: &crate::tools::ToolRunContext,
+    command: &str,
+    error: &str,
+) -> QualityGateEvidence {
     let normalized_argv = shlex::split(command)
         .filter(|argv| !argv.is_empty())
         .unwrap_or_default();
-    let resolved = normalized_argv
-        .first()
-        .and_then(|program| run.resolve_executable(program).ok());
-    let executable_sha256 = resolved.as_deref().and_then(sha256_file);
     QualityGateEvidence {
         run_id: run.run_id(),
         capability_generation: run.generation(),
         normalized_argv,
-        resolved_executable: resolved.map(|path| path.to_string_lossy().to_string()),
-        executable_sha256,
+        resolved_executable: None,
+        executable_sha256: None,
+        verification_binding: None,
+        freshness_error: Some(error.to_string()),
     }
 }
 
@@ -2198,6 +2350,15 @@ mod tests {
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
         crate::tools::security::test_run_context()
     }
+
+    fn run_test_quality_gate(config: QualityGatesConfig) -> Vec<QualityCheckResult> {
+        crate::evidence_freshness::bind_policy(
+            test_run(),
+            "guardrails-unit-test-policy".to_string(),
+        )
+        .expect("bind test verification policy");
+        QualityGateRunner::new(config).run(test_run(), "test-model")
+    }
     use crate::config::QualityCheck;
 
     // ====== Glob matching tests ======
@@ -2605,8 +2766,7 @@ mod tests {
             }],
             timeout_seconds: 30,
         };
-        let runner = QualityGateRunner::new(config);
-        let results = runner.run(test_run());
+        let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
         assert!(results[0].passed);
@@ -2636,8 +2796,7 @@ mod tests {
             }],
             timeout_seconds: 30,
         };
-        let runner = QualityGateRunner::new(config);
-        let results = runner.run(test_run());
+        let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
@@ -2672,8 +2831,7 @@ mod tests {
             }],
             timeout_seconds: 30,
         };
-        let runner = QualityGateRunner::new(config);
-        let results = runner.run(test_run());
+        let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
         // The sentinel file MUST still exist. If the runner shelled out
@@ -2704,8 +2862,7 @@ mod tests {
             }],
             timeout_seconds: 30,
         };
-        let runner = QualityGateRunner::new(config);
-        let results = runner.run(test_run());
+        let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
         assert!(results[0].passed);
@@ -2737,9 +2894,8 @@ mod tests {
                 }],
                 timeout_seconds: 1,
             };
-            let runner = QualityGateRunner::new(config);
             let start = std::time::Instant::now();
-            let results = runner.run(test_run());
+            let results = run_test_quality_gate(config);
             let elapsed = start.elapsed();
 
             assert_eq!(results.len(), 1);
@@ -2770,8 +2926,7 @@ mod tests {
             }],
             timeout_seconds: 30,
         };
-        let runner = QualityGateRunner::new(config);
-        let results = runner.run(test_run());
+        let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
@@ -2794,8 +2949,7 @@ mod tests {
             }],
             timeout_seconds: 30,
         };
-        let runner = QualityGateRunner::new(config);
-        let results = runner.run(test_run());
+        let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
         assert!(results[0].passed);
@@ -3056,7 +3210,7 @@ mod tests {
 
         assert!(check_file_access(test_run(), "any/file.rs").is_ok());
         assert!(check_diff_thresholds(test_run()).is_none());
-        assert!(run_quality_gates(test_run()).is_empty());
+        assert!(run_quality_gates(test_run(), "test-model").is_empty());
         assert!(get_diff_summary(test_run()).is_none());
     }
 
@@ -3138,7 +3292,7 @@ mod tests {
         set_poisoned_for_test();
 
         assert!(check_diff_thresholds(test_run()).is_none());
-        assert!(run_quality_gates(test_run()).is_empty());
+        assert!(run_quality_gates(test_run(), "test-model").is_empty());
         assert!(get_diff_summary(test_run()).is_none());
         record_file_modification(test_run(), "any.rs", 1, 0);
 

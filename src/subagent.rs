@@ -1435,11 +1435,17 @@ fn validate_and_render_subagent_final_response(
     run: &crate::tools::ToolRunContext,
     agent_id: &str,
     final_output: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
     if final_output.trim().is_empty() {
         return Ok(String::new());
     }
-    crate::grounded_loop::validate_and_render_agentic_final_response(run, agent_id, final_output)
+    crate::grounded_loop::validate_and_render_agentic_final_response(
+        run,
+        agent_id,
+        final_output,
+        model_identity,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1651,6 +1657,17 @@ async fn run_subagent_inner(
             };
         }
     };
+    let model = config
+        .model_override
+        .clone()
+        .or_else(|| config.agent_type.preferred_model().map(String::from))
+        .unwrap_or_else(|| {
+            app_config
+                .providers
+                .get(&app_config.proxy.target)
+                .and_then(|p| p.model.clone())
+                .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+        });
     if let Err(error) = crate::guardrails::configure(&subagent_run, &app_config.guardrails) {
         return SubagentResult {
             agent_id,
@@ -1661,8 +1678,12 @@ async fn run_subagent_inner(
             worktree,
         };
     }
-    let task_obs =
-        crate::grounded_loop::observe_session_user_task(&subagent_run, &agent_id, &task_content);
+    let task_obs = crate::grounded_loop::observe_session_user_task(
+        &subagent_run,
+        &agent_id,
+        &task_content,
+        &model,
+    );
 
     let mut subagent_context = vec![crate::context::ContextItem::host_instruction(
         "subagent.role_policy",
@@ -1718,19 +1739,6 @@ async fn run_subagent_inner(
         })
         .unwrap_or_default();
     let filtered_tools = add_subagent_typed_decision_contracts(filtered_tools);
-
-    // Determine the model to use
-    let model = config
-        .model_override
-        .clone()
-        .or_else(|| config.agent_type.preferred_model().map(String::from))
-        .unwrap_or_else(|| {
-            app_config
-                .providers
-                .get(&app_config.proxy.target)
-                .and_then(|p| p.model.clone())
-                .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
-        });
 
     // Get provider config. `api_key` is `Option<ApiKey>`: an unconfigured
     // provider yields `None` and `make_api_call` omits the auth header —
@@ -1938,6 +1946,7 @@ async fn run_subagent_inner(
                 &subagent_run,
                 &agent_id,
                 &final_output,
+                &model,
             ) {
                 Ok(rendered) => {
                     final_output = rendered;
@@ -3737,7 +3746,7 @@ mod tests {
     fn subagent_tool_decision_accepts_grounded_command_decision() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task(test_run(), "Run the focused test command")
+            .observe_user_task(test_run(), "Run the focused test command", "test-model")
             .expect("task observation");
         let args = json!({
             "command": "cargo test --lib subagent_tool_decision",
@@ -3757,7 +3766,7 @@ mod tests {
     fn subagent_tool_decision_rejects_mismatched_command_argv() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task(test_run(), "Run tests")
+            .observe_user_task(test_run(), "Run tests", "test-model")
             .expect("task observation");
         let args = json!({
             "command": "cargo test",

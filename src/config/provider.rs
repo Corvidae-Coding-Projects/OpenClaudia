@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn validate_base_url_accepts_public_https() {
         assert!(
-            validate_base_url("https://api.anthropic.com").is_ok(),
+            validate_base_url("https://1.1.1.1/v1").is_ok(),
             "public https URL must pass validation"
         );
     }

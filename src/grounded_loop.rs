@@ -117,6 +117,7 @@ pub fn observe_session_user_task(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Option<ObsId> {
     let mut ledger = match RealityLedger::open_project_session(session_id) {
         Ok(ledger) => ledger,
@@ -129,7 +130,7 @@ pub fn observe_session_user_task(
             return None;
         }
     };
-    match ledger.observe_user_task(run, content.to_string()) {
+    match ledger.observe_user_task(run, content.to_string(), model_identity) {
         Ok(id) => Some(id),
         Err(err) => {
             tracing::warn!(
@@ -225,6 +226,14 @@ pub fn observe_shell_command_for_session(
     stdout: &str,
     stderr: &str,
 ) {
+    if let Err(error) = crate::evidence_freshness::current_stamp(run) {
+        tracing::warn!(
+            session_id,
+            %error,
+            "failed to initialize shell-command evidence freshness"
+        );
+        return;
+    }
     let binding = crate::ledger::RunBinding::from_run(run);
     crate::tools::record_command_observation_for_session(
         &binding, session_id, cwd, command, exit_code, stdout, stderr,
@@ -413,8 +422,9 @@ pub fn validate_agentic_final_response(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Result<(), String> {
-    validate_and_render_agentic_final_response(run, session_id, content).map(|_| ())
+    validate_and_render_agentic_final_response(run, session_id, content, model_identity).map(|_| ())
 }
 
 /// Validate a final model response and return the human-rendered final text.
@@ -430,6 +440,7 @@ pub fn validate_and_render_agentic_final_response(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
     if content.trim().is_empty() {
         return Ok(String::new());
@@ -446,7 +457,7 @@ pub fn validate_and_render_agentic_final_response(
             return Err(reason);
         }
     };
-    validate_and_render_final_against_ledger(run, &mut ledger, content)
+    validate_and_render_final_against_ledger(run, &mut ledger, content, model_identity)
 }
 
 /// Validate final text against an already-open ledger and record the decision.
@@ -458,8 +469,9 @@ pub fn validate_final_against_ledger(
     run: &crate::tools::ToolRunContext,
     ledger: &mut RealityLedger,
     content: &str,
+    model_identity: &str,
 ) -> Result<(), String> {
-    validate_and_render_final_against_ledger(run, ledger, content).map(|_| ())
+    validate_and_render_final_against_ledger(run, ledger, content, model_identity).map(|_| ())
 }
 
 /// Validate final text against an already-open ledger and return rendered text.
@@ -474,7 +486,9 @@ pub fn validate_and_render_final_against_ledger(
     run: &crate::tools::ToolRunContext,
     ledger: &mut RealityLedger,
     content: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
+    crate::ledger::sync_model_identity(run, model_identity).map_err(|error| error.to_string())?;
     match parse_structured_final_decision(content) {
         Ok(Some(decision)) => return validate_and_render_structured_final(run, ledger, &decision),
         Ok(None) => {}
@@ -704,7 +718,7 @@ mod tests {
             ..crate::config::GuardrailsConfig::default()
         };
         crate::guardrails::configure(run, &config).expect("configure gate");
-        crate::guardrails::run_quality_gates(run)
+        crate::guardrails::run_quality_gates(run, "test-model")
             .into_iter()
             .next()
             .expect("gate result")
@@ -715,7 +729,7 @@ mod tests {
         let run = isolated_test_run();
         let mut ledger = RealityLedger::new();
         let task = ledger
-            .observe_user_task(&run, "Audit the binary commands.")
+            .observe_user_task(&run, "Audit the binary commands.", "test-model")
             .expect("task");
         let read = ledger
             .observe_file_read(&run, "src/main.rs", "fn main() {}", 1, 1, "fn main() {}")
@@ -772,7 +786,7 @@ mod tests {
     fn grounding_message_states_summary_and_memory_are_not_evidence() {
         let mut ledger = RealityLedger::new();
         let task = ledger
-            .observe_user_task(test_run(), "Run cargo test.")
+            .observe_user_task(test_run(), "Run cargo test.", "test-model")
             .expect("task");
         let packet = build_prompt_packet(
             &ledger,
@@ -889,8 +903,9 @@ mod tests {
         })
         .to_string();
 
-        let rendered = validate_and_render_final_against_ledger(&run, &mut ledger, &content)
-            .expect("structured final should pass");
+        let rendered =
+            validate_and_render_final_against_ledger(&run, &mut ledger, &content, "test-model")
+                .expect("structured final should pass");
 
         assert_eq!(
             rendered,
@@ -917,8 +932,13 @@ mod tests {
         })
         .to_string();
 
-        let err = validate_and_render_final_against_ledger(test_run(), &mut ledger, &content)
-            .expect_err("missing verification must be denied");
+        let err = validate_and_render_final_against_ledger(
+            test_run(),
+            &mut ledger,
+            &content,
+            "test-model",
+        )
+        .expect_err("missing verification must be denied");
 
         assert_eq!(
             err,
@@ -951,8 +971,13 @@ mod tests {
             })
         );
 
-        let rendered = validate_and_render_final_against_ledger(test_run(), &mut ledger, &content)
-            .expect("fenced structured final should pass");
+        let rendered = validate_and_render_final_against_ledger(
+            test_run(),
+            &mut ledger,
+            &content,
+            "test-model",
+        )
+        .expect("fenced structured final should pass");
 
         assert_eq!(
             rendered,
@@ -969,8 +994,13 @@ mod tests {
             "\n```\nThis prose is outside the typed envelope."
         );
 
-        let denial = validate_and_render_final_against_ledger(test_run(), &mut ledger, content)
-            .expect_err("text outside the final envelope must be denied");
+        let denial = validate_and_render_final_against_ledger(
+            test_run(),
+            &mut ledger,
+            content,
+            "test-model",
+        )
+        .expect_err("text outside the final envelope must be denied");
 
         assert_eq!(
             denial,
@@ -986,6 +1016,7 @@ mod tests {
             test_run(),
             &mut ledger,
             "Verified with cargo check.",
+            "test-model",
         )
         .expect_err("plain prose cannot bypass claim policy");
 
@@ -1007,8 +1038,9 @@ mod tests {
 
     #[test]
     fn agentic_final_fails_closed_when_ledger_cannot_open() {
-        let err = validate_agentic_final_response(test_run(), "invalid/session", "Done.")
-            .expect_err("ledger open failure must deny non-empty final");
+        let err =
+            validate_agentic_final_response(test_run(), "invalid/session", "Done.", "test-model")
+                .expect_err("ledger open failure must deny non-empty final");
 
         assert!(
             err.contains("final answer requires reality ledger"),

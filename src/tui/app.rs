@@ -1730,6 +1730,7 @@ impl App {
             &run_context,
             &self.chat_session.id(),
             &content,
+            &self.model,
         ) {
             Some(rendered) => self.messages.streaming_text = rendered,
             None => self.messages.streaming_text.clear(),
@@ -3192,6 +3193,32 @@ impl App {
             return None;
         };
 
+        let mutation_effect = match &target {
+            SpawnTarget::Init => Some(crate::tools::effect::ToolEffect::WorkspaceMutation),
+            SpawnTarget::ShellCommand { .. } => Some(crate::tools::effect::ToolEffect::Destructive),
+            SpawnTarget::Diff | SpawnTarget::Review | SpawnTarget::Files | SpawnTarget::Doctor => {
+                None
+            }
+        };
+        let mut freshness_reservation = match mutation_effect {
+            Some(effect) => match crate::evidence_freshness::reserve_mutation(&run_context, effect)
+            {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(AppEvent::ShellDone {
+                            target,
+                            stdout: String::new(),
+                            stderr: format!("cannot reserve shell mutation freshness: {error}"),
+                            exit_code: None,
+                        });
+                    }
+                    return None;
+                }
+            },
+            None => None,
+        };
+
         Some(handle.spawn(async move {
             let Some((exe, rest)) = argv.split_first() else {
                 if let Some(tx) = tx {
@@ -3211,6 +3238,7 @@ impl App {
                     command
                         .args(rest)
                         .current_dir(&cwd)
+                        .kill_on_drop(true)
                         .env_clear()
                         .envs(&environment_grants)
                         .env("HOME", &private_temp)
@@ -3226,6 +3254,18 @@ impl App {
                     format!("cannot resolve '{exe}': {error}"),
                 )),
             };
+
+            if result.is_ok() {
+                if let Some(reservation) = freshness_reservation.as_mut() {
+                    if let Err(error) = reservation.commit() {
+                        tracing::error!(
+                            %error,
+                            "failed to advance freshness after TUI shell completion"
+                        );
+                    }
+                    crate::ledger::invalidate_verification_receipts_for_run(&run_context);
+                }
+            }
 
             if let (SpawnTarget::ShellCommand { displayed }, Ok(out)) = (&ledger_target, &result) {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -3764,9 +3804,10 @@ fn observe_turn_user_task(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
     messages: &[serde_json::Value],
+    model_identity: &str,
 ) -> Option<crate::ledger::ObsId> {
     let content = latest_user_message_content(messages)?;
-    crate::grounded_loop::observe_session_user_task(run, session_id, content)
+    crate::grounded_loop::observe_session_user_task(run, session_id, content, model_identity)
 }
 
 fn request_messages_with_grounding(
@@ -3796,19 +3837,31 @@ fn validate_and_render_agentic_final_response(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
-    crate::grounded_loop::validate_and_render_agentic_final_response(run, session_id, content)
+    crate::grounded_loop::validate_and_render_agentic_final_response(
+        run,
+        session_id,
+        content,
+        model_identity,
+    )
 }
 
 fn render_final_response_for_history(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
     if content.trim().is_empty() {
         return Ok(String::new());
     }
-    match validate_and_render_agentic_final_response(run, session_id, content.trim()) {
+    match validate_and_render_agentic_final_response(
+        run,
+        session_id,
+        content.trim(),
+        model_identity,
+    ) {
         Ok(rendered) => Ok(rendered),
         Err(reason) => {
             tracing::warn!(
@@ -3825,12 +3878,13 @@ fn render_live_final_response_for_display(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Option<String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Some(String::new());
     }
-    render_final_response_for_history(run, session_id, trimmed).ok()
+    render_final_response_for_history(run, session_id, trimmed, model_identity).ok()
 }
 
 fn check_provider_request_policy_for_messages(
@@ -4270,6 +4324,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             headers: ctx.headers,
             request_body: &body,
             provider: ctx.provider,
+            model_identity: ctx.model,
             memory_db: ctx.memory_db.clone(),
             app_config: ctx.app_config.clone(),
             permission_mgr: ctx.permission_mgr.clone(),
@@ -4308,6 +4363,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                             ctx.run_context,
                             ctx.session_id,
                             &followup.content,
+                            ctx.model,
                         ) {
                             Ok(rendered) => rendered,
                             Err(reason) => {
@@ -4347,7 +4403,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
 }
 
 fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInitialTurn> {
-    let task_obs = observe_turn_user_task(p.run_context, p.session_id, p.session_messages);
+    let task_obs = observe_turn_user_task(p.run_context, p.session_id, p.session_messages, p.model);
     let request_messages = match request_messages_with_grounding(
         p.run_context,
         p.session_id,
@@ -4443,6 +4499,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         headers: &headers,
         request_body: &initial_turn.request_body,
         provider: &provider,
+        model_identity: &model,
         memory_db: memory_db.clone(),
         app_config: app_config.clone(),
         permission_mgr: permission_mgr.clone(),
@@ -4486,9 +4543,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
             )
             .await;
         }
-        Err(e) => {
-            send_or_warn(&tx, super::events::AppEvent::ApiError(e), &session_id);
-        }
+        Err(e) => send_or_warn(&tx, super::events::AppEvent::ApiError(e), &session_id),
     }
 }
 
@@ -4593,6 +4648,7 @@ async fn handle_turn_result(
             ctx.run_context,
             ctx.session_id,
             &turn_result.content,
+            ctx.model,
         ) {
             Ok(rendered) => rendered,
             Err(reason) => {
@@ -5185,7 +5241,7 @@ mod tests {
             ..crate::config::GuardrailsConfig::default()
         };
         crate::guardrails::configure(&run, &config).expect("configure gate");
-        let gate = crate::guardrails::run_quality_gates(&run)
+        let gate = crate::guardrails::run_quality_gates(&run, "gpt-test")
             .into_iter()
             .next()
             .expect("gate result");
@@ -5234,6 +5290,7 @@ mod tests {
             crate::tools::security::test_run_context(),
             session_id,
             &content,
+            "test-model",
         )
         .expect("validated structured final should render");
 
@@ -5928,6 +5985,9 @@ mod tests {
     async fn spawn_shell_command_records_ledger_observation() {
         let mut app = App::new("test-model", "test-provider");
         let rx = wire_app(&mut app);
+        let run = Arc::clone(app.run_context.as_ref().expect("TUI run context"));
+        let freshness_before =
+            crate::evidence_freshness::current_stamp(&run).expect("capture freshness before shell");
         let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
         let _guard =
             crate::ledger::install_active_ledger_for_session(app.chat_session.id(), ledger.clone());
@@ -5956,7 +6016,19 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        let freshness_after =
+            crate::evidence_freshness::current_stamp(&run).expect("capture freshness after shell");
+        assert_eq!(
+            freshness_after.workspace_generation,
+            freshness_before.workspace_generation + 1,
+            "arbitrary TUI shell execution must advance workspace freshness"
+        );
         assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].provenance.freshness.as_ref(),
+            Some(&freshness_after),
+            "command receipt must bind the post-execution freshness generation"
+        );
         assert!(observations.iter().any(|obs| {
             matches!(
                 &obs.kind,

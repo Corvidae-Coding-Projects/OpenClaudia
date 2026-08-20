@@ -334,8 +334,9 @@ fn observe_cli_user_task(
     run: &tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Option<openclaudia::ledger::ObsId> {
-    openclaudia::grounded_loop::observe_session_user_task(run, session_id, content)
+    openclaudia::grounded_loop::observe_session_user_task(run, session_id, content, model_identity)
 }
 
 fn request_messages_with_cli_grounding(
@@ -364,8 +365,14 @@ fn validate_and_render_cli_agentic_final_response(
     run: &tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
-    openclaudia::grounded_loop::validate_and_render_agentic_final_response(run, session_id, content)
+    openclaudia::grounded_loop::validate_and_render_agentic_final_response(
+        run,
+        session_id,
+        content,
+        model_identity,
+    )
 }
 
 fn final_response_requires_grounding(content: &str, cancelled: bool) -> bool {
@@ -749,7 +756,12 @@ impl ChatRepl {
 
         let task_messages = self.chat_session.messages_snapshot();
         self.current_task_obs = latest_user_message_content(&task_messages).and_then(|content| {
-            observe_cli_user_task(&self.run_context, &self.chat_session.id(), content)
+            observe_cli_user_task(
+                &self.run_context,
+                &self.chat_session.id(),
+                content,
+                &self.model,
+            )
         });
 
         let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
@@ -1479,6 +1491,7 @@ impl ChatRepl {
             &self.run_context,
             &self.chat_session.id(),
             content.trim(),
+            &self.model,
         ) {
             Ok(rendered) => Some(rendered),
             Err(reason) => {
@@ -3444,7 +3457,7 @@ impl ChatRepl {
     /// Run quality gates after a tool batch and inject any failures
     /// back into the session as system messages.
     fn run_quality_gates_and_inject(&mut self) {
-        let qg_results = guardrails::run_quality_gates(&self.run_context);
+        let qg_results = guardrails::run_quality_gates(&self.run_context, &self.model);
         self.record_quality_gate_verifications(&qg_results);
         let mut injected_failure = false;
         for qg in &qg_results {
@@ -4118,8 +4131,13 @@ providers: {}
             .expect("safe test session");
         let content = "Verified with cargo test.";
 
-        let err = validate_and_render_cli_agentic_final_response(test_run(), &session_id, content)
-            .expect_err("plain assistant text must not bypass the claim gate");
+        let err = validate_and_render_cli_agentic_final_response(
+            test_run(),
+            &session_id,
+            content,
+            "test-model",
+        )
+        .expect_err("plain assistant text must not bypass the claim gate");
 
         assert_eq!(err, "final answer must use the typed final claim envelope");
 
@@ -4150,8 +4168,13 @@ providers: {}
         })
         .to_string();
 
-        let err = validate_and_render_cli_agentic_final_response(test_run(), &session_id, &content)
-            .expect_err("supported runtime claim without verification must be denied");
+        let err = validate_and_render_cli_agentic_final_response(
+            test_run(),
+            &session_id,
+            &content,
+            "test-model",
+        )
+        .expect_err("supported runtime claim without verification must be denied");
 
         assert_eq!(
             err,
@@ -4184,9 +4207,13 @@ providers: {}
         })
         .to_string();
 
-        let rendered =
-            validate_and_render_cli_agentic_final_response(test_run(), &session_id, &content)
-                .expect("typed uncertainty should pass");
+        let rendered = validate_and_render_cli_agentic_final_response(
+            test_run(),
+            &session_id,
+            &content,
+            "test-model",
+        )
+        .expect("typed uncertainty should pass");
 
         assert_eq!(
             rendered,
@@ -4213,7 +4240,7 @@ providers: {}
             ..openclaudia::config::GuardrailsConfig::default()
         };
         guardrails::configure(&run, &config).expect("configure quality gate");
-        let gate = guardrails::run_quality_gates(&run)
+        let gate = guardrails::run_quality_gates(&run, "test-model")
             .into_iter()
             .next()
             .expect("configured quality gate result");

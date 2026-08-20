@@ -275,6 +275,16 @@ impl BackgroundShellManager {
             ));
         }
 
+        // The canonical dispatch reservation ends when `bash` returns its
+        // shell id, but the child can keep mutating the workspace afterward.
+        // Hold a second run-scoped mutation token until the wait thread reaps
+        // the process so quality gates cannot publish during that interval.
+        let mut background_freshness = crate::evidence_freshness::reserve_mutation(
+            run,
+            crate::tools::effect::ToolEffect::Destructive,
+        )?
+        .ok_or_else(|| "background shell did not receive a mutation reservation".to_string())?;
+
         #[cfg(windows)]
         let child = {
             let bash = find_git_bash(run).unwrap_or(bash_bin(run)?);
@@ -366,8 +376,8 @@ impl BackgroundShellManager {
         let command_for_ledger = command.to_string();
         let mut child_for_wait = child;
         let wait_shell_id = shell_id.clone();
-        thread::spawn(move || {
-            if let Ok(status) = child_for_wait.wait() {
+        thread::spawn(move || match child_for_wait.wait() {
+            Ok(status) => {
                 let exit_code = status.code().unwrap_or(-1);
                 *recover_mutex_lock(
                     &exit_status_clone,
@@ -408,6 +418,25 @@ impl BackgroundShellManager {
                     &stdout,
                     &stderr,
                 );
+                if let Err(error) = background_freshness.commit() {
+                    tracing::error!(
+                        shell_id = wait_shell_id,
+                        %error,
+                        "Failed to advance freshness after background shell completion"
+                    );
+                }
+                crate::ledger::invalidate_verification_receipts_for_binding(
+                    run_for_ledger.run_id,
+                    run_for_ledger.capability_generation,
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    shell_id = wait_shell_id,
+                    %error,
+                    "Background shell wait failed; retaining mutation reservation fail-closed"
+                );
+                std::mem::forget(background_freshness);
             }
         });
 

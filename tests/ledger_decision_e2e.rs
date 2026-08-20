@@ -15,12 +15,8 @@ fn test_run() -> std::sync::Arc<openclaudia::tools::ToolRunContext> {
     support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
 }
 
-fn run_gate(
-    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
-    name: &str,
-    command: &str,
-) -> openclaudia::guardrails::QualityCheckResult {
-    let config = openclaudia::config::GuardrailsConfig {
+fn quality_gate_config(name: &str, command: &str) -> openclaudia::config::GuardrailsConfig {
+    openclaudia::config::GuardrailsConfig {
         quality_gates: Some(openclaudia::config::QualityGatesConfig {
             enabled: true,
             checks: vec![openclaudia::config::QualityCheck {
@@ -31,12 +27,30 @@ fn run_gate(
             ..openclaudia::config::QualityGatesConfig::default()
         }),
         ..openclaudia::config::GuardrailsConfig::default()
-    };
+    }
+}
+
+fn run_gate(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    name: &str,
+    command: &str,
+) -> openclaudia::guardrails::QualityCheckResult {
+    let config = quality_gate_config(name, command);
     openclaudia::guardrails::configure(run, &config).expect("configure quality gate");
-    openclaudia::guardrails::run_quality_gates(run)
+    openclaudia::guardrails::run_quality_gates(run, "test-model")
         .into_iter()
         .next()
         .expect("quality gate result")
+}
+
+fn verification_decision(check: &str, verification: openclaudia::ledger::ObsId) -> AgentDecision {
+    AgentDecision::Final {
+        claims: vec![FinalClaim::Verification {
+            check: check.to_string(),
+            passed: true,
+            evidence: vec![verification],
+        }],
+    }
 }
 
 #[test]
@@ -227,7 +241,7 @@ fn observation_index_truncates_unicode_labels_without_panicking() {
     let run = test_run();
     let mut ledger = RealityLedger::new();
     ledger
-        .observe_user_task(&run, "é".repeat(140))
+        .observe_user_task(&run, "é".repeat(140), "test-model")
         .expect("task");
     let index = ledger.observation_index(10);
     assert_eq!(index.len(), 1);
@@ -334,6 +348,253 @@ fn cross_run_quality_gate_result_is_rejected_without_partial_receipts() {
 }
 
 #[test]
+fn one_byte_project_source_change_invalidates_prior_verification() {
+    let workspace = tempfile::TempDir::new().expect("temp workspace");
+    std::fs::create_dir(workspace.path().join("src")).expect("create src");
+    let source = workspace.path().join("src/lib.rs");
+    std::fs::write(&source, b"a").expect("write source");
+    let run = support::test_run_context(workspace.path());
+    let gate = run_gate(&run, "source-check", "true");
+    assert!(gate.passed(), "fixture quality gate must pass");
+    let mut ledger = RealityLedger::new();
+    let verification = append_quality_gate_observations(&run, &mut ledger, &gate)
+        .expect("append fresh gate")
+        .verification;
+    let decision = verification_decision("source-check", verification);
+    validate_decision(&decision, &ledger, &run).expect("unchanged source must remain verified");
+
+    std::fs::write(&source, b"b").expect("change exactly one source byte");
+
+    let denial = validate_decision(&decision, &ledger, &run)
+        .expect_err("one-byte source mutation must invalidate verification");
+    assert!(
+        denial.reason().contains("artifact set changed"),
+        "unexpected denial: {}",
+        denial.reason()
+    );
+}
+
+#[test]
+fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
+    let workspace = tempfile::TempDir::new().expect("temp workspace");
+    std::fs::create_dir(workspace.path().join("src")).expect("create src");
+    std::fs::write(workspace.path().join("src/lib.rs"), b"source").expect("write source");
+    std::fs::create_dir(workspace.path().join("target")).expect("create target");
+    let cache = workspace.path().join("target/cache.bin");
+    std::fs::write(&cache, b"a").expect("write cache");
+    std::fs::create_dir_all(workspace.path().join(".crosslink/.cache"))
+        .expect("create Crosslink runtime cache");
+    let hook_cache = workspace.path().join(".crosslink/.cache/hook-dedupe");
+    std::fs::write(&hook_cache, b"a").expect("write hook cache");
+    let run = support::test_run_context(workspace.path());
+    let gate = run_gate(&run, "cache-policy-check", "true");
+    let mut ledger = RealityLedger::new();
+    let verification = append_quality_gate_observations(&run, &mut ledger, &gate)
+        .expect("append fresh gate")
+        .verification;
+    let observation = ledger.get(verification).expect("verification receipt");
+    let Some(openclaudia::ledger::VerificationMethod::GuardrailsQualityGateSnapshotV2 {
+        binding,
+        ..
+    }) = observation.provenance.verification_method.as_ref()
+    else {
+        panic!("verification must use snapshot-v2 provenance");
+    };
+    assert_eq!(
+        binding.artifacts.dependency_policy,
+        openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV1
+    );
+    assert_eq!(
+        binding.freshness.import_generation,
+        run.generation().get(),
+        "effective imported state is pinned to the immutable run generation"
+    );
+    assert!(!binding.environment_sha256.is_empty());
+    assert!(!binding.verifier_identity_sha256.is_empty());
+
+    std::fs::write(&cache, b"b").expect("change excluded cache byte");
+    std::fs::write(&hook_cache, b"b").expect("change excluded hook cache byte");
+
+    validate_decision(
+        &verification_decision("cache-policy-check", verification),
+        &ledger,
+        &run,
+    )
+    .expect("explicit runtime/build-cache exclusions must not stale source verification");
+}
+
+#[test]
+fn task_model_and_policy_changes_stale_prior_verification_receipts() {
+    let workspace = tempfile::TempDir::new().expect("temp workspace");
+    std::fs::write(workspace.path().join("source.txt"), b"source").expect("write source");
+    let run = support::test_run_context(workspace.path());
+    let gate = run_gate(&run, "context-check", "true");
+    let mut ledger = RealityLedger::new();
+    let verification = append_quality_gate_observations(&run, &mut ledger, &gate)
+        .expect("append fresh gate")
+        .verification;
+    ledger
+        .observe_user_task(&run, "Amended task", "test-model")
+        .expect("observe amended task");
+    assert!(
+        ledger.is_stale(verification),
+        "task amendment must stale the verifier receipt atomically"
+    );
+
+    let second_workspace = tempfile::TempDir::new().expect("second workspace");
+    std::fs::write(second_workspace.path().join("source.txt"), b"source")
+        .expect("write second source");
+    let second_run = support::test_run_context(second_workspace.path());
+    let second_gate = run_gate(&second_run, "model-check", "true");
+    let mut second_ledger = RealityLedger::new();
+    let second_verification =
+        append_quality_gate_observations(&second_run, &mut second_ledger, &second_gate)
+            .expect("append second gate")
+            .verification;
+
+    let changed_model_gate =
+        openclaudia::guardrails::run_quality_gates(&second_run, "different-test-model")
+            .into_iter()
+            .next()
+            .expect("changed-model gate");
+    assert!(changed_model_gate.passed());
+    assert!(
+        second_ledger.is_stale(second_verification),
+        "model change must stale prior verifier receipts before the next gate"
+    );
+
+    let third_workspace = tempfile::TempDir::new().expect("third workspace");
+    std::fs::write(third_workspace.path().join("source.txt"), b"source")
+        .expect("write third source");
+    let third_run = support::test_run_context(third_workspace.path());
+    let third_gate = run_gate(&third_run, "policy-check", "true");
+    let mut third_ledger = RealityLedger::new();
+    let third_verification =
+        append_quality_gate_observations(&third_run, &mut third_ledger, &third_gate)
+            .expect("append third gate")
+            .verification;
+    let replacement_run = third_run
+        .derive_frontend_session(
+            openclaudia::state::SessionId::new(),
+            third_workspace.path(),
+            third_workspace.path(),
+            "test",
+        )
+        .expect("derive replacement policy generation");
+    openclaudia::guardrails::configure(
+        &replacement_run,
+        &quality_gate_config("policy-check", "false"),
+    )
+    .expect("bind replacement verification policy");
+    let policy_denial = validate_decision(
+        &verification_decision("policy-check", third_verification),
+        &third_ledger,
+        &replacement_run,
+    )
+    .expect_err("old verifier receipt must not cross a policy generation transition");
+    assert!(
+        policy_denial.reason().contains("current run generation"),
+        "unexpected policy-transition denial: {}",
+        policy_denial.reason()
+    );
+}
+
+#[test]
+fn background_bash_mutation_blocks_verification_until_reaped() {
+    let workspace = tempfile::TempDir::new().expect("temp workspace");
+    std::fs::create_dir(workspace.path().join("src")).expect("create src");
+    let source = workspace.path().join("src/lib.rs");
+    std::fs::write(&source, b"a").expect("write source");
+    std::fs::write(
+        workspace.path().join("mutate.sh"),
+        b"sleep 1\nprintf b > src/lib.rs\n",
+    )
+    .expect("write background mutation script");
+    let mutator_run = support::test_run_context(workspace.path());
+    let verifier_run = support::test_run_context(workspace.path());
+    openclaudia::guardrails::configure(&mutator_run, &quality_gate_config("race-check", "true"))
+        .expect("configure mutator gate policy");
+    openclaudia::guardrails::configure(&verifier_run, &quality_gate_config("race-check", "true"))
+        .expect("configure verifier gate policy");
+    let background = openclaudia::tools::execute_tool(
+        &mutator_run,
+        &ToolCall {
+            id: "background-mutator".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "bash".to_string(),
+                arguments: serde_json::json!({
+                    "command": "sh mutate.sh",
+                    "run_in_background": true
+                })
+                .to_string(),
+            },
+        },
+    );
+    assert!(
+        !background.is_error(),
+        "background bash must start: {background:?}"
+    );
+    let shell_id = background
+        .content()
+        .strip_prefix("Background shell started with ID: ")
+        .and_then(|content| content.lines().next())
+        .expect("background shell id");
+
+    let racing_gate = openclaudia::guardrails::run_quality_gates(&verifier_run, "test-model")
+        .into_iter()
+        .next()
+        .expect("racing gate result");
+    assert!(!racing_gate.passed());
+    assert!(racing_gate.stderr().contains("mutation is in progress"));
+    let mut ledger = RealityLedger::new();
+    append_quality_gate_observations(&verifier_run, &mut ledger, &racing_gate)
+        .expect_err("cross-run racing gate must not mint verifier evidence");
+
+    let mut completed = false;
+    for attempt in 0..100_u32 {
+        let poll = openclaudia::tools::execute_tool(
+            &mutator_run,
+            &ToolCall {
+                id: format!("background-poll-{attempt}"),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "bash_output".to_string(),
+                    arguments: serde_json::json!({"shell_id": shell_id}).to_string(),
+                },
+            },
+        );
+        assert!(!poll.is_error(), "background poll failed: {poll:?}");
+        if poll.content().contains("finished (exit code: 0)") {
+            completed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(completed, "background mutation did not finish in time");
+    assert_eq!(std::fs::read(&source).expect("read mutated source"), b"b");
+
+    let mut fresh_gate = None;
+    for _ in 0..20 {
+        let candidate = openclaudia::guardrails::run_quality_gates(&verifier_run, "test-model")
+            .into_iter()
+            .next()
+            .expect("post-mutation gate result");
+        if candidate.passed() {
+            fresh_gate = Some(candidate);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    append_quality_gate_observations(
+        &verifier_run,
+        &mut ledger,
+        &fresh_gate.expect("fresh gate must pass after mutation is reaped"),
+    )
+    .expect("post-mutation gate may mint fresh evidence");
+}
+
+#[test]
 fn unsupported_and_unresolved_claims_are_explicitly_allowed_without_proof() {
     let run = test_run();
     let ledger = RealityLedger::new();
@@ -357,7 +618,7 @@ fn run_command_requires_current_user_task_not_tool_text() {
     let run = test_run();
     let mut ledger = RealityLedger::new();
     let task = ledger
-        .observe_user_task(&run, "Run the tests.")
+        .observe_user_task(&run, "Run the tests.", "test-model")
         .expect("task");
     let allowed = AgentDecision::RunCommand {
         reason: "user requested it".to_string(),
@@ -470,7 +731,7 @@ fn task_spec_requires_current_run_user_input() {
     let other_run = test_run();
     let mut ledger = RealityLedger::new();
     let task = ledger
-        .observe_user_task(&run, "Do the audit.")
+        .observe_user_task(&run, "Do the audit.", "test-model")
         .expect("task");
     let spec = TaskSpec::from_user_observation(&ledger, &run, task).expect("task spec");
     assert_eq!(spec.content, "Do the audit.");

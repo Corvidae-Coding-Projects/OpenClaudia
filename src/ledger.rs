@@ -17,6 +17,9 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use crate::evidence_freshness::{
+    ArtifactSetBinding, FreshnessStamp, VerificationFreshnessBinding, WorkspaceDependencyPolicy,
+};
 use crate::runtime::{CapabilityGeneration, RunId};
 
 const SCHEMA_VERSION: i64 = 1;
@@ -171,10 +174,18 @@ pub enum ArtifactBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VerificationMethod {
+    /// Receipt format retained only so older persisted rows remain readable.
+    /// It is not sufficient to authorize a current verification claim.
     GuardrailsQualityGateDirectExec {
         normalized_argv: Vec<String>,
         resolved_executable: Option<String>,
         executable_sha256: Option<String>,
+    },
+    GuardrailsQualityGateSnapshotV2 {
+        normalized_argv: Vec<String>,
+        resolved_executable: String,
+        executable_sha256: String,
+        binding: Box<VerificationFreshnessBinding>,
     },
 }
 
@@ -186,6 +197,8 @@ pub struct EvidenceProvenance {
     pub tool_call: Option<ToolCallBinding>,
     pub artifact: Option<ArtifactBinding>,
     pub verification_method: Option<VerificationMethod>,
+    #[serde(default)]
+    pub freshness: Option<FreshnessStamp>,
 }
 
 impl EvidenceProvenance {
@@ -194,18 +207,36 @@ impl EvidenceProvenance {
         trust: EvidenceTrust,
         source: EvidenceSource,
     ) -> Self {
-        Self::for_binding(RunBinding::from_run(run), trust, source)
+        Self {
+            trust,
+            source,
+            run: Some(RunBinding::from_run(run)),
+            tool_call: None,
+            artifact: None,
+            verification_method: None,
+            freshness: crate::evidence_freshness::current_stamp(run).ok(),
+        }
     }
 
-    const fn for_binding(run: RunBinding, trust: EvidenceTrust, source: EvidenceSource) -> Self {
-        Self {
+    fn for_binding(
+        run: RunBinding,
+        trust: EvidenceTrust,
+        source: EvidenceSource,
+    ) -> Result<Self, LedgerError> {
+        let freshness = crate::evidence_freshness::current_stamp_for_binding(
+            run.run_id,
+            run.capability_generation,
+        )
+        .map_err(LedgerError::InvalidEvidenceProvenance)?;
+        Ok(Self {
             trust,
             source,
             run: Some(run),
             tool_call: None,
             artifact: None,
             verification_method: None,
-        }
+            freshness: Some(freshness),
+        })
     }
 
     fn legacy_unbound(authority: LegacyAuthority) -> Self {
@@ -222,6 +253,7 @@ impl EvidenceProvenance {
             tool_call: None,
             artifact: None,
             verification_method: None,
+            freshness: None,
         }
     }
 
@@ -408,10 +440,12 @@ struct ObservationRecord {
     stale: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct IssuedReceiptState {
     observation_sha256: [u8; 32],
     stale: bool,
+    run: Option<RunBinding>,
+    verification: bool,
 }
 
 #[derive(Default)]
@@ -437,6 +471,14 @@ impl IssuedReceiptRegistry {
     fn mark_stale(&mut self, id: ObsId) {
         if let Some(state) = self.states.get_mut(&id) {
             state.stale = true;
+        }
+    }
+
+    fn mark_verification_stale(&mut self, run: &RunBinding) {
+        for state in self.states.values_mut() {
+            if state.verification && state.run.as_ref() == Some(run) {
+                state.stale = true;
+            }
         }
     }
 }
@@ -626,7 +668,7 @@ impl RealityLedger {
 
     #[must_use]
     pub fn is_stale(&self, id: ObsId) -> bool {
-        self.records.get(&id).is_some_and(|record| record.stale)
+        self.records.get(&id).is_some_and(|record| record.stale) || runtime_receipt_is_stale(id)
     }
 
     /// Return all observations in chronological order.
@@ -678,12 +720,15 @@ impl RealityLedger {
         &mut self,
         run: &crate::tools::ToolRunContext,
         content: impl Into<String>,
+        model_identity: &str,
     ) -> Result<ObsId, LedgerError> {
+        let content = content.into();
+        crate::evidence_freshness::advance_task(run, &content, model_identity)
+            .map_err(LedgerError::InvalidEvidenceProvenance)?;
+        invalidate_verification_receipts_for_run(run);
         self.append(
             EvidenceProvenance::for_run(run, EvidenceTrust::UserInput, EvidenceSource::UserInput),
-            ObservationKind::UserTask {
-                content: content.into(),
-            },
+            ObservationKind::UserTask { content },
         )
     }
 
@@ -763,6 +808,8 @@ impl RealityLedger {
         stdout: impl Into<String>,
         stderr: impl Into<String>,
     ) -> Result<ObsId, LedgerError> {
+        crate::evidence_freshness::current_stamp(run)
+            .map_err(LedgerError::InvalidEvidenceProvenance)?;
         self.observe_command_run_for_binding(
             RunBinding::from_run(run),
             cwd,
@@ -787,7 +834,7 @@ impl RealityLedger {
             run,
             EvidenceTrust::RuntimeObserved,
             EvidenceSource::CommandExecution,
-        );
+        )?;
         provenance.artifact = Some(ArtifactBinding::Command {
             cwd: cwd.clone(),
             argv_sha256: sha256_hex(
@@ -892,6 +939,21 @@ impl RealityLedger {
     ) -> Result<ObsId, LedgerError> {
         Self::validate_quality_gate_result(run, gate)?;
         let proof = gate.evidence();
+        let binding = proof.verification_binding.as_ref().ok_or_else(|| {
+            LedgerError::InvalidEvidenceProvenance(
+                "quality-gate result lacks a freshness binding".to_string(),
+            )
+        })?;
+        let resolved_executable = proof.resolved_executable.as_ref().ok_or_else(|| {
+            LedgerError::InvalidEvidenceProvenance(
+                "quality-gate result lacks a resolved executable".to_string(),
+            )
+        })?;
+        let executable_sha256 = proof.executable_sha256.as_ref().ok_or_else(|| {
+            LedgerError::InvalidEvidenceProvenance(
+                "quality-gate result lacks an executable digest".to_string(),
+            )
+        })?;
 
         let mut provenance = EvidenceProvenance::for_run(
             run,
@@ -900,19 +962,17 @@ impl RealityLedger {
                 check: gate.name().to_string(),
             },
         );
-        provenance.artifact = proof
-            .resolved_executable
-            .as_ref()
-            .zip(proof.executable_sha256.as_ref())
-            .map(|(path, sha256)| ArtifactBinding::Executable {
-                path: path.clone(),
-                sha256: sha256.clone(),
-            });
+        provenance.artifact = Some(ArtifactBinding::Executable {
+            path: resolved_executable.clone(),
+            sha256: executable_sha256.clone(),
+        });
+        provenance.freshness = Some(binding.freshness.clone());
         provenance.verification_method =
-            Some(VerificationMethod::GuardrailsQualityGateDirectExec {
+            Some(VerificationMethod::GuardrailsQualityGateSnapshotV2 {
                 normalized_argv: proof.normalized_argv.clone(),
-                resolved_executable: proof.resolved_executable.clone(),
-                executable_sha256: proof.executable_sha256.clone(),
+                resolved_executable: resolved_executable.clone(),
+                executable_sha256: executable_sha256.clone(),
+                binding: Box::new(binding.clone()),
             });
         self.append(
             provenance,
@@ -929,6 +989,11 @@ impl RealityLedger {
         gate: &crate::guardrails::QualityCheckResult,
     ) -> Result<(), LedgerError> {
         let proof = gate.evidence();
+        if let Some(error) = proof.freshness_error.as_deref() {
+            return Err(LedgerError::InvalidEvidenceProvenance(format!(
+                "quality-gate freshness proof failed: {error}"
+            )));
+        }
         if proof.run_id != run.run_id() || proof.capability_generation != run.generation() {
             return Err(LedgerError::InvalidEvidenceProvenance(
                 "quality-gate result belongs to a different run generation".to_string(),
@@ -947,14 +1012,115 @@ impl RealityLedger {
                 "quality-gate pass state does not match its exit code".to_string(),
             ));
         }
-        if gate.passed()
-            && (proof.resolved_executable.is_none() || proof.executable_sha256.is_none())
-        {
+        let Some(resolved_executable) = proof.resolved_executable.as_deref() else {
             return Err(LedgerError::InvalidEvidenceProvenance(
-                "passing quality gate lacks a resolved executable artifact".to_string(),
+                "quality gate lacks a resolved executable artifact".to_string(),
+            ));
+        };
+        let Some(executable_sha256) = proof.executable_sha256.as_deref() else {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality gate lacks an executable artifact digest".to_string(),
+            ));
+        };
+        let current_executable_sha256 = sha256_file_hex(Path::new(resolved_executable))?;
+        if current_executable_sha256 != executable_sha256 {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality-gate executable changed before its receipt was recorded".to_string(),
+            ));
+        }
+        let Some(binding) = proof.verification_binding.as_ref() else {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality gate lacks an immutable workspace freshness binding".to_string(),
+            ));
+        };
+        crate::evidence_freshness::validate_verification_binding(run, binding)
+            .map_err(LedgerError::InvalidEvidenceProvenance)?;
+        let verifier_identity = crate::evidence_freshness::verifier_identity_sha256(
+            gate.name(),
+            &proof.normalized_argv,
+            Some(resolved_executable),
+            Some(executable_sha256),
+        );
+        if verifier_identity != binding.verifier_identity_sha256 {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality-gate verifier identity does not match its freshness binding".to_string(),
             ));
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn validate_verification_freshness(
+        &self,
+        id: ObsId,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), LedgerError> {
+        let observation = self.records.get(&id).ok_or_else(|| {
+            LedgerError::InvalidEvidenceProvenance(format!(
+                "verification receipt {id} is not present"
+            ))
+        })?;
+        let EvidenceSource::QualityGate { check } = &observation.observation.provenance.source
+        else {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "verification receipt does not come from a quality gate".to_string(),
+            ));
+        };
+        let (normalized_argv, resolved_executable, executable_sha256, binding) =
+            match &observation.observation.provenance.verification_method {
+                Some(VerificationMethod::GuardrailsQualityGateSnapshotV2 {
+                    normalized_argv,
+                    resolved_executable,
+                    executable_sha256,
+                    binding,
+                }) => (
+                    normalized_argv,
+                    resolved_executable,
+                    executable_sha256,
+                    binding,
+                ),
+                Some(VerificationMethod::GuardrailsQualityGateDirectExec { .. }) | None => {
+                    return Err(LedgerError::InvalidEvidenceProvenance(
+                        "verification receipt predates immutable artifact freshness proofs"
+                            .to_string(),
+                    ))
+                }
+            };
+        if observation.observation.provenance.freshness.as_ref() != Some(&binding.freshness) {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "verification receipt freshness stamp does not match its artifact binding"
+                    .to_string(),
+            ));
+        }
+        crate::evidence_freshness::validate_verification_binding(run, binding)
+            .map_err(LedgerError::InvalidEvidenceProvenance)?;
+        let current_executable_sha256 = sha256_file_hex(Path::new(resolved_executable))?;
+        if &current_executable_sha256 != executable_sha256 {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality-gate executable changed after verification".to_string(),
+            ));
+        }
+        if observation.observation.provenance.artifact.as_ref()
+            != Some(&ArtifactBinding::Executable {
+                path: resolved_executable.clone(),
+                sha256: executable_sha256.clone(),
+            })
+        {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "verification receipt executable artifact is internally inconsistent".to_string(),
+            ));
+        }
+        let current_verifier_identity = crate::evidence_freshness::verifier_identity_sha256(
+            check,
+            normalized_argv,
+            Some(resolved_executable),
+            Some(executable_sha256),
+        );
+        if current_verifier_identity != binding.verifier_identity_sha256 {
+            return Err(LedgerError::InvalidEvidenceProvenance(
+                "quality-gate verifier identity changed after verification".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -969,6 +1135,11 @@ impl RealityLedger {
         files: Vec<String>,
         patch: impl Into<String>,
     ) -> Result<ObsId, LedgerError> {
+        let generation_changed = crate::evidence_freshness::observe_workspace_change(run)
+            .map_err(LedgerError::InvalidEvidenceProvenance)?;
+        if generation_changed {
+            invalidate_verification_receipts_for_run(run);
+        }
         let patch = patch.into();
         let mut provenance = EvidenceProvenance::for_run(
             run,
@@ -1098,7 +1269,7 @@ impl RealityLedger {
                 ts: record.observation.ts,
                 trust: record.observation.provenance.trust,
                 source: record.observation.provenance.source.clone(),
-                stale: record.stale,
+                stale: record.stale || runtime_receipt_is_stale(record.observation.id),
                 label: record.observation.kind.compact_label(),
             })
             .collect()
@@ -1197,6 +1368,11 @@ fn register_runtime_issued(record: &ObservationRecord) -> Result<(), LedgerError
     let state = IssuedReceiptState {
         observation_sha256: observation_digest(&record.observation)?,
         stale: record.stale,
+        run: record.observation.provenance.run.clone(),
+        verification: matches!(
+            record.observation.kind,
+            ObservationKind::Verification { .. }
+        ),
     };
     issued_receipts_guard("register_runtime_issued").insert(record.observation.id, state);
     Ok(())
@@ -1206,6 +1382,11 @@ fn was_issued_by_this_runtime(record: &ObservationRecord) -> Result<bool, Ledger
     let state = IssuedReceiptState {
         observation_sha256: observation_digest(&record.observation)?,
         stale: record.stale,
+        run: record.observation.provenance.run.clone(),
+        verification: matches!(
+            record.observation.kind,
+            ObservationKind::Verification { .. }
+        ),
     };
     Ok(issued_receipts_guard("validate_runtime_issued")
         .states
@@ -1218,6 +1399,40 @@ fn mark_runtime_receipts_stale(ids: &[ObsId]) {
     for id in ids {
         issued.mark_stale(*id);
     }
+}
+
+pub(crate) fn invalidate_verification_receipts_for_run(run: &crate::tools::ToolRunContext) {
+    invalidate_verification_receipts_for_binding(run.run_id(), run.generation());
+}
+
+pub(crate) fn invalidate_verification_receipts_for_binding(
+    run_id: RunId,
+    capability_generation: CapabilityGeneration,
+) {
+    let binding = RunBinding {
+        run_id,
+        capability_generation,
+    };
+    issued_receipts_guard("invalidate_verification_receipts").mark_verification_stale(&binding);
+}
+
+pub(crate) fn sync_model_identity(
+    run: &crate::tools::ToolRunContext,
+    model_identity: &str,
+) -> Result<(), LedgerError> {
+    if crate::evidence_freshness::sync_model(run, model_identity)
+        .map_err(LedgerError::InvalidEvidenceProvenance)?
+    {
+        invalidate_verification_receipts_for_run(run);
+    }
+    Ok(())
+}
+
+fn runtime_receipt_is_stale(id: ObsId) -> bool {
+    issued_receipts_guard("runtime_receipt_is_stale")
+        .states
+        .get(&id)
+        .is_some_and(|state| state.stale)
 }
 
 fn observation_digest(observation: &Observation) -> Result<[u8; 32], LedgerError> {
@@ -1246,6 +1461,40 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String, LedgerError> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        LedgerError::InvalidEvidenceProvenance(format!(
+            "cannot open quality-gate executable '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| {
+            LedgerError::InvalidEvidenceProvenance(format!(
+                "cannot hash quality-gate executable '{}': {error}",
+                path.display()
+            ))
+        })?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest_hex(&digest.finalize()))
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
