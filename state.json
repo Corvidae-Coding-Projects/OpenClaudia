@@ -1,6 +1,6 @@
 {
   "next_display_id": 1046,
-  "next_comment_id": 906,
+  "next_comment_id": 907,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6350,7 +6350,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:09:55.024359Z",
-      "updated_at": "2026-08-20T21:20:36.787985327Z",
+      "updated_at": "2026-08-20T21:20:48.367715333Z",
       "closed_at": "2026-08-20T21:20:36.787984304Z",
       "labels": [
         "remediation"
@@ -6403,6 +6403,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAO8fxjrzaNDalhyBXkphtasjCKsUTDf8YZEl6cR7Ljeq758yxuipsxFeZkzZQqhGHjODfY1lTxjYaeSnEmw98AA=="
+        },
+        "5753fe88-28f0-4223-8b9f-20d659654707": {
+          "display_id": 906,
+          "author": "6Vw9",
+          "content": "Delivered S031-G1 descriptor-safe persistence at artifact f1af9b0c162cbaf19b21c29681c9681b27fa51c8fdbafc771857a4877a2fbdf8: pinned Unix roots and targets, class/bounds/mode/link policy, zeroizing reads, generation locks, stage/lock/parent binding, typed unchanged/durable/uncertain/recovered receipts, retry recovery, legacy session compatibility, and diagnostic-only path validation. Verified Linux fmt/diff/check/strict all-target Clippy; full all-feature/all-target tests (2647 active lib, 228 binary, every integration target, zero failures); Windows GNU fail-closed cross-check. Evidence and residual queues are recorded in the slice; Miri unavailable, VDD waits for S-088, rustdoc debt is #1045.",
+          "created_at": "2026-08-20T21:20:48.365314150Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAa68gHmO/wpANLytRpy8rQ36KfZibZQTznW1UEUSHbZNb9ld1jgvgmEfZjSjO3XUUrSnR50Jpc9Y0jsXzm2YKDg=="
         },
         "5a927fd6-0591-4829-bd95-885c0c9987e9": {
           "display_id": 905,
@@ -26571,11 +26580,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 448,
       "timestamp": "2026-08-20T21:20:41.247406742Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 449,
+      "timestamp": "2026-08-20T21:20:48.367715333Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T21:20:41.247406742Z",
+    "timestamp": "2026-08-20T21:20:48.367715333Z",
     "agent_id": "6Vw9",
-    "agent_seq": 448
+    "agent_seq": 449
   }
 }
