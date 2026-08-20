@@ -1,6 +1,6 @@
 {
   "next_display_id": 1056,
-  "next_comment_id": 938,
+  "next_comment_id": 939,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11439,7 +11439,7 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:26.926561528Z",
-      "updated_at": "2026-08-20T23:12:24.477225787Z",
+      "updated_at": "2026-08-20T23:18:50.328644336Z",
       "labels": [
         "remediation"
       ],
@@ -11470,6 +11470,15 @@
           "kind": "decision",
           "signed_by": "SHA256:aYyc+2g0o8C/BrTc8XRSOz9rn0QmRPd7Yf3dQfWyvZ4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg91tlCd5BDW96nHQ90mDKp3ek6NoO80GC7KGanAji4wIAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKA3nlSjxP8XbJ0+LsFSRj1mSeUwzKSw4SM/tH2sBDOvGf8URlcg2BrLwKTi/X2ZVb/T6KeaGM8ycCnMNPwPjCw=="
+        },
+        "a321685a-a845-4c4c-9907-aae98c2be2f8": {
+          "display_id": 938,
+          "author": "s004-wave",
+          "content": "type=decision; slice=S-004; panic_boundary=catch_unwind_closes_startup_control_flow_only; redaction=typed_return_and_terminal_trace_do_not_copy_payload; residual=process_global_panic_hook_runs_before_catch_and_registered_migrations_must_never_format_persisted_paths_or_bytes_in_payloads; rejected=temporary_global_hook_swap_due_cross_thread_race; verification=corrective_queue_pending",
+          "created_at": "2026-08-20T23:18:50.325431126Z",
+          "kind": "decision",
+          "signed_by": "SHA256:aYyc+2g0o8C/BrTc8XRSOz9rn0QmRPd7Yf3dQfWyvZ4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg91tlCd5BDW96nHQ90mDKp3ek6NoO80GC7KGanAji4wIAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKwVzaRTl/A8eqJyHbkgkf6ytg5gZ5ZaKdGE8jfj187u4EIxSgVqPVWVzpfy5KwcyBOj/aj15TYZTyDKKJVCMCg=="
         },
         "a67770f1-e69c-414d-908e-419f18ca7e8a": {
           "display_id": 928,
@@ -27414,11 +27423,16 @@
       "agent_id": "s001-wave",
       "agent_seq": 4,
       "timestamp": "2026-08-20T23:15:14.625208738Z"
+    },
+    {
+      "agent_id": "s004-wave",
+      "agent_seq": 9,
+      "timestamp": "2026-08-20T23:18:50.328644336Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T23:15:14.625208738Z",
-    "agent_id": "s001-wave",
-    "agent_seq": 4
+    "timestamp": "2026-08-20T23:18:50.328644336Z",
+    "agent_id": "s004-wave",
+    "agent_seq": 9
   }
 }
