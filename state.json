@@ -1636,11 +1636,12 @@
       "uuid": "05d05ef1-8187-412c-a11b-ec1b06d4ead6",
       "display_id": 1043,
       "title": "Select the next remediation slice after S-025",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:06:27.520009885Z",
-      "updated_at": "2026-08-20T19:07:54.137317859Z",
+      "updated_at": "2026-08-20T19:07:58.320079562Z",
+      "closed_at": "2026-08-20T19:07:58.320078123Z",
       "labels": [
         "workflow"
       ],
@@ -26406,11 +26407,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 432,
       "timestamp": "2026-08-20T19:07:54.137317859Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 433,
+      "timestamp": "2026-08-20T19:07:58.320079562Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T19:07:54.137317859Z",
+    "timestamp": "2026-08-20T19:07:58.320079562Z",
     "agent_id": "6Vw9",
-    "agent_seq": 432
+    "agent_seq": 433
   }
 }
