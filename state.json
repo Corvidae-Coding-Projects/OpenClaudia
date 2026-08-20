@@ -1,6 +1,6 @@
 {
   "next_display_id": 1056,
-  "next_comment_id": 937,
+  "next_comment_id": 938,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18359,7 +18359,7 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:18.214462612Z",
-      "updated_at": "2026-08-20T23:15:02.859267598Z",
+      "updated_at": "2026-08-20T23:15:14.625208738Z",
       "labels": [
         "remediation"
       ],
@@ -18390,6 +18390,15 @@
           "kind": "decision",
           "signed_by": "SHA256:2Btvvp76wqPqtAO/kRlrhxJu+d2812XJLx6HIAY6Bjk",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgrR/vjQNg+dG653t49ZEccNJsea1ahJuGKbTAm5G9ejQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAd8VuiEh/NQPwzZkjmQhtePoHfGGreljCG8fmR/qmXx7kOAB61qpgucA3PtBm+eC8igqymBg++MV0jf5iuP0/DA=="
+        },
+        "decfb29d-1c99-4981-97fe-b89cd25a4a4f": {
+          "display_id": 937,
+          "author": "s001-wave",
+          "content": "QUALITY_REVIEW_RESULT: PASS; reviewer=primary-orchestrator-6vw9; registry_sha256=da036dbd7c7533d9cc65ff83a29476eb83e3ffe69cd002d535349473310eaa69; corpus_sha256=1f8b05b210fe641ebdfcce22b4af7fe20570e6b88ca1dee037ccd1182ab31304; matrix_sha256=5720c3b11c874f595ba18537e63f16e5fcfbaba7a9c765b67b8580fc50a7e502; review_sha256=af3aec5046d3fdc6c4138f96d5de0667610c8b68c32967705ab183371372f2b4. Six dimensions passed. Limitations: deterministic repeatability only; in-process/no-child path grading only until descriptor-safe traversal; S-088 VDD pending; no promotion of other runtime capabilities.",
+          "created_at": "2026-08-20T23:15:14.622600340Z",
+          "kind": "result",
+          "signed_by": "SHA256:2Btvvp76wqPqtAO/kRlrhxJu+d2812XJLx6HIAY6Bjk",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgrR/vjQNg+dG653t49ZEccNJsea1ahJuGKbTAm5G9ejQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgAmkjyOe13IFYZBEONKELIJu0AJdQ5dkOXKXOfGgegqaIcgN1+r5rHu8fa1lryAeST6bb5C3AG/OR1CgWyqRCA=="
         }
       }
     },
@@ -27400,11 +27409,16 @@
       "agent_id": "s001-wave",
       "agent_seq": 3,
       "timestamp": "2026-08-20T23:15:02.859267598Z"
+    },
+    {
+      "agent_id": "s001-wave",
+      "agent_seq": 4,
+      "timestamp": "2026-08-20T23:15:14.625208738Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T23:15:02.859267598Z",
+    "timestamp": "2026-08-20T23:15:14.625208738Z",
     "agent_id": "s001-wave",
-    "agent_seq": 3
+    "agent_seq": 4
   }
 }
