@@ -1,6 +1,6 @@
 {
   "next_display_id": 1057,
-  "next_comment_id": 940,
+  "next_comment_id": 941,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18332,7 +18332,7 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:36.514810569Z",
-      "updated_at": "2026-08-20T23:37:02.409778308Z",
+      "updated_at": "2026-08-20T23:46:29.214952193Z",
       "labels": [
         "remediation"
       ],
@@ -18345,6 +18345,15 @@
           "kind": "decision",
           "signed_by": "SHA256:GnnQNPlvNEZp35JadXiNDA+I/8ohf5UCKkSJrMb/gew",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgSjog0F9LUCbKsv62g2BnSf4fH0D7kCW68xbgp+h6bYUAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwO8xQUV/jT/N9g0+ytdFb7wmpZcIqGWIpBc8/9dPexq9NtebHYhdTQuQF8AYZ5nswiP3Ajyt6JKIfrTQeRcuAw=="
+        },
+        "53d63de8-6490-4009-a6a3-3c20e6fff701": {
+          "display_id": 940,
+          "author": "s005-wave",
+          "content": "Replace generic underscore-based environment rewriting with a finite typed registry colocating exact variable names, parser, secrecy, precedence, deprecation, and security metadata; apply exact environment values after project/home files and before explicit CLI mutation; reject unknown, ambiguous, malformed, oversized, non-Unicode, and empty security-relevant inputs; preserve exact legacy aliases with warnings; prove every supported field and source-precedence edge through exhaustive typed and process-level negative tests. This addresses F-013 while keeping W14 loader unification and S-088 canonical VDD outside the slice.",
+          "created_at": "2026-08-20T23:46:29.212392989Z",
+          "kind": "plan",
+          "signed_by": "SHA256:GnnQNPlvNEZp35JadXiNDA+I/8ohf5UCKkSJrMb/gew",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgSjog0F9LUCbKsv62g2BnSf4fH0D7kCW68xbgp+h6bYUAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA03dMGS+P3PUH/91ag/pYs1aSihG2aL0N4MhZNpByYURJF3Cse/6Cb7rtFgMwtTtLuH3TGI3zAjI4SdCKi/NTCg=="
         },
         "61773e12-6e41-4880-b464-4ddd02bbe9b1": {
           "display_id": 930,
@@ -27467,11 +27476,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 510,
       "timestamp": "2026-08-20T23:46:23.570202338Z"
+    },
+    {
+      "agent_id": "s005-wave",
+      "agent_seq": 5,
+      "timestamp": "2026-08-20T23:46:29.214952193Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T23:46:23.570202338Z",
-    "agent_id": "6Vw9",
-    "agent_seq": 510
+    "timestamp": "2026-08-20T23:46:29.214952193Z",
+    "agent_id": "s005-wave",
+    "agent_seq": 5
   }
 }
