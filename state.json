@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1056,
+  "next_display_id": 1057,
   "next_comment_id": 940,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -559,6 +559,7 @@
     "955c9fa9-e629-441e-8d31-104beeda2818": 526,
     "956730fe-6b1c-4bce-b20c-3c7f54f81f41": 276,
     "95db6be1-e136-47bb-8460-c232602f0c24": 514,
+    "96075446-6180-48ad-9fca-99339ab293a2": 1056,
     "9610eca6-b219-4c22-b2e3-30c2c65b28a3": 935,
     "96b0db01-d835-4e93-82c6-6b7d19465a8d": 620,
     "97144394-3790-4c47-9daf-41907d8b56d4": 422,
@@ -14445,6 +14446,17 @@
         "claude-code-parity,plugins"
       ]
     },
+    "96075446-6180-48ad-9fca-99339ab293a2": {
+      "uuid": "96075446-6180-48ad-9fca-99339ab293a2",
+      "display_id": 1056,
+      "title": "Treat git merge-base as a read-only provider command",
+      "description": "The Crosslink provider safety hook blocked a composite read-only inspection because it classified 'git merge-base HEAD <baseline>' as a forbidden Git mutation. It then required an intervention receipt, but the prescribed crosslink issue intervene command was itself blocked when its quoted Attempted field contained the same token. Both attempts exited before execution and changed no state. Fix the command classifier and ensure mandated intervention recording cannot be recursively blocked. Reproduce under a managed Codex worker and add provider-hook coverage.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-20T23:46:19.133880609Z",
+      "updated_at": "2026-08-20T23:46:19.133880609Z"
+    },
     "9610eca6-b219-4c22-b2e3-30c2c65b28a3": {
       "uuid": "9610eca6-b219-4c22-b2e3-30c2c65b28a3",
       "display_id": 935,
@@ -27442,11 +27454,16 @@
       "agent_id": "s005-wave",
       "agent_seq": 4,
       "timestamp": "2026-08-20T23:37:02.409778308Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 509,
+      "timestamp": "2026-08-20T23:46:19.133880609Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T23:37:02.409778308Z",
-    "agent_id": "s005-wave",
-    "agent_seq": 4
+    "timestamp": "2026-08-20T23:46:19.133880609Z",
+    "agent_id": "6Vw9",
+    "agent_seq": 509
   }
 }
