@@ -1,6 +1,6 @@
 {
   "next_display_id": 1037,
-  "next_comment_id": 841,
+  "next_comment_id": 842,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4807,11 +4807,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T02:55:47.605967098Z",
-      "updated_at": "2026-08-20T02:58:48.997997464Z",
+      "updated_at": "2026-08-20T03:03:11.394134876Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "9029ca1d-2574-4c02-8727-d2beb00239db": {
+          "display_id": 841,
+          "author": "6Vw9",
+          "content": "S-021 preflight/design:\\n- Current state: policy globs are compiled with filter_map (invalid entries silently disappear), raw lexical targets permit aliases/traversal mismatch, denied reservations remain counted, reset_turn makes quota frontend-dependent, and only selected file/pipeline paths participate.\\n- Preferred boundary: compile configuration all-or-nothing; classify at the canonical executor; reserve tool/mutation/canonical path against the exact (RunId, capability generation) engine before dispatch; reserve exact file diff lines before the write; commit Success/Partial and release Error/cancellation through RAII.\\n- Resource identity: capability-resolved canonical path, matched project-relative and scoped by exact run generation, so relative/absolute/symlink aliases share one ledger identity.\\n- Coverage: all mandatory ToolEffect families pass through one reservation path; path allow/deny and unique-file accounting apply to typed path targets. MCP's separate proxy dispatcher will require the same run-scoped reservation.\\n- Rejected alternative: add counters/checks to every leaf handler. It remains bypassable, duplicates policy, and cannot make concurrent admission atomic.\\n- Config migration: per-run optional non-zero file/line/tool/mutation limits; legacy max_files_per_turn accepted only as an alias, with duplicate/zero input rejected rather than ambiguously weakened.",
+          "created_at": "2026-08-20T03:03:11.391480163Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAm2GaGjsvkp87LfgO4uKbyZnFZjO0OLUbqvUzoKycOsZ5hzF31RBBz7BH1/ZvVvtwSpyi/GYHiVwM/VMlyd7WCw=="
+        },
         "cc259cce-5954-4310-9a30-59f3fcfeec58": {
           "display_id": 840,
           "author": "6Vw9",
@@ -25096,11 +25105,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 304,
       "timestamp": "2026-08-20T02:58:48.997997464Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 305,
+      "timestamp": "2026-08-20T03:03:11.394134876Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T02:58:48.997997464Z",
+    "timestamp": "2026-08-20T03:03:11.394134876Z",
     "agent_id": "6Vw9",
-    "agent_seq": 304
+    "agent_seq": 305
   }
 }
