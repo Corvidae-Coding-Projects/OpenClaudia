@@ -1,6 +1,6 @@
 {
   "next_display_id": 1039,
-  "next_comment_id": 868,
+  "next_comment_id": 869,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18489,10 +18489,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T07:52:17.877003082Z",
-      "updated_at": "2026-08-20T07:52:22.274513397Z",
+      "updated_at": "2026-08-20T08:00:49.191177648Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "65207139-9d8d-4448-b263-8fae46ae22e6": {
+          "display_id": 868,
+          "author": "6Vw9",
+          "content": "S-024 preflight/architecture plan: current verification binds only run + executable; observe_diff stales overlapping reads/diffs and cannot invalidate verifier receipts after Bash/Git, task/model/policy, imported-generation, or direct workspace changes. Preferred design: (1) add a typed run-scoped freshness coordinator with workspace/task/model/policy/import generations and a versioned conservative project-source dependency policy; every new receipt carries a freshness stamp. (2) Quality gates capture bounded deterministic workspace, environment, verifier, argv, policy, task, and model identity before execution, require the same source snapshot and generation after execution, and publish that proof atomically. (3) Canonical effect reservations obtain an RAII mutation token before workspace-capable/session-task effects and commit invalidation on success or typed partial outcome, including Bash/Git; final verification re-hashes the exact dependency set and rejects pending mutations or any generation/digest/executable mismatch. (4) New-run bindings invalidate imported state; explicit model/task synchronization invalidates within-run receipts; guardrails configuration supplies the policy digest/version. (5) Add adversarial one-byte, unrelated-exclusion-policy, gate-self-mutation, pending-race, task/model/policy/import, persistence, and real-dispatch tests, then full serialized fmt/check/clippy/test verification. Alternative rejected: only staling verifier IDs in observe_diff misses non-file mutation paths and races. Expected paths: new freshness module plus lib/ledger/evidence/guardrails/canonical dispatch/grounded frontends and focused integration tests. No generated provider projection is expected.",
+          "created_at": "2026-08-20T08:00:49.188529971Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAeXsnNBIoCKVeShFSA16WAvUyau/76p74qEZd997dhmc+nVNrOEImQ6rsb4SKNXo+/m0NCDChS6LQu914P6obCw=="
+        }
+      }
     },
     "c57d20ce-6aca-47a0-a626-3ca986dca915": {
       "uuid": "c57d20ce-6aca-47a0-a626-3ca986dca915",
@@ -25685,11 +25696,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 365,
       "timestamp": "2026-08-20T07:52:27.957317406Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 366,
+      "timestamp": "2026-08-20T08:00:49.191177648Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T07:52:27.957317406Z",
+    "timestamp": "2026-08-20T08:00:49.191177648Z",
     "agent_id": "6Vw9",
-    "agent_seq": 365
+    "agent_seq": 366
   }
 }
