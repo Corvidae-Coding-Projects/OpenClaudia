@@ -1,6 +1,6 @@
 {
   "next_display_id": 1041,
-  "next_comment_id": 883,
+  "next_comment_id": 884,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13401,7 +13401,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T10:22:37.908405433Z",
-      "updated_at": "2026-08-20T13:42:33.490234934Z",
+      "updated_at": "2026-08-20T13:42:50.344835705Z",
       "closed_at": "2026-08-20T13:42:33.490233645Z",
       "labels": [
         "remediation"
@@ -13442,6 +13442,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArZXPh4ai+WSKtUibqfWNTtYySO4fREcs5+Q/72XHPm7Y3Ol5r7+sF3NRmanUyb41Y+Xi2iV5eKQlOQOOUwlCAA=="
+        },
+        "3c30e240-8f49-46f7-ae2d-2bd9b8e54916": {
+          "display_id": 883,
+          "author": "6Vw9",
+          "content": "Delivered S-025 generation S025-G1: zeroizing typed secrets, transport-only sensitive header/environment materialization, explicit credential persistence, bounded exact-secret diagnostics across provider/OAuth/MCP/proxy/frontends/subagents/VDD, protected PKCE state, signed URL/webhook redaction, adversarial end-to-end tests, and h2 0.4.16. Final digest 22022117f2de4c29ff7c2e9834c622d4c93de32dd9a1a26847770d1c324a133a; locked all-feature/all-target check, strict Clippy, and serialized complete test suite passed.",
+          "created_at": "2026-08-20T13:42:50.341972682Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAC/ThBnqovTT90kNsHIYwziKND2dTYMB8yKVbUG5RAzH9r8kh3iIwzG0A/jdDHLK5NSQtxdV/uKm0VjpfTuoFAg=="
         },
         "3c831620-bdad-4223-b313-6bcfcaf8e6ab": {
           "display_id": 879,
@@ -25995,11 +26004,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 394,
       "timestamp": "2026-08-20T13:42:37.954655044Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 395,
+      "timestamp": "2026-08-20T13:42:50.344835705Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T13:42:37.954655044Z",
+    "timestamp": "2026-08-20T13:42:50.344835705Z",
     "agent_id": "6Vw9",
-    "agent_seq": 394
+    "agent_seq": 395
   }
 }
