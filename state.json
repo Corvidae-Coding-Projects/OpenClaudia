@@ -1,6 +1,6 @@
 {
   "next_display_id": 1038,
-  "next_comment_id": 861,
+  "next_comment_id": 862,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -21522,7 +21522,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T05:12:54.104996671Z",
-      "updated_at": "2026-08-20T07:10:39.355528150Z",
+      "updated_at": "2026-08-20T07:11:17.949396013Z",
       "labels": [
         "remediation"
       ],
@@ -21589,6 +21589,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAP3nxJvmUaWeOxsbCRumMasiTR7aKMvnmqcM2cH5rKvEqgVLXoBnB5pDtArVrSWz4wZyGP1a6otqMXfrH1X+iBg=="
+        },
+        "c454e506-60a2-4234-882b-28cf9947d24f": {
+          "display_id": 861,
+          "author": "6Vw9",
+          "content": "Committed S023-G1 as 5d9c8ef79476fde28ceb1e59c3122a6254c2434f (refactor(grounding): enforce provenance-bound evidence). The commit contains the exact verified source/test digest 2f336b2a1cb734a88e31abe48006f3464bd2fda23652cc4e931e8aef250405e1 plus the completed slice record and Crosslink-generated changelog line. Verification: formatting, all-feature/all-target check, strict Clippy, full single-threaded all-feature suite, focused adversarial suites, staged diff integrity, and security-pattern review all passed under CARGO_BUILD_JOBS=1. Worktree is clean.",
+          "created_at": "2026-08-20T07:11:17.946878957Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAprPQPLPh8TavbOiQLeqf5QeKyQfNY4UzgBjeLhKukSs8XJwGhocxaecsz1lCVJroPtWmTqeabUfFWzhE4unkAA=="
         },
         "e009e838-6652-48dd-a235-bf8c630ea223": {
           "display_id": 859,
@@ -25461,11 +25470,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 337,
       "timestamp": "2026-08-20T07:10:45.356917938Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 338,
+      "timestamp": "2026-08-20T07:11:17.949396013Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T07:10:45.356917938Z",
+    "timestamp": "2026-08-20T07:11:17.949396013Z",
     "agent_id": "6Vw9",
-    "agent_seq": 337
+    "agent_seq": 338
   }
 }
