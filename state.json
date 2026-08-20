@@ -1,6 +1,6 @@
 {
   "next_display_id": 1055,
-  "next_comment_id": 926,
+  "next_comment_id": 927,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11424,11 +11424,20 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:26.926561528Z",
-      "updated_at": "2026-08-20T22:19:47.812154633Z",
+      "updated_at": "2026-08-20T22:19:52.261630823Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "963f0cf4-42a8-4c0b-94d1-7b4addaa0c44": {
+          "display_id": 926,
+          "author": "s004-wave",
+          "content": "[action] S-004 preflight complete at exact baseline; implementing typed fail-closed startup migration gate without Cargo",
+          "created_at": "2026-08-20T22:19:52.259163925Z",
+          "kind": "note",
+          "signed_by": "SHA256:aYyc+2g0o8C/BrTc8XRSOz9rn0QmRPd7Yf3dQfWyvZ4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg91tlCd5BDW96nHQ90mDKp3ek6NoO80GC7KGanAji4wIAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkAqEIlD3Vy6zGXv7yHNMrjYHW1bkVc5Jy4GAJLW2om1rraXa/g1DFHN14WxpPp33TJojTdTuVNE3540ukXtJCA=="
+        },
         "963f5b50-f190-4d59-bb32-56a539bb2b86": {
           "display_id": 925,
           "author": "s004-wave",
@@ -27217,11 +27226,16 @@
       "agent_id": "s004-wave",
       "agent_seq": 2,
       "timestamp": "2026-08-20T22:19:47.812154633Z"
+    },
+    {
+      "agent_id": "s004-wave",
+      "agent_seq": 3,
+      "timestamp": "2026-08-20T22:19:52.261630823Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T22:19:47.812154633Z",
+    "timestamp": "2026-08-20T22:19:52.261630823Z",
     "agent_id": "s004-wave",
-    "agent_seq": 2
+    "agent_seq": 3
   }
 }
