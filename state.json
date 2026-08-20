@@ -1,6 +1,6 @@
 {
   "next_display_id": 1037,
-  "next_comment_id": 847,
+  "next_comment_id": 848,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4807,7 +4807,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T02:55:47.605967098Z",
-      "updated_at": "2026-08-20T04:34:48.369289167Z",
+      "updated_at": "2026-08-20T04:58:30.539375468Z",
       "labels": [
         "remediation"
       ],
@@ -4838,6 +4838,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAvZ+5Pqk2aZRT9kKMGHyJNKLHvUSS/CP1HxhJTmtoSstN7aybv/v4lYzmGWLtrlHHpZUvxfhXTO9C68VB/8HsCw=="
+        },
+        "7cbe9912-68ed-468d-9527-857ba928e8c4": {
+          "display_id": 847,
+          "author": "6Vw9",
+          "content": "S-021 final evidence: atomic reservations are bound to exact RunId/capability generations across canonical registered, subagent, and MCP dispatch; path targets use mandatory metadata and capability normalization; recursive reads enforce concrete leaf and directory-disclosure policy; file mutations reserve exact changed-line impact; started/remote uncertain effects retain typed Partial receipts. Skeptical final review found and fixed an additional directory-scope disclosure edge, then reran all gates. CARGO_BUILD_JOBS=1 cargo check --all-features --all-targets passed; CARGO_BUILD_JOBS=1 cargo clippy --all-features --all-targets -- -D warnings passed; CARGO_BUILD_JOBS=1 cargo test --all-features -- --test-threads=1 passed (2,618 library tests, all binary/integration targets, doc tests; only explicit ignores); cargo fmt --all -- --check and git diff --check passed. S021-G1 source/test digest: d2c9232b14b01c107bbba0ad69ef04571753ca88603a64207facc24ab970e07e. S-088 retrospective VDD is queued in the completed slice document; residual typed storage/final-state reconciliation remains owned by S-031/S-022.",
+          "created_at": "2026-08-20T04:58:30.535396914Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkMwD8qjp7ProCi2rTqu6KznjyaNBL7OmVJVhTo7smcMEwVwmqfqUWH93p2coz78912f7bh9PmBIB1GvlfHK9Aw=="
         },
         "9029ca1d-2574-4c02-8727-d2beb00239db": {
           "display_id": 841,
@@ -25180,11 +25189,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 310,
       "timestamp": "2026-08-20T04:34:48.369289167Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 311,
+      "timestamp": "2026-08-20T04:58:30.539375468Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T04:34:48.369289167Z",
+    "timestamp": "2026-08-20T04:58:30.539375468Z",
     "agent_id": "6Vw9",
-    "agent_seq": 310
+    "agent_seq": 311
   }
 }
