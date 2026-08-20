@@ -400,11 +400,11 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         }
     }
 
-    // Validate filesystem paths that flow into `std::fs::write` /
-    // `create_dir_all` from user / managed-settings input. Closes
-    // crosslink #342: a malicious managed-settings file specifying
-    // `vdd.tracking.path: /etc/cron.d` previously made the VDD logger
-    // write to system-privileged directories under elevated privileges.
+    // Diagnose configured persistence paths before subsystem startup. This
+    // rejects known system trees, lexical escape, and existing link
+    // components, but deliberately does not confer filesystem authority:
+    // path checks can race. Persistent I/O must use the descriptor-bound
+    // `persistence` API at its actual read/write boundary.
     //
     // `project_root` is the current working directory at config load
     // time — the same anchor used by the existing default `.openclaudia/…`

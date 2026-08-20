@@ -40,6 +40,7 @@ pub mod modes;
 pub mod oauth;
 pub mod output_style;
 pub mod permissions;
+pub mod persistence;
 pub mod pipeline;
 pub mod plugins;
 pub mod prompt;

@@ -33,7 +33,13 @@ pub fn get_sessions_dir() -> PathBuf {
 
 /// Save a chat session to disk
 pub fn save_chat_session(session: &Session) -> anyhow::Result<()> {
-    let path = chat_session_path(&session.id())?;
+    save_chat_session_in_dir(session, &get_sessions_dir())
+}
+
+fn save_chat_session_in_dir(session: &Session, directory: &Path) -> anyhow::Result<()> {
+    validate_chat_session_id(&session.id())?;
+    openclaudia::file_error::create_dir_all(directory)?;
+    let path = directory.join(format!("{}.json", session.id()));
     let _ = session.refresh_estimated_tokens();
     openclaudia::file_error::write_json_pretty_atomic(path, session)?;
     Ok(())
@@ -224,6 +230,28 @@ mod tests {
         assert!(
             err.to_string().contains("invalid characters"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_session_save_creates_the_missing_compatibility_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("session parent");
+        let directory = root.path().join("missing/chat_sessions");
+        let session = test_session();
+        save_chat_session_in_dir(&session, &directory).expect("first session save");
+
+        let path = directory.join(format!("{}.json", session.id()));
+        assert!(path.is_file());
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("session metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
         );
     }
 
