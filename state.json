@@ -1,6 +1,6 @@
 {
   "next_display_id": 1057,
-  "next_comment_id": 942,
+  "next_comment_id": 943,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11440,11 +11440,20 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:26.926561528Z",
-      "updated_at": "2026-08-20T23:18:50.328644336Z",
+      "updated_at": "2026-08-20T23:49:33.546054589Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "0f65040d-493a-4442-82f2-ebc69cc26137": {
+          "display_id": 942,
+          "author": "s004-wave",
+          "content": "type=result; slice=S-004; terminal=implemented_and_adversarially_reviewed_vdd_pending; startup_gate=fatal_before_agent_surfaces; outcomes=Writable|RecoveryRequired; transaction=bounded_global_lock+complete_preflight+generation_checked_atomic_publication; diagnostics=typed_content_redacted; focused_lib=19_passed_0_failed_2626_filtered; focused_e2e=5_passed_0_failed; locked_check=pass_28.41s; strict_clippy=pass_57.18s_zero_warnings; full_suite=2638_passed_6_known_1055_failed_1_ignored_no_new_or_S004_failures; windows_gnu_check=pass_39.98s_10_unrelated_cfg_test_warnings; artifact_manifest_sha256=1fec41e64efd88edcc57f2529d90fd1a7da4cf71b05c4fb09d8520d7dfe435fe; residual=S036_windows_storage,S038_schema_import,S088_VDD,panic_hook_payload_discipline,advisory_lock_boundary; issue=remain_open; commit=awaiting_primary_diff_inspection",
+          "created_at": "2026-08-20T23:49:33.543376668Z",
+          "kind": "result",
+          "signed_by": "SHA256:aYyc+2g0o8C/BrTc8XRSOz9rn0QmRPd7Yf3dQfWyvZ4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg91tlCd5BDW96nHQ90mDKp3ek6NoO80GC7KGanAji4wIAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAN00JztMzji6sFlHG5GtOgrO+tIDG/J27fW5UXIK7ICuV/F0N8UL5aLw/pG6Y/0Zo+OiLoQYcPhhvtizgj6DGDg=="
+        },
         "2643f839-c008-4aee-8a6d-adecac09d4b4": {
           "display_id": 934,
           "author": "s004-wave",
@@ -27495,11 +27504,16 @@
       "agent_id": "s005-wave",
       "agent_seq": 6,
       "timestamp": "2026-08-20T23:47:34.775671368Z"
+    },
+    {
+      "agent_id": "s004-wave",
+      "agent_seq": 10,
+      "timestamp": "2026-08-20T23:49:33.546054589Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T23:47:34.775671368Z",
-    "agent_id": "s005-wave",
-    "agent_seq": 6
+    "timestamp": "2026-08-20T23:49:33.546054589Z",
+    "agent_id": "s004-wave",
+    "agent_seq": 10
   }
 }
