@@ -1,15 +1,33 @@
 //! Rewrite interactive chat sessions into the canonical V1 document shape.
 //!
-//! Older TUI and line-REPL releases stored conversation fields at the top
-//! level. Transitional releases also wrote those fields twice: once at the top
-//! level and once inside `session_state`. This idempotent migration removes
-//! both layouts using an atomic sibling-file replacement.
+//! The complete bounded input set is decoded and validated before any target
+//! is published. Each publication is generation-checked, descriptor-relative,
+//! atomic, and durable. A later publication failure leaves a typed partial
+//! count; startup remains closed and a restart deterministically reconciles the
+//! already-current prefix before continuing.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::PathBuf;
 
-use anyhow::{anyhow, Context as _};
+use crate::persistence::{
+    CommitState, FileClass, PersistenceError, PersistentStorage, StorageGeneration,
+};
 
-use super::{Migration, MigrationContext, MigrationOutcome};
+use super::{
+    Migration, MigrationContext, MigrationFailure, MigrationFailureKind, MigrationOutcome,
+    MigrationStore,
+};
+
+const MAX_SESSION_FILES: usize = 4_096;
+const MAX_SESSION_DIRECTORY_ENTRIES: usize = MAX_SESSION_FILES * 2;
+const MAX_SESSION_STORE_BYTES: u64 = 256 * 1_024 * 1_024;
+
+struct PlannedSession {
+    target: OsString,
+    expected: StorageGeneration,
+    desired: Vec<u8>,
+    changes_schema: bool,
+}
 
 pub struct MigrateSessionStateV1;
 
@@ -18,34 +36,203 @@ impl MigrateSessionStateV1 {
         ctx.openclaudia_data.join("chat_sessions")
     }
 
-    fn migrate_file(path: &Path, cwd: &Path) -> anyhow::Result<bool> {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("failed to inspect session {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(anyhow!(
-                "refusing to migrate non-regular session file {}",
-                path.display()
+    const fn persistence_failure(
+        operation: &'static str,
+        error: &PersistenceError,
+    ) -> MigrationFailure {
+        let kind = match error {
+            PersistenceError::TooLarge { .. } => MigrationFailureKind::ResourceLimitExceeded,
+            PersistenceError::Conflict { .. } => MigrationFailureKind::ConcurrentChange,
+            PersistenceError::InvalidRoot { .. } | PersistenceError::InvalidTarget { .. } => {
+                MigrationFailureKind::InvalidPersistentState
+            }
+            PersistenceError::Io { .. }
+            | PersistenceError::Unchanged { .. }
+            | PersistenceError::UnsupportedPlatform { .. } => {
+                MigrationFailureKind::PublicationFailed
+            }
+        };
+        MigrationFailure::new(kind, MigrationStore::OpenClaudiaData, operation)
+    }
+
+    const fn invalid(operation: &'static str) -> MigrationFailure {
+        MigrationFailure::new(
+            MigrationFailureKind::InvalidPersistentState,
+            MigrationStore::OpenClaudiaData,
+            operation,
+        )
+    }
+
+    fn plan(
+        ctx: &MigrationContext,
+        storage: &PersistentStorage,
+        mut targets: Vec<OsString>,
+    ) -> Result<Vec<PlannedSession>, MigrationFailure> {
+        targets.sort();
+        if targets.len() > MAX_SESSION_FILES {
+            return Err(MigrationFailure::new(
+                MigrationFailureKind::ResourceLimitExceeded,
+                MigrationStore::OpenClaudiaData,
+                "bound saved session count",
             ));
         }
-
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read session {}", path.display()))?;
-        let (document, canonical) = crate::state::persist::decode_document_for_migration(&raw, cwd)
-            .with_context(|| format!("failed to decode session {}", path.display()))?;
-        crate::state::validate_session_file(
-            path,
-            document.session_state.state.identity.session_id.as_str(),
-        )
-        .map_err(|reason| anyhow!(reason))
-        .with_context(|| format!("invalid session file {}", path.display()))?;
-
-        if canonical {
-            return Ok(false);
+        let cwd = std::env::current_dir()
+            .map_err(|_| Self::invalid("resolve legacy session working directory"))?;
+        let directory = Self::sessions_dir(ctx);
+        let mut total_bytes = 0_u64;
+        let mut plans = Vec::with_capacity(targets.len());
+        for target in targets {
+            let observed = storage
+                .read(PathBuf::from(&target), FileClass::Session)
+                .map_err(|error| Self::persistence_failure("read saved session", &error))?;
+            let raw = observed
+                .expose_bytes(|bytes| bytes.map(<[u8]>::to_vec))
+                .ok_or_else(|| Self::invalid("reconcile missing saved session"))?;
+            let text = std::str::from_utf8(&raw)
+                .map_err(|_| Self::invalid("decode saved session UTF-8"))?;
+            let (document, canonical) =
+                crate::state::persist::decode_document_for_migration(text, &cwd)
+                    .map_err(|_| Self::invalid("decode saved session schema"))?;
+            let path = directory.join(&target);
+            crate::state::validate_session_file(
+                &path,
+                document.session_state.state.identity.session_id.as_str(),
+            )
+            .map_err(|_| Self::invalid("validate saved session identity"))?;
+            let desired = if canonical {
+                raw
+            } else {
+                serde_json::to_vec_pretty(&document)
+                    .map_err(|_| Self::invalid("encode canonical saved session"))?
+            };
+            total_bytes = total_bytes
+                .checked_add(u64::try_from(desired.len()).unwrap_or(u64::MAX))
+                .filter(|total| *total <= MAX_SESSION_STORE_BYTES)
+                .ok_or_else(|| {
+                    MigrationFailure::new(
+                        MigrationFailureKind::ResourceLimitExceeded,
+                        MigrationStore::OpenClaudiaData,
+                        "bound saved session bytes",
+                    )
+                })?;
+            plans.push(PlannedSession {
+                target,
+                expected: observed.generation(),
+                desired,
+                changes_schema: !canonical,
+            });
         }
+        Ok(plans)
+    }
 
-        crate::file_error::write_json_pretty_atomic(path, &document)
-            .with_context(|| format!("failed to atomically rewrite session {}", path.display()))?;
-        Ok(true)
+    fn open_store(ctx: &MigrationContext) -> Result<Option<PersistentStorage>, MigrationFailure> {
+        let directory = Self::sessions_dir(ctx);
+        match std::fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(Self::invalid("validate saved session store directory"));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(MigrationFailure::from_io(
+                    MigrationFailureKind::InvalidPersistentState,
+                    MigrationStore::OpenClaudiaData,
+                    "inspect saved session store",
+                    &error,
+                ));
+            }
+        }
+        PersistentStorage::open(&directory)
+            .map(Some)
+            .map_err(|error| Self::persistence_failure("open saved session store", &error))
+    }
+
+    fn targets(directory: &std::path::Path) -> Result<Vec<OsString>, MigrationFailure> {
+        let entries = std::fs::read_dir(directory).map_err(|error| {
+            let kind = if error.kind() == std::io::ErrorKind::NotFound {
+                MigrationFailureKind::ConcurrentChange
+            } else {
+                MigrationFailureKind::InvalidPersistentState
+            };
+            MigrationFailure::from_io(
+                kind,
+                MigrationStore::OpenClaudiaData,
+                "enumerate saved session store",
+                &error,
+            )
+        })?;
+        let mut targets = Vec::new();
+        for (index, entry) in entries.enumerate() {
+            if index == MAX_SESSION_DIRECTORY_ENTRIES {
+                return Err(MigrationFailure::new(
+                    MigrationFailureKind::ResourceLimitExceeded,
+                    MigrationStore::OpenClaudiaData,
+                    "bound saved session directory entries",
+                ));
+            }
+            let target = entry
+                .map_err(|error| {
+                    MigrationFailure::from_io(
+                        MigrationFailureKind::InvalidPersistentState,
+                        MigrationStore::OpenClaudiaData,
+                        "read saved session directory entry",
+                        &error,
+                    )
+                })?
+                .file_name();
+            if PathBuf::from(&target)
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                if targets.len() == MAX_SESSION_FILES {
+                    return Err(MigrationFailure::new(
+                        MigrationFailureKind::ResourceLimitExceeded,
+                        MigrationStore::OpenClaudiaData,
+                        "bound saved session count",
+                    ));
+                }
+                targets.push(target);
+            }
+        }
+        Ok(targets)
+    }
+
+    fn publish(storage: &PersistentStorage, plans: Vec<PlannedSession>) -> MigrationOutcome {
+        let mut changed_artifacts = 0usize;
+        for plan in plans {
+            let receipt = match storage.commit(
+                PathBuf::from(&plan.target),
+                FileClass::Session,
+                plan.expected,
+                &plan.desired,
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return MigrationOutcome::Failed(
+                        Self::persistence_failure("publish canonical saved session", &error)
+                            .with_committed_artifacts(changed_artifacts),
+                    );
+                }
+            };
+            if plan.changes_schema {
+                changed_artifacts += 1;
+            }
+            if receipt.state() == CommitState::PublishedDurabilityUncertain {
+                return MigrationOutcome::Failed(
+                    MigrationFailure::new(
+                        MigrationFailureKind::DurabilityUncertain,
+                        MigrationStore::OpenClaudiaData,
+                        "synchronize canonical saved session",
+                    )
+                    .with_committed_artifacts(changed_artifacts),
+                );
+            }
+        }
+        if changed_artifacts == 0 {
+            MigrationOutcome::Current
+        } else {
+            MigrationOutcome::Applied { changed_artifacts }
+        }
     }
 }
 
@@ -58,68 +245,26 @@ impl Migration for MigrateSessionStateV1 {
         "Rewrite saved interactive sessions into canonical state V1"
     }
 
+    fn store(&self) -> MigrationStore {
+        MigrationStore::OpenClaudiaData
+    }
+
     fn run(&self, ctx: &MigrationContext) -> MigrationOutcome {
         let directory = Self::sessions_dir(ctx);
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return MigrationOutcome::Skipped;
-            }
-            Err(error) => {
-                return MigrationOutcome::Failed(format!(
-                    "failed to read session directory {}: {error}",
-                    directory.display()
-                ));
-            }
+        let storage = match Self::open_store(ctx) {
+            Ok(Some(storage)) => storage,
+            Ok(None) => return MigrationOutcome::Current,
+            Err(failure) => return MigrationOutcome::Failed(failure),
         };
-
-        let mut paths = Vec::new();
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    return MigrationOutcome::Failed(format!(
-                        "failed to read an entry in {}: {error}",
-                        directory.display()
-                    ));
-                }
-            };
-            let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "json")
-            {
-                paths.push(path);
-            }
-        }
-        paths.sort();
-
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut migrated = 0usize;
-        let mut failures = Vec::new();
-        for path in paths {
-            match Self::migrate_file(&path, &cwd) {
-                Ok(true) => migrated += 1,
-                Ok(false) => {}
-                Err(error) => failures.push(format!("{error:#}")),
-            }
-        }
-
-        if !failures.is_empty() {
-            return MigrationOutcome::Failed(format!(
-                "rewrote {migrated} session(s), but {} file(s) failed: {}",
-                failures.len(),
-                failures.join("; ")
-            ));
-        }
-        if migrated == 0 {
-            MigrationOutcome::Skipped
-        } else {
-            MigrationOutcome::Applied(format!(
-                "rewrote {migrated} saved session{} to V1",
-                if migrated == 1 { "" } else { "s" }
-            ))
-        }
+        let targets = match Self::targets(&directory) {
+            Ok(targets) => targets,
+            Err(failure) => return MigrationOutcome::Failed(failure),
+        };
+        let plans = match Self::plan(ctx, &storage, targets) {
+            Ok(plans) => plans,
+            Err(failure) => return MigrationOutcome::Failed(failure),
+        };
+        Self::publish(&storage, plans)
     }
 }
 
@@ -156,7 +301,12 @@ mod tests {
         std::fs::write(&path, legacy_fixture("legacy-session")).unwrap();
 
         let outcome = MigrateSessionStateV1.run(&context);
-        assert!(matches!(outcome, MigrationOutcome::Applied(_)));
+        assert!(matches!(
+            outcome,
+            MigrationOutcome::Applied {
+                changed_artifacts: 1
+            }
+        ));
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -209,7 +359,9 @@ mod tests {
 
         assert!(matches!(
             MigrateSessionStateV1.run(&context),
-            MigrationOutcome::Applied(_)
+            MigrationOutcome::Applied {
+                changed_artifacts: 1
+            }
         ));
 
         let migrated: serde_json::Value =
@@ -241,12 +393,12 @@ mod tests {
 
         assert!(matches!(
             MigrateSessionStateV1.run(&context),
-            MigrationOutcome::Skipped
+            MigrationOutcome::Current
         ));
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(matches!(
             MigrateSessionStateV1.run(&context),
-            MigrationOutcome::Skipped
+            MigrationOutcome::Current
         ));
     }
 
@@ -264,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_file_does_not_block_other_session_migrations() {
+    fn malformed_file_blocks_all_session_publication_during_preflight() {
         let (_root, context) = context();
         let broken_path = session_path(&context, "a-broken");
         let valid_path = session_path(&context, "z-valid");
@@ -275,10 +427,10 @@ mod tests {
 
         assert!(matches!(outcome, MigrationOutcome::Failed(_)));
         assert_eq!(std::fs::read(&broken_path).unwrap(), b"{not valid json");
-        let migrated: serde_json::Value =
+        let still_legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(valid_path).unwrap()).unwrap();
-        assert_eq!(migrated["session_state"]["version"], 1);
-        assert!(migrated.get("messages").is_none());
+        assert!(still_legacy.get("session_state").is_none());
+        assert!(still_legacy.get("messages").is_some());
     }
 
     #[test]
