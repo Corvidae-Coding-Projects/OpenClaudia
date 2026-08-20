@@ -1,6 +1,6 @@
 {
   "next_display_id": 1041,
-  "next_comment_id": 876,
+  "next_comment_id": 877,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13406,7 +13406,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T10:22:37.908405433Z",
-      "updated_at": "2026-08-20T10:25:46.584347379Z",
+      "updated_at": "2026-08-20T10:25:50.583482288Z",
       "labels": [
         "remediation"
       ],
@@ -13419,6 +13419,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABABUbDe7gki4FtZ5pEJe/G/6AEQpqp6KteYKx/HbiUZw32t/Mb9UdnO0Iara6y4JzSxFovqBAlQKp4tJPgGCSrCA=="
+        },
+        "2c6fffb7-c781-4c15-ba0d-f69a007bd0b4": {
+          "display_id": 876,
+          "author": "6Vw9",
+          "content": "[action] S-025 preflight mapped current secret ownership and sinks; implementing shared zeroizing secrets, sensitive header transport, typed environment grants, and bounded diagnostic sanitization.",
+          "created_at": "2026-08-20T10:25:50.579804426Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUQT9YTyeyzM/7htL3Zr42sToWcyYqNDbs3i29flW2+igB2vgqXyEKyDbzamhkmZm4oHNdA+8KCJRPHOx4eWaDw=="
         }
       }
     },
@@ -25881,11 +25890,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 383,
       "timestamp": "2026-08-20T10:25:46.584347379Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 384,
+      "timestamp": "2026-08-20T10:25:50.583482288Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T10:25:46.584347379Z",
+    "timestamp": "2026-08-20T10:25:50.583482288Z",
     "agent_id": "6Vw9",
-    "agent_seq": 383
+    "agent_seq": 384
   }
 }
