@@ -1,6 +1,6 @@
 {
   "next_display_id": 1046,
-  "next_comment_id": 908,
+  "next_comment_id": 909,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6355,7 +6355,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T19:09:55.024359Z",
-      "updated_at": "2026-08-20T21:22:00.472059103Z",
+      "updated_at": "2026-08-20T21:22:10.626819019Z",
       "labels": [
         "remediation"
       ],
@@ -6434,6 +6434,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUs3ZQLMvgsyX4/hpkIJ5yKFIQAO94LG8fqZZvDbfcaIUZT9hntZyOiUMeMlJb/YNjuJ5YXU1SJEXGXRcYy/DDQ=="
+        },
+        "89d66e89-ee0e-478e-9e12-1b3f3ef712a3": {
+          "display_id": 908,
+          "author": "6Vw9",
+          "content": "Reopened only to satisfy the repository active-issue commit hook after verified implementation closure; no new scope or artifact change.",
+          "created_at": "2026-08-20T21:22:10.624127501Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAT8IFKDAGJcGO7hFDqjYVtrI0h2eTs4kE1KZimgi86qat0iuhiQcr0kXiQdfkqN6E9IdBrBhrW0GHsReWvJKRDw=="
         }
       }
     },
@@ -26618,11 +26627,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 453,
       "timestamp": "2026-08-20T21:22:00.472059103Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 454,
+      "timestamp": "2026-08-20T21:22:10.626819019Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-20T21:22:00.472059103Z",
+    "timestamp": "2026-08-20T21:22:10.626819019Z",
     "agent_id": "6Vw9",
-    "agent_seq": 453
+    "agent_seq": 454
   }
 }
