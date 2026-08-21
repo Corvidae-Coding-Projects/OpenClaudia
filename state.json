@@ -1,6 +1,6 @@
 {
   "next_display_id": 1063,
-  "next_comment_id": 989,
+  "next_comment_id": 990,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25179,9 +25179,18 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T06:56:56.207726032Z",
-      "updated_at": "2026-08-21T07:25:55.291650910Z",
+      "updated_at": "2026-08-21T07:26:09.764708780Z",
       "closed_at": "2026-08-21T07:24:33.021062250Z",
       "comments": {
+        "31f9731f-a48f-4e90-adbb-c2a571428c52": {
+          "display_id": 989,
+          "author": "6Vw9",
+          "content": "#1061 completed in signed commits 28ada0a1 and 1543376e; Rust 1.98 is the sole pinned toolchain; exact local CI checks pass; swap reset healthy; push blocked by provider hook and requires the user's manual git push. Independent parallel-test isolation defect remains open as #1062.",
+          "created_at": "2026-08-21T07:26:09.762098442Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA73Wmo62Ue9WWlN5j2wrth8/sOC6QVUDO7+dKTAR8EkS2kF9HJLeHP6V5kpRGi2moT00OFyH6yA78DZ96zwjJCQ=="
+        },
         "41ed848a-4c56-4acb-87b9-73f9e9fdf1b0": {
           "display_id": 983,
           "author": "6Vw9",
@@ -28500,11 +28509,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 598,
       "timestamp": "2026-08-21T07:26:05.436519290Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 599,
+      "timestamp": "2026-08-21T07:26:09.764708780Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T07:26:05.436519290Z",
+    "timestamp": "2026-08-21T07:26:09.764708780Z",
     "agent_id": "6Vw9",
-    "agent_seq": 598
+    "agent_seq": 599
   }
 }
