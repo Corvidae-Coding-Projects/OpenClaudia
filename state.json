@@ -1,6 +1,6 @@
 {
   "next_display_id": 1058,
-  "next_comment_id": 953,
+  "next_comment_id": 954,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13467,7 +13467,7 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T02:26:44.536335025Z",
-      "updated_at": "2026-08-21T02:54:28.573764304Z",
+      "updated_at": "2026-08-21T02:54:58.677722947Z",
       "labels": [
         "defect"
       ],
@@ -13498,6 +13498,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAArT+lMjTnxphDAvjzJVK+3MXgqxttOEt/45DpW/LkJUJgtm+S1e+1NIG/Jovk2Fl3gM/EdKbJWfnhBDv9u7VCw=="
+        },
+        "7ae82877-b399-42ff-8225-26302c1537c6": {
+          "display_id": 953,
+          "author": "6Vw9",
+          "content": "Delivered by signed commit bf2ed0f37c45e398a303754cbf45e59b2751ee1c. Signature verified for 190305670+dollspace-gay@users.noreply.github.com with ED25519 SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A. The committed scope is exactly src/evidence_freshness.rs, tests/ledger_decision_e2e.rs, and docs/remediation-slices/024-artifact-verification-invalidation.md; all previously recorded combined verification remains green.",
+          "created_at": "2026-08-21T02:54:58.674347373Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqXRjmoiQM3zTZidTB7QvkrWdpNSgwdFwN6wIPHZzG3ujmdkMIzv3zMMw2pNhrRJr1nlIM5P3ma+Ok5H5oMtRCQ=="
         }
       }
     },
@@ -27681,11 +27690,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 519,
       "timestamp": "2026-08-21T02:54:28.573764304Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 520,
+      "timestamp": "2026-08-21T02:54:58.677722947Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T02:54:28.573764304Z",
+    "timestamp": "2026-08-21T02:54:58.677722947Z",
     "agent_id": "6Vw9",
-    "agent_seq": 519
+    "agent_seq": 520
   }
 }
