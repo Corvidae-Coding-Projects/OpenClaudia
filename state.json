@@ -1,6 +1,6 @@
 {
   "next_display_id": 1080,
-  "next_comment_id": 1080,
+  "next_comment_id": 1081,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13580,7 +13580,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T18:25:31.485800686Z",
-      "updated_at": "2026-08-21T19:50:58.514598077Z",
+      "updated_at": "2026-08-21T19:51:02.780755982Z",
       "labels": [
         "remediation"
       ],
@@ -13593,6 +13593,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAeUDxoHYx1n+W6LPxnbDy7Z7fXBQYl7y5/TS0lGLTMa9oo4EAuNagQOjns5lXhT+Pqf7iAgWdXYcDw2Vt69fEDA=="
+        },
+        "642bf079-8241-40a8-8d50-3643b91eb4fc": {
+          "display_id": 1080,
+          "author": "6Vw9",
+          "content": "Preferred design: canonical versioned JSON parts containing only typed technical-memory revision/head entries, chained exact-byte digests, resumable checkpoint bound to the SQLite snapshot and pinned destination root, and a final durable manifest as the sole completion marker. Import verifies the complete package and applies it in one SQLite immediate transaction. Fresh one-use host approval and explicit run path capabilities are mandatory on every call. Rejected alternatives: SQLite backup would include legacy/session/free-form tables and couple portability to internal schema; one giant JSON document would violate maximum-store memory and crash-resume requirements.",
+          "created_at": "2026-08-21T19:51:02.778183569Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1r+B8NpzhRIheueb2d+Qe+Sx4imsVbhgPSKGM0DftoSdrMBz6+4Kgyz90DXFVMD8tB2Liakg0gv786yqwmpaAg=="
         },
         "74e9e063-28b8-40b2-9f25-a3b217316304": {
           "display_id": 1079,
@@ -30492,11 +30501,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 769,
       "timestamp": "2026-08-21T19:50:58.514598077Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 770,
+      "timestamp": "2026-08-21T19:51:02.780755982Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T19:50:58.514598077Z",
+    "timestamp": "2026-08-21T19:51:02.780755982Z",
     "agent_id": "6Vw9",
-    "agent_seq": 769
+    "agent_seq": 770
   }
 }
