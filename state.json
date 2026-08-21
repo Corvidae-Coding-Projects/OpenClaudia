@@ -1,6 +1,6 @@
 {
   "next_display_id": 1081,
-  "next_comment_id": 1117,
+  "next_comment_id": 1118,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11025,11 +11025,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T16:01:20.623148827Z",
-      "updated_at": "2026-08-21T23:19:15.704045966Z",
+      "updated_at": "2026-08-21T23:21:26.862706551Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "2e469aea-efed-4bc9-a80f-6b37fbbd55eb": {
+          "display_id": 1117,
+          "author": "6Vw9",
+          "content": "[action] Resume S-104 after stale-session handoff; finish MemoryDb team-scope foundation before encrypted authenticated replica protocol",
+          "created_at": "2026-08-21T23:21:26.860353448Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXsrE4JKColVR+IMvt/eC+Eb4jbAU4hhhhL3iPRIa9J4VMZJTflbT0AQuz4y2OBv3woEeBXMYPgxIZVSjtORtDg=="
+        },
         "2f37039c-dc10-433a-90ef-3df3ba008c92": {
           "display_id": 1116,
           "author": "6Vw9",
@@ -31125,11 +31134,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 824,
       "timestamp": "2026-08-21T23:21:21.837319007Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 825,
+      "timestamp": "2026-08-21T23:21:26.862706551Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T23:21:21.837319007Z",
+    "timestamp": "2026-08-21T23:21:26.862706551Z",
     "agent_id": "6Vw9",
-    "agent_seq": 824
+    "agent_seq": 825
   }
 }
