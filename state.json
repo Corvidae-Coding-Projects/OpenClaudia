@@ -1,6 +1,6 @@
 {
   "next_display_id": 1081,
-  "next_comment_id": 1089,
+  "next_comment_id": 1090,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4023,10 +4023,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T20:51:59.798324138Z",
-      "updated_at": "2026-08-21T20:52:04.182507758Z",
+      "updated_at": "2026-08-21T21:13:39.181850327Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "7e776828-9689-4a8f-a8ff-88569131e21d": {
+          "display_id": 1089,
+          "author": "6Vw9",
+          "content": "[action] Implement #1080 by atomically advancing the tracked source-member digest with each valid host review/revocation, preserving ordinary mutation conflicts",
+          "created_at": "2026-08-21T21:13:39.178471637Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAV3LNE+ACMJwm+BzVpA0xe94jqtgbG/6tA+BdkUoXWx6wnBwohaYhctMFzV5ZfFTxzbv4NUjlTh9e88+1u5vwBw=="
+        }
+      }
     },
     "21d57899-92a9-4751-b4c5-76ccc394f85e": {
       "uuid": "21d57899-92a9-4751-b4c5-76ccc394f85e",
@@ -30660,11 +30671,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 783,
       "timestamp": "2026-08-21T21:08:15.824346770Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 784,
+      "timestamp": "2026-08-21T21:13:39.181850327Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T21:08:15.824346770Z",
+    "timestamp": "2026-08-21T21:13:39.181850327Z",
     "agent_id": "6Vw9",
-    "agent_seq": 783
+    "agent_seq": 784
   }
 }
