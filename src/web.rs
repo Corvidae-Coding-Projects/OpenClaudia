@@ -16,7 +16,9 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "browser")]
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -707,7 +709,7 @@ pub fn search_web(
 
     Err(format!(
         "Web search failed: no free browser-backed backend returned usable results.\n  {}\n\
-         Install Chromium or rebuild with the default `browser` feature to enable free search.",
+         Install Chromium and rebuild with `--features browser` to enable free search.",
         backend_errors.join("\n  ")
     ))
 }
@@ -890,18 +892,11 @@ pub fn search_bing(
 /// Returns an error string if the browser cannot be launched or no results are found.
 /// Launch a headless Chromium for scraping.
 ///
-/// `LaunchOptions::path = None` plus the `fetch` feature on
-/// `headless_chrome` lets the upstream `Process::new` resolve the
-/// browser binary in two stages: first it consults the standard
-/// install dirs (`/usr/bin/chromium`, `/Applications/Google Chrome`,
-/// etc) via `FetcherOptions::with_allow_standard_dirs(true)`; if no
-/// system browser is present it auto-downloads a known-good Chromium
-/// revision into the user's data dir and caches it for future runs.
-///
-/// The combined behaviour matches user expectation — the tool just
-/// works on a fresh machine without manual Chromium installation —
-/// and the error path stays actionable when both fail (e.g. no
-/// network during first-run auto-download).
+/// `LaunchOptions::path = None` lets the upstream process resolver consult
+/// the standard install directories (`/usr/bin/chromium`,
+/// `/Applications/Google Chrome`, and similar locations). Runtime executable
+/// download is deliberately disabled, so an operator enabling the `browser`
+/// feature must install a compatible browser.
 #[cfg(feature = "browser")]
 fn launch_browser_for_scraping(
     browser_scratch_root: &Path,
@@ -917,7 +912,7 @@ fn launch_browser_for_scraping(
     Browser::new(opts).map_err(|e| {
         format!(
             "Failed to launch Chromium: {e}. Install chromium/google-chrome \
-             on PATH, or ensure network access for the first-run auto-download."
+             on PATH; this build does not download browser executables at runtime."
         )
     })
 }
@@ -939,8 +934,8 @@ fn browser_profile_dir_under(browser_scratch_root: &Path) -> Result<PathBuf, Str
 ///
 /// # Errors
 ///
-/// Returns a descriptive message if Chromium cannot be launched
-/// (no system Chrome and the first-run auto-download failed), if
+/// Returns a descriptive message if Chromium cannot be launched because no
+/// compatible system browser is installed, if
 /// navigation times out, if the response exceeds the rendered-HTML
 /// cap, or if the DOM does not contain the expected selectors.
 #[cfg(feature = "browser")]
@@ -1116,7 +1111,7 @@ pub fn search_duckduckgo(
     _query: &str,
     _limit: usize,
 ) -> Result<Vec<SearchResult>, String> {
-    Err("DuckDuckGo search requires the browser feature. Rebuild with the default `browser` feature to enable free search.".to_string())
+    Err("DuckDuckGo search requires the browser feature. Rebuild with `--features browser` and install Chromium to enable free search.".to_string())
 }
 
 /// Fetch a URL using a headless Chromium browser, JS-rendered, then
@@ -1130,8 +1125,8 @@ pub fn search_duckduckgo(
 ///
 /// # Errors
 ///
-/// Returns an error string if the URL is invalid, the browser fails
-/// to launch (system Chromium missing AND auto-download blocked),
+/// Returns an error string if the URL is invalid, an operator-installed
+/// Chromium cannot be found or launched,
 /// navigation times out, or the rendered DOM exceeds
 /// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]

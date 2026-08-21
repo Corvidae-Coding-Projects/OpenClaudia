@@ -88,9 +88,11 @@ through explicit capabilities and budgets.
 
 ## Web backend note
 
-Default builds contain browser-backed free search using DuckDuckGo / Bing.
-This describes the current backend, not a security guarantee: browser activity
-does not yet share one complete egress capability with direct HTTP fetches.
+The explicit `browser` build feature contains browser-backed free search using
+DuckDuckGo / Bing. It is opt-in, uses an operator-installed browser, and cannot
+download Chromium at runtime. This describes the current backend, not a
+security guarantee: browser activity does not yet share one complete egress
+capability with direct HTTP fetches.
 
 ## Rule-injector removal
 

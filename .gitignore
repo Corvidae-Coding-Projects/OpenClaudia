@@ -5,6 +5,12 @@ tool_struggles.txt
 __pycache__/
 *.py[cod]
 
+# Retired Chainlink runtime state. Historical evidence is retained only as a
+# deterministic redacted export under docs/historical-evidence/.
+/.chainlink/issues.db*
+/.chainlink/session.json
+/.chainlink/.active-issue
+
 /.crosslink-managed-section-start
 .crosslink/issues.db
 .crosslink/issues.db-wal

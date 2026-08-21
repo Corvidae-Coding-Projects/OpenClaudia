@@ -1193,10 +1193,10 @@ fn destructive_tool_without_a_rule_does_not_execute() {
 /// Crosslink store operations must not claim to be read-only.
 ///
 /// Reaching the store goes through `Database::open`, which runs `init_schema`
-/// and writes DDL; the write path additionally creates `.crosslink/` and can
-/// copy a legacy `.chainlink` database. A `list` that created a directory,
-/// copied a database and wrote a schema while declaring `ReadOnly` would be
-/// the same dishonest-classification shape F-001 records.
+/// and writes DDL; the write path additionally creates `.crosslink/`. A `list`
+/// that created a directory and wrote a schema while declaring `ReadOnly`
+/// would be the same dishonest-classification shape F-001 records. Retired
+/// `.chainlink` stores now fail closed instead of being copied implicitly.
 #[test]
 fn no_crosslink_store_operation_claims_to_be_read_only() {
     for op in crosslink::OPERATIONS {

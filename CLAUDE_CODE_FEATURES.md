@@ -25,9 +25,10 @@ This file is no longer a feature checklist or implementation authority.
 
 ## Current web-search note
 
-The default feature set contains free DuckDuckGo/Bing browser scraping and no
-search-key requirement. This sentence records a backend fact needed by the
-current build documentation test; it is not evidence that browser egress,
+The explicit `browser` feature contains free DuckDuckGo/Bing browser scraping
+and has no search-key requirement. It is not part of the default build and
+requires an operator-installed compatible browser; runtime executable download
+is disabled. Backend availability is not evidence that browser egress,
 cancellation, result provenance, or completion semantics are production-ready.
 
 ## Where capability status lives

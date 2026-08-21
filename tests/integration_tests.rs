@@ -1410,8 +1410,8 @@ mod web_tools {
         assert!(result.is_error(), "Invalid URL should fail");
     }
 
-    // DuckDuckGo/Bing search uses the browser feature (enabled by default)
-    // and does not require a search API key.
+    // DuckDuckGo/Bing search uses the explicit browser feature and does not
+    // require a search API key.
     #[cfg(feature = "browser")]
     #[test]
     #[ignore = "requires network access; run with `cargo test -- --ignored`"]

@@ -238,9 +238,8 @@ enum HookCommands {
     },
 }
 
-// OpenClaudia is a single-user CLI; a current-thread runtime is sufficient
-// and keeps all futures on one thread, which is required by the `onig`-backed
-// StreamingMarkdownRenderer (holds `*mut` raw pointers that are not Send).
+// OpenClaudia is a single-user CLI. A current-thread runtime keeps scheduling
+// deterministic and avoids allocating an idle worker pool for interactive use.
 #[tokio::main(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {

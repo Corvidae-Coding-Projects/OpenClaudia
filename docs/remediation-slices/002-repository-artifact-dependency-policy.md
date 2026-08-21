@@ -1,6 +1,6 @@
 # S-002: Enforce repository artifact and dependency hygiene
 
-Status: Planned
+Status: Implemented and adversarially reviewed; canonical VDD receipt pending S-088
 Effort: Small
 Primary findings: F-009, F-141
 Workstreams: W0, W13
@@ -27,3 +27,240 @@ Make generated state, historical evidence, dependencies, and build artifacts fol
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Delivered implementation
+
+Architecture generation: `S002-G2` from integration baseline
+`7b54737c703bc6fb22d99e9372a2c69cb4638119`.
+
+- Added a bounded, deterministic, standard-library exporter for the retired
+  Chainlink v7 SQLite store and active-session marker. It opens SQLite
+  read-only/immutable, requires the exact reviewed user-table set and columns,
+  checks integrity and relationships, bounds source bytes/rows/text/output,
+  rejects non-finite values and boolean identifiers, orders every record, and
+  emits canonical JSON with typed source and redaction metadata.
+- Added a strict repository checker that derives its tracked-file set from
+  Git, rejects runtime databases/session markers/build output/Python bytecode,
+  requires every policy artifact to be tracked and regular, validates the
+  export and retention schemas, resolves each historical blob at its recorded
+  source commit, rechecks blob IDs/digests/sizes, proves each recorded removal
+  commit's parent contains that blob and its result removes the path,
+  regenerates the export byte-for-byte, and rejects exact, renamed, base64, or
+  hexadecimal reintroductions of the raw artifacts.
+- The retention decision deliberately creates no second raw archive. Existing
+  immutable Git objects are reproduction inputs only; the redacted JSON is the
+  canonical review record, and the manifest explicitly records that Git
+  history availability is not guaranteed. This avoids proliferating the raw
+  mutable database while preserving the reviewed historical claims and their
+  contradictions.
+- Extended `.gitignore` for retired Chainlink databases/session state/active
+  markers and Python bytecode. The checker also covers equivalent mutable
+  `.crosslink`/`.openclaudia` database and marker names plus any tracked
+  `target` or `__pycache__` component.
+- Removed the production copy-on-first-mutation path from the typed Crosslink
+  tool. If a retired `.chainlink/issues.db` exists without a live Crosslink
+  store, mutation now fails before creating `.crosslink/`, reports the explicit
+  ownership conflict, and leaves the legacy bytes untouched. An existing
+  `.crosslink/issues.db` remains operational; this removes ambient import, not
+  the current Crosslink feature.
+- Added a finite GitHub Actions policy matrix with read-only permissions, full
+  history, disabled persisted checkout credentials, immutable action SHAs,
+  explicit timeouts, Rust 1.91 and stable toolchains, locked metadata,
+  cargo-deny, formatting, default/all-feature checks, strict Clippy, complete
+  tests, and macOS/Windows fail-closed compilation/tests. This also resolves
+  the Node-20 action-runtime upgrade tracked by Crosslink #1028 without
+  weakening pinning or provenance.
+- Removed confirmed-unused direct `axum-extra`, `tower`, `tower-http`,
+  `tokio-test`, and `predicates` entries. Aligned the direct HTTP client with
+  Crosslink's `reqwest 0.12` generation and retained Tokio's test clock as an
+  explicit dev-only feature.
+- Replaced `syntect` and its unmaintained `bincode 1`/`yaml-rust` chain with a
+  maintained Arborium/tree-sitter highlighter. The explicit language set
+  retains common fenced-code coverage and aliases; unknown tags retain the
+  existing flat-color fallback. Contextual reparsing is bounded to 64 KiB and
+  1,024 lines per block, after which content remains visible through the
+  fallback instead of being dropped.
+- Made the browser adapter opt-in (`default = []`), retained it under
+  `--features browser`, selected Headless Chrome's offline protocol bundle,
+  and removed runtime executable download. Default tool catalogs do not offer
+  `web_search`/`web_browser`; browser builds require an operator-installed
+  compatible Chrome/Chromium and retain the operational browser paths.
+- Declared Rust 1.91 as the MSRV and explicit dev/test/release profiles.
+  Release builds use one codegen unit, thin LTO, no debug data, and symbol
+  stripping; dev/test retain line tables without full debug payloads.
+- Added root and fuzz cargo-deny policies over their independent lock graphs.
+  Both deny advisories, unmaintained/unsound/yanked packages, unknown sources,
+  wildcard requirements, and duplicate drift. The 33 root and 26 fuzz
+  unavoidable older generations are exact-version exceptions; tree-wide
+  skips are forbidden. Common advisory/source/ban policy is mechanically
+  equal. The fuzz graph adds only NCSA for libFuzzer, while the browser-only
+  `auto_generate_cdp 0.4.6` GPL-file classification exists only in the root
+  graph and is bound to `LICENSE.txt` hash `0xc5a651aa` before its exact
+  exception applies.
+- Documented the executable policy, history reproduction procedure, browser
+  distribution boundary, MSRV, dependency gates, and bounded regular cache
+  cleanup. Existing machine-generated `CHANGELOG.md` content was not edited.
+
+## Artifact generations
+
+- Historical source commit:
+  `d9858534b984bc163f84b58bac4c703bc4c3d00b`.
+- Historical database blob `672465ee72150dd125963c130ffbd52c80ef9039`:
+  282,624 bytes, SHA-256
+  `8ee52062c20e12f346973402a46462c212b0785ea4cfd56ce7ec735273699748`.
+- Historical session blob `d1deb1f4393c2c8269df33812955e36889cc098c`:
+  102 bytes, SHA-256
+  `59e9d200bc35a7fe74ccf2b2b15ab5e75d4aabf27573ca585de7f5ac0c8347a5`.
+- Retired bytecode blob `6b7fd2af95b415e89307b1ae98fa5086942fce26`:
+  10,451 bytes, SHA-256
+  `d10ea46e8ba3e3d354613b5c57a7d6448223b145117407d22d914ea85c87de40`.
+- Canonical redacted export: 209,963 bytes, SHA-256
+  `8b659150f95cdc08e3b6a4fd4199ef136d2a71724a2b4b5b47c3bc6aac14d2aa`;
+  226 issues, 165 comments, 100 labels, 22 dependency edges, three sessions,
+  and three redactions.
+- Retention record: 2,302 bytes, SHA-256
+  `fa8e5b19304c4f94c3949257cb29a0e8c66ac9f51af02566f1fb24982fb438c0`.
+- Root lock: SHA-256
+  `a622150dcb442fef24c443b394ecea9fde91c0e191d835d34f8f018348470988`;
+  611 packages, 45 duplicate names, no `syntect`, `bincode`, or `yaml-rust`.
+- Fuzz lock: SHA-256
+  `4e2a1bbb2eadc76ac2496511f8f2a046e1e9e3b276924df3febc03d7f8efdc56`;
+  575 packages, 35 duplicate names, no `syntect`, `bincode`, or `yaml-rust`.
+- Root/fuzz policy digests:
+  `ad43482be50ea33c0f821d2e39b63375b66f075325461c5b1d317e6bd0a0702f`
+  and
+  `ab98a77b11e52dd017c56136a1e72075ae07b24b14e3448fee336dccd8887841`.
+- Exporter/checker/adversarial-suite digests:
+  `8170ca0b8b92bfb8f596c458c642587929c163efecb5500f602064ed75acd752`,
+  `271547517fd3edc46cf9b2bb5aa821a4c84e1f58b21750cca55d1e074072608b`,
+  and
+  `9ee35e3c4a9916d6eff53223a952d292c1216bddee47e4718ff8457889177744`.
+- The implementation/policy diff excluding this self-referential slice record
+  has SHA-256
+  `6754b7dc349324e900d2074d9d11eb81abec0fea997740df69db3c1f45c79403`.
+  Any non-record change invalidates this generation and requires refreshed
+  evidence.
+
+## Test design and skepticism record
+
+- Twenty-three Python tests include real temporary Git repositories and SQLite
+  databases. Positive evidence is not a prose scan: the checker regenerates
+  historical bytes from recorded Git objects. Negative cases cover unexpected
+  columns and user tables, mismatched/boolean session identity, non-finite
+  SQLite values, non-sensitive export forgery with recomputed digests, forged
+  removal-commit provenance, sensitive content, renamed/base64 raw history,
+  digest tampering, tracked ignored state, missing ignores, untracked-required
+  files, shallow checkout, unpinned actions, unlocked Cargo, duplicate-policy
+  downgrade, non-exact duplicate exceptions, and leakage of the browser-only
+  license exception into fuzz policy.
+- The highlighter tests assert supported-language styling, alias-backed
+  multiline context, unsupported-language fallback, byte exhaustion, and line
+  exhaustion. They require content after the bound to remain on the fallback
+  path rather than treating a parser error or dropped output as success.
+- Registry tests run in both default and browser builds. They assert actual
+  handler presence/absence and definitions, then cross-check the opt-in,
+  operator-installed, no-download contract across source, manifest, and public
+  documentation. The live ignored lane executes the installed browser and the
+  pre-launch SSRF rejection rather than counting compilation alone.
+- The Crosslink regression drives the real typed dispatcher with a mutation
+  while a sentinel legacy database exists. Success requires an error explaining
+  that automatic import is disabled, byte-identical legacy state, and absence
+  of a newly materialized `.crosslink` directory; a source-string assertion
+  would not prove those effects.
+- Completion review found that the initial `multiple-versions = "warn"`
+  design only reported drift. Changing it to `deny` exposed a second weakness:
+  one shared exception list generated unmatched/unnecessary warnings across
+  the distinct root and fuzz graphs. Separate exact lists plus shared-policy
+  validation removed those warnings. An initially omitted fuzz Windows package
+  then produced a real duplicate error, proving the gate failed until its
+  existing exact generation was reviewed and recorded.
+- MSRV probes were treated as negative evidence: Rust 1.88 failed in
+  `rustyline` at `File::lock`, and Rust 1.89 reached project code but failed on
+  `Duration::from_mins`. Rust 1.91 is the first probed toolchain that passes
+  both default and all-feature all-target graphs and matches the declared API
+  requirement.
+
+## Verification record
+
+Every Cargo compilation used `CARGO_BUILD_JOBS=1`; every Rust test command used
+`--test-threads=1`.
+
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v`
+  — final skeptical rerun 23 passed, zero failed in 0.417s.
+- `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_repository_hygiene.py --repo-root .`
+  — verified 678 tracked paths, zero forbidden artifacts, ten required ignore
+  entries, eight pinned action uses, four credential-disabled/full-history
+  checkouts, four bounded jobs, both dependency policies, and byte-for-byte
+  historical regeneration.
+- Both locked metadata commands pass. Root/fuzz lock traversal reports only
+  crates.io plus one/two local packages respectively; no Git dependency is
+  admitted.
+- Root and fuzz `cargo deny --locked ... check advisories licenses sources bans`
+  — pass with zero errors and zero warnings. Root/fuzz bans retain 33/26 exact
+  exception notes; advisory and source checks have none. Root licenses cover
+  488 entries and fuzz licenses cover 464 entries.
+- `cargo fmt --all -- --check` and `git diff --check` — pass with no output.
+- Focused all-feature Crosslink unit gate — 10 passed, zero failed, including
+  the real-dispatch no-copy/no-new-store regression.
+- Focused default TUI tests — 16 passed, including all five maintained
+  highlighter/fallback bounds. Default and browser
+  `tool_registry_handler_e2e` — 22 passed in each feature set.
+- Rust 1.91 `cargo check --locked --all-targets` — pass in 2m13s; the
+  all-feature equivalent — pass in 1m25s.
+- Stable default/all-feature all-target checks — pass in 25.81s and 26.52s.
+- Final stable all-feature/all-target check — pass in 31.79s; strict Clippy
+  with `-D warnings` — pass in 54.58s with zero warnings.
+- Complete default all-target suite — library 2,656 passed, zero failed, one
+  ignored out of 2,657; the 228-test binary harness and every integration/test
+  target also passed.
+- Complete all-feature/all-target suite — library 2,658 passed, zero failed,
+  one ignored out of 2,659; the 228-test binary harness and every
+  integration/test target also passed.
+- `OPENCLAUDIA_TEST_BROWSER=1 cargo test --locked --features browser --test web_integration -- --ignored --test-threads=1`
+  — two live browser tests passed in 4.71s.
+- Final Rust 1.91 all-feature/all-target check — pass in 28.15s.
+- Final Windows GNU all-feature/all-target check — pass in 27.93s. It emitted only
+  pre-existing target-conditional unused/dead-code warnings outside S-002;
+  no S-002 path emitted a warning. This is compile evidence, not Windows
+  runtime browser/sandbox evidence.
+- Final default release — 22,850,880 bytes, SHA-256
+  `0e50780d3d487590e09b0485df41040e37dedf13bc6e89c04781cf1ecb5572ab`,
+  2m56.48s wall, 3,328,056 KiB peak RSS, zero swap.
+- Final browser release — 29,128,160 bytes, SHA-256
+  `aafffbfd143b0f266d02e22167967c785add70642cf16aae0d383a2682b2b199`,
+  3m21.03s wall, 3,388,024 KiB peak RSS, zero swap.
+- The shared target tree reached 76 GiB after the full toolchain/profile
+  matrix. Its measured size and the exact cleanup commands are recorded before
+  post-commit `cargo clean`; build output is never part of the artifact
+  generation.
+
+## Scope boundary and unresolved verification
+
+- S-003 still owns semantic fuzz-harness containment, fake transports,
+  side-effect assertions, corpora, and resource invariants. S-002 removes the
+  default browser feature from the fuzz dependency edge and verifies its
+  independent lock policy; it does not claim fuzz input is yet hermetic.
+- S-071/S-072 own canonical browser/web egress, cancellation, and lifecycle
+  supervision. Browser support is preserved but opt-in while those gaps remain.
+- Exact duplicate exceptions document current upstream constraints; they are
+  not claims that every remaining generation is desirable. Any new generation
+  fails CI and requires an explicit reviewed change, while consolidation of
+  existing upstream-owned families remains maintenance work.
+- Windows GNU emitted known conditional warnings in secure-file, hook, session,
+  process, plugin, OAuth, LSP, TUI, and test-only paths. The secure-file item is
+  already tracked by #1031 and the functional platform work remains in the
+  named remediation slices; S-002 neither hides those warnings nor expands
+  into their implementations.
+- The redacted export is durable source, but the raw historical bytes have no
+  newly created archive. Reproduction depends on the recorded existing Git
+  objects; the retention manifest explicitly makes that limitation visible
+  instead of promising archival availability or reintroducing sensitive
+  mutable state.
+- Canonical artifact-bound alternate-model VDD does not exist until S-088.
+  Queue `S002-G2` and its exact implementation diff digest for retrospective
+  verification using the same harness, guardrails, reality grounding, and
+  capability policy. Any non-record mutation invalidates that queue.
+
+No new remediation slice was added. S-002 fully covers F-009/F-141 within its
+boundary; the action-runtime maintenance issue #1028 is closed with this
+delivery after the signed commit is recorded.

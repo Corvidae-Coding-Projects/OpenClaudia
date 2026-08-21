@@ -13,8 +13,9 @@ product comparison.
   streaming, continuation, reasoning, retry, safety, or session behavior.
 - The current name heuristic includes this example: **Pass `-m gemini-3.5-flash` and the provider is auto-detected**. Heuristics can become
   stale and are not an availability guarantee.
-- Default builds contain **free DuckDuckGo/Bing browser scraping** for web
-  search. The audit found egress and completion gaps; backend presence is not a
+- The explicit `browser` feature contains **free DuckDuckGo/Bing browser scraping**
+  for web search and requires an operator-installed browser. The
+  audit found egress and completion gaps; opt-in backend presence is not a
   production-safety claim.
 
 ## Required comparison method

@@ -39,8 +39,8 @@ use std::path::PathBuf;
 /// convention (`crosslink init` creates `.crosslink/issues.db`).
 const CROSSLINK_DIR: &str = ".crosslink";
 
-/// Legacy chainlink data directory. Migrated on first use — see
-/// [`migrate_chainlink_if_needed`].
+/// Retired Chainlink data directory. A store in this namespace blocks implicit
+/// Crosslink creation so historical mutable state is never copied silently.
 const LEGACY_CHAINLINK_DIR: &str = ".chainlink";
 
 /// One Crosslink operation, with its effect fixed at declaration.
@@ -285,21 +285,38 @@ pub fn classify_operation(args: &Value) -> Result<TypedEffect, String> {
     )
 }
 
-/// Resolve the crosslink DB path under the current working directory.
-/// Creates `.crosslink/` if missing so `Database::open` succeeds
-/// without a separate `crosslink init` step. When `.chainlink/issues.db`
-/// exists and `.crosslink/issues.db` does not, copies the legacy DB
-/// into the new location so existing project history survives the
-/// chainlink→crosslink migration.
+/// Resolve the Crosslink DB path under the current working directory.
+/// Creates `.crosslink/` if missing so `Database::open` succeeds without a
+/// separate `crosslink init` step. If only a retired `.chainlink/issues.db`
+/// exists, this fails closed instead of copying unvalidated mutable state into
+/// a second live store.
 fn db_path_for_cwd(run: &crate::tools::security::ToolRunContext) -> Result<PathBuf, String> {
     run.require(crate::tools::security::ToolResource::WorkspaceWrite)
         .map_err(|error| error.to_string())?;
     let cwd = run.working_directory().to_path_buf();
     let dir = cwd.join(CROSSLINK_DIR);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {CROSSLINK_DIR}/: {e}"))?;
     let db = dir.join("issues.db");
-    migrate_chainlink_if_needed(&cwd, &db);
+    if !path_entry_exists(&db)? {
+        let legacy = cwd.join(LEGACY_CHAINLINK_DIR).join("issues.db");
+        if path_entry_exists(&legacy)? {
+            return Err(format!(
+                "retired {LEGACY_CHAINLINK_DIR}/issues.db detected; automatic import is disabled \
+                 because copying an unvalidated mutable database can create split-brain state. \
+                 Back up and explicitly resolve the legacy store before creating \
+                 {CROSSLINK_DIR}/issues.db"
+            ));
+        }
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {CROSSLINK_DIR}/: {e}"))?;
     Ok(db)
+}
+
+fn path_entry_exists(path: &std::path::Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("Failed to inspect {}: {error}", path.display())),
+    }
 }
 
 /// Resolve the DB path for a query operation **without creating anything**.
@@ -329,42 +346,6 @@ fn db_path_for_query(run: &crate::tools::security::ToolRunContext) -> Result<Pat
     }
 }
 
-/// One-shot import of the legacy `.chainlink/issues.db` (if present)
-/// into `.crosslink/issues.db` (if absent). The schema shape is a
-/// superset — crosslink's `Database::open` runs idempotent
-/// `IF NOT EXISTS` + `ALTER TABLE ADD COLUMN` migrations on first
-/// open, so a byte-copy of the chainlink `SQLite` file is enough;
-/// the `schema_version` gap is filled in on the next call.
-///
-/// Safety: only runs when the destination does NOT exist. We never
-/// overwrite an existing `.crosslink/issues.db`. Failures are
-/// non-fatal — they log a warning and let the agent continue with a
-/// fresh DB.
-fn migrate_chainlink_if_needed(cwd: &std::path::Path, dest_db: &PathBuf) {
-    if dest_db.exists() {
-        return; // already migrated or freshly created
-    }
-    let legacy = cwd.join(LEGACY_CHAINLINK_DIR).join("issues.db");
-    if !legacy.exists() {
-        return; // nothing to migrate
-    }
-    if let Err(e) = std::fs::copy(&legacy, dest_db) {
-        tracing::warn!(
-            legacy = %legacy.display(),
-            dest = %dest_db.display(),
-            "Failed to migrate chainlink DB to crosslink: {e}; \
-             starting with an empty crosslink store."
-        );
-        return; // best-effort — do not block the tool
-    }
-    tracing::info!(
-        legacy = %legacy.display(),
-        dest = %dest_db.display(),
-        "Migrated legacy chainlink DB into crosslink store. \
-         Crosslink will apply incremental schema migrations on next open."
-    );
-}
-
 /// Open a fresh `Database` handle for one tool invocation.
 ///
 /// `Database::open` is idempotent + schema-migrating, so it's safe
@@ -372,9 +353,9 @@ fn migrate_chainlink_if_needed(cwd: &std::path::Path, dest_db: &PathBuf) {
 /// static because (a) the cwd can change mid-session (worktree
 /// switches) and (b) `rusqlite::Connection` is `!Sync`.
 ///
-/// This is the write path: it creates `.crosslink/` and migrates a legacy
-/// `.chainlink` store when needed. Query operations use
-/// [`open_db_for_query`], which does neither.
+/// This is the write path: it may create `.crosslink/`, but it never imports a
+/// retired `.chainlink` store. Query operations use [`open_db_for_query`],
+/// which does not create either path.
 fn open_db(run: &crate::tools::security::ToolRunContext) -> Result<Database, String> {
     let path = db_path_for_cwd(run)?;
     Database::open(&path).map_err(|e| format!("Failed to open crosslink DB: {e}"))
@@ -1129,6 +1110,36 @@ mod tests {
                 operation.name
             );
         }
+    }
+
+    #[test]
+    fn legacy_chainlink_store_blocks_implicit_copy_and_new_store_creation() {
+        let root = tempfile::tempdir().expect("crosslink test root");
+        let legacy_dir = root.path().join(LEGACY_CHAINLINK_DIR);
+        std::fs::create_dir(&legacy_dir).expect("legacy directory");
+        let legacy = legacy_dir.join("issues.db");
+        let sentinel = b"legacy database bytes must remain untouched";
+        std::fs::write(&legacy, sentinel).expect("legacy fixture");
+        let run = crate::tools::security::test_run_context_for(root.path());
+
+        let (message, is_error) = call(
+            &run,
+            &[
+                ("operation", json!("create")),
+                ("title", json!("must not create a new store")),
+            ],
+        );
+
+        assert!(is_error, "legacy state must block implicit store creation");
+        assert!(
+            message.contains("automatic import is disabled"),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), sentinel);
+        assert!(
+            !root.path().join(CROSSLINK_DIR).exists(),
+            "rejection must not materialize a second live store"
+        );
     }
 
     /// A shell-shaped payload is no longer a parse target. It is simply not a

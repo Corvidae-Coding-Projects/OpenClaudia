@@ -29,13 +29,118 @@ use ratatui::{
 };
 use std::io::{self, stdout, Write};
 use std::path::PathBuf;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
 
-static SYNTAX_SET: std::sync::LazyLock<SyntaxSet> =
-    std::sync::LazyLock::new(SyntaxSet::load_defaults_newlines);
-static THEME_SET: std::sync::LazyLock<ThemeSet> = std::sync::LazyLock::new(ThemeSet::load_defaults);
+/// Maximum accumulated fenced-code source reparsed for contextual highlighting.
+///
+/// Arborium parses a complete source unit rather than carrying lexical state one
+/// line at a time. Keeping a byte- and line-bounded prefix preserves multiline
+/// constructs for ordinary code blocks without allowing streaming output to
+/// create unbounded quadratic parse work. Content beyond either bound is still
+/// rendered through the existing flat-color fallback; it is never dropped.
+const MAX_HIGHLIGHT_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_HIGHLIGHT_SOURCE_LINES: usize = 1024;
+
+/// Per-code-block syntax highlighter backed by maintained tree-sitter grammars.
+///
+/// Unsupported language tags are represented by `None` at the call site and
+/// retain the existing flat-color fallback instead of failing rendering.
+struct CodeHighlighter {
+    language: String,
+    engine: arborium::AnsiHighlighter,
+    source: String,
+    line_count: usize,
+    disabled: bool,
+}
+
+impl CodeHighlighter {
+    fn new(language: &str) -> Option<Self> {
+        if language.is_empty() {
+            return None;
+        }
+        let mut engine =
+            arborium::AnsiHighlighter::new(arborium::theme::builtin::catppuccin_mocha());
+        engine.store().get(language)?;
+        // The surrounding renderer owns terminal wrapping and indentation.
+        // Arborium's terminal-width auto-detection would otherwise wrap a line
+        // a second time and make output depend on whether stdout is a TTY.
+        engine.options_mut().width = None;
+        engine.options_mut().pad_to_width = false;
+        Some(Self {
+            language: language.to_string(),
+            engine,
+            source: String::new(),
+            line_count: 0,
+            disabled: false,
+        })
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Option<String> {
+        if self.disabled {
+            return None;
+        }
+        if self.line_count >= MAX_HIGHLIGHT_SOURCE_LINES {
+            self.source.clear();
+            self.disabled = true;
+            return None;
+        }
+        let separator_bytes = usize::from(!self.source.is_empty());
+        let next_size = self
+            .source
+            .len()
+            .checked_add(separator_bytes)?
+            .checked_add(line.len())?;
+        if next_size > MAX_HIGHLIGHT_SOURCE_BYTES {
+            self.source.clear();
+            self.disabled = true;
+            return None;
+        }
+        if separator_bytes == 1 {
+            self.source.push('\n');
+        }
+        self.source.push_str(line);
+        self.line_count += 1;
+        let highlighted = self.engine.highlight(&self.language, &self.source).ok()?;
+        Some(last_ansi_line(&highlighted))
+    }
+}
+
+/// Extract the final rendered line while preserving any SGR style that began
+/// before its newline (for example a multiline comment or string span).
+fn last_ansi_line(rendered: &str) -> String {
+    let Some(newline) = rendered.rfind('\n') else {
+        return rendered.to_string();
+    };
+    let prefix = &rendered[..newline];
+    let tail = &rendered[newline + 1..];
+    let Some(active_style) = active_ansi_style(prefix) else {
+        return tail.to_string();
+    };
+    let mut line = String::with_capacity(active_style.len() + tail.len());
+    line.push_str(active_style);
+    line.push_str(tail);
+    line
+}
+
+fn active_ansi_style(rendered: &str) -> Option<&str> {
+    let mut active = None;
+    let mut offset = 0;
+    while let Some(relative_start) = rendered[offset..].find("\u{1b}[") {
+        let start = offset + relative_start;
+        let sequence = &rendered[start..];
+        let Some(relative_end) = sequence.find('m') else {
+            break;
+        };
+        let end = start + relative_end + 1;
+        let escape = &rendered[start..end];
+        if escape == "\u{1b}[0m" || escape == "\u{1b}[m" {
+            active = None;
+        } else {
+            active = Some(escape);
+        }
+        offset = end;
+    }
+    active
+}
 
 // ─── Brand palette ──────────────────────────────────────────────────────────
 //
@@ -240,7 +345,7 @@ pub fn render_markdown_themed(text: &str, theme: &Theme) {
     let mut stdout = io::stdout();
     let mut in_code_block = false;
     let mut code_lang = String::new();
-    let mut highlighter: Option<HighlightLines> = None;
+    let mut highlighter: Option<CodeHighlighter> = None;
 
     for line in text.lines() {
         if line.starts_with("```") {
@@ -256,18 +361,7 @@ pub fn render_markdown_themed(text: &str, theme: &Theme) {
                 in_code_block = true;
                 code_lang = line.trim_start_matches('`').trim().to_string();
 
-                // Set up syntax highlighter for the detected language
-                let syntax = if code_lang.is_empty() {
-                    SYNTAX_SET.find_syntax_plain_text()
-                } else {
-                    SYNTAX_SET
-                        .find_syntax_by_token(&code_lang)
-                        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text())
-                };
-                let theme_name = "base16-ocean.dark";
-                if let Some(syn_theme) = THEME_SET.themes.get(theme_name) {
-                    highlighter = Some(HighlightLines::new(syntax, syn_theme));
-                }
+                highlighter = CodeHighlighter::new(&code_lang);
 
                 if !code_lang.is_empty() {
                     let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
@@ -344,26 +438,18 @@ pub fn render_markdown_themed(text: &str, theme: &Theme) {
     stdout.flush().ok();
 }
 
-/// Render a single code line with syntect syntax highlighting.
+/// Render a single code line with tree-sitter syntax highlighting.
 ///
 /// Falls back to the theme's `code_color` if highlighting fails.
 fn render_highlighted_code_line(
     stdout: &mut io::Stdout,
     line: &str,
-    highlighter: &mut HighlightLines,
+    highlighter: &mut CodeHighlighter,
     fallback_color: CtColor,
 ) {
-    if let Ok(ranges) = highlighter.highlight_line(line, &SYNTAX_SET) {
+    if let Some(highlighted) = highlighter.highlight_line(line) {
         let _ = stdout.execute(Print("    "));
-        for (style, text) in ranges {
-            let color = CtColor::Rgb {
-                r: style.foreground.r,
-                g: style.foreground.g,
-                b: style.foreground.b,
-            };
-            let _ = stdout.execute(SetForegroundColor(color));
-            let _ = stdout.execute(Print(text));
-        }
+        let _ = stdout.execute(Print(highlighted));
         let _ = stdout.execute(ResetColor);
         let _ = stdout.execute(Print("\n"));
     } else {
@@ -581,18 +667,16 @@ pub struct StreamingMarkdownRenderer {
     /// Language for the current code block (for syntax highlighting)
     code_lang: String,
     /// Syntax highlighter for the current code block
-    highlighter: Option<HighlightLines<'static>>,
+    highlighter: Option<CodeHighlighter>,
     /// The theme to use for rendering
     theme: Theme,
 }
 
-/// The `Send`-able subset of [`StreamingMarkdownRenderer`] state that can be
-/// carried across `.await` boundaries.
+/// The dependency-independent subset of [`StreamingMarkdownRenderer`] state.
 ///
-/// `StreamingMarkdownRenderer` holds a `HighlightLines` (from syntect/onig) that
-/// contains raw pointers and is therefore `!Send`. When the streaming loop needs
-/// to yield at `stream.next().await`, it first extracts this state, drops the
-/// renderer, awaits, then reconstructs the renderer from the state.
+/// The parser cache is intentionally disposable: callers can persist or move
+/// this state without binding session state to a third-party grammar engine,
+/// then reconstruct highlighting from the fenced language tag.
 pub struct MarkdownRenderState {
     line_buffer: String,
     in_code_block: bool,
@@ -615,8 +699,8 @@ impl StreamingMarkdownRenderer {
 
     /// Extract the `Send`-able render state, consuming `self`.
     ///
-    /// The `HighlightLines` (which is `!Send`) is discarded; it will be
-    /// reconstructed from `code_lang` when the renderer is restored via
+    /// The parser cache is discarded; it will be reconstructed from `code_lang`
+    /// when the renderer is restored via
     /// [`StreamingMarkdownRenderer::from_state`].
     #[must_use]
     pub fn into_state(self) -> MarkdownRenderState {
@@ -630,18 +714,12 @@ impl StreamingMarkdownRenderer {
 
     /// Reconstruct a renderer from previously saved state.
     ///
-    /// If the state records an active code block, the `HighlightLines` is
+    /// If the state records an active code block, the syntax highlighter is
     /// rebuilt from the language token so highlighting resumes correctly.
     #[must_use]
     pub fn from_state(state: MarkdownRenderState) -> Self {
-        let highlighter = if state.in_code_block && !state.code_lang.is_empty() {
-            let syntax = SYNTAX_SET
-                .find_syntax_by_token(&state.code_lang)
-                .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
-            THEME_SET
-                .themes
-                .get("base16-ocean.dark")
-                .map(|t| HighlightLines::new(syntax, t))
+        let highlighter = if state.in_code_block {
+            CodeHighlighter::new(&state.code_lang)
         } else {
             None
         };
@@ -685,17 +763,9 @@ impl StreamingMarkdownRenderer {
     fn render_code_block_line(&mut self, line: &str) {
         let mut stdout = io::stdout();
         if let Some(ref mut hl) = self.highlighter {
-            if let Ok(ranges) = hl.highlight_line(line, &SYNTAX_SET) {
+            if let Some(highlighted) = hl.highlight_line(line) {
                 let _ = stdout.execute(Print("    "));
-                for (style, text) in ranges {
-                    let color = CtColor::Rgb {
-                        r: style.foreground.r,
-                        g: style.foreground.g,
-                        b: style.foreground.b,
-                    };
-                    let _ = stdout.execute(SetForegroundColor(color));
-                    let _ = stdout.execute(Print(text));
-                }
+                let _ = stdout.execute(Print(highlighted));
             } else {
                 let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
                 print!("    {line}");
@@ -723,17 +793,7 @@ impl StreamingMarkdownRenderer {
                 self.in_code_block = true;
                 self.code_lang = line.trim_start_matches('`').trim().to_string();
 
-                let syntax = if self.code_lang.is_empty() {
-                    SYNTAX_SET.find_syntax_plain_text()
-                } else {
-                    SYNTAX_SET
-                        .find_syntax_by_token(&self.code_lang)
-                        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text())
-                };
-                let theme_name = "base16-ocean.dark";
-                if let Some(syn_theme) = THEME_SET.themes.get(theme_name) {
-                    self.highlighter = Some(HighlightLines::new(syntax, syn_theme));
-                }
+                self.highlighter = CodeHighlighter::new(&self.code_lang);
 
                 if !self.code_lang.is_empty() {
                     let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
@@ -1384,6 +1444,70 @@ mod tests {
     fn test_theme_default() {
         let theme = Theme::default();
         assert_eq!(theme.name, "default");
+    }
+
+    #[test]
+    fn maintained_syntax_highlighter_colors_supported_language() {
+        let mut highlighter =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        let rendered = highlighter
+            .highlight_line("fn main() { println!(\"hello\"); }")
+            .expect("valid Rust source must highlight");
+        assert!(
+            rendered.contains("\u{1b}["),
+            "highlighted terminal source must contain ANSI styling"
+        );
+        assert!(rendered.contains("main"));
+    }
+
+    #[test]
+    fn unsupported_syntax_tag_uses_existing_flat_color_fallback() {
+        assert!(CodeHighlighter::new("definitely-not-a-language").is_none());
+    }
+
+    #[test]
+    fn maintained_syntax_highlighter_preserves_multiline_context() {
+        let mut contextual =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        contextual
+            .highlight_line("/* opening comment")
+            .expect("first comment line must highlight");
+        let continued = contextual
+            .highlight_line("still inside */ let value = 1;")
+            .expect("continued comment line must highlight");
+
+        let mut isolated =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        let without_context = isolated
+            .highlight_line("still inside */ let value = 1;")
+            .expect("isolated source must remain renderable");
+        assert_ne!(
+            continued, without_context,
+            "multiline parsing must affect the continued line's styling"
+        );
+        assert!(continued.contains("\u{1b}["));
+        assert!(continued.contains("still inside */"));
+    }
+
+    #[test]
+    fn maintained_syntax_highlighter_falls_back_after_bounded_source() {
+        let mut highlighter =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        let oversized = "x".repeat(MAX_HIGHLIGHT_SOURCE_BYTES + 1);
+        assert!(highlighter.highlight_line(&oversized).is_none());
+        assert!(highlighter
+            .highlight_line("let still_visible = true;")
+            .is_none());
+    }
+
+    #[test]
+    fn maintained_syntax_highlighter_bounds_reparse_line_count() {
+        let mut highlighter =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        for _ in 0..MAX_HIGHLIGHT_SOURCE_LINES {
+            assert!(highlighter.highlight_line("// bounded").is_some());
+        }
+        assert!(highlighter.highlight_line("let fallback = true;").is_none());
     }
 
     #[test]

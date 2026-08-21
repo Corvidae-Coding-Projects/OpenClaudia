@@ -276,6 +276,7 @@ const REQUIRES_PROCESS_AND_NETWORK: &[super::security::ToolResource] = &[
     super::security::ToolResource::Process,
     super::security::ToolResource::Network,
 ];
+#[cfg(feature = "browser")]
 const REQUIRES_BROWSER: &[super::security::ToolResource] = &[
     super::security::ToolResource::WorkspaceRead,
     super::security::ToolResource::Process,
@@ -942,7 +943,7 @@ impl ToolHandler for CrosslinkHandler {
 const WEB_FETCH_DESCRIPTION: &str = "Fetch the content of a web page and return it as markdown. Uses direct HTTP first, then a headless Chromium fallback for JavaScript-rendered pages or browser challenges. Use this to read documentation, articles, or other web content.";
 
 #[cfg(not(feature = "browser"))]
-const WEB_FETCH_DESCRIPTION: &str = "Fetch the content of a web page and return it as markdown using direct HTTP. This build does not include JavaScript rendering or headless-browser challenge handling; rebuild with the default `browser` feature for that fallback.";
+const WEB_FETCH_DESCRIPTION: &str = "Fetch the content of a web page and return it as markdown using direct HTTP. This build does not include JavaScript rendering or headless-browser challenge handling; rebuild with `--features browser` for that fallback.";
 
 #[cfg(feature = "browser")]
 const WEB_SEARCH_DESCRIPTION: &str = "Search the web and return relevant results using free DuckDuckGo/Bing browser scraping. No search API key is required. Returns titles, snippets, and URLs. `allowed_domains` / `blocked_domains` mirror Claude Code's WebSearchTool — results are filtered to domains that match (or don't match) the respective list.";

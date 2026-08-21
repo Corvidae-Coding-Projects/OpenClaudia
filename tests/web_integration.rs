@@ -21,7 +21,7 @@
 //!
 //! Gated behind `#[ignore]`. Opt in at runtime with:
 //! ```text
-//! cargo test -p openclaudia --test web_integration -- --ignored
+//! cargo test -p openclaudia --features browser --test web_integration -- --ignored
 //! ```
 //! Set `OPENCLAUDIA_TEST_BROWSER=1` to confirm opt-in intent (tests log a warning if absent).
 
@@ -29,7 +29,9 @@ use openclaudia::permissions::{CheckResult, PermissionManager};
 #[cfg(feature = "browser")]
 use openclaudia::web::parse_duckduckgo_results_from_html;
 use openclaudia::web::{format_search_results, FetchResult, SearchResult};
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(feature = "browser")]
+use serde_json::Value;
 use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};

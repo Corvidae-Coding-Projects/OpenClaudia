@@ -465,19 +465,21 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
     let claude_code_features = include_str!("../CLAUDE_CODE_FEATURES.md");
     let architecture = include_str!("../ARCHITECTURE.md");
     let cargo_toml = include_str!("../Cargo.toml");
+    let registry_source = include_str!("../src/tools/registry.rs");
+    let web_source = include_str!("../src/web.rs");
     let changelog = include_str!("../CHANGELOG.md");
 
     assert!(
-        readme.contains("Free DuckDuckGo/Bing browser scraping"),
-        "README must explain that web search is free and browser-backed"
+        readme.contains("Free DuckDuckGo/Bing browser scraping is available"),
+        "README must explain that opt-in web search is free and browser-backed"
     );
     assert!(
         comparison.contains("free DuckDuckGo/Bing browser scraping"),
         "COMPARISON.md must describe OpenClaudia web search as free and browser-backed"
     );
     assert!(
-        readme.contains("web_search is unavailable"),
-        "README no-default-features build note must explain web_search's browser-feature requirement"
+        readme.contains("`web_search` and `web_browser` are\nunavailable"),
+        "README default build note must explain web_search's browser-feature requirement"
     );
     assert!(
         prompt_tools.contains(
@@ -493,6 +495,18 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
     assert!(
         architecture.contains("DuckDuckGo") && architecture.contains("/ Bing"),
         "architecture doc must describe the current free search backend"
+    );
+    assert!(
+        readme.contains("--features browser")
+            && readme.contains("operator-installed compatible")
+            && claude_code_features.contains("not part of the default build")
+            && architecture.contains("cannot\ndownload Chromium at runtime")
+            && cargo_toml.contains("default = []")
+            && cargo_toml.contains("features = [\"offline\"]")
+            && !cargo_toml.contains("features = [\"fetch\"]")
+            && !registry_source.contains("default `browser` feature")
+            && !web_source.contains("default `browser` feature"),
+        "browser availability must be explicit, opt-in, offline-built, and documented consistently"
     );
     for doc in [
         readme,

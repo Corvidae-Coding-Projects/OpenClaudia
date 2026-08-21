@@ -32,9 +32,10 @@ provider; the audit records the exact gaps.
 - **Git Worktrees** — Create, list, and safely remove isolated git worktrees without mutating the process CWD. Current cleanup/transaction/capability gaps are documented in the audit.
 - **Thinking Mode** — Extended reasoning for Anthropic, OpenAI GPT-5/o1/o3/o4, Gemini 3.x/2.5, DeepSeek V4, Qwen QwQ, Z.AI/GLM, and MiniMax-M3. This describes adapter configuration branches, not uniform preservation or privacy of native reasoning state.
 - **Cron Scheduling** — Create, list, and delete cron schedule metadata for external schedulers. OpenClaudia does not currently execute those schedules.
-- **Web Search** — Free DuckDuckGo/Bing browser scraping is present in default
-  builds. The browser feature has important egress/isolation gaps; with
-  `--no-default-features`, web_search is unavailable.
+- **Web Search** — Free DuckDuckGo/Bing browser scraping is available through
+  the explicit `browser` build feature. It remains opt-in while its documented
+  egress/isolation gaps are remediated; default builds expose direct
+  `web_fetch` but do not register `web_search` or `web_browser`.
 
 The legacy filesystem rule injector has been removed. Repository files under
 `.openclaudia/rules` and deprecated provider-compatibility rule directories are
@@ -52,8 +53,14 @@ cd openclaudia
 cargo build --release
 ```
 
-Default features include the browser implementation. `cargo build --release
---no-default-features` omits that implementation and its search tool.
+The default build does not include browser process integration. Build it
+explicitly with `cargo build --release --features browser`. Browser-enabled
+builds use an operator-installed compatible Chromium/Chrome executable and do
+not download one during an agent tool call. `web_search` and `web_browser` are
+unavailable when the feature is omitted; direct `web_fetch` remains available.
+The [repository artifact and dependency policy](docs/repository-artifact-dependency-policy.md)
+defines the MSRV, locked supply-chain gates, retained historical evidence, and
+safe cache cleanup procedure.
 
 ## Available Tools
 
@@ -76,8 +83,8 @@ owned by the audit and remediation slices.
 | `grep` | Search file contents by regular expression |
 | `notebook_edit` | Edit notebook cells; requires a successful `read_file` first |
 | `web_fetch` | Fetch an allowed web page |
-| `web_search` | Search through the configured/default browser-backed implementation |
-| `web_browser` | Use the feature-gated headless browser surface |
+| `web_search` | Search through the browser-backed implementation when built with `browser` |
+| `web_browser` | Use the opt-in `browser` feature's headless-browser surface |
 | `crosslink` | Use the embedded issue-tracking integration |
 | `lsp` | Run goToDefinition, findReferences, hover, documentSymbols, workspaceSymbol, goToImplementation, and call hierarchy operations |
 | `ask_user_question` | Request structured clarification |

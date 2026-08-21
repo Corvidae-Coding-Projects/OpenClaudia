@@ -2,6 +2,7 @@
 name = "openclaudia"
 version = "0.5.0"
 edition = "2021"
+rust-version = "1.91"
 description = "Open-source universal agent harness - Claude Code capabilities for any AI"
 license = "MIT"
 repository = "https://github.com/dollspace-gay/openclaudia"
@@ -20,12 +21,11 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP server (axum 0.8)
 axum = { version = "0.8", features = ["json", "ws"] }
-axum-extra = { version = "0.12", features = ["typed-header"] }
-tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # HTTP client for upstream requests
-reqwest = { version = "0.13", features = ["json", "stream", "form", "query"] }
+# Keep the direct transport generation aligned with Crosslink while its current
+# published release remains on reqwest 0.12. This removes a second HTTP stack.
+reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -112,29 +112,81 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 # on the libsqlite3-sys major version or cargo refuses to link.
 crosslink = "0.9.0-beta.1"
 
-# Headless browser for web scraping (optional, heavy dependency).
-# `fetch` enables auto-download of a vendored Chromium revision when no
-# system Chrome is present — used by the web_search / web_browser tool
-# fallback in src/web.rs::launch_browser_for_scraping.
-headless_chrome = { version = "1", optional = true, features = ["fetch"] }
+# Headless browser for web scraping (explicit opt-in, heavy dependency).
+# The offline protocol bundle keeps builds reproducible. Runtime executable
+# download is deliberately disabled; operators provide a compatible browser.
+headless_chrome = { version = "1", optional = true, default-features = false, features = ["offline"] }
 scraper = { version = "0.27", optional = true }
 
 # HTML → Markdown conversion (turndown.js-inspired). Used by `web_fetch`
 # to render fetched pages into LLM-friendly markdown without requiring a
 # hosted conversion service.
 htmd = "0.5"
-syntect = "5"
+# Maintained tree-sitter highlighting replaces syntect's unmaintained
+# bincode/yaml-rust dump chain. The explicit language set covers the former
+# built-in terminal profile; unknown fence tags retain the flat-color fallback.
+arborium = { version = "2.18.1", default-features = false, features = [
+    "lang-asm",
+    "lang-bash",
+    "lang-batch",
+    "lang-c",
+    "lang-c-sharp",
+    "lang-clojure",
+    "lang-cmake",
+    "lang-cpp",
+    "lang-css",
+    "lang-d",
+    "lang-diff",
+    "lang-dockerfile",
+    "lang-dot",
+    "lang-elixir",
+    "lang-erlang",
+    "lang-fsharp",
+    "lang-go",
+    "lang-groovy",
+    "lang-haskell",
+    "lang-html",
+    "lang-java",
+    "lang-javascript",
+    "lang-json",
+    "lang-kotlin",
+    "lang-lua",
+    "lang-make",
+    "lang-markdown",
+    "lang-matlab",
+    "lang-objc",
+    "lang-ocaml",
+    "lang-perl",
+    "lang-php",
+    "lang-powershell",
+    "lang-python",
+    "lang-r",
+    "lang-regex",
+    "lang-ruby",
+    "lang-rust",
+    "lang-scala",
+    "lang-sql",
+    "lang-swift",
+    "lang-toml",
+    "lang-tsx",
+    "lang-typescript",
+    "lang-xml",
+    "lang-yaml",
+    "lang-zig",
+] }
 similar = { version = "3", features = ["inline"] }
 
 [features]
-default = ["browser"]
+default = []
 browser = ["headless_chrome", "scraper"]
 
 [dev-dependencies]
 tempfile = "3"
-tokio-test = "0.4"
 wiremock = "0.6"
-predicates = "3"
+# `#[tokio::test(start_paused = true)]` relies on Tokio's test clock. Keep
+# that capability explicit and dev-only instead of obtaining it through an
+# otherwise-unused helper crate.
+tokio = { version = "1", features = ["test-util"] }
 # Property-based testing for round-trip / invariant coverage across the
 # provider adapters, parsers, and other algebraic surfaces.
 # (Note: `rand_core` is no longer a direct dev-dep — its public traits
@@ -147,10 +199,11 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
-# Targeted exception (architectural review): 32 transitive duplicates from
-# ratatui-termwiz optional chain, headless_chrome optional dep, the ring/rustls
-# TLS chain, and ecosystem-wide windows-sys major-version drift. Fix requires
-# upstream coordination, not source changes.
+# Targeted exception (architectural review): `cargo deny` rejects duplicate
+# drift and admits only the exact transitive generations recorded in each lock
+# graph's policy. Clippy cannot express that reviewed exception model, so its
+# coarser duplicate lint is disabled here rather than pretending the graph is
+# singular.
 multiple_crate_versions = "allow"
 
 [lib]
@@ -160,3 +213,17 @@ path = "src/lib.rs"
 [[bin]]
 name = "openclaudia"
 path = "src/main.rs"
+
+# Keep local/test artifacts bounded while preserving useful line-level debug
+# information. Release artifacts favor one optimized, reproducible link unit.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.release]
+codegen-units = 1
+debug = 0
+lto = "thin"
+strip = "symbols"
