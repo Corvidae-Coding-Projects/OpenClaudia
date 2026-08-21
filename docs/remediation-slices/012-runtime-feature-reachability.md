@@ -47,12 +47,12 @@ and rate-limit state machine remain present for their owning follow-up slices.
 |---|---|---|
 | Analytics | Wired | `ServiceRegistry::interactive` / `analytics_subscriber` + `drain_pending` / `StateAnalyticsSubscriber::finish` and `Drop` |
 | Feature rollout | Unavailable | No declared production flag catalog; unknown `OPENCLAUDIA_FEATURE_*` keys fail validation; S-014/S-047 |
-| Background jobs | Unavailable | Preserved synchronous prototype lacks ownership, durable leases, cancellation, budgets, and transactional jobs; S-053/S-054/S-061/S-084 |
+| Background jobs | Unavailable | Preserved synchronous prototype lacks ownership, durable leases, cancellation, budgets, and transactional jobs; S-054/S-061/S-084 |
 | Auto-compaction | Wired | `proxy::compact_request_context` / `AutoCompactor::auto_compact` / request-future completion |
 | Plugin MCP runtime | Wired | Real `PluginManager` + `McpManager` owners in proxy/TUI / MCP dispatch / `disconnect_all` |
 | Plugin MCP shadow registry | Experimental | Preserved transport-neutral migration mirror; never a runtime authority or secret store; S-063/S-064/S-066 |
 | Project memory | Wired | Project memory composition roots / prompt and tool consumers / frontend completion then `MemoryDb` drop |
-| Team memory | Unavailable | Production config rejects the proposed shared path until stable cross-store identity and atomic reconciliation exist; S-053/S-054 |
+| Team memory | Unavailable | Stable cross-store identity and replay landed in S-053; production config still rejects the proposed shared path pending authenticated authority, safe storage/recovery, and evidence-only retrieval in S-054 |
 | Guardrails | Wired | `guardrails::configure` / tool, diff, and quality boundaries / last-`Arc` run retirement |
 | Enterprise policy | Wired | `PolicyEnforcer::new` / provider and tool policy consumers / frontend owner drop |
 | Tool executor | Wired | typed `ToolExecutorRequest` / `ToolExecutor::execute` / typed result publication |
@@ -99,8 +99,8 @@ proves that the resulting ACP run rejects access.
 ### Unavailable configuration
 
 - `memory.team_memory_path`, from YAML or its typed environment name, fails at
-  production config loading with its S-053/S-054 ownership instead of being
-  silently ignored.
+  production config loading with its remaining S-054 ownership instead of
+  being silently ignored. S-053 completed logical identity and durable replay.
 - Arbitrary `OPENCLAUDIA_FEATURE_*` variables no longer bypass the finite typed
   environment registry and fail as unknown names.
 - The library/test prototypes remain available so later slices can complete
@@ -202,8 +202,9 @@ The repair cycle was retained as evidence rather than erased:
   S-078, S-089, S-093, and S-094 own convergence of print, ACP, and proxy
   frontends onto canonical lifecycle routing rather than parallel S-012
   adapters.
-- S-053/S-054 own safe team-memory identity, provenance, and cross-store
-  transactions. S-061/S-062/S-084 own plugin maintenance and durable job
+- S-053 completed safe team-memory identity and cross-store replay. S-054 owns
+  authenticated authority, evidence schema/retrieval, and production activation.
+  S-061/S-062/S-084 own plugin maintenance and durable job
   scheduling. S-068/S-069 own workspace/generation-safe LSP. S-048/S-050 own
   real provider-transport failure injection. S-014/S-047 own declared rollout
   semantics.

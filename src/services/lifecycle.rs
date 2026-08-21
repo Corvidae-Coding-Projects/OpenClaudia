@@ -209,7 +209,7 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
         LifecycleServiceId::BackgroundJobs,
         LifecycleServiceClassification::Unavailable,
         "The synchronous scheduler lacks ownership, durable leases, cancellation, and safe job semantics.",
-        Some("S-053/S-054/S-061/S-084"),
+        Some("S-054/S-061/S-084"),
     ),
     LifecycleServiceRegistration::wired(
         LifecycleServiceId::AutoCompaction,
@@ -247,8 +247,8 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
     LifecycleServiceRegistration::classified(
         LifecycleServiceId::TeamMemory,
         LifecycleServiceClassification::Unavailable,
-        "Cross-store logical identity and atomic reconciliation are incomplete; configured activation fails visibly.",
-        Some("S-053/S-054"),
+        "Logical identity and reconciliation are implemented, but authenticated authority, safe storage/migration, and evidence-only retrieval remain incomplete; configured activation fails visibly.",
+        Some("S-054"),
     ),
     LifecycleServiceRegistration::wired(
         LifecycleServiceId::Guardrails,

@@ -8,8 +8,8 @@
 //! the follow-up slices that will complete it.
 //!
 //! The module contains a scheduling skeleton and one concrete background job:
-//! **memory consolidation** (prune expired short-term entries and
-//! deduplicate archival memories with identical content).
+//! **memory consolidation** (prune expired short-term entries and produce a
+//! bounded, non-destructive review trace for possible semantic duplicates).
 //!
 //! ## Design
 //!
@@ -24,8 +24,8 @@
 //!   Phase 1. It:
 //!   1. Prunes expired short-term sessions and activities via
 //!      [`MemoryDb::cleanup_expired_short_term`].
-//!   2. Deduplicates archival memories whose content is byte-for-byte
-//!      identical (keeping the most recently updated copy).
+//!   2. Preserves distinct logical memories even when their content is
+//!      byte-for-byte identical. Equal prose is not an equivalence proof.
 //!
 //! ## Phase 2 follow-up
 //!
@@ -51,8 +51,8 @@ pub struct JobOutcome {
     pub job_name: &'static str,
     /// Number of records that were removed or merged.
     pub records_pruned: usize,
-    /// Prototype deduplication/summarisation count. Existing jobs may delete a
-    /// duplicate rather than transactionally merge its metadata.
+    /// Number of causally proven revision reconciliations or summaries. Equal
+    /// prose is never counted as a merge.
     pub records_deduped: usize,
 }
 
@@ -84,20 +84,17 @@ pub trait BackgroundJob: Send + Sync {
 
 // ── Memory consolidation job ─────────────────────────────────────────────────
 
-/// Prunes expired short-term memory and deduplicates identical archival entries.
+/// Prunes expired short-term memory and reviews possible archival duplicates.
 ///
 /// Runs two passes:
 /// 1. **Expiry pass** — delegates to [`MemoryDb::cleanup_expired_short_term`]
 ///    which deletes sessions and activities older than 48 hours.
-/// 2. **Dedup pass** — loads all archival memories, groups them by exact
-///    content string, and deletes all but the most-recently-updated copy
-///    within each group.
+/// 2. **Review pass** — loads a bounded set of archival memories and reports
+///    equal-content records that intentionally remain separate logical facts.
 ///
-/// The dedup pass uses a simple `HashMap<String, (id, updated_at)>` so
-/// it is O(n) in memory-entry count. For very large databases (> 10 k
-/// entries) a SQL-level dedup (`GROUP BY content HAVING COUNT(*) > 1`)
-/// would be faster, but the current database size ceiling in practice is
-/// a few hundred rows.
+/// Revision retries and replicas already converge idempotently by immutable
+/// record digest in [`MemoryDb`]. Consolidation does not invent an equivalence
+/// relation from prose or timestamps.
 pub struct MemoryConsolidationJob;
 
 impl BackgroundJob for MemoryConsolidationJob {
@@ -115,11 +112,11 @@ impl BackgroundJob for MemoryConsolidationJob {
             "memory_consolidation: short-term prune complete"
         );
 
-        // Pass 2 — deduplicate identical archival entries.
-        let records_deduped = dedup_archival(db)?;
+        // Pass 2 — bounded, non-destructive duplicate review.
+        let records_deduped = review_archival_equivalence(db)?;
         tracing::debug!(
             records_deduped,
-            "memory_consolidation: archival dedup complete"
+            "memory_consolidation: archival equivalence review complete"
         );
 
         Ok(JobOutcome {
@@ -223,42 +220,39 @@ impl BackgroundJob for PluginDelistingJob {
     }
 }
 
-/// Remove duplicate archival memory entries that share identical content.
-/// Keeps the entry with the latest `updated_at` timestamp; deletes the rest.
-/// Returns the count of deleted rows.
-fn dedup_archival(db: &Arc<MemoryDb>) -> Result<usize> {
+/// Review equal-content records without calling them equivalent.
+///
+/// The immutable revision layer handles exact retry identity. Separate logical
+/// IDs are preserved even if their content bytes match because source, scope,
+/// authorship, and applicability can differ. A future explicit merge operation
+/// must carry a reviewed equivalence proof; this background job has none.
+fn review_archival_equivalence(db: &Arc<MemoryDb>) -> Result<usize> {
     use std::collections::HashMap;
 
-    // (content → (canonical_id, canonical_updated_at, [duplicate_ids]))
-    // We build the map in one list pass to avoid N+1 queries.
-    let all = db.memory_list(usize::MAX)?;
-
-    // Group: content → (best_id, best_updated_at, all_ids_in_group)
-    let mut groups: HashMap<String, (i64, String, Vec<i64>)> = HashMap::new();
+    const REVIEW_LIMIT: usize = 4_096;
+    let all = db.memory_list(REVIEW_LIMIT + 1)?;
+    anyhow::ensure!(
+        all.len() <= REVIEW_LIMIT,
+        "memory consolidation review budget exceeded"
+    );
+    let mut groups: HashMap<String, Vec<crate::memory::LogicalMemoryId>> = HashMap::new();
     for entry in all {
-        let rec = groups
+        groups
             .entry(entry.content.clone())
-            .or_insert_with(|| (entry.id, entry.updated_at.clone(), vec![entry.id]));
-        // Track all ids so we can delete the non-canonical ones.
-        if !rec.2.contains(&entry.id) {
-            rec.2.push(entry.id);
-        }
-        // Promote to canonical if this entry is newer.
-        if entry.updated_at > rec.1 {
-            rec.0 = entry.id;
-            rec.1.clone_from(&entry.updated_at);
+            .or_default()
+            .push(entry.logical_id);
+    }
+    for logical_ids in groups.values().filter(|ids| ids.len() > 1) {
+        tracing::debug!(
+            event = "memory_consolidation_distinct_equal_content",
+            record_count = logical_ids.len(),
+            "equal content retained because logical identity/provenance differ"
+        );
+        if logical_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            anyhow::bail!("duplicate logical identity escaped revision reconciliation");
         }
     }
-
-    let mut deleted = 0_usize;
-    for (_content, (canonical_id, _ts, all_ids)) in groups {
-        for dup_id in all_ids {
-            if dup_id != canonical_id && db.memory_delete(dup_id)? {
-                deleted += 1;
-            }
-        }
-    }
-    Ok(deleted)
+    Ok(0)
 }
 
 // ── AgentSummary job (crosslink #635) ───────────────────────────────────────
@@ -551,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn consolidation_deduplicates_archival_entries() {
+    fn consolidation_preserves_equal_content_with_distinct_identity() {
         let tmp = TempDir::new().unwrap();
         let db = make_db(&tmp);
 
@@ -565,68 +559,32 @@ mod tests {
         let id_unique = db.memory_save("unique content", &[]).unwrap();
 
         let outcome = MemoryConsolidationJob.run(&db).unwrap();
-        assert_eq!(outcome.records_deduped, 1, "one duplicate must be removed");
+        assert_eq!(outcome.records_deduped, 0);
 
-        // The canonical entry survives; the other duplicate is gone.
-        // 2 survive: one from the dup group + the unique entry.
+        let left = db.memory_get(id_a).unwrap().unwrap();
+        let right = db.memory_get(id_b).unwrap().unwrap();
+        assert_ne!(left.logical_id, right.logical_id);
         let survivor_count = [id_a, id_b, id_unique]
             .iter()
             .filter_map(|&id| db.memory_get(id).unwrap())
             .count();
-        assert_eq!(survivor_count, 2);
+        assert_eq!(survivor_count, 3);
     }
 
     #[test]
-    fn consolidation_keeps_most_recently_updated_duplicate() {
+    fn consolidation_never_uses_timestamp_as_equivalence_proof() {
         let tmp = TempDir::new().unwrap();
         let db = make_db(&tmp);
 
-        // Insert two rows with the same content but distinct timestamps so
-        // we can assert which one survives. `datetime('now')` has 1-second
-        // resolution; using raw SQL with explicit offsets guarantees the gap
-        // without relying on wall-clock ticks.
-        // Crosslink #464 dropped the `tags` column from archival_memory in
-        // favour of the `archival_memory_tags` junction table.  These raw
-        // inserts therefore name only the columns that still exist on the
-        // base table; tag assignment is exercised by the dedicated #464
-        // tests in memory.rs.
-        db.execute_raw(
-            "INSERT INTO archival_memory (content, created_at, updated_at) \
-             VALUES ('same content', \
-             datetime('now', '-10 seconds'), datetime('now', '-10 seconds'))",
-        )
-        .unwrap();
-        // Capture the id just inserted.
-        let all_before = db.memory_list(10).unwrap();
-        let id_older = all_before
-            .iter()
-            .find(|e| e.content == "same content")
-            .unwrap()
-            .id;
-
-        // Insert the newer duplicate with a strictly later timestamp.
-        db.execute_raw(
-            "INSERT INTO archival_memory (content, created_at, updated_at) \
-             VALUES ('same content', \
-             datetime('now'), datetime('now'))",
-        )
-        .unwrap();
-        let all_after = db.memory_list(10).unwrap();
-        let id_newer = all_after
-            .iter()
-            .find(|e| e.content == "same content" && e.id != id_older)
-            .unwrap()
-            .id;
+        let id_older = db.memory_save("same content", &[]).unwrap();
+        let id_newer = db.memory_save("temporary", &[]).unwrap();
+        db.memory_update(id_newer, "same content").unwrap();
 
         let outcome = MemoryConsolidationJob.run(&db).unwrap();
-        assert_eq!(outcome.records_deduped, 1);
+        assert_eq!(outcome.records_deduped, 0);
 
-        // The older entry must be gone; the newer one must survive.
-        assert!(
-            db.memory_get(id_older).unwrap().is_none(),
-            "older dup removed"
-        );
-        assert!(db.memory_get(id_newer).unwrap().is_some(), "newer dup kept");
+        assert!(db.memory_get(id_older).unwrap().is_some());
+        assert!(db.memory_get(id_newer).unwrap().is_some());
     }
 
     #[test]

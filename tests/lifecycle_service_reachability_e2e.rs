@@ -164,7 +164,12 @@ fn configured_team_memory_fails_visibly_instead_of_being_ignored() {
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("memory.team_memory_path is currently unavailable"));
-    assert!(text.contains("S-053/S-054"));
+    assert!(text.contains("authenticated team authority"));
+    assert!(text.contains("host-owned storage"));
+    assert!(text.contains("schema recovery"));
+    assert!(text.contains("safe retrieval"));
+    assert!(text.contains("tracked by S-054"));
+    assert!(!text.contains("S-053"));
 }
 
 #[test]
@@ -186,7 +191,12 @@ fn environment_configured_team_memory_fails_at_the_same_boundary() {
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("memory.team_memory_path is currently unavailable"));
-    assert!(text.contains("S-053/S-054"));
+    assert!(text.contains("authenticated team authority"));
+    assert!(text.contains("host-owned storage"));
+    assert!(text.contains("schema recovery"));
+    assert!(text.contains("safe retrieval"));
+    assert!(text.contains("tracked by S-054"));
+    assert!(!text.contains("S-053"));
 }
 
 #[test]

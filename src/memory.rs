@@ -11,6 +11,14 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+mod record;
+
+pub use record::{
+    LogicalMemoryId, MemoryAttribution, MemoryDigest, MemoryProvenance, MemoryRecordError,
+    MemoryRecordScope, MemoryRevision, MemoryRevisionState, MemorySourceEvidence, MemorySourceKind,
+    MemoryStoreId, MemoryVersion, MEMORY_PROVENANCE_SCHEMA_VERSION,
+};
+
 /// Escape `<`, `>`, and `&` for safe interpolation into XML-tagged prompt
 /// regions (e.g. `<core_memory>...</core_memory>`).
 ///
@@ -39,7 +47,11 @@ pub fn xml_escape_for_prompt(s: &str) -> Cow<'_, str> {
 const MEMORY_DB_NAME: &str = "memory.db";
 
 /// Current schema version - increment when adding migrations
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+
+/// Maximum concurrently visible causal heads for one logical memory.
+/// Applying a revision that would exceed this cap rolls its transaction back.
+const MAX_MEMORY_CONFLICT_HEADS: usize = 64;
 
 /// Short-term memory expiration (hours)
 const SHORT_TERM_EXPIRY_HOURS: i64 = 48;
@@ -75,11 +87,50 @@ pub struct RecentActivity {
 /// A single archival memory entry
 #[derive(Debug, Clone)]
 pub struct ArchivalMemory {
+    /// Compatibility locator for this physical store. Never use it as shared
+    /// or replica identity.
     pub id: i64,
+    /// Stable identity shared by replicas and every revision.
+    pub logical_id: LogicalMemoryId,
+    /// Version of the deterministically selected head revision.
+    pub version: MemoryVersion,
+    /// Digest of the selected immutable head.
+    pub record_digest: MemoryDigest,
+    /// Exact predecessor of the selected head.
+    pub parent_digest: Option<MemoryDigest>,
+    /// Digest of the exact content bytes.
+    pub content_digest: MemoryDigest,
     pub content: String,
     pub tags: Vec<String>,
+    /// Source, author, workspace, and replication attribution.
+    pub provenance: MemoryProvenance,
+    /// All concurrent heads. Empty for a non-conflicted record.
+    pub conflict_heads: Vec<MemoryConflictHead>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Metadata for one unresolved concurrent branch of a logical memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryConflictHead {
+    pub version: MemoryVersion,
+    pub record_digest: MemoryDigest,
+    pub parent_digest: Option<MemoryDigest>,
+    pub content_digest: MemoryDigest,
+    pub state: MemoryRevisionState,
+}
+
+/// Result of idempotently applying an immutable revision to a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyRevisionOutcome {
+    /// A new revision became the sole head.
+    Advanced,
+    /// The exact revision was already present.
+    Idempotent,
+    /// The revision was new but an already-present descendant remains head.
+    Historical,
+    /// Multiple concurrent heads now require explicit resolution.
+    Conflicted,
 }
 
 /// Core memory block (always in context)
@@ -230,6 +281,22 @@ impl MemoryDb {
         &self.path
     }
 
+    /// Return the persistent identity of this physical database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata row is absent/corrupt or the mutex is
+    /// poisoned. Callers must fail closed rather than treating a replacement
+    /// database at the same path as the old store.
+    pub fn store_id(&self) -> Result<MemoryStoreId> {
+        let encoded: String = self.lock_conn()?.query_row(
+            "SELECT store_id FROM memory_store_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        encoded.parse().context("invalid physical memory store ID")
+    }
+
     /// Execute a raw SQL statement (crate-internal: for test fixtures only).
     ///
     /// External callers must use typed methods such as [`prune_auto_learn_tables`]
@@ -346,6 +413,11 @@ impl MemoryDb {
         // and makes the comma no longer special.
         if from_version < 4 {
             Self::migrate_v4_on(conn)?;
+        }
+
+        // Version 5: stable logical identity and immutable revision heads.
+        if from_version < 5 {
+            Self::migrate_v5_on(conn)?;
         }
 
         // Record current version
@@ -652,6 +724,627 @@ impl MemoryDb {
         Ok(())
     }
 
+    /// Migration v5: preserve physical row IDs as compatibility locators while
+    /// introducing store-independent logical IDs and an immutable revision DAG.
+    fn migrate_v5_on(conn: &Connection) -> Result<()> {
+        tracing::debug!("Running migration v5: logical memory identity and revisions (S-053)");
+        conn.execute_batch("SAVEPOINT migrate_v5;")
+            .context("v5: failed to begin savepoint")?;
+        match Self::migrate_v5_inner(conn) {
+            Ok(()) => {
+                conn.execute_batch("RELEASE SAVEPOINT migrate_v5;")
+                    .context("v5: failed to release savepoint")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT migrate_v5;");
+                let _ = conn.execute_batch("RELEASE SAVEPOINT migrate_v5;");
+                Err(error)
+            }
+        }
+    }
+
+    fn migrate_v5_inner(conn: &Connection) -> Result<()> {
+        for (column, definition) in [
+            ("logical_id", "TEXT"),
+            ("version", "INTEGER NOT NULL DEFAULT 1"),
+            ("parent_digest", "TEXT"),
+            ("record_digest", "TEXT"),
+            ("content_digest", "TEXT"),
+            ("provenance_json", "TEXT"),
+            ("record_state", "TEXT NOT NULL DEFAULT 'active'"),
+        ] {
+            if !Self::table_has_column(conn, "archival_memory", column)? {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE archival_memory ADD COLUMN {column} {definition};"
+                ))
+                .with_context(|| format!("v5: failed to add archival_memory.{column}"))?;
+            }
+        }
+
+        conn.execute_batch(
+            r"
+            CREATE TABLE IF NOT EXISTS memory_store_metadata (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                store_id TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS memory_revisions (
+                logical_id TEXT NOT NULL,
+                version INTEGER NOT NULL CHECK(version > 0),
+                parent_digest TEXT,
+                record_digest TEXT PRIMARY KEY,
+                content_digest TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                provenance_json TEXT NOT NULL,
+                record_state TEXT NOT NULL CHECK(record_state IN ('active', 'tombstone')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_revisions_logical_version
+                ON memory_revisions(logical_id, version);
+            CREATE INDEX IF NOT EXISTS idx_memory_revisions_parent
+                ON memory_revisions(parent_digest);
+            CREATE TABLE IF NOT EXISTS memory_heads (
+                logical_id TEXT NOT NULL,
+                record_digest TEXT NOT NULL
+                    REFERENCES memory_revisions(record_digest) ON DELETE CASCADE,
+                PRIMARY KEY (logical_id, record_digest)
+            );
+            ",
+        )
+        .context("v5: failed to create revision tables")?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_store_metadata (singleton, store_id) VALUES (1, ?1)",
+            params![MemoryStoreId::new().to_string()],
+        )
+        .context("v5: failed to assign physical store identity")?;
+
+        Self::backfill_v5_legacy_rows(conn)?;
+
+        conn.execute_batch(
+            r"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_archival_memory_logical_id
+                ON archival_memory(logical_id);
+            ",
+        )
+        .context("v5: failed to index logical memory identity")?;
+        Self::validate_v5_projection(conn)
+    }
+
+    fn backfill_v5_legacy_rows(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT id, content, created_at, updated_at FROM archival_memory \
+             WHERE logical_id IS NULL OR record_digest IS NULL OR provenance_json IS NULL \
+             ORDER BY id",
+        )?;
+        let legacy_rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (id, content, created_at, updated_at) in legacy_rows {
+            let tags = Self::load_tags_for(conn, id)?;
+            let canonical = serde_json::to_vec(&serde_json::json!({
+                "row_id": id,
+                "content": content,
+                "tags": tags,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }))?;
+            let logical_id = LogicalMemoryId::for_legacy_record(&canonical);
+            let revision = MemoryRevision::legacy(logical_id, content, tags);
+            Self::insert_revision_row(conn, &revision)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_heads (logical_id, record_digest) VALUES (?1, ?2)",
+                params![logical_id.to_string(), revision.record_digest.as_str()],
+            )?;
+            conn.execute(
+                r"UPDATE archival_memory SET
+                    logical_id = ?1, version = ?2, parent_digest = NULL,
+                    record_digest = ?3, content_digest = ?4,
+                    provenance_json = ?5, record_state = 'active'
+                  WHERE id = ?6",
+                params![
+                    logical_id.to_string(),
+                    i64::try_from(revision.version.get())?,
+                    revision.record_digest.as_str(),
+                    revision.content_digest.as_str(),
+                    serde_json::to_string(&revision.provenance)?,
+                    id,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+        let sql = format!("PRAGMA table_info({table})");
+        let found = conn
+            .prepare(&sql)?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == column);
+        Ok(found)
+    }
+
+    fn validate_v5_projection(conn: &Connection) -> Result<()> {
+        let store_ids = conn
+            .prepare("SELECT store_id FROM memory_store_metadata ORDER BY singleton")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            store_ids.len() == 1,
+            "v5: physical store identity is missing"
+        );
+        let _: MemoryStoreId = store_ids[0]
+            .parse()
+            .context("v5: physical store identity is malformed")?;
+        let invalid: i64 = conn.query_row(
+            r"SELECT COUNT(*) FROM archival_memory
+              WHERE logical_id IS NULL OR version < 1 OR record_digest IS NULL
+                 OR content_digest IS NULL OR provenance_json IS NULL
+                 OR record_state NOT IN ('active', 'tombstone', 'conflicted')",
+            [],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(invalid == 0, "v5: archival projection validation failed");
+        let missing_heads: i64 = conn.query_row(
+            r"SELECT COUNT(*) FROM archival_memory am
+              WHERE NOT EXISTS (
+                SELECT 1 FROM memory_heads mh
+                 WHERE mh.logical_id = am.logical_id
+              )",
+            [],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(missing_heads == 0, "v5: memory head validation failed");
+        Ok(())
+    }
+
+    fn insert_revision_row(conn: &Connection, revision: &MemoryRevision) -> Result<bool> {
+        revision.validate()?;
+        let tags_json = serde_json::to_string(&revision.tags)?;
+        let provenance_json = serde_json::to_string(&revision.provenance)?;
+        let state = match revision.state {
+            MemoryRevisionState::Active => "active",
+            MemoryRevisionState::Tombstone => "tombstone",
+        };
+        let rows = conn.execute(
+            r"INSERT OR IGNORE INTO memory_revisions
+               (logical_id, version, parent_digest, record_digest, content_digest,
+                content, tags_json, provenance_json, record_state)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                revision.logical_id.to_string(),
+                i64::try_from(revision.version.get())?,
+                revision.parent_digest.as_ref().map(MemoryDigest::as_str),
+                revision.record_digest.as_str(),
+                revision.content_digest.as_str(),
+                revision.content,
+                tags_json,
+                provenance_json,
+                state,
+            ],
+        )?;
+        Ok(rows == 1)
+    }
+
+    fn load_revision_by_digest(
+        conn: &Connection,
+        digest: &MemoryDigest,
+    ) -> Result<Option<MemoryRevision>> {
+        conn.query_row(
+            r"SELECT logical_id, version, parent_digest, record_digest,
+                      content_digest, content, tags_json, provenance_json, record_state
+               FROM memory_revisions WHERE record_digest = ?1",
+            params![digest.as_str()],
+            Self::revision_from_row,
+        )
+        .optional()
+        .context("failed to load memory revision")
+    }
+
+    fn revision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRevision> {
+        let logical_id_text: String = row.get(0)?;
+        let version_value: i64 = row.get(1)?;
+        let parent_text: Option<String> = row.get(2)?;
+        let record_text: String = row.get(3)?;
+        let content_text: String = row.get(4)?;
+        let tags_json: String = row.get(6)?;
+        let provenance_json: String = row.get(7)?;
+        let state_text: String = row.get(8)?;
+        let logical_id = logical_id_text.parse().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        let version = u64::try_from(version_value)
+            .ok()
+            .and_then(MemoryVersion::new)
+            .ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(1, version_value))?;
+        let parse_digest = |index: usize, value: String| {
+            value.parse().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        };
+        let parent_digest = parent_text
+            .map(|value| parse_digest(2, value))
+            .transpose()?;
+        let record_digest = parse_digest(3, record_text)?;
+        let content_digest = parse_digest(4, content_text)?;
+        let tags = serde_json::from_str(&tags_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        let provenance = serde_json::from_str(&provenance_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        let state = match state_text.as_str() {
+            "active" => MemoryRevisionState::Active,
+            "tombstone" => MemoryRevisionState::Tombstone,
+            _ => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    "invalid memory revision state".into(),
+                ));
+            }
+        };
+        Ok(MemoryRevision {
+            logical_id,
+            version,
+            parent_digest,
+            record_digest,
+            content_digest,
+            content: row.get(5)?,
+            tags,
+            provenance,
+            state,
+        })
+    }
+
+    fn revision_is_ancestor(
+        conn: &Connection,
+        ancestor: &MemoryDigest,
+        descendant: &MemoryDigest,
+    ) -> Result<bool> {
+        let found: bool = conn.query_row(
+            r"WITH RECURSIVE lineage(record_digest, parent_digest) AS (
+                   SELECT record_digest, parent_digest FROM memory_revisions
+                    WHERE record_digest = ?1
+                   UNION ALL
+                   SELECT revision.record_digest, revision.parent_digest
+                     FROM memory_revisions revision
+                     JOIN lineage ON revision.record_digest = lineage.parent_digest
+               )
+               SELECT EXISTS(SELECT 1 FROM lineage WHERE record_digest = ?2)",
+            params![descendant.as_str(), ancestor.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(found)
+    }
+
+    fn head_digests(conn: &Connection, logical_id: LogicalMemoryId) -> Result<Vec<MemoryDigest>> {
+        let mut stmt = conn.prepare(
+            r"SELECT record_digest FROM memory_heads
+              WHERE logical_id = ?1 ORDER BY record_digest LIMIT ?2",
+        )?;
+        let digests = stmt
+            .query_map(
+                params![
+                    logical_id.to_string(),
+                    i64::try_from(MAX_MEMORY_CONFLICT_HEADS + 1)?
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|value| Ok(value?.parse()?))
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            digests.len() <= MAX_MEMORY_CONFLICT_HEADS,
+            "memory conflict-head budget exceeded"
+        );
+        Ok(digests)
+    }
+
+    fn validate_revision_parent(conn: &Connection, revision: &MemoryRevision) -> Result<()> {
+        let Some(parent_digest) = &revision.parent_digest else {
+            anyhow::ensure!(
+                revision.version == MemoryVersion::INITIAL,
+                "non-root memory revision has no parent"
+            );
+            let existing: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_revisions WHERE logical_id = ?1)",
+                params![revision.logical_id.to_string()],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                !existing,
+                "logical memory already has a different root revision"
+            );
+            return Ok(());
+        };
+        let parent = Self::load_revision_by_digest(conn, parent_digest)?
+            .ok_or_else(|| anyhow::anyhow!("memory revision parent is unavailable"))?;
+        anyhow::ensure!(
+            parent.logical_id == revision.logical_id,
+            "memory revision parent belongs to a different logical record"
+        );
+        anyhow::ensure!(
+            parent.version.get().checked_add(1) == Some(revision.version.get()),
+            "memory revision version does not immediately follow its parent"
+        );
+        anyhow::ensure!(
+            parent.provenance.scope == revision.provenance.scope,
+            "memory revision cannot change replication scope"
+        );
+        Ok(())
+    }
+
+    fn refresh_projection(conn: &Connection, logical_id: LogicalMemoryId) -> Result<usize> {
+        let mut heads = Self::head_digests(conn, logical_id)?
+            .into_iter()
+            .map(|digest| {
+                Self::load_revision_by_digest(conn, &digest)?
+                    .ok_or_else(|| anyhow::anyhow!("memory head references a missing revision"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(!heads.is_empty(), "logical memory has no head revision");
+        heads.sort_by(|left, right| {
+            let left_live = left.state == MemoryRevisionState::Active;
+            let right_live = right.state == MemoryRevisionState::Active;
+            right_live
+                .cmp(&left_live)
+                .then_with(|| right.version.cmp(&left.version))
+                .then_with(|| left.record_digest.cmp(&right.record_digest))
+        });
+        let chosen = &heads[0];
+        let projection_state = if heads.len() > 1 {
+            "conflicted"
+        } else {
+            match chosen.state {
+                MemoryRevisionState::Active => "active",
+                MemoryRevisionState::Tombstone => "tombstone",
+            }
+        };
+        let provenance_json = serde_json::to_string(&chosen.provenance)?;
+        conn.execute(
+            r"INSERT INTO archival_memory
+               (content, logical_id, version, parent_digest, record_digest,
+                content_digest, provenance_json, record_state)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               ON CONFLICT(logical_id) DO UPDATE SET
+                   content = excluded.content,
+                   version = excluded.version,
+                   parent_digest = excluded.parent_digest,
+                   record_digest = excluded.record_digest,
+                   content_digest = excluded.content_digest,
+                   provenance_json = excluded.provenance_json,
+                   record_state = excluded.record_state,
+                   updated_at = datetime('now')",
+            params![
+                chosen.content,
+                logical_id.to_string(),
+                i64::try_from(chosen.version.get())?,
+                chosen.parent_digest.as_ref().map(MemoryDigest::as_str),
+                chosen.record_digest.as_str(),
+                chosen.content_digest.as_str(),
+                provenance_json,
+                projection_state,
+            ],
+        )?;
+        let row_id: i64 = conn.query_row(
+            "SELECT id FROM archival_memory WHERE logical_id = ?1",
+            params![logical_id.to_string()],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "DELETE FROM archival_memory_tags WHERE memory_id = ?1",
+            params![row_id],
+        )?;
+        for tag in &chosen.tags {
+            conn.execute(
+                "INSERT INTO archival_memory_tags (memory_id, tag) VALUES (?1, ?2)",
+                params![row_id, tag],
+            )?;
+        }
+        Ok(heads.len())
+    }
+
+    fn apply_revision_on(
+        conn: &mut Connection,
+        revision: &MemoryRevision,
+    ) -> Result<ApplyRevisionOutcome> {
+        revision.validate()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("memory revision: failed to begin transaction")?;
+        if Self::load_revision_by_digest(&tx, &revision.record_digest)?.is_some() {
+            return Ok(ApplyRevisionOutcome::Idempotent);
+        }
+        Self::validate_revision_parent(&tx, revision)?;
+        let previous_heads = Self::head_digests(&tx, revision.logical_id)?;
+        Self::insert_revision_row(&tx, revision)?;
+
+        let historical = previous_heads.iter().try_fold(false, |found, head| {
+            Ok::<_, anyhow::Error>(
+                found || Self::revision_is_ancestor(&tx, &revision.record_digest, head)?,
+            )
+        })?;
+        if !historical {
+            for head in &previous_heads {
+                if Self::revision_is_ancestor(&tx, head, &revision.record_digest)? {
+                    tx.execute(
+                        "DELETE FROM memory_heads WHERE logical_id = ?1 AND record_digest = ?2",
+                        params![revision.logical_id.to_string(), head.as_str()],
+                    )?;
+                }
+            }
+            tx.execute(
+                "INSERT INTO memory_heads (logical_id, record_digest) VALUES (?1, ?2)",
+                params![
+                    revision.logical_id.to_string(),
+                    revision.record_digest.as_str()
+                ],
+            )?;
+        }
+        let head_count = Self::refresh_projection(&tx, revision.logical_id)?;
+        tx.commit().context("memory revision: commit failed")?;
+        if historical {
+            Ok(ApplyRevisionOutcome::Historical)
+        } else if head_count > 1 {
+            Ok(ApplyRevisionOutcome::Conflicted)
+        } else {
+            Ok(ApplyRevisionOutcome::Advanced)
+        }
+    }
+
+    /// Idempotently import one validated revision into this store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for tampered revisions, unavailable/mismatched parents,
+    /// poisoned state, or a failed transaction.
+    pub fn apply_revision(&self, revision: &MemoryRevision) -> Result<ApplyRevisionOutcome> {
+        Self::apply_revision_on(&mut *self.lock_conn()?, revision)
+    }
+
+    /// Load the selected immutable revision for a physical compatibility row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing/corrupt revision metadata or database I/O.
+    pub fn revision_for_row(&self, id: i64) -> Result<Option<MemoryRevision>> {
+        let conn = self.lock_conn()?;
+        let digest: Option<String> = conn
+            .query_row(
+                "SELECT record_digest FROM archival_memory WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let revision = digest
+            .map(|value| Self::load_revision_by_digest(&conn, &value.parse()?))
+            .transpose()
+            .map(Option::flatten)?;
+        drop(conn);
+        Ok(revision)
+    }
+
+    /// Load every immutable head for one logical memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt revision metadata or database I/O.
+    pub fn revision_heads(&self, logical_id: LogicalMemoryId) -> Result<Vec<MemoryRevision>> {
+        let conn = self.lock_conn()?;
+        Self::head_digests(&conn, logical_id)?
+            .into_iter()
+            .map(|digest| {
+                Self::load_revision_by_digest(&conn, &digest)?
+                    .ok_or_else(|| anyhow::anyhow!("memory head references a missing revision"))
+            })
+            .collect()
+    }
+
+    /// Load at most `maximum` immutable revisions for one logical memory.
+    /// The SQL query reads only one sentinel row beyond the caller's budget so
+    /// oversized replica histories fail before being fully materialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the history exceeds `maximum`, revision metadata
+    /// is corrupt, or the database cannot be read.
+    pub fn revisions_for_logical_bounded(
+        &self,
+        logical_id: LogicalMemoryId,
+        maximum: usize,
+    ) -> Result<Vec<MemoryRevision>> {
+        let limit = maximum
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("memory revision budget is not representable"))?;
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            r"SELECT logical_id, version, parent_digest, record_digest,
+                      content_digest, content, tags_json, provenance_json, record_state
+                 FROM memory_revisions WHERE logical_id = ?1
+                ORDER BY version, record_digest LIMIT ?2",
+        )?;
+        let revisions = stmt
+            .query_map(
+                params![logical_id.to_string(), limit],
+                Self::revision_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            revisions.len() <= maximum,
+            "memory revision history exceeds caller budget"
+        );
+        drop(stmt);
+        drop(conn);
+        Ok(revisions)
+    }
+
+    /// Return whether `descendant` causally includes `ancestor` in this store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when revision metadata or the database cannot be read.
+    pub fn revision_descends_from(
+        &self,
+        descendant: &MemoryDigest,
+        ancestor: &MemoryDigest,
+    ) -> Result<bool> {
+        let conn = self.lock_conn()?;
+        Self::revision_is_ancestor(&conn, ancestor, descendant)
+    }
+
+    /// Load an immutable revision by its digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when revision metadata or the database cannot be read.
+    pub fn revision_by_digest(&self, digest: &MemoryDigest) -> Result<Option<MemoryRevision>> {
+        let conn = self.lock_conn()?;
+        Self::load_revision_by_digest(&conn, digest)
+    }
+
+    /// Resolve a logical identity to this store's compatibility row ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database cannot be read.
+    pub fn row_id_for_logical(&self, logical_id: LogicalMemoryId) -> Result<Option<i64>> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT id FROM archival_memory WHERE logical_id = ?1",
+                params![logical_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to resolve logical memory row")
+    }
+
     // === Archival Memory Operations ===
 
     /// Save a new memory entry.
@@ -668,45 +1361,49 @@ impl MemoryDb {
     ///
     /// Returns an error if the database insert fails or the mutex is poisoned.
     pub fn memory_save(&self, content: &str, tags: &[String]) -> Result<i64> {
-        // Delegate to a `&mut Connection` helper so the mutex guard is
-        // dropped on return — keeps clippy::significant_drop_tightening
-        // satisfied without a per-call `#[allow]` annotation.
-        Self::memory_save_on(&mut *self.lock_conn()?, content, tags)
+        let tags_json = serde_json::to_vec(tags)?;
+        let provenance = MemoryProvenance::new(
+            MemorySourceEvidence::new(
+                MemorySourceKind::Explicit,
+                format!("compat-memory-save:{}", uuid::Uuid::new_v4()),
+                "s053-v1".to_string(),
+                MemoryDigest::for_fields(
+                    b"openclaudia.memory.compat-source.v1",
+                    &[content.as_bytes(), &tags_json],
+                ),
+            ),
+            MemoryAttribution::new(
+                "legacy-api-unattributed".to_string(),
+                Some(self.store_id()?),
+                None,
+            ),
+            MemoryRecordScope::ProjectEvidence,
+        );
+        let revision = MemoryRevision::new(content.to_string(), tags.to_vec(), provenance);
+        self.memory_save_revision(&revision)
     }
 
-    /// Inner save helper: insert the content row and any tag rows in a
-    /// single transaction.  Extracted so the mutex guard in
-    /// [`memory_save`] has no lifetime overlap with the returned `Ok(id)`.
-    fn memory_save_on(conn: &mut Connection, content: &str, tags: &[String]) -> Result<i64> {
-        let tx = conn
-            .transaction()
-            .context("memory_save: failed to begin transaction")?;
-
-        tx.execute(
-            "INSERT INTO archival_memory (content) VALUES (?1)",
-            params![content],
+    /// Store an already-constructed root revision and return its local row ID.
+    /// The same revision may be passed to multiple stores; retries are
+    /// idempotent because [`MemoryRevision::record_digest`] is immutable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the revision is not a root, is invalid, or cannot
+    /// be committed.
+    pub fn memory_save_revision(&self, revision: &MemoryRevision) -> Result<i64> {
+        anyhow::ensure!(
+            revision.version == MemoryVersion::INITIAL && revision.parent_digest.is_none(),
+            "memory_save_revision requires a root revision"
+        );
+        let mut conn = self.lock_conn()?;
+        let _ = Self::apply_revision_on(&mut conn, revision)?;
+        conn.query_row(
+            "SELECT id FROM archival_memory WHERE logical_id = ?1",
+            params![revision.logical_id.to_string()],
+            |row| row.get(0),
         )
-        .context("memory_save: archival_memory INSERT failed")?;
-        let id = tx.last_insert_rowid();
-
-        if !tags.is_empty() {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT OR IGNORE INTO archival_memory_tags (memory_id, tag) \
-                     VALUES (?1, ?2)",
-                )
-                .context("memory_save: failed to prepare tag insert")?;
-            for tag in tags {
-                if tag.is_empty() {
-                    continue;
-                }
-                stmt.execute(params![id, tag])
-                    .context("memory_save: tag insert failed")?;
-            }
-        }
-
-        tx.commit().context("memory_save: commit failed")?;
-        Ok(id)
+        .context("memory_save_revision: projection row missing")
     }
 
     /// Load all tags for a given memory id (sorted for deterministic output).
@@ -721,6 +1418,150 @@ impl MemoryDb {
             .query_map(params![memory_id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(tags)
+    }
+
+    fn hydrate_archival_projection(
+        conn: &Connection,
+        id: i64,
+        content: String,
+        created_at: String,
+        updated_at: String,
+    ) -> Result<ArchivalMemory> {
+        let (
+            logical_text,
+            version_value,
+            parent_text,
+            record_text,
+            content_text,
+            provenance_json,
+            projection_state,
+        ): (String, i64, Option<String>, String, String, String, String) = conn.query_row(
+            r"SELECT logical_id, version, parent_digest, record_digest,
+                      content_digest, provenance_json, record_state
+                 FROM archival_memory WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )?;
+        let logical_id = logical_text.parse().context("invalid logical memory ID")?;
+        let version = u64::try_from(version_value)
+            .ok()
+            .and_then(MemoryVersion::new)
+            .ok_or_else(|| anyhow::anyhow!("invalid memory projection version"))?;
+        let parent_digest = parent_text
+            .map(|value| value.parse())
+            .transpose()
+            .context("invalid memory parent digest")?;
+        let record_digest = record_text
+            .parse()
+            .context("invalid memory record digest")?;
+        let content_digest = content_text
+            .parse()
+            .context("invalid memory content digest")?;
+        let provenance =
+            serde_json::from_str(&provenance_json).context("invalid memory provenance envelope")?;
+        let tags = Self::load_tags_for(conn, id)?;
+        let conflict_heads = if projection_state == "conflicted" {
+            Self::load_conflict_heads(conn, logical_id)?
+        } else {
+            Vec::new()
+        };
+        Ok(ArchivalMemory {
+            id,
+            logical_id,
+            version,
+            record_digest,
+            parent_digest,
+            content_digest,
+            content,
+            tags,
+            provenance,
+            conflict_heads,
+            created_at,
+            updated_at,
+        })
+    }
+
+    fn load_conflict_heads(
+        conn: &Connection,
+        logical_id: LogicalMemoryId,
+    ) -> Result<Vec<MemoryConflictHead>> {
+        let mut stmt = conn.prepare(
+            r"SELECT revision.version, revision.record_digest,
+                      revision.parent_digest, revision.content_digest,
+                      revision.record_state
+                 FROM memory_heads head
+                 JOIN memory_revisions revision
+                   ON revision.record_digest = head.record_digest
+                WHERE head.logical_id = ?1
+                ORDER BY revision.version DESC, revision.record_digest LIMIT ?2",
+        )?;
+        let heads = stmt
+            .query_map(
+                params![
+                    logical_id.to_string(),
+                    i64::try_from(MAX_MEMORY_CONFLICT_HEADS + 1)?
+                ],
+                |row| {
+                    let version_value: i64 = row.get(0)?;
+                    let version = u64::try_from(version_value)
+                        .ok()
+                        .and_then(MemoryVersion::new)
+                        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, version_value))?;
+                    let record_text: String = row.get(1)?;
+                    let parent_text: Option<String> = row.get(2)?;
+                    let content_text: String = row.get(3)?;
+                    let parse_digest = |index: usize, value: String| {
+                        value.parse().map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                index,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    };
+                    let state_text: String = row.get(4)?;
+                    let state = match state_text.as_str() {
+                        "active" => MemoryRevisionState::Active,
+                        "tombstone" => MemoryRevisionState::Tombstone,
+                        _ => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "invalid memory revision state",
+                                )),
+                            ));
+                        }
+                    };
+                    Ok(MemoryConflictHead {
+                        version,
+                        record_digest: parse_digest(1, record_text)?,
+                        parent_digest: parent_text
+                            .map(|value| parse_digest(2, value))
+                            .transpose()?,
+                        content_digest: parse_digest(3, content_text)?,
+                        state,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to load memory conflict heads")?;
+        anyhow::ensure!(
+            heads.len() <= MAX_MEMORY_CONFLICT_HEADS,
+            "memory conflict-head budget exceeded"
+        );
+        Ok(heads)
     }
 
     /// Search archival memory using full-text search.
@@ -775,6 +1616,7 @@ impl MemoryDb {
             FROM archival_memory_fts
             JOIN archival_memory am ON archival_memory_fts.rowid = am.id
             WHERE archival_memory_fts MATCH ?1
+              AND am.record_state != 'tombstone'
             ORDER BY rank
             LIMIT ?2",
         ) {
@@ -804,14 +1646,9 @@ impl MemoryDb {
 
         let mut memories = Vec::with_capacity(rows.len());
         for (id, content, created_at, updated_at) in rows {
-            let tags = Self::load_tags_for(conn, id)?;
-            memories.push(ArchivalMemory {
-                id,
-                content,
-                tags,
-                created_at,
-                updated_at,
-            });
+            memories.push(Self::hydrate_archival_projection(
+                conn, id, content, created_at, updated_at,
+            )?);
         }
 
         Ok(memories)
@@ -851,6 +1688,7 @@ impl MemoryDb {
             FROM archival_memory am
             JOIN archival_memory_tags amt ON amt.memory_id = am.id
             WHERE amt.tag = ?1
+              AND am.record_state != 'tombstone'
             ORDER BY am.updated_at DESC
             LIMIT ?2",
         )?;
@@ -863,14 +1701,9 @@ impl MemoryDb {
 
         let mut memories = Vec::with_capacity(rows.len());
         for (id, content, created_at, updated_at) in rows {
-            let tags = Self::load_tags_for(conn, id)?;
-            memories.push(ArchivalMemory {
-                id,
-                content,
-                tags,
-                created_at,
-                updated_at,
-            });
+            memories.push(Self::hydrate_archival_projection(
+                conn, id, content, created_at, updated_at,
+            )?);
         }
 
         Ok(memories)
@@ -886,7 +1719,8 @@ impl MemoryDb {
     pub fn memory_get(&self, id: i64) -> Result<Option<ArchivalMemory>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, content, created_at, updated_at FROM archival_memory WHERE id = ?1",
+            "SELECT id, content, created_at, updated_at FROM archival_memory \
+             WHERE id = ?1 AND record_state != 'tombstone'",
         )?;
 
         let core = stmt
@@ -901,16 +1735,9 @@ impl MemoryDb {
             .optional()?;
 
         let memory = match core {
-            Some((row_id, content, created_at, updated_at)) => {
-                let tags = Self::load_tags_for(&conn, row_id)?;
-                Some(ArchivalMemory {
-                    id: row_id,
-                    content,
-                    tags,
-                    created_at,
-                    updated_at,
-                })
-            }
+            Some((row_id, content, created_at, updated_at)) => Some(
+                Self::hydrate_archival_projection(&conn, row_id, content, created_at, updated_at)?,
+            ),
             None => None,
         };
 
@@ -924,11 +1751,21 @@ impl MemoryDb {
     ///
     /// Returns an error if the database update fails.
     pub fn memory_update(&self, id: i64, content: &str) -> Result<bool> {
-        let rows = self.lock_conn()?.execute(
-            "UPDATE archival_memory SET content = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![content, id],
+        let Some(current) = self.revision_for_row(id)? else {
+            return Ok(false);
+        };
+        if current.state == MemoryRevisionState::Tombstone {
+            return Ok(false);
+        }
+        let tags_json = serde_json::to_vec(&current.tags)?;
+        let provenance = self.compat_mutation_provenance(
+            &current,
+            b"update",
+            &[content.as_bytes(), &tags_json],
         )?;
-        Ok(rows > 0)
+        let revision = current.successor(content.to_string(), current.tags.clone(), provenance)?;
+        let _ = self.apply_revision(&revision)?;
+        Ok(true)
     }
 
     /// Delete a memory entry.
@@ -938,10 +1775,42 @@ impl MemoryDb {
     ///
     /// Returns an error if the database delete fails.
     pub fn memory_delete(&self, id: i64) -> Result<bool> {
-        let rows = self
-            .lock_conn()?
-            .execute("DELETE FROM archival_memory WHERE id = ?1", params![id])?;
-        Ok(rows > 0)
+        let Some(current) = self.revision_for_row(id)? else {
+            return Ok(false);
+        };
+        if current.state == MemoryRevisionState::Tombstone {
+            return Ok(false);
+        }
+        let provenance = self.compat_mutation_provenance(&current, b"delete", &[])?;
+        let revision = current.tombstone(provenance)?;
+        let _ = self.apply_revision(&revision)?;
+        Ok(true)
+    }
+
+    fn compat_mutation_provenance(
+        &self,
+        current: &MemoryRevision,
+        operation: &[u8],
+        fields: &[&[u8]],
+    ) -> Result<MemoryProvenance> {
+        let mut source_fields = Vec::with_capacity(fields.len() + 2);
+        source_fields.push(operation);
+        source_fields.push(current.record_digest.as_str().as_bytes());
+        source_fields.extend_from_slice(fields);
+        Ok(MemoryProvenance::new(
+            MemorySourceEvidence::new(
+                MemorySourceKind::Explicit,
+                format!("compat-memory-mutation:{}", uuid::Uuid::new_v4()),
+                current.version.to_string(),
+                MemoryDigest::for_fields(b"openclaudia.memory.compat-mutation.v1", &source_fields),
+            ),
+            MemoryAttribution::new(
+                "legacy-api-unattributed".to_string(),
+                Some(self.store_id()?),
+                current.provenance.workspace_id.clone(),
+            ),
+            current.provenance.scope,
+        ))
     }
 
     /// List recent memories.
@@ -956,6 +1825,7 @@ impl MemoryDb {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, content, created_at, updated_at FROM archival_memory \
+             WHERE record_state != 'tombstone' \
              ORDER BY updated_at DESC LIMIT ?1",
         )?;
 
@@ -967,14 +1837,9 @@ impl MemoryDb {
 
         let mut memories = Vec::with_capacity(rows.len());
         for (id, content, created_at, updated_at) in rows {
-            let tags = Self::load_tags_for(&conn, id)?;
-            memories.push(ArchivalMemory {
-                id,
-                content,
-                tags,
-                created_at,
-                updated_at,
-            });
+            memories.push(Self::hydrate_archival_projection(
+                &conn, id, content, created_at, updated_at,
+            )?);
         }
 
         Ok(memories)
@@ -988,17 +1853,22 @@ impl MemoryDb {
     /// Returns an error if the database query fails.
     pub fn memory_stats(&self) -> Result<MemoryStats> {
         let conn = self.lock_conn()?;
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM archival_memory", [], |row| row.get(0))?;
-        let total_size: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM archival_memory",
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM archival_memory WHERE record_state != 'tombstone'",
             [],
             |row| row.get(0),
         )?;
-        let last_updated: Option<String> =
-            conn.query_row("SELECT MAX(updated_at) FROM archival_memory", [], |row| {
-                row.get(0)
-            })?;
+        let total_size: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM archival_memory \
+             WHERE record_state != 'tombstone'",
+            [],
+            |row| row.get(0),
+        )?;
+        let last_updated: Option<String> = conn.query_row(
+            "SELECT MAX(updated_at) FROM archival_memory WHERE record_state != 'tombstone'",
+            [],
+            |row| row.get(0),
+        )?;
         drop(conn);
 
         Ok(MemoryStats {
@@ -1101,10 +1971,19 @@ impl MemoryDb {
     ///
     /// Returns an error if the database delete fails.
     pub fn clear_archival_memory(&self) -> Result<usize> {
-        let rows = self
-            .lock_conn()?
-            .execute("DELETE FROM archival_memory", [])?;
-        Ok(rows)
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction().context("clear archival memory: begin")?;
+        let rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM archival_memory WHERE record_state != 'tombstone'",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute("DELETE FROM memory_heads", [])?;
+        tx.execute("DELETE FROM memory_revisions", [])?;
+        tx.execute("DELETE FROM archival_memory", [])?;
+        tx.commit().context("clear archival memory: commit")?;
+        drop(conn);
+        Ok(usize::try_from(rows).unwrap_or(0))
     }
 
     // === Short-Term Memory Operations ===
@@ -1856,6 +2735,8 @@ impl MemoryDb {
         tx.execute_batch(
             r"
             DELETE FROM archival_memory_tags;
+            DELETE FROM memory_heads;
+            DELETE FROM memory_revisions;
             DELETE FROM archival_memory;
             DELETE FROM core_memory;
             DELETE FROM recent_sessions;
@@ -1985,6 +2866,250 @@ mod tests {
         let results = db.memory_search("Rust", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
+    }
+
+    fn s053_provenance(source: &str) -> MemoryProvenance {
+        MemoryProvenance::new(
+            MemorySourceEvidence::new(
+                MemorySourceKind::Explicit,
+                source.to_string(),
+                "generation-1".to_string(),
+                MemoryDigest::for_fields(b"s053-test-source", &[source.as_bytes()]),
+            ),
+            MemoryAttribution::new(
+                "test-actor".to_string(),
+                None,
+                Some("test-workspace".to_string()),
+            ),
+            MemoryRecordScope::UserPrivate,
+        )
+    }
+
+    #[test]
+    fn s053_revision_retry_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("memory.db")).unwrap();
+        let revision = MemoryRevision::new(
+            "use cargo +1.98.0".to_string(),
+            vec!["toolchain".to_string()],
+            s053_provenance("receipt-1"),
+        );
+        assert_eq!(
+            db.apply_revision(&revision).unwrap(),
+            ApplyRevisionOutcome::Advanced
+        );
+        assert_eq!(
+            db.apply_revision(&revision).unwrap(),
+            ApplyRevisionOutcome::Idempotent
+        );
+        assert_eq!(db.memory_list(10).unwrap().len(), 1);
+        assert_eq!(db.revision_heads(revision.logical_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn s053_logical_identity_rejects_a_second_root() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("memory.db")).unwrap();
+        let root = MemoryRevision::new(
+            "first root".to_string(),
+            Vec::new(),
+            s053_provenance("first-root"),
+        );
+        db.apply_revision(&root).unwrap();
+        let collision = MemoryRevision::legacy(
+            root.logical_id,
+            "different root with a reused logical ID".to_string(),
+            Vec::new(),
+        );
+
+        let error = db.apply_revision(&collision).unwrap_err().to_string();
+        assert!(error.contains("already has a different root"));
+        assert_eq!(
+            db.revisions_for_logical_bounded(root.logical_id, 1)
+                .unwrap(),
+            vec![root]
+        );
+    }
+
+    #[test]
+    fn s053_revision_history_fails_before_exceeding_caller_budget() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("memory.db")).unwrap();
+        let root = MemoryRevision::new(
+            "initial lesson".to_string(),
+            Vec::new(),
+            s053_provenance("bounded-root"),
+        );
+        db.apply_revision(&root).unwrap();
+        let successor = root
+            .successor(
+                "corrected lesson".to_string(),
+                Vec::new(),
+                s053_provenance("bounded-successor"),
+            )
+            .unwrap();
+        db.apply_revision(&successor).unwrap();
+
+        let error = db
+            .revisions_for_logical_bounded(root.logical_id, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds caller budget"));
+        assert_eq!(
+            db.revisions_for_logical_bounded(root.logical_id, 2)
+                .unwrap(),
+            vec![root, successor]
+        );
+    }
+
+    #[test]
+    fn s053_imported_revision_cannot_change_replication_scope() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("memory.db")).unwrap();
+        let root = MemoryRevision::new(
+            "private lesson".to_string(),
+            Vec::new(),
+            s053_provenance("private-root"),
+        );
+        db.apply_revision(&root).unwrap();
+        let mut shared_provenance = s053_provenance("attempted-scope-change");
+        shared_provenance.scope = MemoryRecordScope::TeamShared;
+        let imported = root
+            .successor_with_unchecked_scope_for_storage_test(shared_provenance)
+            .unwrap();
+
+        let error = db.apply_revision(&imported).unwrap_err().to_string();
+        assert!(error.contains("cannot change replication scope"));
+        assert!(db
+            .revision_by_digest(&imported.record_digest)
+            .unwrap()
+            .is_none());
+        assert_eq!(db.revision_heads(root.logical_id).unwrap(), vec![root]);
+    }
+
+    #[test]
+    fn s053_conflict_head_budget_rejects_and_rolls_back_excess_branch() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("memory.db")).unwrap();
+        let root = MemoryRevision::new(
+            "shared ancestor".to_string(),
+            Vec::new(),
+            s053_provenance("conflict-root"),
+        );
+        db.apply_revision(&root).unwrap();
+
+        for index in 0..MAX_MEMORY_CONFLICT_HEADS {
+            let branch = root
+                .successor(
+                    format!("concurrent correction {index}"),
+                    Vec::new(),
+                    s053_provenance(&format!("conflict-{index}")),
+                )
+                .unwrap();
+            db.apply_revision(&branch).unwrap();
+        }
+        assert_eq!(
+            db.revision_heads(root.logical_id).unwrap().len(),
+            MAX_MEMORY_CONFLICT_HEADS
+        );
+
+        let excess = root
+            .successor(
+                "one conflict too many".to_string(),
+                Vec::new(),
+                s053_provenance("conflict-excess"),
+            )
+            .unwrap();
+        let error = db.apply_revision(&excess).unwrap_err().to_string();
+        assert!(error.contains("conflict-head budget exceeded"));
+        assert!(db
+            .revision_by_digest(&excess.record_digest)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.revision_heads(root.logical_id).unwrap().len(),
+            MAX_MEMORY_CONFLICT_HEADS
+        );
+    }
+
+    #[test]
+    fn s053_physical_store_identity_persists_and_distinguishes_stores() {
+        let dir = tempdir().unwrap();
+        let left_path = dir.path().join("left.db");
+        let left = MemoryDb::open(&left_path).unwrap();
+        let left_id = left.store_id().unwrap();
+        drop(left);
+        assert_eq!(
+            MemoryDb::open(&left_path).unwrap().store_id().unwrap(),
+            left_id
+        );
+        assert_ne!(
+            MemoryDb::open(&dir.path().join("right.db"))
+                .unwrap()
+                .store_id()
+                .unwrap(),
+            left_id
+        );
+    }
+
+    #[test]
+    fn s053_concurrent_branches_are_retained_until_explicit_resolution() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("memory.db")).unwrap();
+        let root = MemoryRevision::new(
+            "initial lesson".to_string(),
+            Vec::new(),
+            s053_provenance("root"),
+        );
+        db.apply_revision(&root).unwrap();
+        let left = root
+            .successor(
+                "left correction".to_string(),
+                Vec::new(),
+                s053_provenance("left"),
+            )
+            .unwrap();
+        let right = root
+            .successor(
+                "right correction".to_string(),
+                Vec::new(),
+                s053_provenance("right"),
+            )
+            .unwrap();
+        assert_eq!(
+            db.apply_revision(&left).unwrap(),
+            ApplyRevisionOutcome::Advanced
+        );
+        assert_eq!(
+            db.apply_revision(&right).unwrap(),
+            ApplyRevisionOutcome::Conflicted
+        );
+
+        let row_id = db.row_id_for_logical(root.logical_id).unwrap().unwrap();
+        let projection = db.memory_get(row_id).unwrap().unwrap();
+        assert_eq!(projection.conflict_heads.len(), 2);
+        assert!(db
+            .revision_by_digest(&left.record_digest)
+            .unwrap()
+            .is_some());
+        assert!(db
+            .revision_by_digest(&right.record_digest)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn s053_version_bound_delete_retains_a_tombstone_revision() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("memory.db")).unwrap();
+        let id = db.memory_save("obsolete lesson", &[]).unwrap();
+        let before = db.revision_for_row(id).unwrap().unwrap();
+        assert!(db.memory_delete(id).unwrap());
+        assert!(db.memory_get(id).unwrap().is_none());
+        let tombstone = db.revision_for_row(id).unwrap().unwrap();
+        assert_eq!(tombstone.state, MemoryRevisionState::Tombstone);
+        assert_eq!(tombstone.parent_digest, Some(before.record_digest));
+        assert_eq!(tombstone.version.get(), before.version.get() + 1);
     }
 
     #[test]
@@ -3072,6 +4197,16 @@ mod tests {
     }
 
     /// #464-3: migration from a pre-v4 database preserves every well-formed
+    fn assert_s053_legacy_identity_is_metadata_sensitive(db: &MemoryDb) {
+        let same_a = db.memory_get(4).unwrap().unwrap();
+        let same_b = db.memory_get(5).unwrap().unwrap();
+        assert_eq!(same_a.content, same_b.content);
+        assert_ne!(
+            same_a.logical_id, same_b.logical_id,
+            "legacy records with distinct metadata must retain distinct identity"
+        );
+    }
+
     /// tag in the legacy comma-joined column.  We build a v3-shaped
     /// database by hand (because production code now starts at v4), then
     /// reopen it through `MemoryDb::open` which triggers `migrate_v4_on`.
@@ -3131,6 +4266,16 @@ mod tests {
                 params![3_i64, "row three", ""],
             )
             .unwrap();
+            raw.execute(
+                "INSERT INTO archival_memory (id, content, tags) VALUES (?1, ?2, ?3)",
+                params![4_i64, "same prose", "source-a"],
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO archival_memory (id, content, tags) VALUES (?1, ?2, ?3)",
+                params![5_i64, "same prose", "source-b"],
+            )
+            .unwrap();
             drop(raw);
         }
 
@@ -3160,6 +4305,7 @@ mod tests {
             "empty legacy tag string must migrate to zero junction rows; got {:?}",
             row_three.tags
         );
+        assert_s053_legacy_identity_is_metadata_sensitive(&db);
 
         // The legacy column must be gone: re-querying `tags` from
         // `archival_memory` should error with "no such column".
@@ -3174,7 +4320,8 @@ mod tests {
         );
         drop(lock);
 
-        // schema_version must now be 4.
+        // The legacy v3 fixture must advance through normalized tags and the
+        // current logical-identity schema.
         let v_lock = db.conn.lock().unwrap();
         let version: i64 = v_lock
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
@@ -3182,7 +4329,7 @@ mod tests {
             })
             .unwrap();
         drop(v_lock);
-        assert_eq!(version, 4, "schema_version must be 4 after migration");
+        assert_eq!(version, 5, "schema_version must be current after migration");
     }
 
     /// #464-4: `memory_save(content, &[])` writes only the content row;

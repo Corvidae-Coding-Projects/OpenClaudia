@@ -1,8 +1,9 @@
 //! Memory configuration.
 //!
 //! Per crosslink #604 this preserves the proposed path to a *team* memory
-//! directory. Production configuration currently rejects activation until the
-//! cross-store identity and transaction work in S-053/S-054 is complete.
+//! directory. S-053 completed cross-store identity and replay, but production
+//! configuration still rejects activation until S-054 establishes authenticated
+//! authority, host-owned storage, schema recovery, and safe retrieval.
 //!
 //! Parity reference: Claude Code's `teamMemPaths.ts` exposes a shared
 //! memory location so multiple users on the same project share core and
@@ -28,7 +29,7 @@ pub struct MemoryConfig {
     ///
     /// When `None`, all production memory operations remain scoped to the
     /// project database. A `Some` value is currently rejected by production
-    /// configuration loading. The proposal can be expressed via either the
+    /// configuration loading pending S-054. The proposal can be expressed via either the
     /// `[memory]` section of `config.yaml` or the canonical
     /// `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` environment variable. The exact
     /// single-underscore spelling remains a deprecated migration alias.

@@ -276,13 +276,13 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         return Err(ConfigError::Message(e));
     }
 
-    // `TeamMemoryStore` is preserved, but its current numeric-ID merge and
-    // two-database write semantics are not safe to activate in production.
-    // Reject the configured claim instead of silently opening only the project
-    // store and pretending the team path participated.
+    // S-053 completed logical identity, causal merge, and durable cross-store
+    // replay. Production activation remains gated on S-054: a shared path is
+    // not authenticated team authority, host-owned private storage, or a safe
+    // migration/recovery and retrieval policy.
     if config.memory.team_memory_path.is_some() {
         return Err(ConfigError::Message(
-            "memory.team_memory_path is currently unavailable: cross-store logical identity and atomic reconciliation are incomplete (tracked by S-053/S-054)"
+            "memory.team_memory_path is currently unavailable: authenticated team authority, host-owned storage, schema recovery, and safe retrieval remain incomplete (tracked by S-054)"
                 .to_string(),
         ));
     }

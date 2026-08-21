@@ -262,17 +262,15 @@ impl AgentType {
     }
 }
 
-fn add_browser_search_tool(tools: Vec<&'static str>) -> Vec<&'static str> {
-    #[cfg(feature = "browser")]
-    {
-        let mut tools = tools;
-        tools.push("web_search");
-        tools
-    }
-    #[cfg(not(feature = "browser"))]
-    {
-        tools
-    }
+#[cfg(feature = "browser")]
+fn add_browser_search_tool(mut tools: Vec<&'static str>) -> Vec<&'static str> {
+    tools.push("web_search");
+    tools
+}
+
+#[cfg(not(feature = "browser"))]
+const fn add_browser_search_tool(tools: Vec<&'static str>) -> Vec<&'static str> {
+    tools
 }
 
 // === System Prompts for Agent Types ===

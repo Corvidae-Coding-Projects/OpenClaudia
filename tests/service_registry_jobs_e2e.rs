@@ -6,8 +6,8 @@
 //! `LspServerManager`, sprint 46 covered `JobScheduler` ticks
 //! plus `MockRateLimit`; this file covers the `ServiceRegistry`
 //! builder API plus the `MemoryConsolidationJob` body that
-//! drives short-term prune plus archival dedup against a
-//! tempdir-backed memory store.
+//! drives short-term pruning plus bounded, non-destructive archival
+//! equivalence review against a tempdir-backed memory store.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
@@ -200,38 +200,65 @@ fn memory_consolidation_on_empty_db_returns_zero_metrics() {
 }
 
 #[test]
-fn memory_consolidation_dedups_identical_archival_entries() {
+fn memory_consolidation_preserves_equal_prose_with_distinct_logical_identity() {
     let (db, _dir) = fresh_db();
-    // Insert 3 archival rows with identical content.
     let content = "duplicate-content";
-    db.memory_save(content, &[]).expect("save 1");
-    db.memory_save(content, &[]).expect("save 2");
-    db.memory_save(content, &[]).expect("save 3");
-    // Also one distinct entry — must NOT be deduped.
-    db.memory_save("unique-content", &[]).expect("save 4");
+    let first_id = db.memory_save(content, &[]).expect("save 1");
+    let second_id = db.memory_save(content, &[]).expect("save 2");
+    let third_id = db.memory_save(content, &[]).expect("save 3");
+    let unique_id = db.memory_save("unique-content", &[]).expect("save 4");
+
+    let before = [first_id, second_id, third_id, unique_id].map(|id| {
+        db.memory_get(id)
+            .expect("read before")
+            .expect("present before")
+    });
+    let mut logical_ids = before
+        .iter()
+        .map(|entry| entry.logical_id)
+        .collect::<Vec<_>>();
+    logical_ids.sort_unstable();
+    logical_ids.dedup();
+    assert_eq!(logical_ids.len(), 4, "equal prose is not logical identity");
 
     let job = MemoryConsolidationJob;
     let outcome = job.run(&db).expect("run OK");
-    assert_eq!(
-        outcome.records_deduped, 2,
-        "3 identical rows → 2 deduped (1 canonical kept); got {}",
-        outcome.records_deduped
-    );
+    assert_eq!(outcome.records_deduped, 0);
+
+    for (id, expected) in [first_id, second_id, third_id, unique_id]
+        .into_iter()
+        .zip(before)
+    {
+        let after = db.memory_get(id).expect("read after").expect("preserved");
+        assert_eq!(after.logical_id, expected.logical_id);
+        assert_eq!(after.record_digest, expected.record_digest);
+        assert_eq!(after.content, expected.content);
+    }
 }
 
 #[test]
-fn memory_consolidation_is_idempotent_on_repeat_runs() {
+fn memory_consolidation_is_idempotently_non_destructive() {
     let (db, _dir) = fresh_db();
-    db.memory_save("dup", &[]).expect("1");
-    db.memory_save("dup", &[]).expect("2");
+    let first_id = db.memory_save("dup", &[]).expect("1");
+    let second_id = db.memory_save("dup", &[]).expect("2");
+    let before = [first_id, second_id].map(|id| {
+        db.memory_get(id)
+            .expect("read before")
+            .expect("present before")
+    });
+    assert_ne!(before[0].logical_id, before[1].logical_id);
+
     let job = MemoryConsolidationJob;
     let first = job.run(&db).expect("first run");
-    assert_eq!(first.records_deduped, 1);
+    assert_eq!(first.records_deduped, 0);
     let second = job.run(&db).expect("second run");
-    assert_eq!(
-        second.records_deduped, 0,
-        "post-dedup nothing left to dedup"
-    );
+    assert_eq!(second.records_deduped, 0);
+
+    for (id, expected) in [first_id, second_id].into_iter().zip(before) {
+        let after = db.memory_get(id).expect("read after").expect("preserved");
+        assert_eq!(after.logical_id, expected.logical_id);
+        assert_eq!(after.record_digest, expected.record_digest);
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
