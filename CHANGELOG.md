@@ -171,6 +171,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-103: Establish authenticated team-memory authority (#1074)
+- S-103: Establish authenticated team-memory authority (#1074)
 - Keep technical-memory source lifecycle coherent across host review transitions (#1080)
 - S-107: Add complete portable technical-memory export and import (#1079)
 - S-106: Bind technical-memory review to host approval (#1078)
