@@ -6240,11 +6240,12 @@
       "uuid": "37cdaa89-3c10-45c0-9d6e-3881a36884cd",
       "display_id": 1063,
       "title": "Audit remediation state and select the next slice",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T07:42:38.940730687Z",
-      "updated_at": "2026-08-21T07:47:32.547603955Z",
+      "updated_at": "2026-08-21T07:47:36.817533933Z",
+      "closed_at": "2026-08-21T07:47:36.817532709Z",
       "labels": [
         "audit"
       ],
@@ -28635,11 +28636,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 609,
       "timestamp": "2026-08-21T07:47:32.547603955Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 610,
+      "timestamp": "2026-08-21T07:47:36.817533933Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T07:47:32.547603955Z",
+    "timestamp": "2026-08-21T07:47:36.817533933Z",
     "agent_id": "6Vw9",
-    "agent_seq": 609
+    "agent_seq": 610
   }
 }
