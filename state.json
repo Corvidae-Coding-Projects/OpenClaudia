@@ -1,6 +1,6 @@
 {
   "next_display_id": 1069,
-  "next_comment_id": 1008,
+  "next_comment_id": 1009,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22260,11 +22260,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T08:43:37.521619513Z",
-      "updated_at": "2026-08-21T08:53:29.030121529Z",
+      "updated_at": "2026-08-21T08:53:33.467980460Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "0a2f9848-a378-413c-afcb-e74cce990e73": {
+          "display_id": 1008,
+          "author": "6Vw9",
+          "content": "Architecture decision: replace the three divergent doctor implementations with one library-layer typed report contract. Every receipt records a stable check id, offline/read-only/active class, declared and observed effects, evidence generation, pass/fail/degraded/skipped outcome, and bounded redacted code/detail. Standalone doctor bypasses writable startup migrations, creates no ToolRunContext, manager, session, plugin tracker, subprocess, or HTTP client. It reads validated config and bundled capability evidence only. CLI active check ids require exact explicit grants; provider reachability remains skipped until a canonical trusted-origin, redirect, secret, and deadline broker exists, rather than retaining the unsafe arbitrary GET. Interactive frontends project already-composed runtime state into the same report; empty or unavailable managers cannot pass. Registry maturity becomes partial, not operational, with VDD still pending S-088.",
+          "created_at": "2026-08-21T08:53:33.465320861Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVJRqzGKMJ7cni9X8zdRDUDltpZM4rS/y/RHBrjzL/ttgrXuVU3qss79dVt3WVXbr+Q0nUgsfBwA4ZQzQ10IEBA=="
+        },
         "a22987a1-8b89-4990-a881-273acacc49a9": {
           "display_id": 1007,
           "author": "6Vw9",
@@ -28988,11 +28997,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 640,
       "timestamp": "2026-08-21T08:53:29.030121529Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 641,
+      "timestamp": "2026-08-21T08:53:33.467980460Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T08:53:29.030121529Z",
+    "timestamp": "2026-08-21T08:53:33.467980460Z",
     "agent_id": "6Vw9",
-    "agent_seq": 640
+    "agent_seq": 641
   }
 }
