@@ -24,7 +24,7 @@ enum CapabilityDomain {
 
 /// Open an existing regular file for reading without following any symlink
 /// during the authoritative kernel lookup.
-pub(super) fn open_regular_read(context: &ToolRunContext, path: &Path) -> Result<File, String> {
+pub fn open_regular_read(context: &ToolRunContext, path: &Path) -> Result<File, String> {
     context
         .require(ToolResource::WorkspaceRead)
         .map_err(|error| error.to_string())?;
@@ -99,7 +99,7 @@ pub(super) fn open_regular_update_or_create(
 }
 
 /// Open host-owned control state below the exact run project for reading.
-pub(super) fn open_host_control_regular_read(
+pub fn open_host_control_regular_read(
     context: &ToolRunContext,
     path: &Path,
 ) -> Result<File, String> {
@@ -326,6 +326,85 @@ pub(super) fn read_to_string(file: &mut File, path: &Path) -> Result<String, Str
     Ok(content)
 }
 
+/// Read one descriptor-pinned file twice under a hard byte ceiling.
+///
+/// The repeated read prevents a concurrently rewritten source from being
+/// accepted as a mixed snapshot. Both reads use the same already-confined
+/// descriptor; no path is resolved again after admission.
+pub fn read_stable_bounded_bytes(
+    file: &mut File,
+    path: &Path,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let before = file
+        .metadata()
+        .map_err(|error| format!("Failed to inspect '{}': {error}", path.display()))?;
+    if before.len() > u64::try_from(maximum_bytes).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "File '{}' exceeds the {maximum_bytes}-byte read budget",
+            path.display()
+        ));
+    }
+    let first = read_bounded_once(file, path, maximum_bytes)?;
+    let middle = file
+        .metadata()
+        .map_err(|error| format!("Failed to inspect '{}': {error}", path.display()))?;
+    let second = read_bounded_once(file, path, maximum_bytes)?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("Failed to inspect '{}': {error}", path.display()))?;
+    if !same_file_snapshot(&before, &middle)
+        || !same_file_snapshot(&middle, &after)
+        || first != second
+    {
+        return Err(format!(
+            "File '{}' changed while its bounded snapshot was read",
+            path.display()
+        ));
+    }
+    Ok(first)
+}
+
+fn read_bounded_once(
+    file: &mut File,
+    path: &Path,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("Failed to seek '{}': {error}", path.display()))?;
+    let limit = u64::try_from(maximum_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(maximum_bytes.min(64 * 1024));
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Failed to read '{}': {error}", path.display()))?;
+    if bytes.len() > maximum_bytes {
+        return Err(format!(
+            "File '{}' exceeds the {maximum_bytes}-byte read budget",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
 fn require_regular(file: &File, path: &Path) -> Result<(), String> {
     let metadata = file
         .metadata()
@@ -394,7 +473,7 @@ fn reject_writable_hardlink(_file: &File, _path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn is_not_found_message(error: &str) -> bool {
+pub fn is_not_found_message(error: &str) -> bool {
     error.starts_with("NOT_FOUND:")
 }
 

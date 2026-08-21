@@ -12,6 +12,8 @@
 //! - `memory_list`: List recent typed lessons
 //! - `memory_update`: Create a causal correction of an exact lesson revision
 //! - `memory_delete`: Tombstone an exact lesson revision
+//! - `memory_source_status`: Inspect a strict repository lesson source
+//! - `memory_source_refresh`: Atomically import/refresh that explicit source
 //!
 //! Conversation prose, transcripts, and legacy core-memory sections are not
 //! exposed through these model-facing tools.
@@ -38,7 +40,7 @@ pub mod effect;
 pub use cron::{
     execute_cron_create, execute_cron_delete, execute_cron_list, validate_cron_expression,
 };
-mod file;
+pub(crate) mod file;
 pub(crate) use file::open_capability_regular_read;
 pub use file::{
     create_capability_text_file, create_run_control_directory, create_run_control_text_file,

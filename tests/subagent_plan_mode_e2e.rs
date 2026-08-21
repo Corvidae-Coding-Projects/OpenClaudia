@@ -89,6 +89,7 @@ const MUTATION_TOOLS_HARD_REFUSED: &[&str] = &[
     "memory_save",
     "memory_delete",
     "memory_update",
+    "memory_source_refresh",
 ];
 
 #[test]

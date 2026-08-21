@@ -2131,7 +2131,13 @@ impl AcpServer {
             "glob" | "grep" => self.acp_search(run, session_id, &args, tool_name).await,
             // SQLite work belongs on the blocking pool; it still retains the
             // provider's exact invocation ID for typed provenance.
-            "memory_search" | "memory_save" | "memory_update" | "memory_delete" | "memory_list" => {
+            "memory_search"
+            | "memory_save"
+            | "memory_update"
+            | "memory_delete"
+            | "memory_list"
+            | "memory_source_status"
+            | "memory_source_refresh" => {
                 self.execute_local_tool_async(
                     run,
                     session_id,
@@ -4107,6 +4113,46 @@ permissions:
             .starts_with("tool-invocation:sha256:"));
     }
 
+    async fn assert_acp_memory_source_routes(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let source_status = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-source-status",
+            "memory_source_status",
+            json!({}),
+        )
+        .await;
+        assert!(
+            !source_status.is_error,
+            "ACP memory_source_status failed: {}",
+            source_status.content
+        );
+
+        let source_refresh = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-source-refresh",
+            "memory_source_refresh",
+            json!({}),
+        )
+        .await;
+        assert!(
+            !source_refresh.is_error,
+            "ACP memory_source_refresh failed: {}",
+            source_refresh.content
+        );
+        assert!(matches!(
+            server
+                .memory_db
+                .technical_memory_source_status()
+                .expect("ACP source state"),
+            crate::memory::TechnicalMemorySourceStoreStatus::Unconfigured
+        ));
+    }
+
     #[tokio::test]
     async fn acp_routes_every_typed_memory_operation_to_its_host_store() {
         let (server, _rx, _tmp) = test_server();
@@ -4125,6 +4171,8 @@ permissions:
             "ACP memory_list failed: {}",
             listed.content
         );
+
+        assert_acp_memory_source_routes(&server, &run).await;
 
         let saved = execute_acp_memory_tool(
             &server,

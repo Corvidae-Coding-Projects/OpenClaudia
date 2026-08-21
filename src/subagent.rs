@@ -227,6 +227,8 @@ impl AgentType {
                     "memory_save",
                     "memory_update",
                     "memory_delete",
+                    "memory_source_status",
+                    "memory_source_refresh",
                 ];
                 add_browser_search_tool(tools)
             }
@@ -238,6 +240,7 @@ impl AgentType {
                     "web_fetch",
                     "memory_search",
                     "memory_list",
+                    "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
             }
@@ -248,6 +251,7 @@ impl AgentType {
                     "web_fetch",
                     "memory_search",
                     "memory_list",
+                    "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
             }
@@ -266,6 +270,7 @@ impl AgentType {
                     "web_fetch",
                     "memory_search",
                     "memory_list",
+                    "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
             }
@@ -3704,15 +3709,19 @@ mod tests {
             "memory_save",
             "memory_update",
             "memory_delete",
+            "memory_source_status",
+            "memory_source_refresh",
         ] {
             assert!(general.contains(&name), "general agent is missing {name}");
         }
         let plan = available_subagent_tools(AgentType::Plan, true);
         assert!(plan.contains(&"memory_search"));
         assert!(plan.contains(&"memory_list"));
+        assert!(plan.contains(&"memory_source_status"));
         assert!(!plan.contains(&"memory_save"));
         assert!(!plan.contains(&"memory_update"));
         assert!(!plan.contains(&"memory_delete"));
+        assert!(!plan.contains(&"memory_source_refresh"));
     }
 
     #[test]

@@ -90,6 +90,8 @@ owned by the audit and remediation slices.
 | `memory_list` | List recent typed technical lessons for the exact workspace |
 | `memory_update` | Correct one exact lesson revision through compare-and-swap causal history |
 | `memory_delete` | Delete one exact lesson revision by writing an immutable causal tombstone |
+| `memory_source_status` | Inspect and verify the explicit repository technical-lesson source without loading it into a prompt |
+| `memory_source_refresh` | Atomically import, update, rename, restore, or explicitly prune a verified repository lesson source |
 | `crosslink` | Use the embedded issue-tracking integration |
 | `lsp` | Run goToDefinition, findReferences, hover, documentSymbols, workspaceSymbol, goToImplementation, and call hierarchy operations |
 | `ask_user_question` | Request structured clarification |
@@ -111,6 +113,26 @@ owned by the audit and remediation slices.
 | `cron_list` | List schedule metadata |
 | `list_mcp_resources` | List resources from connected MCP servers |
 | `read_mcp_resource` | Read a named MCP resource |
+
+### Repository technical-lesson sources
+
+`MEMORY.md` remains a compatibility filename, but it is not a prose prompt or
+instruction file. When present at the workspace root or at
+`.openclaudia/MEMORY.md`, it must contain the exact versioned JSON manifest
+defined by [S-056](docs/remediation-slices/056-operational-memdir-lifecycle.md).
+Each entry is a bounded `TechnicalLessonDraft` with a stable `lesson_id` and at
+least one digest-bound citation to a regular workspace source, test,
+configuration, or documentation file. Arbitrary Markdown, home-directory
+fallbacks, links, control-state citations, ambiguous dual files, and
+unverified/oversized artifacts are rejected.
+
+Use `memory_source_status` to inspect the discovered and persisted generations.
+Use its current `source_digest` as `expected_source_digest` when calling
+`memory_source_refresh`; removals additionally require `prune_missing: true`.
+Refresh publishes lesson changes and source state in one causal transaction.
+The agent can retrieve imported lessons only with `memory_search` or
+`memory_list`; source contents are never appended to system, developer, or user
+prompts automatically.
 
 ## Supported Models
 

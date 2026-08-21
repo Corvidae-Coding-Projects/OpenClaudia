@@ -20,6 +20,7 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as 
 
 mod lesson;
 mod record;
+mod source;
 
 pub use lesson::{
     LessonApplicability, LessonCitation, LessonCitationKind, LessonCorrection, LessonRetention,
@@ -37,6 +38,13 @@ pub use record::{
     LogicalMemoryId, MemoryAttribution, MemoryDigest, MemoryProvenance, MemoryRecordError,
     MemoryRecordScope, MemoryRevision, MemoryRevisionState, MemorySourceEvidence, MemorySourceKind,
     MemoryStoreId, MemoryVersion, MEMORY_PROVENANCE_SCHEMA_VERSION,
+};
+pub(crate) use source::TechnicalMemoryRefreshRequest;
+pub use source::{
+    TechnicalMemoryRefreshResult, TechnicalMemoryRefreshStatus, TechnicalMemorySourceMember,
+    TechnicalMemorySourcePresence, TechnicalMemorySourceState, TechnicalMemorySourceStoreError,
+    TechnicalMemorySourceStoreStatus, TECHNICAL_MEMORY_SOURCE_STATE_SCHEMA_VERSION,
+    TECHNICAL_MEMORY_SOURCE_TAG,
 };
 
 /// Escape `<`, `>`, and `&` for safe interpolation into XML-tagged prompt
@@ -2453,42 +2461,56 @@ impl MemoryDb {
         revision: &MemoryRevision,
         expected_parent: &MemoryDigest,
     ) -> Result<ApplyRevisionOutcome> {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("technical lesson: failed to begin linear mutation")?;
+        let outcome = Self::apply_linear_revision_in_transaction(&tx, revision, expected_parent)?;
+        tx.commit()
+            .context("technical lesson: committing linear mutation")?;
+        Ok(outcome)
+    }
+
+    /// Apply one exact local successor inside a caller-owned transaction.
+    ///
+    /// Source refresh uses this seam to publish every changed lesson and its
+    /// source-state revision atomically. The caller must hold an immediate
+    /// transaction and commit only after all linked projections succeed.
+    fn apply_linear_revision_in_transaction(
+        conn: &Connection,
+        revision: &MemoryRevision,
+        expected_parent: &MemoryDigest,
+    ) -> Result<ApplyRevisionOutcome> {
         revision.validate()?;
         anyhow::ensure!(
             revision.parent_digest.as_ref() == Some(expected_parent),
             "linear memory revision is not bound to its expected parent"
         );
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .context("technical lesson: failed to begin linear mutation")?;
 
-        if Self::load_revision_by_digest(&tx, &revision.record_digest)?.is_some() {
-            let heads = Self::head_digests(&tx, revision.logical_id)?;
+        if Self::load_revision_by_digest(conn, &revision.record_digest)?.is_some() {
+            let heads = Self::head_digests(conn, revision.logical_id)?;
             if heads.as_slice() == [revision.record_digest.clone()] {
-                tx.commit()
-                    .context("technical lesson: committing idempotent mutation")?;
                 return Ok(ApplyRevisionOutcome::Idempotent);
             }
             return Err(TechnicalLessonStoreError::ConcurrentMutation.into());
         }
 
-        let heads = Self::head_digests(&tx, revision.logical_id)?;
+        let heads = Self::head_digests(conn, revision.logical_id)?;
         if heads.as_slice() != [expected_parent.clone()] {
             return Err(TechnicalLessonStoreError::StaleRevision.into());
         }
-        Self::validate_revision_parent(&tx, revision)?;
+        Self::validate_revision_parent(conn, revision)?;
         anyhow::ensure!(
-            Self::insert_revision_row(&tx, revision)?,
+            Self::insert_revision_row(conn, revision)?,
             "technical lesson successor was not inserted"
         );
-        let removed = tx.execute(
+        let removed = conn.execute(
             "DELETE FROM memory_heads WHERE logical_id = ?1 AND record_digest = ?2",
             params![revision.logical_id.to_string(), expected_parent.as_str()],
         )?;
         if removed != 1 {
             return Err(TechnicalLessonStoreError::StaleRevision.into());
         }
-        tx.execute(
+        conn.execute(
             "INSERT INTO memory_heads (logical_id, record_digest) VALUES (?1, ?2)",
             params![
                 revision.logical_id.to_string(),
@@ -2496,11 +2518,9 @@ impl MemoryDb {
             ],
         )?;
         anyhow::ensure!(
-            Self::refresh_projection(&tx, revision.logical_id)? == 1,
+            Self::refresh_projection(conn, revision.logical_id)? == 1,
             "technical lesson linear mutation did not retain one causal head"
         );
-        tx.commit()
-            .context("technical lesson: committing linear mutation")?;
         Ok(ApplyRevisionOutcome::Advanced)
     }
 

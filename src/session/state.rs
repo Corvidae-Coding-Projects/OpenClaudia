@@ -304,6 +304,7 @@ pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "todo_read",
     "memory_search",
     "memory_list",
+    "memory_source_status",
     "crosslink",
     "bash_output",
 ];

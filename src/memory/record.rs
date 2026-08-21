@@ -173,6 +173,18 @@ impl fmt::Display for MemoryVersion {
 pub struct MemoryDigest(String);
 
 impl MemoryDigest {
+    /// Hash one exact byte sequence without adding a domain envelope.
+    ///
+    /// This is reserved for artifact identity, where the interoperable
+    /// `SHA-256(file-bytes)` value is the contract. Semantic record digests
+    /// should continue to use [`Self::for_fields`] so their type and fields
+    /// remain domain separated.
+    #[must_use]
+    pub fn sha256(bytes: &[u8]) -> Self {
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        digest_from_bytes(digest)
+    }
+
     /// Hash a domain-separated sequence of length-prefixed fields.
     #[must_use]
     pub fn for_fields(domain: &[u8], fields: &[&[u8]]) -> Self {
@@ -741,6 +753,14 @@ mod tests {
             MemoryAttribution::new("actor-1".to_string(), None, Some("workspace-1".to_string())),
             scope,
         )
+    }
+
+    #[test]
+    fn interoperable_sha256_matches_the_standard_empty_vector() {
+        assert_eq!(
+            MemoryDigest::sha256(b"").as_str(),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

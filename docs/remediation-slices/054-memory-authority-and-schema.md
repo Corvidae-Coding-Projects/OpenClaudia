@@ -173,8 +173,9 @@ Crosslink result receipt to avoid self-reference.
   containment so host-owned technical memory can activate there safely.
 - S-055: replace the legacy prose/correlation learner with causal typed lesson
   capture and measured false/harmful-learning behavior.
-- S-056: complete explicit `MEMORY.md` import/export/review lifecycle without
-  granting file prose instruction authority.
+- S-056 delivers strict explicit `MEMORY.md` source status/refresh/prune without
+  granting file prose instruction authority; S-106/#1078 owns the remaining
+  host-authorized review transition and complete portable export.
 - S-103/#1074 and S-104/#1075: authenticated team authority and bounded
   replication; the direct shared-path proposal stays rejected.
 - S-105/#1076: artifact-bound evaluation of semantic/task-conditioned retrieval.

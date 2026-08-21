@@ -18,6 +18,7 @@ use openclaudia::tools::{
     effect::{ToolEffect, ToolTarget},
     get_tool_definitions,
     registry::registry,
+    ToolResource,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -44,6 +45,8 @@ fn documented_tool_names() -> Vec<&'static str> {
         "memory_list",
         "memory_update",
         "memory_delete",
+        "memory_source_status",
+        "memory_source_refresh",
         "web_fetch",
         "web_search",
         "web_browser",
@@ -117,9 +120,9 @@ fn documented_tool_names_match_emitted_tool_definitions() {
 
 #[test]
 fn registry_documented_tool_count_is_current() {
-    // PINS CATALOG SIZE: 41 with the browser feature, 39 without it.
+    // PINS CATALOG SIZE: 43 with the browser feature, 41 without it.
     // Adding a tool: append a line to HANDLERS and bump this number.
-    let expected = if cfg!(feature = "browser") { 41 } else { 39 };
+    let expected = if cfg!(feature = "browser") { 43 } else { 41 };
     assert_eq!(
         documented_tool_names().len(),
         expected,
@@ -322,6 +325,34 @@ fn notebook_edit_effect_uses_notebook_path_arg_key() {
         spec.target,
         ToolTarget::Arg("notebook_path"),
         "PINS DOC: notebook_edit uses notebook_path key not path"
+    );
+}
+
+#[test]
+fn technical_memory_source_tools_declare_exact_effects_and_resources() {
+    let reg = registry();
+    let status = reg
+        .get("memory_source_status")
+        .expect("memory source status");
+    let status_spec = status.effect_spec();
+    assert_eq!(status_spec.canonical, "MemorySourceRead");
+    assert_eq!(status_spec.effect, ToolEffect::ReadOnly);
+    assert_eq!(status_spec.target, ToolTarget::ToolScope);
+    assert_eq!(
+        status.required_resources(&HashMap::new()),
+        [ToolResource::WorkspaceRead, ToolResource::Memory]
+    );
+
+    let refresh = reg
+        .get("memory_source_refresh")
+        .expect("memory source refresh");
+    let refresh_spec = refresh.effect_spec();
+    assert_eq!(refresh_spec.canonical, "MemorySourceRefresh");
+    assert_eq!(refresh_spec.effect, ToolEffect::ExternalMutation);
+    assert_eq!(refresh_spec.target, ToolTarget::ToolScope);
+    assert_eq!(
+        refresh.required_resources(&HashMap::new()),
+        [ToolResource::WorkspaceRead, ToolResource::Memory]
     );
 }
 

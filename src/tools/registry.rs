@@ -1461,6 +1461,93 @@ impl ToolHandler for MemoryDeleteHandler {
     }
 }
 
+struct MemorySourceStatusHandler;
+impl ToolHandler for MemorySourceStatusHandler {
+    fn name(&self) -> &'static str {
+        "memory_source_status"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_MEMORY
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only("MemorySourceRead")
+    }
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory_source_status",
+                "description": "Inspect the explicit repository technical-memory source and its host-owned imported state. The source must be a strict typed manifest; prose is rejected and nothing is added to the prompt.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {}
+                }
+            }
+        })
+    }
+    fn execute(
+        &self,
+        _permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        memory_tool::execute_source_status(ctx.run, ctx.memory_db, args)
+    }
+}
+
+struct MemorySourceRefreshHandler;
+impl ToolHandler for MemorySourceRefreshHandler {
+    fn name(&self) -> &'static str {
+        "memory_source_refresh"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_MEMORY
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::ExternalMutation, "MemorySourceRefresh")
+    }
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory_source_refresh",
+                "description": "Explicitly import or refresh the strict repository technical-memory manifest into the host-owned workspace store. Call memory_source_status first. Existing sources require its current source_digest; removals require prune_missing=true. Publication is atomic and imported lessons remain untrusted reference evidence.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "expected_source_digest": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                            "description": "Current persisted source_digest returned by memory_source_status. Omit only for an initial import or an exact idempotent refresh."
+                        },
+                        "prune_missing": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Explicitly tombstone lessons removed from the manifest, or all tracked source lessons when the source file is missing."
+                        }
+                    }
+                }
+            }
+        })
+    }
+    fn execute(
+        &self,
+        _permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        memory_tool::execute_source_refresh(ctx.run, ctx.memory_db, args)
+    }
+}
+
 // ── todo ─────────────────────────────────────────────────────────────────────
 
 struct TodoWriteHandler;
@@ -1945,10 +2032,10 @@ impl ToolHandler for CronListHandler {
 // ── plan_mode ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "browser")]
-const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, memory_search, memory_list, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, memory_search, memory_list, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
 
 #[cfg(not(feature = "browser"))]
-const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, bash_output, todo_read, memory_search, memory_list, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. Browser-backed web_search and web_browser are unavailable in this build. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, bash_output, todo_read, memory_search, memory_list, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. Browser-backed web_search and web_browser are unavailable in this build. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
 
 struct EnterPlanModeHandler;
 impl ToolHandler for EnterPlanModeHandler {
@@ -2589,6 +2676,8 @@ static HANDLERS: &[&dyn ToolHandler] = &[
     &MemoryListHandler,
     &MemoryUpdateHandler,
     &MemoryDeleteHandler,
+    &MemorySourceStatusHandler,
+    &MemorySourceRefreshHandler,
     // todo
     &TodoWriteHandler,
     &TodoReadHandler,

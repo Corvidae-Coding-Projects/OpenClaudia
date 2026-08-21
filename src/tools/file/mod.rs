@@ -4,7 +4,7 @@ mod grep;
 mod list;
 mod notebook;
 mod read;
-mod secure_fs;
+pub mod secure_fs;
 mod write;
 
 pub use edit::execute_edit_file;

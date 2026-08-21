@@ -1681,6 +1681,8 @@ mod tool_definitions {
             "memory_list",
             "memory_update",
             "memory_delete",
+            "memory_source_status",
+            "memory_source_refresh",
         ] {
             assert!(
                 tool_names.contains(&expected),

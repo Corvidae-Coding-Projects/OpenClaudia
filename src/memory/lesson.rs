@@ -348,6 +348,64 @@ impl TechnicalLesson {
         Ok(lesson)
     }
 
+    /// Recreate an active lesson after an exact causal tombstone.
+    ///
+    /// Source refresh uses this only when the stable manifest identity is
+    /// reintroduced after an explicit prune. The new payload remains a
+    /// candidate and names the tombstone as its exact predecessor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the replacement, reason, timestamp, or
+    /// workspace-bound lesson violates the strict lesson schema.
+    pub fn restored(
+        workspace_id: WorkspaceMemoryId,
+        mut replacement: TechnicalLessonDraft,
+        tombstone_digest: MemoryDigest,
+        reason: String,
+        captured_at_unix_seconds: i64,
+    ) -> Result<Self, TechnicalLessonError> {
+        canonicalize_applicability(&mut replacement.applicability);
+        canonicalize_citations(&mut replacement.citations);
+        let lesson = Self {
+            schema_version: TECHNICAL_LESSON_SCHEMA_VERSION,
+            workspace_id,
+            title: replacement.title,
+            kind: replacement.kind,
+            observation: replacement.observation,
+            guidance: replacement.guidance,
+            applicability: replacement.applicability,
+            citations: replacement.citations,
+            confidence: replacement.confidence,
+            sensitivity: replacement.sensitivity,
+            retention: replacement.retention,
+            review: LessonReviewState::Candidate,
+            correction: Some(LessonCorrection {
+                corrected_record_digest: tombstone_digest,
+                reason,
+            }),
+            captured_at_unix_seconds,
+        };
+        lesson.validate()?;
+        Ok(lesson)
+    }
+
+    /// Project the host-bound record back to its canonical source draft.
+    #[must_use]
+    pub fn draft(&self) -> TechnicalLessonDraft {
+        TechnicalLessonDraft {
+            title: self.title.clone(),
+            kind: self.kind,
+            observation: self.observation.clone(),
+            guidance: self.guidance.clone(),
+            applicability: self.applicability.clone(),
+            citations: self.citations.clone(),
+            confidence: self.confidence,
+            sensitivity: self.sensitivity,
+            retention: self.retention.clone(),
+        }
+    }
+
     /// Encode the canonical struct field order used as revision content.
     ///
     /// # Errors
