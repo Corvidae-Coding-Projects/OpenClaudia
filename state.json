@@ -1,6 +1,6 @@
 {
   "next_display_id": 1081,
-  "next_comment_id": 1113,
+  "next_comment_id": 1114,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11025,10 +11025,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T16:01:20.623148827Z",
-      "updated_at": "2026-08-21T16:01:26.105853820Z",
+      "updated_at": "2026-08-21T23:15:27.760353207Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "e3741f84-7b4e-4be3-9c6a-60af6215ba18": {
+          "display_id": 1113,
+          "author": "6Vw9",
+          "content": "[action] Preflight S-104 encrypted authenticated team technical-memory replication; preserve S-103 authority and S-053 causal graph",
+          "created_at": "2026-08-21T23:15:27.757824036Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl5h1oKIxGG6aOH6PhXLVdOkJPRQ6CJ4OMmX5bxWWoUR41ZKudBbB7SiiRniDWX8sLHJocsNeZ2OTG5CYLoIiBA=="
+        }
+      }
     },
     "63b74ccf-9147-460c-ba4f-6dbe9d2ae1f5": {
       "uuid": "63b74ccf-9147-460c-ba4f-6dbe9d2ae1f5",
@@ -31057,11 +31068,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 818,
       "timestamp": "2026-08-21T23:15:23.116212652Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 819,
+      "timestamp": "2026-08-21T23:15:27.760353207Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T23:15:23.116212652Z",
+    "timestamp": "2026-08-21T23:15:27.760353207Z",
     "agent_id": "6Vw9",
-    "agent_seq": 818
+    "agent_seq": 819
   }
 }
