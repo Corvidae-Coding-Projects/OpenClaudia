@@ -390,6 +390,53 @@ impl TechnicalLesson {
         Ok(lesson)
     }
 
+    /// Create a causal successor that marks this exact evidence revision as
+    /// host reviewed. Content, confidence, applicability, and capture time are
+    /// preserved; review changes authority metadata only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receipt/timestamp or resulting lesson is
+    /// invalid.
+    pub fn host_reviewed(
+        &self,
+        reviewed_record_digest: MemoryDigest,
+        receipt_id: String,
+        reviewed_at_unix_seconds: i64,
+    ) -> Result<Self, TechnicalLessonError> {
+        let mut reviewed = self.clone();
+        reviewed.review = LessonReviewState::HostReviewed {
+            receipt_id,
+            reviewed_at_unix_seconds,
+        };
+        reviewed.correction = Some(LessonCorrection {
+            corrected_record_digest: reviewed_record_digest,
+            reason: "host reviewed this exact technical-lesson revision".to_string(),
+        });
+        reviewed.validate()?;
+        Ok(reviewed)
+    }
+
+    /// Create a candidate successor that revokes host review without changing
+    /// the technical claim or pretending it was freshly captured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the resulting causal metadata is invalid.
+    pub fn review_revoked(
+        &self,
+        reviewed_record_digest: MemoryDigest,
+    ) -> Result<Self, TechnicalLessonError> {
+        let mut revoked = self.clone();
+        revoked.review = LessonReviewState::Candidate;
+        revoked.correction = Some(LessonCorrection {
+            corrected_record_digest: reviewed_record_digest,
+            reason: "host review was explicitly revoked".to_string(),
+        });
+        revoked.validate()?;
+        Ok(revoked)
+    }
+
     /// Project the host-bound record back to its canonical source draft.
     #[must_use]
     pub fn draft(&self) -> TechnicalLessonDraft {
@@ -508,6 +555,14 @@ impl TechnicalLesson {
         )
     }
 
+    /// Whether host review is currently effective after retention gates.
+    #[must_use]
+    pub const fn is_effectively_host_reviewed_at(&self, now_unix_seconds: i64) -> bool {
+        matches!(self.review, LessonReviewState::HostReviewed { .. })
+            && !self.is_expired_at(now_unix_seconds)
+            && !self.is_due_for_review_at(now_unix_seconds)
+    }
+
     /// Search projection. It contains technical fields only, never provenance
     /// wrappers or arbitrary surrounding transcript text.
     #[must_use]
@@ -539,6 +594,9 @@ pub struct TechnicalLessonRecord {
     pub provenance: super::MemoryProvenance,
     pub conflicted: bool,
     pub due_for_review: bool,
+    /// False for candidates and whenever expiry/review-after policy makes a
+    /// prior review stale.
+    pub effectively_host_reviewed: bool,
     pub lesson: TechnicalLesson,
 }
 
@@ -605,6 +663,14 @@ pub enum TechnicalLessonStoreError {
     StaleRevision,
     #[error("technical lesson mutation did not become the sole causal head")]
     ConcurrentMutation,
+    #[error("host approval receipt was already used for another memory transition")]
+    ReviewReceiptReuse,
+    #[error("technical lesson is expired or already due for review")]
+    ReviewIneligible,
+    #[error("technical lesson host-review audit is missing or inconsistent")]
+    ReviewAuditInvalid,
+    #[error("host approval is not bound to this technical-memory workspace")]
+    ReviewApprovalInvalid,
 }
 
 fn validate_text(
@@ -662,6 +728,11 @@ fn validate_review(
     } = review
     {
         validate_single_line_text(receipt_id, MAX_LESSON_ITEM_BYTES, "review receipt")?;
+        if uuid::Uuid::parse_str(receipt_id).is_err() {
+            return Err(TechnicalLessonError::InvalidText {
+                field: "review receipt",
+            });
+        }
         if *reviewed_at_unix_seconds < captured_at {
             return Err(TechnicalLessonError::InvalidTimestamp);
         }

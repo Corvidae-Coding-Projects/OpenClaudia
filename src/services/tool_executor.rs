@@ -268,16 +268,18 @@ impl ToolExecutor {
             },
         };
 
-        if let Err(reason) =
-            permission_mgr.consume_execution_permit(&authorization, tool_call, session_id)
-        {
-            return ToolResult::failure(
-                tool_call,
-                ToolFailureCode::PermissionDenied,
-                format!("Permission denied: execution permit rejected: {reason}"),
-                ToolRetryability::Never,
-            );
-        }
+        let consumed_authorization =
+            match permission_mgr.consume_execution_permit(&authorization, tool_call, session_id) {
+                Ok(consumed) => consumed,
+                Err(reason) => {
+                    return ToolResult::failure(
+                        tool_call,
+                        ToolFailureCode::PermissionDenied,
+                        format!("Permission denied: execution permit rejected: {reason}"),
+                        ToolRetryability::Never,
+                    );
+                }
+            };
 
         if let Err(err) = tool_policy.check_and_record_tool(&tool_call.function.name) {
             return ToolResult::failure(
@@ -294,6 +296,7 @@ impl ToolExecutor {
             memory_db,
             app_config,
             task_mgr,
+            Some(&consumed_authorization),
         )
     }
 

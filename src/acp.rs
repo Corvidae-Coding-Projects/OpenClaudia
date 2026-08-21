@@ -2135,6 +2135,7 @@ impl AcpServer {
             | "memory_save"
             | "memory_update"
             | "memory_delete"
+            | "memory_review"
             | "memory_list"
             | "memory_source_status"
             | "memory_source_refresh" => {
@@ -4153,6 +4154,49 @@ permissions:
         ));
     }
 
+    async fn assert_acp_memory_review_requires_host_decision(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+        record: &crate::memory::TechnicalLessonRecord,
+    ) {
+        let denied = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-review-without-host",
+            "memory_review",
+            json!({
+                "action": "review",
+                "logical_id": record.logical_id.to_string(),
+                "expected_record_digest": record.record_digest.to_string()
+            }),
+        )
+        .await;
+        assert!(denied.is_error);
+        assert!(
+            denied
+                .content
+                .contains("no interactive prompt is available"),
+            "ACP must route memory_review through the canonical permission gate: {}",
+            denied.content
+        );
+        let after_denial = server
+            .memory_db
+            .query_technical_lessons(
+                Some("ACP memory dispatch"),
+                5,
+                chrono::Utc::now().timestamp(),
+            )
+            .expect("query after ACP review denial")
+            .records
+            .pop()
+            .expect("lesson remains after ACP review denial");
+        assert_eq!(after_denial.record_digest, record.record_digest);
+        assert_eq!(
+            after_denial.lesson.review,
+            crate::memory::LessonReviewState::Candidate
+        );
+    }
+
     #[tokio::test]
     async fn acp_routes_every_typed_memory_operation_to_its_host_store() {
         let (server, _rx, _tmp) = test_server();
@@ -4194,6 +4238,8 @@ permissions:
             .records
             .pop()
             .expect("ACP save persisted one lesson");
+
+        assert_acp_memory_review_requires_host_decision(&server, &run, &first).await;
 
         let updated = execute_acp_memory_tool(
             &server,

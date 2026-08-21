@@ -945,7 +945,7 @@ impl MemoryDb {
         Ok(revision)
     }
 
-    fn apply_root_revision_in_transaction(
+    pub(super) fn apply_root_revision_in_transaction(
         conn: &Connection,
         revision: &MemoryRevision,
     ) -> Result<()> {
@@ -1107,7 +1107,7 @@ impl MemoryDb {
         Ok(true)
     }
 
-    fn store_id_on(conn: &Connection) -> Result<MemoryStoreId> {
+    pub(super) fn store_id_on(conn: &Connection) -> Result<MemoryStoreId> {
         let encoded: String = conn.query_row(
             "SELECT store_id FROM memory_store_metadata WHERE singleton = 1",
             [],

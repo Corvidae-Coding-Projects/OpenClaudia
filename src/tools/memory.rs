@@ -9,9 +9,11 @@ use serde_json::{json, Value};
 use crate::memdir::{EntrypointInspection, EntrypointIssue, EntrypointIssueCode};
 use crate::memory::{
     LogicalMemoryId, MemoryDb, MemoryDigest, MemorySourceEvidence, MemorySourceKind,
-    TechnicalLessonCorrectionRequest, TechnicalLessonDraft, TechnicalLessonStoreError,
-    TechnicalMemorySourceStoreError, TechnicalMemorySourceStoreStatus,
+    TechnicalLessonCorrectionRequest, TechnicalLessonDraft, TechnicalLessonReviewAction,
+    TechnicalLessonReviewRequest, TechnicalLessonStoreError, TechnicalMemorySourceStoreError,
+    TechnicalMemorySourceStoreStatus,
 };
+use crate::permissions::HostApprovalEvidence;
 
 use super::{
     ToolFailure, ToolFailureCode, ToolHandlerResult, ToolObservation, ToolRetryability,
@@ -48,6 +50,14 @@ struct UpdateArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeleteArgs {
+    logical_id: String,
+    expected_record_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewArgs {
+    action: TechnicalLessonReviewAction,
     logical_id: String,
     expected_record_digest: String,
 }
@@ -271,6 +281,58 @@ pub fn execute_delete(
         ),
         Err(error) if is_conflict_error(&error) => conflict(error.to_string()),
         Err(error) => store_error("memory_delete", &error),
+    }
+}
+
+pub fn execute_review(
+    db: Option<&MemoryDb>,
+    approval: &HostApprovalEvidence,
+    args: &HashMap<String, Value>,
+) -> ToolHandlerResult {
+    let Some(db) = db else {
+        return unavailable();
+    };
+    let parsed = match serde_json::from_value::<ReviewArgs>(args_value(args)) {
+        Ok(parsed) => parsed,
+        Err(error) => return invalid_arguments("memory_review", &error),
+    };
+    let logical_id = match LogicalMemoryId::from_str(&parsed.logical_id) {
+        Ok(value) => value,
+        Err(error) => return invalid_input(error.to_string()),
+    };
+    let expected_record_digest = match MemoryDigest::from_str(&parsed.expected_record_digest) {
+        Ok(value) => value,
+        Err(error) => return invalid_input(error.to_string()),
+    };
+    match db.transition_technical_lesson_review(&TechnicalLessonReviewRequest {
+        logical_id,
+        expected_record_digest,
+        action: parsed.action,
+        approval,
+        reviewed_at_unix_seconds: chrono::Utc::now().timestamp(),
+    }) {
+        Ok(result) => match serde_json::to_value(&result) {
+            Ok(value) => private_review_structured(
+                format!(
+                    "Technical lesson {} review transition finished with status {:?}.",
+                    result.logical_id, result.status
+                ),
+                &value,
+            ),
+            Err(error) => encoding_error("memory_review", &error),
+        },
+        Err(error)
+            if error.downcast_ref::<TechnicalLessonStoreError>()
+                == Some(&TechnicalLessonStoreError::ReviewApprovalInvalid) =>
+        {
+            private_error(ToolFailure::new(
+                ToolFailureCode::PermissionDenied,
+                "Host review approval is not bound to this technical-memory workspace".to_string(),
+                ToolRetryability::Never,
+            ))
+        }
+        Err(error) if is_conflict_error(&error) => conflict(error.to_string()),
+        Err(error) => store_error("memory_review", &error),
     }
 }
 
@@ -591,6 +653,25 @@ fn private_source_structured(text: String, value: &Value, kind: &str) -> ToolHan
             "restored": value.get("restored"),
             "deleted": value.get("deleted"),
             "unchanged": value.get("unchanged"),
+        }),
+    });
+    result
+}
+
+fn private_review_structured(text: String, value: &Value) -> ToolHandlerResult {
+    let mut result = private_structured(text, value.clone());
+    result.observations.push(ToolObservation {
+        kind: "technical_memory_host_review".to_string(),
+        authoritative: true,
+        data: json!({
+            "schema_version": 1,
+            "operation": "memory_review",
+            "status": value.get("status"),
+            "logical_id": value.get("logical_id"),
+            "previous_record_digest": value.get("previous_record_digest"),
+            "record_digest": value.get("record_digest"),
+            "audit_record_digest": value.get("audit_record_digest"),
+            "effectively_host_reviewed": value.get("effectively_host_reviewed"),
         }),
     });
     result

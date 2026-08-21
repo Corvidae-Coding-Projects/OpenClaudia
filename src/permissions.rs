@@ -17,11 +17,12 @@ use std::sync::{LazyLock, Mutex};
 use tracing::{debug, info, warn};
 
 mod receipts;
+pub(crate) use receipts::{approval_workspace_digest, HostApprovalEvidence};
 use receipts::{digest_text, ApprovalStore};
 pub use receipts::{
     inspect_permission_store, trusted_permission_store_path, ApprovalBinding, ApprovalProvenance,
-    ExecutionPermit, LocalApprovalCache, LocalApprovalDecision, PermissionStoreSummary,
-    APPROVAL_RECEIPT_SCHEMA_VERSION,
+    ConsumedExecutionPermit, ExecutionPermit, LocalApprovalCache, LocalApprovalDecision,
+    PermissionStoreSummary, APPROVAL_RECEIPT_SCHEMA_VERSION,
 };
 
 /// Global cache for compiled glob-to-regex patterns.
@@ -888,6 +889,12 @@ impl PermissionManager {
         let scope = self
             .approval_store
             .scope_for(&resolved, &arguments, session_id);
+        if resolved.canonical == "MemoryReview" {
+            return AuthorizationResult::NeedsPrompt {
+                tool: resolved.canonical,
+                target: resolved.target,
+            };
+        }
         match self.approval_store.take_approval(&scope, &tool_call.id) {
             Ok(Some(permit)) => {
                 Self::log_permission_decision(
@@ -908,7 +915,7 @@ impl PermissionManager {
         }
 
         match self.policy_default_outcome(resolved, transient_allow_rules) {
-            CheckResult::Allowed => AuthorizationResult::Allowed(ApprovalStore::mint_once(
+            CheckResult::Allowed => AuthorizationResult::Allowed(self.approval_store.mint_once(
                 scope,
                 &tool_call.id,
                 ApprovalProvenance::PolicyEvaluation,
@@ -934,6 +941,19 @@ impl PermissionManager {
     ) -> Result<ExecutionPermit, String> {
         let (arguments, resolved, scope) = self.approvable_scope(tool_call, session_id)?;
         let _ = arguments;
+        if resolved.canonical == "MemoryReview"
+            && !matches!(
+                provenance,
+                ApprovalProvenance::InteractiveUser
+                    | ApprovalProvenance::AcpClient
+                    | ApprovalProvenance::HostAdministrator
+            )
+        {
+            return Err(
+                "technical-memory review requires a one-use authenticated host decision"
+                    .to_string(),
+            );
+        }
         Self::log_permission_decision(
             "allowed",
             "one_use_approval",
@@ -941,7 +961,9 @@ impl PermissionManager {
             &resolved.target,
             "",
         );
-        Ok(ApprovalStore::mint_once(scope, &tool_call.id, provenance))
+        Ok(self
+            .approval_store
+            .mint_once(scope, &tool_call.id, provenance))
     }
 
     /// Grant repeated use of this exact normalized invocation for the current
@@ -958,6 +980,11 @@ impl PermissionManager {
         provenance: ApprovalProvenance,
     ) -> Result<ExecutionPermit, String> {
         let (_arguments, resolved, scope) = self.approvable_scope(tool_call, Some(session_id))?;
+        if resolved.canonical == "MemoryReview" {
+            return Err(
+                "technical-memory review cannot use a reusable session approval".to_string(),
+            );
+        }
         let permit = self
             .approval_store
             .approve_for_session(scope, &tool_call.id, provenance);
@@ -986,6 +1013,9 @@ impl PermissionManager {
         provenance: ApprovalProvenance,
     ) -> Result<ExecutionPermit, String> {
         let (_arguments, resolved, scope) = self.approvable_scope(tool_call, session_id)?;
+        if resolved.canonical == "MemoryReview" {
+            return Err("technical-memory review cannot use a persisted approval".to_string());
+        }
         let permit = self
             .approval_store
             .approve_persisted(scope, &tool_call.id, provenance)?;
@@ -1045,7 +1075,7 @@ impl PermissionManager {
         permit: &ExecutionPermit,
         tool_call: &crate::tools::ToolCall,
         session_id: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<ConsumedExecutionPermit, String> {
         if !permit.matches_call_id(tool_call) {
             return Err("execution permit belongs to a different tool call id".to_string());
         }

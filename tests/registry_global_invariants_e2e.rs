@@ -45,6 +45,7 @@ fn documented_tool_names() -> Vec<&'static str> {
         "memory_list",
         "memory_update",
         "memory_delete",
+        "memory_review",
         "memory_source_status",
         "memory_source_refresh",
         "web_fetch",
@@ -120,9 +121,9 @@ fn documented_tool_names_match_emitted_tool_definitions() {
 
 #[test]
 fn registry_documented_tool_count_is_current() {
-    // PINS CATALOG SIZE: 43 with the browser feature, 41 without it.
+    // PINS CATALOG SIZE: 44 with the browser feature, 42 without it.
     // Adding a tool: append a line to HANDLERS and bump this number.
-    let expected = if cfg!(feature = "browser") { 43 } else { 41 };
+    let expected = if cfg!(feature = "browser") { 44 } else { 42 };
     assert_eq!(
         documented_tool_names().len(),
         expected,
@@ -352,6 +353,19 @@ fn technical_memory_source_tools_declare_exact_effects_and_resources() {
     assert_eq!(refresh_spec.target, ToolTarget::ToolScope);
     assert_eq!(
         refresh.required_resources(&HashMap::new()),
+        [ToolResource::WorkspaceRead, ToolResource::Memory]
+    );
+}
+
+#[test]
+fn technical_memory_review_declares_exact_effect_and_resource() {
+    let review = registry().get("memory_review").expect("memory review");
+    let spec = review.effect_spec();
+    assert_eq!(spec.canonical, "MemoryReview");
+    assert_eq!(spec.effect, ToolEffect::ExternalMutation);
+    assert_eq!(spec.target, ToolTarget::Arg("logical_id"));
+    assert_eq!(
+        review.required_resources(&HashMap::new()),
         [ToolResource::WorkspaceRead, ToolResource::Memory]
     );
 }

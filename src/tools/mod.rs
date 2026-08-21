@@ -12,6 +12,7 @@
 //! - `memory_list`: List recent typed lessons
 //! - `memory_update`: Create a causal correction of an exact lesson revision
 //! - `memory_delete`: Tombstone an exact lesson revision
+//! - `memory_review`: Apply or revoke a fresh host-authorized review
 //! - `memory_source_status`: Inspect a strict repository lesson source
 //! - `memory_source_refresh`: Atomically import/refresh that explicit source
 //!
@@ -129,7 +130,9 @@ pub use worktree::cwd_cache_generation;
 
 use crate::config::AppConfig;
 use crate::memory::MemoryDb;
-use crate::permissions::{AuthorizationResult, CheckResult, ExecutionPermit, PermissionManager};
+use crate::permissions::{
+    AuthorizationResult, CheckResult, ConsumedExecutionPermit, ExecutionPermit, PermissionManager,
+};
 use crate::session::TaskManager;
 use crate::subagent;
 use serde::{Deserialize, Serialize};
@@ -295,8 +298,10 @@ const fn value_type_name(value: &Value) -> &'static str {
 }
 
 fn host_safety_dispatch_permit(
+    run: &ToolRunContext,
     tool_call: &ToolCall,
     args: &HashMap<String, Value>,
+    authorization: Option<&ConsumedExecutionPermit>,
 ) -> Result<registry::ToolDispatchPermit, Box<ToolResult>> {
     let arguments = Value::Object(
         args.iter()
@@ -313,10 +318,17 @@ fn host_safety_dispatch_permit(
             ))
         },
     )?;
-    Ok(registry::ToolDispatchPermit::new(
-        &tool_call.id,
-        &tool_call.function.name,
-        args,
+    Ok(authorization.map_or_else(
+        || registry::ToolDispatchPermit::new(&tool_call.id, &tool_call.function.name, args),
+        |authorization| {
+            registry::ToolDispatchPermit::new_with_authorization(
+                &tool_call.id,
+                &tool_call.function.name,
+                args,
+                authorization,
+                run,
+            )
+        },
     ))
 }
 
@@ -376,8 +388,9 @@ fn dispatch_registered_after_authorization(
     tool_call: &ToolCall,
     args: &HashMap<String, Value>,
     ctx: &mut ToolContext<'_>,
+    authorization: Option<&ConsumedExecutionPermit>,
 ) -> ToolResult {
-    let permit = match host_safety_dispatch_permit(tool_call, args) {
+    let permit = match host_safety_dispatch_permit(ctx.run, tool_call, args, authorization) {
         Ok(permit) => permit,
         Err(result) => return *result,
     };
@@ -426,16 +439,18 @@ pub fn execute_tool_with_memory(
         Ok(permit) => permit,
         Err(result) => return *result,
     };
-    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
-        return *result;
-    }
-    execute_tool_with_memory_after_authorization(run, tool_call, memory_db)
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return *result,
+    };
+    execute_tool_with_memory_after_authorization(run, tool_call, memory_db, Some(&authorization))
 }
 
 fn execute_tool_with_memory_after_authorization(
     run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
+    authorization: Option<&ConsumedExecutionPermit>,
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
@@ -463,7 +478,7 @@ fn execute_tool_with_memory_after_authorization(
         app_config: None,
         task_mgr: None,
     };
-    dispatch_registered_after_authorization(tool_call, &args, &mut ctx)
+    dispatch_registered_after_authorization(tool_call, &args, &mut ctx, authorization)
 }
 
 /// Execute a tool call with full context (memory + config for subagents).
@@ -479,10 +494,17 @@ pub fn execute_tool_full(
         Ok(permit) => permit,
         Err(result) => return *result,
     };
-    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
-        return *result;
-    }
-    execute_tool_full_after_authorization(run, tool_call, memory_db, app_config)
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return *result,
+    };
+    execute_tool_full_after_authorization(
+        run,
+        tool_call,
+        memory_db,
+        app_config,
+        Some(&authorization),
+    )
 }
 
 fn execute_tool_full_after_authorization(
@@ -490,12 +512,13 @@ fn execute_tool_full_after_authorization(
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
+    authorization: Option<&ConsumedExecutionPermit>,
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
         Err(result) => return *result,
     };
-    let dispatch_permit = match host_safety_dispatch_permit(tool_call, &args) {
+    let dispatch_permit = match host_safety_dispatch_permit(run, tool_call, &args, authorization) {
         Ok(permit) => permit,
         Err(result) => return *result,
     };
@@ -764,7 +787,7 @@ fn consume_for_execution(
     tool_call: &ToolCall,
     permission_mgr: &PermissionManager,
     permit: &ExecutionPermit,
-) -> Result<(), Box<ToolResult>> {
+) -> Result<ConsumedExecutionPermit, Box<ToolResult>> {
     permission_mgr
         .consume_execution_permit(permit, tool_call, None)
         .map_err(|reason| {
@@ -799,11 +822,19 @@ pub fn execute_tool_with_tasks(
         Ok(permit) => permit,
         Err(result) => return *result,
     };
-    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
-        return *result;
-    }
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return *result,
+    };
 
-    execute_tool_after_authorization(run, tool_call, memory_db, app_config, task_mgr)
+    execute_tool_after_authorization(
+        run,
+        tool_call,
+        memory_db,
+        app_config,
+        task_mgr,
+        Some(&authorization),
+    )
 }
 
 /// Execute a tool after the caller has already made the approval decision.
@@ -818,6 +849,7 @@ pub(crate) fn execute_tool_after_authorization(
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
     task_mgr: Option<&mut TaskManager>,
+    authorization: Option<&ConsumedExecutionPermit>,
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
@@ -830,7 +862,13 @@ pub(crate) fn execute_tool_after_authorization(
         tool_call.function.name.as_str(),
         "task" | "agent_output" | "task_stop"
     ) {
-        return execute_tool_full_after_authorization(run, tool_call, memory_db, app_config);
+        return execute_tool_full_after_authorization(
+            run,
+            tool_call,
+            memory_db,
+            app_config,
+            authorization,
+        );
     }
 
     // All other tools — including task_create/task_update/task_get/task_list —
@@ -842,7 +880,7 @@ pub(crate) fn execute_tool_after_authorization(
         task_mgr,
     };
 
-    dispatch_registered_after_authorization(tool_call, &args, &mut ctx)
+    dispatch_registered_after_authorization(tool_call, &args, &mut ctx, authorization)
 }
 
 /// New canonical dispatch: requires a [`PermissionManager`] and uses the strict fail-closed check.
@@ -873,10 +911,18 @@ pub fn execute_tool_with_permission_required(
         Ok(permit) => permit,
         Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
     };
-    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
-        return *result;
-    }
-    execute_tool_after_authorization(run, tool_call, memory_db, app_config, task_mgr)
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return *result,
+    };
+    execute_tool_after_authorization(
+        run,
+        tool_call,
+        memory_db,
+        app_config,
+        task_mgr,
+        Some(&authorization),
+    )
 }
 
 /// Typed-outcome dispatch: runs the permission gate and returns a structured [`ExecutionOutcome`].
@@ -910,11 +956,17 @@ pub fn execute_tool_gated(
         }
         Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
     };
-    if let Err(result) = consume_for_execution(tool_call, permission_mgr, &permit) {
-        return ExecutionOutcome::Result(result);
-    }
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return ExecutionOutcome::Result(result),
+    };
     ExecutionOutcome::Result(Box::new(execute_tool_after_authorization(
-        run, tool_call, memory_db, app_config, task_mgr,
+        run,
+        tool_call,
+        memory_db,
+        app_config,
+        task_mgr,
+        Some(&authorization),
     )))
 }
 
@@ -961,7 +1013,8 @@ mod tests {
             },
         };
 
-        let result = execute_tool_after_authorization(test_run(), &tool_call, None, None, None);
+        let result =
+            execute_tool_after_authorization(test_run(), &tool_call, None, None, None, None);
         assert!(result.is_error());
         assert!(matches!(
             result.outcome(),
@@ -987,7 +1040,8 @@ mod tests {
             },
         };
 
-        let result = execute_tool_after_authorization(test_run(), &tool_call, None, None, None);
+        let result =
+            execute_tool_after_authorization(test_run(), &tool_call, None, None, None, None);
         assert!(result.is_error());
         assert!(matches!(
             result.outcome(),

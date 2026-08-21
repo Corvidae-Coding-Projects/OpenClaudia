@@ -67,6 +67,59 @@ impl ApprovalProvenance {
     }
 }
 
+/// How the exact execution permit was granted.
+///
+/// Review authority deliberately distinguishes a fresh one-use host decision
+/// from policy evaluation and reusable session/persisted grants. The latter
+/// are valid for ordinary tool execution but cannot review durable memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalGrantKind {
+    OneUse,
+    Session,
+    Persisted,
+    Policy,
+}
+
+impl ApprovalGrantKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OneUse => "one_use",
+            Self::Session => "session",
+            Self::Persisted => "persisted",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+/// Immutable audit projection derived from a consumed host approval permit.
+///
+/// This type is crate-private and has no public constructor. Model arguments
+/// can never create it; the permission subsystem derives it only after exact
+/// scope validation and one-use consumption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostApprovalEvidence {
+    pub(crate) schema_version: u32,
+    pub(crate) receipt_id: String,
+    pub(crate) grant_kind: String,
+    pub(crate) provenance: String,
+    pub(crate) scope_digest: String,
+    pub(crate) evidence_digest: String,
+    pub(crate) actor_id: String,
+    pub(crate) workspace_digest: String,
+    pub(crate) workspace_generation: u64,
+    pub(crate) capability_generation: u64,
+    pub(crate) run_id_digest: String,
+    pub(crate) session_id_digest: Option<String>,
+    pub(crate) tool: String,
+    pub(crate) effect: String,
+    pub(crate) operation: Option<String>,
+    pub(crate) target_digest: String,
+    pub(crate) arguments_digest: String,
+    pub(crate) tool_call_id_digest: String,
+    pub(crate) host_policy_generation: u32,
+}
+
 /// Stable host/user/workspace identity used to scope approvals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalBinding {
@@ -75,6 +128,7 @@ pub struct ApprovalBinding {
     workspace_root: PathBuf,
     workspace_generation_base: u64,
     follows_process_cwd_generation: bool,
+    run_id_digest: Option<String>,
 }
 
 impl ApprovalBinding {
@@ -89,6 +143,7 @@ impl ApprovalBinding {
             workspace_root,
             workspace_generation_base: generation.max(1),
             follows_process_cwd_generation: false,
+            run_id_digest: None,
         }
     }
 
@@ -105,11 +160,13 @@ impl ApprovalBinding {
     /// Bind approvals to the current host actor and one exact run generation.
     #[must_use]
     pub fn for_run(run: &crate::tools::ToolRunContext) -> Self {
-        Self::new(
+        let mut binding = Self::new(
             current_actor_identity(),
             run.project_root(),
             run.generation().get(),
-        )
+        );
+        binding.run_id_digest = Some(digest_text(&run.run_id().to_string()));
+        binding
     }
 
     fn workspace_generation(&self) -> u64 {
@@ -142,6 +199,11 @@ fn current_actor_identity() -> String {
 
 fn normalized_workspace(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+pub fn approval_workspace_digest(path: &Path) -> String {
+    let workspace_root = normalized_workspace(path);
+    digest_text(&workspace_root.to_string_lossy())
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -204,14 +266,50 @@ impl ApprovalScope {
     }
 
     fn trace_id(&self) -> String {
+        let session_id_digest = self.session_id.as_deref().map(digest_text);
+        ApprovalScopeDigestInput {
+            actor_id: &self.actor_id,
+            workspace_digest: &self.workspace_digest,
+            workspace_generation: self.workspace_generation,
+            capability_generation: self.capability_generation,
+            session_id_digest: session_id_digest.as_deref(),
+            tool: &self.tool,
+            effect: &self.effect,
+            operation: self.operation.as_deref(),
+            target_digest: &self.target_digest,
+            arguments_digest: &self.arguments_digest,
+        }
+        .digest()
+    }
+}
+
+struct ApprovalScopeDigestInput<'a> {
+    actor_id: &'a str,
+    workspace_digest: &'a str,
+    workspace_generation: u64,
+    capability_generation: u64,
+    session_id_digest: Option<&'a str>,
+    tool: &'a str,
+    effect: &'a str,
+    operation: Option<&'a str>,
+    target_digest: &'a str,
+    arguments_digest: &'a str,
+}
+
+impl ApprovalScopeDigestInput<'_> {
+    fn digest(&self) -> String {
         digest_text(&format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.actor_id,
             self.workspace_digest,
             self.workspace_generation,
             self.capability_generation,
+            self.session_id_digest.unwrap_or("none"),
             self.tool,
-            self.arguments_digest
+            self.effect,
+            self.operation.unwrap_or("none"),
+            self.target_digest,
+            self.arguments_digest,
         ))
     }
 }
@@ -536,16 +634,24 @@ impl ApprovalStore {
     }
 
     pub(super) fn mint_once(
+        &self,
         scope: ApprovalScope,
         tool_call_id: &str,
         provenance: ApprovalProvenance,
     ) -> ExecutionPermit {
+        let grant_kind = if provenance == ApprovalProvenance::PolicyEvaluation {
+            ApprovalGrantKind::Policy
+        } else {
+            ApprovalGrantKind::OneUse
+        };
         ExecutionPermit::new(
             scope,
             tool_call_id,
             Utc::now() + Duration::minutes(5),
             Uuid::new_v4(),
             provenance,
+            grant_kind,
+            self.binding.run_id_digest.clone(),
         )
     }
 
@@ -583,6 +689,8 @@ impl ApprovalStore {
             now + Duration::minutes(5),
             receipt_id,
             provenance,
+            ApprovalGrantKind::Session,
+            self.binding.run_id_digest.clone(),
         )
     }
 
@@ -644,6 +752,8 @@ impl ApprovalStore {
             now + Duration::minutes(5),
             receipt_id,
             provenance,
+            ApprovalGrantKind::Persisted,
+            self.binding.run_id_digest.clone(),
         ))
     }
 
@@ -659,7 +769,13 @@ impl ApprovalStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if self.path.as_os_str().is_empty() {
-            return Ok(take_session_approval(&mut state, scope, tool_call_id, now));
+            return Ok(take_session_approval(
+                &mut state,
+                scope,
+                tool_call_id,
+                now,
+                self.binding.run_id_digest.clone(),
+            ));
         }
         let persisted_scope = scope.without_session();
         with_store_lock(&self.path, || {
@@ -686,7 +802,13 @@ impl ApprovalStore {
                 return Ok(None);
             }
 
-            if let Some(permit) = take_session_approval(&mut state, scope, tool_call_id, now) {
+            if let Some(permit) = take_session_approval(
+                &mut state,
+                scope,
+                tool_call_id,
+                now,
+                self.binding.run_id_digest.clone(),
+            ) {
                 if dirty {
                     save_state(&self.path, &persisted)?;
                 }
@@ -726,6 +848,8 @@ impl ApprovalStore {
                 now + Duration::minutes(5),
                 receipt_id,
                 provenance,
+                ApprovalGrantKind::Persisted,
+                self.binding.run_id_digest.clone(),
             );
             if exhausted {
                 persisted.approvals.remove(index);
@@ -742,7 +866,7 @@ impl ApprovalStore {
         resolved: &ResolvedEffect,
         arguments: &Value,
         session_id: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<ConsumedExecutionPermit, String> {
         let mut state = self
             .state
             .lock()
@@ -797,6 +921,7 @@ fn take_session_approval(
     scope: &ApprovalScope,
     tool_call_id: &str,
     now: DateTime<Utc>,
+    run_id_digest: Option<String>,
 ) -> Option<ExecutionPermit> {
     state
         .session_approvals
@@ -812,6 +937,8 @@ fn take_session_approval(
         now + Duration::minutes(5),
         record.receipt_id,
         record.provenance,
+        ApprovalGrantKind::Session,
+        run_id_digest,
     ))
 }
 
@@ -835,7 +962,22 @@ pub struct ExecutionPermit {
     tool_call_id: Box<str>,
     expires_at: DateTime<Utc>,
     provenance: ApprovalProvenance,
+    grant_kind: ApprovalGrantKind,
+    run_id_digest: Option<Box<str>>,
     consumed: AtomicBool,
+}
+
+/// Opaque proof of one consumed execution permit.
+///
+/// Ordinary tools need only its existence; authority-bearing handlers may
+/// request a further run-bound host-approval projection.
+pub struct ConsumedExecutionPermit {
+    receipt_id: Uuid,
+    scope: Box<ApprovalScope>,
+    tool_call_id: Box<str>,
+    provenance: ApprovalProvenance,
+    grant_kind: ApprovalGrantKind,
+    run_id_digest: Option<Box<str>>,
 }
 
 /// Decision returned by a bounded local-operation cache.
@@ -1005,6 +1147,8 @@ impl ExecutionPermit {
         expires_at: DateTime<Utc>,
         receipt_id: Uuid,
         provenance: ApprovalProvenance,
+        grant_kind: ApprovalGrantKind,
+        run_id_digest: Option<String>,
     ) -> Self {
         Self {
             schema_version: APPROVAL_RECEIPT_SCHEMA_VERSION,
@@ -1013,11 +1157,13 @@ impl ExecutionPermit {
             tool_call_id: tool_call_id.into(),
             expires_at,
             provenance,
+            grant_kind,
+            run_id_digest: run_id_digest.map(String::into_boxed_str),
             consumed: AtomicBool::new(false),
         }
     }
 
-    fn consume_for(&self, expected: &ApprovalScope) -> Result<(), String> {
+    fn consume_for(&self, expected: &ApprovalScope) -> Result<ConsumedExecutionPermit, String> {
         if self.schema_version != APPROVAL_RECEIPT_SCHEMA_VERSION {
             return Err("execution permit schema is unsupported".to_string());
         }
@@ -1042,7 +1188,14 @@ impl ExecutionPermit {
             provenance = self.provenance.as_str(),
             "Exact approval permit consumed"
         );
-        Ok(())
+        Ok(ConsumedExecutionPermit {
+            receipt_id: self.receipt_id,
+            scope: self.scope.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+            provenance: self.provenance,
+            grant_kind: self.grant_kind,
+            run_id_digest: self.run_id_digest.clone(),
+        })
     }
 
     pub(super) fn matches_call_id(&self, call: &ToolCall) -> bool {
@@ -1056,6 +1209,156 @@ impl ExecutionPermit {
     }
 }
 
+impl ConsumedExecutionPermit {
+    /// Derive authority-bearing evidence for the exact run that will dispatch
+    /// the call. Only a fresh one-use decision from a host principal qualifies.
+    pub(crate) fn host_approval_evidence(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        host_policy_generation: u32,
+    ) -> Result<HostApprovalEvidence, &'static str> {
+        if self.grant_kind != ApprovalGrantKind::OneUse {
+            return Err("host review requires a fresh one-use approval");
+        }
+        if !matches!(
+            self.provenance,
+            ApprovalProvenance::InteractiveUser
+                | ApprovalProvenance::AcpClient
+                | ApprovalProvenance::HostAdministrator
+        ) {
+            return Err("approval provenance cannot grant host-review authority");
+        }
+        let binding = ApprovalBinding::for_run(run);
+        if self.scope.actor_id != binding.actor_id {
+            return Err("approval actor does not match the dispatch run");
+        }
+        if self.scope.workspace_digest != binding.workspace_digest {
+            return Err("approval workspace does not match the dispatch run");
+        }
+        if self.scope.workspace_generation != binding.workspace_generation() {
+            return Err("approval workspace generation does not match the dispatch run");
+        }
+        let Some(run_id_digest) = self.run_id_digest.as_deref() else {
+            return Err("approval is not bound to an exact dispatch run");
+        };
+        if binding.run_id_digest.as_deref() != Some(run_id_digest) {
+            return Err("approval run identity does not match the dispatch run");
+        }
+        let mut evidence = HostApprovalEvidence {
+            schema_version: APPROVAL_RECEIPT_SCHEMA_VERSION,
+            receipt_id: self.receipt_id.to_string(),
+            grant_kind: self.grant_kind.as_str().to_string(),
+            provenance: self.provenance.as_str().to_string(),
+            scope_digest: self.scope.trace_id(),
+            evidence_digest: String::new(),
+            actor_id: self.scope.actor_id.clone(),
+            workspace_digest: self.scope.workspace_digest.clone(),
+            workspace_generation: self.scope.workspace_generation,
+            capability_generation: self.scope.capability_generation,
+            run_id_digest: run_id_digest.to_string(),
+            session_id_digest: self.scope.session_id.as_deref().map(digest_text),
+            tool: self.scope.tool.clone(),
+            effect: self.scope.effect.clone(),
+            operation: self.scope.operation.clone(),
+            target_digest: self.scope.target_digest.clone(),
+            arguments_digest: self.scope.arguments_digest.clone(),
+            tool_call_id_digest: digest_text(&self.tool_call_id),
+            host_policy_generation,
+        };
+        evidence.evidence_digest = evidence
+            .computed_evidence_digest()
+            .map_err(|_| "host approval evidence could not be encoded")?;
+        Ok(evidence)
+    }
+}
+
+impl HostApprovalEvidence {
+    /// Recompute the exact non-path tool projection carried by this evidence.
+    /// This lets an authority-bearing storage API defend itself even if a
+    /// future internal caller accidentally pairs a valid consumed receipt with
+    /// different arguments.
+    pub(crate) fn binds_exact_call(
+        &self,
+        canonical_tool: &str,
+        effect: &str,
+        operation: Option<&str>,
+        target: &str,
+        arguments: &Value,
+    ) -> bool {
+        let evidence_digest_matches = self
+            .computed_evidence_digest()
+            .is_ok_and(|digest| digest == self.evidence_digest);
+        evidence_digest_matches
+            && self.tool == canonical_tool
+            && self.effect == effect
+            && self.operation.as_deref() == operation
+            && self.target_digest == digest_text(target)
+            && self.arguments_digest == digest_text(&canonical_json(arguments))
+            && self.scope_digest
+                == ApprovalScopeDigestInput {
+                    actor_id: &self.actor_id,
+                    workspace_digest: &self.workspace_digest,
+                    workspace_generation: self.workspace_generation,
+                    capability_generation: self.capability_generation,
+                    session_id_digest: self.session_id_digest.as_deref(),
+                    tool: &self.tool,
+                    effect: &self.effect,
+                    operation: self.operation.as_deref(),
+                    target_digest: &self.target_digest,
+                    arguments_digest: &self.arguments_digest,
+                }
+                .digest()
+    }
+
+    fn computed_evidence_digest(&self) -> Result<String, serde_json::Error> {
+        #[derive(Serialize)]
+        struct DigestInput<'a> {
+            schema_version: u32,
+            receipt_id: &'a str,
+            grant_kind: &'a str,
+            provenance: &'a str,
+            scope_digest: &'a str,
+            actor_id: &'a str,
+            workspace_digest: &'a str,
+            workspace_generation: u64,
+            capability_generation: u64,
+            run_id_digest: &'a str,
+            session_id_digest: Option<&'a str>,
+            tool: &'a str,
+            effect: &'a str,
+            operation: Option<&'a str>,
+            target_digest: &'a str,
+            arguments_digest: &'a str,
+            tool_call_id_digest: &'a str,
+            host_policy_generation: u32,
+        }
+
+        let encoded = serde_json::to_string(&DigestInput {
+            schema_version: self.schema_version,
+            receipt_id: &self.receipt_id,
+            grant_kind: &self.grant_kind,
+            provenance: &self.provenance,
+            scope_digest: &self.scope_digest,
+            actor_id: &self.actor_id,
+            workspace_digest: &self.workspace_digest,
+            workspace_generation: self.workspace_generation,
+            capability_generation: self.capability_generation,
+            run_id_digest: &self.run_id_digest,
+            session_id_digest: self.session_id_digest.as_deref(),
+            tool: &self.tool,
+            effect: &self.effect,
+            operation: self.operation.as_deref(),
+            target_digest: &self.target_digest,
+            arguments_digest: &self.arguments_digest,
+            tool_call_id_digest: &self.tool_call_id_digest,
+            host_policy_generation: self.host_policy_generation,
+        })?;
+        Ok(digest_text(&format!(
+            "openclaudia.permission.host-approval-evidence.v1:{encoded}"
+        )))
+    }
+}
+
 impl fmt::Debug for ExecutionPermit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1065,6 +1368,8 @@ impl fmt::Debug for ExecutionPermit {
             .field("scope_digest", &self.scope.trace_id())
             .field("expires_at", &self.expires_at)
             .field("provenance", &self.provenance)
+            .field("grant_kind", &self.grant_kind)
+            .field("run_bound", &self.run_id_digest.is_some())
             .field("consumed", &self.consumed.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }

@@ -3715,6 +3715,7 @@ mod tests {
             assert!(general.contains(&name), "general agent is missing {name}");
         }
         let plan = available_subagent_tools(AgentType::Plan, true);
+        assert!(!general.contains(&"memory_review"));
         assert!(plan.contains(&"memory_search"));
         assert!(plan.contains(&"memory_list"));
         assert!(plan.contains(&"memory_source_status"));
@@ -3722,6 +3723,12 @@ mod tests {
         assert!(!plan.contains(&"memory_update"));
         assert!(!plan.contains(&"memory_delete"));
         assert!(!plan.contains(&"memory_source_refresh"));
+        for agent_type in AgentType::ALL {
+            assert!(
+                !available_subagent_tools(*agent_type, true).contains(&"memory_review"),
+                "subagent role {agent_type:?} has no direct host approval channel"
+            );
+        }
     }
 
     #[test]

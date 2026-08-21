@@ -20,6 +20,7 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as 
 
 mod lesson;
 mod record;
+mod review;
 mod source;
 
 pub use lesson::{
@@ -38,6 +39,11 @@ pub use record::{
     LogicalMemoryId, MemoryAttribution, MemoryDigest, MemoryProvenance, MemoryRecordError,
     MemoryRecordScope, MemoryRevision, MemoryRevisionState, MemorySourceEvidence, MemorySourceKind,
     MemoryStoreId, MemoryVersion, MEMORY_PROVENANCE_SCHEMA_VERSION,
+};
+pub(crate) use review::TechnicalLessonReviewRequest;
+pub use review::{
+    TechnicalLessonReviewAction, TechnicalLessonReviewResult, TechnicalLessonReviewStatus,
+    TECHNICAL_MEMORY_REVIEW_AUDIT_SCHEMA_VERSION, TECHNICAL_MEMORY_REVIEW_AUDIT_TAG,
 };
 pub(crate) use source::TechnicalMemoryRefreshRequest;
 pub use source::{
@@ -281,6 +287,7 @@ pub struct MemoryDb {
     conn: Mutex<Connection>,
     path: PathBuf,
     workspace_id: Option<WorkspaceMemoryId>,
+    approval_workspace_digest: Option<String>,
 }
 
 struct ValidatedTechnicalLessonQuery {
@@ -353,6 +360,7 @@ impl MemoryDb {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
             workspace_id,
+            approval_workspace_digest: None,
         })
     }
 
@@ -413,6 +421,8 @@ impl MemoryDb {
         Self::validate_private_database_file(&host_home, &database_path)?;
         database.bind_workspace_authority(&workspace_id, "user_private")?;
         database.workspace_id = Some(workspace_id);
+        database.approval_workspace_digest =
+            Some(crate::permissions::approval_workspace_digest(&project_dir));
         Ok(database)
     }
 
@@ -1512,6 +1522,7 @@ impl MemoryDb {
             let workspace_id = workspace_id
                 .context("an unbound memory store cannot contain typed technical lessons")?;
             Self::validate_technical_lesson_lineage_revision(&revision, workspace_id)?;
+            Self::validate_host_review_audit_on(conn, &revision, workspace_id)?;
         }
         Ok(())
     }
@@ -3230,6 +3241,8 @@ impl MemoryDb {
             provenance: revision.provenance,
             conflicted: false,
             due_for_review: lesson.is_due_for_review_at(captured_at_unix_seconds),
+            effectively_host_reviewed: lesson
+                .is_effectively_host_reviewed_at(captured_at_unix_seconds),
             lesson,
         })
     }
@@ -3279,6 +3292,7 @@ impl MemoryDb {
             provenance: revision.provenance,
             conflicted: false,
             due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
+            effectively_host_reviewed: lesson.is_effectively_host_reviewed_at(now_unix_seconds),
             lesson,
         }))
     }
@@ -3484,6 +3498,8 @@ impl MemoryDb {
                         provenance: row.provenance,
                         conflicted: false,
                         due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
+                        effectively_host_reviewed: lesson
+                            .is_effectively_host_reviewed_at(now_unix_seconds),
                         lesson,
                     },
                 ));
@@ -3592,6 +3608,8 @@ impl MemoryDb {
             provenance: revision.provenance,
             conflicted: false,
             due_for_review: lesson.is_due_for_review_at(captured_at_unix_seconds),
+            effectively_host_reviewed: lesson
+                .is_effectively_host_reviewed_at(captured_at_unix_seconds),
             lesson,
         })
     }
@@ -3645,6 +3663,7 @@ impl MemoryDb {
             provenance: current.provenance.clone(),
             conflicted: false,
             due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
+            effectively_host_reviewed: lesson.is_effectively_host_reviewed_at(now_unix_seconds),
             lesson,
         }))
     }
@@ -3740,6 +3759,7 @@ impl MemoryDb {
         anyhow::ensure!(!heads.is_empty(), "technical lesson has no causal head");
         for head in &heads {
             Self::validate_technical_lesson_lineage_revision(head, workspace_id)?;
+            Self::validate_host_review_audit_on(conn, head, workspace_id)?;
         }
 
         let mut expected_conflicts = if heads.len() > 1 {
@@ -3810,6 +3830,13 @@ impl MemoryDb {
         conn: &Connection,
         revision: &MemoryRevision,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !revision
+                .tags
+                .iter()
+                .any(|tag| tag == TECHNICAL_MEMORY_REVIEW_AUDIT_TAG),
+            "host-review audit revisions require the authenticated review transaction"
+        );
         let mut belongs_to_technical_lineage =
             revision.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG);
         let mut ancestor_digest = revision.parent_digest.clone();
@@ -3839,7 +3866,19 @@ impl MemoryDb {
             .workspace_id
             .as_ref()
             .context("an unbound memory store cannot contain typed technical lessons")?;
-        Self::validate_technical_lesson_lineage_revision(revision, workspace_id)
+        Self::validate_technical_lesson_lineage_revision(revision, workspace_id)?;
+        if revision.state == MemoryRevisionState::Active {
+            let lesson = TechnicalLesson::decode(&revision.content)?;
+            anyhow::ensure!(
+                lesson.review == LessonReviewState::Candidate
+                    && !revision
+                        .provenance
+                        .source_id
+                        .starts_with("host-review-receipt:"),
+                "host-review lesson revisions require the authenticated review transaction"
+            );
+        }
+        Ok(())
     }
 
     fn validate_technical_lesson_lineage_revision(
@@ -3889,6 +3928,20 @@ impl MemoryDb {
             _ => anyhow::bail!(
                 "technical lesson correction metadata does not match its causal parent"
             ),
+        }
+        match &lesson.review {
+            LessonReviewState::HostReviewed { receipt_id, .. } => {
+                anyhow::ensure!(
+                    revision.provenance.source_kind == MemorySourceKind::Explicit
+                        && revision
+                            .provenance
+                            .source_id
+                            .strip_prefix("host-review-receipt:")
+                            == Some(receipt_id.as_str()),
+                    "host-reviewed lesson lacks exact host-review provenance"
+                );
+            }
+            LessonReviewState::Candidate => {}
         }
         Ok(lesson)
     }

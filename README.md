@@ -90,6 +90,7 @@ owned by the audit and remediation slices.
 | `memory_list` | List recent typed technical lessons for the exact workspace |
 | `memory_update` | Correct one exact lesson revision through compare-and-swap causal history |
 | `memory_delete` | Delete one exact lesson revision by writing an immutable causal tombstone |
+| `memory_review` | Review or revoke one exact lesson revision using a fresh one-use host approval; review never raises confidence or creates instruction authority |
 | `memory_source_status` | Inspect and verify the explicit repository technical-lesson source without loading it into a prompt |
 | `memory_source_refresh` | Atomically import, update, rename, restore, or explicitly prune a verified repository lesson source |
 | `crosslink` | Use the embedded issue-tracking integration |

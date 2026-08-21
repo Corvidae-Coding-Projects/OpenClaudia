@@ -61,6 +61,13 @@ pub struct ToolDispatchPermit {
     invocation_id: String,
     tool_name: String,
     arguments_digest: [u8; 32],
+    host_approval: HostApprovalState,
+}
+
+enum HostApprovalState {
+    Missing,
+    Rejected(&'static str),
+    Present(Box<crate::permissions::HostApprovalEvidence>),
 }
 
 impl ToolDispatchPermit {
@@ -70,11 +77,43 @@ impl ToolDispatchPermit {
             invocation_id: invocation_id.to_string(),
             tool_name: tool_name.to_string(),
             arguments_digest: digest_arguments(args),
+            host_approval: HostApprovalState::Missing,
+        }
+    }
+
+    pub(super) fn new_with_authorization(
+        invocation_id: &str,
+        tool_name: &str,
+        args: &HashMap<String, Value>,
+        authorization: &crate::permissions::ConsumedExecutionPermit,
+        run: &super::security::ToolRunContext,
+    ) -> Self {
+        let host_approval = authorization
+            .host_approval_evidence(run, super::HOST_SAFETY_POLICY_GENERATION)
+            .map_or_else(HostApprovalState::Rejected, |evidence| {
+                HostApprovalState::Present(Box::new(evidence))
+            });
+        Self {
+            policy_generation: super::HOST_SAFETY_POLICY_GENERATION,
+            invocation_id: invocation_id.to_string(),
+            tool_name: tool_name.to_string(),
+            arguments_digest: digest_arguments(args),
+            host_approval,
         }
     }
 
     fn invocation_id(&self) -> &str {
         &self.invocation_id
+    }
+
+    const fn require_host_approval(
+        &self,
+    ) -> Result<&crate::permissions::HostApprovalEvidence, &'static str> {
+        match &self.host_approval {
+            HostApprovalState::Present(evidence) => Ok(&**evidence),
+            HostApprovalState::Missing => Err("host approval evidence is unavailable"),
+            HostApprovalState::Rejected(reason) => Err(reason),
+        }
     }
 
     fn matches(&self, tool_name: &str, args: &HashMap<String, Value>) -> bool {
@@ -1461,6 +1500,59 @@ impl ToolHandler for MemoryDeleteHandler {
     }
 }
 
+struct MemoryReviewHandler;
+impl ToolHandler for MemoryReviewHandler {
+    fn name(&self) -> &'static str {
+        "memory_review"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_MEMORY
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "MemoryReview", "logical_id")
+    }
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory_review",
+                "description": "Ask the host to review or revoke review of one exact technical-lesson revision. This call always requires a fresh one-use host approval; model, policy-default, reusable, and coordinator grants cannot create review authority. Review does not turn evidence into instructions or raise its confidence.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "action": {"type": "string", "enum": ["review", "revoke"]},
+                        "logical_id": {"type": "string", "format": "uuid"},
+                        "expected_record_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+                    },
+                    "required": ["action", "logical_id", "expected_record_digest"]
+                }
+            }
+        })
+    }
+    fn execute(
+        &self,
+        permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        let approval = match permit.require_host_approval() {
+            Ok(approval) => approval,
+            Err(reason) => {
+                return ToolHandlerResult::error(ToolFailure::new(
+                    ToolFailureCode::PermissionDenied,
+                    format!("Host review denied: {reason}"),
+                    ToolRetryability::Never,
+                ));
+            }
+        };
+        memory_tool::execute_review(ctx.memory_db, approval, args)
+    }
+}
+
 struct MemorySourceStatusHandler;
 impl ToolHandler for MemorySourceStatusHandler {
     fn name(&self) -> &'static str {
@@ -2676,6 +2768,7 @@ static HANDLERS: &[&dyn ToolHandler] = &[
     &MemoryListHandler,
     &MemoryUpdateHandler,
     &MemoryDeleteHandler,
+    &MemoryReviewHandler,
     &MemorySourceStatusHandler,
     &MemorySourceRefreshHandler,
     // todo
