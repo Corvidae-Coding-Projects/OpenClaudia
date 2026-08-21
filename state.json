@@ -1,6 +1,6 @@
 {
   "next_display_id": 1060,
-  "next_comment_id": 967,
+  "next_comment_id": 968,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15019,7 +15019,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T03:42:07.329398051Z",
-      "updated_at": "2026-08-21T04:11:22.500857910Z",
+      "updated_at": "2026-08-21T04:11:26.595926799Z",
       "labels": [
         "remediation"
       ],
@@ -15068,6 +15068,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFHMPRE82DZ6NU7nH0xg16fpuRB877FV2Kh5jUwiTm41kK8Rmjh+EOsH/WMqvux/6dYy5Yy6bL3AuNifDTHWDBA=="
+        },
+        "cff70570-ccf5-47a3-b5e1-704fe199ff8d": {
+          "display_id": 967,
+          "author": "6Vw9",
+          "content": "Generation 1 repository evidence is executable and passing: the bounded read-only exporter deterministically reproduces docs/historical-evidence/chainlink-history-v1.json at SHA-256 8b659150f95cdc08e3b6a4fd4199ef136d2a71724a2b4b5b47c3bc6aac14d2aa (209,963 bytes; 226 issues, 165 comments, 100 labels, 22 dependency edges, 3 sessions; 3 redactions). The retention record binds the exact historical commit/blobs/raw digests and remains redacted-export-only. Eleven positive/adversarial Python cases pass, the real repository checker verifies 670 tracked paths plus 8 pinned actions/4 bounded jobs/4 credential-disabled checkouts, and both root and fuzz locked cargo-deny advisory/license/source/bans gates pass. Fuzz-specific review added exact local version 0.5.0 and explicit NCSA allowance instead of weakening wildcard/license policy.",
+          "created_at": "2026-08-21T04:11:26.593295211Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2NTOaiQDGf9Am9QK5XI5uz09jlpOMujaSL+pzGB7t3LPdhJYELPnUE8FFPAzR093NQnHO2jvQFT9NE89MNa4Ag=="
         }
       }
     },
@@ -28008,11 +28017,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 551,
       "timestamp": "2026-08-21T04:11:22.500857910Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 552,
+      "timestamp": "2026-08-21T04:11:26.595926799Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T04:11:22.500857910Z",
+    "timestamp": "2026-08-21T04:11:26.595926799Z",
     "agent_id": "6Vw9",
-    "agent_seq": 551
+    "agent_seq": 552
   }
 }
