@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1075,
+  "next_display_id": 1076,
   "next_comment_id": 1052,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -392,6 +392,7 @@
     "631fbb46-8e45-470b-b9ce-8f10724b6633": 55,
     "636fa7ad-0abf-4eef-a694-81625f057077": 576,
     "637ea469-ddc5-46d4-a6b7-370879e25af4": 704,
+    "6394a3ab-59ba-4aff-800b-67fa71ef92b1": 1075,
     "63b74ccf-9147-460c-ba4f-6dbe9d2ae1f5": 1066,
     "63bb4578-bd45-4bc6-9fd9-f24fdaf0a11c": 171,
     "63c385dd-3ef1-4e59-8301-2f5a4fb473e5": 509,
@@ -10617,6 +10618,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1UDSgs3R1O7+xS1+e5yRfvR7Px8yYgA8v2nRfKpdPuNsAUH8gkJB83JKoVtJhaPDOnXVZQd0Ubh0axUbGhBcBw=="
         }
       }
+    },
+    "6394a3ab-59ba-4aff-800b-67fa71ef92b1": {
+      "uuid": "6394a3ab-59ba-4aff-800b-67fa71ef92b1",
+      "display_id": 1075,
+      "title": "S-104: Wire the team-memory replication service",
+      "description": "Implement docs/remediation-slices/104-team-memory-replication-service.md after S-103. Provide an authenticated encrypted bounded replication protocol over S-053 causal identities, durable idempotent outbox/inbox recovery, offline/concurrent conflict preservation, explicit partial/stale/unavailable outcomes, and canonical startup/tool/frontend wiring. Never use direct shared SQLite access as authorization or consistency.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T16:01:20.623148827Z",
+      "updated_at": "2026-08-21T16:01:20.623148827Z"
     },
     "63b74ccf-9147-460c-ba4f-6dbe9d2ae1f5": {
       "uuid": "63b74ccf-9147-460c-ba4f-6dbe9d2ae1f5",
@@ -29898,11 +29911,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 719,
       "timestamp": "2026-08-21T16:01:10.532361729Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 720,
+      "timestamp": "2026-08-21T16:01:20.623148827Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T16:01:10.532361729Z",
+    "timestamp": "2026-08-21T16:01:20.623148827Z",
     "agent_id": "6Vw9",
-    "agent_seq": 719
+    "agent_seq": 720
   }
 }
