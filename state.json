@@ -1,6 +1,6 @@
 {
   "next_display_id": 1074,
-  "next_comment_id": 1045,
+  "next_comment_id": 1046,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9200,10 +9200,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T14:07:17.731257893Z",
-      "updated_at": "2026-08-21T14:07:21.665134914Z",
+      "updated_at": "2026-08-21T14:07:47.971874670Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "8d5aa635-0e0e-4b2a-b9be-4af2a30672e6": {
+          "display_id": 1045,
+          "author": "6Vw9",
+          "content": "Implement S-054 in five evidence-bound layers: (1) strict current/minimum/future store validation and recoverable migration gate; (2) typed repository technical-lesson/citation/applicability/retention/correction schema on S-053 revision identity; (3) host-owned workspace-keyed authority and explicit team membership grants, never repository-selected authority; (4) bounded typed retrieval results and canonical tool registration/dispatch through every frontend; (5) remove ambient memory prompt authority and retain inferred learning/memdir ingestion for S-055/S-056. Reject any candidate whose tests merely parse prose or whose storage/retrieval path bypasses run capabilities.",
+          "created_at": "2026-08-21T14:07:47.969540160Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPC02Wzg1F0RF9mNtmyp6hHjj28y+XQm3VfBbKEmvIFiujsnVExxkwJj+JhIvUy+gy7+OfQuvMTh6aN9E02K4Cw=="
+        }
+      }
     },
     "5b072c3e-0beb-4e95-9473-d3b349860613": {
       "uuid": "5b072c3e-0beb-4e95-9473-d3b349860613",
@@ -29772,11 +29783,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 710,
       "timestamp": "2026-08-21T14:07:44.145528050Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 711,
+      "timestamp": "2026-08-21T14:07:47.971874670Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T14:07:44.145528050Z",
+    "timestamp": "2026-08-21T14:07:47.971874670Z",
     "agent_id": "6Vw9",
-    "agent_seq": 710
+    "agent_seq": 711
   }
 }
