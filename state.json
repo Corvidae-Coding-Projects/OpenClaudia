@@ -1,6 +1,6 @@
 {
   "next_display_id": 1068,
-  "next_comment_id": 1003,
+  "next_comment_id": 1004,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11337,7 +11337,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T07:49:42.777962351Z",
-      "updated_at": "2026-08-21T08:38:35.482686915Z",
+      "updated_at": "2026-08-21T08:38:49.518911672Z",
       "labels": [
         "remediation"
       ],
@@ -11386,6 +11386,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA30XDzxw97XaTxmwj5up0i4SRipC2iKplp7EFqya8f/5Su4p+RG5MY6I35HvT2pthaI1R8b2HBH5lXFiXTSmWCw=="
+        },
+        "bbb6cda7-e54c-4685-a490-acfbe283a733": {
+          "display_id": 1003,
+          "author": "6Vw9",
+          "content": "Implement one shared hermetic fuzz library, reduce all nine libFuzzer binaries to thin delegates, expose only pure bounded production seams, add reviewed seed corpora and hostile outside-sentinel coverage, enforce the fuzz crate in CI on Rust 1.98, and version the evidence-freshness policy so generated fuzz caches are excluded while curated seeds remain bound.",
+          "created_at": "2026-08-21T08:38:49.516332712Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqR9S/3OArRje+dOBzAYZ0iWML2WrtmzhGfc3B5FjjhVH3Qpluu5qlGKJc1cY8pvonA2IKVZa2NHAykiQseTsBA=="
         },
         "e4db867f-7a3a-46f7-9acd-42a3ede236a3": {
           "display_id": 998,
@@ -28866,11 +28875,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 628,
       "timestamp": "2026-08-21T08:38:35.482686915Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 629,
+      "timestamp": "2026-08-21T08:38:49.518911672Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T08:38:35.482686915Z",
+    "timestamp": "2026-08-21T08:38:49.518911672Z",
     "agent_id": "6Vw9",
-    "agent_seq": 628
+    "agent_seq": 629
   }
 }
