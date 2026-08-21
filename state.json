@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1077,
+  "next_display_id": 1078,
   "next_comment_id": 1059,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -471,6 +471,7 @@
     "78ff357c-3bf2-4d3e-91c7-27e9fadf417b": 466,
     "790e1224-eac2-4387-92bb-6162bba29c07": 325,
     "793df03a-05c0-42cf-8904-cc5c5615abf7": 859,
+    "795e038e-7ce0-45e6-96df-7ca89f0201b6": 1077,
     "7980bad4-f2d3-4b47-ac40-92cf7478bb91": 11,
     "7981ba52-0389-4ec2-9241-8dfac0bc4fe6": 964,
     "79f3fb57-dfdc-40a9-8f2d-9bc9b371f0a6": 996,
@@ -12583,6 +12584,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAhMAZPxx0ZLVzckjte6XllSByOszQh600UFCMNbaf9nKHS9MUtFwgRIJe9UcZ+QXKjlkicYdnw9vr9Ni+1ctEAw=="
         }
       }
+    },
+    "795e038e-7ce0-45e6-96df-7ca89f0201b6": {
+      "uuid": "795e038e-7ce0-45e6-96df-7ca89f0201b6",
+      "display_id": 1077,
+      "title": "S-056: Complete typed technical-memory source lifecycle",
+      "description": "Implement docs/remediation-slices/056-operational-memdir-lifecycle.md after S-054. Treat repository memory files only as untrusted, versioned sources of strict codebase TechnicalLesson candidates: descriptor-safe bounded discovery, file identity/digest/citations, explicit refresh/import/delete/rename/conflict outcomes and user controls, no ambient prompt concatenation or free-form prose authority, and retrieval only through the canonical memory tools. Preserve every intended capability while wiring it through host-owned workspace memory.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T16:51:47.731752120Z",
+      "updated_at": "2026-08-21T16:51:47.731752120Z"
     },
     "7980bad4-f2d3-4b47-ac40-92cf7478bb91": {
       "uuid": "7980bad4-f2d3-4b47-ac40-92cf7478bb91",
@@ -30055,11 +30068,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 732,
       "timestamp": "2026-08-21T16:50:46.623160045Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 733,
+      "timestamp": "2026-08-21T16:51:47.731752120Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T16:50:46.623160045Z",
+    "timestamp": "2026-08-21T16:51:47.731752120Z",
     "agent_id": "6Vw9",
-    "agent_seq": 732
+    "agent_seq": 733
   }
 }
