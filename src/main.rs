@@ -279,11 +279,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Run on-disk schema migrations before any subsystem touches the
-    // stores they manage. Failures never abort startup — the runner
-    // logs each and continues.
-    let _ =
-        openclaudia::migrations::run_all(&openclaudia::migrations::MigrationContext::from_env());
+    // A writable frontend may start only after every required persistent
+    // store reaches a known, current state. Recovery diagnostics contain
+    // stable codes and actions but never persisted paths or bytes.
+    openclaudia::migrations::run_startup()
+        .into_writable()
+        .map_err(anyhow::Error::new)?;
 
     let agent_capable_surface = cli.print.is_some()
         || matches!(
