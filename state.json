@@ -1,6 +1,6 @@
 {
   "next_display_id": 1066,
-  "next_comment_id": 999,
+  "next_comment_id": 1000,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11296,7 +11296,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T07:49:42.777962351Z",
-      "updated_at": "2026-08-21T08:22:39.691970048Z",
+      "updated_at": "2026-08-21T08:22:56.296715136Z",
       "labels": [
         "remediation"
       ],
@@ -11309,6 +11309,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdts/eNwAB6/21XgNLgJ+EbXPUwibsZ6bReEJPQsK3iH+YKlTp/t2uqYDAqCpvvd0BflDfSGK/vEd6CN3vLEfBg=="
+        },
+        "509a3db2-9b13-4a00-8070-7830fb2d783a": {
+          "display_id": 999,
+          "author": "6Vw9",
+          "content": "Full-suite containment finding: ordinary cargo test with the fuzz manifest creates the official fuzz/target cache, but the versioned evidence-freshness walker excludes only repository-root target. The 3.1 GiB ignored fuzz cache was therefore hashed as source, crossed the 1 GiB fail-closed ceiling, poisoned nine unrelated quality/final-gate tests, and stretched process timeout tests. S-003 requires a new versioned source-tree policy that excludes exact fuzz runtime and build outputs while continuing to hash curated seed-prefixed corpus files and similarly named nested source paths. Tests must prove both sides. This is necessary for an operational fuzz harness and is not being waived as runner flakiness.",
+          "created_at": "2026-08-21T08:22:56.294255323Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxJpO2DLnwFTy7wyTn6oj3wI2psGHWpuMhv79AxKkQi2fvmzNDxyAwmZ98oy6ivGBwsRgdHNGj/oBf5QN5szjDw=="
         },
         "9ae53b18-e122-4373-b31e-ff3717ccb224": {
           "display_id": 997,
@@ -28758,11 +28767,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 620,
       "timestamp": "2026-08-21T08:22:39.691970048Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 621,
+      "timestamp": "2026-08-21T08:22:56.296715136Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T08:22:39.691970048Z",
+    "timestamp": "2026-08-21T08:22:56.296715136Z",
     "agent_id": "6Vw9",
-    "agent_seq": 620
+    "agent_seq": 621
   }
 }
