@@ -1,6 +1,6 @@
 {
   "next_display_id": 1074,
-  "next_comment_id": 1051,
+  "next_comment_id": 1052,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9200,7 +9200,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T14:07:17.731257893Z",
-      "updated_at": "2026-08-21T15:23:09.227975396Z",
+      "updated_at": "2026-08-21T15:24:33.870952491Z",
       "labels": [
         "remediation"
       ],
@@ -9240,6 +9240,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPC02Wzg1F0RF9mNtmyp6hHjj28y+XQm3VfBbKEmvIFiujsnVExxkwJj+JhIvUy+gy7+OfQuvMTh6aN9E02K4Cw=="
+        },
+        "961da52f-6313-4939-ad7b-4f9e28512d74": {
+          "display_id": 1051,
+          "author": "6Vw9",
+          "content": "Correction to the preceding review receipt: after expanding the compact json! object, retention.unix_seconds was already nested inside properties; the initial impossible-schema diagnosis was mistaken. No behavioral retention repair was needed. I have retained the useful hardening change that replaces duplicated schema bounds with the canonical lesson constants and will add direct schema/host validation coverage. The ACP call-ID, README/stale-test, and SQLite no-follow findings remain valid.",
+          "created_at": "2026-08-21T15:24:33.868136304Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ82sPVqQKH8jaQ6IWHYroJ+ulQkIxJtVgeFjoqeq1MXnUu79SreCxHsKVw8TJWthtLIfsc/r2bmgI++eYb7/AQ=="
         },
         "bd523bf2-ab48-46a9-b57a-646d84aa5ce6": {
           "display_id": 1048,
@@ -29858,11 +29867,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 716,
       "timestamp": "2026-08-21T15:23:09.227975396Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 717,
+      "timestamp": "2026-08-21T15:24:33.870952491Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T15:23:09.227975396Z",
+    "timestamp": "2026-08-21T15:24:33.870952491Z",
     "agent_id": "6Vw9",
-    "agent_seq": 716
+    "agent_seq": 717
   }
 }
