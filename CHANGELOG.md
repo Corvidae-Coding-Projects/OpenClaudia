@@ -171,6 +171,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Parallel remediation wave: S-001, S-004, and S-005 (#1048)
+- S-005: Replace generic environment-key rewriting (#1051)
+- S-004: Make startup migrations fail closed (#1050)
+- S-001: Build the capability evidence registry (#1049)
+- Exclude repository worktree storage from verification source snapshots (#1057)
 - Implement and fully verify remediation slice S-031 (#1044)
 - Implement and fully verify remediation slice S-031 (#1044)
 - Implement and fully verify remediation slice S-025 (#1040)
