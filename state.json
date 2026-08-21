@@ -1,6 +1,6 @@
 {
   "next_display_id": 1063,
-  "next_comment_id": 983,
+  "next_comment_id": 984,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25183,8 +25183,17 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T06:56:56.207726032Z",
-      "updated_at": "2026-08-21T07:22:24.811764534Z",
+      "updated_at": "2026-08-21T07:22:36.181786579Z",
       "comments": {
+        "41ed848a-4c56-4acb-87b9-73f9e9fdf1b0": {
+          "display_id": 983,
+          "author": "6Vw9",
+          "content": "User correction supersedes the issue's original mixed-toolchain wording: Rust 1.98.0 is now the sole repository development, lint, build, and CI toolchain. Cargo.toml declares rust-version 1.98, rust-toolchain.toml pins 1.98.0, and the policy checker rejects floating or mismatched workflow pins. Local verification uses only Rust 1.98; CARGO_BUILD_JOBS=4 balances the 24-core/30-GiB host instead of forcing one build thread. Test execution remains --test-threads=1 because a four-thread diagnostic reproduced 48 process-global isolation races, separately tracked as #1062.",
+          "created_at": "2026-08-21T07:22:36.179274391Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZobi95VkOEFpYVdmGmRszLd/vw+BV5Uxn6m38N6jDKKDssmAK22MgvjNCUOZwdM2PptctEDGsGVhdmYk7sIfBQ=="
+        },
         "64247343-0ff4-4a46-8fe3-074f263f305f": {
           "display_id": 982,
           "author": "6Vw9",
@@ -28396,11 +28405,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 588,
       "timestamp": "2026-08-21T07:22:24.811764534Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 589,
+      "timestamp": "2026-08-21T07:22:36.181786579Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T07:22:24.811764534Z",
+    "timestamp": "2026-08-21T07:22:36.181786579Z",
     "agent_id": "6Vw9",
-    "agent_seq": 588
+    "agent_seq": 589
   }
 }
