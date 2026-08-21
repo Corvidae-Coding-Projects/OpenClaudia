@@ -3,7 +3,7 @@
   "review_id": "capability-corpus-review-v2",
   "reviewer_id": "primary-orchestrator-6vw9",
   "corpus_id": "capability-evidence-v1",
-  "corpus_sha256": "sha256:0a3e910522c1db0ec54472ffa727d5630337516ef13d26062fcf7c4183bc7c6e",
+  "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
   "verdict": "approved",
   "reviewed_scenario_ids": [
     "registry-render-success",
@@ -19,6 +19,7 @@
     "artifact_bounds_and_isolation"
   ],
   "limitations": [
+    "S-012 changed only the deterministic registry-render expected file and final-environment digests for registry generation 3; the primary reviewer rechecked that exact internal-record/header projection delta and retained every scenario, trace, effect proof, trial, and failure grader unchanged.",
     "S-006 changed only the deterministic registry-render expected file and final-environment digests for registry generation 2; the primary reviewer rechecked that exact projection delta and retained every scenario, trace, effect proof, trial, and failure grader unchanged.",
     "Independent primary review approved the frozen registry and corpus after inspecting effect proof binding, final-state grading, trace identity, input bounds, executable scenarios, and adversarial tests; approval does not promote other runtime capabilities.",
     "Three fresh deterministic trials prove repeatability only and do not add stochastic model coverage.",

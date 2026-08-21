@@ -184,12 +184,15 @@ environment.
 | `vdd.tracking.log_adversary_responses` | `OPENCLAUDIA_VDD__TRACKING__LOG_ADVERSARY_RESPONSES` | `true` or `false` / sensitive |
 | `providers.openai-compatible.base_url` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__BASE_URL` | non-empty URL string / sensitive |
 | `providers.openai-compatible.api_key` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__API_KEY` | validated API key / secret |
-| `memory.team_memory_path` | `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` | non-empty path string / sensitive |
+| `memory.team_memory_path` | `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` | reserved path proposal / currently rejected until S-053/S-054 |
 | `web_fetch.preapproved_domains` | `OPENCLAUDIA_WEB_FETCH__PREAPPROVED_DOMAINS` | JSON string array / authority-sensitive |
 
 The complete supported-name matrix, including provider aliases, parser,
 secrecy, precedence, and deprecation metadata, is exposed by
 `openclaudia::config::environment_variable_metadata()`.
+Arbitrary `OPENCLAUDIA_FEATURE_*` variables are not a supported rollout
+mechanism: no production flag catalog exists, so those names fail as unknown
+instead of silently doing nothing.
 
 ### Config File
 
@@ -297,6 +300,15 @@ openclaudia hooks status       # Review inert repository hook proposals and exac
 openclaudia hooks approve <sha256:...>  # Approve one current, digest-bound proposal
 openclaudia hooks revoke <sha256:...>   # Revoke one exact approval receipt
 ```
+
+`--verbose` opts the TUI and legacy REPL into local lifecycle analytics at
+debug level. Current lifecycle records contain an event name, a SHA-256 digest
+of the session identifier, and the final message count; they do not contain the
+raw session identifier or prompt content. Nothing is uploaded or exported. TUI
+records share the ordinary `.openclaudia/logs/` file lifecycle and remain until
+the user deletes those logs; the legacy REPL writes them to stderr. Without
+`--verbose` (or an equivalent explicit `RUST_LOG` debug filter), these records
+are not emitted.
 
 ## Slash Commands (Default TUI)
 

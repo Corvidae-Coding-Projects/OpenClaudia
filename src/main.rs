@@ -757,9 +757,10 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     let _ = openclaudia::mcp::install_manager(&run_context, &mcp_manager);
     app.set_mcp_runtime(plugin_manager, mcp_manager, trusted_mcp_servers);
     app.set_permission_bypass(dangerously_skip_permissions || !config.permissions.enabled);
-    app.set_analytics_sink(std::sync::Arc::new(
-        openclaudia::services::analytics::TracingAnalytics,
-    ));
+    app.set_service_registry(openclaudia::services::ServiceRegistry::interactive(
+        std::sync::Arc::new(openclaudia::services::analytics::TracingAnalytics),
+    ))
+    .map_err(anyhow::Error::msg)?;
     app.run()
         .await
         .map_err(|e| anyhow::anyhow!("TUI error: {e}"))

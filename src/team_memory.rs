@@ -1,5 +1,11 @@
 //! Team memory store — per-user + optional shared team scope.
 //!
+//! This prototype is preserved for S-053/S-054, but production
+//! [`crate::config::load_config`] rejects a configured team path. A shared
+//! filesystem path alone does not establish membership, logical identity, or
+//! atomic cross-store reconciliation, so frontends must not construct this as
+//! an active service yet.
+//!
 //! Crosslink #604. Parity with Claude Code's `teamMemPaths.ts`: a project
 //! may carry an additional *shared* memory directory that several users on
 //! the same project read and write together. The shared store sits **next

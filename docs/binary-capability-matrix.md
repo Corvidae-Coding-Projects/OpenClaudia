@@ -1,4 +1,4 @@
-# Binary Capability Matrix — Registry Generation 2
+# Binary Capability Matrix — Registry Generation 3
 
 Generated from `capabilities/registry.json` after typed evidence validation. Do not edit this table by hand: prose is not readiness evidence. `operational` requires reviewed executable success and failure receipts for every reachable entrypoint; other maturity labels retain their stated limitations.
 

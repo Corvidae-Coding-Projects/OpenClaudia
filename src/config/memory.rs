@@ -1,7 +1,8 @@
 //! Memory configuration.
 //!
-//! Per crosslink #604 this carries the optional path to a *team* memory
-//! directory that participates alongside the per-user memory database.
+//! Per crosslink #604 this preserves the proposed path to a *team* memory
+//! directory. Production configuration currently rejects activation until the
+//! cross-store identity and transaction work in S-053/S-054 is complete.
 //!
 //! Parity reference: Claude Code's `teamMemPaths.ts` exposes a shared
 //! memory location so multiple users on the same project share core and
@@ -17,17 +18,17 @@ use std::path::PathBuf;
 /// Memory configuration.
 ///
 /// All fields are optional; defaulting yields per-user-only behaviour
-/// (the team store is simply absent). When `team_memory_path` is set,
-/// memory operations participate against the team store in addition to
-/// the per-user store, governed by the [`MemoryScope`](crate::team_memory::MemoryScope)
-/// passed to each operation.
+/// (the team store is simply absent). Deserialization preserves the proposed
+/// field for migration and library tests, while
+/// [`crate::config::load_config`] rejects a configured path rather than
+/// silently claiming production activation.
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct MemoryConfig {
     /// Directory containing a shared team memory database.
     ///
-    /// When `Some`, the path is opened (creating it if missing) alongside
-    /// the per-user memory database. When `None`, all memory ops remain
-    /// scoped to the per-user database. Configurable via either the
+    /// When `None`, all production memory operations remain scoped to the
+    /// project database. A `Some` value is currently rejected by production
+    /// configuration loading. The proposal can be expressed via either the
     /// `[memory]` section of `config.yaml` or the canonical
     /// `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` environment variable. The exact
     /// single-underscore spelling remains a deprecated migration alias.

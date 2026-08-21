@@ -1,10 +1,10 @@
 //! Plugin-declared MCP server registry (crosslink #654, CC parity with
 //! `mcpPluginIntegration.ts`).
 //!
-//! Plugins may declare MCP servers in their manifest. On plugin load the
-//! host calls [`crate::services::ServiceRegistry::wire_plugin_mcp_servers`]
-//! to copy those declarations into the registry; on unload (or reload)
-//! [`PluginMcpRegistry::replace_plugin`] swaps the prior set in place.
+//! Plugins may declare MCP servers in their manifest. The production runtime
+//! consumes those declarations directly through `PluginManager` and
+//! `McpManager`; this transport-neutral mirror is preserved as experimental
+//! migration scaffolding and is not a runtime authority or secret store.
 //!
 //! Why a typed struct instead of `HashMap<String, McpServerConfig>`: we
 //! want to remember which *plugin* contributed each server so a

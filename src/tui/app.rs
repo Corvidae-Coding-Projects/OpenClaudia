@@ -828,6 +828,7 @@ pub struct App {
     /// tracing sink after startup resume; tests and headless users remain
     /// silent unless they explicitly provide a sink.
     analytics_subscriber: Option<crate::services::analytics::StateAnalyticsSubscriber>,
+    service_registry: crate::services::ServiceRegistry,
     /// Active permission prompt (if any). Tool execution blocks until resolved.
     pending_permission: Option<PendingPermission>,
     /// Active `ask_user_question` modal (if any). The pipeline's
@@ -922,6 +923,7 @@ impl App {
             chat_session,
             transcript_subscriber,
             analytics_subscriber: None,
+            service_registry: crate::services::ServiceRegistry::analytics_disabled(),
             pending_permission: None,
             pending_user_question: None,
             hook_engine: None,
@@ -1065,16 +1067,23 @@ impl App {
         }));
     }
 
-    /// Install the lifecycle analytics sink for the active state store.
-    pub fn set_analytics_sink(
+    /// Install the explicit lifecycle-service composition for this frontend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a caller attempts to install an analytics-disabled
+    /// registry into the interactive TUI.
+    pub fn set_service_registry(
         &mut self,
-        sink: std::sync::Arc<dyn crate::services::analytics::AnalyticsSink>,
-    ) {
-        self.analytics_subscriber =
-            Some(crate::services::analytics::StateAnalyticsSubscriber::new(
-                self.chat_session.state_store(),
-                sink,
-            ));
+        registry: crate::services::ServiceRegistry,
+    ) -> Result<(), &'static str> {
+        let Some(subscriber) = registry.analytics_subscriber(self.chat_session.state_store())
+        else {
+            return Err("interactive TUI service registry has analytics disabled");
+        };
+        self.service_registry = registry;
+        self.analytics_subscriber = Some(subscriber);
+        Ok(())
     }
 
     fn drain_state_subscribers(&mut self) {
@@ -1462,6 +1471,7 @@ impl App {
         if let Some(analytics) = self.analytics_subscriber.as_mut() {
             analytics.finish();
         }
+        debug_assert!(self.service_registry.analytics_is_enabled());
 
         // Fire SessionEnd hooks. Best-effort: the app is already exiting
         // so we can't recover from a failure, and we must not spam the

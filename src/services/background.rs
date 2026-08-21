@@ -1,6 +1,13 @@
-//! Background job scheduling — crosslink #168 Phase 1.
+//! Preserved background-job mechanics — unavailable in production.
 //!
-//! Implements a scheduling skeleton and one concrete background job:
+//! `OpenClaudia` does not construct or tick this scheduler in a production
+//! frontend. The synchronous scheduler lacks lifecycle ownership, durable
+//! leases, cancellation, budgets, and safe transactional job semantics, so
+//! [`crate::services::lifecycle_service_catalog`] classifies it as
+//! `Unavailable`. The implementation remains available for isolated tests and
+//! the follow-up slices that will complete it.
+//!
+//! The module contains a scheduling skeleton and one concrete background job:
 //! **memory consolidation** (prune expired short-term entries and
 //! deduplicate archival memories with identical content).
 //!
@@ -10,12 +17,9 @@
 //!   A job receives an [`Arc<MemoryDb>`] (the only shared resource
 //!   needed for Phase 1) and returns a [`JobOutcome`] describing what
 //!   happened.
-//! - [`JobScheduler`] holds a list of registered jobs plus a monotonic
-//!   clock of when each last ran. Callers invoke [`JobScheduler::tick`]
-//!   from whatever driving loop they own (e.g., the idle poller in
-//!   the session layer). The scheduler is deliberately **synchronous and
-//!   not tokio-aware** — the tick takes < 1 ms for typical databases,
-//!   and async wrapping is Phase 2's concern.
+//! - [`JobScheduler`] holds a list of registered jobs plus a monotonic clock of
+//!   when each last ran. Its synchronous [`JobScheduler::tick`] method is a
+//!   testable primitive, not a production lifecycle.
 //! - [`MemoryConsolidationJob`] is the only concrete job shipped in
 //!   Phase 1. It:
 //!   1. Prunes expired short-term sessions and activities via
@@ -47,7 +51,8 @@ pub struct JobOutcome {
     pub job_name: &'static str,
     /// Number of records that were removed or merged.
     pub records_pruned: usize,
-    /// Number of records that were deduplicated (merged into canonical).
+    /// Prototype deduplication/summarisation count. Existing jobs may delete a
+    /// duplicate rather than transactionally merge its metadata.
     pub records_deduped: usize,
 }
 
@@ -127,17 +132,14 @@ impl BackgroundJob for MemoryConsolidationJob {
 
 // ── Plugin auto-update job (#652) + delisting auto-uninstall (#658) ─────────
 
-/// Background poll for plugin updates (CC parity, crosslink #652).
+/// Preserved plugin-update job shape (CC parity, crosslink #652).
 ///
-/// Walks the snapshot of installed plugins on every tick and emits a
-/// structured `plugin_autoupdate_check` event per plugin. Mirrors
-/// `pluginAutoupdate.ts` from CC.
+/// Walks the supplied snapshot and emits an explicit *unavailable* diagnostic;
+/// it performs no marketplace request and never claims that it polled or
+/// updated a plugin.
 ///
-/// Phase 1 scope: scheduling slot only — the actual version-check +
-/// signed-update download lands alongside the marketplace transport
-/// layer (tracked in #652's runtime follow-up). Until then, `run`
-/// emits one event per plugin so operators can observe the polling
-/// cadence without yet downloading anything.
+/// The actual version check and signed transactional update remain owned by
+/// S-061/S-062/S-084. Production does not schedule this job.
 pub struct PluginAutoupdateJob {
     /// Discovery snapshot supplied by the caller — a list of
     /// `(plugin_id, current_version)` pairs. Cloned out of the live
@@ -162,11 +164,11 @@ impl BackgroundJob for PluginAutoupdateJob {
 
     fn run(&self, _db: &Arc<MemoryDb>) -> Result<JobOutcome> {
         for (plugin_id, version) in &self.plugins {
-            tracing::info!(
+            tracing::debug!(
                 event = "plugin_autoupdate_check",
                 plugin_id,
                 current_version = version.as_deref().unwrap_or("unknown"),
-                "polled plugin source for available update"
+                "plugin update check unavailable; no marketplace request was made"
             );
         }
         Ok(JobOutcome {
@@ -177,11 +179,11 @@ impl BackgroundJob for PluginAutoupdateJob {
     }
 }
 
-/// Background poll for plugin delisting (CC parity, crosslink #658).
+/// Preserved plugin-delisting job shape (CC parity, crosslink #658).
 ///
-/// Detects plugins delisted from their source marketplace and emits an
-/// actionable event so the operator can decide on uninstall. Mirrors
-/// `pluginBlocklist.ts::detectAndUninstallDelistedPlugins`.
+/// Emits an explicit *unavailable* diagnostic for each supplied snapshot. It
+/// performs no marketplace request and never claims that it checked or removed
+/// a plugin.
 ///
 /// Phase 1 scope mirrors [`PluginAutoupdateJob`]: scheduling slot now,
 /// marketplace transport later. The job is parameterised with the same
@@ -206,11 +208,11 @@ impl BackgroundJob for PluginDelistingJob {
 
     fn run(&self, _db: &Arc<MemoryDb>) -> Result<JobOutcome> {
         for (plugin_id, source) in &self.plugins {
-            tracing::info!(
+            tracing::debug!(
                 event = "plugin_delisting_check",
                 plugin_id,
                 source,
-                "polled marketplace for delisting status"
+                "plugin delisting check unavailable; no marketplace request was made"
             );
         }
         Ok(JobOutcome {
@@ -261,22 +263,22 @@ fn dedup_archival(db: &Arc<MemoryDb>) -> Result<usize> {
 
 // ── AgentSummary job (crosslink #635) ───────────────────────────────────────
 
-/// Periodic background summarisation of subagent state.
+/// Preserved background summarisation prototype for subagent state.
 ///
-/// Crosslink #635 — subagents accumulate per-task state (todo lists, tool
+/// Crosslink #635 — subagents accumulate per-task state (task lists, tool
 /// outputs, intermediate notes) that the parent agent rarely re-reads
 /// verbatim. This job condenses each completed subagent task's metadata
 /// into a single archival memory row tagged `agent-summary`, so the
 /// parent's `memory_search` can recall "what did the subagent do for
 /// task X?" without paging through the original turns.
 ///
-/// The job is intentionally minimal at this landing — it walks the
+/// This is not a production summarizer. It walks the
 /// memory database for rows tagged with `subagent-task:*` (the
 /// established subagent-record tag) and folds same-task rows into a
-/// single canonical summary row. The folding heuristic is the same one
-/// `extract_and_persist_memories` uses: first paragraph for asks, last
-/// paragraph for conclusions. Adding richer NLP-level summarisation is
-/// follow-up work; the dispatch seam here is what's contracted.
+/// single archival row. The prototype concatenates bounded source bodies; it
+/// does not perform a semantic summary. Safe activation requires the canonical
+/// task evidence, provenance, review, and transactional work in
+/// S-052/S-053/S-055.
 pub struct AgentSummaryJob;
 
 impl BackgroundJob for AgentSummaryJob {
@@ -286,9 +288,8 @@ impl BackgroundJob for AgentSummaryJob {
 
     fn run(&self, db: &Arc<MemoryDb>) -> Result<JobOutcome> {
         // Pull every row currently in archival memory and pick out the
-        // ones carrying a `subagent-task:*` tag. The job is rate-limited
-        // by the scheduler's interval, so a list-everything pass is
-        // acceptable here.
+        // ones carrying a `subagent-task:*` tag. This unbounded list pass is
+        // preserved prototype behavior and must not be production-scheduled.
         let rows = db.memory_list(usize::MAX)?;
         let mut by_task: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
@@ -367,7 +368,8 @@ struct ScheduledJob {
 
 /// Runs registered [`BackgroundJob`]s on a time-based schedule.
 ///
-/// The scheduler is **synchronous** — callers drive it by calling
+/// This type is an unavailable library/test primitive, not a production
+/// scheduler. It is **synchronous** — callers drive it by calling
 /// [`tick`][`JobScheduler::tick`] from their own event / idle loop.
 /// This keeps the implementation free of `tokio` dependencies so it
 /// compiles in unit-test harnesses that don't start a runtime.

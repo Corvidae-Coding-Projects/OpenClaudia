@@ -1176,8 +1176,9 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
     // Single-pass construction — no temporary clones of CompactionConfig.
     // Adding a new override field is enforced at compile time via the
     // destructuring in `CompactionConfig::apply_overrides` (crosslink #489).
-    let compactor =
-        ContextCompactor::for_model_with_overrides(&request.model, &state.compactor_overrides);
+    let compactor = crate::services::AutoCompactor::auto(
+        ContextCompactor::for_model_with_overrides(&request.model, &state.compactor_overrides),
+    );
 
     let actual_token_hint: Option<usize> = {
         let sm = state.session_manager.read().await;
@@ -1191,17 +1192,17 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
     };
 
     match compactor
-        .compact_with_hint(
+        .auto_compact(
             request,
+            actual_token_hint,
             Some(&state.hook_engine),
             &state.run_context,
             None,
-            actual_token_hint,
             None,
         )
         .await
     {
-        Ok(result) if result.compacted => {
+        Ok(Some(result)) if result.compacted => {
             let summary_len = result.summary.as_ref().map_or(0, std::string::String::len);
             info!(
                 original = result.original_tokens,
@@ -1220,7 +1221,7 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
                 )
                 .await;
         }
-        Ok(_) => {}
+        Ok(Some(_) | None) => {}
         Err(crate::compaction::CompactionError::HookBlocked(reason)) => {
             warn!(reason = %reason, "Compaction blocked by hook");
         }

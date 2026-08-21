@@ -1,5 +1,4 @@
-//! `LspServerManager` — pooled, per-language LSP server handles
-//! (crosslink #636).
+//! Preserved LSP pooling prototype — unavailable in production.
 //!
 //! Today every LSP tool call in [`crate::tools::lsp`] spawns a fresh
 //! language server, drives the initialize handshake, performs one
@@ -11,6 +10,12 @@
 //! server per language is the standard editor pattern and the same
 //! shape CC's `LSPServerManager.ts` uses.
 //!
+//! The current language-only key is not workspace-, authority-, server-, or
+//! generation-safe. Production therefore does not construct this pool;
+//! [`crate::services::lifecycle_service_catalog`] assigns safe activation to
+//! S-068/S-069. The implementation is preserved and its child ownership is
+//! still enforced so library/tests do not leak processes.
+//!
 //! ## What ships here
 //!
 //! * [`LspServerManager`] — `Arc<Mutex<HashMap<Language, ChildHandle>>>`
@@ -18,8 +23,8 @@
 //! * [`ChildHandle`] — opaque wrapper around a spawned server's pipes
 //!   plus a `last_used` timestamp so the idle reaper can evict stale
 //!   entries.
-//! * `reap_idle` — bounded sweep that closes servers idle longer than
-//!   the configured TTL.
+//! * `reap_idle` — prototype sweep that closes servers idle longer than the
+//!   configured TTL; aggregate pool size is not yet bounded.
 //!
 //! ## What is intentionally deferred
 //!
@@ -65,6 +70,15 @@ impl ChildHandle {
     }
 }
 
+impl Drop for ChildHandle {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Trait used by [`LspServerManager`] to spawn a new server when an
 /// `acquire` misses the pool.
 ///
@@ -85,10 +99,8 @@ pub trait LspSpawner: Send + Sync {
 
 /// Default idle TTL after which a pooled server is reaped: 5 minutes.
 ///
-/// Chosen to outlive interactive editing sessions (where one LSP call
-/// leads to several follow-ups within seconds) but not so long that a
-/// daemon-mode `OpenClaudia` accumulates stale `rust-analyzer`
-/// processes across hours of background idle.
+/// This prototype value is exercised only by library/tests until S-068/S-069
+/// establish the production process budget and lifecycle.
 pub const DEFAULT_IDLE_TTL: Duration = Duration::from_mins(5);
 
 /// Pooled, per-language LSP server manager (crosslink #636).
@@ -136,9 +148,9 @@ impl LspServerManager {
 
     /// Take a server handle out of the pool, spawning a fresh one on
     /// miss. Callers are expected to `release` it when their LSP
-    /// exchange is complete; if they drop it instead, the underlying
-    /// `Child::drop` will SIGKILL the process and the next `acquire`
-    /// for that language will spawn anew.
+    /// exchange is complete. Dropping an acquired [`ChildHandle`] instead
+    /// kills and waits for its child, and the next `acquire` for that language
+    /// spawns anew.
     ///
     /// # Errors
     ///
@@ -160,9 +172,10 @@ impl LspServerManager {
         let Some(mut guard) = self.inner_guard("release") else {
             return;
         };
-        // If a concurrent `acquire` already spawned a replacement
-        // for this language, drop the older one (the newer is
-        // more likely to be in a clean state).
+        // Last release wins and the displaced pooled child is reaped. The
+        // language-only prototype cannot determine which concurrently spawned
+        // server is the authoritative generation; that is one reason it stays
+        // unavailable until S-068/S-069.
         let key = handle.language.clone();
         if let Some(mut stale) = guard.insert(key, handle) {
             if let Some(mut child) = stale.child.take() {

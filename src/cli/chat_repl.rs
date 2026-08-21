@@ -195,6 +195,7 @@ pub struct ChatRepl {
     model: String,
     rl: rustyline::DefaultEditor,
     chat_session: Session,
+    service_registry: openclaudia::services::ServiceRegistry,
     analytics_subscriber: openclaudia::services::analytics::StateAnalyticsSubscriber,
     current_task_obs: Option<openclaudia::ledger::ObsId>,
     active_theme: tui::Theme,
@@ -529,10 +530,16 @@ impl ChatRepl {
         chat_session.set_permission_bypass(
             args.dangerously_skip_permissions || !config.permissions.enabled,
         );
-        let analytics_subscriber = openclaudia::services::analytics::StateAnalyticsSubscriber::new(
-            chat_session.state_store(),
-            std::sync::Arc::new(openclaudia::services::analytics::TracingAnalytics),
+        let analytics_sink: std::sync::Arc<dyn openclaudia::services::analytics::AnalyticsSink> =
+            std::sync::Arc::new(openclaudia::services::analytics::TracingAnalytics);
+        let service_registry = openclaudia::services::ServiceRegistry::interactive(
+            std::sync::Arc::clone(&analytics_sink),
         );
+        let Some(analytics_subscriber) =
+            service_registry.analytics_subscriber(chat_session.state_store())
+        else {
+            anyhow::bail!("interactive REPL service registry has analytics disabled");
+        };
 
         let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id())?;
         let memory_db: Option<memory::MemoryDb> = init_memory_with_banner();
@@ -574,6 +581,7 @@ impl ChatRepl {
             model,
             rl,
             chat_session,
+            service_registry,
             analytics_subscriber,
             current_task_obs: None,
             active_theme: tui::Theme::load(),
@@ -636,6 +644,7 @@ impl ChatRepl {
             &self.history_path,
         );
         self.analytics_subscriber.finish();
+        debug_assert!(self.service_registry.analytics_is_enabled());
         let end_input = openclaudia::hooks::HookInput::for_run(
             &self.run_context,
             openclaudia::hooks::HookEvent::SessionEnd,

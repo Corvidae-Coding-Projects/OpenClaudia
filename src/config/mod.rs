@@ -276,6 +276,17 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         return Err(ConfigError::Message(e));
     }
 
+    // `TeamMemoryStore` is preserved, but its current numeric-ID merge and
+    // two-database write semantics are not safe to activate in production.
+    // Reject the configured claim instead of silently opening only the project
+    // store and pretending the team path participated.
+    if config.memory.team_memory_path.is_some() {
+        return Err(ConfigError::Message(
+            "memory.team_memory_path is currently unavailable: cross-store logical identity and atomic reconciliation are incomplete (tracked by S-053/S-054)"
+                .to_string(),
+        ));
+    }
+
     // Validate each provider's base_url for SSRF / scheme safety (crosslink #329).
     let mut names: Vec<&String> = config.providers.keys().collect();
     names.sort();

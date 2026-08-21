@@ -741,12 +741,15 @@ impl AcpServer {
     ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
         let session_id = crate::state::SessionId::from_raw(openclaudia_session_id)
             .map_err(|error| format!("Invalid OpenClaudia session id: {error}"))?;
-        self.launch_capabilities.derive_frontend_session(
+        let run = self.launch_capabilities.derive_frontend_session(
             session_id,
             &self.launch_root,
             &self.launch_root,
             &self.config.proxy.target,
-        )
+        )?;
+        crate::guardrails::configure(&run, &self.config.guardrails)
+            .map_err(|error| format!("Cannot configure ACP guardrails: {error}"))?;
+        Ok(run)
     }
 
     fn run_context_for_acp(
@@ -3989,6 +3992,33 @@ permissions:
         assert_ne!(first.run_id(), second.run_id());
         assert_ne!(first.generation(), second.generation());
         assert_ne!(first.private_temp_root(), second.private_temp_root());
+    }
+
+    #[test]
+    fn production_session_run_binds_the_loaded_guardrail_policy() {
+        let (mut server, _rx, _tmp) = test_server();
+        server.config.guardrails = serde_yaml::from_str(
+            r"
+blast_radius:
+  enabled: true
+  mode: strict
+  denied_paths:
+    - '.env'
+",
+        )
+        .expect("strict ACP guardrails");
+
+        let session_id = crate::state::SessionId::new();
+        let run = server
+            .build_run_context(session_id.as_str())
+            .expect("guardrail-bound ACP run");
+        let rejection = crate::guardrails::check_file_access(&run, ".env")
+            .expect_err("ACP run must enforce its configured deny rule");
+        assert!(
+            rejection.contains("matches deny list pattern"),
+            "{rejection}"
+        );
+        crate::tools::retire_run(&run);
     }
 
     fn next_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {

@@ -26,13 +26,11 @@
 //!
 //! ## Why a service and not just a fn
 //!
-//! Keeping this in `services::` puts it in the same dispatch graph as
-//! `analytics` / `feature_flags` etc., so future call sites can lift it
-//! out of `ServiceRegistry` instead of constructing one ad-hoc. The
-//! current registry doesn't carry an `AutoCompactor` slot yet (the
-//! compactor needs per-request configuration that `ServiceRegistry`'s
-//! shared-instance model doesn't fit), but the dependency direction is
-//! correct: services depend on compaction, not the other way around.
+//! The proxy constructs this typed owner per request because model-specific
+//! compaction overrides do not fit a shared global registry. Its production
+//! disposition is recorded in `services::lifecycle_service_catalog`; keeping
+//! the dependency explicit avoids hiding request authority in a service
+//! locator.
 
 use std::sync::Arc;
 

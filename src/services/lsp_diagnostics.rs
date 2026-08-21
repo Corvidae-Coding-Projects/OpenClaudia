@@ -1,5 +1,4 @@
-//! Passive LSP diagnostic accumulation + conversation injection
-//! (crosslinks #638 + #640).
+//! Preserved LSP diagnostic staging — unavailable in production.
 //!
 //! Language servers emit `textDocument/publishDiagnostics` notifications
 //! asynchronously: a request like `goToDefinition` triggers a full
@@ -10,9 +9,15 @@
 //! signal the LSP exposes — the agent never learns it just edited a
 //! file into a broken state.
 //!
+//! Production does not construct this registry or inject its rendered text.
+//! The current shape lacks workspace/generation/document-version identity,
+//! aggregate byte budgets, and an untrusted-evidence boundary. Safe activation
+//! remains assigned to S-068/S-069 in
+//! [`crate::services::lifecycle_service_catalog`].
+//!
 //! ## What ships
 //!
-//! * [`Diagnostic`] — wire-compatible projection of an LSP diagnostic.
+//! * [`Diagnostic`] — lossy staging projection of an LSP diagnostic.
 //! * [`DiagnosticRegistry`] — thread-safe accumulator keyed by file
 //!   URI; the LSP tool layer (forthcoming) will push notifications
 //!   here.
@@ -20,8 +25,8 @@
 //!   (`session.rs` / `pipeline.rs`) implements to splice the
 //!   accumulated diagnostics into the next assistant turn as a
 //!   `<lsp-diagnostics>` block.
-//! * [`NoopDiagnosticInjector`] — safe default that drops the
-//!   diagnostics on the floor (used in non-interactive headless mode).
+//! * [`NoopDiagnosticInjector`] — explicit library/test discard behavior; it
+//!   is not a production fallback.
 //!
 //! ## Where it plugs in (later)
 //!
@@ -92,12 +97,11 @@ pub struct Diagnostic {
     pub source: Option<String>,
 }
 
-/// Thread-safe accumulator (crosslink #638).
+/// Thread-safe staging accumulator (crosslink #638).
 ///
-/// Implements a simple bounded-FIFO per URI: the most recent N
-/// diagnostics per file are retained, older entries are evicted. The
-/// cap keeps a runaway server (clangd over a large project frequently
-/// emits hundreds of warnings) from blowing up the registry's memory.
+/// A per-URI count cap truncates each supplied vector. URI count and aggregate
+/// bytes remain unbounded, and the type carries no ordering/version proof;
+/// callers must not treat it as a production bounded FIFO.
 pub struct DiagnosticRegistry {
     inner: Mutex<HashMap<String, Vec<Diagnostic>>>,
     per_file_cap: usize,

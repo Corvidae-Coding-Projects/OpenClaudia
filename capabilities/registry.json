@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generation": 2,
+  "generation": 3,
   "capabilities": [
     {
       "id": "interactive-tui",
@@ -232,6 +232,28 @@
       "evidence_ids": []
     },
     {
+      "id": "lifecycle-service-reachability",
+      "display_name": "Lifecycle service reachability",
+      "visibility": "internal",
+      "maturity": "partial",
+      "summary": "Validates an immutable catalog that distinguishes wired services from disabled, experimental, unavailable, and test-only implementations.",
+      "limitation": "The typed catalog and deterministic tests bind current analytics, compaction, and fail-closed configuration paths; artifact-bound VDD evidence remains pending S-088, and incomplete background, team-memory, LSP, feature-rollout, and shadow MCP implementations are not promoted.",
+      "entrypoints": [
+        {
+          "id": "services.lifecycle-catalog",
+          "kind": "library_api",
+          "invocation": "services::lifecycle_service_catalog",
+          "reachability": "reachable",
+          "required_failure_modes": []
+        }
+      ],
+      "required_effects": [
+        { "id": "services.trace", "kind": "trace_emission", "expectation": "must_occur", "description": "A future operational promotion must bind construction, consumer, and shutdown events." },
+        { "id": "services.silent-activation", "kind": "session_mutation", "expectation": "must_not_occur", "description": "Unavailable or test-only services must never activate silently." }
+      ],
+      "evidence_ids": []
+    },
+    {
       "id": "capability-evidence-registry",
       "display_name": "Capability evidence registry",
       "visibility": "internal",
@@ -263,7 +285,7 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-render-success",
       "coverage": { "kind": "success" },
-      "corpus_sha256": "sha256:0a3e910522c1db0ec54472ffa727d5630337516ef13d26062fcf7c4183bc7c6e",
+      "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
       "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {
@@ -282,9 +304,9 @@
         "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a"
       },
       "receipts": [
-        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:baa1cd765448ca33cf10e9f031e4100a725ff7f902317a548deba0f2017f6627", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
-        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:baa1cd765448ca33cf10e9f031e4100a725ff7f902317a548deba0f2017f6627", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
-        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:baa1cd765448ca33cf10e9f031e4100a725ff7f902317a548deba0f2017f6627", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" }
+        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:e04d0c4861c2620a2cc18feb4d1b9d70206a31e124303f21c3eedf1bd56e1791", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
+        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:e04d0c4861c2620a2cc18feb4d1b9d70206a31e124303f21c3eedf1bd56e1791", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
+        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:e04d0c4861c2620a2cc18feb4d1b9d70206a31e124303f21c3eedf1bd56e1791", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" }
       ]
     },
     {
@@ -293,7 +315,7 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-rejects-docs-only",
       "coverage": { "kind": "failure", "failure_mode": "documentation_only_claim" },
-      "corpus_sha256": "sha256:0a3e910522c1db0ec54472ffa727d5630337516ef13d26062fcf7c4183bc7c6e",
+      "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
       "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {
@@ -322,7 +344,7 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-rejects-missing-failure-evidence",
       "coverage": { "kind": "failure", "failure_mode": "missing_failure_evidence" },
-      "corpus_sha256": "sha256:0a3e910522c1db0ec54472ffa727d5630337516ef13d26062fcf7c4183bc7c6e",
+      "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
       "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {

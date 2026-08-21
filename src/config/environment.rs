@@ -2021,8 +2021,7 @@ fn is_openclaudia_name(name: &OsStr) -> bool {
 }
 
 fn is_external_openclaudia_variable(name: &str) -> bool {
-    name.starts_with("OPENCLAUDIA_FEATURE_")
-        || name.starts_with("OPENCLAUDIA_TEST_")
+    name.starts_with("OPENCLAUDIA_TEST_")
         || matches!(
             name,
             "OPENCLAUDIA_ACP__MAX_ITERATIONS"

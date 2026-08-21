@@ -1,11 +1,11 @@
-//! Rate-limit mocking for dev/test (crosslink #639).
+//! Test-only rate-limit state machine (crosslink #639).
 //!
 //! Most provider SDKs return `429 Too Many Requests` with a
 //! `Retry-After: N` header (or equivalent JSON body) under quota
-//! pressure. `OpenClaudia` handles those at the proxy layer, but the
-//! handling is exercised only by live API calls — and exhausting
-//! Anthropic's actual quota during a unit test is a non-starter. This
-//! module is the fake the test layer plugs in.
+//! pressure. This implementation is not connected to any provider or proxy
+//! transport, so it must not be mistaken for retry coverage. The lifecycle
+//! catalog classifies it as `TestOnly`; S-048/S-050 own relocation to the real
+//! transport seam with retry/cancellation assertions.
 //!
 //! ## What ships
 //!
@@ -17,18 +17,13 @@
 //! * `record_call` / `next_response` pair so tests can step through
 //!   the mock without relying on wall-clock timing.
 //!
-//! ## Where it plugs in (later)
-//!
-//! The proxy's provider-call path will call `next_response()` *before*
-//! issuing the live request. When the mock is `Throttle`d, the proxy
-//! short-circuits with the synthetic 429 instead of talking to the
-//! upstream. The wiring is the follow-up — this commit lands the seam.
+//! It deliberately has no production installation path.
 
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tracing::error;
 
-/// What the next live request should observe under mock pressure.
+/// What the next directly simulated request observes under mock pressure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockResponse {
     /// Request proceeds as normal — the mock is dormant.
@@ -37,16 +32,15 @@ pub enum MockResponse {
     Throttle {
         /// Suggested back-off duration the proxy emits to the model.
         retry_after: Duration,
-        /// Optional human-readable reason; pipes through to the
-        /// `429` response body so tests can assert on the wording.
+        /// Optional human-readable fixture reason.
         reason: String,
     },
 }
 
-/// Trait for any dev/test rate-limit emulator. Production code uses
-/// `()` for "no mock installed"; tests install [`MockRateLimit`].
+/// Trait for an isolated rate-limit emulator. No production transport installs
+/// this trait; tests call [`MockRateLimit`] directly.
 pub trait RateLimitMock: Send + Sync {
-    /// What the proxy should do for the *next* outbound request.
+    /// Advance the fixture state for the next simulated request.
     fn next_response(&self) -> MockResponse;
 
     /// Record that a live request was actually sent. Used by mocks

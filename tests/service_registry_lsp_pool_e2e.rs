@@ -1,5 +1,5 @@
-//! End-to-end tests for `ServiceRegistry` accessor + override
-//! semantics, plus `LspServerManager` pool lifecycle.
+//! End-to-end tests for explicit lifecycle-service composition plus the
+//! preserved, currently unavailable `LspServerManager` implementation.
 //!
 //! Sprint 47 of the verification effort.
 
@@ -9,8 +9,9 @@
 
 use anyhow::Result;
 use openclaudia::services::{
-    AnalyticsEvent, AnalyticsSink, ChildHandle, LspServerManager, LspSpawner, NoopAnalytics,
-    ServiceRegistry, StaticFlags,
+    lifecycle_service_catalog, AnalyticsEvent, AnalyticsSink, ChildHandle,
+    LifecycleServiceClassification, LifecycleServiceId, LspServerManager, LspSpawner,
+    ServiceRegistry,
 };
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,71 +74,41 @@ impl LspSpawner for SleepSpawner {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — ServiceRegistry::noop
+// Section A — explicit analytics composition
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn noop_registry_returns_noop_analytics_by_default() {
-    let reg = ServiceRegistry::noop();
-    // analytics().record(...) on the noop sink must not panic
-    // and must not record (NoopAnalytics drops events).
-    reg.analytics()
-        .record(AnalyticsEvent::PromptSubmitted { prompt_chars: 1 });
-    // No assertion needed — the contract is "no panic, no
-    // observable side effect" which the test exercises by
-    // construction.
+fn disabled_registry_exposes_absence_instead_of_a_noop_claim() {
+    let registry = ServiceRegistry::analytics_disabled();
+    assert!(!registry.analytics_is_enabled());
+    assert!(registry.analytics().is_none());
+    assert!(registry.analytics_arc().is_none());
 }
 
 #[test]
-fn noop_registry_returns_default_static_flags_by_default() {
-    let reg = ServiceRegistry::noop();
-    // Default flags are all-false.
-    assert!(!reg.flags().is_enabled("any_unset_flag"));
-    assert!(!reg.flags().is_enabled("another_unset_flag"));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — with_analytics + with_flags swap
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn with_analytics_swaps_the_sink_observably() {
+fn interactive_registry_routes_to_the_required_sink() {
     let capturing = Arc::new(CapturingSink::default());
-    let reg = ServiceRegistry::noop().with_analytics(capturing.clone());
-    reg.analytics().record(AnalyticsEvent::SessionStart {
-        session_id: "s1".to_string(),
-    });
-    reg.analytics().record(AnalyticsEvent::ToolUsed {
-        tool: "bash".to_string(),
-        success: true,
-    });
-    // The capturing sink saw both events.
-    assert_eq!(
-        capturing.len(),
-        2,
-        "with_analytics swap MUST route through to the new sink"
-    );
-}
-
-#[test]
-fn with_flags_swaps_the_flag_source_observably() {
-    let mut flags = StaticFlags::new();
-    flags.set("my_feature", true);
-    let reg = ServiceRegistry::noop().with_flags(Arc::new(flags));
-    assert!(reg.flags().is_enabled("my_feature"));
-    assert!(!reg.flags().is_enabled("not_set"));
+    let registry = ServiceRegistry::interactive(capturing.clone());
+    registry
+        .analytics()
+        .expect("interactive sink")
+        .record(AnalyticsEvent::ToolUsed {
+            tool: "bash".to_string(),
+            success: true,
+        });
+    assert_eq!(capturing.len(), 1);
 }
 
 #[test]
 fn registry_is_clone_cheap_and_sinks_are_shared() {
     let capturing = Arc::new(CapturingSink::default());
-    let reg1 = ServiceRegistry::noop().with_analytics(capturing.clone());
+    let reg1 = ServiceRegistry::interactive(capturing.clone());
     let reg2 = reg1.clone();
-    // Recording through reg1 and reg2 hits the same Arc'd
-    // sink — both events visible.
     reg1.analytics()
+        .expect("interactive sink")
         .record(AnalyticsEvent::ThinkingEmitted { budget: 1000 });
     reg2.analytics()
+        .expect("interactive sink")
         .record(AnalyticsEvent::ThinkingEmitted { budget: 2000 });
     assert_eq!(
         capturing.len(),
@@ -147,14 +118,14 @@ fn registry_is_clone_cheap_and_sinks_are_shared() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section C — analytics_arc / flags_arc shared-ownership escape hatch
+// Section B — audited classification
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn analytics_arc_returns_shared_arc_pointing_at_same_sink() {
     let capturing = Arc::new(CapturingSink::default());
-    let reg = ServiceRegistry::noop().with_analytics(capturing.clone());
-    let cloned_arc = reg.analytics_arc();
+    let reg = ServiceRegistry::interactive(capturing.clone());
+    let cloned_arc = reg.analytics_arc().expect("interactive sink");
     cloned_arc.record(AnalyticsEvent::PromptSubmitted { prompt_chars: 42 });
     assert_eq!(
         capturing.len(),
@@ -164,49 +135,26 @@ fn analytics_arc_returns_shared_arc_pointing_at_same_sink() {
 }
 
 #[test]
-fn flags_arc_returns_shared_arc_pointing_at_same_source() {
-    let mut flags = StaticFlags::new();
-    flags.set("on", true);
-    let reg = ServiceRegistry::noop().with_flags(Arc::new(flags));
-    let cloned_arc = reg.flags_arc();
-    assert!(cloned_arc.is_enabled("on"));
-    assert!(!cloned_arc.is_enabled("off"));
+fn lsp_pool_and_diagnostics_are_not_misreported_as_production_services() {
+    for id in [
+        LifecycleServiceId::LspPool,
+        LifecycleServiceId::LspDiagnostics,
+    ] {
+        let registration = lifecycle_service_catalog()
+            .iter()
+            .find(|registration| registration.id() == id)
+            .expect("catalog row");
+        assert_eq!(
+            registration.classification(),
+            LifecycleServiceClassification::Unavailable
+        );
+        assert!(registration.path().is_none());
+        assert!(registration.follow_up().is_some());
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — plugin MCP registrations
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn fresh_registry_has_no_plugin_mcp_registrations() {
-    let reg = ServiceRegistry::noop();
-    let registrations = reg.plugin_mcp_registrations();
-    assert!(
-        registrations.is_empty(),
-        "fresh registry MUST have no plugin MCP registrations"
-    );
-}
-
-#[test]
-fn wire_plugin_mcp_servers_with_empty_iter_is_no_op() {
-    let reg = ServiceRegistry::noop();
-    reg.wire_plugin_mcp_servers(std::iter::empty());
-    assert!(reg.plugin_mcp_registrations().is_empty());
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section E — NoopAnalytics + StaticFlags type-equality with registry default
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn noop_analytics_sink_can_be_installed_explicitly() {
-    let _reg = ServiceRegistry::noop().with_analytics(Arc::new(NoopAnalytics));
-    // Compile-time check: NoopAnalytics implements AnalyticsSink
-    // such that Arc<NoopAnalytics> coerces to Arc<dyn AnalyticsSink>.
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section F — LspServerManager spawn + acquire
+// Section C — preserved LspServerManager mechanics
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -216,9 +164,20 @@ fn lsp_acquire_spawns_a_new_child_on_first_call_for_language() {
     let handle = mgr.acquire("rust").expect("acquire rust");
     assert_eq!(handle.language, "rust");
     assert!(handle.child.is_some());
+    let pid = handle.child.as_ref().map(Child::id).expect("child pid");
     assert_eq!(count.load(Ordering::SeqCst), 1, "first acquire MUST spawn");
-    // Cleanup: kill the child via the handle's Drop.
+    // Cleanup is part of the handle contract, not a test-only courtesy.
     drop(handle);
+    let still_alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .expect("inspect dropped child")
+        .status
+        .success();
+    assert!(
+        !still_alive,
+        "dropping an acquired handle must reap child {pid}"
+    );
 }
 
 #[test]
@@ -287,10 +246,16 @@ fn lsp_release_after_concurrent_spawn_kills_displaced_child() {
     mgr.release(handle_a);
     // Verify: the pool size is 1.
     assert_eq!(mgr.len(), 1);
-    // The displaced B is dead — confirm by attempting a kill
-    // on the pid (we don't have a direct handle, so this is
-    // best-effort).
-    let _ = pid_b; // just silence unused
+    let displaced_still_alive = Command::new("kill")
+        .args(["-0", &pid_b.to_string()])
+        .output()
+        .expect("inspect displaced child")
+        .status
+        .success();
+    assert!(
+        !displaced_still_alive,
+        "releasing a competing generation must reap displaced child {pid_b}"
+    );
 }
 
 #[test]
