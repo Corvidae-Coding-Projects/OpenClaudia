@@ -1,6 +1,6 @@
 {
   "next_display_id": 1079,
-  "next_comment_id": 1073,
+  "next_comment_id": 1074,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -2289,11 +2289,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T18:03:37.187217446Z",
-      "updated_at": "2026-08-21T18:06:38.914170593Z",
+      "updated_at": "2026-08-21T18:21:28.624611268Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "03197ebd-6b2b-46a3-a2fa-f7216ae9d4b5": {
+          "display_id": 1073,
+          "author": "6Vw9",
+          "content": "[action] S-106 preflight: mapping exact host approval receipt consumption, causal review transitions, complete portable export/import, and every frontend/runtime caller before edits",
+          "created_at": "2026-08-21T18:21:28.622186528Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAb7+u/L4f8KMq2LlCmEJszmdJ/xT5RsUtlLipgd73vrvTR5t50dHvwdTar6VyzJ6wLKwtYPznKUT9FUlfLNuOAQ=="
+        },
         "9701fee4-6bb9-4e78-88f5-05f7431bf2c0": {
           "display_id": 1067,
           "author": "6Vw9",
@@ -30345,11 +30354,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 756,
       "timestamp": "2026-08-21T18:21:23.942675252Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 757,
+      "timestamp": "2026-08-21T18:21:28.624611268Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T18:21:23.942675252Z",
+    "timestamp": "2026-08-21T18:21:28.624611268Z",
     "agent_id": "6Vw9",
-    "agent_seq": 756
+    "agent_seq": 757
   }
 }
