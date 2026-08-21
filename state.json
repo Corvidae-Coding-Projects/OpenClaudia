@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1066,
+  "next_display_id": 1067,
   "next_comment_id": 1001,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -386,6 +386,7 @@
     "631fbb46-8e45-470b-b9ce-8f10724b6633": 55,
     "636fa7ad-0abf-4eef-a694-81625f057077": 576,
     "637ea469-ddc5-46d4-a6b7-370879e25af4": 704,
+    "63b74ccf-9147-460c-ba4f-6dbe9d2ae1f5": 1066,
     "63bb4578-bd45-4bc6-9fd9-f24fdaf0a11c": 171,
     "63c385dd-3ef1-4e59-8301-2f5a4fb473e5": 509,
     "6498f85a-d3f9-442d-95d5-e2a974e1c870": 944,
@@ -10284,6 +10285,17 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1UDSgs3R1O7+xS1+e5yRfvR7Px8yYgA8v2nRfKpdPuNsAUH8gkJB83JKoVtJhaPDOnXVZQd0Ubh0axUbGhBcBw=="
         }
       }
+    },
+    "63b74ccf-9147-460c-ba4f-6dbe9d2ae1f5": {
+      "uuid": "63b74ccf-9147-460c-ba4f-6dbe9d2ae1f5",
+      "display_id": 1066,
+      "title": "Stop flagging Rust fixture strings as implementation stubs",
+      "description": "The customized post-edit checker scans string literals in Rust tests and reports fixture text such as pub fn old with an empty body as a production stub. This creates false mandatory remediation output after unrelated edits. Parse or scope Rust code structurally, or exclude literal fixture contents, while retaining detection of actual unfinished implementation bodies.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T08:24:04.813461740Z",
+      "updated_at": "2026-08-21T08:24:04.813461740Z"
     },
     "63bb4578-bd45-4bc6-9fd9-f24fdaf0a11c": {
       "uuid": "63bb4578-bd45-4bc6-9fd9-f24fdaf0a11c",
@@ -28786,11 +28798,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 622,
       "timestamp": "2026-08-21T08:23:00.436210054Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 623,
+      "timestamp": "2026-08-21T08:24:04.813461740Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T08:23:00.436210054Z",
+    "timestamp": "2026-08-21T08:24:04.813461740Z",
     "agent_id": "6Vw9",
-    "agent_seq": 622
+    "agent_seq": 623
   }
 }
