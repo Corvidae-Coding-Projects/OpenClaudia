@@ -201,3 +201,28 @@ pretending the model-facing bounded list is either authority or export.
 Canonical alternate-model VDD remains pending S-088 and prevents this slice
 from being marked `Verified`; it does not make the implemented deterministic
 gates disappear.
+
+## Corrective follow-up: source-owned host review (#1080)
+
+The source lifecycle now treats a valid host review or revocation as a linked
+causal transition rather than external head drift. Before mutation, the review
+transaction captures the exact coherent source membership. It then publishes
+the lesson successor, immutable host-review audit, and source-state successor
+under the same SQLite `BEGIN IMMEDIATE` transaction. Failure to publish any one
+record rolls back all three.
+
+Source status accepts a reviewed member only when a bounded audit-valid review
+lineage terminates at the exact imported `source_id`/`lesson_id` provenance.
+This prevents a portable or locally forged state from laundering an ordinary
+agent correction into source ownership. Review preserves that rejection as a
+typed conflict rather than relabeling it as an external store failure. Ordinary
+`memory_update` and `memory_delete` operations still leave the source lifecycle
+in a typed conflict until an explicit source refresh reconciles it, and drift in
+one source member does not prevent review of an unrelated lesson.
+
+The corrective Rust 1.98.0 gates passed with four build jobs and one test
+thread: source lifecycle 17/17, review E2E 7/7, internal review 9/9, portable
+memory 5/5, and technical memory 18/18. Locked all-feature/all-target check,
+strict Clippy, the complete all-target test command, and Windows GNU
+all-feature/all-target check also passed. The Windows warnings remained
+target-conditional code outside this corrective change.

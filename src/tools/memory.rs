@@ -1067,4 +1067,7 @@ fn store_error(operation: &str, error: &anyhow::Error) -> ToolHandlerResult {
 
 fn is_conflict_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<TechnicalLessonStoreError>().is_some()
+        || error
+            .downcast_ref::<TechnicalMemorySourceStoreError>()
+            .is_some()
 }

@@ -13,10 +13,11 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use openclaudia::memory::{
-    MemoryDb, MemoryDigest, MemorySourceEvidence, MemorySourceKind, TechnicalLessonDraft,
-    TechnicalMemorySourcePresence, TechnicalMemorySourceStoreStatus,
+    ApplyRevisionOutcome, MemoryDb, MemoryDigest, MemorySourceEvidence, MemorySourceKind,
+    TechnicalLessonDraft, TechnicalMemorySourcePresence, TechnicalMemorySourceStoreStatus,
+    TECHNICAL_MEMORY_REVIEW_AUDIT_TAG, TECHNICAL_MEMORY_SOURCE_TAG,
 };
-use openclaudia::permissions::PermissionManager;
+use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
 use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
 use openclaudia::tools::{ToolFailureCode, ToolOutcome, ToolResult, ToolRunContext};
 use rusqlite::{params, Connection};
@@ -85,6 +86,29 @@ fn execute_on(
         task_mgr: None,
         permission_mgr: &manager,
         authorization: None,
+        session_id: Some("s056-e2e"),
+        policy_enforcer: None,
+    })
+}
+
+fn execute_with_host_approval(fixture: &Fixture, name: &str, arguments: Value) -> ToolResult {
+    let manager = PermissionManager::unrestricted_for_run(&fixture.run);
+    let Value::Object(arguments) = arguments else {
+        panic!("tool arguments must be an object");
+    };
+    let arguments: HashMap<_, _> = arguments.into_iter().collect();
+    let call = support::tool_call(name, &arguments);
+    let permit = manager
+        .approve_tool_call_once(&call, Some("s056-e2e"), ApprovalProvenance::InteractiveUser)
+        .expect("fresh host approval");
+    ToolExecutor::execute(ToolExecutorRequest {
+        run_context: &fixture.run,
+        tool_call: &call,
+        memory_db: Some(&fixture.db),
+        app_config: None,
+        task_mgr: None,
+        permission_mgr: &manager,
+        authorization: Some(permit),
         session_id: Some("s056-e2e"),
         policy_enforcer: None,
     })
@@ -220,6 +244,39 @@ fn assert_failure(result: &ToolResult, expected: ToolFailureCode) {
     }
 }
 
+fn review_record(fixture: &Fixture, action: &str, record: &Value) -> ToolResult {
+    execute_with_host_approval(
+        fixture,
+        "memory_review",
+        json!({
+            "action": action,
+            "logical_id": record["logical_id"],
+            "expected_record_digest": record["record_digest"],
+        }),
+    )
+}
+
+fn assert_source_member_head(fixture: &Fixture, expected_record_digest: &str) -> MemoryDigest {
+    match fixture
+        .db
+        .technical_memory_source_status()
+        .expect("source status")
+    {
+        TechnicalMemorySourceStoreStatus::Ready {
+            state_record_digest,
+            state,
+        } => {
+            assert_eq!(state.members.len(), 1);
+            assert_eq!(
+                state.members[0].record_digest.as_str(),
+                expected_record_digest
+            );
+            state_record_digest
+        }
+        other => panic!("expected ready source state, got {other:?}"),
+    }
+}
+
 #[test]
 fn import_update_and_exact_replay_preserve_causal_identity() {
     let fixture = Fixture::new();
@@ -304,6 +361,344 @@ fn import_update_and_exact_replay_preserve_causal_identity() {
     assert_eq!(updated["status"], "updated");
     assert_eq!(current_source(&fixture).0, third_source);
     assert_eq!(one_record(&fixture)["version"], 3);
+}
+
+#[test]
+fn host_review_and_revocation_advance_the_source_member_in_the_same_transaction() {
+    let fixture = Fixture::new();
+    let source_digest = write_manifest(
+        &fixture,
+        "MEMORY.md",
+        1,
+        Some("Descriptor-safe publication keeps host review and source state coherent."),
+    );
+    refresh_value(&fixture, None, false);
+    let candidate = one_record(&fixture);
+    let initial_state_digest = assert_source_member_head(
+        &fixture,
+        candidate["record_digest"]
+            .as_str()
+            .expect("candidate digest"),
+    );
+
+    let reviewed = review_record(&fixture, "review", &candidate);
+    assert!(
+        !reviewed.is_error(),
+        "review failed: {}",
+        reviewed.content()
+    );
+    let reviewed_digest = reviewed.structured().expect("review result")["record_digest"]
+        .as_str()
+        .expect("reviewed digest")
+        .to_string();
+    let reviewed_state_digest = assert_source_member_head(&fixture, &reviewed_digest);
+    assert_ne!(reviewed_state_digest, initial_state_digest);
+    assert_eq!(current_source(&fixture).0, source_digest);
+    let replayed_source = refresh_value(&fixture, None, false);
+    assert_eq!(replayed_source["status"], "unchanged");
+    assert_eq!(current_source(&fixture).1, reviewed_state_digest);
+
+    let reviewed_record = one_record(&fixture);
+    let revoked = review_record(&fixture, "revoke", &reviewed_record);
+    assert!(!revoked.is_error(), "revoke failed: {}", revoked.content());
+    let revoked_digest = revoked.structured().expect("revoke result")["record_digest"]
+        .as_str()
+        .expect("revoked digest")
+        .to_string();
+    let revoked_state_digest = assert_source_member_head(&fixture, &revoked_digest);
+    assert_ne!(revoked_state_digest, reviewed_state_digest);
+    assert_eq!(current_source(&fixture).0, source_digest);
+    let replayed_source = refresh_value(&fixture, None, false);
+    assert_eq!(replayed_source["status"], "unchanged");
+    assert_eq!(current_source(&fixture).1, revoked_state_digest);
+
+    let conn = Connection::open(fixture.db.path()).expect("open memory store");
+    let source_revisions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_revisions revision WHERE EXISTS (\
+             SELECT 1 FROM json_each(revision.tags_json) AS tag WHERE tag.value = ?1)",
+            [openclaudia::memory::TECHNICAL_MEMORY_SOURCE_TAG],
+            |row| row.get(0),
+        )
+        .expect("count source-state revisions");
+    assert_eq!(source_revisions, 3);
+}
+
+#[test]
+fn ordinary_source_member_corrections_and_deletions_remain_fail_closed() {
+    for operation in ["memory_update", "memory_delete"] {
+        let fixture = Fixture::new();
+        let source_observation =
+            "Descriptor-safe publication rejects untracked member transitions.";
+        let source_digest = write_manifest(&fixture, "MEMORY.md", 1, Some(source_observation));
+        refresh_value(&fixture, None, false);
+        let candidate = one_record(&fixture);
+        let arguments = if operation == "memory_update" {
+            let source_manifest: Value =
+                serde_json::from_slice(&manifest_bytes(&fixture, 1, Some(source_observation)))
+                    .expect("decode source manifest");
+            let mut replacement = source_manifest["lessons"][0]["lesson"].clone();
+            replacement["observation"] = Value::String(
+                "An ordinary correction must not silently rewrite source ownership.".to_string(),
+            );
+            json!({
+                "logical_id": candidate["logical_id"],
+                "expected_record_digest": candidate["record_digest"],
+                "correction_reason": "Exercise the source ownership boundary.",
+                "replacement": replacement,
+            })
+        } else {
+            json!({
+                "logical_id": candidate["logical_id"],
+                "expected_record_digest": candidate["record_digest"],
+            })
+        };
+        let mutation = execute(&fixture, operation, arguments);
+        assert!(
+            !mutation.is_error(),
+            "{operation} failed before exercising source drift: {}",
+            mutation.content()
+        );
+        assert!(matches!(
+            fixture
+                .db
+                .technical_memory_source_status()
+                .expect("typed source status"),
+            TechnicalMemorySourceStoreStatus::Conflict { .. }
+        ));
+        assert_eq!(status(&fixture)["relation"], "conflict");
+        assert_failure(
+            &refresh(&fixture, Some(&source_digest), false),
+            ToolFailureCode::Conflict,
+        );
+        if operation == "memory_update" {
+            let corrected = one_record(&fixture);
+            let corrected_digest = corrected["record_digest"].clone();
+            assert_failure(
+                &review_record(&fixture, "review", &corrected),
+                ToolFailureCode::Conflict,
+            );
+            assert_eq!(one_record(&fixture)["record_digest"], corrected_digest);
+        }
+    }
+}
+
+#[test]
+fn forged_source_state_cannot_launder_an_agent_correction_into_source_ownership() {
+    let fixture = Fixture::new();
+    let source_observation = "Descriptor-safe publication requires source-owned lineage.";
+    write_manifest(&fixture, "MEMORY.md", 1, Some(source_observation));
+    refresh_value(&fixture, None, false);
+    let (mut state, state_record_digest) = match fixture
+        .db
+        .technical_memory_source_status()
+        .expect("initial source status")
+    {
+        TechnicalMemorySourceStoreStatus::Ready {
+            state_record_digest,
+            state,
+        } => (state, state_record_digest),
+        other => panic!("expected ready source, got {other:?}"),
+    };
+    let candidate = one_record(&fixture);
+    let source_manifest: Value =
+        serde_json::from_slice(&manifest_bytes(&fixture, 1, Some(source_observation)))
+            .expect("decode source manifest");
+    let mut replacement = source_manifest["lessons"][0]["lesson"].clone();
+    replacement["observation"] =
+        Value::String("An agent correction is not source publication.".to_string());
+    let corrected = execute(
+        &fixture,
+        "memory_update",
+        json!({
+            "logical_id": candidate["logical_id"],
+            "expected_record_digest": candidate["record_digest"],
+            "correction_reason": "Construct an untrusted successor for the lineage gate.",
+            "replacement": replacement,
+        }),
+    );
+    assert!(!corrected.is_error(), "correction: {}", corrected.content());
+    let corrected_record = corrected.structured().expect("correction result")["record"].clone();
+    state.members[0].record_digest = corrected_record["record_digest"]
+        .as_str()
+        .expect("corrected digest")
+        .parse()
+        .expect("parsed corrected digest");
+
+    let current_state_revision = fixture
+        .db
+        .revision_by_digest(&state_record_digest)
+        .expect("load source-state revision")
+        .expect("source-state revision");
+    let forged_state_revision = current_state_revision
+        .successor(
+            serde_json::to_string(&state).expect("encode forged source state"),
+            vec![TECHNICAL_MEMORY_SOURCE_TAG.to_string()],
+            current_state_revision.provenance.clone(),
+        )
+        .expect("forge structurally valid source-state successor");
+    assert_eq!(
+        fixture
+            .db
+            .apply_revision(&forged_state_revision)
+            .expect("persist adversarial source-state fixture"),
+        ApplyRevisionOutcome::Advanced
+    );
+
+    assert!(matches!(
+        fixture
+            .db
+            .technical_memory_source_status()
+            .expect("lineage validation"),
+        TechnicalMemorySourceStoreStatus::Conflict { .. }
+    ));
+    assert_failure(
+        &review_record(&fixture, "review", &corrected_record),
+        ToolFailureCode::Conflict,
+    );
+    assert_eq!(
+        one_record(&fixture)["record_digest"],
+        corrected_record["record_digest"]
+    );
+}
+
+#[test]
+fn source_member_drift_does_not_block_review_of_an_unrelated_lesson() {
+    let fixture = Fixture::new();
+    let source_observation = "Descriptor-safe publication isolates unrelated review authority.";
+    write_manifest(&fixture, "MEMORY.md", 1, Some(source_observation));
+    refresh_value(&fixture, None, false);
+    let source_member = one_record(&fixture);
+    let source_manifest: Value =
+        serde_json::from_slice(&manifest_bytes(&fixture, 1, Some(source_observation)))
+            .expect("decode source manifest");
+    let mut replacement = source_manifest["lessons"][0]["lesson"].clone();
+    replacement["observation"] = Value::String(
+        "An ordinary correction intentionally creates source lifecycle drift.".to_string(),
+    );
+    let correction = execute(
+        &fixture,
+        "memory_update",
+        json!({
+            "logical_id": source_member["logical_id"],
+            "expected_record_digest": source_member["record_digest"],
+            "correction_reason": "Exercise isolation from an unrelated review.",
+            "replacement": replacement,
+        }),
+    );
+    assert!(
+        !correction.is_error(),
+        "correction: {}",
+        correction.content()
+    );
+    assert!(matches!(
+        fixture
+            .db
+            .technical_memory_source_status()
+            .expect("source conflict"),
+        TechnicalMemorySourceStoreStatus::Conflict { .. }
+    ));
+
+    let mut unrelated_draft: TechnicalLessonDraft =
+        serde_json::from_value(source_manifest["lessons"][0]["lesson"].clone())
+            .expect("unrelated lesson draft");
+    unrelated_draft.title = "Review an unrelated technical lesson".to_string();
+    unrelated_draft.observation =
+        "A source-member conflict must not become a global review denial.".to_string();
+    let unrelated = fixture
+        .db
+        .save_technical_lesson_candidate(
+            &unrelated_draft,
+            MemorySourceEvidence::new(
+                MemorySourceKind::ToolOutcome,
+                "s1080:unrelated-review".to_string(),
+                "test-generation".to_string(),
+                MemoryDigest::for_fields(b"s1080.unrelated-review.v1", &[b"unrelated"]),
+            ),
+            "s1080-test".to_string(),
+            10,
+        )
+        .expect("save unrelated lesson");
+    let unrelated = serde_json::to_value(unrelated).expect("unrelated record JSON");
+    let reviewed = review_record(&fixture, "review", &unrelated);
+    assert!(
+        !reviewed.is_error(),
+        "unrelated review failed: {}",
+        reviewed.content()
+    );
+    assert_eq!(
+        reviewed.structured().expect("review result")["status"],
+        "reviewed"
+    );
+    assert!(matches!(
+        fixture
+            .db
+            .technical_memory_source_status()
+            .expect("source conflict remains"),
+        TechnicalMemorySourceStoreStatus::Conflict { .. }
+    ));
+}
+
+#[test]
+fn source_state_publication_failure_rolls_back_review_lesson_and_audit() {
+    let fixture = Fixture::new();
+    write_manifest(
+        &fixture,
+        "MEMORY.md",
+        1,
+        Some("Descriptor-safe review publication rolls back every linked record."),
+    );
+    refresh_value(&fixture, None, false);
+    let candidate = one_record(&fixture);
+    let candidate_digest = candidate["record_digest"]
+        .as_str()
+        .expect("candidate digest")
+        .to_string();
+    let source_state_digest = assert_source_member_head(&fixture, &candidate_digest);
+
+    let conn = Connection::open(fixture.db.path()).expect("open raw memory store");
+    conn.execute_batch(
+        r"CREATE TRIGGER reject_review_source_state
+          BEFORE INSERT ON memory_revisions
+          WHEN EXISTS (SELECT 1 FROM json_each(NEW.tags_json) AS tag
+                       WHERE tag.value = 'openclaudia:technical-memory-source:v1')
+          BEGIN SELECT RAISE(ABORT, 'injected source-state publication failure'); END;",
+    )
+    .expect("install source-state failure trigger");
+    drop(conn);
+
+    let failed = review_record(&fixture, "review", &candidate);
+    assert_failure(&failed, ToolFailureCode::External);
+    assert_eq!(one_record(&fixture)["record_digest"], candidate_digest);
+    assert_eq!(
+        one_record(&fixture)["lesson"]["review"],
+        json!({"state": "candidate"})
+    );
+    assert_eq!(
+        assert_source_member_head(&fixture, &candidate_digest),
+        source_state_digest
+    );
+
+    let conn = Connection::open(fixture.db.path()).expect("inspect rolled-back store");
+    let audit_revisions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_revisions revision WHERE EXISTS (\
+             SELECT 1 FROM json_each(revision.tags_json) AS tag WHERE tag.value = ?1)",
+            [TECHNICAL_MEMORY_REVIEW_AUDIT_TAG],
+            |row| row.get(0),
+        )
+        .expect("count review-audit revisions");
+    assert_eq!(audit_revisions, 0);
+    let lesson_revisions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_revisions WHERE logical_id = ?1",
+            [candidate["logical_id"]
+                .as_str()
+                .expect("candidate logical ID")],
+            |row| row.get(0),
+        )
+        .expect("count rolled-back lesson revisions");
+    assert_eq!(lesson_revisions, 1);
 }
 
 #[test]

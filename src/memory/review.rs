@@ -3,7 +3,8 @@
 //! Review is a causal metadata transition, not a confidence upgrade and never
 //! an instruction grant. The canonical executor supplies an opaque consumed
 //! one-use host approval; this module binds its redacted audit projection to
-//! one exact lesson head and publishes both records in one SQLite transaction.
+//! one exact lesson head and publishes the lesson, audit, and any linked source
+//! projection in one SQLite transaction.
 
 use anyhow::{Context as _, Result};
 use rusqlite::{params, Connection, TransactionBehavior};
@@ -266,6 +267,7 @@ impl MemoryDb {
         if !Self::head_digests(conn, receipt_logical_id)?.is_empty() {
             return Err(TechnicalLessonStoreError::ReviewReceiptReuse.into());
         }
+        let source_member = Self::prepare_source_member_review_on(conn, workspace_id, current)?;
         let next_lesson = match action {
             TechnicalLessonReviewAction::Review => lesson.host_reviewed(
                 current.record_digest.clone(),
@@ -329,6 +331,15 @@ impl MemoryDb {
         }
         Self::apply_root_revision_in_transaction(conn, &audit_revision)?;
         Self::validate_host_review_audit_on(conn, &revision, workspace_id)?;
+        if let Some(source_member) = source_member {
+            Self::publish_source_member_review_on(
+                conn,
+                workspace_id,
+                source_member,
+                &revision,
+                approval.actor_id.clone(),
+            )?;
+        }
         Ok(TechnicalLessonReviewResult {
             status: match action {
                 TechnicalLessonReviewAction::Review => TechnicalLessonReviewStatus::Reviewed,
@@ -415,6 +426,25 @@ impl MemoryDb {
         audit
             .validate_for_revision(revision, &lesson, workspace_id, &audit_revision)
             .map_err(|_| TechnicalLessonStoreError::ReviewAuditInvalid.into())
+    }
+
+    /// Require this exact lesson revision to be a host-review transition, not
+    /// merely a candidate revision for which no audit is required.
+    pub(super) fn validate_host_review_transition_on(
+        conn: &Connection,
+        revision: &MemoryRevision,
+        workspace_id: &WorkspaceMemoryId,
+    ) -> Result<()> {
+        if revision.provenance.source_kind != MemorySourceKind::Explicit
+            || revision
+                .provenance
+                .source_id
+                .strip_prefix(REVIEW_SOURCE_PREFIX)
+                .is_none()
+        {
+            return Err(TechnicalLessonStoreError::ReviewAuditInvalid.into());
+        }
+        Self::validate_host_review_audit_on(conn, revision, workspace_id)
     }
 
     fn load_review_audit_revision_on(

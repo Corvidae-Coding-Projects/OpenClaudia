@@ -25,6 +25,7 @@ pub const TECHNICAL_MEMORY_SOURCE_STATE_SCHEMA_VERSION: u32 = 1;
 // while remaining below the manifest's own 512 KiB admission ceiling.
 const MAX_SOURCE_STATE_BYTES: usize = 256 * 1024;
 const MAX_SOURCE_LIFECYCLE_MEMBERS: usize = 512;
+const MAX_SOURCE_REVIEW_LINEAGE_REVISIONS: usize = 4_096;
 
 /// Whether the tracked manifest currently exists in the workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +161,14 @@ pub enum TechnicalMemorySourceStoreError {
 struct StoredSource {
     state: TechnicalMemorySourceState,
     revision: MemoryRevision,
+}
+
+/// Coherent source membership captured before a host-review transaction moves
+/// the member head. Keeping this opaque outside the source module prevents the
+/// review path from constructing or partially updating source state itself.
+pub(super) struct PreparedSourceMemberReview {
+    source: StoredSource,
+    member_index: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -997,6 +1006,91 @@ impl MemoryDb {
         Ok(stored)
     }
 
+    /// Capture the exact source membership, if any, before a host review moves
+    /// the lesson head. A conflicting source projection rejects the review
+    /// before any lesson or audit record is written.
+    pub(super) fn prepare_source_member_review_on(
+        conn: &Connection,
+        workspace_id: &WorkspaceMemoryId,
+        current: &MemoryRevision,
+    ) -> Result<Option<PreparedSourceMemberReview>> {
+        let rows = Self::memory_search_by_tag_on(conn, TECHNICAL_MEMORY_SOURCE_TAG, 2)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        if rows.len() != 1 || !rows[0].conflict_heads.is_empty() {
+            return Err(TechnicalMemorySourceStoreError::CausalConflict.into());
+        }
+        let source = Self::decode_stored_source_on(conn, &rows[0], workspace_id)?;
+        let member_index = source
+            .state
+            .members
+            .iter()
+            .position(|member| member.logical_id == current.logical_id);
+        let Some(member_index) = member_index else {
+            return Ok(None);
+        };
+        if !Self::source_members_match_heads_on(conn, &source.state, workspace_id)? {
+            return Err(TechnicalMemorySourceStoreError::CausalConflict.into());
+        }
+        let member = &source.state.members[member_index];
+        if member.record_digest != current.record_digest
+            || source.state.presence != TechnicalMemorySourcePresence::Active
+        {
+            return Err(TechnicalMemorySourceStoreError::CausalConflict.into());
+        }
+        Ok(Some(PreparedSourceMemberReview {
+            source,
+            member_index,
+        }))
+    }
+
+    /// Advance one prepared source member to an audit-validated host-review
+    /// successor. The caller owns the surrounding immediate transaction, so a
+    /// source-state publication failure rolls back the lesson and audit too.
+    pub(super) fn publish_source_member_review_on(
+        conn: &Connection,
+        workspace_id: &WorkspaceMemoryId,
+        prepared: PreparedSourceMemberReview,
+        reviewed_revision: &MemoryRevision,
+        author_id: String,
+    ) -> Result<()> {
+        let current = prepared.source;
+        let mut state = current.state.clone();
+        let member = state
+            .members
+            .get_mut(prepared.member_index)
+            .context("prepared technical-memory source member is unavailable")?;
+        if member.logical_id != reviewed_revision.logical_id
+            || reviewed_revision.parent_digest.as_ref() != Some(&member.record_digest)
+        {
+            return Err(TechnicalMemorySourceStoreError::CausalConflict.into());
+        }
+        Self::validate_technical_lesson_revision(reviewed_revision, workspace_id)?;
+        Self::validate_host_review_transition_on(conn, reviewed_revision, workspace_id)?;
+        member
+            .record_digest
+            .clone_from(&reviewed_revision.record_digest);
+
+        let source_digest = state.source_digest.clone();
+        let source_version = format!("generation:{}", state.source_generation);
+        let store_id = Self::store_id_on(conn)?;
+        Self::publish_source_state_on(
+            conn,
+            Some(&current),
+            &state,
+            store_id,
+            author_id,
+            source_digest,
+            source_version,
+        )?;
+        anyhow::ensure!(
+            Self::source_members_match_heads_on(conn, &state, workspace_id)?,
+            "host-reviewed technical-memory source member is incoherent"
+        );
+        Ok(())
+    }
+
     fn decode_stored_source_on(
         conn: &Connection,
         row: &super::ArchivalMemory,
@@ -1059,6 +1153,7 @@ impl MemoryDb {
         state: &TechnicalMemorySourceState,
         workspace_id: &WorkspaceMemoryId,
     ) -> Result<bool> {
+        let mut review_lineage_budget = MAX_SOURCE_REVIEW_LINEAGE_REVISIONS;
         for member in &state.members {
             let heads = Self::head_digests(conn, member.logical_id)?;
             if heads.as_slice() != [member.record_digest.clone()] {
@@ -1067,16 +1162,14 @@ impl MemoryDb {
             let Some(revision) = Self::load_revision_by_digest(conn, &member.record_digest)? else {
                 return Ok(false);
             };
-            if Self::validate_technical_lesson_revision(&revision, workspace_id).is_err() {
-                return Ok(false);
-            }
-            if revision.provenance.source_kind != MemorySourceKind::Imported
-                || revision.provenance.source_id
-                    != source_member_source_id(&state.source_id, &member.lesson_id)
-                || revision.provenance.origin_store_id.is_none()
-                || revision.provenance.scope != MemoryRecordScope::UserPrivate
-                || revision.provenance.workspace_id.as_deref() != Some(workspace_id.as_str())
-            {
+            if !Self::active_source_member_has_owned_lineage_on(
+                conn,
+                state,
+                member,
+                revision,
+                workspace_id,
+                &mut review_lineage_budget,
+            )? {
                 return Ok(false);
             }
         }
@@ -1102,6 +1195,45 @@ impl MemoryDb {
             }
         }
         Ok(true)
+    }
+
+    fn active_source_member_has_owned_lineage_on(
+        conn: &Connection,
+        state: &TechnicalMemorySourceState,
+        member: &TechnicalMemorySourceMember,
+        mut revision: MemoryRevision,
+        workspace_id: &WorkspaceMemoryId,
+        review_lineage_budget: &mut usize,
+    ) -> Result<bool> {
+        loop {
+            if Self::validate_technical_lesson_revision(&revision, workspace_id).is_err()
+                || revision.logical_id != member.logical_id
+            {
+                return Ok(false);
+            }
+            let source_import = revision.provenance.source_kind == MemorySourceKind::Imported
+                && revision.provenance.source_id
+                    == source_member_source_id(&state.source_id, &member.lesson_id)
+                && revision.provenance.origin_store_id.is_some()
+                && revision.provenance.scope == MemoryRecordScope::UserPrivate
+                && revision.provenance.workspace_id.as_deref() == Some(workspace_id.as_str());
+            if source_import {
+                return Ok(true);
+            }
+            if *review_lineage_budget == 0
+                || Self::validate_host_review_transition_on(conn, &revision, workspace_id).is_err()
+            {
+                return Ok(false);
+            }
+            *review_lineage_budget -= 1;
+            let Some(parent_digest) = revision.parent_digest else {
+                return Ok(false);
+            };
+            let Some(parent) = Self::load_revision_by_digest(conn, &parent_digest)? else {
+                return Ok(false);
+            };
+            revision = parent;
+        }
     }
 
     pub(super) fn store_id_on(conn: &Connection) -> Result<MemoryStoreId> {

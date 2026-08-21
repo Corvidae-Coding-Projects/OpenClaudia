@@ -151,3 +151,19 @@ units medium-sized without reducing the requested end state.
 Record the exact consumed-capability and audit schemas, artifact generations,
 commands/tests, frontend evidence, residual permission risks, and the S-107,
 S-103, S-104, and S-105 boundaries.
+
+## Corrective follow-up: source lifecycle coherence (#1080)
+
+Host review and revocation now also advance an exact source-owned member digest
+when the reviewed lesson belongs to the active technical-memory source. The
+source membership is prepared before mutation and the lesson successor, review
+audit, and source-state successor commit atomically. The resulting source state
+keeps its repository generation and source digest while naming the new reviewed
+head; unchanged source refresh remains idempotent.
+
+Acceptance is deliberately narrower than accepting any descendant head. A
+member is source-owned only when its current revision is an exact import or a
+bounded chain of immutable, audit-validated host-review transitions ending at
+an exact import. Agent corrections and deletions do not acquire source
+authority and continue to surface a source conflict. An injected failure on the
+source-state insert proves that the preceding lesson and audit writes roll back.
