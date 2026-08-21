@@ -3,9 +3,10 @@
 //! S-053 gives this store stable logical identity, immutable causal revisions,
 //! explicit conflicts, version-bound tombstones, and durable idempotent
 //! cross-store reconciliation. Production [`crate::config::load_config`] still
-//! rejects a configured team path until S-054 supplies authenticated authority,
-//! host-owned storage, schema recovery, and retrieval policy. A shared path
-//! alone is not a team authorization model.
+//! rejects a configured team path. S-054 supplies host-owned local storage,
+//! schema recovery, and evidence-only retrieval; S-103/S-104 must supply
+//! authenticated team authority and bounded replication. A shared path alone
+//! is not a team authorization model.
 //!
 //! Crosslink #604. Parity with Claude Code's `teamMemPaths.ts`: a project
 //! may carry an additional *shared* memory directory that several users on
@@ -33,7 +34,7 @@
 //! descendant supersedes its ancestor. Concurrent branches remain explicit
 //! conflict heads and neither branch is deleted. Equal prose with different
 //! logical IDs remains distinct. Core sections retain their stable section key
-//! and user overlay precedence pending the broader authority work in S-054.
+//! and user overlay precedence pending the team-authority work in S-103/S-104.
 //!
 //! # Tombstones
 //!

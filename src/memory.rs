@@ -1,18 +1,38 @@
-//! Auto-learning memory module for `OpenClaudia`.
+//! Persistent memory stores for `OpenClaudia`.
 //!
-//! Provides structured, automatic knowledge capture using `SQLite`.
-//! Learns from tool execution signals, user corrections, and session patterns.
-//! Each project gets its own memory database that persists across sessions.
+//! Production model-facing memory is a host-owned, workspace-bound collection
+//! of strict technical lessons retrieved only through explicit typed tools.
+//! Legacy session, compaction, and automatic-learning tables remain available
+//! to compatibility callers, but are not model instructions and are excluded
+//! from technical-lesson retrieval.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::io::{BufReader, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+mod lesson;
 mod record;
 
+pub use lesson::{
+    LessonApplicability, LessonCitation, LessonCitationKind, LessonCorrection, LessonRetention,
+    LessonReviewState, TechnicalLesson, TechnicalLessonConfidence,
+    TechnicalLessonCorrectionRequest, TechnicalLessonDraft, TechnicalLessonError,
+    TechnicalLessonKind, TechnicalLessonQueryResult, TechnicalLessonQueryStatus,
+    TechnicalLessonRecord, TechnicalLessonSensitivity, TechnicalLessonStoreError,
+    WorkspaceMemoryId, MAX_LESSON_APPLICABILITY_ITEMS, MAX_LESSON_CITATIONS,
+    MAX_LESSON_CORRECTION_BYTES, MAX_LESSON_GUIDANCE_BYTES, MAX_LESSON_ITEM_BYTES,
+    MAX_LESSON_LOCATOR_BYTES, MAX_LESSON_OBSERVATION_BYTES, MAX_LESSON_TITLE_BYTES,
+    MAX_LESSON_VERSION_BYTES, MAX_TECHNICAL_LESSONS_PER_STORE, MAX_TECHNICAL_LESSON_BYTES,
+    MAX_TECHNICAL_QUERY_RESULT_BYTES, TECHNICAL_LESSON_SCHEMA_VERSION, TECHNICAL_LESSON_TAG,
+};
 pub use record::{
     LogicalMemoryId, MemoryAttribution, MemoryDigest, MemoryProvenance, MemoryRecordError,
     MemoryRecordScope, MemoryRevision, MemoryRevisionState, MemorySourceEvidence, MemorySourceKind,
@@ -47,11 +67,33 @@ pub fn xml_escape_for_prompt(s: &str) -> Cow<'_, str> {
 const MEMORY_DB_NAME: &str = "memory.db";
 
 /// Current schema version - increment when adding migrations
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
+
+/// Oldest explicitly versioned store this build can migrate. Unversioned
+/// non-empty databases are rejected because their partial state cannot be
+/// distinguished from a failed migration without guessing.
+const MINIMUM_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
+
+/// Hard file-size ceiling applied before SQLite parses or migrates a store.
+const MAX_MEMORY_STORE_BYTES: u64 = 512 * 1024 * 1024;
+/// Hard row ceiling across migration-owned tables.
+const MAX_MEMORY_MIGRATION_ROWS: i64 = 1_000_000;
 
 /// Maximum concurrently visible causal heads for one logical memory.
 /// Applying a revision that would exceed this cap rolls its transaction back.
 const MAX_MEMORY_CONFLICT_HEADS: usize = 64;
+
+/// Bounded attribution fields for typed technical lessons. These values are
+/// metadata, not an escape hatch around the lesson payload's own byte budget.
+const MAX_TECHNICAL_SOURCE_ID_BYTES: usize = 256;
+const MAX_TECHNICAL_SOURCE_VERSION_BYTES: usize = 256;
+const MAX_TECHNICAL_AUTHOR_ID_BYTES: usize = 256;
+const MAX_TECHNICAL_REVISION_TAGS_BYTES: usize = 1_024;
+const MAX_TECHNICAL_PROVENANCE_BYTES: usize = 4 * 1_024;
+/// Querying does not materialize the entire maximum-sized store. A partial
+/// result explicitly reports when newer records exhausted either scan budget.
+const MAX_TECHNICAL_QUERY_SCAN_RECORDS: usize = 512;
+const MAX_TECHNICAL_QUERY_SCAN_BYTES: usize = 4 * 1_024 * 1_024;
 
 /// Short-term memory expiration (hours)
 const SHORT_TERM_EXPIRY_HOURS: i64 = 48;
@@ -194,6 +236,22 @@ fn escape_fts5_phrase(raw: &str) -> String {
     format!("\"{inner}\"")
 }
 
+const fn technical_lesson_kind_name(kind: TechnicalLessonKind) -> &'static str {
+    match kind {
+        TechnicalLessonKind::Architecture => "architecture",
+        TechnicalLessonKind::Build => "build",
+        TechnicalLessonKind::Compatibility => "compatibility",
+        TechnicalLessonKind::Configuration => "configuration",
+        TechnicalLessonKind::Debugging => "debugging",
+        TechnicalLessonKind::Dependency => "dependency",
+        TechnicalLessonKind::Operational => "operational",
+        TechnicalLessonKind::Performance => "performance",
+        TechnicalLessonKind::Security => "security",
+        TechnicalLessonKind::Testing => "testing",
+        TechnicalLessonKind::Tooling => "tooling",
+    }
+}
+
 /// Tables that the auto-learning subsystem may prune.
 ///
 /// Using an enum allowlist prevents callers from interpolating arbitrary
@@ -214,6 +272,30 @@ pub enum AutoLearnTable {
 pub struct MemoryDb {
     conn: Mutex<Connection>,
     path: PathBuf,
+    workspace_id: Option<WorkspaceMemoryId>,
+}
+
+struct ValidatedTechnicalLessonQuery {
+    normalized: Option<String>,
+    terms: Vec<String>,
+}
+
+struct TechnicalLessonCandidates {
+    ranked: Vec<(usize, TechnicalLessonRecord)>,
+    omitted_expired: usize,
+    omitted_conflicted: usize,
+    truncated_by_budget: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TechnicalCorrectionReplay<'a> {
+    current: &'a MemoryRevision,
+    expected_parent: &'a MemoryDigest,
+    workspace_id: &'a WorkspaceMemoryId,
+    replacement: &'a TechnicalLessonDraft,
+    correction_reason: &'a str,
+    expected_provenance: &'a MemoryProvenance,
+    now_unix_seconds: i64,
 }
 
 impl MemoryDb {
@@ -238,22 +320,31 @@ impl MemoryDb {
     ///
     /// Returns an error if the database cannot be opened or schema migration fails.
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("Failed to open memory database at {}", path.display()))?;
+        let existing_version = Self::preflight_path_without_writes(path)?;
+        if (MINIMUM_MIGRATABLE_SCHEMA_VERSION..SCHEMA_VERSION).contains(&existing_version) {
+            Self::ensure_recovery_backup(path, existing_version)?;
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .with_context(|| format!("Failed to open memory database at {}", path.display()))?;
 
         // Enable foreign-key enforcement (off by default in SQLite).  The v4
         // migration introduces `archival_memory_tags` with an `ON DELETE
         // CASCADE` reference to `archival_memory(id)` — without this PRAGMA
         // the cascade is silently a no-op and orphaned tag rows accumulate.
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .context("Failed to enable SQLite foreign-key enforcement")?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
+            .context("Failed to configure SQLite memory-store enforcement")?;
 
         // Run schema migrations on the bare connection before wrapping in Mutex
-        Self::ensure_schema_on(&conn)?;
+        Self::ensure_schema_on(&conn, existing_version)?;
+        let workspace_id = Self::load_workspace_binding(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
+            workspace_id,
         })
     }
 
@@ -275,10 +366,65 @@ impl MemoryDb {
         Self::open(&db_path)
     }
 
+    /// Open the production private store under host-owned state, keyed by the
+    /// exact canonical workspace root. Repository contents never select or
+    /// contain this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either authority root is non-canonical, a state
+    /// directory is linked/insecure, the store is corrupt or unsupported, or
+    /// its persisted workspace binding names a different codebase.
+    pub fn open_for_workspace(host_home: &Path, project_dir: &Path) -> Result<Self> {
+        #[cfg(not(unix))]
+        Self::require_private_storage_backend()?;
+        let host_home = host_home
+            .canonicalize()
+            .with_context(|| format!("canonicalizing host home {}", host_home.display()))?;
+        let project_dir = project_dir
+            .canonicalize()
+            .with_context(|| format!("canonicalizing workspace {}", project_dir.display()))?;
+        anyhow::ensure!(host_home.is_absolute(), "host home must be absolute");
+        anyhow::ensure!(project_dir.is_absolute(), "workspace root must be absolute");
+
+        let workspace_id = WorkspaceMemoryId::for_canonical_root(&project_dir);
+        let state_root = host_home
+            .join(".openclaudia")
+            .join("memory")
+            .join("workspaces")
+            .join(workspace_id.path_component());
+        Self::create_private_state_directory(&host_home, &state_root)?;
+
+        let database_path = state_root.join(MEMORY_DB_NAME);
+        let database_existed = Self::validate_private_database_file(&host_home, &database_path)?;
+        let mut database = Self::open(&database_path)?;
+        if !database_existed {
+            #[cfg(unix)]
+            std::fs::set_permissions(&database_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Self::validate_private_database_file(&host_home, &database_path)?;
+        database.bind_workspace_authority(&workspace_id, "user_private")?;
+        database.workspace_id = Some(workspace_id);
+        Ok(database)
+    }
+
+    #[cfg(not(unix))]
+    fn require_private_storage_backend() -> Result<()> {
+        anyhow::bail!(
+            "host-owned technical memory is unavailable until the platform provides a race-safe private-storage backend (S-036)"
+        )
+    }
+
     /// Get the database path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Host-derived workspace identity attached to a production store.
+    #[must_use]
+    pub const fn workspace_id(&self) -> Option<&WorkspaceMemoryId> {
+        self.workspace_id.as_ref()
     }
 
     /// Return the persistent identity of this physical database.
@@ -358,32 +504,288 @@ impl MemoryDb {
         Ok(())
     }
 
-    /// Ensure database schema exists and run migrations (operates on bare `Connection`).
-    fn ensure_schema_on(conn: &Connection) -> Result<()> {
-        // Create version tracking table first
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)",
-            [],
-        )?;
-
-        // Get current version (0 if table is empty = new db or pre-versioning db)
-        let current_version: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        // Run migrations
-        if current_version < SCHEMA_VERSION {
-            tracing::info!(
-                "Migrating memory database from version {current_version} to {SCHEMA_VERSION}",
-            );
-            Self::run_migrations_on(conn, current_version)?;
+    /// Inspect an existing store through a read-only connection before any
+    /// writer is opened. Future, corrupt, unversioned-nonempty, and partial
+    /// stores therefore fail without blessing or changing their bytes.
+    fn preflight_path_without_writes(path: &Path) -> Result<i64> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspecting memory database {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "memory database is not a regular file"
+        );
+        anyhow::ensure!(
+            metadata.len() <= MAX_MEMORY_STORE_BYTES,
+            "memory database exceeds the migration byte budget"
+        );
+        if metadata.len() == 0 {
+            return Ok(0);
         }
 
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .with_context(|| format!("opening memory database read-only at {}", path.display()))?;
+        let integrity: String = conn
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .context("checking memory database integrity")?;
+        anyhow::ensure!(integrity == "ok", "memory database integrity check failed");
+
+        let has_version_table = Self::table_exists(&conn, "schema_version")?;
+        if !has_version_table {
+            let application_objects: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                application_objects == 0,
+                "unversioned non-empty memory database is unsupported"
+            );
+            return Ok(0);
+        }
+
+        let mut stmt = conn.prepare("SELECT version FROM schema_version ORDER BY version")?;
+        let versions = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            versions.len() == 1,
+            "memory schema marker must contain exactly one version"
+        );
+        anyhow::ensure!(
+            versions
+                .iter()
+                .all(|version| *version >= MINIMUM_MIGRATABLE_SCHEMA_VERSION),
+            "memory schema marker is invalid"
+        );
+        let current = *versions.last().expect("nonempty checked above");
+        anyhow::ensure!(
+            current <= SCHEMA_VERSION,
+            "memory schema version {current} is newer than supported version {SCHEMA_VERSION}"
+        );
+        Self::validate_schema_shape(&conn, current)?;
+        Self::validate_migration_row_budget(&conn, current)?;
+        Ok(current)
+    }
+
+    fn ensure_recovery_backup(path: &Path, source_version: i64) -> Result<()> {
+        let file_name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .context("memory database path has no UTF-8 file name")?;
+        let backup_path = path.with_file_name(format!("{file_name}.pre-v6-backup.sqlite"));
+        let temp_path =
+            path.with_file_name(format!(".{file_name}.backup-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let source = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .context("opening memory migration source for recovery backup")?;
+            source
+                .backup(rusqlite::MAIN_DB, &temp_path, None)
+                .context("creating SQLite recovery backup before memory migration")?;
+            let backup_version = Self::preflight_path_without_writes(&temp_path)?;
+            if backup_version == SCHEMA_VERSION {
+                // Another opener completed the migration after our read-only
+                // source preflight. Its fully validated current snapshot needs
+                // no additional pre-v6 recovery copy.
+                std::fs::remove_file(&temp_path)?;
+                return Ok(());
+            }
+            anyhow::ensure!(
+                backup_version == source_version,
+                "memory recovery backup version differs from its source"
+            );
+            if backup_path.exists() {
+                let existing_version = Self::preflight_path_without_writes(&backup_path)?;
+                anyhow::ensure!(
+                    existing_version == source_version,
+                    "existing memory recovery backup does not match the migration source version"
+                );
+                anyhow::ensure!(
+                    Self::files_equal_bounded(&temp_path, &backup_path)?,
+                    "existing memory recovery backup differs from the current migration source"
+                );
+                std::fs::remove_file(&temp_path)?;
+                return Ok(());
+            }
+            #[cfg(unix)]
+            {
+                std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            let file = std::fs::File::open(&temp_path)?;
+            file.sync_all()
+                .context("syncing memory migration recovery backup")?;
+            match std::fs::hard_link(&temp_path, &backup_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing_version = Self::preflight_path_without_writes(&backup_path)?;
+                    anyhow::ensure!(
+                        existing_version == source_version
+                            && Self::files_equal_bounded(&temp_path, &backup_path)?,
+                        "concurrently published memory recovery backup differs from its source"
+                    );
+                }
+                Err(error) => {
+                    return Err(error).context(
+                        "publishing memory migration recovery backup without replacement",
+                    );
+                }
+            }
+            std::fs::remove_file(&temp_path)?;
+            #[cfg(unix)]
+            if let Some(parent) = backup_path.parent() {
+                std::fs::File::open(parent)?
+                    .sync_all()
+                    .context("syncing memory recovery backup directory")?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+    }
+
+    fn files_equal_bounded(left: &Path, right: &Path) -> Result<bool> {
+        let left_meta = std::fs::symlink_metadata(left)?;
+        let right_meta = std::fs::symlink_metadata(right)?;
+        anyhow::ensure!(
+            left_meta.file_type().is_file() && right_meta.file_type().is_file(),
+            "memory recovery comparison requires regular files"
+        );
+        anyhow::ensure!(
+            left_meta.len() <= MAX_MEMORY_STORE_BYTES && right_meta.len() <= MAX_MEMORY_STORE_BYTES,
+            "memory recovery comparison exceeds the store byte budget"
+        );
+        if left_meta.len() != right_meta.len() {
+            return Ok(false);
+        }
+
+        let mut left = BufReader::new(std::fs::File::open(left)?);
+        let mut right = BufReader::new(std::fs::File::open(right)?);
+        let mut left_chunk = vec![0_u8; 64 * 1024];
+        let mut right_chunk = vec![0_u8; 64 * 1024];
+        loop {
+            let left_read = left.read(&mut left_chunk)?;
+            let right_read = right.read(&mut right_chunk)?;
+            if left_read != right_read {
+                return Ok(false);
+            }
+            if left_chunk[..left_read] != right_chunk[..left_read] {
+                return Ok(false);
+            }
+            if left_read == 0 {
+                return Ok(true);
+            }
+        }
+    }
+
+    fn validate_migration_row_budget(conn: &Connection, version: i64) -> Result<()> {
+        let mut tables = vec!["archival_memory", "core_memory"];
+        if version >= 2 {
+            tables.extend(["recent_sessions", "recent_activity"]);
+        }
+        if version >= 3 {
+            tables.extend([
+                "coding_patterns",
+                "file_relationships",
+                "error_patterns",
+                "learned_preferences",
+            ]);
+        }
+        if version >= 4 {
+            tables.push("archival_memory_tags");
+        }
+        if version >= 5 {
+            tables.extend(["memory_store_metadata", "memory_revisions", "memory_heads"]);
+        }
+        if version >= 6 {
+            tables.push("memory_store_contract");
+        }
+        let mut total = 0_i64;
+        for table in tables {
+            let count: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            total = total
+                .checked_add(count)
+                .context("memory migration row count overflowed")?;
+            anyhow::ensure!(
+                total <= MAX_MEMORY_MIGRATION_ROWS,
+                "memory database exceeds the migration row budget"
+            );
+        }
         Ok(())
+    }
+
+    /// Ensure database schema exists and run the complete migration chain in
+    /// one exclusive transaction. A failed step never publishes a later
+    /// marker or a partially upgraded table set.
+    fn ensure_schema_on(conn: &Connection, current_version: i64) -> Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .context("beginning memory schema migration")?;
+        let result = (|| {
+            let locked_version = if Self::table_exists(conn, "schema_version")? {
+                Self::read_schema_version_marker(conn)?
+            } else {
+                0
+            };
+            if locked_version == SCHEMA_VERSION {
+                Self::validate_schema_shape(conn, locked_version)?;
+                Self::validate_migration_row_budget(conn, locked_version)?;
+                return Ok(());
+            }
+            anyhow::ensure!(
+                locked_version == current_version,
+                "memory schema changed while its recovery point was prepared"
+            );
+            tracing::info!(
+                "Migrating memory database from version {locked_version} to {SCHEMA_VERSION}",
+            );
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)",
+                [],
+            )?;
+            Self::run_migrations_on(conn, locked_version)?;
+            Self::validate_schema_shape(conn, SCHEMA_VERSION)?;
+            Self::validate_migration_row_budget(conn, SCHEMA_VERSION)
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT;")
+                    .context("committing memory schema migration")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    fn read_schema_version_marker(conn: &Connection) -> Result<i64> {
+        let mut stmt = conn.prepare("SELECT version FROM schema_version ORDER BY version")?;
+        let versions = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            versions.len() == 1,
+            "memory schema marker must contain exactly one version"
+        );
+        let version = versions[0];
+        anyhow::ensure!(
+            (MINIMUM_MIGRATABLE_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&version),
+            "memory schema marker is unsupported"
+        );
+        Ok(version)
     }
 
     /// Run all migrations from `current_version` to `SCHEMA_VERSION` (operates on bare `Connection`).
@@ -420,14 +822,839 @@ impl MemoryDb {
             Self::migrate_v5_on(conn)?;
         }
 
-        // Record current version
+        // Version 6: strict store contract and typed technical-lesson reader
+        // version. Lesson payloads remain immutable revision content so S-053
+        // replication carries their exact bytes and causal identity.
+        if from_version < 6 {
+            Self::migrate_v6_on(conn)?;
+        }
+
+        // Publish exactly one marker only after every migration and validator
+        // succeeded inside the surrounding transaction.
+        conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
-            "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
+            "INSERT INTO schema_version (version) VALUES (?1)",
             params![SCHEMA_VERSION],
         )?;
 
         tracing::info!("Database migration complete. Now at version {SCHEMA_VERSION}");
         Ok(())
+    }
+
+    fn migrate_v6_on(conn: &Connection) -> Result<()> {
+        tracing::debug!("Running migration v6: strict memory store contract (S-054)");
+        conn.execute_batch(
+            r"
+            CREATE TABLE memory_store_contract (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                store_schema_version INTEGER NOT NULL CHECK(store_schema_version = 6),
+                minimum_reader_version INTEGER NOT NULL CHECK(minimum_reader_version = 6),
+                lesson_schema_version INTEGER NOT NULL CHECK(lesson_schema_version = 1),
+                authority_kind TEXT NOT NULL
+                    CHECK(authority_kind IN ('explicit_unbound', 'user_private', 'team_shared')),
+                workspace_id TEXT,
+                schema_digest TEXT NOT NULL,
+                migration_state TEXT NOT NULL CHECK(migration_state = 'ready'),
+                CHECK((authority_kind = 'explicit_unbound' AND workspace_id IS NULL)
+                   OR (authority_kind != 'explicit_unbound' AND workspace_id IS NOT NULL))
+            );
+            INSERT INTO memory_store_contract
+                (singleton, store_schema_version, minimum_reader_version,
+                 lesson_schema_version, authority_kind, workspace_id, schema_digest,
+                 migration_state)
+            VALUES (1, 6, 6, 1, 'explicit_unbound', NULL, 'pending', 'ready');
+            CREATE TRIGGER technical_lesson_count_cap
+            BEFORE INSERT ON archival_memory_tags
+            WHEN new.tag = 'openclaudia:technical-lesson:v1'
+             AND NOT EXISTS (
+                 SELECT 1 FROM archival_memory_tags
+                  WHERE memory_id = new.memory_id AND tag = new.tag
+             )
+             AND (SELECT COUNT(*) FROM archival_memory_tags
+                   WHERE tag = 'openclaudia:technical-lesson:v1') >= 4096
+            BEGIN
+                SELECT RAISE(ABORT, 'technical lesson store budget exceeded');
+            END;
+            ",
+        )
+        .context("v6: failed to create strict store contract")?;
+        let schema_digest = Self::schema_manifest_digest(conn)?;
+        conn.execute(
+            "UPDATE memory_store_contract SET schema_digest = ?1 WHERE singleton = 1",
+            params![schema_digest],
+        )?;
+        Ok(())
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![table],
+            |row| row.get(0),
+        )
+        .context("inspecting memory schema table")
+    }
+
+    fn object_exists(conn: &Connection, object_type: &str, name: &str) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+            params![object_type, name],
+            |row| row.get(0),
+        )
+        .context("inspecting memory schema object")
+    }
+
+    fn require_schema_objects(
+        conn: &Connection,
+        object_type: &str,
+        names: &[&str],
+        version: i64,
+    ) -> Result<()> {
+        for name in names {
+            anyhow::ensure!(
+                Self::object_exists(conn, object_type, name)?,
+                "memory schema v{version} is partial: missing {object_type} {name}"
+            );
+        }
+        Ok(())
+    }
+
+    fn require_schema_columns(
+        conn: &Connection,
+        table: &str,
+        columns: &[&str],
+        version: i64,
+    ) -> Result<()> {
+        for column in columns {
+            anyhow::ensure!(
+                Self::table_has_column(conn, table, column)?,
+                "memory schema v{version} is partial: missing {table}.{column}"
+            );
+        }
+        Ok(())
+    }
+
+    fn expected_schema_objects(version: i64) -> BTreeSet<String> {
+        let mut objects = BTreeSet::new();
+        let mut add = |kind: &str, names: &[&str]| {
+            objects.extend(names.iter().map(|name| format!("{kind}:{name}")));
+        };
+        add(
+            "table",
+            &[
+                "schema_version",
+                "archival_memory",
+                "archival_memory_fts",
+                "archival_memory_fts_data",
+                "archival_memory_fts_idx",
+                "archival_memory_fts_docsize",
+                "archival_memory_fts_config",
+                "core_memory",
+            ],
+        );
+        add(
+            "trigger",
+            &[
+                "archival_memory_ai",
+                "archival_memory_ad",
+                "archival_memory_au",
+            ],
+        );
+        if version >= 2 {
+            add("table", &["recent_sessions", "recent_activity"]);
+            add(
+                "index",
+                &[
+                    "idx_recent_sessions_ended",
+                    "idx_recent_activity_created",
+                    "idx_recent_activity_session",
+                ],
+            );
+        }
+        if version >= 3 {
+            add(
+                "table",
+                &[
+                    "coding_patterns",
+                    "file_relationships",
+                    "error_patterns",
+                    "learned_preferences",
+                ],
+            );
+            add(
+                "index",
+                &[
+                    "idx_coding_patterns_glob",
+                    "idx_coding_patterns_type",
+                    "idx_error_patterns_sig",
+                ],
+            );
+        }
+        if version >= 4 {
+            add("table", &["archival_memory_tags"]);
+            add("index", &["idx_archival_memory_tags_tag"]);
+        }
+        if version >= 5 {
+            add(
+                "table",
+                &["memory_store_metadata", "memory_revisions", "memory_heads"],
+            );
+            add(
+                "index",
+                &[
+                    "idx_memory_revisions_logical_version",
+                    "idx_memory_revisions_parent",
+                    "idx_archival_memory_logical_id",
+                ],
+            );
+        }
+        if version >= 6 {
+            add("table", &["memory_store_contract"]);
+            add("trigger", &["technical_lesson_count_cap"]);
+        }
+        objects
+    }
+
+    fn validate_schema_object_manifest(conn: &Connection, version: i64) -> Result<()> {
+        let actual = conn
+            .prepare(
+                r"SELECT type || ':' || name FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%'
+                      AND type IN ('table', 'index', 'trigger', 'view')
+                    ORDER BY type, name",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let expected = Self::expected_schema_objects(version);
+        anyhow::ensure!(
+            actual == expected,
+            "memory schema v{version} object manifest differs from the supported exact schema"
+        );
+        Ok(())
+    }
+
+    fn schema_manifest_digest(conn: &Connection) -> Result<String> {
+        let rows = conn
+            .prepare(
+                r"SELECT type, name, COALESCE(sql, '') FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%'
+                      AND type IN ('table', 'index', 'trigger', 'view')
+                    ORDER BY type, name",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let encoded = serde_json::to_vec(&rows)?;
+        Ok(MemoryDigest::for_fields(b"openclaudia.memory.schema.v1", &[&encoded]).to_string())
+    }
+
+    fn expected_schema_manifest_digest(version: i64) -> Result<String> {
+        static EXPECTED_DIGESTS: OnceLock<std::result::Result<Vec<String>, String>> =
+            OnceLock::new();
+        let digests = EXPECTED_DIGESTS.get_or_init(|| {
+            (MINIMUM_MIGRATABLE_SCHEMA_VERSION..=SCHEMA_VERSION)
+                .map(Self::build_expected_schema_manifest_digest)
+                .collect::<Result<Vec<_>>>()
+                .map_err(|error| error.to_string())
+        });
+        let digests = digests
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))?;
+        let index = usize::try_from(version - MINIMUM_MIGRATABLE_SCHEMA_VERSION)?;
+        digests
+            .get(index)
+            .cloned()
+            .context("supported memory schema digest is unavailable")
+    }
+
+    fn build_expected_schema_manifest_digest(version: i64) -> Result<String> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY)",
+            [],
+        )?;
+        Self::migrate_v1_on(&conn)?;
+        if version >= 2 {
+            Self::migrate_v2_on(&conn)?;
+        }
+        if version >= 3 {
+            Self::migrate_v3_on(&conn)?;
+        }
+        if version >= 4 {
+            Self::migrate_v4_on(&conn)?;
+        }
+        if version >= 5 {
+            Self::migrate_v5_on(&conn)?;
+        }
+        if version >= 6 {
+            Self::migrate_v6_on(&conn)?;
+        }
+        Self::schema_manifest_digest(&conn)
+    }
+
+    /// Validate the reported source version rather than assuming a marker
+    /// proves that every preceding migration completed.
+    fn validate_schema_shape(conn: &Connection, version: i64) -> Result<()> {
+        anyhow::ensure!(
+            (MINIMUM_MIGRATABLE_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&version),
+            "unsupported memory schema version {version}"
+        );
+        Self::validate_schema_object_manifest(conn, version)?;
+        anyhow::ensure!(
+            Self::schema_manifest_digest(conn)? == Self::expected_schema_manifest_digest(version)?,
+            "memory schema v{version} object definitions differ from the supported exact schema"
+        );
+        Self::validate_v1_schema_shape(conn, version)?;
+        if version >= 2 {
+            Self::validate_v2_schema_shape(conn, version)?;
+        }
+        if version >= 3 {
+            Self::validate_v3_schema_shape(conn, version)?;
+        }
+        if version >= 4 {
+            Self::validate_v4_schema_shape(conn, version)?;
+        }
+        if version >= 5 {
+            Self::validate_v5_schema_shape(conn, version)?;
+        }
+        if version >= 6 {
+            Self::validate_v6_schema_shape(conn, version)?;
+        }
+        Ok(())
+    }
+
+    fn validate_v1_schema_shape(conn: &Connection, version: i64) -> Result<()> {
+        Self::require_schema_objects(
+            conn,
+            "table",
+            &[
+                "schema_version",
+                "archival_memory",
+                "archival_memory_fts",
+                "core_memory",
+            ],
+            version,
+        )?;
+        Self::require_schema_objects(
+            conn,
+            "trigger",
+            &[
+                "archival_memory_ai",
+                "archival_memory_ad",
+                "archival_memory_au",
+            ],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "archival_memory",
+            &["id", "content", "created_at", "updated_at"],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "core_memory",
+            &["section", "content", "updated_at"],
+            version,
+        )?;
+        if version < 4 {
+            Self::require_schema_columns(conn, "archival_memory", &["tags"], version)?;
+        }
+        Ok(())
+    }
+
+    fn validate_v2_schema_shape(conn: &Connection, version: i64) -> Result<()> {
+        Self::require_schema_objects(
+            conn,
+            "table",
+            &["recent_sessions", "recent_activity"],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "recent_sessions",
+            &[
+                "id",
+                "session_id",
+                "summary",
+                "files_modified",
+                "issues_worked",
+                "started_at",
+                "ended_at",
+            ],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "recent_activity",
+            &[
+                "id",
+                "session_id",
+                "activity_type",
+                "target",
+                "details",
+                "created_at",
+            ],
+            version,
+        )?;
+        Ok(())
+    }
+
+    fn validate_v3_schema_shape(conn: &Connection, version: i64) -> Result<()> {
+        Self::require_schema_objects(
+            conn,
+            "table",
+            &[
+                "coding_patterns",
+                "file_relationships",
+                "error_patterns",
+                "learned_preferences",
+            ],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "coding_patterns",
+            &[
+                "id",
+                "file_glob",
+                "pattern_type",
+                "description",
+                "confidence",
+                "created_at",
+                "updated_at",
+            ],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "file_relationships",
+            &["id", "file_a", "file_b", "co_edit_count", "last_seen"],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "error_patterns",
+            &[
+                "id",
+                "error_signature",
+                "file_context",
+                "resolution",
+                "occurrences",
+                "created_at",
+                "updated_at",
+            ],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "learned_preferences",
+            &[
+                "id",
+                "category",
+                "preference",
+                "source",
+                "confidence",
+                "created_at",
+                "updated_at",
+            ],
+            version,
+        )?;
+        Ok(())
+    }
+
+    fn validate_v4_schema_shape(conn: &Connection, version: i64) -> Result<()> {
+        Self::require_schema_objects(conn, "table", &["archival_memory_tags"], version)?;
+        Self::require_schema_columns(conn, "archival_memory_tags", &["memory_id", "tag"], version)?;
+        anyhow::ensure!(
+            !Self::table_has_column(conn, "archival_memory", "tags")?,
+            "memory schema v{version} is partial: legacy archival_memory.tags remains"
+        );
+        Ok(())
+    }
+
+    fn validate_v5_schema_shape(conn: &Connection, version: i64) -> Result<()> {
+        Self::require_schema_objects(
+            conn,
+            "table",
+            &["memory_store_metadata", "memory_revisions", "memory_heads"],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "memory_store_metadata",
+            &["singleton", "store_id"],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "memory_revisions",
+            &[
+                "logical_id",
+                "version",
+                "parent_digest",
+                "record_digest",
+                "content_digest",
+                "content",
+                "tags_json",
+                "provenance_json",
+                "record_state",
+                "created_at",
+            ],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "memory_heads",
+            &["logical_id", "record_digest"],
+            version,
+        )?;
+        Self::require_schema_columns(
+            conn,
+            "archival_memory",
+            &[
+                "logical_id",
+                "version",
+                "parent_digest",
+                "record_digest",
+                "content_digest",
+                "provenance_json",
+                "record_state",
+            ],
+            version,
+        )?;
+        Self::validate_v5_projection(conn)
+    }
+
+    fn validate_v6_schema_shape(conn: &Connection, version: i64) -> Result<()> {
+        Self::require_schema_objects(conn, "table", &["memory_store_contract"], version)?;
+        Self::require_schema_objects(conn, "trigger", &["technical_lesson_count_cap"], version)?;
+        Self::require_schema_columns(
+            conn,
+            "memory_store_contract",
+            &[
+                "singleton",
+                "store_schema_version",
+                "minimum_reader_version",
+                "lesson_schema_version",
+                "authority_kind",
+                "workspace_id",
+                "schema_digest",
+                "migration_state",
+            ],
+            version,
+        )?;
+        Self::validate_v6_contract(conn)
+    }
+
+    fn validate_v6_contract(conn: &Connection) -> Result<()> {
+        let rows = conn
+            .prepare(
+                r"SELECT store_schema_version, minimum_reader_version,
+                          lesson_schema_version, authority_kind, workspace_id,
+                          schema_digest, migration_state
+                     FROM memory_store_contract ORDER BY singleton LIMIT 2",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            rows.len() == 1,
+            "memory store contract is missing or duplicated"
+        );
+        let (
+            store_version,
+            minimum_reader,
+            lesson_version,
+            authority,
+            workspace,
+            stored_schema_digest,
+            state,
+        ) = &rows[0];
+        anyhow::ensure!(
+            *store_version == SCHEMA_VERSION
+                && *minimum_reader == SCHEMA_VERSION
+                && *lesson_version == i64::from(TECHNICAL_LESSON_SCHEMA_VERSION)
+                && state == "ready",
+            "memory store contract is unsupported or partially migrated"
+        );
+        anyhow::ensure!(
+            stored_schema_digest == &Self::schema_manifest_digest(conn)?,
+            "memory store schema digest does not match its exact object definitions"
+        );
+        let workspace_id = match (authority.as_str(), workspace.as_deref()) {
+            ("explicit_unbound", None) => None,
+            ("user_private" | "team_shared", Some(encoded)) => Some(
+                encoded
+                    .parse()
+                    .context("memory store workspace binding is malformed")?,
+            ),
+            _ => anyhow::bail!("memory store authority binding is inconsistent"),
+        };
+        Self::validate_current_technical_lesson_projections(conn, workspace_id.as_ref())?;
+        Ok(())
+    }
+
+    fn validate_current_technical_lesson_projections(
+        conn: &Connection,
+        workspace_id: Option<&WorkspaceMemoryId>,
+    ) -> Result<()> {
+        Self::validate_technical_lesson_revision_history(conn, workspace_id)?;
+        let rows = Self::memory_search_by_tag_on(
+            conn,
+            TECHNICAL_LESSON_TAG,
+            MAX_TECHNICAL_LESSONS_PER_STORE + 1,
+        )?;
+        anyhow::ensure!(
+            rows.len() <= MAX_TECHNICAL_LESSONS_PER_STORE,
+            "technical lesson store budget exceeded"
+        );
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let workspace_id = workspace_id
+            .context("an unbound memory store cannot contain typed technical lessons")?;
+        for row in &rows {
+            Self::decode_technical_lesson_row(conn, row, workspace_id)?;
+        }
+        Ok(())
+    }
+
+    /// Validate every active typed revision, including superseded history,
+    /// before the store becomes usable. Querying only the mutable projection
+    /// would otherwise leave corrected ancestors outside the integrity gate.
+    fn validate_technical_lesson_revision_history(
+        conn: &Connection,
+        workspace_id: Option<&WorkspaceMemoryId>,
+    ) -> Result<()> {
+        let total_revisions: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memory_revisions", [], |row| {
+                row.get(0)
+            })?;
+        anyhow::ensure!(
+            (0..=MAX_MEMORY_MIGRATION_ROWS).contains(&total_revisions),
+            "memory database exceeds the revision validation budget"
+        );
+
+        let mut stmt = conn.prepare(
+            r"WITH RECURSIVE technical_history(record_digest) AS (
+                   SELECT revision.record_digest
+                     FROM memory_revisions revision
+                    WHERE EXISTS (
+                        SELECT 1 FROM json_each(revision.tags_json) AS tag
+                         WHERE tag.value = ?1
+                    )
+                   UNION
+                   SELECT child.record_digest
+                     FROM memory_revisions child
+                     JOIN technical_history parent
+                       ON child.parent_digest = parent.record_digest
+               )
+               SELECT revision.logical_id, revision.version,
+                      revision.parent_digest, revision.record_digest,
+                      revision.content_digest, revision.content,
+                      revision.tags_json, revision.provenance_json,
+                      revision.record_state, LENGTH(revision.content),
+                      LENGTH(revision.tags_json), LENGTH(revision.provenance_json)
+                 FROM memory_revisions revision
+                 JOIN technical_history history
+                   ON history.record_digest = revision.record_digest
+                ORDER BY revision.record_digest
+                LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![
+            TECHNICAL_LESSON_TAG,
+            MAX_MEMORY_MIGRATION_ROWS.saturating_add(1)
+        ])?;
+        let mut validated = 0_i64;
+        while let Some(row) = rows.next()? {
+            validated = validated
+                .checked_add(1)
+                .context("technical revision validation count overflowed")?;
+            anyhow::ensure!(
+                validated <= MAX_MEMORY_MIGRATION_ROWS,
+                "technical revision history exceeds its validation budget"
+            );
+            let content_bytes: i64 = row.get(9)?;
+            let tags_bytes: i64 = row.get(10)?;
+            let provenance_bytes: i64 = row.get(11)?;
+            anyhow::ensure!(
+                (0..=i64::try_from(MAX_TECHNICAL_LESSON_BYTES)?).contains(&content_bytes)
+                    && (0..=i64::try_from(MAX_TECHNICAL_REVISION_TAGS_BYTES)?)
+                        .contains(&tags_bytes)
+                    && (0..=i64::try_from(MAX_TECHNICAL_PROVENANCE_BYTES)?)
+                        .contains(&provenance_bytes),
+                "technical revision exceeds its persisted field budget"
+            );
+            let revision = Self::revision_from_row(row)?;
+            let workspace_id = workspace_id
+                .context("an unbound memory store cannot contain typed technical lessons")?;
+            Self::validate_technical_lesson_lineage_revision(&revision, workspace_id)?;
+        }
+        Ok(())
+    }
+
+    fn load_workspace_binding(conn: &Connection) -> Result<Option<WorkspaceMemoryId>> {
+        if !Self::table_exists(conn, "memory_store_contract")? {
+            return Ok(None);
+        }
+        let encoded: Option<String> = conn.query_row(
+            "SELECT workspace_id FROM memory_store_contract WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        encoded
+            .map(|value| value.parse().context("invalid memory workspace binding"))
+            .transpose()
+    }
+
+    fn bind_workspace_authority(
+        &self,
+        workspace_id: &WorkspaceMemoryId,
+        authority_kind: &'static str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(authority_kind, "user_private" | "team_shared"),
+            "invalid memory authority kind"
+        );
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("binding memory store workspace authority")?;
+        let (stored_authority, stored_workspace): (String, Option<String>) = tx.query_row(
+            r"SELECT authority_kind, workspace_id FROM memory_store_contract
+               WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        match (stored_authority.as_str(), stored_workspace.as_deref()) {
+            ("explicit_unbound", None) => {
+                tx.execute(
+                    r"UPDATE memory_store_contract
+                         SET authority_kind = ?1, workspace_id = ?2
+                       WHERE singleton = 1 AND authority_kind = 'explicit_unbound'
+                         AND workspace_id IS NULL",
+                    params![authority_kind, workspace_id.as_str()],
+                )?;
+            }
+            (stored_kind, Some(stored_id))
+                if stored_kind == authority_kind && stored_id == workspace_id.as_str() => {}
+            _ => {
+                anyhow::bail!("memory store is already bound to a different workspace or authority")
+            }
+        }
+        tx.commit()
+            .context("committing memory store workspace authority")?;
+        drop(conn);
+        Ok(())
+    }
+
+    fn create_private_state_directory(host_home: &Path, target: &Path) -> Result<()> {
+        let relative = target
+            .strip_prefix(host_home)
+            .context("memory state path escaped host home")?;
+        let mut current = host_home.to_path_buf();
+        #[cfg(unix)]
+        let expected_owner = std::fs::metadata(host_home)?.uid();
+
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                anyhow::bail!("memory state path is not normalized");
+            };
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    anyhow::ensure!(
+                        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+                        "memory state component is not a real directory: {}",
+                        current.display()
+                    );
+                    #[cfg(unix)]
+                    {
+                        anyhow::ensure!(
+                            metadata.uid() == expected_owner,
+                            "memory state component has a different owner: {}",
+                            current.display()
+                        );
+                        anyhow::ensure!(
+                            metadata.permissions().mode().trailing_zeros() >= 6,
+                            "memory state component is group/world accessible: {}",
+                            current.display()
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    #[cfg(unix)]
+                    let builder = {
+                        let mut builder = std::fs::DirBuilder::new();
+                        builder.mode(0o700);
+                        builder
+                    };
+                    #[cfg(not(unix))]
+                    let builder = std::fs::DirBuilder::new();
+                    builder.create(&current).with_context(|| {
+                        format!("creating private memory state at {}", current.display())
+                    })?;
+                    #[cfg(unix)]
+                    std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o700))?;
+                }
+                Err(error) => return Err(error).context("inspecting memory state directory"),
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            // Reuse S-031's descriptor/no-link/owner/mode validation for the
+            // final authority root. SQLite still owns its internal locking and
+            // transaction protocol inside this pinned directory.
+            let _ = crate::persistence::PersistentStorage::open(target)
+                .context("opening private memory persistence root")?;
+        }
+        Ok(())
+    }
+
+    /// Validate an existing host-owned database before and after SQLite opens
+    /// it. The containing directory is private, but the file contract remains
+    /// explicit so a later permission change cannot expose lesson contents.
+    fn validate_private_database_file(host_home: &Path, path: &Path) -> Result<bool> {
+        #[cfg(not(unix))]
+        let _ = host_home;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("inspecting private memory database"),
+        };
+        anyhow::ensure!(
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+            "private memory database is not a regular file"
+        );
+        #[cfg(unix)]
+        {
+            let expected_owner = std::fs::metadata(host_home)?.uid();
+            anyhow::ensure!(
+                metadata.uid() == expected_owner,
+                "private memory database has a different owner"
+            );
+            anyhow::ensure!(
+                metadata.permissions().mode().trailing_zeros() >= 6,
+                "private memory database is group/world accessible"
+            );
+        }
+        Ok(true)
     }
 
     /// Migration v1: Original schema
@@ -1218,6 +2445,65 @@ impl MemoryDb {
         }
     }
 
+    /// Apply a locally-authored successor only when its exact parent remains
+    /// the sole causal head. Unlike replica import, a stale local correction
+    /// must not create a conflict branch and then report an ordinary error.
+    fn apply_linear_revision_on(
+        conn: &mut Connection,
+        revision: &MemoryRevision,
+        expected_parent: &MemoryDigest,
+    ) -> Result<ApplyRevisionOutcome> {
+        revision.validate()?;
+        anyhow::ensure!(
+            revision.parent_digest.as_ref() == Some(expected_parent),
+            "linear memory revision is not bound to its expected parent"
+        );
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("technical lesson: failed to begin linear mutation")?;
+
+        if Self::load_revision_by_digest(&tx, &revision.record_digest)?.is_some() {
+            let heads = Self::head_digests(&tx, revision.logical_id)?;
+            if heads.as_slice() == [revision.record_digest.clone()] {
+                tx.commit()
+                    .context("technical lesson: committing idempotent mutation")?;
+                return Ok(ApplyRevisionOutcome::Idempotent);
+            }
+            return Err(TechnicalLessonStoreError::ConcurrentMutation.into());
+        }
+
+        let heads = Self::head_digests(&tx, revision.logical_id)?;
+        if heads.as_slice() != [expected_parent.clone()] {
+            return Err(TechnicalLessonStoreError::StaleRevision.into());
+        }
+        Self::validate_revision_parent(&tx, revision)?;
+        anyhow::ensure!(
+            Self::insert_revision_row(&tx, revision)?,
+            "technical lesson successor was not inserted"
+        );
+        let removed = tx.execute(
+            "DELETE FROM memory_heads WHERE logical_id = ?1 AND record_digest = ?2",
+            params![revision.logical_id.to_string(), expected_parent.as_str()],
+        )?;
+        if removed != 1 {
+            return Err(TechnicalLessonStoreError::StaleRevision.into());
+        }
+        tx.execute(
+            "INSERT INTO memory_heads (logical_id, record_digest) VALUES (?1, ?2)",
+            params![
+                revision.logical_id.to_string(),
+                revision.record_digest.as_str()
+            ],
+        )?;
+        anyhow::ensure!(
+            Self::refresh_projection(&tx, revision.logical_id)? == 1,
+            "technical lesson linear mutation did not retain one causal head"
+        );
+        tx.commit()
+            .context("technical lesson: committing linear mutation")?;
+        Ok(ApplyRevisionOutcome::Advanced)
+    }
+
     /// Idempotently import one validated revision into this store.
     ///
     /// # Errors
@@ -1225,7 +2511,9 @@ impl MemoryDb {
     /// Returns an error for tampered revisions, unavailable/mismatched parents,
     /// poisoned state, or a failed transaction.
     pub fn apply_revision(&self, revision: &MemoryRevision) -> Result<ApplyRevisionOutcome> {
-        Self::apply_revision_on(&mut *self.lock_conn()?, revision)
+        let mut conn = self.lock_conn()?;
+        self.validate_typed_revision_for_store_on(&conn, revision)?;
+        Self::apply_revision_on(&mut conn, revision)
     }
 
     /// Load the selected immutable revision for a physical compatibility row.
@@ -1397,6 +2685,7 @@ impl MemoryDb {
             "memory_save_revision requires a root revision"
         );
         let mut conn = self.lock_conn()?;
+        self.validate_typed_revision_for_store_on(&conn, revision)?;
         let _ = Self::apply_revision_on(&mut conn, revision)?;
         conn.query_row(
             "SELECT id FROM archival_memory WHERE logical_id = ?1",
@@ -1843,6 +3132,810 @@ impl MemoryDb {
         }
 
         Ok(memories)
+    }
+
+    // === Typed codebase technical lessons ===
+
+    /// Persist one explicitly proposed technical lesson as an immutable root
+    /// revision. The caller supplies a typed source observation; workspace,
+    /// physical-store, scope, review state, and capture time are host-bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this is not a workspace-bound production store,
+    /// the draft is invalid, the store cap is reached, or persistence fails.
+    pub fn save_technical_lesson_candidate(
+        &self,
+        draft: &TechnicalLessonDraft,
+        source: MemorySourceEvidence,
+        author_id: String,
+        captured_at_unix_seconds: i64,
+    ) -> Result<TechnicalLessonRecord> {
+        let workspace_id = self
+            .workspace_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
+        let provenance = MemoryProvenance::new(
+            source,
+            MemoryAttribution::new(
+                author_id,
+                Some(self.store_id()?),
+                Some(workspace_id.to_string()),
+            ),
+            MemoryRecordScope::UserPrivate,
+        );
+        Self::validate_technical_lesson_provenance(&provenance, &workspace_id)?;
+        let logical_id =
+            LogicalMemoryId::for_technical_source(workspace_id.as_str(), &provenance.source_id);
+        if let Some(record) = self.existing_idempotent_technical_lesson(
+            logical_id,
+            &workspace_id,
+            draft,
+            &provenance,
+            captured_at_unix_seconds,
+        )? {
+            return Ok(record);
+        }
+        let lesson = TechnicalLesson::from_candidate(
+            workspace_id.clone(),
+            draft.clone(),
+            captured_at_unix_seconds,
+        )?;
+        let revision = MemoryRevision::new_with_logical_id(
+            logical_id,
+            lesson.encode()?,
+            vec![
+                TECHNICAL_LESSON_TAG.to_string(),
+                format!("technical-kind:{}", technical_lesson_kind_name(lesson.kind)),
+            ],
+            provenance,
+        );
+        if let Err(error) = self.memory_save_revision(&revision) {
+            if let Some(record) = self.existing_idempotent_technical_lesson(
+                logical_id,
+                &workspace_id,
+                draft,
+                &revision.provenance,
+                captured_at_unix_seconds,
+            )? {
+                return Ok(record);
+            }
+            return Err(error);
+        }
+        Ok(TechnicalLessonRecord {
+            logical_id: revision.logical_id,
+            version: revision.version,
+            record_digest: revision.record_digest,
+            scope: revision.provenance.scope,
+            provenance: revision.provenance,
+            conflicted: false,
+            due_for_review: lesson.is_due_for_review_at(captured_at_unix_seconds),
+            lesson,
+        })
+    }
+
+    fn existing_idempotent_technical_lesson(
+        &self,
+        logical_id: LogicalMemoryId,
+        workspace_id: &WorkspaceMemoryId,
+        draft: &TechnicalLessonDraft,
+        expected_provenance: &MemoryProvenance,
+        now_unix_seconds: i64,
+    ) -> Result<Option<TechnicalLessonRecord>> {
+        let heads = self.revision_heads(logical_id)?;
+        if heads.is_empty() {
+            return Ok(None);
+        }
+        if heads.len() != 1 {
+            return Err(TechnicalLessonStoreError::IdempotencyCollision.into());
+        }
+        let revision = heads
+            .into_iter()
+            .next()
+            .context("idempotent technical lesson head disappeared")?;
+        revision.validate()?;
+        Self::validate_technical_lesson_provenance(&revision.provenance, workspace_id)?;
+        if revision.version != MemoryVersion::INITIAL
+            || revision.parent_digest.is_some()
+            || revision.state != MemoryRevisionState::Active
+            || &revision.provenance != expected_provenance
+        {
+            return Err(TechnicalLessonStoreError::IdempotencyCollision.into());
+        }
+        let lesson = TechnicalLesson::decode(&revision.content)?;
+        let expected = TechnicalLesson::from_candidate(
+            workspace_id.clone(),
+            draft.clone(),
+            lesson.captured_at_unix_seconds,
+        )?;
+        if lesson != expected {
+            return Err(TechnicalLessonStoreError::IdempotencyCollision.into());
+        }
+        Ok(Some(TechnicalLessonRecord {
+            logical_id,
+            version: revision.version,
+            record_digest: revision.record_digest,
+            scope: revision.provenance.scope,
+            provenance: revision.provenance,
+            conflicted: false,
+            due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
+            lesson,
+        }))
+    }
+
+    /// Retrieve bounded typed lessons for this exact workspace. Legacy
+    /// archival prose is never considered because only the exact typed tag is
+    /// read and every selected row must decode through the strict schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query bounds, corrupt tagged records,
+    /// workspace/provenance mismatch, oversized stores, or database failures.
+    pub fn query_technical_lessons(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+        now_unix_seconds: i64,
+    ) -> Result<TechnicalLessonQueryResult> {
+        const MAX_RESULT_COUNT: usize = 20;
+
+        anyhow::ensure!(
+            (1..=MAX_RESULT_COUNT).contains(&limit),
+            "technical lesson result limit must be between 1 and {MAX_RESULT_COUNT}"
+        );
+        anyhow::ensure!(
+            now_unix_seconds >= 0,
+            "technical lesson query time is invalid"
+        );
+        let workspace_id = self
+            .workspace_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
+        let query = Self::validate_technical_lesson_query(query)?;
+        let mut candidates = self.collect_technical_lesson_candidates(
+            &workspace_id,
+            &query.terms,
+            now_unix_seconds,
+        )?;
+        candidates
+            .ranked
+            .sort_by(|(left_score, left), (right_score, right)| {
+                right_score
+                    .cmp(left_score)
+                    .then_with(|| {
+                        right
+                            .lesson
+                            .captured_at_unix_seconds
+                            .cmp(&left.lesson.captured_at_unix_seconds)
+                    })
+                    .then_with(|| right.version.cmp(&left.version))
+                    .then_with(|| left.logical_id.cmp(&right.logical_id))
+            });
+        let truncated = candidates.ranked.len() > limit;
+        let records = candidates
+            .ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>();
+        let status = if truncated
+            || candidates.truncated_by_budget
+            || candidates.omitted_expired > 0
+            || candidates.omitted_conflicted > 0
+        {
+            TechnicalLessonQueryStatus::Partial
+        } else if records.is_empty() {
+            TechnicalLessonQueryStatus::NoHit
+        } else {
+            TechnicalLessonQueryStatus::Complete
+        };
+        let mut result = TechnicalLessonQueryResult {
+            schema_version: TECHNICAL_LESSON_SCHEMA_VERSION,
+            workspace_id,
+            authority: "untrusted_reference_evidence",
+            status,
+            query: query.normalized,
+            records,
+            omitted_expired: candidates.omitted_expired,
+            omitted_conflicted: candidates.omitted_conflicted,
+            truncated_by_budget: candidates.truncated_by_budget || truncated,
+        };
+        while serde_json::to_vec(&result)?.len() > MAX_TECHNICAL_QUERY_RESULT_BYTES {
+            anyhow::ensure!(
+                result.records.pop().is_some(),
+                "technical lesson query metadata exceeds its result byte budget"
+            );
+            result.status = TechnicalLessonQueryStatus::Partial;
+            result.truncated_by_budget = true;
+        }
+        Ok(result)
+    }
+
+    fn validate_technical_lesson_query(
+        query: Option<&str>,
+    ) -> Result<ValidatedTechnicalLessonQuery> {
+        const MAX_QUERY_BYTES: usize = 512;
+        const MAX_QUERY_TERMS: usize = 16;
+
+        let normalized = query
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        anyhow::ensure!(
+            query.is_none() || normalized.is_some(),
+            "technical lesson query must not be empty"
+        );
+        if let Some(value) = &normalized {
+            anyhow::ensure!(
+                value.len() <= MAX_QUERY_BYTES && !value.chars().any(char::is_control),
+                "technical lesson query is invalid or oversized"
+            );
+        }
+        let terms = normalized
+            .as_deref()
+            .map(|value| {
+                let terms = value
+                    .split_whitespace()
+                    .map(str::to_lowercase)
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    terms.len() <= MAX_QUERY_TERMS,
+                    "technical lesson query has too many terms"
+                );
+                Ok::<_, anyhow::Error>(terms)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(ValidatedTechnicalLessonQuery { normalized, terms })
+    }
+
+    fn collect_technical_lesson_candidates(
+        &self,
+        workspace_id: &WorkspaceMemoryId,
+        query_terms: &[String],
+        now_unix_seconds: i64,
+    ) -> Result<TechnicalLessonCandidates> {
+        Self::collect_technical_lesson_candidates_on(
+            &*self.lock_conn()?,
+            workspace_id,
+            query_terms,
+            now_unix_seconds,
+        )
+    }
+
+    fn collect_technical_lesson_candidates_on(
+        conn: &Connection,
+        workspace_id: &WorkspaceMemoryId,
+        query_terms: &[String],
+        now_unix_seconds: i64,
+    ) -> Result<TechnicalLessonCandidates> {
+        let rows = Self::memory_search_by_tag_on(
+            conn,
+            TECHNICAL_LESSON_TAG,
+            MAX_TECHNICAL_QUERY_SCAN_RECORDS + 1,
+        )?;
+        let row_budget_exhausted = rows.len() > MAX_TECHNICAL_QUERY_SCAN_RECORDS;
+        let mut result = TechnicalLessonCandidates {
+            ranked: Vec::with_capacity(rows.len().min(MAX_TECHNICAL_QUERY_SCAN_RECORDS)),
+            omitted_expired: 0,
+            omitted_conflicted: 0,
+            truncated_by_budget: row_budget_exhausted,
+        };
+        let mut scanned_bytes = 0_usize;
+        for row in rows.into_iter().take(MAX_TECHNICAL_QUERY_SCAN_RECORDS) {
+            anyhow::ensure!(
+                row.content.len() <= MAX_TECHNICAL_LESSON_BYTES,
+                "technical lesson exceeds its record byte budget"
+            );
+            let next_bytes = scanned_bytes
+                .checked_add(row.content.len())
+                .context("technical lesson scan byte count overflowed")?;
+            if next_bytes > MAX_TECHNICAL_QUERY_SCAN_BYTES {
+                result.truncated_by_budget = true;
+                break;
+            }
+            scanned_bytes = next_bytes;
+            let lesson = Self::decode_technical_lesson_row(conn, &row, workspace_id)?;
+            if lesson.is_expired_at(now_unix_seconds) {
+                result.omitted_expired += 1;
+                continue;
+            }
+            if !row.conflict_heads.is_empty() {
+                result.omitted_conflicted += 1;
+                continue;
+            }
+            let projection = lesson.search_projection().to_lowercase();
+            let score = if query_terms.is_empty() {
+                1
+            } else {
+                query_terms
+                    .iter()
+                    .filter(|term| projection.contains(term.as_str()))
+                    .count()
+            };
+            if score > 0 {
+                result.ranked.push((
+                    score,
+                    TechnicalLessonRecord {
+                        logical_id: row.logical_id,
+                        version: row.version,
+                        record_digest: row.record_digest,
+                        scope: row.provenance.scope,
+                        provenance: row.provenance,
+                        conflicted: false,
+                        due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
+                        lesson,
+                    },
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Create a causal correction of one exact lesson head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale digests, conflicts, wrong-workspace payloads,
+    /// invalid replacement evidence, or persistence failure.
+    pub fn correct_technical_lesson(
+        &self,
+        request: TechnicalLessonCorrectionRequest,
+    ) -> Result<TechnicalLessonRecord> {
+        let TechnicalLessonCorrectionRequest {
+            logical_id,
+            expected_record_digest,
+            replacement,
+            correction_reason,
+            source,
+            author_id,
+            captured_at_unix_seconds,
+        } = request;
+        let workspace_id = self
+            .workspace_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
+        let heads = self.revision_heads(logical_id)?;
+        if heads.len() > 1 {
+            return Err(TechnicalLessonStoreError::UnresolvedConflict.into());
+        }
+        let current = heads
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("technical lesson is unavailable"))?;
+        current.validate()?;
+        let provenance = MemoryProvenance::new(
+            source,
+            MemoryAttribution::new(
+                author_id,
+                Some(self.store_id()?),
+                Some(workspace_id.to_string()),
+            ),
+            current.provenance.scope,
+        );
+        Self::validate_technical_lesson_provenance(&provenance, &workspace_id)?;
+        if current.record_digest != expected_record_digest {
+            if let Some(record) =
+                self.existing_idempotent_technical_correction(TechnicalCorrectionReplay {
+                    current: &current,
+                    expected_parent: &expected_record_digest,
+                    workspace_id: &workspace_id,
+                    replacement: &replacement,
+                    correction_reason: &correction_reason,
+                    expected_provenance: &provenance,
+                    now_unix_seconds: captured_at_unix_seconds,
+                })?
+            {
+                return Ok(record);
+            }
+            return Err(TechnicalLessonStoreError::StaleRevision.into());
+        }
+        anyhow::ensure!(
+            current.state == MemoryRevisionState::Active,
+            "technical lesson is deleted"
+        );
+        let previous = TechnicalLesson::decode(&current.content)?;
+        anyhow::ensure!(
+            previous.workspace_id == workspace_id,
+            "technical lesson belongs to a different workspace"
+        );
+        let lesson = previous.corrected(
+            replacement,
+            current.record_digest.clone(),
+            correction_reason,
+            captured_at_unix_seconds,
+        )?;
+        let revision = current.successor(
+            lesson.encode()?,
+            vec![
+                TECHNICAL_LESSON_TAG.to_string(),
+                format!("technical-kind:{}", technical_lesson_kind_name(lesson.kind)),
+            ],
+            provenance,
+        )?;
+        let outcome = Self::apply_linear_revision_on(
+            &mut *self.lock_conn()?,
+            &revision,
+            &current.record_digest,
+        )?;
+        if !matches!(
+            outcome,
+            ApplyRevisionOutcome::Advanced | ApplyRevisionOutcome::Idempotent
+        ) {
+            return Err(TechnicalLessonStoreError::ConcurrentMutation.into());
+        }
+        Ok(TechnicalLessonRecord {
+            logical_id,
+            version: revision.version,
+            record_digest: revision.record_digest,
+            scope: revision.provenance.scope,
+            provenance: revision.provenance,
+            conflicted: false,
+            due_for_review: lesson.is_due_for_review_at(captured_at_unix_seconds),
+            lesson,
+        })
+    }
+
+    fn existing_idempotent_technical_correction(
+        &self,
+        replay: TechnicalCorrectionReplay<'_>,
+    ) -> Result<Option<TechnicalLessonRecord>> {
+        let TechnicalCorrectionReplay {
+            current,
+            expected_parent,
+            workspace_id,
+            replacement,
+            correction_reason,
+            expected_provenance,
+            now_unix_seconds,
+        } = replay;
+        if current.state != MemoryRevisionState::Active
+            || current.parent_digest.as_ref() != Some(expected_parent)
+            || current.provenance.source_id != expected_provenance.source_id
+        {
+            return Ok(None);
+        }
+        if &current.provenance != expected_provenance {
+            return Err(TechnicalLessonStoreError::IdempotencyCollision.into());
+        }
+        let parent = self
+            .revision_by_digest(expected_parent)?
+            .context("idempotent correction parent is unavailable")?;
+        parent.validate()?;
+        anyhow::ensure!(
+            parent.logical_id == current.logical_id && parent.state == MemoryRevisionState::Active,
+            "idempotent correction parent is inconsistent"
+        );
+        let parent_lesson = TechnicalLesson::decode(&parent.content)?;
+        let lesson = TechnicalLesson::decode(&current.content)?;
+        let expected = parent_lesson.corrected(
+            replacement.clone(),
+            expected_parent.clone(),
+            correction_reason.to_string(),
+            lesson.captured_at_unix_seconds,
+        )?;
+        if lesson != expected || &lesson.workspace_id != workspace_id {
+            return Err(TechnicalLessonStoreError::IdempotencyCollision.into());
+        }
+        Ok(Some(TechnicalLessonRecord {
+            logical_id: current.logical_id,
+            version: current.version,
+            record_digest: current.record_digest.clone(),
+            scope: current.provenance.scope,
+            provenance: current.provenance.clone(),
+            conflicted: false,
+            due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
+            lesson,
+        }))
+    }
+
+    /// Tombstone one exact technical-lesson head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale/conflicted/non-lesson state or persistence
+    /// failure. The immutable history remains available for audit/recovery.
+    pub fn delete_technical_lesson(
+        &self,
+        logical_id: LogicalMemoryId,
+        expected_record_digest: &MemoryDigest,
+        source: MemorySourceEvidence,
+        author_id: String,
+    ) -> Result<MemoryDigest> {
+        let workspace_id = self
+            .workspace_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
+        let heads = self.revision_heads(logical_id)?;
+        if heads.len() > 1 {
+            return Err(TechnicalLessonStoreError::UnresolvedConflict.into());
+        }
+        let current = heads
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("technical lesson is unavailable"))?;
+        current.validate()?;
+        let provenance = MemoryProvenance::new(
+            source,
+            MemoryAttribution::new(
+                author_id,
+                Some(self.store_id()?),
+                Some(workspace_id.to_string()),
+            ),
+            current.provenance.scope,
+        );
+        Self::validate_technical_lesson_provenance(&provenance, &workspace_id)?;
+        if current.state == MemoryRevisionState::Tombstone
+            && current.parent_digest.as_ref() == Some(expected_record_digest)
+            && current.provenance.source_id == provenance.source_id
+        {
+            if current.provenance != provenance {
+                return Err(TechnicalLessonStoreError::IdempotencyCollision.into());
+            }
+            return Ok(current.record_digest);
+        }
+        anyhow::ensure!(
+            current.state == MemoryRevisionState::Active,
+            "technical lesson is already deleted"
+        );
+        if &current.record_digest != expected_record_digest {
+            return Err(TechnicalLessonStoreError::StaleRevision.into());
+        }
+        let lesson = TechnicalLesson::decode(&current.content)?;
+        anyhow::ensure!(
+            lesson.workspace_id == workspace_id,
+            "technical lesson belongs to a different workspace"
+        );
+        let tombstone = current.tombstone(provenance)?;
+        let outcome = Self::apply_linear_revision_on(
+            &mut *self.lock_conn()?,
+            &tombstone,
+            &current.record_digest,
+        )?;
+        if !matches!(
+            outcome,
+            ApplyRevisionOutcome::Advanced | ApplyRevisionOutcome::Idempotent
+        ) {
+            return Err(TechnicalLessonStoreError::ConcurrentMutation.into());
+        }
+        Ok(tombstone.record_digest)
+    }
+
+    fn decode_technical_lesson_row(
+        conn: &Connection,
+        row: &ArchivalMemory,
+        workspace_id: &WorkspaceMemoryId,
+    ) -> Result<TechnicalLesson> {
+        anyhow::ensure!(
+            row.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG),
+            "archival row is not a typed technical lesson"
+        );
+        let mut heads = Self::head_digests(conn, row.logical_id)?
+            .into_iter()
+            .map(|digest| {
+                Self::load_revision_by_digest(conn, &digest)?
+                    .context("technical lesson head references a missing revision")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(!heads.is_empty(), "technical lesson has no causal head");
+        for head in &heads {
+            Self::validate_technical_lesson_lineage_revision(head, workspace_id)?;
+        }
+
+        let mut expected_conflicts = if heads.len() > 1 {
+            heads
+                .iter()
+                .map(|head| MemoryConflictHead {
+                    version: head.version,
+                    record_digest: head.record_digest.clone(),
+                    parent_digest: head.parent_digest.clone(),
+                    content_digest: head.content_digest.clone(),
+                    state: head.state,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        expected_conflicts.sort_by(|left, right| {
+            right
+                .version
+                .cmp(&left.version)
+                .then_with(|| left.record_digest.cmp(&right.record_digest))
+        });
+        anyhow::ensure!(
+            row.conflict_heads == expected_conflicts,
+            "technical lesson conflict projection does not match its causal heads"
+        );
+
+        heads.sort_by(|left, right| {
+            let left_live = left.state == MemoryRevisionState::Active;
+            let right_live = right.state == MemoryRevisionState::Active;
+            right_live
+                .cmp(&left_live)
+                .then_with(|| right.version.cmp(&left.version))
+                .then_with(|| left.record_digest.cmp(&right.record_digest))
+        });
+        let chosen = &heads[0];
+        anyhow::ensure!(
+            chosen.state == MemoryRevisionState::Active
+                && row.logical_id == chosen.logical_id
+                && row.version == chosen.version
+                && row.parent_digest == chosen.parent_digest
+                && row.record_digest == chosen.record_digest
+                && row.content_digest == chosen.content_digest
+                && row.content == chosen.content
+                && row.tags == chosen.tags
+                && row.provenance == chosen.provenance,
+            "technical lesson projection differs from its immutable selected head"
+        );
+
+        let lesson = TechnicalLesson::decode(&chosen.content)?;
+        anyhow::ensure!(
+            &lesson.workspace_id == workspace_id,
+            "technical lesson payload belongs to a different workspace"
+        );
+        anyhow::ensure!(
+            row.provenance.workspace_id.as_deref() == Some(workspace_id.as_str()),
+            "technical lesson provenance workspace does not match the store"
+        );
+        anyhow::ensure!(
+            row.provenance.scope == MemoryRecordScope::UserPrivate,
+            "technical lesson is outside the user-private authority"
+        );
+        Ok(lesson)
+    }
+
+    fn validate_typed_revision_for_store_on(
+        &self,
+        conn: &Connection,
+        revision: &MemoryRevision,
+    ) -> Result<()> {
+        let mut belongs_to_technical_lineage =
+            revision.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG);
+        let mut ancestor_digest = revision.parent_digest.clone();
+        let mut ancestors_examined = 0_i64;
+        while !belongs_to_technical_lineage {
+            let Some(digest) = ancestor_digest else {
+                break;
+            };
+            ancestors_examined = ancestors_examined
+                .checked_add(1)
+                .context("technical lineage depth overflowed")?;
+            anyhow::ensure!(
+                ancestors_examined <= MAX_MEMORY_MIGRATION_ROWS,
+                "technical lineage exceeds its validation budget"
+            );
+            let Some(ancestor) = Self::load_revision_by_digest(conn, &digest)? else {
+                break;
+            };
+            belongs_to_technical_lineage =
+                ancestor.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG);
+            ancestor_digest = ancestor.parent_digest;
+        }
+        if !belongs_to_technical_lineage {
+            return Ok(());
+        }
+        let workspace_id = self
+            .workspace_id
+            .as_ref()
+            .context("an unbound memory store cannot contain typed technical lessons")?;
+        Self::validate_technical_lesson_lineage_revision(revision, workspace_id)
+    }
+
+    fn validate_technical_lesson_lineage_revision(
+        revision: &MemoryRevision,
+        workspace_id: &WorkspaceMemoryId,
+    ) -> Result<()> {
+        if revision.state == MemoryRevisionState::Active {
+            Self::validate_technical_lesson_revision(revision, workspace_id)?;
+            return Ok(());
+        }
+        revision.validate()?;
+        Self::validate_technical_lesson_provenance(&revision.provenance, workspace_id)?;
+        anyhow::ensure!(
+            revision.parent_digest.is_some(),
+            "technical lesson tombstone has no causal parent"
+        );
+        Ok(())
+    }
+
+    fn validate_technical_lesson_revision(
+        revision: &MemoryRevision,
+        workspace_id: &WorkspaceMemoryId,
+    ) -> Result<TechnicalLesson> {
+        revision.validate()?;
+        anyhow::ensure!(
+            revision.state == MemoryRevisionState::Active,
+            "a tagged technical lesson revision must be active"
+        );
+        Self::validate_technical_lesson_provenance(&revision.provenance, workspace_id)?;
+        let lesson = TechnicalLesson::decode(&revision.content)?;
+        anyhow::ensure!(
+            &lesson.workspace_id == workspace_id,
+            "technical lesson revision belongs to a different workspace"
+        );
+        let mut expected_tags = vec![
+            TECHNICAL_LESSON_TAG.to_string(),
+            format!("technical-kind:{}", technical_lesson_kind_name(lesson.kind)),
+        ];
+        expected_tags.sort();
+        anyhow::ensure!(
+            revision.tags == expected_tags,
+            "technical lesson revision has noncanonical schema tags"
+        );
+        match (&revision.parent_digest, &lesson.correction) {
+            (None, None) => {}
+            (Some(parent), Some(correction)) if &correction.corrected_record_digest == parent => {}
+            _ => anyhow::bail!(
+                "technical lesson correction metadata does not match its causal parent"
+            ),
+        }
+        Ok(lesson)
+    }
+
+    fn validate_technical_lesson_provenance(
+        provenance: &MemoryProvenance,
+        workspace_id: &WorkspaceMemoryId,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            provenance.schema_version == MEMORY_PROVENANCE_SCHEMA_VERSION,
+            "technical lesson provenance schema is unsupported"
+        );
+        Self::validate_technical_identity(
+            &provenance.source_id,
+            MAX_TECHNICAL_SOURCE_ID_BYTES,
+            "source ID",
+        )?;
+        Self::validate_technical_identity(
+            &provenance.source_version,
+            MAX_TECHNICAL_SOURCE_VERSION_BYTES,
+            "source version",
+        )?;
+        Self::validate_technical_identity(
+            &provenance.author_id,
+            MAX_TECHNICAL_AUTHOR_ID_BYTES,
+            "author ID",
+        )?;
+        anyhow::ensure!(
+            provenance.workspace_id.as_deref() == Some(workspace_id.as_str()),
+            "technical lesson provenance workspace does not match the store"
+        );
+        anyhow::ensure!(
+            provenance.scope == MemoryRecordScope::UserPrivate,
+            "technical lesson provenance is outside the user-private authority"
+        );
+        anyhow::ensure!(
+            provenance.source_kind != MemorySourceKind::LegacyUnattributed,
+            "typed technical lessons cannot use unattributed legacy provenance"
+        );
+        if provenance.source_kind == MemorySourceKind::AgentProposal {
+            let Some(digest) = provenance.source_id.strip_prefix("tool-invocation:sha256:") else {
+                anyhow::bail!("agent-proposed technical lesson source ID is malformed");
+            };
+            anyhow::ensure!(
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "agent-proposed technical lesson source ID is malformed"
+            );
+            anyhow::ensure!(
+                provenance.origin_store_id.is_some(),
+                "agent-proposed technical lesson has no origin store"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_technical_identity(value: &str, maximum: usize, label: &str) -> Result<()> {
+        anyhow::ensure!(
+            !value.is_empty()
+                && value.trim() == value
+                && value.len() <= maximum
+                && !value.chars().any(char::is_control),
+            "technical lesson provenance {label} is invalid or oversized"
+        );
+        Ok(())
     }
 
     /// Get memory statistics.
@@ -3335,10 +5428,10 @@ mod tests {
     // Each sub-test uses a fresh tempfile DB to stay isolated.
     // -----------------------------------------------------------------------
 
-    /// B4: fresh DB migrates to `schema_version` = 3 and pre-populates the
-    /// three core memory sections (persona, `project_info`, `user_preferences`).
+    /// B4: a fresh DB migrates to the exact current schema and pre-populates
+    /// the legacy compatibility core-memory sections.
     #[test]
-    fn b4_schema_migration_reaches_v3_with_core_sections() {
+    fn b4_schema_migration_reaches_current_with_core_sections() {
         let dir = tempdir().unwrap();
         let db = MemoryDb::open(&dir.path().join("test.db")).unwrap();
 
@@ -4219,36 +6312,13 @@ mod tests {
         // NOT call MemoryDb::open here — that would jump straight to v4.
         {
             let raw = rusqlite::Connection::open(&db_path).unwrap();
-            raw.execute_batch(
-                r"
-                CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
-                CREATE TABLE archival_memory (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    content TEXT NOT NULL,
-                    tags TEXT DEFAULT '',
-                    created_at TEXT DEFAULT (datetime('now')),
-                    updated_at TEXT DEFAULT (datetime('now'))
-                );
-                CREATE TABLE core_memory (
-                    section TEXT PRIMARY KEY,
-                    content TEXT NOT NULL,
-                    updated_at TEXT DEFAULT (datetime('now'))
-                );
-                INSERT INTO core_memory (section, content) VALUES
-                    ('persona', 'p'),
-                    ('project_info', 'pi'),
-                    ('user_preferences', 'up');
-                CREATE VIRTUAL TABLE archival_memory_fts USING fts5(
-                    content, tags, content=archival_memory, content_rowid=id
-                );
-                CREATE TRIGGER archival_memory_ai AFTER INSERT ON archival_memory BEGIN
-                    INSERT INTO archival_memory_fts(rowid, content, tags)
-                        VALUES (new.id, new.content, new.tags);
-                END;
-                INSERT INTO schema_version (version) VALUES (3);
-                ",
-            )
-            .unwrap();
+            raw.execute_batch("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+                .unwrap();
+            MemoryDb::migrate_v1_on(&raw).unwrap();
+            MemoryDb::migrate_v2_on(&raw).unwrap();
+            MemoryDb::migrate_v3_on(&raw).unwrap();
+            raw.execute("INSERT INTO schema_version (version) VALUES (3)", [])
+                .unwrap();
             // Insert three legacy rows with comma-joined tag strings.
             raw.execute(
                 "INSERT INTO archival_memory (id, content, tags) VALUES (?1, ?2, ?3)",
@@ -4329,7 +6399,10 @@ mod tests {
             })
             .unwrap();
         drop(v_lock);
-        assert_eq!(version, 5, "schema_version must be current after migration");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "schema_version must be current after migration"
+        );
     }
 
     /// #464-4: `memory_save(content, &[])` writes only the content row;

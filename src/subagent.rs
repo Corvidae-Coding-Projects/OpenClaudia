@@ -222,15 +222,33 @@ impl AgentType {
                     "edit_file",
                     "list_files",
                     "web_fetch",
+                    "memory_search",
+                    "memory_list",
+                    "memory_save",
+                    "memory_update",
+                    "memory_delete",
                 ];
                 add_browser_search_tool(tools)
             }
             Self::Explore => {
-                let tools = vec!["bash", "read_file", "list_files", "web_fetch"];
+                let tools = vec![
+                    "bash",
+                    "read_file",
+                    "list_files",
+                    "web_fetch",
+                    "memory_search",
+                    "memory_list",
+                ];
                 add_browser_search_tool(tools)
             }
             Self::Plan | Self::Guide => {
-                let tools = vec!["read_file", "list_files", "web_fetch"];
+                let tools = vec![
+                    "read_file",
+                    "list_files",
+                    "web_fetch",
+                    "memory_search",
+                    "memory_list",
+                ];
                 add_browser_search_tool(tools)
             }
             Self::Coordinator => {
@@ -246,6 +264,8 @@ impl AgentType {
                     "read_file",
                     "list_files",
                     "web_fetch",
+                    "memory_search",
+                    "memory_list",
                 ];
                 add_browser_search_tool(tools)
             }
@@ -1407,7 +1427,7 @@ pub async fn run_subagent(
     app_config: &AppConfig,
     client: &Client,
 ) -> SubagentResult {
-    run_subagent_inner(parent_run, config, app_config, client, None, None).await
+    run_subagent_inner(parent_run, config, app_config, client, None, None, None).await
 }
 
 async fn run_subagent_with_effect_receipt(
@@ -1415,6 +1435,7 @@ async fn run_subagent_with_effect_receipt(
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
+    memory_db: Option<Arc<crate::memory::MemoryDb>>,
 ) -> (SubagentResult, bool) {
     let effect_started = AtomicBool::new(false);
     let result = run_subagent_inner(
@@ -1422,6 +1443,7 @@ async fn run_subagent_with_effect_receipt(
         config,
         app_config,
         client,
+        memory_db,
         None,
         Some(&effect_started),
     )
@@ -1452,6 +1474,7 @@ async fn run_subagent_inner(
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
+    memory_db: Option<Arc<crate::memory::MemoryDb>>,
     preallocated_agent_id: Option<&str>,
     effect_receipt: Option<&AtomicBool>,
 ) -> SubagentResult {
@@ -1718,7 +1741,7 @@ async fn run_subagent_inner(
         crate::context::ContextBudget::default(),
     );
 
-    let allowed_tools = config.agent_type.allowed_tools();
+    let allowed_tools = available_subagent_tools(config.agent_type, memory_db.is_some());
 
     // Filter tool definitions to only allowed tools
     let all_tools = crate::tools::get_tool_definitions();
@@ -2031,7 +2054,7 @@ async fn run_subagent_inner(
                 crate::services::tool_executor::ToolExecutorRequest {
                     run_context: &subagent_run,
                     tool_call: &executable_tc,
-                    memory_db: None,
+                    memory_db: memory_db.as_deref(),
                     app_config: None,
                     task_mgr: None,
                     permission_mgr: &permission_mgr,
@@ -2558,6 +2581,43 @@ fn observe_subagent_tool_result(
 
 // === Tool Execution ===
 
+fn available_subagent_tools(
+    agent_type: AgentType,
+    technical_memory_available: bool,
+) -> Vec<&'static str> {
+    let mut tools = agent_type.allowed_tools();
+    if !technical_memory_available {
+        tools.retain(|name| !name.starts_with("memory_"));
+    }
+    tools
+}
+
+fn reopen_subagent_memory(
+    memory_db: Option<&crate::memory::MemoryDb>,
+) -> Result<Option<Arc<crate::memory::MemoryDb>>, String> {
+    let Some(memory) = memory_db else {
+        return Ok(None);
+    };
+    let expected_workspace = memory
+        .workspace_id()
+        .cloned()
+        .ok_or_else(|| "Subagent technical memory is not workspace-bound".to_string())?;
+    let expected_store = memory
+        .store_id()
+        .map_err(|error| format!("Cannot inspect the parent technical-memory store: {error}"))?;
+    let reopened = crate::memory::MemoryDb::open(memory.path())
+        .map_err(|error| format!("Cannot reopen technical memory for the subagent: {error}"))?;
+    if reopened.workspace_id() != Some(&expected_workspace)
+        || reopened.store_id().ok().as_ref() != Some(&expected_store)
+    {
+        return Err(
+            "The subagent technical-memory store changed identity while it was reopened"
+                .to_string(),
+        );
+    }
+    Ok(Some(Arc::new(reopened)))
+}
+
 fn no_task_effect((content, is_error): (String, bool)) -> (String, bool, bool) {
     (content, is_error, false)
 }
@@ -2568,6 +2628,7 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
     parent_run: &Arc<crate::tools::ToolRunContext>,
     args: &HashMap<String, Value, S>,
     app_config: &AppConfig,
+    memory_db: Option<&crate::memory::MemoryDb>,
 ) -> (String, bool, bool) {
     let description = match args.arg_str_strict("description") {
         Ok(description) => description,
@@ -2627,6 +2688,11 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
         isolation,
     };
 
+    let subagent_memory = match reopen_subagent_memory(memory_db) {
+        Ok(memory) => memory,
+        Err(error) => return (error, true, false),
+    };
+
     // Create HTTP client
     let client = Client::new();
 
@@ -2658,6 +2724,7 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
         let app_config_bg = app_config.clone();
         let client_bg = client;
         let parent_run_bg = Arc::clone(parent_run);
+        let memory_db_bg = subagent_memory;
         let agent_id_bg = agent_id.clone();
         let preallocated_agent_id_bg = config_bg
             .resume_agent_id
@@ -2683,6 +2750,7 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
                 &config_bg,
                 &app_config_bg,
                 &client_bg,
+                memory_db_bg,
                 preallocated_agent_id_bg.as_deref(),
                 None,
             )
@@ -2709,7 +2777,7 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
         (message, false, true)
     } else {
         // Run synchronously via defensive runtime dispatch (#719).
-        dispatch_subagent_sync(parent_run, &config, app_config, &client)
+        dispatch_subagent_sync(parent_run, &config, app_config, &client, subagent_memory)
     }
 }
 
@@ -2739,7 +2807,7 @@ pub fn execute_task_tool<S: BuildHasher>(
     args: &HashMap<String, Value, S>,
     app_config: &AppConfig,
 ) -> (String, bool) {
-    let (content, is_error, _) = execute_task_tool_with_receipt(parent_run, args, app_config);
+    let (content, is_error, _) = execute_task_tool_with_receipt(parent_run, args, app_config, None);
     (content, is_error)
 }
 
@@ -2748,9 +2816,10 @@ pub fn execute_task_tool_typed<S: BuildHasher>(
     parent_run: &Arc<crate::tools::ToolRunContext>,
     args: &HashMap<String, Value, S>,
     app_config: &AppConfig,
+    memory_db: Option<&crate::memory::MemoryDb>,
 ) -> crate::tools::ToolHandlerResult {
     let (content, is_error, effect_started) =
-        execute_task_tool_with_receipt(parent_run, args, app_config);
+        execute_task_tool_with_receipt(parent_run, args, app_config, memory_db);
     bind_subagent_legacy_result(content, is_error, effect_started)
 }
 
@@ -2776,12 +2845,13 @@ fn dispatch_subagent_sync(
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
+    memory_db: Option<Arc<crate::memory::MemoryDb>>,
 ) -> (String, bool, bool) {
     let (result, effect_started) = match Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
                 handle.block_on(run_subagent_with_effect_receipt(
-                    parent_run, config, app_config, client,
+                    parent_run, config, app_config, client, memory_db,
                 ))
             }),
             _ => {
@@ -2797,7 +2867,7 @@ fn dispatch_subagent_sync(
         },
         Err(_) => match tokio::runtime::Runtime::new() {
             Ok(rt) => rt.block_on(run_subagent_with_effect_receipt(
-                parent_run, config, app_config, client,
+                parent_run, config, app_config, client, memory_db,
             )),
             Err(e) => {
                 return (format!("Failed to create runtime: {e}"), true, false);
@@ -3358,7 +3428,7 @@ mod tests {
     #[test]
     fn task_tool_receipt_distinguishes_validation_error_from_started_failure() {
         let empty = HashMap::<String, Value>::new();
-        let validation = execute_task_tool_typed(test_run(), &empty, &issue719_app_config());
+        let validation = execute_task_tool_typed(test_run(), &empty, &issue719_app_config(), None);
         assert!(matches!(
             validation.outcome,
             crate::tools::ToolOutcome::Error { .. }
@@ -3378,7 +3448,7 @@ mod tests {
             ("subagent_type".to_string(), json!("explore")),
         ]);
 
-        let started = execute_task_tool_typed(test_run(), &args, &app_config);
+        let started = execute_task_tool_typed(test_run(), &args, &app_config, None);
 
         assert!(
             matches!(&started.outcome, crate::tools::ToolOutcome::Partial { .. }),
@@ -3439,6 +3509,7 @@ mod tests {
             &config,
             &app_config,
             &client,
+            None,
             Some(agent_id),
             None,
         )
@@ -3489,6 +3560,7 @@ mod tests {
             &config,
             &app_config,
             &client,
+            None,
             Some(agent_id),
             None,
         )
@@ -3615,6 +3687,51 @@ mod tests {
                 .as_str(),
             Some("agent_output")
         );
+    }
+
+    #[test]
+    fn subagent_memory_tools_are_service_gated_and_role_scoped() {
+        for agent_type in AgentType::ALL {
+            assert!(available_subagent_tools(*agent_type, false)
+                .iter()
+                .all(|name| !name.starts_with("memory_")));
+        }
+
+        let general = available_subagent_tools(AgentType::GeneralPurpose, true);
+        for name in [
+            "memory_search",
+            "memory_list",
+            "memory_save",
+            "memory_update",
+            "memory_delete",
+        ] {
+            assert!(general.contains(&name), "general agent is missing {name}");
+        }
+        let plan = available_subagent_tools(AgentType::Plan, true);
+        assert!(plan.contains(&"memory_search"));
+        assert!(plan.contains(&"memory_list"));
+        assert!(!plan.contains(&"memory_save"));
+        assert!(!plan.contains(&"memory_update"));
+        assert!(!plan.contains(&"memory_delete"));
+    }
+
+    #[test]
+    fn subagent_reopens_only_the_exact_workspace_bound_memory_store() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let memory = crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("workspace memory");
+        let expected_store = memory.store_id().expect("store id");
+        let expected_workspace = memory.workspace_id().expect("workspace id").clone();
+        let reopened = reopen_subagent_memory(Some(&memory))
+            .expect("reopen memory")
+            .expect("memory service");
+        assert_eq!(reopened.store_id().expect("reopened store"), expected_store);
+        assert_eq!(reopened.workspace_id(), Some(&expected_workspace));
+
+        let unbound_path = host.path().join("unbound.db");
+        let unbound = crate::memory::MemoryDb::open(&unbound_path).expect("unbound store");
+        assert!(reopen_subagent_memory(Some(&unbound)).is_err());
     }
 
     #[test]

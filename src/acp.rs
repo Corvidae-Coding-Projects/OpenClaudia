@@ -113,6 +113,9 @@ pub struct AcpServer {
     session_map: HashMap<String, String>,
     /// ACP session ID -> exact immutable host capability generation.
     run_contexts: HashMap<String, Arc<crate::tools::ToolRunContext>>,
+    /// Host-owned technical lesson store shared by every isolated ACP session
+    /// for this exact launch workspace.
+    memory_db: Arc<crate::memory::MemoryDb>,
     /// Insertion-order tracker that pairs with [`Self::session_map`].
     /// We deliberately do NOT use a third-party LRU crate: the cap is
     /// small (≤64) and the operations are O(N) but only run on
@@ -405,7 +408,6 @@ fn build_acp_prompt_context(
     let items = ide_context_item(ide_state).into_iter().collect();
     crate::prompt::build_prompt_context_with_items_for_run(
         &crate::modes::BehaviorMode::default(),
-        None,
         run,
         items,
         crate::context::ContextBudget::default(),
@@ -837,16 +839,46 @@ impl AcpServer {
         stdout_tx: mpsc::UnboundedSender<String>,
         launch_root: std::path::PathBuf,
     ) -> Result<Self, String> {
+        let host_home = dirs::home_dir()
+            .ok_or_else(|| "host home is unavailable for private technical memory".to_string())?;
+        Self::new_with_host_home(
+            config,
+            model,
+            api_key,
+            claude_code_token,
+            stdout_tx,
+            launch_root,
+            host_home,
+        )
+    }
+
+    fn new_with_host_home(
+        config: AppConfig,
+        model: String,
+        api_key: Option<crate::providers::ApiKey>,
+        claude_code_token: Option<crate::secrets::OAuthToken>,
+        stdout_tx: mpsc::UnboundedSender<String>,
+        launch_root: std::path::PathBuf,
+        host_home: std::path::PathBuf,
+    ) -> Result<Self, String> {
         let launch_capabilities =
             crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &launch_root)
                 .working_directory(&launch_root)
                 .host_startup_grants()
+                .host_home(Some(host_home))
                 .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
                 .process(true)
                 .network(true)
                 .secrets(true)
                 .provider(config.proxy.target.clone())
                 .build()?;
+        let host_home = launch_capabilities
+            .host_home()
+            .ok_or_else(|| "host home is unavailable for private technical memory".to_string())?;
+        let memory_db = Arc::new(
+            crate::memory::MemoryDb::open_for_workspace(host_home, &launch_root)
+                .map_err(|error| format!("opening ACP technical memory failed: {error}"))?,
+        );
         let persist_dir = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("openclaudia")
@@ -864,6 +896,7 @@ impl AcpServer {
             hook_engine,
             session_map: HashMap::new(),
             run_contexts: HashMap::new(),
+            memory_db,
             session_order: VecDeque::new(),
             messages: Vec::new(),
             model,
@@ -1756,7 +1789,13 @@ impl AcpServer {
                         );
 
                         let result = self
-                            .execute_tool_via_acp(run, oc_session_id, &tc.name, &tc.arguments)
+                            .execute_tool_via_acp(
+                                run,
+                                oc_session_id,
+                                &tc.id,
+                                &tc.name,
+                                &tc.arguments,
+                            )
                             .await;
                         record_acp_tool_result_observation(
                             run,
@@ -2050,6 +2089,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
     ) -> AcpToolResult {
@@ -2089,15 +2129,27 @@ impl AcpServer {
             "kill_shell" => self.acp_kill_shell(run, session_id, &args),
             "list_files" => self.acp_list_files(run, session_id, &args).await,
             "glob" | "grep" => self.acp_search(run, session_id, &args, tool_name).await,
-            // Internal tools run locally — not file/terminal operations
-            "web_fetch" | "web_search" | "web_browser" | "memory_search" | "memory_save"
-            | "memory_delete" | "memory_list" | "task_create" | "task_update" | "task_get"
-            | "task_list" | "todo_write" | "todo_read" | "enter_plan_mode" | "exit_plan_mode" => {
-                self.execute_local_tool(run, session_id, tool_name, arguments_json)
+            // SQLite work belongs on the blocking pool; it still retains the
+            // provider's exact invocation ID for typed provenance.
+            "memory_search" | "memory_save" | "memory_update" | "memory_delete" | "memory_list" => {
+                self.execute_local_tool_async(
+                    run,
+                    session_id,
+                    tool_call_id,
+                    tool_name,
+                    arguments_json,
+                )
+                .await
+            }
+            // Other internal tools run locally — not file/terminal operations.
+            "web_fetch" | "web_search" | "web_browser" | "task_create" | "task_update"
+            | "task_get" | "task_list" | "todo_write" | "todo_read" | "enter_plan_mode"
+            | "exit_plan_mode" => {
+                self.execute_local_tool(run, session_id, tool_call_id, tool_name, arguments_json)
             }
             name if name.starts_with("mcp__") => {
                 // MCP tools run locally through the MCP manager
-                self.execute_local_tool(run, session_id, tool_name, arguments_json)
+                self.execute_local_tool(run, session_id, tool_call_id, tool_name, arguments_json)
             }
             _ => AcpToolResult {
                 content: format!("Unknown tool: {tool_name}"),
@@ -2131,18 +2183,21 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
     ) -> AcpToolResult {
         let permission_mgr = self.permission_manager_for_run(run);
-        execute_local_tool_with_permission(
+        execute_local_tool_with_permission(AcpLocalToolRequest {
             run,
-            &permission_mgr,
+            permission_mgr: &permission_mgr,
             session_id,
+            tool_call_id,
             tool_name,
             arguments_json,
-            Some(self.policy_enforcer.as_ref()),
-        )
+            policy_enforcer: Some(self.policy_enforcer.as_ref()),
+            memory_db: Some(self.memory_db.as_ref()),
+        })
     }
 
     /// Execute a synchronous local tool on Tokio's blocking pool so a
@@ -2153,12 +2208,15 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
     ) -> AcpToolResult {
         let permission_mgr = self.permission_manager_for_run(run);
         let policy_enforcer = Arc::clone(&self.policy_enforcer);
+        let memory_db = Arc::clone(&self.memory_db);
         let session_id = session_id.to_string();
+        let tool_call_id = tool_call_id.to_string();
         let tool_name = tool_name.to_string();
         let arguments_json = arguments_json.to_string();
         let cancellation = Arc::clone(&self.cancel_flag);
@@ -2168,14 +2226,16 @@ impl AcpServer {
             Arc::clone(run),
         ));
         let mut worker = tokio::task::spawn_blocking(move || {
-            execute_local_tool_with_permission(
-                &worker_run,
-                &permission_mgr,
-                &session_id,
-                &tool_name,
-                &arguments_json,
-                Some(policy_enforcer.as_ref()),
-            )
+            execute_local_tool_with_permission(AcpLocalToolRequest {
+                run: &worker_run,
+                permission_mgr: &permission_mgr,
+                session_id: &session_id,
+                tool_call_id: &tool_call_id,
+                tool_name: &tool_name,
+                arguments_json: &arguments_json,
+                policy_enforcer: Some(policy_enforcer.as_ref()),
+                memory_db: Some(memory_db.as_ref()),
+            })
         });
         loop {
             tokio::select! {
@@ -2266,6 +2326,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
+            "acp-normalized-read-file",
             "read_file",
             &Value::Object(local_args).to_string(),
         )
@@ -2291,6 +2352,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
+            "acp-normalized-write-file",
             "write_file",
             &json!({"path": path, "content": content}).to_string(),
         )
@@ -2327,6 +2389,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
+            "acp-normalized-edit-file",
             "edit_file",
             &json!({
                 "path": path,
@@ -2360,8 +2423,14 @@ impl AcpServer {
             "command": command,
             "run_in_background": run_in_background,
         });
-        self.execute_local_tool_async(run, session_id, "bash", &local_args.to_string())
-            .await
+        self.execute_local_tool_async(
+            run,
+            session_id,
+            "acp-normalized-bash",
+            "bash",
+            &local_args.to_string(),
+        )
+        .await
     }
 
     fn acp_bash_output(
@@ -2382,6 +2451,7 @@ impl AcpServer {
         self.execute_local_tool(
             run,
             session_id,
+            "acp-normalized-bash-output",
             "bash_output",
             &json!({"shell_id": shell_id}).to_string(),
         )
@@ -2405,6 +2475,7 @@ impl AcpServer {
         self.execute_local_tool(
             run,
             session_id,
+            "acp-normalized-kill-shell",
             "kill_shell",
             &json!({"shell_id": shell_id}).to_string(),
         )
@@ -2423,6 +2494,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
+            "acp-normalized-list-files",
             "list_files",
             &json!({"path": path}).to_string(),
         )
@@ -2445,8 +2517,14 @@ impl AcpServer {
                 }
             }
         };
-        self.execute_local_tool_async(run, session_id, tool_name, &arguments_json)
-            .await
+        self.execute_local_tool_async(
+            run,
+            session_id,
+            "acp-normalized-search",
+            tool_name,
+            &arguments_json,
+        )
+        .await
     }
 }
 
@@ -2476,18 +2554,34 @@ fn validate_and_render_acp_final_response(
     )
 }
 
-fn execute_local_tool_with_permission(
-    run: &Arc<crate::tools::ToolRunContext>,
-    permission_mgr: &PermissionManager,
-    session_id: &str,
-    tool_name: &str,
-    arguments_json: &str,
-    policy_enforcer: Option<&crate::services::policy::PolicyEnforcer>,
-) -> AcpToolResult {
+#[derive(Clone, Copy)]
+struct AcpLocalToolRequest<'a> {
+    run: &'a Arc<crate::tools::ToolRunContext>,
+    permission_mgr: &'a PermissionManager,
+    session_id: &'a str,
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    arguments_json: &'a str,
+    policy_enforcer: Option<&'a crate::services::policy::PolicyEnforcer>,
+    memory_db: Option<&'a crate::memory::MemoryDb>,
+}
+
+fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpToolResult {
     use crate::tools::{FunctionCall, ToolCall};
 
+    let AcpLocalToolRequest {
+        run,
+        permission_mgr,
+        session_id,
+        tool_call_id,
+        tool_name,
+        arguments_json,
+        policy_enforcer,
+        memory_db,
+    } = request;
+
     let tc = ToolCall {
-        id: "local".to_string(),
+        id: tool_call_id.to_string(),
         call_type: "function".to_string(),
         function: FunctionCall {
             name: tool_name.to_string(),
@@ -2499,7 +2593,7 @@ fn execute_local_tool_with_permission(
         crate::services::tool_executor::ToolExecutorRequest {
             run_context: run,
             tool_call: &tc,
-            memory_db: None,
+            memory_db,
             app_config: None,
             task_mgr: None,
             permission_mgr,
@@ -2927,6 +3021,8 @@ pub async fn run_acp_server(
 ) -> Result<()> {
     let launch_root = std::env::current_dir()
         .map_err(|error| anyhow::anyhow!("Cannot resolve ACP workspace: {error}"))?;
+    let host_home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot resolve host home for private technical memory"))?;
     // Set up stdout writer channel — all writes go through this to avoid interleaving
     let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<String>();
 
@@ -2944,13 +3040,14 @@ pub async fn run_acp_server(
         }
     });
 
-    let mut server = AcpServer::new(
+    let mut server = AcpServer::new_with_host_home(
         config,
         model,
         api_key,
         claude_code_token,
         stdout_tx,
         launch_root,
+        host_home,
     )
     .map_err(anyhow::Error::msg)?;
 
@@ -3923,12 +4020,17 @@ permissions:
             )
             .expect("test ACP session run");
         let run_contexts = HashMap::from([("unit-test".to_string(), Arc::clone(&run))]);
+        let memory_db = Arc::new(
+            crate::memory::MemoryDb::open_for_workspace(tmp.path(), &launch_root)
+                .expect("test ACP technical memory"),
+        );
         let server = AcpServer {
             config: test_config(),
             session_manager: SessionManager::new(tmp.path().join("sessions")),
             hook_engine: HookEngine::new(HooksConfig::default()),
             session_map: HashMap::new(),
             run_contexts,
+            memory_db,
             session_order: VecDeque::new(),
             messages: Vec::new(),
             model: "local-model".to_string(),
@@ -3955,6 +4057,157 @@ permissions:
             .run_contexts
             .get("unit-test")
             .expect("test server carries an explicit run capability")
+    }
+
+    fn acp_memory_draft(title: &str) -> Value {
+        let digest = crate::memory::MemoryDigest::for_fields(
+            b"openclaudia.s054.acp-test.v1",
+            &[b"src/acp.rs"],
+        );
+        json!({
+            "title": title,
+            "kind": "testing",
+            "observation": "ACP dispatch reaches the host-owned workspace store.",
+            "guidance": "Keep typed memory on the canonical local tool path.",
+            "applicability": {"paths": ["src/acp.rs"]},
+            "citations": [{
+                "kind": "test",
+                "locator": "src/acp.rs",
+                "source_version": "unit-test",
+                "digest": digest.to_string(),
+                "line_start": 1,
+                "line_end": 1
+            }],
+            "confidence": "verified_by_test",
+            "sensitivity": "internal",
+            "retention": {"policy": "indefinite"}
+        })
+    }
+
+    async fn execute_acp_memory_tool(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+        call_id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> super::AcpToolResult {
+        server
+            .execute_tool_via_acp(run, "unit-test", call_id, name, &arguments.to_string())
+            .await
+    }
+
+    fn assert_agent_proposal(record: &crate::memory::TechnicalLessonRecord) {
+        assert_eq!(
+            record.provenance.source_kind,
+            crate::memory::MemorySourceKind::AgentProposal
+        );
+        assert!(record
+            .provenance
+            .source_id
+            .starts_with("tool-invocation:sha256:"));
+    }
+
+    #[tokio::test]
+    async fn acp_routes_every_typed_memory_operation_to_its_host_store() {
+        let (server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+
+        let listed = execute_acp_memory_tool(
+            &server,
+            &run,
+            "call-memory-list",
+            "memory_list",
+            json!({"limit": 5}),
+        )
+        .await;
+        assert!(
+            !listed.is_error,
+            "ACP memory_list failed: {}",
+            listed.content
+        );
+
+        let saved = execute_acp_memory_tool(
+            &server,
+            &run,
+            "call-memory-save",
+            "memory_save",
+            acp_memory_draft("ACP memory dispatch is canonical"),
+        )
+        .await;
+        assert!(!saved.is_error, "ACP memory_save failed: {}", saved.content);
+        let first = server
+            .memory_db
+            .query_technical_lessons(
+                Some("ACP memory dispatch"),
+                5,
+                chrono::Utc::now().timestamp(),
+            )
+            .expect("query ACP-saved lesson")
+            .records
+            .pop()
+            .expect("ACP save persisted one lesson");
+
+        let updated = execute_acp_memory_tool(
+            &server,
+            &run,
+            "call-memory-update",
+            "memory_update",
+            json!({
+                "logical_id": first.logical_id.to_string(),
+                "expected_record_digest": first.record_digest.to_string(),
+                "correction_reason": "Exercise ACP update routing.",
+                "replacement": acp_memory_draft("ACP memory update is canonical")
+            }),
+        )
+        .await;
+        assert!(
+            !updated.is_error,
+            "ACP memory_update failed: {}",
+            updated.content
+        );
+        let second = server
+            .memory_db
+            .query_technical_lessons(Some("ACP memory update"), 5, chrono::Utc::now().timestamp())
+            .expect("query ACP-updated lesson")
+            .records
+            .pop()
+            .expect("ACP update persisted one lesson");
+        assert_eq!(second.logical_id, first.logical_id);
+        assert_eq!(second.version.get(), 2);
+        assert_agent_proposal(&first);
+        assert_agent_proposal(&second);
+        assert_ne!(first.provenance.source_id, second.provenance.source_id);
+
+        let deleted = execute_acp_memory_tool(
+            &server,
+            &run,
+            "call-memory-delete",
+            "memory_delete",
+            json!({
+                "logical_id": second.logical_id.to_string(),
+                "expected_record_digest": second.record_digest.to_string()
+            }),
+        )
+        .await;
+        assert!(
+            !deleted.is_error,
+            "ACP memory_delete failed: {}",
+            deleted.content
+        );
+
+        let searched = execute_acp_memory_tool(
+            &server,
+            &run,
+            "call-memory-search",
+            "memory_search",
+            json!({"query": "sqlite", "limit": 5}),
+        )
+        .await;
+        assert!(
+            !searched.is_error,
+            "ACP memory_search failed: {}",
+            searched.content
+        );
     }
 
     #[test]
@@ -5029,7 +5282,7 @@ blast_radius:
 
 #[cfg(test)]
 mod acp_permission_gate_tests {
-    use super::{acp_list_files_command, execute_local_tool_with_permission};
+    use super::{acp_list_files_command, execute_local_tool_with_permission, AcpLocalToolRequest};
     use crate::permissions::PermissionManager;
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
@@ -5046,14 +5299,16 @@ mod acp_permission_gate_tests {
     fn headless_gate_denies_unmatched_bash_instead_of_prompting() {
         let (mgr, _tmp) = enabled(vec![]);
 
-        let blocked = execute_local_tool_with_permission(
-            test_run(),
-            &mgr,
-            "session-1",
-            "bash",
-            r#"{"command":"cargo test"}"#,
-            None,
-        );
+        let blocked = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: test_run(),
+            permission_mgr: &mgr,
+            session_id: "session-1",
+            tool_call_id: "call-blocked-bash",
+            tool_name: "bash",
+            arguments_json: r#"{"command":"cargo test"}"#,
+            policy_enforcer: None,
+            memory_db: None,
+        });
 
         assert!(blocked.is_error);
         assert!(
@@ -5072,14 +5327,16 @@ mod acp_permission_gate_tests {
     fn headless_gate_allows_matching_default_allow_rule() {
         let (mgr, _tmp) = enabled(vec!["git status *".to_string()]);
 
-        let outcome = execute_local_tool_with_permission(
-            test_run(),
-            &mgr,
-            "session-1",
-            "bash",
-            r#"{"command":"git status --short"}"#,
-            None,
-        );
+        let outcome = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: test_run(),
+            permission_mgr: &mgr,
+            session_id: "session-1",
+            tool_call_id: "call-allowed-bash",
+            tool_name: "bash",
+            arguments_json: r#"{"command":"git status --short"}"#,
+            policy_enforcer: None,
+            memory_db: None,
+        });
 
         assert!(
             !outcome.is_error,
@@ -5095,14 +5352,17 @@ mod acp_permission_gate_tests {
         ));
         let (mgr, _store_tmp) = enabled(vec![format!("Write({})", allowed_path.display())]);
 
-        let outcome = execute_local_tool_with_permission(
-            test_run(),
-            &mgr,
-            "session-1",
-            "write_file",
-            &serde_json::json!({"path": allowed_path, "content": "ok"}).to_string(),
-            None,
-        );
+        let arguments = serde_json::json!({"path": allowed_path, "content": "ok"}).to_string();
+        let outcome = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: test_run(),
+            permission_mgr: &mgr,
+            session_id: "session-1",
+            tool_call_id: "call-allowed-write",
+            tool_name: "write_file",
+            arguments_json: &arguments,
+            policy_enforcer: None,
+            memory_db: None,
+        });
 
         assert!(
             !outcome.is_error,

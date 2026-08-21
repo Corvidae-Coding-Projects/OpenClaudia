@@ -1666,8 +1666,7 @@ mod tool_definitions {
     }
 
     #[test]
-    fn test_get_all_tool_definitions_no_memory_tools() {
-        // Memory tools were removed in favor of auto-learning
+    fn typed_technical_memory_tools_replace_the_absent_legacy_surface() {
         let tools = get_all_tool_definitions(false);
         let tool_names: Vec<&str> = tools
             .as_array()
@@ -1676,10 +1675,19 @@ mod tool_definitions {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
 
-        assert!(
-            !tool_names.iter().any(|n| n.contains("memory")),
-            "Memory tools should not be present (replaced by auto-learning)"
-        );
+        for expected in [
+            "memory_save",
+            "memory_search",
+            "memory_list",
+            "memory_update",
+            "memory_delete",
+        ] {
+            assert!(
+                tool_names.contains(&expected),
+                "canonical technical-memory tool {expected} must be registered"
+            );
+        }
+        assert!(!tool_names.contains(&"core_memory_update"));
     }
 
     #[test]

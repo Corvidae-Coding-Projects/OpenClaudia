@@ -6,11 +6,15 @@
 //! - Write: Write/create files
 //! - Edit: Make targeted edits to files
 //!
-//! Stateful mode adds memory tools:
-//! - `memory_save`: Store information in archival memory
-//! - `memory_search`: Search archival memory
-//! - `memory_update`: Update existing memory
-//! - `core_memory_update`: Update core memory sections
+//! Stateful mode adds typed codebase-lesson tools:
+//! - `memory_save`: Store one cited, codebase-specific technical lesson
+//! - `memory_search`: Retrieve bounded cited lessons as reference evidence
+//! - `memory_list`: List recent typed lessons
+//! - `memory_update`: Create a causal correction of an exact lesson revision
+//! - `memory_delete`: Tombstone an exact lesson revision
+//!
+//! Conversation prose, transcripts, and legacy core-memory sections are not
+//! exposed through these model-facing tools.
 //!
 
 mod accumulator;
@@ -53,6 +57,7 @@ pub mod security;
 pub use file::source_to_line_array;
 pub mod file_index;
 pub mod lsp;
+mod memory;
 mod plan_mode;
 pub mod registry;
 pub mod remote_trigger;
@@ -307,6 +312,7 @@ fn host_safety_dispatch_permit(
         },
     )?;
     Ok(registry::ToolDispatchPermit::new(
+        &tool_call.id,
         &tool_call.function.name,
         args,
     ))
@@ -556,7 +562,7 @@ fn execute_tool_full_after_authorization(
                                 ToolRetryability::Never,
                             ))
                         },
-                        |config| subagent::execute_task_tool_typed(run, &args, config),
+                        |config| subagent::execute_task_tool_typed(run, &args, config, memory_db),
                     )
                 },
             ),

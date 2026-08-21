@@ -78,6 +78,21 @@ impl LogicalMemoryId {
     #[must_use]
     pub(crate) fn for_legacy_record(canonical_record: &[u8]) -> Self {
         let digest = digest_bytes_fields(b"openclaudia.memory.legacy-id.v1", &[canonical_record]);
+        Self::from_deterministic_digest(digest)
+    }
+
+    /// Build the stable identity for one exact workspace/source invocation.
+    /// Replaying that invocation therefore addresses the same root revision.
+    #[must_use]
+    pub(crate) fn for_technical_source(workspace_id: &str, source_id: &str) -> Self {
+        let digest = digest_bytes_fields(
+            b"openclaudia.memory.technical-source-id.v1",
+            &[workspace_id.as_bytes(), source_id.as_bytes()],
+        );
+        Self::from_deterministic_digest(digest)
+    }
+
+    fn from_deterministic_digest(digest: [u8; 32]) -> Self {
         let mut bytes = [0_u8; 16];
         bytes.copy_from_slice(&digest[..16]);
         // Mark this as a standards-shaped, deterministic UUID without claiming
@@ -184,10 +199,14 @@ impl FromStr for MemoryDigest {
         let Some(hex) = value.strip_prefix("sha256:") else {
             return Err(MemoryRecordError::InvalidDigest);
         };
-        if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(MemoryRecordError::InvalidDigest);
         }
-        Ok(Self(format!("sha256:{}", hex.to_ascii_lowercase())))
+        Ok(Self(value.to_string()))
     }
 }
 
@@ -229,6 +248,9 @@ pub enum MemoryRecordScope {
 pub enum MemorySourceKind {
     /// Explicit host/user action.
     Explicit,
+    /// Model-proposed capture or correction made through a canonical tool
+    /// invocation. The proposal remains untrusted until separately reviewed.
+    AgentProposal,
     /// Typed tool or task outcome.
     ToolOutcome,
     /// Imported repository or external artifact.
@@ -397,6 +419,25 @@ impl MemoryRevision {
     pub fn new(content: String, tags: Vec<String>, provenance: MemoryProvenance) -> Self {
         Self::build(
             LogicalMemoryId::new(),
+            MemoryVersion::INITIAL,
+            None,
+            content,
+            tags,
+            provenance,
+            MemoryRevisionState::Active,
+        )
+    }
+
+    /// Create an idempotent root at a host-derived logical identity.
+    #[must_use]
+    pub(crate) fn new_with_logical_id(
+        logical_id: LogicalMemoryId,
+        content: String,
+        tags: Vec<String>,
+        provenance: MemoryProvenance,
+    ) -> Self {
+        Self::build(
+            logical_id,
             MemoryVersion::INITIAL,
             None,
             content,
@@ -609,6 +650,7 @@ fn revision_digest(
         &mut hasher,
         match provenance.source_kind {
             MemorySourceKind::Explicit => b"explicit",
+            MemorySourceKind::AgentProposal => b"agent_proposal",
             MemorySourceKind::ToolOutcome => b"tool_outcome",
             MemorySourceKind::Imported => b"imported",
             MemorySourceKind::LegacyUnattributed => b"legacy_unattributed",

@@ -93,7 +93,6 @@ fn build_print_chat_request(
     }];
     let prompt_context = openclaudia::prompt::build_prompt_context_for_run(
         &openclaudia::modes::BehaviorMode::default(),
-        None,
         run,
     );
     openclaudia::proxy::ChatCompletionRequest {

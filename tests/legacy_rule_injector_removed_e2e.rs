@@ -31,7 +31,7 @@ fn repository_rule_file_cannot_enter_the_system_prompt() {
     std::fs::write(legacy_directory.join("global.md"), SENTINEL).expect("legacy file fixture");
 
     let cwd = project.path().to_string_lossy();
-    let blocks = build_prompt_context(&BehaviorMode::default(), None, Some(&cwd));
+    let blocks = build_prompt_context(&BehaviorMode::default(), Some(&cwd));
     let prompt = blocks.to_combined();
 
     assert!(!prompt.contains(SENTINEL));

@@ -82,9 +82,9 @@ and production activation.
   publishing its tombstone. There is no last-write-wins or failure-as-empty
   path in revision/replica merge.
 - Production `team_memory_path` remains fail-closed. S-053 removes identity and
-  replay as blockers; S-054 still must provide authenticated membership,
-  capability-safe host storage, strict migration/recovery, and evidence-only
-  retrieval before activation.
+  replay as blockers; S-054 provides capability-safe host storage, strict
+  migration/recovery, and evidence-only local retrieval. S-103/S-104 must add
+  authenticated membership and bounded replication before team activation.
 
 ## Acceptance
 
@@ -153,7 +153,9 @@ The final ordered source/test artifact manifest has SHA-256
 The slice document is commit-tracked and its stable digest is recorded in the
 Crosslink result receipt to avoid self-reference.
 
-Unresolved work is intentionally assigned, not hidden: S-054 owns memory
-authority/schema/retrieval and production team activation; S-055 owns
-evidence-bound automatic learning; S-056 owns memdir lifecycle; S-084 owns the
-supervised background scheduler; S-088 owns artifact-bound VDD.
+Unresolved work is intentionally assigned, not hidden: S-054 owns local memory
+authority/schema and the bounded lexical retrieval baseline; S-055 owns
+evidence-bound automatic learning; S-056 owns memdir lifecycle; S-103/S-104 own
+authenticated team authority and replication; S-105 owns evaluated advanced
+retrieval; S-084 owns the supervised background scheduler; S-088 owns
+artifact-bound VDD.

@@ -99,7 +99,7 @@ arboard = "3"
 ratatui = "0.30"
 
 # SQLite for stateful memory
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["backup", "bundled"] }
 
 # Crosslink — local-first issue tracker + session memory + handoff
 # notes. Deep integration replaces the legacy shell-out `chainlink`

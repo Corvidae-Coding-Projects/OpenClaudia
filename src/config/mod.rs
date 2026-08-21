@@ -277,12 +277,11 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     }
 
     // S-053 completed logical identity, causal merge, and durable cross-store
-    // replay. Production activation remains gated on S-054: a shared path is
-    // not authenticated team authority, host-owned private storage, or a safe
-    // migration/recovery and retrieval policy.
+    // replay. Production activation remains gated on S-103/S-104: a shared
+    // path is not authenticated team authority or a replication service.
     if config.memory.team_memory_path.is_some() {
         return Err(ConfigError::Message(
-            "memory.team_memory_path is currently unavailable: authenticated team authority, host-owned storage, schema recovery, and safe retrieval remain incomplete (tracked by S-054)"
+            "memory.team_memory_path is currently unavailable: a filesystem path is not authenticated team authority or a replication service (tracked by S-103/S-104)"
                 .to_string(),
         ));
     }

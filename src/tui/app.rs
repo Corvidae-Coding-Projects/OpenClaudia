@@ -1032,7 +1032,6 @@ impl App {
         };
         self.api_client.prompt_blocks = Some(crate::prompt::build_prompt_context_for_run(
             &self.chat_session.behavior_mode(),
-            self.memory_db.as_deref(),
             run,
         ));
     }

@@ -12,6 +12,7 @@
 
 mod cli;
 
+use anyhow::Context as _;
 use openclaudia::{
     config, guardrails, memory,
     permissions::{
@@ -691,9 +692,6 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         dangerously_skip_permissions,
     } = options;
 
-    let cwd_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let memory_db: Option<memory::MemoryDb> = open_project_memory_db(&cwd_path);
-
     let merged_hooks = load_effective_hooks(config.hooks.clone());
     let hook_engine = std::sync::Arc::new(HookEngine::new(merged_hooks));
 
@@ -732,13 +730,13 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     // MCP subprocesses/reconnects retain this exact resumed-session
     // capability rather than discovering identity from a worker thread.
     let run_context = app.tool_run_context().map_err(anyhow::Error::msg)?;
+    let memory_db = Some(open_workspace_memory_db(&run_context)?);
     app.permission_mgr = Some(std::sync::Arc::new(init_permission_manager(
         config,
         dangerously_skip_permissions,
         &run_context,
     )));
-    let tui_prompt_blocks =
-        prompt::build_prompt_context_for_run(behavior_mode, memory_db.as_ref(), &run_context);
+    let tui_prompt_blocks = prompt::build_prompt_context_for_run(behavior_mode, &run_context);
     app.set_api_config(
         endpoint,
         headers,
@@ -1049,15 +1047,13 @@ fn maybe_resume_session(chat_session: &mut Session, resume: bool, session_id: Op
     }
 }
 
-/// Open the project-scoped memory database and print one-line status
-/// banners for recent-session count and auto-learning stats.
-///
-/// Returns `None` if the database cannot be opened — the caller then
-/// runs without memory (a `tracing::warn`! is logged, but the session
-/// still starts). Extracted from `cmd_chat` per crosslink #262.
-fn init_memory_with_banner() -> Option<memory::MemoryDb> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let db = open_project_memory_db(&cwd)?;
+/// Open the exact workspace's host-owned technical-memory service and report
+/// the non-authoritative archival/session counts retained for compatibility.
+/// Startup fails closed when the store cannot be validated or opened.
+fn init_memory_with_banner(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+) -> anyhow::Result<memory::MemoryDb> {
+    let db = open_workspace_memory_db(run)?;
 
     let recent_count = db.get_recent_sessions(10).map_or(0, |s| s.len());
     if recent_count > 0 {
@@ -1080,24 +1076,23 @@ fn init_memory_with_banner() -> Option<memory::MemoryDb> {
         }
     }
 
-    Some(db)
+    Ok(db)
 }
 
-fn open_project_memory_db(project_dir: &Path) -> Option<memory::MemoryDb> {
-    match memory::MemoryDb::open_for_project(project_dir) {
-        Ok(db) => {
-            tracing::debug!("Memory database: {}", db.path().display());
-            Some(db)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %project_dir.display(),
-                "Failed to initialize memory database"
-            );
-            None
-        }
-    }
+fn open_workspace_memory_db(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+) -> anyhow::Result<memory::MemoryDb> {
+    let host_home = run
+        .host_home()
+        .ok_or_else(|| anyhow::anyhow!("host home is unavailable for private technical memory"))?;
+    let db = memory::MemoryDb::open_for_workspace(host_home, run.project_root())
+        .context("opening host-owned workspace technical memory")?;
+    tracing::debug!(
+        path = %db.path().display(),
+        workspace_id = ?db.workspace_id().map(ToString::to_string),
+        "Technical memory database ready"
+    );
+    Ok(db)
 }
 
 /// Build the VDD engine if VDD is enabled in config, printing a status
@@ -2489,12 +2484,13 @@ mod tests {
     }
 
     #[test]
-    fn open_project_memory_db_returns_none_when_openclaudia_path_is_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join(".openclaudia"), b"not a directory")
+    fn host_owned_memory_open_fails_when_state_path_is_a_file() {
+        let host = tempfile::tempdir().expect("host home");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(host.path().join(".openclaudia"), b"not a directory")
             .expect("write .openclaudia file");
 
-        assert!(open_project_memory_db(dir.path()).is_none());
+        assert!(memory::MemoryDb::open_for_workspace(host.path(), project.path()).is_err());
     }
 
     #[test]

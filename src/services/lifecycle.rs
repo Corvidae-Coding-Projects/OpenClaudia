@@ -209,7 +209,7 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
         LifecycleServiceId::BackgroundJobs,
         LifecycleServiceClassification::Unavailable,
         "The synchronous scheduler lacks ownership, durable leases, cancellation, and safe job semantics.",
-        Some("S-054/S-061/S-084"),
+        Some("S-055/S-061/S-062/S-084"),
     ),
     LifecycleServiceRegistration::wired(
         LifecycleServiceId::AutoCompaction,
@@ -238,17 +238,17 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
     LifecycleServiceRegistration::wired(
         LifecycleServiceId::ProjectMemory,
         LifecyclePath::new(
-            "main::open_project_memory_db/cli::chat_repl::init_memory_with_banner",
-            "ToolExecutor and prompt memory consumers",
-            "frontend finalization followed by MemoryDb drop",
+            "main::open_workspace_memory_db/cli::chat_repl::init_memory_with_banner",
+            "canonical memory_* tool handlers and role-scoped subagents",
+            "frontend/subagent completion followed by MemoryDb drop",
         ),
-        "Interactive frontends pass the real project MemoryDb to product consumers.",
+        "Interactive frontends open one host-owned workspace store and expose typed technical lessons only through explicit tools.",
     ),
     LifecycleServiceRegistration::classified(
         LifecycleServiceId::TeamMemory,
         LifecycleServiceClassification::Unavailable,
-        "Logical identity and reconciliation are implemented, but authenticated authority, safe storage/migration, and evidence-only retrieval remain incomplete; configured activation fails visibly.",
-        Some("S-054"),
+        "Logical identity, safe local storage, and evidence-only retrieval are implemented, but authenticated authority and bounded replication remain incomplete; configured path activation fails visibly.",
+        Some("S-103/S-104"),
     ),
     LifecycleServiceRegistration::wired(
         LifecycleServiceId::Guardrails,

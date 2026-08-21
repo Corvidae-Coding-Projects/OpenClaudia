@@ -542,7 +542,6 @@ impl ChatRepl {
         };
 
         let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id())?;
-        let memory_db: Option<memory::MemoryDb> = init_memory_with_banner();
         let policy_enforcer = std::sync::Arc::new(
             openclaudia::services::policy::PolicyEnforcer::new(config.policy.clone()),
         );
@@ -559,6 +558,7 @@ impl ChatRepl {
                 .provider(config.proxy.target.clone())
                 .build()
                 .map_err(anyhow::Error::msg)?;
+        let memory_db = Some(init_memory_with_banner(&run_context)?);
         guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
         let permission_mgr =
             init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);
@@ -773,7 +773,7 @@ impl ChatRepl {
             )
         });
 
-        let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
+        let prompt_blocks = self.build_prompt_blocks_for_turn();
         let request_state = self.chat_session.messages_snapshot();
         let request_messages = match request_messages_with_cli_grounding(
             &self.run_context,
@@ -1533,11 +1533,7 @@ impl ChatRepl {
     }
 
     /// Build Claudia's typed, bounded prompt context for this turn.
-    fn build_prompt_blocks_for_turn(
-        &self,
-        memory_db: Option<&memory::MemoryDb>,
-    ) -> prompt::SystemPromptBlocks {
-        let messages = self.chat_session.messages_snapshot();
+    fn build_prompt_blocks_for_turn(&self) -> prompt::SystemPromptBlocks {
         let behavior_mode = self.chat_session.behavior_mode();
         let mut additional_items = Vec::new();
 
@@ -1552,63 +1548,8 @@ impl ChatRepl {
             ));
         }
 
-        if let Some(db) = memory_db {
-            let mut injected_files: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for msg in messages.iter().rev().take(10) {
-                if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
-                    if role == "tool" || role == "assistant" {
-                        if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
-                            for tc in tool_calls {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("");
-                                if matches!(name, "read_file" | "edit_file" | "write_file") {
-                                    if let Some(args_str) = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("arguments"))
-                                        .and_then(|a| a.as_str())
-                                    {
-                                        if let Ok(args) =
-                                            serde_json::from_str::<serde_json::Value>(args_str)
-                                        {
-                                            if let Some(path) = args
-                                                .get("path")
-                                                .or_else(|| args.get("file_path"))
-                                                .and_then(|p| p.as_str())
-                                            {
-                                                injected_files.insert(path.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let mut injected_files: Vec<String> = injected_files.into_iter().collect();
-            injected_files.sort();
-            for (index, file_path) in injected_files.iter().take(3).enumerate() {
-                if let Ok(knowledge) = db.format_file_knowledge(file_path) {
-                    if !knowledge.is_empty() {
-                        additional_items.push(openclaudia::context::ContextItem::reference(
-                            format!("memory.file_knowledge.{index}"),
-                            openclaudia::context::ReferenceSource::Memory,
-                            format!("memory-db:file:{file_path}"),
-                            knowledge,
-                            openclaudia::context::ContextFreshness::Turn,
-                            320,
-                        ));
-                    }
-                }
-            }
-        }
         prompt::build_prompt_context_with_items_for_run(
             &behavior_mode,
-            memory_db,
             &self.run_context,
             additional_items,
             openclaudia::context::ContextBudget::default(),

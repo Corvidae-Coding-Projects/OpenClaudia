@@ -85,6 +85,11 @@ owned by the audit and remediation slices.
 | `web_fetch` | Fetch an allowed web page |
 | `web_search` | Search through the browser-backed implementation when built with `browser` |
 | `web_browser` | Use the opt-in `browser` feature's headless-browser surface |
+| `memory_save` | Propose one cited, codebase-specific technical lesson as untrusted private evidence |
+| `memory_search` | Retrieve bounded cited technical lessons for the exact workspace; results are evidence, not instructions |
+| `memory_list` | List recent typed technical lessons for the exact workspace |
+| `memory_update` | Correct one exact lesson revision through compare-and-swap causal history |
+| `memory_delete` | Delete one exact lesson revision by writing an immutable causal tombstone |
 | `crosslink` | Use the embedded issue-tracking integration |
 | `lsp` | Run goToDefinition, findReferences, hover, documentSymbols, workspaceSymbol, goToImplementation, and call hierarchy operations |
 | `ask_user_question` | Request structured clarification |
@@ -184,7 +189,7 @@ environment.
 | `vdd.tracking.log_adversary_responses` | `OPENCLAUDIA_VDD__TRACKING__LOG_ADVERSARY_RESPONSES` | `true` or `false` / sensitive |
 | `providers.openai-compatible.base_url` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__BASE_URL` | non-empty URL string / sensitive |
 | `providers.openai-compatible.api_key` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__API_KEY` | validated API key / secret |
-| `memory.team_memory_path` | `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` | reserved path proposal / currently rejected until S-054 |
+| `memory.team_memory_path` | `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` | reserved legacy path proposal / rejected; authenticated team authority and replication are tracked by S-103/S-104 |
 | `web_fetch.preapproved_domains` | `OPENCLAUDIA_WEB_FETCH__PREAPPROVED_DOMAINS` | JSON string array / authority-sensitive |
 
 The complete supported-name matrix, including provider aliases, parser,

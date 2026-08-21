@@ -302,6 +302,8 @@ pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "task",
     "agent_output",
     "todo_read",
+    "memory_search",
+    "memory_list",
     "crosslink",
     "bash_output",
 ];
@@ -718,7 +720,7 @@ mod plan_mode_tests {
         );
         assert!(
             !is_tool_allowed_in_plan_mode("memory_save", &state.plan_realpath, &no_args),
-            "newly added tool not yet in allowlist must be refused (#341)"
+            "technical-memory mutation must be refused in plan mode (#341)"
         );
     }
 

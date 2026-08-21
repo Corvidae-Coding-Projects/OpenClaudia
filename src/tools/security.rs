@@ -40,6 +40,8 @@ pub enum ToolResource {
     Process,
     Network,
     Secrets,
+    /// Host-owned, workspace-bound technical-memory service.
+    Memory,
 }
 
 /// Typed fail-closed resource error.
@@ -764,6 +766,7 @@ impl ToolRunContext {
             ToolResource::Process => CapabilityKind::Process,
             ToolResource::Network => CapabilityKind::Network,
             ToolResource::Secrets => CapabilityKind::Secrets,
+            ToolResource::Memory => CapabilityKind::Memory,
         };
         self.runtime
             .descriptor()

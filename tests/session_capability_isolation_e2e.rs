@@ -479,7 +479,6 @@ fn prompt_skill_catalog_is_concurrently_bound_to_each_run_root() {
             barrier.wait();
             openclaudia::prompt::build_prompt_context_for_run(
                 &openclaudia::modes::BehaviorMode::default(),
-                None,
                 &run,
             )
             .reference_context()
@@ -493,7 +492,6 @@ fn prompt_skill_catalog_is_concurrently_bound_to_each_run_root() {
             barrier.wait();
             openclaudia::prompt::build_prompt_context_for_run(
                 &openclaudia::modes::BehaviorMode::default(),
-                None,
                 &run,
             )
             .reference_context()
@@ -510,7 +508,6 @@ fn prompt_skill_catalog_is_concurrently_bound_to_each_run_root() {
 
     let compatibility = openclaudia::prompt::build_prompt_context(
         &openclaudia::modes::BehaviorMode::default(),
-        None,
         root_a.path().to_str(),
     );
     assert!(
