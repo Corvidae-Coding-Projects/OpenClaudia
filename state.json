@@ -1,6 +1,6 @@
 {
   "next_display_id": 1068,
-  "next_comment_id": 1001,
+  "next_comment_id": 1002,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7805,10 +7805,21 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T08:34:51.434913457Z",
-      "updated_at": "2026-08-21T08:34:55.686284470Z",
+      "updated_at": "2026-08-21T08:35:20.648998129Z",
       "labels": [
         "defect"
-      ]
+      ],
+      "comments": {
+        "dccc018a-4e3c-4f8c-90da-5d0a2e6abad0": {
+          "display_id": 1001,
+          "author": "6Vw9",
+          "content": "Confirmed tests/bash_background_e2e.rs line 214 generates the spawn-7 command. Five bwrap parents had no children, were blocked in do_wait_intr_irq, and had elapsed times from six minutes to over one day. SIGTERM did not reap them; explicit SIGKILL removed all five. Underlying teardown remains unfixed and the issue stays open.",
+          "created_at": "2026-08-21T08:35:20.646285003Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALb41LjiwYCoM9mEBxyn39rLXiz90n4cSyZh5UHcllTHVeKciKJVPw6MTssaUc/MYPyjbxpH3UAPAqpnZinieCQ=="
+        }
+      }
     },
     "4979db5f-d4e8-4163-b5f1-c287a0f79936": {
       "uuid": "4979db5f-d4e8-4163-b5f1-c287a0f79936",
@@ -28836,11 +28847,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 626,
       "timestamp": "2026-08-21T08:34:55.686284470Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 627,
+      "timestamp": "2026-08-21T08:35:20.648998129Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T08:34:55.686284470Z",
+    "timestamp": "2026-08-21T08:35:20.648998129Z",
     "agent_id": "6Vw9",
-    "agent_seq": 626
+    "agent_seq": 627
   }
 }
