@@ -842,6 +842,9 @@ def _validate_ci_policy(repo_root: Path) -> dict[str, int]:
         "cargo check --locked --all-features --all-targets",
         "cargo clippy --locked --all-targets --all-features -- -D warnings",
         "cargo test --locked --all-targets --all-features -- --test-threads=1",
+        "cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets",
+        "cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings",
+        "cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --test-threads=1",
     }
     missing = sorted(fragment for fragment in required_fragments if fragment not in text)
     if missing:
@@ -879,6 +882,12 @@ def _validate_rust_toolchain_policy(repo_root: Path) -> None:
     if package.get("rust-version") != PINNED_RUST_TOOLCHAIN.removesuffix(".0"):
         raise PolicyError(
             f"Cargo.toml rust-version must match Rust {PINNED_RUST_TOOLCHAIN}"
+        )
+    fuzz_manifest = _read_toml(repo_root / "fuzz/Cargo.toml", "fuzz Cargo manifest")
+    fuzz_package = _expect_mapping(fuzz_manifest.get("package"), "fuzz Cargo package")
+    if fuzz_package.get("rust-version") != PINNED_RUST_TOOLCHAIN.removesuffix(".0"):
+        raise PolicyError(
+            f"fuzz/Cargo.toml rust-version must match Rust {PINNED_RUST_TOOLCHAIN}"
         )
 
 

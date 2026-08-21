@@ -167,7 +167,7 @@ pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", 
 // ─── Theme support ──────────────────────────────────────────────────────────
 
 /// A color theme for the terminal UI
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     /// Theme identifier
     pub name: String,
@@ -481,6 +481,10 @@ fn render_heading(stdout: &mut io::Stdout, line: &str, theme: &Theme) {
 
 /// Render inline formatting: bold, italic, inline code, links
 fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
+    let _ = render_inline_to(stdout, text, theme);
+}
+
+fn render_inline_to<W: io::Write>(writer: &mut W, text: &str, theme: &Theme) -> io::Result<()> {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut i = 0;
@@ -489,10 +493,10 @@ fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
         // Bold: **text**
         if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
             if let Some(end) = find_closing(&chars, i + 2, "**") {
-                let _ = stdout.execute(SetAttribute(Attribute::Bold));
+                writer.execute(SetAttribute(Attribute::Bold))?;
                 let inner: String = chars[i + 2..end].iter().collect();
-                print!("{inner}");
-                let _ = stdout.execute(SetAttribute(Attribute::NoBold));
+                write!(writer, "{inner}")?;
+                writer.execute(SetAttribute(Attribute::NoBold))?;
                 i = end + 2;
                 continue;
             }
@@ -501,10 +505,10 @@ fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
         // Italic: *text* (but not **)
         if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
             if let Some(end) = find_closing_char(&chars, i + 1, '*') {
-                let _ = stdout.execute(SetAttribute(Attribute::Italic));
+                writer.execute(SetAttribute(Attribute::Italic))?;
                 let inner: String = chars[i + 1..end].iter().collect();
-                print!("{inner}");
-                let _ = stdout.execute(SetAttribute(Attribute::NoItalic));
+                write!(writer, "{inner}")?;
+                writer.execute(SetAttribute(Attribute::NoItalic))?;
                 i = end + 1;
                 continue;
             }
@@ -513,10 +517,10 @@ fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
         // Inline code: `text`
         if chars[i] == '`' {
             if let Some(end) = find_closing_char(&chars, i + 1, '`') {
-                let _ = stdout.execute(SetForegroundColor(theme.code_color));
+                writer.execute(SetForegroundColor(theme.code_color))?;
                 let inner: String = chars[i + 1..end].iter().collect();
-                print!("{inner}");
-                let _ = stdout.execute(ResetColor);
+                write!(writer, "{inner}")?;
+                writer.execute(ResetColor)?;
                 i = end + 1;
                 continue;
             }
@@ -525,21 +529,22 @@ fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
         // Link: [text](url)
         if chars[i] == '[' {
             if let Some((link_text, url, end_pos)) = parse_link(&chars, i) {
-                let _ = stdout.execute(SetAttribute(Attribute::Underlined));
-                print!("{link_text}");
-                let _ = stdout.execute(SetAttribute(Attribute::NoUnderline));
-                let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-                print!(" ({url})");
-                let _ = stdout.execute(ResetColor);
+                writer.execute(SetAttribute(Attribute::Underlined))?;
+                write!(writer, "{link_text}")?;
+                writer.execute(SetAttribute(Attribute::NoUnderline))?;
+                writer.execute(SetForegroundColor(CtColor::DarkGrey))?;
+                write!(writer, " ({url})")?;
+                writer.execute(ResetColor)?;
                 i = end_pos;
                 continue;
             }
         }
 
         // Regular character
-        print!("{}", chars[i]);
+        write!(writer, "{}", chars[i])?;
         i += 1;
     }
+    Ok(())
 }
 
 /// Find closing delimiter in char slice (e.g., "**")
@@ -672,11 +677,16 @@ pub struct StreamingMarkdownRenderer {
     theme: Theme,
 }
 
+/// Hard upper bound for horizontal-rule expansion in deterministic and
+/// terminal streaming renderers.
+pub const MAX_STREAMING_MARKDOWN_COLUMNS: u16 = 512;
+
 /// The dependency-independent subset of [`StreamingMarkdownRenderer`] state.
 ///
 /// The parser cache is intentionally disposable: callers can persist or move
 /// this state without binding session state to a third-party grammar engine,
 /// then reconstruct highlighting from the fenced language tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownRenderState {
     line_buffer: String,
     in_code_block: bool,
@@ -688,12 +698,21 @@ impl StreamingMarkdownRenderer {
     /// Create a new streaming renderer with the loaded theme
     #[must_use]
     pub fn new() -> Self {
+        Self::with_theme(Theme::load())
+    }
+
+    /// Create a streaming renderer with an explicit theme.
+    ///
+    /// Unlike [`Self::new`], this constructor performs no user-configuration
+    /// lookup and is suitable for deterministic or hermetic execution.
+    #[must_use]
+    pub const fn with_theme(theme: Theme) -> Self {
         Self {
             line_buffer: String::new(),
             in_code_block: false,
             code_lang: String::new(),
             highlighter: None,
-            theme: Theme::load(),
+            theme,
         }
     }
 
@@ -735,51 +754,92 @@ impl StreamingMarkdownRenderer {
     /// Feed a text chunk into the renderer. Complete lines are rendered
     /// immediately; the trailing incomplete line stays buffered.
     pub fn push(&mut self, text: &str) {
+        let mut stdout = io::stdout();
+        let columns = terminal::size().map_or(80, |(columns, _)| columns);
+        let _ = self.push_to(text, &mut stdout, columns);
+    }
+
+    /// Feed a text chunk into an explicit output sink.
+    ///
+    /// This is the deterministic streaming boundary used by tests and fuzzing:
+    /// it neither reads the terminal nor writes to process stdout. Horizontal
+    /// rule expansion is capped even if the caller supplies an extreme width.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first write or flush error reported by `writer`.
+    pub fn push_to<W: io::Write>(
+        &mut self,
+        text: &str,
+        writer: &mut W,
+        terminal_columns: u16,
+    ) -> io::Result<()> {
         self.line_buffer.push_str(text);
 
         // Render all complete lines
         while let Some(newline_pos) = self.line_buffer.find('\n') {
             let line = self.line_buffer[..newline_pos].to_string();
             self.line_buffer = self.line_buffer[newline_pos + 1..].to_string();
-            self.render_line(&line);
-            println!();
+            self.render_line_to(&line, writer, terminal_columns)?;
+            writeln!(writer)?;
         }
 
         // Flush stdout after each push so partial output appears immediately
-        io::stdout().flush().ok();
+        writer.flush()
     }
 
     /// Flush any remaining buffered text at stream end
     pub fn flush(&mut self) {
+        let mut stdout = io::stdout();
+        let columns = terminal::size().map_or(80, |(columns, _)| columns);
+        let _ = self.flush_to(&mut stdout, columns);
+    }
+
+    /// Flush buffered text into an explicit output sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first write or flush error reported by `writer`.
+    pub fn flush_to<W: io::Write>(
+        &mut self,
+        writer: &mut W,
+        terminal_columns: u16,
+    ) -> io::Result<()> {
         if !self.line_buffer.is_empty() {
             let line = std::mem::take(&mut self.line_buffer);
-            self.render_line(&line);
-            io::stdout().flush().ok();
+            self.render_line_to(&line, writer, terminal_columns)?;
         }
+        writer.flush()
     }
 
-    /// Render a single complete line with markdown formatting
     /// Render one line of code-block content, applying syntax highlighting when available.
-    fn render_code_block_line(&mut self, line: &str) {
-        let mut stdout = io::stdout();
+    fn render_code_block_line_to<W: io::Write>(
+        &mut self,
+        line: &str,
+        writer: &mut W,
+    ) -> io::Result<()> {
         if let Some(ref mut hl) = self.highlighter {
             if let Some(highlighted) = hl.highlight_line(line) {
-                let _ = stdout.execute(Print("    "));
-                let _ = stdout.execute(Print(highlighted));
+                writer.execute(Print("    "))?;
+                writer.execute(Print(highlighted))?;
             } else {
-                let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
-                print!("    {line}");
+                writer.execute(SetForegroundColor(self.theme.code_color))?;
+                write!(writer, "    {line}")?;
             }
         } else {
-            let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
-            print!("    {line}");
+            writer.execute(SetForegroundColor(self.theme.code_color))?;
+            write!(writer, "    {line}")?;
         }
-        let _ = stdout.execute(ResetColor);
+        writer.execute(ResetColor)?;
+        Ok(())
     }
 
-    fn render_line(&mut self, line: &str) {
-        let mut stdout = io::stdout();
-
+    fn render_line_to<W: io::Write>(
+        &mut self,
+        line: &str,
+        writer: &mut W,
+        terminal_columns: u16,
+    ) -> io::Result<()> {
         // Code fence toggle
         if line.starts_with("```") {
             if self.in_code_block {
@@ -787,7 +847,7 @@ impl StreamingMarkdownRenderer {
                 self.in_code_block = false;
                 self.code_lang.clear();
                 self.highlighter = None;
-                let _ = stdout.execute(ResetColor);
+                writer.execute(ResetColor)?;
             } else {
                 // Start code block
                 self.in_code_block = true;
@@ -796,46 +856,45 @@ impl StreamingMarkdownRenderer {
                 self.highlighter = CodeHighlighter::new(&self.code_lang);
 
                 if !self.code_lang.is_empty() {
-                    let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-                    print!("  --- {} ---", self.code_lang);
-                    let _ = stdout.execute(ResetColor);
+                    writer.execute(SetForegroundColor(CtColor::DarkGrey))?;
+                    write!(writer, "  --- {} ---", self.code_lang)?;
+                    writer.execute(ResetColor)?;
                 }
             }
-            return;
+            return Ok(());
         }
 
         // Inside code block: syntax highlight
         if self.in_code_block {
-            self.render_code_block_line(line);
-            return;
+            return self.render_code_block_line_to(line, writer);
         }
 
         // Heading
         if line.starts_with('#') {
             let level = line.chars().take_while(|c| *c == '#').count();
             let text = line[level..].trim_start();
-            let _ = stdout.execute(SetAttribute(Attribute::Bold));
+            writer.execute(SetAttribute(Attribute::Bold))?;
             if level <= 2 {
-                let _ = stdout.execute(SetForegroundColor(self.theme.heading_color));
+                writer.execute(SetForegroundColor(self.theme.heading_color))?;
             }
             match level {
-                1 => print!("{}", text.to_uppercase()),
-                _ => print!("{text}"),
+                1 => write!(writer, "{}", text.to_uppercase())?,
+                _ => write!(writer, "{text}")?,
             }
-            let _ = stdout.execute(SetAttribute(Attribute::Reset));
-            let _ = stdout.execute(ResetColor);
-            return;
+            writer.execute(SetAttribute(Attribute::Reset))?;
+            writer.execute(ResetColor)?;
+            return Ok(());
         }
 
         // Blockquote
         if line.starts_with("> ") || line == ">" {
             let content = line.strip_prefix("> ").unwrap_or("");
-            let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-            print!("  | ");
-            let _ = stdout.execute(SetForegroundColor(CtColor::White));
-            render_inline(&mut stdout, content, &self.theme);
-            let _ = stdout.execute(ResetColor);
-            return;
+            writer.execute(SetForegroundColor(CtColor::DarkGrey))?;
+            write!(writer, "  | ")?;
+            writer.execute(SetForegroundColor(CtColor::White))?;
+            render_inline_to(writer, content, &self.theme)?;
+            writer.execute(ResetColor)?;
+            return Ok(());
         }
 
         // List items
@@ -843,29 +902,29 @@ impl StreamingMarkdownRenderer {
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let indent = line.len() - trimmed.len();
             let content = &trimmed[2..];
-            print!("{}  \u{2022} ", " ".repeat(indent));
-            render_inline(&mut stdout, content, &self.theme);
-            return;
+            write!(writer, "{}  \u{2022} ", " ".repeat(indent))?;
+            render_inline_to(writer, content, &self.theme)?;
+            return Ok(());
         }
         if let Some(rest) = strip_ordered_list_prefix(trimmed) {
             let indent = line.len() - trimmed.len();
             let num_part = &trimmed[..trimmed.len() - rest.len()];
-            print!("{}  {}", " ".repeat(indent), num_part);
-            render_inline(&mut stdout, rest, &self.theme);
-            return;
+            write!(writer, "{}  {}", " ".repeat(indent), num_part)?;
+            render_inline_to(writer, rest, &self.theme)?;
+            return Ok(());
         }
 
         // Horizontal rule
         if line.trim() == "---" || line.trim() == "***" || line.trim() == "___" {
-            let (cols, _) = terminal::size().unwrap_or((80, 24));
-            let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-            print!("{}", "\u{2500}".repeat(cols as usize));
-            let _ = stdout.execute(ResetColor);
-            return;
+            let columns = terminal_columns.clamp(1, MAX_STREAMING_MARKDOWN_COLUMNS);
+            writer.execute(SetForegroundColor(CtColor::DarkGrey))?;
+            write!(writer, "{}", "\u{2500}".repeat(usize::from(columns)))?;
+            writer.execute(ResetColor)?;
+            return Ok(());
         }
 
         // Regular line with inline formatting
-        render_inline(&mut stdout, line, &self.theme);
+        render_inline_to(writer, line, &self.theme)
     }
 }
 

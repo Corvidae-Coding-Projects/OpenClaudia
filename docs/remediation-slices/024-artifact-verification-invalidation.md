@@ -70,6 +70,11 @@ Record changed artifact generations, commands/tests run, typed evidence receipts
   checkouts contain independent Git metadata and build caches. Nested paths
   such as `src/.worktrees` remain verified source. V1 remains deserializable,
   but its receipts cannot authorize a current claim under policy version 2.
+- S-003 advances the active policy to `ProjectSourceTreeV3` and policy version
+  3. V3 excludes only the fuzz package's declared runtime/build outputs:
+  `fuzz/target`, `fuzz/artifacts`, `fuzz/coverage`, and non-`seed-*` corpus
+  discoveries. Reviewed `fuzz/corpus/*/seed-*` files remain hashed evidence;
+  V1 and V2 tags remain deserializable but cannot authorize a current claim.
 - ACP, CLI chat, the TUI, pipeline streaming paths, and subagents now pass the
   model actually used for the turn into task observation, quality gates, and
   final validation. Model changes invalidate old verification before a new
@@ -215,7 +220,7 @@ or weakened to conceal a freshness failure.
   without an OS/VCS snapshot. S-032/S-074 own stronger descriptor/snapshot
   workspace boundaries; this slice does not claim control over arbitrary host
   writers.
-- `ProjectSourceTreeV2` intentionally treats non-enumerated runtime files as
+- `ProjectSourceTreeV3` intentionally treats non-enumerated runtime files as
   relevant. This can conservatively reject a gate if another local service
   changes such a file, but it cannot make stale source appear fresh.
 - Crosslink issue #1039 tracks a deterministic resolver seam for the remaining

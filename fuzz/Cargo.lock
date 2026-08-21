@@ -3018,8 +3018,8 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "openclaudia",
- "regex",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

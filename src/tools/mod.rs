@@ -31,14 +31,15 @@ pub mod effect;
 /// (`tests/cron_e2e.rs`) can drive create/list/delete + the
 /// validator perimeter directly. Internal call sites continue to
 /// reach these via the module path.
-pub use cron::{execute_cron_create, execute_cron_delete, execute_cron_list};
+pub use cron::{
+    execute_cron_create, execute_cron_delete, execute_cron_list, validate_cron_expression,
+};
 mod file;
 pub(crate) use file::open_capability_regular_read;
-pub(crate) use file::resolve_path as resolve_capability_path;
 pub use file::{
     create_capability_text_file, create_run_control_directory, create_run_control_text_file,
     initialize_project_for_run, read_capability_text_attachment, read_run_control_text,
-    ProjectInitOutcome,
+    resolve_path as resolve_capability_path, ProjectInitOutcome,
 };
 mod grounding;
 pub(crate) mod host_safety;

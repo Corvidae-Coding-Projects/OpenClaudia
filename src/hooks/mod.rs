@@ -437,6 +437,41 @@ pub enum HookError {
     Denied { binary: String },
 }
 
+/// Maximum matcher source bytes accepted by the production hook engine.
+pub const MAX_HOOK_MATCHER_BYTES: usize = 1024;
+
+/// Compile and evaluate one hook matcher without executing a hook or consulting
+/// ambient hook configuration.
+///
+/// This is the pure matcher boundary shared by normal hook admission and the
+/// hermetic fuzz harness. Event-specific fail-open/fail-closed policy remains
+/// in [`HookEngine`]; callers receive the typed compile/limit error here.
+///
+/// # Errors
+///
+/// Returns [`HookError::InvalidMatcher`] for empty, oversized, or invalid regex
+/// patterns.
+pub fn validate_hook_matcher(pattern: &str, context: &str) -> Result<bool, HookError> {
+    const MAX_REGEX_SIZE: usize = 10 * 1024;
+
+    if pattern.is_empty() {
+        return Err(HookError::InvalidMatcher("Empty pattern".to_string()));
+    }
+    if pattern.len() > MAX_HOOK_MATCHER_BYTES {
+        return Err(HookError::InvalidMatcher(format!(
+            "Pattern too long ({} bytes, max {})",
+            pattern.len(),
+            MAX_HOOK_MATCHER_BYTES
+        )));
+    }
+
+    RegexBuilder::new(pattern)
+        .size_limit(MAX_REGEX_SIZE)
+        .build()
+        .map(|regex| regex.is_match(context))
+        .map_err(|error| HookError::InvalidMatcher(error.to_string()))
+}
+
 /// Callback for executing model hooks via a provider adapter.
 /// This avoids a direct dependency from hooks.rs on providers.rs.
 pub type ModelHookCallback = Box<
@@ -743,31 +778,8 @@ impl HookEngine {
         }
     }
 
-    /// Validate regex pattern and check for match
-    /// Maximum pattern length to prevent `ReDoS` via complex expressions.
-    const MAX_PATTERN_LEN: usize = 1024;
-    /// Maximum compiled regex size (bytes) to limit pathological backtracking.
-    const MAX_REGEX_SIZE: usize = 10 * 1024; // 10KB
-
     fn validate_and_match(pattern: &str, context: &str) -> Result<bool, HookError> {
-        if pattern.is_empty() {
-            return Err(HookError::InvalidMatcher("Empty pattern".to_string()));
-        }
-        if pattern.len() > Self::MAX_PATTERN_LEN {
-            return Err(HookError::InvalidMatcher(format!(
-                "Pattern too long ({} chars, max {})",
-                pattern.len(),
-                Self::MAX_PATTERN_LEN
-            )));
-        }
-
-        match RegexBuilder::new(pattern)
-            .size_limit(Self::MAX_REGEX_SIZE)
-            .build()
-        {
-            Ok(re) => Ok(re.is_match(context)),
-            Err(e) => Err(HookError::InvalidMatcher(e.to_string())),
-        }
+        validate_hook_matcher(pattern, context)
     }
 
     /// Parse hook output — matches Claude Code behavior:

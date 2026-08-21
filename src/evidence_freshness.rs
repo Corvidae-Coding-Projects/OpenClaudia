@@ -17,7 +17,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-pub const VERIFICATION_POLICY_VERSION: u32 = 2;
+pub const VERIFICATION_POLICY_VERSION: u32 = 3;
 const MAX_SNAPSHOT_ENTRIES: u64 = 100_000;
 const MAX_SNAPSHOT_BYTES: u64 = 1_073_741_824;
 
@@ -64,6 +64,12 @@ pub enum WorkspaceDependencyPolicy {
     /// Only the root subtree is excluded; a nested `src/.worktrees` directory
     /// remains part of the verified source artifact set.
     ProjectSourceTreeV2,
+    /// Extends [`Self::ProjectSourceTreeV2`] with the exact runtime/build
+    /// outputs owned by the repository's fuzz package. The `fuzz/target`,
+    /// `fuzz/artifacts`, and `fuzz/coverage` subtrees plus non-seed corpus
+    /// discoveries are excluded. Reviewed `fuzz/corpus/*/seed-*` inputs remain
+    /// verified source artifacts.
+    ProjectSourceTreeV3,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -722,7 +728,7 @@ fn artifact_set(root: &Path) -> Result<ArtifactSetBinding, String> {
     }
 
     Ok(ArtifactSetBinding {
-        dependency_policy: WorkspaceDependencyPolicy::ProjectSourceTreeV2,
+        dependency_policy: WorkspaceDependencyPolicy::ProjectSourceTreeV3,
         workspace_root: root.to_string_lossy().to_string(),
         workspace_sha256: digest_hex(digest.finalize().as_slice()),
         entry_count,
@@ -738,6 +744,17 @@ fn artifact_path_is_excluded(relative: &Path) -> bool {
     matches!(
         components.first().and_then(|part| part.to_str()),
         Some(".git" | "target" | ".worktrees")
+    ) || matches!(
+        components.as_slice(),
+        [first, second, ..]
+            if *first == std::ffi::OsStr::new("fuzz")
+                && matches!(second.to_str(), Some("target" | "artifacts" | "coverage"))
+    ) || matches!(
+        components.as_slice(),
+        [first, second, _target, discovered, ..]
+            if *first == std::ffi::OsStr::new("fuzz")
+                && *second == std::ffi::OsStr::new("corpus")
+                && !discovered.to_string_lossy().starts_with("seed-")
     ) || matches!(
         components.as_slice(),
         [first, second, ..]

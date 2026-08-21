@@ -250,6 +250,17 @@ fn project_root(run: &super::security::ToolRunContext) -> Result<PathBuf, String
     Ok(run.project_root().to_path_buf())
 }
 
+/// Resolve a caller-supplied path through one immutable run capability.
+///
+/// Relative paths are anchored to the run working directory, existing path
+/// components are canonicalized, and successful results remain inside a root
+/// for which the run has read authority.
+///
+/// # Errors
+///
+/// Returns an error when workspace reads are not granted, the input contains a
+/// parent traversal component, no existing ancestor can be resolved, or the
+/// normalized path is outside every root granted to the run.
 pub fn resolve_path(run: &super::security::ToolRunContext, path: &str) -> Result<PathBuf, String> {
     run.require(super::security::ToolResource::WorkspaceRead)
         .map_err(|error| error.to_string())?;

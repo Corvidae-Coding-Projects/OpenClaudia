@@ -374,26 +374,64 @@ fn one_byte_project_source_change_invalidates_prior_verification() {
     );
 }
 
+struct CachePolicyFixture {
+    nested_source: std::path::PathBuf,
+    excluded_paths: Vec<std::path::PathBuf>,
+    reviewed_seed: std::path::PathBuf,
+}
+
+fn create_cache_policy_fixture(root: &std::path::Path) -> CachePolicyFixture {
+    std::fs::create_dir_all(root.join("src/.worktrees")).expect("create nested source directory");
+    std::fs::write(root.join("src/lib.rs"), b"source").expect("write source");
+    let nested_source = root.join("src/.worktrees/source.txt");
+    std::fs::write(&nested_source, b"a").expect("write nested source");
+
+    let cache = root.join("target/cache.bin");
+    let worktree_cache = root.join(".worktrees/slice/target/cache.bin");
+    let hook_cache = root.join(".crosslink/.cache/hook-dedupe");
+    let fuzz_build_cache = root.join("fuzz/target/cache.bin");
+    let fuzz_artifact = root.join("fuzz/artifacts/fuzz_path_resolve/crash-input");
+    let fuzz_coverage = root.join("fuzz/coverage/report.profraw");
+    let discovered_corpus = root.join("fuzz/corpus/fuzz_path_resolve/0123456789abcdef");
+    for path in [
+        &cache,
+        &worktree_cache,
+        &hook_cache,
+        &fuzz_artifact,
+        &fuzz_coverage,
+        &discovered_corpus,
+    ] {
+        std::fs::create_dir_all(path.parent().expect("fixture path has parent"))
+            .expect("create excluded cache parent");
+        std::fs::write(path, b"a").expect("write excluded cache fixture");
+    }
+    std::fs::create_dir_all(fuzz_build_cache.parent().expect("fuzz cache has parent"))
+        .expect("create fuzz build cache");
+    std::fs::File::create(&fuzz_build_cache)
+        .and_then(|file| file.set_len(1_073_741_825))
+        .expect("create sparse oversized fuzz build cache");
+    let reviewed_seed = root.join("fuzz/corpus/fuzz_path_resolve/seed-reviewed");
+    std::fs::write(&reviewed_seed, b"a").expect("write reviewed corpus seed");
+
+    CachePolicyFixture {
+        nested_source,
+        excluded_paths: vec![
+            cache,
+            worktree_cache,
+            hook_cache,
+            fuzz_build_cache,
+            fuzz_artifact,
+            fuzz_coverage,
+            discovered_corpus,
+        ],
+        reviewed_seed,
+    }
+}
+
 #[test]
 fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     let workspace = tempfile::TempDir::new().expect("temp workspace");
-    std::fs::create_dir(workspace.path().join("src")).expect("create src");
-    std::fs::write(workspace.path().join("src/lib.rs"), b"source").expect("write source");
-    std::fs::create_dir_all(workspace.path().join("src/.worktrees"))
-        .expect("create nested source directory");
-    let nested_source = workspace.path().join("src/.worktrees/source.txt");
-    std::fs::write(&nested_source, b"a").expect("write nested source");
-    std::fs::create_dir(workspace.path().join("target")).expect("create target");
-    let cache = workspace.path().join("target/cache.bin");
-    std::fs::write(&cache, b"a").expect("write cache");
-    std::fs::create_dir_all(workspace.path().join(".worktrees/slice/target"))
-        .expect("create linked-worktree cache");
-    let worktree_cache = workspace.path().join(".worktrees/slice/target/cache.bin");
-    std::fs::write(&worktree_cache, b"a").expect("write linked-worktree cache");
-    std::fs::create_dir_all(workspace.path().join(".crosslink/.cache"))
-        .expect("create Crosslink runtime cache");
-    let hook_cache = workspace.path().join(".crosslink/.cache/hook-dedupe");
-    std::fs::write(&hook_cache, b"a").expect("write hook cache");
+    let fixture = create_cache_policy_fixture(workspace.path());
     let run = support::test_run_context(workspace.path());
     let gate = run_gate(&run, "cache-policy-check", "true");
     let mut ledger = RealityLedger::new();
@@ -410,15 +448,22 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     };
     assert_eq!(
         binding.artifacts.dependency_policy,
-        openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV2
+        openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV3
     );
-    assert_eq!(binding.freshness.policy_version, 2);
+    assert_eq!(binding.freshness.policy_version, 3);
     let legacy_policy: openclaudia::ledger::WorkspaceDependencyPolicy =
         serde_json::from_str("\"project_source_tree_v1\"")
             .expect("legacy policy tag remains deserializable");
     assert_eq!(
         legacy_policy,
         openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV1
+    );
+    let prior_policy: openclaudia::ledger::WorkspaceDependencyPolicy =
+        serde_json::from_str("\"project_source_tree_v2\"")
+            .expect("prior policy tag remains deserializable");
+    assert_eq!(
+        prior_policy,
+        openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV2
     );
     assert_eq!(
         binding.freshness.import_generation,
@@ -428,9 +473,9 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     assert!(!binding.environment_sha256.is_empty());
     assert!(!binding.verifier_identity_sha256.is_empty());
 
-    std::fs::write(&cache, b"b").expect("change excluded cache byte");
-    std::fs::write(&worktree_cache, b"b").expect("change excluded worktree-cache byte");
-    std::fs::write(&hook_cache, b"b").expect("change excluded hook cache byte");
+    for path in &fixture.excluded_paths {
+        std::fs::write(path, b"b").expect("change excluded cache byte");
+    }
 
     validate_decision(
         &verification_decision("cache-policy-check", verification),
@@ -439,7 +484,21 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     )
     .expect("explicit runtime/build-cache exclusions must not stale source verification");
 
-    std::fs::write(&nested_source, b"b").expect("change nested source byte");
+    std::fs::write(&fixture.reviewed_seed, b"b").expect("change reviewed corpus seed byte");
+    let denial = validate_decision(
+        &verification_decision("cache-policy-check", verification),
+        &ledger,
+        &run,
+    )
+    .expect_err("reviewed seed corpus must remain covered");
+    assert!(
+        denial.reason().contains("artifact set changed"),
+        "unexpected denial: {}",
+        denial.reason()
+    );
+    std::fs::write(&fixture.reviewed_seed, b"a").expect("restore reviewed corpus seed byte");
+
+    std::fs::write(&fixture.nested_source, b"b").expect("change nested source byte");
     let denial = validate_decision(
         &verification_decision("cache-policy-check", verification),
         &ledger,

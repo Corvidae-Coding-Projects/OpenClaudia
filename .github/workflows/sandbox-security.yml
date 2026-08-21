@@ -50,6 +50,7 @@ jobs:
           toolchain: 1.98.0
       - run: cargo check --locked --all-targets
       - run: cargo check --locked --all-features --all-targets
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
 
   linux:
     runs-on: ubuntu-latest
@@ -85,6 +86,13 @@ jobs:
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features -- --test-threads=1
+      - name: Verify hermetic fuzz harnesses
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --test-threads=1
       - run: cargo test --locked --all-features --test sandbox_escape_e2e -- --test-threads=1
       - run: cargo test --locked --all-features --test session_filesystem_capabilities_e2e -- --test-threads=1
 

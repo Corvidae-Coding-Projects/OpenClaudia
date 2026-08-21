@@ -315,6 +315,12 @@ def create_policy_repository(root: Path) -> tuple[dict[str, object], bytes]:
                 'edition = "2021"\nrust-version = "1.98"\n',
                 encoding="utf-8",
             )
+        elif path == "fuzz/Cargo.toml":
+            destination.write_text(
+                '[package]\nname = "policy-fuzz-fixture"\nversion = "0.0.0"\n'
+                'edition = "2021"\nrust-version = "1.98"\n',
+                encoding="utf-8",
+            )
         elif path == "rust-toolchain.toml":
             destination.write_text(
                 '[toolchain]\nchannel = "1.98.0"\nprofile = "minimal"\n'
@@ -353,6 +359,9 @@ jobs:
           cargo check --locked --all-features --all-targets
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets --all-features -- --test-threads=1
+          cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --test-threads=1
 """,
         encoding="utf-8",
     )
@@ -695,6 +704,21 @@ class RepositoryPolicyTests(unittest.TestCase):
             manifest.write_text(text, encoding="utf-8")
 
             with self.assertRaisesRegex(PolicyError, "rust-version must match Rust 1.98.0"):
+                check_repository(root)
+
+    def test_fuzz_manifest_toolchain_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_policy_repository(root)
+            manifest = root / "fuzz/Cargo.toml"
+            text = manifest.read_text(encoding="utf-8").replace(
+                'rust-version = "1.98"', 'rust-version = "1.97"'
+            )
+            manifest.write_text(text, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                PolicyError, "fuzz/Cargo.toml rust-version must match Rust 1.98.0"
+            ):
                 check_repository(root)
 
     def test_toolchain_file_mismatch_is_rejected(self) -> None:

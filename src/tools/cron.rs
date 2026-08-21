@@ -331,14 +331,20 @@ fn validate_cron_atom(atom: &str, spec: &CronField) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a cron expression (basic check for 5-field format).
+/// Validate one five-field cron expression without reading or mutating schedule
+/// state.
 ///
-/// Crosslink #901: the field parser now treats `*`, single values,
-/// ranges, steps, and range+step as composable atoms, applied to each
-/// comma-separated piece. Previously `0-30/5 * * * *` and `1,3-5,8 * * * *`
-/// were both rejected because the comma branch parsed each piece as a
-/// flat integer.
-fn validate_cron(expr: &str) -> Result<(), String> {
+/// This is the canonical validation seam used by both `cron_create` and the
+/// hermetic fuzz harness. Keeping it separate from persistence ensures that
+/// arbitrary validation input cannot create or replace a schedule.
+/// Each field treats `*`, single values, ranges, steps, and range-plus-step as
+/// composable atoms within comma-separated lists.
+///
+/// # Errors
+///
+/// Returns a diagnostic when the expression has the wrong number of fields or
+/// a field violates its numeric, range, list, or step grammar.
+pub fn validate_cron_expression(expr: &str) -> Result<(), String> {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != FIELDS.len() {
         return Err(format!(
@@ -458,7 +464,7 @@ fn execute_cron_create_at<S: BuildHasher>(
         Err(e) => return e.into_tool_error(),
     };
 
-    if let Err(e) = validate_cron(&cron_expression) {
+    if let Err(e) = validate_cron_expression(&cron_expression) {
         return (format!("Invalid cron expression: {e}"), true);
     }
 
@@ -708,18 +714,18 @@ mod tests {
 
     #[test]
     fn test_validate_cron_valid() {
-        assert!(validate_cron("0 * * * *").is_ok());
-        assert!(validate_cron("*/5 * * * *").is_ok());
-        assert!(validate_cron("0 9 * * 1-5").is_ok());
-        assert!(validate_cron("30 8 1,15 * *").is_ok());
+        assert!(validate_cron_expression("0 * * * *").is_ok());
+        assert!(validate_cron_expression("*/5 * * * *").is_ok());
+        assert!(validate_cron_expression("0 9 * * 1-5").is_ok());
+        assert!(validate_cron_expression("30 8 1,15 * *").is_ok());
     }
 
     #[test]
     fn test_validate_cron_invalid() {
-        assert!(validate_cron("* *").is_err());
-        assert!(validate_cron("60 * * * *").is_err());
-        assert!(validate_cron("* 25 * * *").is_err());
-        assert!(validate_cron("* * * * 8").is_err());
+        assert!(validate_cron_expression("* *").is_err());
+        assert!(validate_cron_expression("60 * * * *").is_err());
+        assert!(validate_cron_expression("* 25 * * *").is_err());
+        assert!(validate_cron_expression("* * * * 8").is_err());
     }
 
     #[test]
@@ -1094,7 +1100,7 @@ mod tests {
     #[test]
     fn validate_cron_rejects_step_zero() {
         assert!(
-            validate_cron("*/0 * * * *").is_err(),
+            validate_cron_expression("*/0 * * * *").is_err(),
             "step=0 must be invalid"
         );
     }
@@ -1102,30 +1108,30 @@ mod tests {
     /// Contract: out-of-range minute (60) is rejected.
     #[test]
     fn validate_cron_rejects_minute_60() {
-        assert!(validate_cron("60 * * * *").is_err());
+        assert!(validate_cron_expression("60 * * * *").is_err());
     }
 
     /// Contract: out-of-range weekday (7) is rejected.
     #[test]
     fn validate_cron_rejects_weekday_7() {
-        assert!(validate_cron("* * * * 7").is_err());
+        assert!(validate_cron_expression("* * * * 7").is_err());
     }
 
     /// Contract: comma-separated list within valid range is accepted.
     #[test]
     fn validate_cron_accepts_comma_list() {
-        assert!(validate_cron("0,30 9 * * 1,5").is_ok());
+        assert!(validate_cron_expression("0,30 9 * * 1,5").is_ok());
     }
 
     /// Crosslink #901: step+range like `0-30/5` is now accepted.
     #[test]
     fn validate_cron_accepts_step_range() {
         assert!(
-            validate_cron("0-30/5 * * * *").is_ok(),
+            validate_cron_expression("0-30/5 * * * *").is_ok(),
             "step+range 0-30/5 must be accepted"
         );
         assert!(
-            validate_cron("*/15 0-12/2 * * *").is_ok(),
+            validate_cron_expression("*/15 0-12/2 * * *").is_ok(),
             "step over a range must be accepted in any field"
         );
     }
@@ -1134,7 +1140,7 @@ mod tests {
     #[test]
     fn validate_cron_accepts_mixed_comma_with_range() {
         assert!(
-            validate_cron("1,3-5,8 * * * *").is_ok(),
+            validate_cron_expression("1,3-5,8 * * * *").is_ok(),
             "comma-separated list containing a range must be accepted"
         );
     }
@@ -1143,7 +1149,7 @@ mod tests {
     #[test]
     fn validate_cron_rejects_reversed_range() {
         assert!(
-            validate_cron("30-10 * * * *").is_err(),
+            validate_cron_expression("30-10 * * * *").is_err(),
             "reversed range must be rejected"
         );
     }
