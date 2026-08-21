@@ -2282,14 +2282,14 @@
     "0c3ac24f-2432-4062-b3d8-3a475cf7e748": {
       "uuid": "0c3ac24f-2432-4062-b3d8-3a475cf7e748",
       "display_id": 1078,
-      "title": "S-106: Add host-reviewed technical-memory authority and portable export",
-      "description": "Complete W5's remaining user control boundary after S-054/S-056. Add an explicit host-authorized review transition for exact technical-lesson revisions that is bound to a real permission/approval receipt (never model self-assertion), with compare-and-swap, correction/supersession, expiry, revocation, and audit semantics. Add a bounded, resumable, portable export of the complete selected workspace memory set, including causal identities, tombstones, provenance, citations, retention, review state, schema/version, integrity digest, and typed partial/error receipts; do not treat model-facing memory_list's context-limited page as export. Define import round-trip and privacy/redaction behavior, wire supported frontends, and verify unauthorized/self-reviewed, stale, tampered, oversized, interrupted, and round-trip cases.",
+      "title": "S-106: Bind technical-memory review to host approval",
+      "description": "Complete W5's host-review authority boundary after S-054/S-056. Add an explicit review and revocation transition for exact technical-lesson revisions, bound to a consumed one-use host approval capability, exact logical/revision/workspace/run/actor/policy generations, and immutable causal audit evidence. Model proposals, policy defaults, reusable approvals, coordinator authority, stale revisions, and cross-workspace receipts must never self-assert HostReviewed. Corrections, source refresh, expiry, revocation, and deletion must not retain stale reviewed authority. Portable export/import is preserved separately as S-107 so both work units remain independently reviewable.",
       "status": "open",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T18:03:37.187217446Z",
-      "updated_at": "2026-08-21T18:21:28.624611268Z",
+      "updated_at": "2026-08-21T18:25:27.368571466Z",
       "labels": [
         "remediation"
       ],
@@ -30359,11 +30359,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 757,
       "timestamp": "2026-08-21T18:21:28.624611268Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 758,
+      "timestamp": "2026-08-21T18:25:27.368571466Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T18:21:28.624611268Z",
+    "timestamp": "2026-08-21T18:25:27.368571466Z",
     "agent_id": "6Vw9",
-    "agent_seq": 757
+    "agent_seq": 758
   }
 }
