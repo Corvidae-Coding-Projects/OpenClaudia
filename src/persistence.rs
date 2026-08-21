@@ -61,6 +61,12 @@ pub enum FileClass {
     Configuration,
     /// Small canonical application state and transactional manifests.
     State,
+    /// Canonical portable technical-memory manifests, checkpoints, and parts.
+    ///
+    /// This class is owner-private and capped before allocation so a package
+    /// claiming a small part cannot cause the generic artifact ceiling to be
+    /// materialized during validation.
+    PortableMemoryPackage,
     /// Session, transcript, and checkpoint documents.
     Session,
     /// Verification, ledger, and evidence receipts.
@@ -75,7 +81,7 @@ impl FileClass {
     pub const fn max_bytes(self) -> u64 {
         match self {
             Self::Credentials => 1_024 * 1_024,
-            Self::Configuration => 4 * 1_024 * 1_024,
+            Self::Configuration | Self::PortableMemoryPackage => 4 * 1_024 * 1_024,
             Self::State => 16 * 1_024 * 1_024,
             Self::Session | Self::Evidence => 64 * 1_024 * 1_024,
             Self::Artifact => 256 * 1_024 * 1_024,
@@ -100,7 +106,7 @@ impl FileClass {
             // the canonical 0600 creation mode. Secret and canonical state
             // classes never admit group/world visibility.
             Self::Configuration | Self::Session | Self::Artifact => 0o644,
-            Self::Credentials | Self::State | Self::Evidence => 0o600,
+            Self::Credentials | Self::State | Self::Evidence | Self::PortableMemoryPackage => 0o600,
         }
     }
 }
@@ -3230,6 +3236,10 @@ mod tests {
     #[test]
     fn file_classes_have_distinct_bounded_policies() {
         assert!(FileClass::Credentials.max_bytes() < FileClass::Configuration.max_bytes());
+        assert_eq!(
+            FileClass::Configuration.max_bytes(),
+            FileClass::PortableMemoryPackage.max_bytes()
+        );
         assert!(FileClass::Configuration.max_bytes() < FileClass::State.max_bytes());
         assert!(FileClass::State.max_bytes() < FileClass::Session.max_bytes());
         assert_eq!(

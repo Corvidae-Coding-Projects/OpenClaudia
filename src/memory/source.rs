@@ -198,7 +198,7 @@ impl MemoryDb {
         Self::technical_memory_source_status_on(&*self.lock_conn()?, workspace_id)
     }
 
-    fn technical_memory_source_status_on(
+    pub(super) fn technical_memory_source_status_on(
         conn: &Connection,
         workspace_id: &WorkspaceMemoryId,
     ) -> Result<TechnicalMemorySourceStoreStatus> {
@@ -1014,15 +1014,13 @@ impl MemoryDb {
             revision.content == row.content,
             "technical-memory source projection diverges from its immutable revision"
         );
-        let store_id = Self::store_id_on(conn)?;
-        Self::validate_source_state_revision(&revision, &state, store_id)?;
+        Self::validate_source_state_revision(&revision, &state)?;
         Ok(StoredSource { state, revision })
     }
 
-    fn validate_source_state_revision(
+    pub(super) fn validate_source_state_revision(
         revision: &MemoryRevision,
         state: &TechnicalMemorySourceState,
-        store_id: MemoryStoreId,
     ) -> Result<()> {
         revision.validate()?;
         let expected_evidence_digest = match state.presence {
@@ -1048,7 +1046,7 @@ impl MemoryDb {
                 && revision.provenance.source_id == source_state_source_id(&state.source_id)
                 && revision.provenance.source_version == expected_evidence_version
                 && revision.provenance.source_digest == expected_evidence_digest
-                && revision.provenance.origin_store_id == Some(store_id)
+                && revision.provenance.origin_store_id.is_some()
                 && revision.provenance.scope == MemoryRecordScope::UserPrivate
                 && revision.provenance.workspace_id.as_deref() == Some(state.workspace_id.as_str()),
             "technical-memory source revision authority is invalid"
@@ -1061,7 +1059,6 @@ impl MemoryDb {
         state: &TechnicalMemorySourceState,
         workspace_id: &WorkspaceMemoryId,
     ) -> Result<bool> {
-        let store_id = Self::store_id_on(conn)?;
         for member in &state.members {
             let heads = Self::head_digests(conn, member.logical_id)?;
             if heads.as_slice() != [member.record_digest.clone()] {
@@ -1076,7 +1073,7 @@ impl MemoryDb {
             if revision.provenance.source_kind != MemorySourceKind::Imported
                 || revision.provenance.source_id
                     != source_member_source_id(&state.source_id, &member.lesson_id)
-                || revision.provenance.origin_store_id != Some(store_id)
+                || revision.provenance.origin_store_id.is_none()
                 || revision.provenance.scope != MemoryRecordScope::UserPrivate
                 || revision.provenance.workspace_id.as_deref() != Some(workspace_id.as_str())
             {
@@ -1097,7 +1094,7 @@ impl MemoryDb {
                 || revision.provenance.source_kind != MemorySourceKind::Imported
                 || revision.provenance.source_id
                     != source_member_source_id(&state.source_id, &member.lesson_id)
-                || revision.provenance.origin_store_id != Some(store_id)
+                || revision.provenance.origin_store_id.is_none()
                 || revision.provenance.scope != MemoryRecordScope::UserPrivate
                 || revision.provenance.workspace_id.as_deref() != Some(workspace_id.as_str())
             {
@@ -1163,7 +1160,7 @@ impl MemoryDb {
 }
 
 impl TechnicalMemorySourceState {
-    fn decode(encoded: &str) -> Result<Self> {
+    pub(super) fn decode(encoded: &str) -> Result<Self> {
         anyhow::ensure!(
             encoded.len() <= MAX_SOURCE_STATE_BYTES,
             "technical-memory source state exceeds its byte budget"
@@ -1174,7 +1171,7 @@ impl TechnicalMemorySourceState {
         Ok(state)
     }
 
-    fn validate_for_workspace(&self, workspace_id: &WorkspaceMemoryId) -> Result<()> {
+    pub(super) fn validate_for_workspace(&self, workspace_id: &WorkspaceMemoryId) -> Result<()> {
         self.validate()?;
         anyhow::ensure!(
             &self.workspace_id == workspace_id,

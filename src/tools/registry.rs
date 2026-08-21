@@ -320,6 +320,11 @@ const REQUIRES_MEMORY: &[super::security::ToolResource] = &[
     super::security::ToolResource::WorkspaceRead,
     super::security::ToolResource::Memory,
 ];
+const REQUIRES_MEMORY_AND_WRITE: &[super::security::ToolResource] = &[
+    super::security::ToolResource::WorkspaceRead,
+    super::security::ToolResource::WorkspaceWrite,
+    super::security::ToolResource::Memory,
+];
 const REQUIRES_PROCESS_AND_WRITE: &[super::security::ToolResource] = &[
     super::security::ToolResource::WorkspaceRead,
     super::security::ToolResource::WorkspaceWrite,
@@ -1553,6 +1558,127 @@ impl ToolHandler for MemoryReviewHandler {
     }
 }
 
+struct MemoryExportHandler;
+impl ToolHandler for MemoryExportHandler {
+    fn name(&self) -> &'static str {
+        "memory_export"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_MEMORY_AND_WRITE
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(
+            ToolEffect::ExternalMutation,
+            "MemoryExport",
+            "destination_root",
+        )
+    }
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory_export",
+                "description": "Publish a complete, bounded, resumable package of this workspace's typed codebase technical lessons, causal revisions, tombstones, provenance, citations, retention, source lifecycle, and host-review audit. Legacy prose, prompts, and transcripts are excluded. Every invocation requires a fresh host decision and an already-granted private destination directory.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "destination_root": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 4096,
+                            "description": "Absolute existing private directory already granted writable access to this run."
+                        },
+                        "expected_checkpoint_digest": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                            "description": "Exact checkpoint digest returned by an interrupted prior export; omit for a new destination."
+                        }
+                    },
+                    "required": ["destination_root"]
+                }
+            }
+        })
+    }
+    fn execute(
+        &self,
+        permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        let approval = match permit.require_host_approval() {
+            Ok(approval) => approval,
+            Err(reason) => {
+                return ToolHandlerResult::error(ToolFailure::new(
+                    ToolFailureCode::PermissionDenied,
+                    format!("Technical-memory export denied: {reason}"),
+                    ToolRetryability::Never,
+                ));
+            }
+        };
+        memory_tool::execute_export(ctx.run, ctx.memory_db, approval, args)
+    }
+}
+
+struct MemoryImportHandler;
+impl ToolHandler for MemoryImportHandler {
+    fn name(&self) -> &'static str {
+        "memory_import"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_MEMORY
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "MemoryImport", "source_root")
+    }
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory_import",
+                "description": "Strictly verify and atomically restore a complete portable technical-memory package for this exact workspace. Tampered, incomplete, oversized, linked, wrong-workspace, or causally divergent packages fail closed. Imported lessons remain explicitly retrieved reference evidence, never prompt authority. Every invocation requires a fresh host decision.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "source_root": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 4096,
+                            "description": "Absolute existing private package directory already granted readable access to this run."
+                        }
+                    },
+                    "required": ["source_root"]
+                }
+            }
+        })
+    }
+    fn execute(
+        &self,
+        permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        let approval = match permit.require_host_approval() {
+            Ok(approval) => approval,
+            Err(reason) => {
+                return ToolHandlerResult::error(ToolFailure::new(
+                    ToolFailureCode::PermissionDenied,
+                    format!("Technical-memory import denied: {reason}"),
+                    ToolRetryability::Never,
+                ));
+            }
+        };
+        memory_tool::execute_import(ctx.run, ctx.memory_db, approval, args)
+    }
+}
+
 struct MemorySourceStatusHandler;
 impl ToolHandler for MemorySourceStatusHandler {
     fn name(&self) -> &'static str {
@@ -2769,6 +2895,8 @@ static HANDLERS: &[&dyn ToolHandler] = &[
     &MemoryUpdateHandler,
     &MemoryDeleteHandler,
     &MemoryReviewHandler,
+    &MemoryExportHandler,
+    &MemoryImportHandler,
     &MemorySourceStatusHandler,
     &MemorySourceRefreshHandler,
     // todo

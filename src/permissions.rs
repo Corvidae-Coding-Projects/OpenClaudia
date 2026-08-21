@@ -140,6 +140,13 @@ fn canonical_permission_tool(tool: &str) -> Option<&'static str> {
     }
 }
 
+fn requires_fresh_host_approval(canonical_tool: &str) -> bool {
+    matches!(
+        canonical_tool,
+        "MemoryReview" | "MemoryExport" | "MemoryImport"
+    )
+}
+
 fn normalize_bash_allowed_tool_pattern(pattern: &str) -> String {
     let pattern = pattern.trim();
     if !pattern.contains("://") {
@@ -889,7 +896,7 @@ impl PermissionManager {
         let scope = self
             .approval_store
             .scope_for(&resolved, &arguments, session_id);
-        if resolved.canonical == "MemoryReview" {
+        if requires_fresh_host_approval(&resolved.canonical) {
             return AuthorizationResult::NeedsPrompt {
                 tool: resolved.canonical,
                 target: resolved.target,
@@ -941,7 +948,7 @@ impl PermissionManager {
     ) -> Result<ExecutionPermit, String> {
         let (arguments, resolved, scope) = self.approvable_scope(tool_call, session_id)?;
         let _ = arguments;
-        if resolved.canonical == "MemoryReview"
+        if requires_fresh_host_approval(&resolved.canonical)
             && !matches!(
                 provenance,
                 ApprovalProvenance::InteractiveUser
@@ -950,7 +957,7 @@ impl PermissionManager {
             )
         {
             return Err(
-                "technical-memory review requires a one-use authenticated host decision"
+                "durable technical-memory authority requires a one-use authenticated host decision"
                     .to_string(),
             );
         }
@@ -980,9 +987,10 @@ impl PermissionManager {
         provenance: ApprovalProvenance,
     ) -> Result<ExecutionPermit, String> {
         let (_arguments, resolved, scope) = self.approvable_scope(tool_call, Some(session_id))?;
-        if resolved.canonical == "MemoryReview" {
+        if requires_fresh_host_approval(&resolved.canonical) {
             return Err(
-                "technical-memory review cannot use a reusable session approval".to_string(),
+                "durable technical-memory authority cannot use a reusable session approval"
+                    .to_string(),
             );
         }
         let permit = self
@@ -1013,8 +1021,10 @@ impl PermissionManager {
         provenance: ApprovalProvenance,
     ) -> Result<ExecutionPermit, String> {
         let (_arguments, resolved, scope) = self.approvable_scope(tool_call, session_id)?;
-        if resolved.canonical == "MemoryReview" {
-            return Err("technical-memory review cannot use a persisted approval".to_string());
+        if requires_fresh_host_approval(&resolved.canonical) {
+            return Err(
+                "durable technical-memory authority cannot use a persisted approval".to_string(),
+            );
         }
         let permit = self
             .approval_store

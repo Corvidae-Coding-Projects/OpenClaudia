@@ -69,9 +69,10 @@ impl ApprovalProvenance {
 
 /// How the exact execution permit was granted.
 ///
-/// Review authority deliberately distinguishes a fresh one-use host decision
-/// from policy evaluation and reusable session/persisted grants. The latter
-/// are valid for ordinary tool execution but cannot review durable memory.
+/// Durable technical-memory authority distinguishes a fresh one-use host
+/// decision from policy evaluation and reusable session/persisted grants. The
+/// latter remain valid for ordinary tool execution but cannot review, export,
+/// or import durable technical memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalGrantKind {
     OneUse,
@@ -317,7 +318,7 @@ impl ApprovalScopeDigestInput<'_> {
 fn normalize_target(resolved: &ResolvedEffect, binding: &ApprovalBinding) -> String {
     if matches!(
         resolved.canonical.as_str(),
-        "Read" | "Write" | "Edit" | "Lsp"
+        "Read" | "Write" | "Edit" | "Lsp" | "MemoryExport" | "MemoryImport"
     ) {
         let path = Path::new(&resolved.target);
         let rooted = if path.is_absolute() {
@@ -1218,7 +1219,7 @@ impl ConsumedExecutionPermit {
         host_policy_generation: u32,
     ) -> Result<HostApprovalEvidence, &'static str> {
         if self.grant_kind != ApprovalGrantKind::OneUse {
-            return Err("host review requires a fresh one-use approval");
+            return Err("durable technical memory requires a fresh one-use approval");
         }
         if !matches!(
             self.provenance,
@@ -1226,7 +1227,7 @@ impl ConsumedExecutionPermit {
                 | ApprovalProvenance::AcpClient
                 | ApprovalProvenance::HostAdministrator
         ) {
-            return Err("approval provenance cannot grant host-review authority");
+            return Err("approval provenance cannot grant durable host authority");
         }
         let binding = ApprovalBinding::for_run(run);
         if self.scope.actor_id != binding.actor_id {
@@ -1273,6 +1274,40 @@ impl ConsumedExecutionPermit {
 }
 
 impl HostApprovalEvidence {
+    /// Verify that this evidence came from a fresh trusted-host decision and
+    /// binds one exact canonical call.  Durable authority boundaries use this
+    /// in addition to their domain-specific state checks; merely possessing a
+    /// syntactically valid receipt is never sufficient.
+    pub(crate) fn authorizes_exact_host_call(
+        &self,
+        canonical_tool: &str,
+        effect: &str,
+        operation: Option<&str>,
+        target: &str,
+        arguments: &Value,
+    ) -> bool {
+        self.schema_version == APPROVAL_RECEIPT_SCHEMA_VERSION
+            && self.grant_kind == ApprovalGrantKind::OneUse.as_str()
+            && matches!(
+                self.provenance.as_str(),
+                "interactive_user" | "acp_client" | "host_administrator"
+            )
+            && self.workspace_generation > 0
+            && self.capability_generation > 0
+            && self.host_policy_generation > 0
+            && Uuid::parse_str(&self.receipt_id).is_ok()
+            && is_sha256_text(&self.scope_digest)
+            && is_sha256_text(&self.evidence_digest)
+            && is_sha256_text(&self.actor_id)
+            && is_sha256_text(&self.workspace_digest)
+            && is_sha256_text(&self.run_id_digest)
+            && self.session_id_digest.as_deref().is_none_or(is_sha256_text)
+            && is_sha256_text(&self.target_digest)
+            && is_sha256_text(&self.arguments_digest)
+            && is_sha256_text(&self.tool_call_id_digest)
+            && self.binds_exact_call(canonical_tool, effect, operation, target, arguments)
+    }
+
     /// Recompute the exact non-path tool projection carried by this evidence.
     /// This lets an authority-bearing storage API defend itself even if a
     /// future internal caller accidentally pairs a valid consumed receipt with
@@ -1357,6 +1392,15 @@ impl HostApprovalEvidence {
             "openclaudia.permission.host-approval-evidence.v1:{encoded}"
         )))
     }
+}
+
+fn is_sha256_text(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 impl fmt::Debug for ExecutionPermit {

@@ -46,6 +46,8 @@ fn documented_tool_names() -> Vec<&'static str> {
         "memory_update",
         "memory_delete",
         "memory_review",
+        "memory_export",
+        "memory_import",
         "memory_source_status",
         "memory_source_refresh",
         "web_fetch",
@@ -121,9 +123,9 @@ fn documented_tool_names_match_emitted_tool_definitions() {
 
 #[test]
 fn registry_documented_tool_count_is_current() {
-    // PINS CATALOG SIZE: 44 with the browser feature, 42 without it.
+    // PINS CATALOG SIZE: 46 with the browser feature, 44 without it.
     // Adding a tool: append a line to HANDLERS and bump this number.
-    let expected = if cfg!(feature = "browser") { 44 } else { 42 };
+    let expected = if cfg!(feature = "browser") { 46 } else { 44 };
     assert_eq!(
         documented_tool_names().len(),
         expected,
@@ -366,6 +368,33 @@ fn technical_memory_review_declares_exact_effect_and_resource() {
     assert_eq!(spec.target, ToolTarget::Arg("logical_id"));
     assert_eq!(
         review.required_resources(&HashMap::new()),
+        [ToolResource::WorkspaceRead, ToolResource::Memory]
+    );
+}
+
+#[test]
+fn portable_memory_tools_declare_exact_effects_and_resources() {
+    let export = registry().get("memory_export").expect("memory export");
+    let export_spec = export.effect_spec();
+    assert_eq!(export_spec.canonical, "MemoryExport");
+    assert_eq!(export_spec.effect, ToolEffect::ExternalMutation);
+    assert_eq!(export_spec.target, ToolTarget::Arg("destination_root"));
+    assert_eq!(
+        export.required_resources(&HashMap::new()),
+        [
+            ToolResource::WorkspaceRead,
+            ToolResource::WorkspaceWrite,
+            ToolResource::Memory,
+        ]
+    );
+
+    let import = registry().get("memory_import").expect("memory import");
+    let import_spec = import.effect_spec();
+    assert_eq!(import_spec.canonical, "MemoryImport");
+    assert_eq!(import_spec.effect, ToolEffect::ExternalMutation);
+    assert_eq!(import_spec.target, ToolTarget::Arg("source_root"));
+    assert_eq!(
+        import.required_resources(&HashMap::new()),
         [ToolResource::WorkspaceRead, ToolResource::Memory]
     );
 }

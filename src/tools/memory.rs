@@ -1,6 +1,7 @@
 //! Canonical typed tools for codebase-specific technical lessons.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::str::FromStr as _;
 
 use serde::Deserialize;
@@ -9,11 +10,12 @@ use serde_json::{json, Value};
 use crate::memdir::{EntrypointInspection, EntrypointIssue, EntrypointIssueCode};
 use crate::memory::{
     LogicalMemoryId, MemoryDb, MemoryDigest, MemorySourceEvidence, MemorySourceKind,
-    TechnicalLessonCorrectionRequest, TechnicalLessonDraft, TechnicalLessonReviewAction,
-    TechnicalLessonReviewRequest, TechnicalLessonStoreError, TechnicalMemorySourceStoreError,
-    TechnicalMemorySourceStoreStatus,
+    PortableMemoryExportStatus, PortableMemoryImportStatus, TechnicalLessonCorrectionRequest,
+    TechnicalLessonDraft, TechnicalLessonReviewAction, TechnicalLessonReviewRequest,
+    TechnicalLessonStoreError, TechnicalMemorySourceStoreError, TechnicalMemorySourceStoreStatus,
 };
 use crate::permissions::HostApprovalEvidence;
+use crate::persistence::PersistentStorage;
 
 use super::{
     ToolFailure, ToolFailureCode, ToolHandlerResult, ToolObservation, ToolRetryability,
@@ -74,6 +76,20 @@ struct SourceRefreshArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceStatusArgs {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportArgs {
+    destination_root: String,
+    #[serde(default)]
+    expected_checkpoint_digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportArgs {
+    source_root: String,
+}
 
 const fn default_search_limit() -> usize {
     DEFAULT_SEARCH_LIMIT
@@ -425,6 +441,321 @@ pub fn execute_source_refresh(
         }
         Err(error) => store_error("memory_source_refresh", &error),
     }
+}
+
+pub fn execute_export(
+    run: &ToolRunContext,
+    db: Option<&MemoryDb>,
+    approval: &HostApprovalEvidence,
+    args: &HashMap<String, Value>,
+) -> ToolHandlerResult {
+    let Some(db) = db else {
+        return unavailable();
+    };
+    let arguments = args_value(args);
+    let parsed = match serde_json::from_value::<ExportArgs>(arguments.clone()) {
+        Ok(parsed) => parsed,
+        Err(error) => return invalid_arguments("memory_export", &error),
+    };
+    let expected_checkpoint_digest = match parsed.expected_checkpoint_digest {
+        Some(encoded) => match MemoryDigest::from_str(&encoded) {
+            Ok(digest) => Some(digest),
+            Err(error) => return invalid_input(error.to_string()),
+        },
+        None => None,
+    };
+    let storage = match package_storage(run, &parsed.destination_root, true) {
+        Ok(storage) => storage,
+        Err(error) => return error.into_tool_result(),
+    };
+    let request = crate::memory::portable::PortableMemoryExportRequest {
+        storage: &storage,
+        expected_checkpoint_digest,
+        approval,
+        arguments: &arguments,
+        control: crate::memory::portable::PortableOperationControl::new(
+            run.runtime().cancellation(),
+        ),
+    };
+    match db.export_technical_memory_package(&request) {
+        Ok(result) => portable_export_result(&result),
+        Err(error) => portable_error("memory_export", &error),
+    }
+}
+
+pub fn execute_import(
+    run: &ToolRunContext,
+    db: Option<&MemoryDb>,
+    approval: &HostApprovalEvidence,
+    args: &HashMap<String, Value>,
+) -> ToolHandlerResult {
+    let Some(db) = db else {
+        return unavailable();
+    };
+    let arguments = args_value(args);
+    let parsed = match serde_json::from_value::<ImportArgs>(arguments.clone()) {
+        Ok(parsed) => parsed,
+        Err(error) => return invalid_arguments("memory_import", &error),
+    };
+    let storage = match package_storage(run, &parsed.source_root, false) {
+        Ok(storage) => storage,
+        Err(error) => return error.into_tool_result(),
+    };
+    let request = crate::memory::portable::PortableMemoryImportRequest {
+        storage: &storage,
+        approval,
+        arguments: &arguments,
+        control: crate::memory::portable::PortableOperationControl::new(
+            run.runtime().cancellation(),
+        ),
+    };
+    match db.import_technical_memory_package(&request) {
+        Ok(result) => portable_import_result(&result),
+        Err(error) => portable_error("memory_import", &error),
+    }
+}
+
+fn package_storage(
+    run: &ToolRunContext,
+    encoded: &str,
+    write: bool,
+) -> Result<PersistentStorage, PackageStorageError> {
+    if encoded.is_empty() || encoded.len() > 4_096 || encoded.chars().any(char::is_control) {
+        return Err(PackageStorageError::InvalidPath);
+    }
+    let path = PathBuf::from(encoded);
+    if !path.is_absolute() {
+        return Err(PackageStorageError::InvalidPath);
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return Err(PackageStorageError::InvalidPath);
+    };
+    let permitted = if write {
+        run.permits_write(&canonical)
+    } else {
+        run.permits_read(&canonical)
+    };
+    if !permitted {
+        return Err(PackageStorageError::CapabilityDenied);
+    }
+    PersistentStorage::open(&canonical).map_err(|error| {
+        tracing::warn!(operation = "technical_memory_package_open", error = %error);
+        PackageStorageError::UnsafeRoot
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PackageStorageError {
+    InvalidPath,
+    CapabilityDenied,
+    UnsafeRoot,
+}
+
+impl PackageStorageError {
+    fn into_tool_result(self) -> ToolHandlerResult {
+        match self {
+            Self::InvalidPath => invalid_input(
+                "technical-memory package root must be an absolute existing directory"
+                    .to_string(),
+            ),
+            Self::CapabilityDenied => private_error(ToolFailure::new(
+                ToolFailureCode::PermissionDenied,
+                "Technical-memory package root is outside this run's explicit filesystem capability"
+                    .to_string(),
+                ToolRetryability::Never,
+            )),
+            Self::UnsafeRoot => private_error(ToolFailure::new(
+                ToolFailureCode::External,
+                "Technical-memory package root is not a private descriptor-safe directory"
+                    .to_string(),
+                ToolRetryability::Never,
+            )),
+        }
+    }
+}
+
+fn portable_export_result(result: &crate::memory::PortableMemoryExportResult) -> ToolHandlerResult {
+    let value = match serde_json::to_value(result) {
+        Ok(value) => value,
+        Err(error) => return encoding_error("memory_export", &error),
+    };
+    match result.status {
+        PortableMemoryExportStatus::Completed | PortableMemoryExportStatus::Idempotent => {
+            let mut output = private_structured(
+                format!(
+                    "Technical-memory package {:?}: {} revisions and {} heads in {} part(s).",
+                    result.status, result.revision_count, result.head_count, result.completed_parts,
+                ),
+                value.clone(),
+            );
+            output.artifacts.push(super::ToolArtifact {
+                id: result
+                    .manifest_digest
+                    .as_ref()
+                    .or(result.package_id.as_ref())
+                    .map_or_else(
+                        || "incomplete-technical-memory-package".to_string(),
+                        ToString::to_string,
+                    ),
+                kind: "technical_memory_package".to_string(),
+                label: "Portable technical-memory package".to_string(),
+                metadata: value.clone(),
+                sensitivity: ToolSensitivity::Private,
+            });
+            output.observations.push(ToolObservation {
+                kind: "technical_memory_package_export".to_string(),
+                authoritative: true,
+                data: value,
+            });
+            output
+        }
+        PortableMemoryExportStatus::Cancelled
+        | PortableMemoryExportStatus::DeadlineExceeded
+        | PortableMemoryExportStatus::DurabilityUncertain => {
+            let code = match result.status {
+                PortableMemoryExportStatus::Cancelled => ToolFailureCode::Cancelled,
+                PortableMemoryExportStatus::DeadlineExceeded => ToolFailureCode::DeadlineExceeded,
+                PortableMemoryExportStatus::DurabilityUncertain => ToolFailureCode::External,
+                PortableMemoryExportStatus::Completed | PortableMemoryExportStatus::Idempotent => {
+                    ToolFailureCode::Internal
+                }
+            };
+            let mut failure = ToolFailure::new(
+                code,
+                "Technical-memory package publication or validation did not reach confirmed durable completion"
+                    .to_string(),
+                ToolRetryability::Safe,
+            );
+            failure.recovery = Some(json!({
+                "expected_checkpoint_digest": result.checkpoint_digest,
+                "package_id": result.package_id,
+                "completed_parts": result.completed_parts,
+            }));
+            let mut output = ToolHandlerResult::partial_structured(
+                "Technical-memory package completion was not durably confirmed; use the typed recovery state before retrying.",
+                value.clone(),
+                vec![failure],
+                Some(json!({
+                    "tool": "memory_export",
+                    "expected_checkpoint_digest": result.checkpoint_digest,
+                })),
+            );
+            output.sensitivity = ToolSensitivity::Private;
+            output.observations.push(ToolObservation {
+                kind: "technical_memory_package_export_partial".to_string(),
+                authoritative: true,
+                data: value,
+            });
+            output
+        }
+    }
+}
+
+fn portable_import_result(result: &crate::memory::PortableMemoryImportResult) -> ToolHandlerResult {
+    let value = match serde_json::to_value(result) {
+        Ok(value) => value,
+        Err(error) => return encoding_error("memory_import", &error),
+    };
+    if matches!(
+        result.status,
+        PortableMemoryImportStatus::Cancelled | PortableMemoryImportStatus::DeadlineExceeded
+    ) {
+        let code = if result.status == PortableMemoryImportStatus::Cancelled {
+            ToolFailureCode::Cancelled
+        } else {
+            ToolFailureCode::DeadlineExceeded
+        };
+        let mut output = ToolHandlerResult::partial_structured(
+            "Technical-memory package import stopped before atomic publication.",
+            value,
+            vec![ToolFailure::new(
+                code,
+                "Technical-memory package import stopped; no memory mutation committed".to_string(),
+                ToolRetryability::Safe,
+            )],
+            Some(json!({"tool": "memory_import"})),
+        );
+        output.sensitivity = ToolSensitivity::Private;
+        return output;
+    }
+    let mut output = private_structured(
+        format!(
+            "Technical-memory package {:?}: {} revisions and {} heads.",
+            result.status, result.revision_count, result.head_count
+        ),
+        value.clone(),
+    );
+    output.observations.push(ToolObservation {
+        kind: "technical_memory_package_import".to_string(),
+        authoritative: true,
+        data: value,
+    });
+    output
+}
+
+fn portable_error(
+    operation: &str,
+    error: &crate::memory::portable::PortableMemoryError,
+) -> ToolHandlerResult {
+    use crate::memory::portable::PortableMemoryError;
+
+    let (code, retryability, message, recovery) = match &error {
+        PortableMemoryError::ApprovalInvalid => (
+            ToolFailureCode::PermissionDenied,
+            ToolRetryability::Never,
+            "Technical-memory package approval does not bind this exact call".to_string(),
+            None,
+        ),
+        PortableMemoryError::CheckpointRequired { observed } => (
+            ToolFailureCode::Conflict,
+            ToolRetryability::Safe,
+            "Technical-memory export requires the current checkpoint digest to resume"
+                .to_string(),
+            Some(json!({"expected_checkpoint_digest": observed})),
+        ),
+        PortableMemoryError::StaleCheckpoint
+        | PortableMemoryError::DestinationConflict
+        | PortableMemoryError::CausalConflict
+        | PortableMemoryError::SnapshotChanged => (
+            ToolFailureCode::Conflict,
+            ToolRetryability::Safe,
+            "Technical-memory package state changed or conflicts with the requested operation"
+                .to_string(),
+            None,
+        ),
+        PortableMemoryError::InvalidPackage
+        | PortableMemoryError::UnsupportedSchema
+        | PortableMemoryError::BudgetExceeded
+        | PortableMemoryError::WrongWorkspace => (
+            ToolFailureCode::InvalidInput,
+            ToolRetryability::Never,
+            "Technical-memory package failed strict schema, workspace, causal, or budget validation"
+                .to_string(),
+            None,
+        ),
+        PortableMemoryError::Cancelled => (
+            ToolFailureCode::Cancelled,
+            ToolRetryability::Safe,
+            "Technical-memory package operation was cancelled".to_string(),
+            None,
+        ),
+        PortableMemoryError::DeadlineExceeded => (
+            ToolFailureCode::DeadlineExceeded,
+            ToolRetryability::Safe,
+            "Technical-memory package operation reached its fixed work deadline".to_string(),
+            None,
+        ),
+        PortableMemoryError::Persistence(_) | PortableMemoryError::Store(_) => (
+            ToolFailureCode::External,
+            ToolRetryability::Safe,
+            "Technical-memory package persistence or store validation failed".to_string(),
+            None,
+        ),
+    };
+    tracing::warn!(operation, error = %error, "technical memory package operation failed");
+    let mut failure = ToolFailure::new(code, message, retryability);
+    failure.recovery = recovery;
+    private_error(failure)
 }
 
 fn verified_source_inspection(run: &std::sync::Arc<ToolRunContext>) -> EntrypointInspection {

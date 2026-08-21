@@ -90,6 +90,8 @@ const MUTATION_TOOLS_HARD_REFUSED: &[&str] = &[
     "memory_delete",
     "memory_update",
     "memory_review",
+    "memory_export",
+    "memory_import",
     "memory_source_refresh",
 ];
 

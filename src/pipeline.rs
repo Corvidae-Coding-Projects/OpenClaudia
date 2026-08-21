@@ -4681,48 +4681,61 @@ mod tests {
     }
 
     #[test]
-    fn memory_review_prompt_accepts_only_the_one_use_choice() {
+    fn durable_memory_prompts_accept_only_the_one_use_choice() {
         use std::sync::mpsc as std_mpsc;
 
         let run = test_run();
         let manager = PermissionManager::unrestricted_for_run(&run);
-        let call = ToolCall {
-            id: "review-call".to_string(),
-            call_type: "function".to_string(),
-            function: tools::FunctionCall {
-                name: "memory_review".to_string(),
-                arguments: serde_json::json!({
+        let (tx, _rx) = std_mpsc::channel::<AppEvent>();
+        for (name, arguments) in [
+            (
+                "memory_review",
+                serde_json::json!({
                     "action": "review",
                     "logical_id": "00000000-0000-0000-0000-000000000001",
                     "expected_record_digest": format!("sha256:{}", "0".repeat(64)),
-                })
-                .to_string(),
-            },
-        };
-        let (tx, _rx) = std_mpsc::channel::<AppEvent>();
+                }),
+            ),
+            (
+                "memory_export",
+                serde_json::json!({"destination_root": "/tmp/portable-export"}),
+            ),
+            (
+                "memory_import",
+                serde_json::json!({"source_root": "/tmp/portable-import"}),
+            ),
+        ] {
+            let call = ToolCall {
+                id: format!("{name}-call"),
+                call_type: "function".to_string(),
+                function: tools::FunctionCall {
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                },
+            };
+            let allowed = permission_prompt_response(
+                &Ok(PermissionResponse::Allow),
+                &manager,
+                Some("session-durable-memory"),
+                &call,
+                &tx,
+            );
+            assert!(matches!(
+                allowed,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ));
 
-        let allowed = permission_prompt_response(
-            &Ok(PermissionResponse::Allow),
-            &manager,
-            Some("session-review"),
-            &call,
-            &tx,
-        );
-        assert!(matches!(
-            allowed,
-            PermissionOutcome::Allowed {
-                authorization: Some(_)
-            }
-        ));
-
-        let reusable = permission_prompt_response(
-            &Ok(PermissionResponse::AlwaysAllow),
-            &manager,
-            Some("session-review"),
-            &call,
-            &tx,
-        );
-        assert!(matches!(reusable, PermissionOutcome::DeniedWithResult(_)));
+            let reusable = permission_prompt_response(
+                &Ok(PermissionResponse::AlwaysAllow),
+                &manager,
+                Some("session-durable-memory"),
+                &call,
+                &tx,
+            );
+            assert!(matches!(reusable, PermissionOutcome::DeniedWithResult(_)));
+        }
     }
 
     /// #603: `web_fetch` is gated, but a configured preapproved host should

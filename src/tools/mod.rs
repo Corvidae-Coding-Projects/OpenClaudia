@@ -13,6 +13,8 @@
 //! - `memory_update`: Create a causal correction of an exact lesson revision
 //! - `memory_delete`: Tombstone an exact lesson revision
 //! - `memory_review`: Apply or revoke a fresh host-authorized review
+//! - `memory_export`: Publish a bounded portable causal package
+//! - `memory_import`: Strictly verify and atomically restore that package
 //! - `memory_source_status`: Inspect a strict repository lesson source
 //! - `memory_source_refresh`: Atomically import/refresh that explicit source
 //!

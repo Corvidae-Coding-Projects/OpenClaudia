@@ -3716,6 +3716,8 @@ mod tests {
         }
         let plan = available_subagent_tools(AgentType::Plan, true);
         assert!(!general.contains(&"memory_review"));
+        assert!(!general.contains(&"memory_export"));
+        assert!(!general.contains(&"memory_import"));
         assert!(plan.contains(&"memory_search"));
         assert!(plan.contains(&"memory_list"));
         assert!(plan.contains(&"memory_source_status"));
@@ -3726,6 +3728,11 @@ mod tests {
         for agent_type in AgentType::ALL {
             assert!(
                 !available_subagent_tools(*agent_type, true).contains(&"memory_review"),
+                "subagent role {agent_type:?} has no direct host approval channel"
+            );
+            assert!(
+                !available_subagent_tools(*agent_type, true).contains(&"memory_export")
+                    && !available_subagent_tools(*agent_type, true).contains(&"memory_import"),
                 "subagent role {agent_type:?} has no direct host approval channel"
             );
         }

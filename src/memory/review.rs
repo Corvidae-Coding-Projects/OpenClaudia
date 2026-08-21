@@ -6,7 +6,7 @@
 //! one exact lesson head and publishes both records in one SQLite transaction.
 
 use anyhow::{Context as _, Result};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -100,6 +100,57 @@ struct ReviewMutation<'a> {
 }
 
 impl MemoryDb {
+    pub(super) fn validate_all_host_review_audits_on(
+        conn: &Connection,
+        workspace_id: &WorkspaceMemoryId,
+    ) -> Result<()> {
+        let mut statement = conn.prepare(
+            r"SELECT revision.logical_id, revision.version,
+                     revision.parent_digest, revision.record_digest,
+                     revision.content_digest, revision.content,
+                     revision.tags_json, revision.provenance_json,
+                     revision.record_state
+                FROM memory_revisions revision
+               WHERE EXISTS (
+                   SELECT 1 FROM json_each(revision.tags_json) AS tag
+                    WHERE tag.value = ?1
+               )
+               ORDER BY revision.record_digest",
+        )?;
+        let mut rows = statement.query(params![TECHNICAL_MEMORY_REVIEW_AUDIT_TAG])?;
+        while let Some(row) = rows.next()? {
+            let audit_revision = Self::revision_from_row(row)?;
+            audit_revision.validate()?;
+            anyhow::ensure!(
+                audit_revision.version == super::MemoryVersion::INITIAL
+                    && audit_revision.parent_digest.is_none()
+                    && audit_revision.state == MemoryRevisionState::Active
+                    && audit_revision.tags == [TECHNICAL_MEMORY_REVIEW_AUDIT_TAG.to_string()]
+                    && audit_revision.provenance.workspace_id.as_deref()
+                        == Some(workspace_id.as_str())
+                    && audit_revision.provenance.scope == MemoryRecordScope::UserPrivate,
+                "host-review audit root is invalid"
+            );
+            let audit = TechnicalLessonReviewAudit::decode(&audit_revision.content)?;
+            anyhow::ensure!(
+                audit.workspace_id == *workspace_id,
+                "host-review audit belongs to a different workspace"
+            );
+            let reviewed_revision =
+                Self::load_revision_by_digest(conn, &audit.resulting_record_digest)?
+                    .context("host-review audit result revision is unavailable")?;
+            let lesson =
+                Self::validate_technical_lesson_revision(&reviewed_revision, workspace_id)?;
+            audit.validate_for_revision(
+                &reviewed_revision,
+                &lesson,
+                workspace_id,
+                &audit_revision,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Review or revoke one exact technical-lesson head using authority that
     /// the canonical permission executor already consumed.
     pub(crate) fn transition_technical_lesson_review(
@@ -390,7 +441,7 @@ impl TechnicalLessonReviewAudit {
         Ok(encoded)
     }
 
-    fn decode(encoded: &str) -> Result<Self> {
+    pub(super) fn decode(encoded: &str) -> Result<Self> {
         anyhow::ensure!(
             encoded.len() <= MAX_REVIEW_AUDIT_BYTES,
             "host-review audit exceeds its byte budget"

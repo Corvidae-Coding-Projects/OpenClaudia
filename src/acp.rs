@@ -2136,6 +2136,8 @@ impl AcpServer {
             | "memory_update"
             | "memory_delete"
             | "memory_review"
+            | "memory_export"
+            | "memory_import"
             | "memory_list"
             | "memory_source_status"
             | "memory_source_refresh" => {
@@ -4197,6 +4199,34 @@ permissions:
         );
     }
 
+    async fn assert_acp_portable_memory_requires_host_decision(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let root = run.project_root().to_string_lossy().into_owned();
+        for (name, arguments) in [
+            ("memory_export", json!({"destination_root": root.clone()})),
+            ("memory_import", json!({"source_root": root})),
+        ] {
+            let denied = execute_acp_memory_tool(
+                server,
+                run,
+                &format!("call-{name}-without-host"),
+                name,
+                arguments,
+            )
+            .await;
+            assert!(denied.is_error, "ACP {name} unexpectedly executed");
+            assert!(
+                denied
+                    .content
+                    .contains("no interactive prompt is available"),
+                "ACP must route {name} through the canonical fresh-host gate: {}",
+                denied.content
+            );
+        }
+    }
+
     #[tokio::test]
     async fn acp_routes_every_typed_memory_operation_to_its_host_store() {
         let (server, _rx, _tmp) = test_server();
@@ -4240,6 +4270,7 @@ permissions:
             .expect("ACP save persisted one lesson");
 
         assert_acp_memory_review_requires_host_decision(&server, &run, &first).await;
+        assert_acp_portable_memory_requires_host_decision(&server, &run).await;
 
         let updated = execute_acp_memory_tool(
             &server,

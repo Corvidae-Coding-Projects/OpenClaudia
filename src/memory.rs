@@ -19,6 +19,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
 mod lesson;
+pub(crate) mod portable;
 mod record;
 mod review;
 mod source;
@@ -34,6 +35,12 @@ pub use lesson::{
     MAX_LESSON_LOCATOR_BYTES, MAX_LESSON_OBSERVATION_BYTES, MAX_LESSON_TITLE_BYTES,
     MAX_LESSON_VERSION_BYTES, MAX_TECHNICAL_LESSONS_PER_STORE, MAX_TECHNICAL_LESSON_BYTES,
     MAX_TECHNICAL_QUERY_RESULT_BYTES, TECHNICAL_LESSON_SCHEMA_VERSION, TECHNICAL_LESSON_TAG,
+};
+pub use portable::{
+    PortableMemoryExportResult, PortableMemoryExportStatus, PortableMemoryImportResult,
+    PortableMemoryImportStatus, TechnicalMemoryPackageManifest,
+    TECHNICAL_MEMORY_PACKAGE_CHECKPOINT_NAME, TECHNICAL_MEMORY_PACKAGE_MANIFEST_NAME,
+    TECHNICAL_MEMORY_PACKAGE_SCHEMA_VERSION,
 };
 pub use record::{
     LogicalMemoryId, MemoryAttribution, MemoryDigest, MemoryProvenance, MemoryRecordError,

@@ -408,6 +408,30 @@ impl ToolHandlerResult {
         }
     }
 
+    /// Report a typed partial effect with bounded recovery state.
+    #[must_use]
+    pub fn partial_structured(
+        text: impl Into<String>,
+        structured: Value,
+        failures: Vec<ToolFailure>,
+        continuation: Option<Value>,
+    ) -> Self {
+        Self {
+            outcome: ToolOutcome::Partial {
+                content: ToolContent::structured(text.into(), structured),
+                failures,
+                continuation,
+            },
+            artifacts: Vec::new(),
+            attachments: Vec::new(),
+            observations: Vec::new(),
+            display: ToolDisplay::Auto,
+            follow_up: ToolFollowUp::None,
+            usage: ToolUsage::default(),
+            sensitivity: ToolSensitivity::Workspace,
+        }
+    }
+
     #[must_use]
     pub fn legacy(content: String, is_error: bool) -> Self {
         if is_error {

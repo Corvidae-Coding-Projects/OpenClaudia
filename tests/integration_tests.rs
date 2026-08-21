@@ -1682,6 +1682,8 @@ mod tool_definitions {
             "memory_update",
             "memory_delete",
             "memory_review",
+            "memory_export",
+            "memory_import",
             "memory_source_status",
             "memory_source_refresh",
         ] {
