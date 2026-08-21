@@ -12,6 +12,7 @@ pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 pub mod acp;
 pub mod auto_learn;
+pub mod capability_evidence;
 pub mod claude_credentials;
 pub mod codex_credentials;
 pub mod compaction;

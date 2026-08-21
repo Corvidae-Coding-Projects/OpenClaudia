@@ -31,5 +31,7 @@ Future comparisons must use a dated, reproducible evaluation:
    date. Do not infer their internals from bundle string counts.
 5. Publish uncertainty and failures alongside successes.
 
-Until that evaluation exists, the full audit—not a marketing matrix—is the
-source of truth for OpenClaudia capability status.
+Until that comparison evaluation exists, the full audit remains the detailed
+finding record. Current OpenClaudia maturity labels come from the typed
+`capabilities/registry.json` artifact and its reviewed executable receipts;
+`docs/binary-capability-matrix.md` is only the generated user projection.

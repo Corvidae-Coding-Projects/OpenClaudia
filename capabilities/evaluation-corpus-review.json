@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "review_id": "capability-corpus-review-v1",
+  "reviewer_id": "primary-orchestrator-6vw9",
+  "corpus_id": "capability-evidence-v1",
+  "corpus_sha256": "sha256:1f8b05b210fe641ebdfcce22b4af7fe20570e6b88ca1dee037ccd1182ab31304",
+  "verdict": "approved",
+  "reviewed_scenario_ids": [
+    "registry-render-success",
+    "registry-rejects-docs-only",
+    "registry-rejects-missing-failure-evidence"
+  ],
+  "reviewed_dimensions": [
+    "final_environment_graders",
+    "success_and_failure_coverage",
+    "multi_trial_design",
+    "trace_assertions",
+    "effect_observation_assertions",
+    "artifact_bounds_and_isolation"
+  ],
+  "limitations": [
+    "Independent primary review approved the frozen registry and corpus after inspecting effect proof binding, final-state grading, trace identity, input bounds, executable scenarios, and adversarial tests; approval does not promote other runtime capabilities.",
+    "Three fresh deterministic trials prove repeatability only and do not add stochastic model coverage.",
+    "Path grading is authoritative only for the declared in-process, no-child executor; descriptor-safe traversal is required before concurrent or child-process scenarios are admitted.",
+    "Canonical alternate-model VDD remains pending until S-088 is implemented."
+  ]
+}
