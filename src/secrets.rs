@@ -539,8 +539,7 @@ impl SensitiveHeaders {
     #[must_use]
     pub fn contains_name(&self, name: &str) -> bool {
         HeaderName::from_bytes(name.as_bytes())
-            .ok()
-            .is_some_and(|name| self.0.iter().any(|(candidate, _)| candidate == name))
+            .is_ok_and(|name| self.0.iter().any(|(candidate, _)| candidate == name))
     }
 
     /// Compare one value without exposing it. Intended for behavioral tests

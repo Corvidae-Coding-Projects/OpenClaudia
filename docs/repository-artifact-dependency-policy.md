@@ -59,9 +59,9 @@ build artifact, or release.
 
 ## Dependency and build policy
 
-- Rust 1.91 is the owned MSRV. It is the first stable release providing the
-  `Duration::from_mins` API used by the current runtime; CI checks both 1.91 and
-  current stable against the locked graph.
+- Rust 1.98 is the single owned development, build, lint, and CI toolchain.
+  `Cargo.toml`, `rust-toolchain.toml`, and every workflow job must agree on that
+  version; the repository checker rejects floating or mismatched toolchains.
 - `Cargo.lock` and `fuzz/Cargo.lock` are committed. CI uses `--locked`; a lock
   change is an intentional reviewed artifact generation.
 - The default profile excludes browser process integration. `--features

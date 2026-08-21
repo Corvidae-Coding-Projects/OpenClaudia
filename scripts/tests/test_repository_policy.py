@@ -295,6 +295,7 @@ def create_policy_repository(root: Path) -> tuple[dict[str, object], bytes]:
     for path in (
         "Cargo.lock",
         "Cargo.toml",
+        "rust-toolchain.toml",
         "docs/repository-artifact-dependency-policy.md",
         "fuzz/Cargo.lock",
         "fuzz/Cargo.toml",
@@ -308,6 +309,18 @@ def create_policy_repository(root: Path) -> tuple[dict[str, object], bytes]:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if path in {"deny.toml", "fuzz/deny.toml"}:
             destination.write_bytes((REPOSITORY_ROOT / path).read_bytes())
+        elif path == "Cargo.toml":
+            destination.write_text(
+                '[package]\nname = "policy-fixture"\nversion = "0.0.0"\n'
+                'edition = "2021"\nrust-version = "1.98"\n',
+                encoding="utf-8",
+            )
+        elif path == "rust-toolchain.toml":
+            destination.write_text(
+                '[toolchain]\nchannel = "1.98.0"\nprofile = "minimal"\n'
+                'components = ["clippy", "rustfmt"]\n',
+                encoding="utf-8",
+            )
         else:
             destination.write_text("fixture\n", encoding="utf-8")
     workflow = root / WORKFLOW_PATH
@@ -328,7 +341,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          toolchain: 1.91.0
+          toolchain: 1.98.0
       - run: |
           python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
           python3 scripts/check_repository_hygiene.py --repo-root .
@@ -656,6 +669,45 @@ class RepositoryPolicyTests(unittest.TestCase):
             workflow.write_text(text, encoding="utf-8")
 
             with self.assertRaisesRegex(PolicyError, "unpinned or malformed action"):
+                check_repository(root)
+
+    def test_ci_toolchain_must_match_canonical_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_policy_repository(root)
+            workflow = root / WORKFLOW_PATH
+            text = workflow.read_text(encoding="utf-8").replace(
+                "toolchain: 1.98.0", "toolchain: stable"
+            )
+            workflow.write_text(text, encoding="utf-8")
+
+            with self.assertRaisesRegex(PolicyError, "single pinned Rust toolchain 1.98.0"):
+                check_repository(root)
+
+    def test_manifest_toolchain_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_policy_repository(root)
+            manifest = root / "Cargo.toml"
+            text = manifest.read_text(encoding="utf-8").replace(
+                'rust-version = "1.98"', 'rust-version = "1.97"'
+            )
+            manifest.write_text(text, encoding="utf-8")
+
+            with self.assertRaisesRegex(PolicyError, "rust-version must match Rust 1.98.0"):
+                check_repository(root)
+
+    def test_toolchain_file_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            create_policy_repository(root)
+            toolchain = root / "rust-toolchain.toml"
+            text = toolchain.read_text(encoding="utf-8").replace(
+                'channel = "1.98.0"', 'channel = "stable"'
+            )
+            toolchain.write_text(text, encoding="utf-8")
+
+            with self.assertRaisesRegex(PolicyError, "pin the canonical 1.98.0 toolchain"):
                 check_repository(root)
 
     def test_shallow_ci_checkout_is_rejected(self) -> None:

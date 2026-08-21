@@ -75,7 +75,7 @@ impl AgentColor {
     /// Pick a color for the `n`th teammate. Round-robin through
     /// [`Self::PALETTE`].
     #[must_use]
-    pub fn for_index(n: usize) -> Self {
+    pub const fn for_index(n: usize) -> Self {
         Self::PALETTE[n % Self::PALETTE.len()]
     }
 }

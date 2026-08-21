@@ -2,7 +2,7 @@
 name = "openclaudia"
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.98"
 description = "Open-source universal agent harness - Claude Code capabilities for any AI"
 license = "MIT"
 repository = "https://github.com/dollspace-gay/openclaudia"

@@ -40,8 +40,10 @@ RETENTION_VERSION = 1
 EXPORT_PATH = PurePosixPath("docs/historical-evidence/chainlink-history-v1.json")
 RETENTION_PATH = PurePosixPath("docs/historical-evidence/chainlink-retention-v1.json")
 WORKFLOW_PATH = PurePosixPath(".github/workflows/sandbox-security.yml")
+RUST_TOOLCHAIN_PATH = PurePosixPath("rust-toolchain.toml")
 ROOT_DENY_PATH = PurePosixPath("deny.toml")
 FUZZ_DENY_PATH = PurePosixPath("fuzz/deny.toml")
+PINNED_RUST_TOOLCHAIN = "1.98.0"
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_WORKFLOW_BYTES = 512 * 1024
 MAX_TRACKED_OUTPUT_BYTES = 16 * 1024 * 1024
@@ -70,6 +72,7 @@ REQUIRED_REPOSITORY_FILES = {
     ".gitignore",
     "Cargo.lock",
     "Cargo.toml",
+    RUST_TOOLCHAIN_PATH.as_posix(),
     "docs/repository-artifact-dependency-policy.md",
     "fuzz/Cargo.lock",
     "fuzz/Cargo.toml",
@@ -785,6 +788,11 @@ def _validate_ci_policy(repo_root: Path) -> dict[str, int]:
         raise PolicyError("repository policy workflow must not run untrusted changes with pull_request_target")
     if not re.search(r"(?m)^permissions:\s*\n\s+contents:\s+read\s*$", text):
         raise PolicyError("repository policy workflow must declare read-only repository permissions")
+    toolchains = re.findall(r"(?m)^\s+toolchain:\s+(\S+)\s*$", text)
+    if not toolchains or set(toolchains) != {PINNED_RUST_TOOLCHAIN}:
+        raise PolicyError(
+            f"every CI job must use the single pinned Rust toolchain {PINNED_RUST_TOOLCHAIN}"
+        )
 
     lines = text.splitlines()
     uses_lines = [(index, line) for index, line in enumerate(lines) if "uses:" in line]
@@ -830,7 +838,7 @@ def _validate_ci_policy(repo_root: Path) -> dict[str, int]:
         "cargo install cargo-deny --version 0.20.2 --locked",
         "cargo deny --locked check advisories licenses sources bans",
         "cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories licenses sources bans",
-        "toolchain: 1.91.0",
+        f"toolchain: {PINNED_RUST_TOOLCHAIN}",
         "cargo check --locked --all-features --all-targets",
         "cargo clippy --locked --all-targets --all-features -- -D warnings",
         "cargo test --locked --all-targets --all-features -- --test-threads=1",
@@ -854,6 +862,26 @@ def _validate_ci_policy(repo_root: Path) -> dict[str, int]:
     }
 
 
+def _validate_rust_toolchain_policy(repo_root: Path) -> None:
+    toolchain = _read_toml(repo_root / RUST_TOOLCHAIN_PATH, "Rust toolchain policy")
+    if toolchain != {
+        "toolchain": {
+            "channel": PINNED_RUST_TOOLCHAIN,
+            "profile": "minimal",
+            "components": ["clippy", "rustfmt"],
+        }
+    }:
+        raise PolicyError(
+            f"rust-toolchain.toml must pin the canonical {PINNED_RUST_TOOLCHAIN} toolchain"
+        )
+    manifest = _read_toml(repo_root / "Cargo.toml", "root Cargo manifest")
+    package = _expect_mapping(manifest.get("package"), "root Cargo package")
+    if package.get("rust-version") != PINNED_RUST_TOOLCHAIN.removesuffix(".0"):
+        raise PolicyError(
+            f"Cargo.toml rust-version must match Rust {PINNED_RUST_TOOLCHAIN}"
+        )
+
+
 def check_repository(repo_root: Path) -> dict[str, Any]:
     """Check repository policy and return deterministic evidence."""
     repo_root = repo_root.resolve()
@@ -875,6 +903,7 @@ def check_repository(repo_root: Path) -> dict[str, Any]:
     for path in REQUIRED_REPOSITORY_FILES:
         _read_regular_file(repo_root / path, 4 * 1024 * 1024, f"repository policy file {path}")
     _validate_ignores(repo_root)
+    _validate_rust_toolchain_policy(repo_root)
     ci_policy = _validate_ci_policy(repo_root)
     dependency_policy = _validate_dependency_policy(repo_root)
 
