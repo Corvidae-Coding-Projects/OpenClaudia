@@ -1,6 +1,6 @@
 {
   "next_display_id": 1080,
-  "next_comment_id": 1082,
+  "next_comment_id": 1083,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13580,7 +13580,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T18:25:31.485800686Z",
-      "updated_at": "2026-08-21T20:45:32.846503503Z",
+      "updated_at": "2026-08-21T20:45:37.325982274Z",
       "labels": [
         "remediation"
       ],
@@ -13620,6 +13620,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQC6QUu8mpElJSIzFPHGCyCbNiO2XEeX7Mhs3AakTKfVz/Z7AxkEoFNYToRkJnLAv4R3hv5aTzgyuNvulGQYbBg=="
+        },
+        "cd442f30-8f45-451d-99f1-4a7f8f21388b": {
+          "display_id": 1082,
+          "author": "6Vw9",
+          "content": "S-107 review retained deterministic canonical JSON parts plus final-manifest publication. SQLite backup/single-file export remains rejected because it would carry legacy prose/session tables and defeat bounded resumable validation. Added a fixed 60-second per-call control, final SQLite generation fence, 4 MiB descriptor-safe part class, canonical manifest digest vector, and one-use prompt coverage for review/export/import.",
+          "created_at": "2026-08-21T20:45:37.323512438Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9dIIYWvqp71vJZA2Bt3oPonAO911Qkdi49a/FTMpXZgClN22U5U8DkpMRtvfnN4LNhtPaCkPYgDzDMXoJELDCg=="
         }
       }
     },
@@ -30520,11 +30529,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 771,
       "timestamp": "2026-08-21T20:45:32.846503503Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 772,
+      "timestamp": "2026-08-21T20:45:37.325982274Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T20:45:32.846503503Z",
+    "timestamp": "2026-08-21T20:45:37.325982274Z",
     "agent_id": "6Vw9",
-    "agent_seq": 771
+    "agent_seq": 772
   }
 }
