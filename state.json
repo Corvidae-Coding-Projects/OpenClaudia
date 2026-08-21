@@ -18405,11 +18405,12 @@
       "display_id": 1070,
       "title": "S-012: Wire or honestly classify lifecycle services",
       "description": "Complete docs/remediation-slices/012-runtime-feature-reachability.md. Prefer wiring intended lifecycle services into real production composition roots. Do not remove product capabilities merely because they are dormant; classify only genuinely unavailable or downstream-owned behavior honestly, with executable reachability evidence and skeptical tests.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T10:08:48.053528975Z",
-      "updated_at": "2026-08-21T11:11:17.503462620Z",
+      "updated_at": "2026-08-21T11:11:21.723113757Z",
+      "closed_at": "2026-08-21T11:11:21.723112538Z",
       "labels": [
         "remediation"
       ],
@@ -29419,11 +29420,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 679,
       "timestamp": "2026-08-21T11:11:17.503462620Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 680,
+      "timestamp": "2026-08-21T11:11:21.723113757Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T11:11:17.503462620Z",
+    "timestamp": "2026-08-21T11:11:21.723113757Z",
     "agent_id": "6Vw9",
-    "agent_seq": 679
+    "agent_seq": 680
   }
 }
