@@ -4014,12 +4014,13 @@
       "display_id": 1080,
       "title": "Keep technical-memory source lifecycle coherent across host review transitions",
       "description": "A fresh host review or review revocation can advance a source-managed lesson head without atomically advancing the source lifecycle member digest. The next source status/refresh then sees a permanent causal conflict even though both transitions were valid. Preserve review authority/audit semantics while updating the exact source member head in the same transaction; keep ordinary agent corrections/deletions fail-closed.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T20:51:59.798324138Z",
-      "updated_at": "2026-08-21T21:42:37.207788573Z",
+      "updated_at": "2026-08-21T21:42:41.287358514Z",
+      "closed_at": "2026-08-21T21:42:41.287353968Z",
       "labels": [
         "remediation"
       ],
@@ -30747,11 +30748,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 790,
       "timestamp": "2026-08-21T21:42:37.207788573Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 791,
+      "timestamp": "2026-08-21T21:42:41.287358514Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T21:42:37.207788573Z",
+    "timestamp": "2026-08-21T21:42:41.287358514Z",
     "agent_id": "6Vw9",
-    "agent_seq": 790
+    "agent_seq": 791
   }
 }
