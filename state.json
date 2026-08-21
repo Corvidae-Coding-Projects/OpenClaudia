@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1070,
+  "next_display_id": 1071,
   "next_comment_id": 1019,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -698,6 +698,7 @@
     "b37272ca-c8d3-4ed0-8285-a3a07a09b297": 573,
     "b4268c9e-91ed-4542-a102-7ecdf96f4483": 49,
     "b492e957-dbb9-452f-99ae-fe7ee4b2be46": 65,
+    "b4d2a6bf-17e9-4d24-95f2-f47395504b83": 1070,
     "b508e207-b4c2-4a93-8580-bfd69b636ead": 303,
     "b53124a1-be40-474d-aeb5-e188514fe84b": 760,
     "b5591a58-2eb2-46f2-9d76-665b3f5faa81": 307,
@@ -18395,6 +18396,17 @@
         }
       }
     },
+    "b4d2a6bf-17e9-4d24-95f2-f47395504b83": {
+      "uuid": "b4d2a6bf-17e9-4d24-95f2-f47395504b83",
+      "display_id": 1070,
+      "title": "S-012: Wire or honestly classify lifecycle services",
+      "description": "Complete docs/remediation-slices/012-runtime-feature-reachability.md. Prefer wiring intended lifecycle services into real production composition roots. Do not remove product capabilities merely because they are dormant; classify only genuinely unavailable or downstream-owned behavior honestly, with executable reachability evidence and skeptical tests.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T10:08:48.053528975Z",
+      "updated_at": "2026-08-21T10:08:48.053528975Z"
+    },
     "b508e207-b4c2-4a93-8580-bfd69b636ead": {
       "uuid": "b508e207-b4c2-4a93-8580-bfd69b636ead",
       "display_id": 303,
@@ -29206,11 +29218,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 661,
       "timestamp": "2026-08-21T10:04:53.862771103Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 662,
+      "timestamp": "2026-08-21T10:08:48.053528975Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T10:04:53.862771103Z",
+    "timestamp": "2026-08-21T10:08:48.053528975Z",
     "agent_id": "6Vw9",
-    "agent_seq": 661
+    "agent_seq": 662
   }
 }
