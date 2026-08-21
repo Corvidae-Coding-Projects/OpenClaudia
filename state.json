@@ -1,6 +1,6 @@
 {
   "next_display_id": 1065,
-  "next_comment_id": 996,
+  "next_comment_id": 997,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11295,10 +11295,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T07:49:42.777962351Z",
-      "updated_at": "2026-08-21T07:49:47.133690884Z",
+      "updated_at": "2026-08-21T07:54:59.159988473Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "4d984301-d470-471b-b900-1366f85c52d3": {
+          "display_id": 996,
+          "author": "6Vw9",
+          "content": "S-003 architecture decision: replace all nine standalone fuzz bodies with calls into one normal Rust fuzz-harness library so the exact logic is unit-testable on the pinned Rust 1.98 toolchain. Arbitrary bytes are capped before parsing. Cron and hook targets call pure production validators; tool-argument fuzzing calls the mandatory effect classifier and never dispatches; path fuzzing uses an explicit process/network/secret-denied ToolRunContext rooted in owned TempDir state; provider/SSE/conversion targets assert deterministic bounded semantic state; streaming Markdown renders through an injected bounded in-memory writer with an explicit theme/width and is compared whole-vs-partitioned. Track curated seed-* corpus files while ignoring runtime-generated corpus hashes, and add CI checks for the separate fuzz crate. Rejected alternative: keep public execute_tool calls behind permissive/fake policy, because that still exercises effectful handler code and makes absence of host process/network/database effects an assumption rather than a type/call-boundary fact. VDD receipt remains queued until S-088.",
+          "created_at": "2026-08-21T07:54:59.157498413Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdts/eNwAB6/21XgNLgJ+EbXPUwibsZ6bReEJPQsK3iH+YKlTp/t2uqYDAqCpvvd0BflDfSGK/vEd6CN3vLEfBg=="
+        }
+      }
     },
     "716c00c9-1e6b-46a4-8e00-73fb1773aa84": {
       "uuid": "716c00c9-1e6b-46a4-8e00-73fb1773aa84",
@@ -28689,11 +28700,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 615,
       "timestamp": "2026-08-21T07:49:52.528271789Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 616,
+      "timestamp": "2026-08-21T07:54:59.159988473Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T07:49:52.528271789Z",
+    "timestamp": "2026-08-21T07:54:59.159988473Z",
     "agent_id": "6Vw9",
-    "agent_seq": 615
+    "agent_seq": 616
   }
 }
