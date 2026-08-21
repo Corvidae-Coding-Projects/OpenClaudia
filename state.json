@@ -1,6 +1,6 @@
 {
   "next_display_id": 1066,
-  "next_comment_id": 998,
+  "next_comment_id": 999,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11296,7 +11296,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T07:49:42.777962351Z",
-      "updated_at": "2026-08-21T08:06:26.298120928Z",
+      "updated_at": "2026-08-21T08:22:39.691970048Z",
       "labels": [
         "remediation"
       ],
@@ -11318,6 +11318,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA30XDzxw97XaTxmwj5up0i4SRipC2iKplp7EFqya8f/5Su4p+RG5MY6I35HvT2pthaI1R8b2HBH5lXFiXTSmWCw=="
+        },
+        "e4db867f-7a3a-46f7-9acd-42a3ede236a3": {
+          "display_id": 998,
+          "author": "6Vw9",
+          "content": "Full-suite containment finding: ordinary \nrunning 4 tests\ntest tests::target_sources_delegate_only_to_the_hermetic_harness ... ok\ntest tests::hostile_regressions_cannot_create_the_requested_host_file ... ok\ntest tests::every_target_has_a_small_tracked_seed ... ok\ntest tests::semantic_regression_inputs_exercise_every_entry_point ... ok\n\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s creates the official  cache, but the versioned evidence-freshness walker excludes only repository-root . The 3.1 GiB ignored fuzz cache was therefore hashed as source, crossed the 1 GiB fail-closed ceiling, poisoned nine unrelated quality/final-gate tests, and stretched process timeout tests. S-003 requires a new versioned source-tree policy that excludes exact fuzz runtime/build outputs while continuing to hash curated  corpus files and similarly named nested source paths; tests must prove both sides. This is necessary for an operational fuzz harness and is not being waived as runner flakiness.",
+          "created_at": "2026-08-21T08:22:39.686807862Z",
+          "kind": "finding",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/ivbnyr5PkZWkt0bIMhVzqtqJRDWGfyNesOQoIQxD3isAZZMgSshGdmjRwJDntUBO45UzPjQrg1uT6IE9fJmBw=="
         }
       }
     },
@@ -28744,11 +28753,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 619,
       "timestamp": "2026-08-21T08:06:26.298120928Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 620,
+      "timestamp": "2026-08-21T08:22:39.691970048Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T08:06:26.298120928Z",
+    "timestamp": "2026-08-21T08:22:39.691970048Z",
     "agent_id": "6Vw9",
-    "agent_seq": 619
+    "agent_seq": 620
   }
 }
