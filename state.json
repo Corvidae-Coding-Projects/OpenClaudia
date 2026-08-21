@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1079,
+  "next_display_id": 1080,
   "next_comment_id": 1074,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -500,6 +500,7 @@
     "7f243bc9-9bb4-47c5-b94e-a0c6286418bf": 121,
     "7f55337f-3cc2-47e1-a287-6b6e7b82e15e": 511,
     "7f9da092-5b97-426c-b27e-9e2c59bd83bd": 846,
+    "7fb42a7a-a7d8-47e9-978f-7843cbf73e4f": 1079,
     "7fec1cfd-d63d-4d21-b47b-1381d4b409c4": 805,
     "806cc380-d8ae-4f97-82d6-c5224c840462": 619,
     "806f7a9a-6dca-4b4f-be19-0705f4215858": 317,
@@ -13531,6 +13532,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxjJnFRrBNXdR6dZWkkwLFbwerQf1GJI8csf9JMP7SiAyptvYxcVzWv4WaVBYXyLT+12u68Cy5wsxS+HivpJABA=="
         }
       }
+    },
+    "7fb42a7a-a7d8-47e9-978f-7843cbf73e4f": {
+      "uuid": "7fb42a7a-a7d8-47e9-978f-7843cbf73e4f",
+      "display_id": 1079,
+      "title": "S-107: Add complete portable technical-memory export and import",
+      "description": "Complete W5's portable user-control boundary after S-106. Export the complete selected workspace technical-memory causal set through a bounded resumable host-owned workflow, including schemas, identities, every revision/head/tombstone, provenance, citations, retention, review audit state, integrity digests, typed checkpoints, and partial/error receipts. Publish atomically to an explicit destination capability; support cancellation and restart; reject links, truncation, tampering, oversize, stale snapshots, and wrong destinations. Provide strict round-trip import without losing causal/privacy metadata. Do not expose transcript or free-form prose and do not implement team replication from S-103/S-104.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T18:25:31.485800686Z",
+      "updated_at": "2026-08-21T18:25:31.485800686Z"
     },
     "7fec1cfd-d63d-4d21-b47b-1381d4b409c4": {
       "uuid": "7fec1cfd-d63d-4d21-b47b-1381d4b409c4",
@@ -30364,11 +30377,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 758,
       "timestamp": "2026-08-21T18:25:27.368571466Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 759,
+      "timestamp": "2026-08-21T18:25:31.485800686Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T18:25:27.368571466Z",
+    "timestamp": "2026-08-21T18:25:31.485800686Z",
     "agent_id": "6Vw9",
-    "agent_seq": 758
+    "agent_seq": 759
   }
 }
