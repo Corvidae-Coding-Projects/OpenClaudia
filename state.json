@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1080,
+  "next_display_id": 1081,
   "next_comment_id": 1083,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -126,6 +126,7 @@
     "21371662-2722-4f5e-b80a-0fe8fcc1b6d4": 189,
     "214129e3-bc77-4d6d-904e-1dd9248bfaea": 890,
     "214a0a02-6c41-4888-92e5-5f63f51f9da8": 152,
+    "21c48962-2690-49e5-a402-64da78746f24": 1080,
     "21d57899-92a9-4751-b4c5-76ccc394f85e": 1042,
     "21e13dad-6fac-4ae8-9f1c-62788c0392cb": 538,
     "229161ac-804a-46d0-bd0f-7db135965396": 457,
@@ -4011,6 +4012,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "21c48962-2690-49e5-a402-64da78746f24": {
+      "uuid": "21c48962-2690-49e5-a402-64da78746f24",
+      "display_id": 1080,
+      "title": "Keep technical-memory source lifecycle coherent across host review transitions",
+      "description": "A fresh host review or review revocation can advance a source-managed lesson head without atomically advancing the source lifecycle member digest. The next source status/refresh then sees a permanent causal conflict even though both transitions were valid. Preserve review authority/audit semantics while updating the exact source member head in the same transaction; keep ordinary agent corrections/deletions fail-closed.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T20:51:59.798324138Z",
+      "updated_at": "2026-08-21T20:51:59.798324138Z"
     },
     "21d57899-92a9-4751-b4c5-76ccc394f85e": {
       "uuid": "21d57899-92a9-4751-b4c5-76ccc394f85e",
@@ -30534,11 +30547,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 772,
       "timestamp": "2026-08-21T20:45:37.325982274Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 773,
+      "timestamp": "2026-08-21T20:51:59.798324138Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T20:45:37.325982274Z",
+    "timestamp": "2026-08-21T20:51:59.798324138Z",
     "agent_id": "6Vw9",
-    "agent_seq": 772
+    "agent_seq": 773
   }
 }
