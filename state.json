@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1057,
+  "next_display_id": 1058,
   "next_comment_id": 948,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -517,6 +517,7 @@
     "89571bd5-e0fe-43c1-9eea-91102e4cb0d0": 543,
     "89e84c5e-00ee-42da-a47c-9c195ab62c8f": 1035,
     "8a03a034-8008-4b5c-8594-6005d2f534c0": 976,
+    "8ac4fb5b-b5d1-4ba9-9fe8-2ce1c4675d17": 1057,
     "8b1a21f2-7f4f-46ad-8108-aeca11053ab8": 877,
     "8bc856af-681a-4fe6-bcac-c808b7f71afd": 844,
     "8bf9bbad-f57c-40db-a794-14070216fc96": 280,
@@ -13441,6 +13442,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9WpXC44n+eZ8wEgaK5C4odMiujh8B9q9JFYgysXEroQgovD4LJPGkVYY/o3wU+y21VRsxXvh+dixugk91RdSBQ=="
         }
       }
+    },
+    "8ac4fb5b-b5d1-4ba9-9fe8-2ce1c4675d17": {
+      "uuid": "8ac4fb5b-b5d1-4ba9-9fe8-2ce1c4675d17",
+      "display_id": 1057,
+      "title": "Exclude repository worktree storage from verification source snapshots",
+      "description": "Combined root verification for S-001/S-004/S-005 exposed that ProjectSourceTreeV1 excludes root target but traverses repository-local .worktrees. Three isolated worktrees contain 262 GiB of build artifacts, so quality-gate freshness fails at the 1 GiB bound and causes nine unrelated verification tests to fail. Exclude only the root .worktrees control/build subtree, retain nested same-named source paths, add direct negative/positive coverage, and rerun the affected gates plus the combined full suite.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T02:26:44.536335025Z",
+      "updated_at": "2026-08-21T02:26:44.536335025Z"
     },
     "8b1a21f2-7f4f-46ad-8108-aeca11053ab8": {
       "uuid": "8b1a21f2-7f4f-46ad-8108-aeca11053ab8",
@@ -27582,11 +27595,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 511,
       "timestamp": "2026-08-21T00:15:05.120362308Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 512,
+      "timestamp": "2026-08-21T02:26:44.536335025Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T00:15:05.120362308Z",
+    "timestamp": "2026-08-21T02:26:44.536335025Z",
     "agent_id": "6Vw9",
-    "agent_seq": 511
+    "agent_seq": 512
   }
 }
