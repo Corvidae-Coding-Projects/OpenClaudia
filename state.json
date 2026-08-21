@@ -1,6 +1,6 @@
 {
   "next_display_id": 1081,
-  "next_comment_id": 1090,
+  "next_comment_id": 1091,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4023,7 +4023,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T20:51:59.798324138Z",
-      "updated_at": "2026-08-21T21:13:39.181850327Z",
+      "updated_at": "2026-08-21T21:13:43.360715974Z",
       "labels": [
         "remediation"
       ],
@@ -4036,6 +4036,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAV3LNE+ACMJwm+BzVpA0xe94jqtgbG/6tA+BdkUoXWx6wnBwohaYhctMFzV5ZfFTxzbv4NUjlTh9e88+1u5vwBw=="
+        },
+        "b9afa598-4ba9-4c2d-b3ab-60cc2ff1c27b": {
+          "display_id": 1090,
+          "author": "6Vw9",
+          "content": "Root-cause repair: prepare the exact coherent source membership before mutation; publish lesson successor, immutable host-review audit, and a source-state successor in one immediate SQLite transaction; admit only imported or audit-validated host-review member heads; retain ordinary update/delete drift as typed source conflict. Verify review/revoke/replay, unchanged refresh, ordinary correction/delete conflict, and rollback when source-state publication fails.",
+          "created_at": "2026-08-21T21:13:43.358106870Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAIkI1VjgDFIxWUNZv/SYlVl/1TgS7+stSfHK+ab2BWhsyAEu6rXjPBQxl4SmBbyPUa1SS+OaZoVLFjzkYWQwmDg=="
         }
       }
     },
@@ -30676,11 +30685,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 784,
       "timestamp": "2026-08-21T21:13:39.181850327Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 785,
+      "timestamp": "2026-08-21T21:13:43.360715974Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T21:13:39.181850327Z",
+    "timestamp": "2026-08-21T21:13:43.360715974Z",
     "agent_id": "6Vw9",
-    "agent_seq": 784
+    "agent_seq": 785
   }
 }
