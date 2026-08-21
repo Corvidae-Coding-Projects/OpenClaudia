@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1065,
+  "next_display_id": 1066,
   "next_comment_id": 997,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -779,6 +779,7 @@
     "c898920b-0eda-48c5-a0e9-b5882655cbf3": 885,
     "c8f1326c-6a66-42be-81fc-888614f4ef84": 951,
     "c940b382-2640-4369-a01a-5ce41ef42c37": 728,
+    "c95948bb-711e-46e1-b757-cd7dba65d754": 1065,
     "c9be86da-f6bd-4cc8-9f54-1c93e70489fb": 193,
     "c9d209e3-0c75-4d7b-ba78-60eb91dee8f8": 308,
     "c9e72600-9854-4b55-bd89-56f54ec98297": 658,
@@ -20290,6 +20291,17 @@
         "qa-review"
       ]
     },
+    "c95948bb-711e-46e1-b757-cd7dba65d754": {
+      "uuid": "c95948bb-711e-46e1-b757-cd7dba65d754",
+      "display_id": 1065,
+      "title": "Stop treating Rust todo module names as stub patterns",
+      "description": "The customized PostToolUse stub detector flags legitimate lines such as 'mod todo;' and 'pub use todo::{...}' as TODO comments after unrelated edits to src/tools/mod.rs. It demands replacement of real production modules and creates misleading intervention output. Match actual TODO/FIXME comment syntax rather than raw substring 'todo'. Discovered during S-003 issue #1064.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T07:56:03.178923628Z",
+      "updated_at": "2026-08-21T07:56:03.178923628Z"
+    },
     "c9be86da-f6bd-4cc8-9f54-1c93e70489fb": {
       "uuid": "c9be86da-f6bd-4cc8-9f54-1c93e70489fb",
       "display_id": 193,
@@ -28705,11 +28717,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 616,
       "timestamp": "2026-08-21T07:54:59.159988473Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 617,
+      "timestamp": "2026-08-21T07:56:03.178923628Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T07:54:59.159988473Z",
+    "timestamp": "2026-08-21T07:56:03.178923628Z",
     "agent_id": "6Vw9",
-    "agent_seq": 616
+    "agent_seq": 617
   }
 }
