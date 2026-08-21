@@ -17,7 +17,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-pub const VERIFICATION_POLICY_VERSION: u32 = 1;
+pub const VERIFICATION_POLICY_VERSION: u32 = 2;
 const MAX_SNAPSHOT_ENTRIES: u64 = 100_000;
 const MAX_SNAPSHOT_BYTES: u64 = 1_073_741_824;
 
@@ -58,6 +58,12 @@ pub enum WorkspaceDependencyPolicy {
     /// exclusions are VCS metadata or runtime/build caches, not source inputs
     /// asserted by the final gate.
     ProjectSourceTreeV1,
+    /// Extends [`Self::ProjectSourceTreeV1`] by excluding the repository-local
+    /// `.worktrees` control subtree. Linked worktrees contain independent build
+    /// caches and Git metadata rather than source owned by the current run.
+    /// Only the root subtree is excluded; a nested `src/.worktrees` directory
+    /// remains part of the verified source artifact set.
+    ProjectSourceTreeV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -716,7 +722,7 @@ fn artifact_set(root: &Path) -> Result<ArtifactSetBinding, String> {
     }
 
     Ok(ArtifactSetBinding {
-        dependency_policy: WorkspaceDependencyPolicy::ProjectSourceTreeV1,
+        dependency_policy: WorkspaceDependencyPolicy::ProjectSourceTreeV2,
         workspace_root: root.to_string_lossy().to_string(),
         workspace_sha256: digest_hex(digest.finalize().as_slice()),
         entry_count,
@@ -731,7 +737,7 @@ fn artifact_path_is_excluded(relative: &Path) -> bool {
         .collect::<Vec<_>>();
     matches!(
         components.first().and_then(|part| part.to_str()),
-        Some(".git" | "target")
+        Some(".git" | "target" | ".worktrees")
     ) || matches!(
         components.as_slice(),
         [first, second, ..]

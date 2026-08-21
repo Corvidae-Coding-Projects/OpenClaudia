@@ -56,7 +56,7 @@ Record changed artifact generations, commands/tests run, typed evidence receipts
   Any workspace, environment, model, policy, verifier, or generation change
   turns the result into a non-authoritative failure. Receipt append and final
   claim validation independently rehash the executable and live artifact set.
-- The versioned `ProjectSourceTreeV1` dependency policy hashes file type,
+- The original versioned `ProjectSourceTreeV1` dependency policy hashes file type,
   relative path, permissions, byte length, regular-file contents, and symlink
   target for at most 100,000 entries / 1 GiB. It fails closed on special files,
   escaping/unresolved symlinks, excluded-subtree aliases, read races, and
@@ -64,6 +64,12 @@ Record changed artifact generations, commands/tests run, typed evidence receipts
   `.crosslink/.cache`, and `.crosslink/.hub-cache` are explicit unrelated
   VCS/runtime/build exclusions; tracked configuration and untracked source
   remain included.
+- Post-integration maintenance issue #1057 advances the active policy and
+  guardrail-policy generation to `ProjectSourceTreeV2`. V2 additionally
+  excludes only the repository-root `.worktrees` control subtree, whose linked
+  checkouts contain independent Git metadata and build caches. Nested paths
+  such as `src/.worktrees` remain verified source. V1 remains deserializable,
+  but its receipts cannot authorize a current claim under policy version 2.
 - ACP, CLI chat, the TUI, pipeline streaming paths, and subagents now pass the
   model actually used for the turn into task observation, quality gates, and
   final validation. Model changes invalidate old verification before a new
@@ -157,6 +163,32 @@ All Cargo compilation used `CARGO_BUILD_JOBS=1`; all tests used
   assertions; the cross-run race and TUI shell freshness tests also passed
   independently during adversarial review.
 
+Post-integration maintenance issue #1057 was verified separately after all
+linked-worktree Cargo caches were removed. Every rebuild used
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0`, and every test command remained
+single-threaded:
+
+- `cargo test --locked --all-features --test ledger_decision_e2e --
+  --test-threads=1` — 19 passed, including root `.worktrees` exclusion,
+  nested `.worktrees` inclusion, V2 policy binding, and V1 compatibility.
+- All four clusters containing the nine failures that originally exposed the
+  oversized artifact scan passed after the V2 correction: 11 grounded-loop
+  tests, 7 guardrail-quality tests, the exact pipeline regression, and the
+  exact TUI regression.
+- `cargo check --locked --all-features --all-targets` and strict
+  `cargo clippy --locked --all-features --all-targets -- -D warnings` — pass.
+- `cargo test --locked --all-features --all-targets -- --test-threads=1` —
+  exit 0: 2,653 library tests and every integration/binary target passed. The
+  six linked-worktree sandbox tests tracked by #1055 also pass from the
+  canonical repository checkout.
+- `cargo check --locked --all-features --all-targets --target
+  x86_64-pc-windows-gnu` — pass. It emitted only the previously recorded
+  target-conditional unused/dead-code warnings outside the #1057 paths.
+
+The pre-verification cleanup removed 539.6 GiB of Cargo artifacts from the
+canonical checkout and the three isolated slice worktrees. The final rebuilt
+cache is removed again only after all Cargo evidence has been captured.
+
 The skeptical review did not trust positive fixtures merely because they
 passed. It caught and repaired a mismatched TUI model fixture, Crosslink's
 machine-local hook cache being treated as source, direct command receipts that
@@ -183,7 +215,7 @@ or weakened to conceal a freshness failure.
   without an OS/VCS snapshot. S-032/S-074 own stronger descriptor/snapshot
   workspace boundaries; this slice does not claim control over arbitrary host
   writers.
-- `ProjectSourceTreeV1` intentionally treats non-enumerated runtime files as
+- `ProjectSourceTreeV2` intentionally treats non-enumerated runtime files as
   relevant. This can conservatively reject a gate if another local service
   changes such a file, but it cannot make stale source appear fresh.
 - Crosslink issue #1039 tracks a deterministic resolver seam for the remaining

@@ -379,9 +379,17 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     let workspace = tempfile::TempDir::new().expect("temp workspace");
     std::fs::create_dir(workspace.path().join("src")).expect("create src");
     std::fs::write(workspace.path().join("src/lib.rs"), b"source").expect("write source");
+    std::fs::create_dir_all(workspace.path().join("src/.worktrees"))
+        .expect("create nested source directory");
+    let nested_source = workspace.path().join("src/.worktrees/source.txt");
+    std::fs::write(&nested_source, b"a").expect("write nested source");
     std::fs::create_dir(workspace.path().join("target")).expect("create target");
     let cache = workspace.path().join("target/cache.bin");
     std::fs::write(&cache, b"a").expect("write cache");
+    std::fs::create_dir_all(workspace.path().join(".worktrees/slice/target"))
+        .expect("create linked-worktree cache");
+    let worktree_cache = workspace.path().join(".worktrees/slice/target/cache.bin");
+    std::fs::write(&worktree_cache, b"a").expect("write linked-worktree cache");
     std::fs::create_dir_all(workspace.path().join(".crosslink/.cache"))
         .expect("create Crosslink runtime cache");
     let hook_cache = workspace.path().join(".crosslink/.cache/hook-dedupe");
@@ -402,6 +410,14 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     };
     assert_eq!(
         binding.artifacts.dependency_policy,
+        openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV2
+    );
+    assert_eq!(binding.freshness.policy_version, 2);
+    let legacy_policy: openclaudia::ledger::WorkspaceDependencyPolicy =
+        serde_json::from_str("\"project_source_tree_v1\"")
+            .expect("legacy policy tag remains deserializable");
+    assert_eq!(
+        legacy_policy,
         openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV1
     );
     assert_eq!(
@@ -413,6 +429,7 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     assert!(!binding.verifier_identity_sha256.is_empty());
 
     std::fs::write(&cache, b"b").expect("change excluded cache byte");
+    std::fs::write(&worktree_cache, b"b").expect("change excluded worktree-cache byte");
     std::fs::write(&hook_cache, b"b").expect("change excluded hook cache byte");
 
     validate_decision(
@@ -421,6 +438,19 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
         &run,
     )
     .expect("explicit runtime/build-cache exclusions must not stale source verification");
+
+    std::fs::write(&nested_source, b"b").expect("change nested source byte");
+    let denial = validate_decision(
+        &verification_decision("cache-policy-check", verification),
+        &ledger,
+        &run,
+    )
+    .expect_err("nested .worktrees source path must remain covered");
+    assert!(
+        denial.reason().contains("artifact set changed"),
+        "unexpected denial: {}",
+        denial.reason()
+    );
 }
 
 #[test]
