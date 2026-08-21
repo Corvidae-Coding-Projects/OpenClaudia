@@ -1,0 +1,348 @@
+{
+  "schema_version": 1,
+  "generation": 1,
+  "capabilities": [
+    {
+      "id": "interactive-tui",
+      "display_name": "Interactive TUI",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "Full-screen interactive agent frontend and its launch-time variants.",
+      "limitation": "Provider continuation, canonical lifecycle, cancellation, and terminal-state evidence are incomplete.",
+      "entrypoints": [
+        { "id": "tui.default", "kind": "default_tui", "invocation": "openclaudia", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "tui.model", "kind": "default_tui", "invocation": "openclaudia -m <model>", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "tui.verbose", "kind": "default_tui", "invocation": "openclaudia -v", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "tui.resume", "kind": "default_tui", "invocation": "openclaudia --resume", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "tui.session", "kind": "default_tui", "invocation": "openclaudia --session-id <id>", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "tui.network", "kind": "network_request", "expectation": "may_occur", "description": "Provider calls require explicit network authority." },
+        { "id": "tui.filesystem", "kind": "filesystem_read", "expectation": "may_occur", "description": "Tool and session reads require workspace authority." },
+        { "id": "tui.process", "kind": "process_execution", "expectation": "may_occur", "description": "Process tools require explicit process authority." },
+        { "id": "tui.session-state", "kind": "session_mutation", "expectation": "may_occur", "description": "Conversation and resume state can mutate." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "legacy-repl",
+      "display_name": "Legacy line REPL",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "Line-oriented compatibility frontend with a separate orchestration loop.",
+      "limitation": "Request, tool, hook, transcript, and finalization semantics drift from the default TUI.",
+      "entrypoints": [
+        { "id": "repl.default", "kind": "legacy_repl", "invocation": "openclaudia --tui-mode", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "repl.network", "kind": "network_request", "expectation": "may_occur", "description": "Provider calls require network authority." },
+        { "id": "repl.process", "kind": "process_execution", "expectation": "may_occur", "description": "Tool calls may execute processes." },
+        { "id": "repl.session-state", "kind": "session_mutation", "expectation": "may_occur", "description": "Conversation state can mutate." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "coordinator-prompt-mode",
+      "display_name": "Coordinator prompt mode",
+      "visibility": "user_facing",
+      "maturity": "experimental",
+      "summary": "Legacy REPL launch shape that selects coordinator-oriented prompts.",
+      "limitation": "Coordinator dispatch, isolation, supervision, and lifecycle enforcement are not operational.",
+      "entrypoints": [
+        { "id": "coordinator.repl", "kind": "legacy_repl", "invocation": "openclaudia --coordinator --tui-mode", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "coordinator.session-state", "kind": "session_mutation", "expectation": "may_occur", "description": "Coordinator-labelled conversation state can mutate." },
+        { "id": "coordinator.process", "kind": "process_execution", "expectation": "may_occur", "description": "Intended delegation requires supervised process effects." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "behavioral-mode-presets",
+      "display_name": "Behavioral mode presets",
+      "visibility": "user_facing",
+      "maturity": "experimental",
+      "summary": "Prompt-oriented mode selection at TUI startup.",
+      "limitation": "Mode names do not yet enforce effect or resource capabilities.",
+      "entrypoints": [
+        { "id": "modes.tui", "kind": "default_tui", "invocation": "openclaudia --mode <preset>", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "modes.session-state", "kind": "session_mutation", "expectation": "may_occur", "description": "Mode selection changes run context." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "print-mode",
+      "display_name": "One-shot print mode",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "Non-interactive single-prompt provider route.",
+      "limitation": "The route lacks canonical state, aggregate budgets, trace, and typed partial or cancelled terminal status.",
+      "entrypoints": [
+        { "id": "print.default", "kind": "print", "invocation": "openclaudia --print \"prompt\"", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "print.network", "kind": "network_request", "expectation": "must_occur", "description": "The provider request uses network authority." },
+        { "id": "print.trace", "kind": "trace_emission", "expectation": "must_occur", "description": "Operational print mode must emit a terminal trace." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "project-initialization",
+      "display_name": "Project initialization",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "Creates the current project scaffold.",
+      "limitation": "The multi-file overwrite path is not transactional and the scaffold still needs the remediated authority model.",
+      "entrypoints": [
+        { "id": "init.default", "kind": "init", "invocation": "openclaudia init", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "init.force", "kind": "init", "invocation": "openclaudia init --force", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "init.read", "kind": "filesystem_read", "expectation": "must_occur", "description": "Initialization inventories existing destinations." },
+        { "id": "init.write", "kind": "filesystem_write", "expectation": "must_occur", "description": "Initialization writes a project scaffold." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "legacy-native-auth",
+      "display_name": "Legacy native authentication",
+      "visibility": "user_facing",
+      "maturity": "unsupported",
+      "summary": "Current native OAuth launch, cache status, and local logout routes.",
+      "limitation": "Subscription-client impersonation is not approved for production and logout does not prove provider revocation.",
+      "entrypoints": [
+        { "id": "auth.login", "kind": "auth", "invocation": "openclaudia auth", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "auth.status", "kind": "auth", "invocation": "openclaudia auth --status", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "auth.logout", "kind": "auth", "invocation": "openclaudia auth --logout", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "auth.network", "kind": "network_request", "expectation": "may_occur", "description": "Authentication can contact an external provider." },
+        { "id": "auth.credentials", "kind": "credential_read", "expectation": "may_occur", "description": "Status and login access credential-bearing state." },
+        { "id": "auth.external", "kind": "external_mutation", "expectation": "may_occur", "description": "A supported OAuth flow would mutate provider authorization state." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "http-proxy",
+      "display_name": "HTTP proxy",
+      "visibility": "user_facing",
+      "maturity": "unsupported",
+      "summary": "Configured HTTP listener and provider transform routes.",
+      "limitation": "Clients are unauthenticated, request and session state are not isolated, and lifecycle checks are incomplete.",
+      "entrypoints": [
+        { "id": "proxy.default", "kind": "proxy", "invocation": "openclaudia start", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "proxy.port", "kind": "proxy", "invocation": "openclaudia start -p 9090", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "proxy.target", "kind": "proxy", "invocation": "openclaudia start -t openai", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "proxy.network", "kind": "network_request", "expectation": "must_occur", "description": "The listener and upstream provider use network authority." },
+        { "id": "proxy.credentials", "kind": "credential_read", "expectation": "may_occur", "description": "Upstream requests may require provider credentials." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "acp-server",
+      "display_name": "ACP stdio server",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "ACP JSON-RPC server over standard input and output.",
+      "limitation": "Session isolation, tool and mode parity, cancellation, and partial terminal outcomes remain incomplete.",
+      "entrypoints": [
+        { "id": "acp.default", "kind": "acp", "invocation": "openclaudia acp", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "acp.model", "kind": "acp", "invocation": "openclaudia acp -m <model>", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "acp.network", "kind": "network_request", "expectation": "may_occur", "description": "Provider calls require network authority." },
+        { "id": "acp.process", "kind": "process_execution", "expectation": "may_occur", "description": "ACP tool calls may execute processes." },
+        { "id": "acp.session-state", "kind": "session_mutation", "expectation": "may_occur", "description": "ACP sessions mutate conversation state." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "iteration-loop",
+      "display_name": "Iteration loop",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "Current iterative provider and Stop-hook command path.",
+      "limitation": "It uses a separate lifecycle; one iteration counter is not an aggregate budget or durable stop condition.",
+      "entrypoints": [
+        { "id": "loop.default", "kind": "loop", "invocation": "openclaudia loop", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "loop.finite", "kind": "loop", "invocation": "openclaudia loop -n 10", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "loop.network", "kind": "network_request", "expectation": "must_occur", "description": "Iterations call a provider." },
+        { "id": "loop.session-state", "kind": "session_mutation", "expectation": "must_occur", "description": "Iterations update run state." },
+        { "id": "loop.process", "kind": "process_execution", "expectation": "may_occur", "description": "Hooks and tools may execute processes." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "configuration-display",
+      "display_name": "Configuration display",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "Loads and renders current configuration.",
+      "limitation": "Secret redaction, provenance, duplicate loaders, and unknown-field handling need the typed configuration remediation.",
+      "entrypoints": [
+        { "id": "config.default", "kind": "config", "invocation": "openclaudia config", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "config.read", "kind": "filesystem_read", "expectation": "must_occur", "description": "Configuration sources are read from disk." },
+        { "id": "config.credentials", "kind": "credential_read", "expectation": "may_occur", "description": "Configuration can reference credential-bearing values." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "doctor-diagnostics",
+      "display_name": "Doctor diagnostics",
+      "visibility": "user_facing",
+      "maturity": "unsupported",
+      "summary": "Runs the current diagnostic command.",
+      "limitation": "Several checks are synthetic or effectful and therefore cannot serve as live capability or release evidence.",
+      "entrypoints": [
+        { "id": "doctor.default", "kind": "doctor", "invocation": "openclaudia doctor", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "doctor.read", "kind": "filesystem_read", "expectation": "may_occur", "description": "Diagnostics inspect local state." },
+        { "id": "doctor.process", "kind": "process_execution", "expectation": "may_occur", "description": "Some diagnostics probe local programs." },
+        { "id": "doctor.network", "kind": "network_request", "expectation": "may_occur", "description": "Current active probes can contact providers." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "repository-hook-proposals",
+      "display_name": "Repository hook proposals",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "Displays inert hook proposals and manages exact host-owned approval receipts.",
+      "limitation": "Per-invocation revocation, extension identity, executable binding, and complete lifecycle admission remain downstream work.",
+      "entrypoints": [
+        { "id": "hooks.status", "kind": "hooks", "invocation": "openclaudia hooks status", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "hooks.approve", "kind": "hooks", "invocation": "openclaudia hooks approve <sha256:...>", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "hooks.revoke", "kind": "hooks", "invocation": "openclaudia hooks revoke <sha256:...>", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "hooks.read", "kind": "filesystem_read", "expectation": "must_occur", "description": "Status reads proposal and bound-file content." },
+        { "id": "hooks.write", "kind": "filesystem_write", "expectation": "may_occur", "description": "Approve and revoke mutate the trusted receipt store." },
+        { "id": "hooks.process", "kind": "process_execution", "expectation": "must_not_occur", "description": "Proposal review must not execute repository hook commands." }
+      ],
+      "evidence_ids": []
+    },
+    {
+      "id": "capability-evidence-registry",
+      "display_name": "Capability evidence registry",
+      "visibility": "internal",
+      "maturity": "operational",
+      "summary": "Validates capability maturity against reviewed executable receipts and renders documentation projections.",
+      "limitation": "This foundation does not promote any other capability; canonical VDD remains pending S-088.",
+      "entrypoints": [
+        {
+          "id": "registry.library",
+          "kind": "library_api",
+          "invocation": "CapabilityEvidenceBundle::bundled",
+          "reachability": "reachable",
+          "required_failure_modes": ["documentation_only_claim", "missing_failure_evidence"]
+        }
+      ],
+      "required_effects": [
+        { "id": "registry.projection", "kind": "documentation_projection", "expectation": "must_occur", "description": "The generated user table is a deterministic projection of validated data." },
+        { "id": "registry.final-state", "kind": "final_environment_observation", "expectation": "must_occur", "description": "Graders read final files and forbidden-path absence after execution." },
+        { "id": "registry.trace", "kind": "trace_emission", "expectation": "must_occur", "description": "Every receipt binds a typed causal trace." },
+        { "id": "registry.release-promotion", "kind": "documentation_projection", "expectation": "must_not_occur", "description": "Rejected and successful evaluation scenarios must not publish an operational release claim." }
+      ],
+      "evidence_ids": ["registry.render.success", "registry.docs-only.failure", "registry.missing-failure.failure"]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "registry.render.success",
+      "capability_id": "capability-evidence-registry",
+      "entrypoint_id": "registry.library",
+      "scenario_id": "registry-render-success",
+      "coverage": { "kind": "success" },
+      "corpus_sha256": "sha256:1f8b05b210fe641ebdfcce22b4af7fe20570e6b88ca1dee037ccd1182ab31304",
+      "quality_review_id": "capability-corpus-review-v1",
+      "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
+      "trace": {
+        "envelope": {
+          "schema_version": 1,
+          "scenario_id": "registry-render-success",
+          "outcome": { "kind": "success" },
+          "events": [
+            { "sequence": 1, "kind": "scenario_started" },
+            { "sequence": 2, "kind": "registry_loaded" },
+            { "sequence": 3, "kind": "registry_validated" },
+            { "sequence": 4, "kind": "documentation_rendered" },
+            { "sequence": 5, "kind": "final_environment_inspected" }
+          ]
+        },
+        "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a"
+      },
+      "receipts": [
+        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:bb78a5cd2415ac5df9045668b1a9e403132d7f8841c24a8ee5b2b99f5a8d28c4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
+        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:bb78a5cd2415ac5df9045668b1a9e403132d7f8841c24a8ee5b2b99f5a8d28c4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
+        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:bb78a5cd2415ac5df9045668b1a9e403132d7f8841c24a8ee5b2b99f5a8d28c4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" }
+      ]
+    },
+    {
+      "id": "registry.docs-only.failure",
+      "capability_id": "capability-evidence-registry",
+      "entrypoint_id": "registry.library",
+      "scenario_id": "registry-rejects-docs-only",
+      "coverage": { "kind": "failure", "failure_mode": "documentation_only_claim" },
+      "corpus_sha256": "sha256:1f8b05b210fe641ebdfcce22b4af7fe20570e6b88ca1dee037ccd1182ab31304",
+      "quality_review_id": "capability-corpus-review-v1",
+      "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
+      "trace": {
+        "envelope": {
+          "schema_version": 1,
+          "scenario_id": "registry-rejects-docs-only",
+          "outcome": { "kind": "rejected", "code": "operational_missing_success_evidence" },
+          "events": [
+            { "sequence": 1, "kind": "scenario_started" },
+            { "sequence": 2, "kind": "registry_loaded" },
+            { "sequence": 3, "kind": "registry_rejected" },
+            { "sequence": 4, "kind": "final_environment_inspected" }
+          ]
+        },
+        "trace_sha256": "sha256:d121a70a18ba59cd9ed5d7151df426cce45263aeb5c8cae38185e03592388133"
+      },
+      "receipts": [
+        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:ca9f8b63d167b9e8ad077edf7df92ac2f99dfbd0747912f1604aa085b2fdcbf5", "trace_sha256": "sha256:d121a70a18ba59cd9ed5d7151df426cce45263aeb5c8cae38185e03592388133", "effect_observations_sha256": "sha256:d86646a7abe87bd0ff44abc39d9b90f97ef1f99fead53f2dc006153b0323a687" },
+        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:ca9f8b63d167b9e8ad077edf7df92ac2f99dfbd0747912f1604aa085b2fdcbf5", "trace_sha256": "sha256:d121a70a18ba59cd9ed5d7151df426cce45263aeb5c8cae38185e03592388133", "effect_observations_sha256": "sha256:d86646a7abe87bd0ff44abc39d9b90f97ef1f99fead53f2dc006153b0323a687" },
+        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:ca9f8b63d167b9e8ad077edf7df92ac2f99dfbd0747912f1604aa085b2fdcbf5", "trace_sha256": "sha256:d121a70a18ba59cd9ed5d7151df426cce45263aeb5c8cae38185e03592388133", "effect_observations_sha256": "sha256:d86646a7abe87bd0ff44abc39d9b90f97ef1f99fead53f2dc006153b0323a687" }
+      ]
+    },
+    {
+      "id": "registry.missing-failure.failure",
+      "capability_id": "capability-evidence-registry",
+      "entrypoint_id": "registry.library",
+      "scenario_id": "registry-rejects-missing-failure-evidence",
+      "coverage": { "kind": "failure", "failure_mode": "missing_failure_evidence" },
+      "corpus_sha256": "sha256:1f8b05b210fe641ebdfcce22b4af7fe20570e6b88ca1dee037ccd1182ab31304",
+      "quality_review_id": "capability-corpus-review-v1",
+      "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
+      "trace": {
+        "envelope": {
+          "schema_version": 1,
+          "scenario_id": "registry-rejects-missing-failure-evidence",
+          "outcome": { "kind": "rejected", "code": "operational_missing_failure_evidence" },
+          "events": [
+            { "sequence": 1, "kind": "scenario_started" },
+            { "sequence": 2, "kind": "registry_loaded" },
+            { "sequence": 3, "kind": "registry_rejected" },
+            { "sequence": 4, "kind": "final_environment_inspected" }
+          ]
+        },
+        "trace_sha256": "sha256:0ee9343ad646e43aeb09fc07de69a133c083c0195267dad3560ab14d80e15fbe"
+      },
+      "receipts": [
+        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:9521fb96346534a0b5a0b22eb2446494746687f7d3b6159482138e01ed6c58e4", "trace_sha256": "sha256:0ee9343ad646e43aeb09fc07de69a133c083c0195267dad3560ab14d80e15fbe", "effect_observations_sha256": "sha256:d86646a7abe87bd0ff44abc39d9b90f97ef1f99fead53f2dc006153b0323a687" },
+        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:9521fb96346534a0b5a0b22eb2446494746687f7d3b6159482138e01ed6c58e4", "trace_sha256": "sha256:0ee9343ad646e43aeb09fc07de69a133c083c0195267dad3560ab14d80e15fbe", "effect_observations_sha256": "sha256:d86646a7abe87bd0ff44abc39d9b90f97ef1f99fead53f2dc006153b0323a687" },
+        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:9521fb96346534a0b5a0b22eb2446494746687f7d3b6159482138e01ed6c58e4", "trace_sha256": "sha256:0ee9343ad646e43aeb09fc07de69a133c083c0195267dad3560ab14d80e15fbe", "effect_observations_sha256": "sha256:d86646a7abe87bd0ff44abc39d9b90f97ef1f99fead53f2dc006153b0323a687" }
+      ]
+    }
+  ]
+}

@@ -234,7 +234,9 @@ session:
 ## CLI Commands
 
 The following command shapes exist. “Exists” does not imply feature parity or
-safe unattended operation; consult the capability matrix and audit.
+safe unattended operation; consult the [generated capability
+matrix](docs/binary-capability-matrix.md) and audit. Capability maturity comes
+from the typed registry and executable receipts, never from this prose block.
 
 ```bash
 openclaudia                    # Start full-screen interactive TUI (default)

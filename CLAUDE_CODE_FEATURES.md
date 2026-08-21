@@ -6,8 +6,7 @@ marked similarly named OpenClaudia modules as implemented. The full audit shows
 that this produced false parity claims, especially for MCP, planning, sessions,
 hooks, permissions, subagents, memory, reasoning, and tool loops.
 
-This file remains because a compile-time documentation test includes it. It is
-no longer a feature checklist or implementation authority.
+This file is no longer a feature checklist or implementation authority.
 
 ## Current compatibility rules
 
@@ -33,8 +32,13 @@ cancellation, result provenance, or completion semantics are production-ready.
 
 ## Where capability status lives
 
-- `docs/full-codebase-audit-2026-08-16.md` records current evidence.
+- `capabilities/registry.json` records typed maturity, entrypoints, effects,
+  limitations, and executable evidence links.
+- `capabilities/evaluation-corpus.json` and its digest-bound quality review
+  record define repeated final-environment graders.
+- `docs/binary-capability-matrix.md` is generated from the validated registry.
+- `docs/full-codebase-audit-2026-08-16.md` records the detailed findings.
 - `docs/production-remediation-design.md` defines the preserved outcomes and
   target contracts.
-- Future compatibility matrices must be generated from released conformance
-  tests rather than maintained as prose checklists.
+- Future compatibility matrices must add released conformance scenarios to the
+  same evidence boundary rather than reintroduce prose checklists.

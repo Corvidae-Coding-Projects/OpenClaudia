@@ -107,4 +107,7 @@ mechanisms.
 
 - `docs/full-codebase-audit-2026-08-16.md`: evidence and per-file findings.
 - `docs/production-remediation-design.md`: target architecture and release gates.
-- `docs/binary-capability-matrix.md`: current entrypoint status, with limitations.
+- `capabilities/registry.json`: typed entrypoint maturity, required effects,
+  limitations, and executable evidence links.
+- `docs/binary-capability-matrix.md`: generated user projection of that
+  validated registry.
