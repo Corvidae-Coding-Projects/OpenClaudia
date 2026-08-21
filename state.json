@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1078,
+  "next_display_id": 1079,
   "next_comment_id": 1067,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -52,6 +52,7 @@
     "0b92d979-883f-4057-95ba-986931067c69": 473,
     "0bb5c68e-6cb6-419e-883a-9a7f74df78a9": 914,
     "0bda6ef1-002b-4fb1-83af-49d6897b788f": 866,
+    "0c3ac24f-2432-4062-b3d8-3a475cf7e748": 1078,
     "0cb38cac-012d-4d5d-b197-dc4e83d70fa1": 352,
     "0d1ea690-7841-4953-b010-9b394b2d76b2": 167,
     "0d517753-75e2-472e-9d93-8c2a18ee18c0": 122,
@@ -2277,6 +2278,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATUOCITMY2lJ1yDgSCao+KgwlWWkl+QmTSA8F0umBnBjo3mW9N/RGhjOz3+V0YgiRc5T30uBWqSdX+6O9NhFbCA=="
         }
       }
+    },
+    "0c3ac24f-2432-4062-b3d8-3a475cf7e748": {
+      "uuid": "0c3ac24f-2432-4062-b3d8-3a475cf7e748",
+      "display_id": 1078,
+      "title": "S-106: Add host-reviewed technical-memory authority and portable export",
+      "description": "Complete W5's remaining user control boundary after S-054/S-056. Add an explicit host-authorized review transition for exact technical-lesson revisions that is bound to a real permission/approval receipt (never model self-assertion), with compare-and-swap, correction/supersession, expiry, revocation, and audit semantics. Add a bounded, resumable, portable export of the complete selected workspace memory set, including causal identities, tombstones, provenance, citations, retention, review state, schema/version, integrity digest, and typed partial/error receipts; do not treat model-facing memory_list's context-limited page as export. Define import round-trip and privacy/redaction behavior, wire supported frontends, and verify unauthorized/self-reviewed, stale, tampered, oversized, interrupted, and round-trip cases.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T18:03:37.187217446Z",
+      "updated_at": "2026-08-21T18:03:37.187217446Z"
     },
     "0cb38cac-012d-4d5d-b197-dc4e83d70fa1": {
       "uuid": "0cb38cac-012d-4d5d-b197-dc4e83d70fa1",
@@ -30217,11 +30230,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 745,
       "timestamp": "2026-08-21T17:53:37.599750863Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 746,
+      "timestamp": "2026-08-21T18:03:37.187217446Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T17:53:37.599750863Z",
+    "timestamp": "2026-08-21T18:03:37.187217446Z",
     "agent_id": "6Vw9",
-    "agent_seq": 745
+    "agent_seq": 746
   }
 }
