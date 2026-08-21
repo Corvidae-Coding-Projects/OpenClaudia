@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Fix Rust 1.98 strict Clippy runner failures (#1061)
 - S-002: Enforce repository artifact and dependency hygiene (#1059)
 - S-002: Enforce repository artifact and dependency hygiene (#1059)
 - Upgrade GitHub Actions off deprecated Node 20 runtimes (#1028)
