@@ -13591,12 +13591,13 @@
       "display_id": 1079,
       "title": "S-107: Add complete portable technical-memory export and import",
       "description": "Complete W5's portable user-control boundary after S-106. Export the complete selected workspace technical-memory causal set through a bounded resumable host-owned workflow, including schemas, identities, every revision/head/tombstone, provenance, citations, retention, review audit state, integrity digests, typed checkpoints, and partial/error receipts. Publish atomically to an explicit destination capability; support cancellation and restart; reject links, truncation, tampering, oversize, stale snapshots, and wrong destinations. Provide strict round-trip import without losing causal/privacy metadata. Do not expose transcript or free-form prose and do not implement team replication from S-103/S-104.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T18:25:31.485800686Z",
-      "updated_at": "2026-08-21T21:06:37.141763578Z",
+      "updated_at": "2026-08-21T21:06:41.714958642Z",
+      "closed_at": "2026-08-21T21:06:41.714953917Z",
       "labels": [
         "remediation"
       ],
@@ -30616,11 +30617,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 778,
       "timestamp": "2026-08-21T21:06:37.141763578Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 779,
+      "timestamp": "2026-08-21T21:06:41.714958642Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T21:06:37.141763578Z",
+    "timestamp": "2026-08-21T21:06:41.714958642Z",
     "agent_id": "6Vw9",
-    "agent_seq": 778
+    "agent_seq": 779
   }
 }
