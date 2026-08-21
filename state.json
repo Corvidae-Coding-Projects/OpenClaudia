@@ -1,6 +1,6 @@
 {
   "next_display_id": 1073,
-  "next_comment_id": 1037,
+  "next_comment_id": 1038,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9777,7 +9777,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:30:58.895224572Z",
-      "updated_at": "2026-08-21T13:01:55.863340906Z",
+      "updated_at": "2026-08-21T13:39:10.679997236Z",
       "labels": [
         "remediation"
       ],
@@ -9799,6 +9799,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl5qNsZf4nUKOXPd9bIkopnI+IvwascrRWiAKU6h2WcxdT+udMtGZunYJCBynnZveidMj04i4ah65moWwwtnCBA=="
+        },
+        "74ed8d3f-9d9d-4bad-8c84-ea526f4d61d1": {
+          "display_id": 1037,
+          "author": "6Vw9",
+          "content": "Pre-commit skeptical review blocked the initial green candidate and found four causal defects: second-root logical-ID collision; completed operation rows consuming a lifetime 4096 cap; sync state not bound to physical user/team store identities (F-075 store-replacement leak); and equal selected projections hiding a remote conflict head. Repairs now add persistent MemoryStoreId/origin provenance, second-root rejection, exact sidecar store-pair binding with fail-closed replacement, separate durable replica enrollment plus completed-op retirement, maximal-head union, offline-parent reconciliation, private-memory replication refusal, and version/store-bound overlays. New adversarial unit gate passes 13/13 and public identity E2E passes 5/5; existing memory/config/team gate passes 83/83 and team compatibility 37/37. Final repository-wide re-gate remains pending.",
+          "created_at": "2026-08-21T13:39:10.675155900Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgBEWkNoNANwVo3Y73gAQ4woUyLz9cJ7GPo7NRDLYHC/M24XrUdjQECDIuDJEHIsPJLAb9Ad214pI1f379+wDAg=="
         },
         "8a577229-679e-482c-b26d-f821427ea898": {
           "display_id": 1036,
@@ -29608,11 +29617,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 695,
       "timestamp": "2026-08-21T13:01:55.863340906Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 696,
+      "timestamp": "2026-08-21T13:39:10.679997236Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T13:01:55.863340906Z",
+    "timestamp": "2026-08-21T13:39:10.679997236Z",
     "agent_id": "6Vw9",
-    "agent_seq": 695
+    "agent_seq": 696
   }
 }
