@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-054: Make memory typed, untrusted technical lessons with retrieval (#1073)
 - S-053: Give memory stable identity and merge semantics (#1072)
 - S-012: Wire or honestly classify lifecycle services (#1070)
 - S-006: Rebuild doctor as evidence-safe diagnostics (#1068)
