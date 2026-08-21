@@ -9209,12 +9209,13 @@
       "display_id": 1073,
       "title": "S-054: Make memory typed, untrusted technical lessons with retrieval",
       "description": "Implement docs/remediation-slices/054-memory-authority-and-schema.md after S-053. Memory is a repository-specific technical-lesson system, not prose/transcript capture: define strict versioned lesson/evidence/citation/applicability/retention/correction schemas; keep private storage host-owned and project/team/imported data untrusted; reject corrupt/partial/future stores without mutation; retrieve bounded cited lessons explicitly through a canonical typed tool in every supported frontend; prevent memory from becoming system/developer instructions; keep inferred promotion for S-055 and MEMORY.md lifecycle for S-056.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T14:07:17.731257893Z",
-      "updated_at": "2026-08-21T16:50:36.689189317Z",
+      "updated_at": "2026-08-21T16:50:46.623160045Z",
+      "closed_at": "2026-08-21T16:50:46.623155989Z",
       "labels": [
         "remediation"
       ],
@@ -30049,11 +30050,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 731,
       "timestamp": "2026-08-21T16:50:36.689189317Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 732,
+      "timestamp": "2026-08-21T16:50:46.623160045Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T16:50:36.689189317Z",
+    "timestamp": "2026-08-21T16:50:46.623160045Z",
     "agent_id": "6Vw9",
-    "agent_seq": 731
+    "agent_seq": 732
   }
 }
