@@ -1,6 +1,6 @@
 {
   "next_display_id": 1063,
-  "next_comment_id": 986,
+  "next_comment_id": 987,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25183,7 +25183,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T06:56:56.207726032Z",
-      "updated_at": "2026-08-21T07:24:05.200648841Z",
+      "updated_at": "2026-08-21T07:24:20.920566483Z",
       "comments": {
         "41ed848a-4c56-4acb-87b9-73f9e9fdf1b0": {
           "display_id": 983,
@@ -25202,6 +25202,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAWF1BhSQ8JfR14ETEoV9TuPJ4Wio01VURYu7d+5Rt6WukAKzJlk8xE05kxddj/7O7+Ez7LzxLed8ne2kOpV60Ag=="
+        },
+        "c724f3fe-dc43-4ede-ad59-48c9f9539284": {
+          "display_id": 986,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 28ada0a1 (fix(ci): standardize on Rust 1.98). Signature verified with ED25519 SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A. Exact gates: Rust 1.98 fmt check PASS; default and all-feature/all-target checks PASS; strict Clippy -D warnings PASS; full all-target/all-feature CI suite PASS with --test-threads=1; repository policy 26/26 PASS and live hygiene verified. Worktree clean immediately after commit.",
+          "created_at": "2026-08-21T07:24:20.918057638Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEcCs2KWYLIBVGZj/p1L72+ni0DVGiRVsiPyWVrk+7WPBSvhcgyWz2GDHaEBiGmnvahQAKMSQVkA+LC+1WJbMCQ=="
         },
         "ed308cc4-45d1-4164-9433-6a9b1df266d8": {
           "display_id": 984,
@@ -28438,11 +28447,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 591,
       "timestamp": "2026-08-21T07:24:05.200648841Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 592,
+      "timestamp": "2026-08-21T07:24:20.920566483Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T07:24:05.200648841Z",
+    "timestamp": "2026-08-21T07:24:20.920566483Z",
     "agent_id": "6Vw9",
-    "agent_seq": 591
+    "agent_seq": 592
   }
 }
