@@ -1,6 +1,6 @@
 {
   "next_display_id": 1071,
-  "next_comment_id": 1021,
+  "next_comment_id": 1022,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18409,7 +18409,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T10:08:48.053528975Z",
-      "updated_at": "2026-08-21T10:10:57.733505679Z",
+      "updated_at": "2026-08-21T10:15:51.098473213Z",
       "labels": [
         "remediation"
       ],
@@ -18425,6 +18425,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "67dcbb5e-b6d9-4707-b476-3c4d8b314e7d": {
+          "display_id": 1021,
+          "author": "6Vw9",
+          "content": "S-012 architecture decision after production-call inventory: use a hybrid explicit-composition design, not a giant service-locator. ServiceRegistry will become a validated immutable lifecycle catalog plus the genuinely injected analytics sink; production constructors will have no Default/no-op fallback. Existing typed handles remain explicit at their consumers (PluginManager/McpManager, MemoryDb, guardrails, policy, ToolExecutor), and the catalog records their exact construction/consumer/shutdown anchors. The proxy compaction path will consume AutoCompactor so that policy seam is real. Generic OPENCLAUDIA_FEATURE_* values and configured team_memory_path will fail visibly while their implementations remain preserved for later typed-rollout and memory-identity slices. Unsafe background/plugin jobs, LSP staging, shadow PluginMcpRegistry, and rate-limit mock will be explicitly unavailable/experimental/test-only with follow-up slices rather than started or deleted. Credible alternative rejected: putting every heterogeneous handle behind ServiceRegistry would obscure capabilities/lifetimes, duplicate existing owners, and make run/session rebinding less type-safe. Capability registry gains an internal partial reachability record linked by tests to the lifecycle catalog; generation/projection evidence will be updated without promoting underlying services. VDD remains pending S-088.",
+          "created_at": "2026-08-21T10:15:51.095988138Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+L7T3zPgvzX/movE9gEGVgX+C9ohYA6RXYIiWcEVdsrMEKidR64vJMN/HzTdZYQ57AE+3xQezADYhz3AiDqSAQ=="
         },
         "72261967-8946-4003-9375-69ca0f77d46d": {
           "display_id": 1020,
@@ -29273,11 +29282,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 666,
       "timestamp": "2026-08-21T10:10:57.733505679Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 667,
+      "timestamp": "2026-08-21T10:15:51.098473213Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T10:10:57.733505679Z",
+    "timestamp": "2026-08-21T10:15:51.098473213Z",
     "agent_id": "6Vw9",
-    "agent_seq": 666
+    "agent_seq": 667
   }
 }
