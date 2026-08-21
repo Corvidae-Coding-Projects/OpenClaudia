@@ -7520,11 +7520,12 @@
       "uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "display_id": 1071,
       "title": "Complete every dormant feature through production wiring",
+      "description": "Umbrella remediation goal: convert every genuinely dormant, stubbed, test-only, experimental, or unreachable product feature into production-wired behavior, without removing intended capabilities. Work proceeds through dependency-ordered child slices with typed contracts, migrations, runtime reachability, failure semantics, tests, capability evidence, and signed commits. Memory specifically means structured, repository-scoped technical lessons (decisions, failure modes, verified fixes, commands, constraints, and reusable patterns) that agents explicitly retrieve through a tool call; it does not mean transcript or free-form prose harvesting.",
       "status": "open",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-21T12:29:43.714800980Z",
+      "updated_at": "2026-08-21T12:29:57.044954454Z",
       "labels": [
         "remediation"
       ],
@@ -29509,11 +29510,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 687,
       "timestamp": "2026-08-21T12:29:43.714800980Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 688,
+      "timestamp": "2026-08-21T12:29:57.044954454Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T12:29:43.714800980Z",
+    "timestamp": "2026-08-21T12:29:57.044954454Z",
     "agent_id": "6Vw9",
-    "agent_seq": 687
+    "agent_seq": 688
   }
 }
