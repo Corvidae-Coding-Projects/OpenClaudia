@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1062,
+  "next_display_id": 1063,
   "next_comment_id": 982,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -181,6 +181,7 @@
     "2e224da2-6312-4959-b478-43f8ec8b6bf1": 919,
     "2e37b184-84f0-4053-b5f5-cb9044e11415": 490,
     "2e3c3682-def6-49a6-94ea-2b4dc7cc28b2": 60,
+    "2e5cc716-77b0-43ae-95f3-e144e59e98fa": 1062,
     "2e8a8e18-b837-4932-bc94-54badfbb0c7b": 497,
     "2eb25cb5-72f4-40e9-b0da-5d2a9ad17452": 600,
     "2eb443bb-0125-4bd9-abf0-b6ed789c28eb": 754,
@@ -5382,6 +5383,17 @@
       "labels": [
         "feature"
       ]
+    },
+    "2e5cc716-77b0-43ae-95f3-e144e59e98fa": {
+      "uuid": "2e5cc716-77b0-43ae-95f3-e144e59e98fa",
+      "display_id": 1062,
+      "title": "Make the Rust test suite safe under parallel execution",
+      "description": "Rust 1.98 full all-feature/all-target test execution with four test threads completed compilation in 27.69s but the lib harness failed 48 tests (2610 passed, 1 ignored). Failures show process-global isolation defects: OAuth tests temporarily set umask(0), racing permission/persistence temp roots into mode 0777; grounding/pipeline tests race shared evidence mutation state; permission and environment fixtures use unrelated local locks that do not serialize the shared globals. Keep build concurrency enabled, introduce one canonical scoped process-global test guard or remove ambient globals, then make the suite pass with parallel test threads before raising CI test concurrency. Discovered while fixing runner/toolchain drift in #1061.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T07:18:01.712667919Z",
+      "updated_at": "2026-08-21T07:18:01.712667919Z"
     },
     "2e8a8e18-b837-4932-bc94-54badfbb0c7b": {
       "uuid": "2e8a8e18-b837-4932-bc94-54badfbb0c7b",
@@ -28363,11 +28375,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 586,
       "timestamp": "2026-08-21T06:57:00.977650373Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 587,
+      "timestamp": "2026-08-21T07:18:01.712667919Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T06:57:00.977650373Z",
+    "timestamp": "2026-08-21T07:18:01.712667919Z",
     "agent_id": "6Vw9",
-    "agent_seq": 586
+    "agent_seq": 587
   }
 }
