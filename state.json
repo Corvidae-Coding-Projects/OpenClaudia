@@ -1,6 +1,6 @@
 {
   "next_display_id": 1074,
-  "next_comment_id": 1047,
+  "next_comment_id": 1048,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9200,7 +9200,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T14:07:17.731257893Z",
-      "updated_at": "2026-08-21T14:07:52.063434319Z",
+      "updated_at": "2026-08-21T14:17:12.862503120Z",
       "labels": [
         "remediation"
       ],
@@ -9213,6 +9213,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAIksGB+1SmaESZIgRs7OS7JogeAjAH+hULChCWo/F6qJH17r/ePt5bkWDFhyO2ZdH+AlEf8nfNDphSSpsTu/qDw=="
+        },
+        "675d952a-ef62-4a56-b8b6-52c7be7b9f9c": {
+          "display_id": 1047,
+          "author": "6Vw9",
+          "content": "Preflight confirmed four concrete S-054 defects in current production paths: (1) src/tools/mod.rs and ACP name routing claim memory_save/memory_search, but registry::HANDLERS has no memory handlers; (2) ACP local dispatch always supplies memory_db: None; (3) main/chat/TUI open repository-local .openclaudia/memory.db through MemoryDb::open_for_project rather than a host-owned workspace-keyed authority; (4) prompt::add_memory_items ambiently appends learned preferences and recent session prose to every request. S-054 will preserve legacy archival/session APIs as non-authoritative compatibility data, add strict typed technical-lesson records and bounded tools, move production storage to host-owned workspace identity, reject malformed/partial/future stores before writes, and remove ambient prompt loading.",
+          "created_at": "2026-08-21T14:17:12.860003866Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAufe/75XRDekXPSNg8HGrBSbE+hEQW5QHRwn6Bsza7Bb083SrVs9fsXOGlE92bW9oMY4iz1DaJoAxiDRdHuJUCQ=="
         },
         "8d5aa635-0e0e-4b2a-b9be-4af2a30672e6": {
           "display_id": 1045,
@@ -29802,11 +29811,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 712,
       "timestamp": "2026-08-21T14:07:52.063434319Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 713,
+      "timestamp": "2026-08-21T14:17:12.862503120Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T14:07:52.063434319Z",
+    "timestamp": "2026-08-21T14:17:12.862503120Z",
     "agent_id": "6Vw9",
-    "agent_seq": 712
+    "agent_seq": 713
   }
 }
