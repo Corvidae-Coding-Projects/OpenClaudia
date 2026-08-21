@@ -1,6 +1,6 @@
 {
   "next_display_id": 1060,
-  "next_comment_id": 966,
+  "next_comment_id": 967,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15019,7 +15019,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T03:42:07.329398051Z",
-      "updated_at": "2026-08-21T04:07:37.714125586Z",
+      "updated_at": "2026-08-21T04:11:22.500857910Z",
       "labels": [
         "remediation"
       ],
@@ -15059,6 +15059,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA21eYmGPnxaoDFefnRlLA2gzFjG+X0mWfRxIsI7zj+eyuBvB3ImBkfHsxdNd/1J/le+nevEABKzPYY2MLopQcBg=="
+        },
+        "bb1a9edc-8ef3-4b2c-805a-cefc9670bc4e": {
+          "display_id": 966,
+          "author": "6Vw9",
+          "content": "[action] S-002 historical exporter/checker and root/fuzz locked cargo-deny gates now pass; export deterministically reproduces SHA-256 8b659150... with 3 redactions and 516 retained rows; continuing compile/profile gates.",
+          "created_at": "2026-08-21T04:11:22.498209023Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFHMPRE82DZ6NU7nH0xg16fpuRB877FV2Kh5jUwiTm41kK8Rmjh+EOsH/WMqvux/6dYy5Yy6bL3AuNifDTHWDBA=="
         }
       }
     },
@@ -27994,11 +28003,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 550,
       "timestamp": "2026-08-21T04:11:17.808058147Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 551,
+      "timestamp": "2026-08-21T04:11:22.500857910Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T04:11:17.808058147Z",
+    "timestamp": "2026-08-21T04:11:22.500857910Z",
     "agent_id": "6Vw9",
-    "agent_seq": 550
+    "agent_seq": 551
   }
 }
