@@ -1,6 +1,6 @@
 {
   "next_display_id": 1081,
-  "next_comment_id": 1101,
+  "next_comment_id": 1102,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3296,11 +3296,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T16:01:06.036665411Z",
-      "updated_at": "2026-08-21T21:44:19.340993831Z",
+      "updated_at": "2026-08-21T21:50:04.469657218Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "2c037793-3d91-4a26-b4e8-dcb6aa8256b0": {
+          "display_id": 1101,
+          "author": "6Vw9",
+          "content": "Architecture decision: persist a host-owned signed team authority ledger beside the private workspace memory store. Typed team/workspace/principal/membership identities bind a role, expiry, membership generation, principal public key, and authority key generation. A zeroizing local principal key issues short-lived exact-operation/request grants; validation consumes a grant once and durably appends a bounded causally linked redacted audit before any team disclosure or mutation. Team-key and principal-key rotation invalidate older grants; revocation/downgrade changes the signed authority generation; restart reload validates the full signature chain. Repository config may select only a team ID. Rejected shared-path ACL authority and repository bearer-token alternatives because copied paths/config cannot prove identity, role, workspace, revocation, generation, or replay state. S-104 consumes this contract for encrypted typed-lesson replication; legacy prose/core memory is not promoted.",
+          "created_at": "2026-08-21T21:50:04.467197909Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQMwh35UVCp9HlyTeu9K1hQs4V4KO9CfUA7VOxF7C34aof7F2eC2RSSQBANOQuIS5VfIrEnZFJxC4emmtuRf6BA=="
+        },
         "5eb0d7e5-8b51-4092-a462-609f8567c1f7": {
           "display_id": 1100,
           "author": "6Vw9",
@@ -30848,11 +30857,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 798,
       "timestamp": "2026-08-21T21:44:19.340993831Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 799,
+      "timestamp": "2026-08-21T21:50:04.469657218Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T21:44:19.340993831Z",
+    "timestamp": "2026-08-21T21:50:04.469657218Z",
     "agent_id": "6Vw9",
-    "agent_seq": 798
+    "agent_seq": 799
   }
 }
