@@ -1,6 +1,6 @@
 {
   "next_display_id": 1060,
-  "next_comment_id": 964,
+  "next_comment_id": 965,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15019,11 +15019,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T03:42:07.329398051Z",
-      "updated_at": "2026-08-21T03:48:11.519806288Z",
+      "updated_at": "2026-08-21T03:48:23.142727451Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "1fbb7c6e-2b51-477b-b1fb-3ce9082fda01": {
+          "display_id": 964,
+          "author": "6Vw9",
+          "content": "Architecture decision: keep no raw legacy database/session/bytecode in the current tree. Generate the canonical historical record from the immutable pre-deletion Git blob through a bounded read-only SQLite schema whitelist, stable ordering, explicit secret/path/email redaction, integrity checks, and a retention manifest binding source commit/blob/SHA-256/size to export SHA-256/counts/redaction policy. Repository policy checks use git tracked-path evidence and deterministic fixtures, not prose scanning. Dependency enforcement uses Cargo.lock plus cargo-deny with explicit license/source/advisory/duplicate decisions. Preserve operational browser and syntax-highlight features: browser becomes explicit opt-in with headless_chrome offline protocol and no fetch feature; replace the unmaintained syntect path with maintained tree-sitter-backed highlighting. Rejected alternatives: re-adding the raw database or an opaque encrypted archive, relying only on inaccessible Git history, ignoring RUSTSEC advisories, disabling highlighting, or deleting browser support.",
+          "created_at": "2026-08-21T03:48:23.140260172Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAjZoCkoHTch4TsVmxdhKHIpNuzxAxI+/Emi+XpvkpM2JYrr89+12MGaYOKq8f/eifDz1DswRcuenwcaU5TdZgAA=="
+        },
         "91a32be0-fe3c-4894-a02c-97129543de1f": {
           "display_id": 962,
           "author": "6Vw9",
@@ -27956,11 +27965,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 546,
       "timestamp": "2026-08-21T03:48:11.519806288Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 547,
+      "timestamp": "2026-08-21T03:48:23.142727451Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T03:48:11.519806288Z",
+    "timestamp": "2026-08-21T03:48:23.142727451Z",
     "agent_id": "6Vw9",
-    "agent_seq": 546
+    "agent_seq": 547
   }
 }
