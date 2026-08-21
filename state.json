@@ -1,6 +1,6 @@
 {
   "next_display_id": 1068,
-  "next_comment_id": 1005,
+  "next_comment_id": 1006,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11337,7 +11337,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T07:49:42.777962351Z",
-      "updated_at": "2026-08-21T08:39:24.955111821Z",
+      "updated_at": "2026-08-21T08:40:21.234536164Z",
       "closed_at": "2026-08-21T08:39:24.955106245Z",
       "labels": [
         "remediation"
@@ -11387,6 +11387,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALXTnnqDF06wSTFpWHUvTqIBqFwGzuxUTjruNj7pL5aVwszf66m/eM5Mtw2j4uxoYHdGYmU+J1w2c/1h0D1o1Dg=="
+        },
+        "787b3dbe-3d42-404b-befb-0ec6480f8744": {
+          "display_id": 1005,
+          "author": "6Vw9",
+          "content": "Final delivery consists of signed implementation commit 58fb0455877608e11512027b3715665ef61c8ee7 and signed machine-generated changelog commit b696a66d443346487864896e4d72303c51de75b6. Both signatures verify with the configured SSH signing identity. Issue status remains closed and the worktree is clean.",
+          "created_at": "2026-08-21T08:40:21.232137869Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAnUOOS7GXhFVYKi07TKwjS7i8vEO1VwBE5QTvRAyCIT0o7fkLZARTzH0TSmDQPfv8eaAyCaIHZNHrGVz2enPKDw=="
         },
         "9ae53b18-e122-4373-b31e-ff3717ccb224": {
           "display_id": 997,
@@ -28910,11 +28919,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 633,
       "timestamp": "2026-08-21T08:39:59.001001551Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 634,
+      "timestamp": "2026-08-21T08:40:21.234536164Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T08:39:59.001001551Z",
+    "timestamp": "2026-08-21T08:40:21.234536164Z",
     "agent_id": "6Vw9",
-    "agent_seq": 633
+    "agent_seq": 634
   }
 }
