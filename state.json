@@ -18445,12 +18445,13 @@
       "display_id": 1051,
       "title": "S-005: Replace generic environment-key rewriting",
       "description": "Implement only docs/remediation-slices/005-typed-environment-config-loading.md from common baseline 9194ac26. Preserve scope, adversarially review tests, record receipts and VDD pending, commit but do not close before integration.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:12:36.514810569Z",
-      "updated_at": "2026-08-21T02:55:58.658479020Z",
+      "updated_at": "2026-08-21T02:56:02.716199009Z",
+      "closed_at": "2026-08-21T02:56:02.716197596Z",
       "labels": [
         "remediation"
       ],
@@ -27755,11 +27756,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 526,
       "timestamp": "2026-08-21T02:55:58.658479020Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 527,
+      "timestamp": "2026-08-21T02:56:02.716199009Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T02:55:58.658479020Z",
+    "timestamp": "2026-08-21T02:56:02.716199009Z",
     "agent_id": "6Vw9",
-    "agent_seq": 526
+    "agent_seq": 527
   }
 }
