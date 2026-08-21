@@ -1,6 +1,6 @@
 {
   "next_display_id": 1058,
-  "next_comment_id": 951,
+  "next_comment_id": 952,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13467,7 +13467,7 @@
       "parent_uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T02:26:44.536335025Z",
-      "updated_at": "2026-08-21T02:31:09.125957910Z",
+      "updated_at": "2026-08-21T02:54:15.483250633Z",
       "labels": [
         "defect"
       ],
@@ -13480,6 +13480,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/gvtd3qq6OHK/QR0eWZL480oStN8z/O1ATb8MoWfi7ptIBKlI1qL5qvQn2TPEEy8tO9nR92OkdKRIg2a7JkhDQ=="
+        },
+        "3cd78742-f6ea-4042-b083-c7cb70233990": {
+          "display_id": 951,
+          "author": "6Vw9",
+          "content": "ProjectSourceTreeV2 correction verified on integration head 870cd36d plus the uncommitted three-file fix. Exact artifact SHA-256: src/evidence_freshness.rs 9824187a26e69555cd2d01a53dcc00a76edba193f0788ff0e2c6331043f5b80b; tests/ledger_decision_e2e.rs 23684afe951826dbb7ef3317997bd01fc432c71f304c1f263eb6c4f48c16d770; S-024 record 9383fb1bebbb5a0cf4763351cf177ca1fa4342fd9b77801c6e648d9b1bb5ca10; combined binary diff 117ea7edbef31417cdf25dbb23b0d69baf9ba0a688ec6486c05a4142aacacd84. Verification: fmt and diff checks pass; ledger_decision_e2e 19/19; all four prior-failure clusters green; all-target check pass; strict Clippy -D warnings pass; full locked all-feature/all-target suite exit 0 with 2,653 library tests and all integration/binary targets passing; Windows GNU all-feature/all-target check pass with only pre-existing target-conditional warnings outside these paths. Root .worktrees is gitignored/untracked; nested src/.worktrees remains evidence-bound. Commit identity will be added after signing.",
+          "created_at": "2026-08-21T02:54:15.480456309Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALjgVIJ/OHdUurbmqEm6H+fJEM5EdYjNAVmc2GTJXuK6hs+OFUvQCbshQC0lJTNV5W0I64KqVW3s96tDs4G7aCg=="
         }
       }
     },
@@ -27653,11 +27662,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 517,
       "timestamp": "2026-08-21T02:54:11.323756526Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 518,
+      "timestamp": "2026-08-21T02:54:15.483250633Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T02:54:11.323756526Z",
+    "timestamp": "2026-08-21T02:54:15.483250633Z",
     "agent_id": "6Vw9",
-    "agent_seq": 517
+    "agent_seq": 518
   }
 }
