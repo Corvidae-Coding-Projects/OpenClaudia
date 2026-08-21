@@ -1,6 +1,6 @@
 {
   "next_display_id": 1074,
-  "next_comment_id": 1049,
+  "next_comment_id": 1050,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9200,7 +9200,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T14:07:17.731257893Z",
-      "updated_at": "2026-08-21T14:37:03.544818522Z",
+      "updated_at": "2026-08-21T14:37:08.511198751Z",
       "labels": [
         "remediation"
       ],
@@ -9240,6 +9240,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARxCmu0aHn1XSuDxmEhvQ+rPK9OGvLhRMaVUyudjpCVUv3pi/JskAeyUoBpeE9jqEUJrcQET75xezS2pvZBflDw=="
+        },
+        "f8a77dde-0dde-4fde-8543-b034cc8e8e87": {
+          "display_id": 1049,
+          "author": "6Vw9",
+          "content": "Skeptical preflight found one additional real wiring defect in the in-progress diff: memory_update was registered but omitted from ACP's local tool routing match, and the ACP test fixture lacked the new host-owned store. Both are being corrected before compile. Provider hook repeated the known false positive for fixture text 'fn selected() {}'; that workflow defect remains tracked by #1066 and is not a product stub.",
+          "created_at": "2026-08-21T14:37:08.508777019Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFXffXXnG2zaj+IRsaB+pFal7KndaGvMOZ2Hdn1/T9BB+3W10flRa0xnxSCblonRyXTt+DSOsHqdBYGr0etXTAg=="
         }
       }
     },
@@ -29830,11 +29839,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 714,
       "timestamp": "2026-08-21T14:37:03.544818522Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 715,
+      "timestamp": "2026-08-21T14:37:08.511198751Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T14:37:03.544818522Z",
+    "timestamp": "2026-08-21T14:37:08.511198751Z",
     "agent_id": "6Vw9",
-    "agent_seq": 714
+    "agent_seq": 715
   }
 }
