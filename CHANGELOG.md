@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-006: Rebuild doctor as evidence-safe diagnostics (#1068)
 - S-003: Make fuzz targets side-effect free (#1064)
 - Fix Rust 1.98 strict Clippy runner failures (#1061)
 - S-002: Enforce repository artifact and dependency hygiene (#1059)
