@@ -3287,12 +3287,13 @@
       "display_id": 1074,
       "title": "S-103: Establish authenticated team-memory authority",
       "description": "Implement docs/remediation-slices/103-authenticated-team-memory-authority.md. Replace the rejected shared-path proposal with host-approved team/principal/workspace identities, authenticated membership and roles, secret-safe credentials, revocation/rotation, operation-scoped grants, and bounded redacted audit receipts. A configured filesystem path must never create authority. Replication transport remains S-104.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T16:01:06.036665411Z",
-      "updated_at": "2026-08-21T23:06:32.888424082Z",
+      "updated_at": "2026-08-21T23:06:37.258269482Z",
+      "closed_at": "2026-08-21T23:06:37.258268357Z",
       "labels": [
         "remediation"
       ],
@@ -30995,11 +30996,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 812,
       "timestamp": "2026-08-21T23:06:32.888424082Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 813,
+      "timestamp": "2026-08-21T23:06:37.258269482Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T23:06:32.888424082Z",
+    "timestamp": "2026-08-21T23:06:37.258269482Z",
     "agent_id": "6Vw9",
-    "agent_seq": 812
+    "agent_seq": 813
   }
 }
