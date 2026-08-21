@@ -1,6 +1,6 @@
 {
   "next_display_id": 1069,
-  "next_comment_id": 1016,
+  "next_comment_id": 1017,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22260,7 +22260,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T08:43:37.521619513Z",
-      "updated_at": "2026-08-21T10:02:00.438080461Z",
+      "updated_at": "2026-08-21T10:02:11.934873816Z",
       "labels": [
         "remediation"
       ],
@@ -22309,6 +22309,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAd/wrfBK+tqD0xtlpEKpgjPcY5BPEoo4nEGjvhkd2o/gunkZbthTuUQ/lSnX2puRgn9JhnICkumXRoqTlEnZ3CA=="
+        },
+        "8e3cc5f8-2edd-4456-af5c-9b5ffb56d3ca": {
+          "display_id": 1016,
+          "author": "6Vw9",
+          "content": "Reopened only to commit Crosslink's exact generated closure changelog; no implementation or changelog content is being changed",
+          "created_at": "2026-08-21T10:02:11.932443801Z",
+          "kind": "action",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAf9li0uOEYr6LGTgxIiKY1M6nCBWpMAbgHI25YhAhwjSKjbgjXqfHMA6NU+iUS+7Cr2Bp8xmbkaRX42J22XP3Bw=="
         },
         "a22987a1-8b89-4990-a881-273acacc49a9": {
           "display_id": 1007,
@@ -29120,11 +29129,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 652,
       "timestamp": "2026-08-21T10:02:06.129581020Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 653,
+      "timestamp": "2026-08-21T10:02:11.934873816Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T10:02:06.129581020Z",
+    "timestamp": "2026-08-21T10:02:11.934873816Z",
     "agent_id": "6Vw9",
-    "agent_seq": 652
+    "agent_seq": 653
   }
 }
