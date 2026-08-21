@@ -1,6 +1,6 @@
 {
   "next_display_id": 1073,
-  "next_comment_id": 1033,
+  "next_comment_id": 1034,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9777,10 +9777,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:30:58.895224572Z",
-      "updated_at": "2026-08-21T12:31:03.380291041Z",
+      "updated_at": "2026-08-21T12:34:18.274548184Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "2c7f88ef-d4d3-46f1-afca-756d31ce43b6": {
+          "display_id": 1033,
+          "author": "6Vw9",
+          "content": "Architecture decision for S-053: use an immutable revision DAG keyed by a global logical UUID, not row IDs or equal prose. Every revision carries a monotonic version, parent/record/content/source digests, typed scope/provenance/author, and active/tombstone state. Replica import is idempotent by record digest; a descendant supersedes its ancestor, concurrent branches remain explicit conflict heads, and deterministic projection never deletes either branch. Team Both-writes persist an operation before applying the same revision to both stores and replay pending operations on reopen. Merged reads collapse identical logical revisions, expose conflicts, rank once, and truncate once. Existing row IDs remain compatibility locators only. Rejected alternative: content-hash identity/last-write-wins, because identical text can have different source/scope and timestamps cannot prove causality. S-054 will add strict authority/schema/tool retrieval for typed codebase technical lessons.",
+          "created_at": "2026-08-21T12:34:18.271983553Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAs9B65JdJcvywL5/iM+wvoWfapwkcBtE3oBG54U/1ZX0NgCg5MKF9P6+aFnAjl7WJYEMw5iSkqyjBk315vNG+AA=="
+        }
+      }
     },
     "5edf2191-0411-4d97-aaec-5be8989409ca": {
       "uuid": "5edf2191-0411-4d97-aaec-5be8989409ca",
@@ -29550,11 +29561,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 691,
       "timestamp": "2026-08-21T12:31:08.349642765Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 692,
+      "timestamp": "2026-08-21T12:34:18.274548184Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T12:31:08.349642765Z",
+    "timestamp": "2026-08-21T12:34:18.274548184Z",
     "agent_id": "6Vw9",
-    "agent_seq": 691
+    "agent_seq": 692
   }
 }
