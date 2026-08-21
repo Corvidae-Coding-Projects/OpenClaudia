@@ -28,8 +28,9 @@ pub struct MemoryConfig {
     /// When `Some`, the path is opened (creating it if missing) alongside
     /// the per-user memory database. When `None`, all memory ops remain
     /// scoped to the per-user database. Configurable via either the
-    /// `[memory]` section of `config.yaml` or the `OPENCLAUDIA_MEMORY_TEAM_MEMORY_PATH`
-    /// environment variable.
+    /// `[memory]` section of `config.yaml` or the canonical
+    /// `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` environment variable. The exact
+    /// single-underscore spelling remains a deprecated migration alias.
     #[serde(default)]
     pub team_memory_path: Option<PathBuf>,
 }
