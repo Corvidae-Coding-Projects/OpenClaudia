@@ -10855,11 +10855,12 @@
       "display_id": 1028,
       "title": "Upgrade GitHub Actions off deprecated Node 20 runtimes",
       "description": "GitHub run 32284515796 warns that actions/checkout@v4 targets deprecated Node.js 20 and is being forced onto Node.js 24. Audit .github workflows for Node-20-based action versions, upgrade to supported pinned major/commit versions, and verify pull-request/security workflows without weakening permissions or provenance pinning. Discovered during S-019 publication verification; unrelated to the S-019 artifact.",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T18:05:18.224661965Z",
-      "updated_at": "2026-08-21T06:40:10.907340662Z",
+      "updated_at": "2026-08-21T06:40:14.939974485Z",
+      "closed_at": "2026-08-21T06:40:14.939973194Z",
       "labels": [
         "maintenance"
       ],
@@ -28149,11 +28150,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 562,
       "timestamp": "2026-08-21T06:40:10.907340662Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 563,
+      "timestamp": "2026-08-21T06:40:14.939974485Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T06:40:10.907340662Z",
+    "timestamp": "2026-08-21T06:40:14.939974485Z",
     "agent_id": "6Vw9",
-    "agent_seq": 562
+    "agent_seq": 563
   }
 }
