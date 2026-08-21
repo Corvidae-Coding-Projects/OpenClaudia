@@ -1,6 +1,6 @@
 {
   "next_display_id": 1077,
-  "next_comment_id": 1054,
+  "next_comment_id": 1055,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9218,7 +9218,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T14:07:17.731257893Z",
-      "updated_at": "2026-08-21T16:02:08.611942143Z",
+      "updated_at": "2026-08-21T16:11:42.284099786Z",
       "labels": [
         "remediation"
       ],
@@ -9276,6 +9276,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ82sPVqQKH8jaQ6IWHYroJ+ulQkIxJtVgeFjoqeq1MXnUu79SreCxHsKVw8TJWthtLIfsc/r2bmgI++eYb7/AQ=="
+        },
+        "9a951c43-4f37-4a21-abac-5bb4618b70f0": {
+          "display_id": 1054,
+          "author": "6Vw9",
+          "content": "Adversarial hardening pass fixed three uncovered S-054 faults: host memory directories previously allowed group/world traversal and database mode was implicit; persisted workspace/digest encodings silently normalized uppercase rather than rejecting noncanonical identity; and an oversized tagged projection could stop the scan as ordinary Partial before corrupt-record validation. Unix state is now owner-private (directories 0700/database 0600), noncanonical IDs fail, oversized typed rows are visible errors, and non-Unix production open fails closed pending S-036. New negatives pass in technical_memory_e2e (17/17); memory-focused lib gate passes 107/107; check and strict Clippy pass on Rust 1.98.",
+          "created_at": "2026-08-21T16:11:42.281111485Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAy/sMurOQ3HEo1XhvyZV+phNyeClf+FrQY2/kQuoeRht59LIi/EOWJgFcD5MhPF4fTHpHKWIULyzWbbkVAsNCBA=="
         },
         "a52fafb5-ea32-4bde-bc2b-7db0c62ff92f": {
           "display_id": 1052,
@@ -29978,11 +29987,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 725,
       "timestamp": "2026-08-21T16:02:08.611942143Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 726,
+      "timestamp": "2026-08-21T16:11:42.284099786Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T16:02:08.611942143Z",
+    "timestamp": "2026-08-21T16:11:42.284099786Z",
     "agent_id": "6Vw9",
-    "agent_seq": 725
+    "agent_seq": 726
   }
 }
