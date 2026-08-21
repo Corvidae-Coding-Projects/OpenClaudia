@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1069,
+  "next_display_id": 1070,
   "next_comment_id": 1018,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -288,6 +288,7 @@
     "4a36082e-13b8-437f-b66f-7ee7beb6e37d": 103,
     "4a463d5d-ce25-413a-aa00-e82c9f2d4104": 920,
     "4aba17c7-1b3c-411b-b388-591e7001ab3c": 520,
+    "4b4c1c60-67ab-404b-a810-59728e5b3d54": 1069,
     "4bcc5066-2e6d-42a5-a189-76f3ea0e8b97": 24,
     "4bcd67fd-31b8-4458-a7ba-bda6f686db6b": 321,
     "4c2fb6eb-bcf8-4e95-86a2-ca2d058026fd": 745,
@@ -7999,6 +8000,17 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAip/hIVErwAxCKWlQXDGIMF1QhXcqL9TucK8dRoCSbITKk8QS35BxWzx3mr8hTsZcTGoZqUm8n1GvaubbVCQtCQ=="
         }
       }
+    },
+    "4b4c1c60-67ab-404b-a810-59728e5b3d54": {
+      "uuid": "4b4c1c60-67ab-404b-a810-59728e5b3d54",
+      "display_id": 1069,
+      "title": "Allow generated closure changelog to be committed without reopen/reclose",
+      "description": "Closing an issue generates CHANGELOG.md after releasing its active lock. Strict provider hooks then reject the required git commit because no Crosslink issue is active. Reproduction: select an issue, commit implementation, crosslink issue close ID, then attempt to commit the generated changelog. Current workaround is reopen/select the same issue, commit the unchanged generated output, then close --no-changelog. Required fix: make closure output commit-capable without an unrelated issue or reopen cycle, while preserving exact machine generation, signed-commit gates, and duplicate prevention.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T10:03:51.204175849Z",
+      "updated_at": "2026-08-21T10:03:51.204175849Z"
     },
     "4bcc5066-2e6d-42a5-a189-76f3ea0e8b97": {
       "uuid": "4bcc5066-2e6d-42a5-a189-76f3ea0e8b97",
@@ -29155,11 +29167,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 656,
       "timestamp": "2026-08-21T10:02:36.793815557Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 657,
+      "timestamp": "2026-08-21T10:03:51.204175849Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T10:02:36.793815557Z",
+    "timestamp": "2026-08-21T10:03:51.204175849Z",
     "agent_id": "6Vw9",
-    "agent_seq": 656
+    "agent_seq": 657
   }
 }
