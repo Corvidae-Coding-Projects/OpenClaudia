@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1076,
+  "next_display_id": 1077,
   "next_comment_id": 1052,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -437,6 +437,7 @@
     "6e5d4ff2-0f4d-4a53-ba9e-ab6bb418ab3b": 533,
     "6e91ef5d-5676-43a1-94c2-4fd4abd19332": 366,
     "6eca7e6f-d207-4b09-a3a2-23942f86c6a1": 249,
+    "6f3a8870-85f3-4e48-8084-ae851ec0d118": 1076,
     "6f7f58c3-2918-4d21-8961-9fc431540ce4": 710,
     "706dcde7-cad4-4d11-b9bd-ee4d23d4158f": 1064,
     "716c00c9-1e6b-46a4-8e00-73fb1773aa84": 135,
@@ -11634,6 +11635,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqlkDUoMeM0J4XoUNpCJuDNMb5MXUSmoNsOA7P+xCcClEn689P4w+CwCcIxPSik98fJ4tLvEVlnnoeQFAfx95Dg=="
         }
       }
+    },
+    "6f3a8870-85f3-4e48-8084-ae851ec0d118": {
+      "uuid": "6f3a8870-85f3-4e48-8084-ae851ec0d118",
+      "display_id": 1076,
+      "title": "S-105: Evaluate and improve technical-memory retrieval",
+      "description": "Implement docs/remediation-slices/105-evaluated-technical-memory-retrieval.md. Build artifact-bound held-out evaluations for repository-specific technical lessons and compare bounded lexical, semantic, task-conditioned, hybrid, reranking, diversity, and threshold policies against no-memory/simple baselines. Preserve typed citations, scope, authority, privacy, explicit partial/error states, and resource budgets; retain only mechanisms with measured benefit.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T16:01:36.931436163Z",
+      "updated_at": "2026-08-21T16:01:36.931436163Z"
     },
     "6f7f58c3-2918-4d21-8961-9fc431540ce4": {
       "uuid": "6f7f58c3-2918-4d21-8961-9fc431540ce4",
@@ -29924,11 +29937,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 721,
       "timestamp": "2026-08-21T16:01:26.105853820Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 722,
+      "timestamp": "2026-08-21T16:01:36.931436163Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T16:01:26.105853820Z",
+    "timestamp": "2026-08-21T16:01:36.931436163Z",
     "agent_id": "6Vw9",
-    "agent_seq": 721
+    "agent_seq": 722
   }
 }
