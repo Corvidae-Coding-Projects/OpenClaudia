@@ -230,62 +230,53 @@ pub fn slash_help() {
     println!();
 }
 
-pub fn slash_doctor(run: Option<&openclaudia::tools::ToolRunContext>) {
-    println!("\nRunning diagnostics...\n");
-    print!("  Git... ");
-    match git_command()
-        .and_then(|mut cmd| cmd.args(["--version"]).output().map_err(|e| e.to_string()))
-    {
-        Ok(o) if o.status.success() => {
-            println!("\u{2713} {}", String::from_utf8_lossy(&o.stdout).trim());
-        }
-        _ => println!("\u{2717} not found"),
-    }
-    print!("  Claude Code credentials... ");
-    if openclaudia::claude_credentials::has_claude_code_credentials() {
-        println!("\u{2713} found");
+pub fn slash_doctor(
+    run: Option<&openclaudia::tools::ToolRunContext>,
+    app_config: Option<&openclaudia::config::AppConfig>,
+    composed_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
+) {
+    let report = repl_doctor_report(run, app_config, composed_runtime);
+    print!("{}", report.render_human());
+}
+
+fn repl_doctor_report(
+    run: Option<&openclaudia::tools::ToolRunContext>,
+    app_config: Option<&openclaudia::config::AppConfig>,
+    composed_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
+) -> openclaudia::doctor::DoctorReport {
+    let config_exists = app_config.is_some() || openclaudia::config::config_file_exists();
+    let loaded_config = if app_config.is_none() && config_exists {
+        openclaudia::config::load_config().ok()
     } else {
-        println!("\u{2717} not found (~/.claude/.credentials.json)");
-    }
-    print!("  Config... ");
-    match openclaudia::config::load_config() {
-        Ok(_) => println!("\u{2713} loaded"),
-        Err(e) => println!("\u{2717} {e}"),
-    }
-    print!("  MCP config... ");
-    match run {
-        Some(run) => match project_mcp_server_count_for_run(run) {
-            Ok(Some(count)) => {
-                println!("\u{2713} {count} server(s)");
-            }
-            Ok(None) => println!("\u{00b7} not configured"),
-            Err(error) => println!("\u{2717} {error}"),
-        },
-        None => println!("\u{00b7} unavailable without a run context"),
-    }
-    print!("  Skills... ");
-    let loaded_skills = run.map_or_else(skills::load_global_skills, |run| {
-        skills::load_skills_for_project(run.project_root(), run.working_directory())
+        None
+    };
+    let unavailable_config = if config_exists {
+        openclaudia::doctor::DoctorConfig::Invalid
+    } else {
+        openclaudia::doctor::DoctorConfig::Missing
+    };
+    let config_state = app_config
+        .map(openclaudia::doctor::DoctorConfig::Attached)
+        .or_else(|| {
+            loaded_config
+                .as_ref()
+                .map(openclaudia::doctor::DoctorConfig::LoadedFromSources)
+        })
+        .unwrap_or(unavailable_config);
+    let runtime = composed_runtime.cloned().unwrap_or_else(|| {
+        run.map_or_else(
+            openclaudia::doctor::DoctorRuntimeSnapshot::standalone,
+            |run| {
+                let manager = openclaudia::mcp::registered_manager(run);
+                openclaudia::doctor::DoctorRuntimeSnapshot::from_run_with_mcp(run, manager.as_ref())
+            },
+        )
     });
-    if loaded_skills.is_empty() {
-        println!("\u{00b7} none loaded");
-    } else {
-        println!("\u{2713} {} skill(s)", loaded_skills.len());
-    }
-    print!("  GitHub CLI (gh)... ");
-    match gh_command()
-        .and_then(|mut cmd| cmd.args(["--version"]).output().map_err(|e| e.to_string()))
-    {
-        Ok(o) if o.status.success() => println!(
-            "\u{2713} {}",
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .next()
-                .unwrap_or("installed")
-        ),
-        _ => println!("\u{00b7} not found (optional, for /commit-push-pr)"),
-    }
-    println!();
+    openclaudia::doctor::diagnose(
+        config_state,
+        &runtime,
+        &openclaudia::doctor::DoctorRequest::default(),
+    )
 }
 
 pub fn slash_config(args: &str) {
@@ -1970,11 +1961,12 @@ pub fn handle_slash_command(
     provider: &str,
     current_model: &str,
 ) -> Option<SlashCommandResult> {
-    handle_slash_command_scoped(input, messages, provider, current_model, None)
+    handle_slash_command_scoped(input, messages, provider, current_model, None, None, None)
 }
 
 /// Handle slash commands with one immutable run available to commands that
 /// discover project-owned resources.
+#[cfg(test)]
 pub fn handle_slash_command_for_run(
     input: &str,
     messages: &mut Vec<serde_json::Value>,
@@ -1982,7 +1974,37 @@ pub fn handle_slash_command_for_run(
     current_model: &str,
     run: &openclaudia::tools::ToolRunContext,
 ) -> Option<SlashCommandResult> {
-    handle_slash_command_scoped(input, messages, provider, current_model, Some(run))
+    handle_slash_command_scoped(
+        input,
+        messages,
+        provider,
+        current_model,
+        Some(run),
+        None,
+        None,
+    )
+}
+
+/// Handle slash commands against the exact run and validated configuration
+/// already composed by the production legacy frontend.
+pub fn handle_slash_command_for_runtime(
+    input: &str,
+    messages: &mut Vec<serde_json::Value>,
+    provider: &str,
+    current_model: &str,
+    run: &openclaudia::tools::ToolRunContext,
+    app_config: &openclaudia::config::AppConfig,
+    doctor_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
+) -> Option<SlashCommandResult> {
+    handle_slash_command_scoped(
+        input,
+        messages,
+        provider,
+        current_model,
+        Some(run),
+        Some(app_config),
+        doctor_runtime,
+    )
 }
 
 fn handle_slash_command_scoped(
@@ -1991,6 +2013,8 @@ fn handle_slash_command_scoped(
     provider: &str,
     current_model: &str,
     run_context: Option<&openclaudia::tools::ToolRunContext>,
+    app_config: Option<&openclaudia::config::AppConfig>,
+    doctor_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
 ) -> Option<SlashCommandResult> {
     if !input.starts_with('/') {
         return None;
@@ -2018,6 +2042,8 @@ fn handle_slash_command_scoped(
         provider,
         current_model,
         run_context,
+        app_config,
+        doctor_runtime,
     };
 
     Some(
@@ -3210,7 +3236,8 @@ mod tests {
         gh_bin, git_bin, handle_slash_command, handle_slash_command_for_run, hook_status_lines,
         parse_pinned_git_source, permission_status_lines, plugin_install_dir_for_name,
         project_mcp_server_count_from_str, render_agents_listing, render_plugin_command_prompt,
-        slash_plugin, PinnedGitSource, PinnedGitSourceError, PluginAction, SlashCommandResult,
+        repl_doctor_report, slash_plugin, PinnedGitSource, PinnedGitSourceError, PluginAction,
+        SlashCommandResult,
     };
     use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, PermissionsConfig};
     use openclaudia::plugins::PluginCommand;
@@ -3219,6 +3246,58 @@ mod tests {
     /// Convenience: empty message vec, dummy provider + model.
     fn ctx() -> Vec<serde_json::Value> {
         Vec::new()
+    }
+
+    #[test]
+    fn repl_doctor_uses_attached_config_without_claiming_a_file_read() {
+        let config: openclaudia::config::AppConfig = serde_yaml::from_str(
+            "proxy:\n  port: 8080\n  host: 127.0.0.1\n  target: local\nproviders:\n  local:\n    base_url: http://localhost:1234/v1\n",
+        )
+        .expect("typed test configuration");
+        let (_root, run) = scoped_run();
+        let client = reqwest::Client::new();
+        let adapter = openclaudia::providers::get_adapter("local").expect("local adapter");
+        let plugin_manager =
+            openclaudia::plugins::PluginManager::new_for_project(run.project_root());
+        let runtime = openclaudia::doctor::DoctorRuntimeSnapshot::from_run(&run)
+            .with_composed_provider_transport(&client, adapter)
+            .with_composed_plugin_manager(&plugin_manager);
+        let report = repl_doctor_report(Some(&run), Some(&config), Some(&runtime));
+        let receipt = report
+            .receipts()
+            .iter()
+            .find(|receipt| receipt.check_id() == "configuration")
+            .expect("configuration receipt");
+
+        assert_eq!(receipt.code(), "configuration.attached");
+        assert!(receipt.observed_effects().is_empty());
+        assert_eq!(
+            report
+                .receipts()
+                .iter()
+                .find(|receipt| receipt.check_id() == "runtime.context")
+                .expect("runtime context receipt")
+                .code(),
+            "runtime.context.composed"
+        );
+        assert_eq!(
+            report
+                .receipts()
+                .iter()
+                .find(|receipt| receipt.check_id() == "runtime.provider_transport")
+                .expect("provider transport receipt")
+                .code(),
+            "runtime.provider_transport.composed"
+        );
+        assert_eq!(
+            report
+                .receipts()
+                .iter()
+                .find(|receipt| receipt.check_id() == "runtime.plugins")
+                .expect("plugin receipt")
+                .code(),
+            "runtime.plugins.empty"
+        );
     }
 
     fn scoped_run() -> (

@@ -2888,26 +2888,40 @@ impl App {
 
     /// Handle the `/doctor` slash command (environment diagnostics).
     fn handle_slash_doctor(&mut self) {
-        let skill_count = self.session_skills().len();
-        let checks = [
-            match crate::config::load_config() {
-                Ok(_) => "✓ Config: loaded".to_string(),
-                Err(e) => format!("✗ Config: {e}"),
-            },
-            format!("✓ Provider: {}", self.provider),
-            format!("✓ Model: {}", self.model),
-            format!("✓ Endpoint: {}", self.api_client.endpoint),
-            format!("✓ Skills: {skill_count} loaded"),
-            if self.memory_db.is_some() {
-                "✓ Memory DB: connected".to_string()
-            } else {
-                "✗ Memory DB: not available".to_string()
-            },
-        ];
-        self.messages.add(DisplayMessage::system(format!(
-            "Diagnostics:\n{}",
-            checks.join("\n")
-        )));
+        let mut runtime = self.run_context.as_ref().map_or_else(
+            |_| crate::doctor::DoctorRuntimeSnapshot::live_without_run(),
+            |run| crate::doctor::DoctorRuntimeSnapshot::from_run(run),
+        );
+        if !self.api_client.endpoint.is_empty() {
+            if let Ok(adapter) = crate::providers::get_adapter(&self.provider) {
+                runtime =
+                    runtime.with_composed_provider_transport(&self.api_client.client, adapter);
+            }
+        }
+        if let Some(memory) = self.memory_db.as_deref() {
+            runtime = runtime.with_composed_memory_store(memory);
+        }
+        if let Some(mcp) = self.mcp_runtime.as_ref() {
+            runtime = runtime
+                .with_composed_plugin_manager(mcp.plugin_manager.as_ref())
+                .with_composed_mcp_manager(&mcp.manager);
+        }
+
+        let config_state = self.app_config.as_deref().map_or(
+            crate::doctor::DoctorConfig::Unavailable,
+            crate::doctor::DoctorConfig::Attached,
+        );
+        let report = crate::doctor::diagnose(
+            config_state,
+            &runtime,
+            &crate::doctor::DoctorRequest::default(),
+        );
+        let rendered = if report.validate().is_ok() {
+            report.render_human()
+        } else {
+            "Diagnostics unavailable: typed report validation failed closed.".to_string()
+        };
+        self.messages.add(DisplayMessage::system(rendered));
     }
 
     /// Discover skills through this session's immutable project boundary.
@@ -5047,6 +5061,29 @@ mod tests {
         // Sanity: model/provider stay on App (not migrated into ApiClient).
         assert_eq!(app.model, "test-model");
         assert_eq!(app.provider, "anthropic");
+    }
+
+    #[test]
+    fn tui_doctor_uses_shared_receipts_without_transport_details() {
+        let mut app = App::new("doctor-model-canary", "local");
+        app.api_client.endpoint = "https://doctor-endpoint-canary.invalid".to_string();
+        app.api_client
+            .headers
+            .insert_literal("x-doctor-secret", "doctor-header-canary".to_string())
+            .expect("test header");
+
+        app.handle_slash_doctor();
+
+        let message = app.messages.messages.last().expect("doctor message");
+        assert!(message.content.contains("evidence.registry"));
+        assert!(message.content.contains("runtime.context"));
+        assert!(message.content.contains("runtime.provider_transport"));
+        assert!(message
+            .content
+            .contains("runtime.provider_transport.composed"));
+        assert!(!message.content.contains("doctor-model-canary"));
+        assert!(!message.content.contains("doctor-endpoint-canary"));
+        assert!(!message.content.contains("doctor-header-canary"));
     }
 
     #[test]

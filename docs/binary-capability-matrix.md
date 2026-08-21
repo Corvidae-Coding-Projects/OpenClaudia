@@ -1,4 +1,4 @@
-# Binary Capability Matrix — Registry Generation 1
+# Binary Capability Matrix — Registry Generation 2
 
 Generated from `capabilities/registry.json` after typed evidence validation. Do not edit this table by hand: prose is not readiness evidence. `operational` requires reviewed executable success and failure receipts for every reachable entrypoint; other maturity labels retain their stated limitations.
 
@@ -26,7 +26,8 @@ Generated from `capabilities/registry.json` after typed evidence validation. Do 
 | Iteration loop | `openclaudia loop` | loop | reachable | partial | network request, session mutation, process execution | none — not operational | It uses a separate lifecycle; one iteration counter is not an aggregate budget or durable stop condition. |
 | Iteration loop | `openclaudia loop -n 10` | loop | reachable | partial | network request, session mutation, process execution | none — not operational | It uses a separate lifecycle; one iteration counter is not an aggregate budget or durable stop condition. |
 | Configuration display | `openclaudia config` | config | reachable | partial | filesystem read, credential read | none — not operational | Secret redaction, provenance, duplicate loaders, and unknown-field handling need the typed configuration remediation. |
-| Doctor diagnostics | `openclaudia doctor` | doctor | reachable | unsupported | filesystem read, process execution, network request | none — not operational | Several checks are synthetic or effectful and therefore cannot serve as live capability or release evidence. |
+| Doctor diagnostics | `openclaudia doctor` | doctor | reachable | partial | filesystem read, credential read, network request | none — not operational | Standalone runtime checks remain unavailable, active provider reachability remains disabled until the canonical broker exists, and alternate-model VDD is pending S-088. |
+| Doctor diagnostics | `openclaudia doctor --allow-active provider.reachability` | doctor | reachable | partial | filesystem read, credential read, network request | none — not operational | Standalone runtime checks remain unavailable, active provider reachability remains disabled until the canonical broker exists, and alternate-model VDD is pending S-088. |
 | Repository hook proposals | `openclaudia hooks status` | hooks | reachable | partial | filesystem read, filesystem write, process execution | none — not operational | Per-invocation revocation, extension identity, executable binding, and complete lifecycle admission remain downstream work. |
 | Repository hook proposals | `openclaudia hooks approve <sha256:...>` | hooks | reachable | partial | filesystem read, filesystem write, process execution | none — not operational | Per-invocation revocation, extension identity, executable binding, and complete lifecycle admission remain downstream work. |
 | Repository hook proposals | `openclaudia hooks revoke <sha256:...>` | hooks | reachable | partial | filesystem read, filesystem write, process execution | none — not operational | Per-invocation revocation, extension identity, executable binding, and complete lifecycle admission remain downstream work. |

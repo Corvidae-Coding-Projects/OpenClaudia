@@ -291,7 +291,8 @@ openclaudia acp -m <model>     # ACP with specific model
 openclaudia loop               # Start iteration mode with Stop hooks
 openclaudia loop -n 10         # Max 10 iterations
 openclaudia config             # Show current configuration
-openclaudia doctor             # Run current diagnostics (not release evidence)
+openclaudia doctor             # Run offline, non-mutating typed diagnostics
+openclaudia doctor --json      # Emit machine-readable diagnostic receipts
 openclaudia hooks status       # Review inert repository hook proposals and exact digests
 openclaudia hooks approve <sha256:...>  # Approve one current, digest-bound proposal
 openclaudia hooks revoke <sha256:...>   # Revoke one exact approval receipt

@@ -26,6 +26,10 @@ pub struct SlashCtx<'a> {
     /// Immutable run used for project-bounded commands. Compatibility callers
     /// without one must fail closed to global/user application layers.
     pub run_context: Option<&'a openclaudia::tools::ToolRunContext>,
+    /// Already-validated configuration from the real frontend composition.
+    pub app_config: Option<&'a openclaudia::config::AppConfig>,
+    /// Exact service snapshot supplied by a composed frontend for `/doctor`.
+    pub doctor_runtime: Option<&'a openclaudia::doctor::DoctorRuntimeSnapshot>,
 }
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
@@ -524,7 +528,7 @@ impl CommandHandler for DoctorCommand {
         "doctor"
     }
     fn handle(&self, ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
-        slash_doctor(ctx.run_context);
+        slash_doctor(ctx.run_context, ctx.app_config, ctx.doctor_runtime);
         SlashCommandResult::Handled
     }
 }

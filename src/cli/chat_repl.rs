@@ -30,7 +30,7 @@ use crate::cli::repl::session_io::{
     save_session_to_short_term_memory,
 };
 use crate::cli::repl::slash::{
-    handle_activity_command, handle_memory_command, handle_slash_command_for_run,
+    handle_activity_command, handle_memory_command, handle_slash_command_for_runtime,
     PluginActionOutcome, PluginActionRunner, PluginCommandInvocation, SkillInvocation,
     SlashCommandResult,
 };
@@ -872,13 +872,28 @@ impl ChatRepl {
         input: &mut String,
         memory_db: Option<&memory::MemoryDb>,
     ) -> SlashOutcome {
+        let doctor_runtime = input.trim().eq_ignore_ascii_case("/doctor").then(|| {
+            let manager = openclaudia::mcp::registered_manager(&self.run_context);
+            let mut snapshot = openclaudia::doctor::DoctorRuntimeSnapshot::from_run_with_mcp(
+                &self.run_context,
+                manager.as_ref(),
+            )
+            .with_composed_provider_transport(&self.client, self.adapter)
+            .with_composed_plugin_manager(&self.plugin_manager);
+            if let Some(store) = memory_db {
+                snapshot = snapshot.with_composed_memory_store(store);
+            }
+            snapshot
+        });
         let result = self.chat_session.update_messages(|messages| {
-            handle_slash_command_for_run(
+            handle_slash_command_for_runtime(
                 input,
                 messages,
                 &self.config.proxy.target,
                 &self.model,
                 &self.run_context,
+                &self.config,
+                doctor_runtime.as_ref(),
             )
         });
         let Some(result) = result else {

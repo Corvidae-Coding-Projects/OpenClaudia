@@ -2762,6 +2762,23 @@ impl McpManager {
         self.servers.lock().await.len()
     }
 
+    /// Non-blocking, read-only snapshot for synchronous health reporting.
+    ///
+    /// Returns `None` while another operation owns the server map rather than
+    /// blocking a frontend or fabricating an empty manager. The tuple is
+    /// `(registered, live)` and never starts, reconnects, or contacts a server.
+    #[must_use]
+    pub fn try_health_counts(&self) -> Option<(usize, usize)> {
+        let servers = self.servers.try_lock().ok()?;
+        let registered = servers.len();
+        let live = servers
+            .values()
+            .filter(|entry| entry.server.is_some())
+            .count();
+        drop(servers);
+        Some((registered, live))
+    }
+
     /// Whether a server is registered. True does NOT guarantee live;
     /// use [`Self::is_live`] for that.
     pub async fn is_connected(&self, name: &str) -> bool {
@@ -2829,6 +2846,7 @@ mod tests {
     #[tokio::test]
     async fn test_mcp_manager_new() {
         let manager = McpManager::new(Arc::clone(test_run()));
+        assert_eq!(manager.try_health_counts(), Some((0, 0)));
         assert_eq!(manager.server_count().await, 0);
     }
 

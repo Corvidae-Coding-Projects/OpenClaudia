@@ -172,8 +172,16 @@ enum Commands {
     /// Show current configuration
     Config,
 
-    /// Check configuration and connectivity
-    Doctor,
+    /// Emit evidence-safe configuration and runtime diagnostics
+    Doctor {
+        /// Emit the typed receipt envelope as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Grant one exact active diagnostic check (repeatable)
+        #[arg(long = "allow-active", value_name = "CHECK_ID")]
+        allow_active: Vec<String>,
+    },
 
     /// Review, approve, or revoke repository hook imports
     Hooks {
@@ -279,11 +287,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // A writable frontend may start only after every required persistent
-    // store reaches a known, current state. Recovery diagnostics contain
-    // stable codes and actions but never persisted paths or bytes.
-    openclaudia::migrations::run_startup()
-        .into_writable()
-        .map_err(anyhow::Error::new)?;
+    // store reaches a known, current state. Evidence-safe doctor is the sole
+    // exception: it must not acquire a migration lock, repair data, or publish
+    // a marker merely to report that runtime migration evidence is unavailable.
+    if command_requires_writable_startup(cli.command.as_ref()) {
+        openclaudia::migrations::run_startup()
+            .into_writable()
+            .map_err(anyhow::Error::new)?;
+    }
 
     let agent_capable_surface = cli.print.is_some()
         || matches!(
@@ -352,7 +363,9 @@ async fn main() -> anyhow::Result<()> {
             cli::commands::start::cmd_start(port, host, target.or(cli.target)).await
         }
         Some(Commands::Config) => cli::commands::config_cmd::cmd_config(),
-        Some(Commands::Doctor) => cli::commands::doctor::cmd_doctor().await,
+        Some(Commands::Doctor { json, allow_active }) => {
+            cli::commands::doctor::cmd_doctor(json, &allow_active)
+        }
         Some(Commands::Hooks { command }) => match command.unwrap_or(HookCommands::Status) {
             HookCommands::Status => {
                 cli::commands::hooks::cmd_hooks_status();
@@ -446,11 +459,15 @@ const fn subcommand_name(command: &Commands) -> &'static str {
         Commands::Auth { .. } => "auth",
         Commands::Start { .. } => "start",
         Commands::Config => "config",
-        Commands::Doctor => "doctor",
+        Commands::Doctor { .. } => "doctor",
         Commands::Hooks { .. } => "hooks",
         Commands::Acp { .. } => "acp",
         Commands::Loop { .. } => "loop",
     }
+}
+
+const fn command_requires_writable_startup(command: Option<&Commands>) -> bool {
+    !matches!(command, Some(Commands::Doctor { .. }))
 }
 
 /// Full-screen TUI mode (default when no subcommand).
@@ -2535,6 +2552,18 @@ mod tests {
         };
 
         assert!(!should_redirect_tui_logs(&cli));
+    }
+
+    #[test]
+    fn only_doctor_bypasses_writable_startup_migrations() {
+        assert!(!command_requires_writable_startup(Some(
+            &Commands::Doctor {
+                json: true,
+                allow_active: Vec::new(),
+            }
+        )));
+        assert!(command_requires_writable_startup(Some(&Commands::Config)));
+        assert!(command_requires_writable_startup(None));
     }
 
     #[test]

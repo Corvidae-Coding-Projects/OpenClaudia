@@ -20,6 +20,7 @@ pub mod config;
 pub mod context;
 pub mod coordinator;
 pub mod decision;
+pub mod doctor;
 pub mod evidence;
 mod evidence_freshness;
 pub mod file_error;

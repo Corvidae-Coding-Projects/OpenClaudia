@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generation": 1,
+  "generation": 2,
   "capabilities": [
     {
       "id": "interactive-tui",
@@ -198,16 +198,17 @@
       "id": "doctor-diagnostics",
       "display_name": "Doctor diagnostics",
       "visibility": "user_facing",
-      "maturity": "unsupported",
-      "summary": "Runs the current diagnostic command.",
-      "limitation": "Several checks are synthetic or effectful and therefore cannot serve as live capability or release evidence.",
+      "maturity": "partial",
+      "summary": "Emits typed, redacted, effect-declared evidence over static state or a real frontend composition.",
+      "limitation": "Standalone runtime checks remain unavailable, active provider reachability remains disabled until the canonical broker exists, and alternate-model VDD is pending S-088.",
       "entrypoints": [
-        { "id": "doctor.default", "kind": "doctor", "invocation": "openclaudia doctor", "reachability": "reachable", "required_failure_modes": [] }
+        { "id": "doctor.default", "kind": "doctor", "invocation": "openclaudia doctor", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "doctor.active", "kind": "doctor", "invocation": "openclaudia doctor --allow-active provider.reachability", "reachability": "reachable", "required_failure_modes": [] }
       ],
       "required_effects": [
-        { "id": "doctor.read", "kind": "filesystem_read", "expectation": "may_occur", "description": "Diagnostics inspect local state." },
-        { "id": "doctor.process", "kind": "process_execution", "expectation": "may_occur", "description": "Some diagnostics probe local programs." },
-        { "id": "doctor.network", "kind": "network_request", "expectation": "may_occur", "description": "Current active probes can contact providers." }
+        { "id": "doctor.read", "kind": "filesystem_read", "expectation": "may_occur", "description": "Read-only diagnostics can inspect typed local configuration." },
+        { "id": "doctor.credentials", "kind": "credential_read", "expectation": "may_occur", "description": "Configuration validation can inspect redacted credential-bearing values without refreshing foreign stores." },
+        { "id": "doctor.network", "kind": "network_request", "expectation": "may_occur", "description": "A future active provider probe requires an exact grant and canonical broker; the current generation records it as skipped." }
       ],
       "evidence_ids": []
     },
@@ -262,8 +263,8 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-render-success",
       "coverage": { "kind": "success" },
-      "corpus_sha256": "sha256:1f8b05b210fe641ebdfcce22b4af7fe20570e6b88ca1dee037ccd1182ab31304",
-      "quality_review_id": "capability-corpus-review-v1",
+      "corpus_sha256": "sha256:0a3e910522c1db0ec54472ffa727d5630337516ef13d26062fcf7c4183bc7c6e",
+      "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {
         "envelope": {
@@ -281,9 +282,9 @@
         "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a"
       },
       "receipts": [
-        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:bb78a5cd2415ac5df9045668b1a9e403132d7f8841c24a8ee5b2b99f5a8d28c4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
-        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:bb78a5cd2415ac5df9045668b1a9e403132d7f8841c24a8ee5b2b99f5a8d28c4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
-        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:bb78a5cd2415ac5df9045668b1a9e403132d7f8841c24a8ee5b2b99f5a8d28c4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" }
+        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:baa1cd765448ca33cf10e9f031e4100a725ff7f902317a548deba0f2017f6627", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
+        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:baa1cd765448ca33cf10e9f031e4100a725ff7f902317a548deba0f2017f6627", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
+        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:baa1cd765448ca33cf10e9f031e4100a725ff7f902317a548deba0f2017f6627", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" }
       ]
     },
     {
@@ -292,8 +293,8 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-rejects-docs-only",
       "coverage": { "kind": "failure", "failure_mode": "documentation_only_claim" },
-      "corpus_sha256": "sha256:1f8b05b210fe641ebdfcce22b4af7fe20570e6b88ca1dee037ccd1182ab31304",
-      "quality_review_id": "capability-corpus-review-v1",
+      "corpus_sha256": "sha256:0a3e910522c1db0ec54472ffa727d5630337516ef13d26062fcf7c4183bc7c6e",
+      "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {
         "envelope": {
@@ -321,8 +322,8 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-rejects-missing-failure-evidence",
       "coverage": { "kind": "failure", "failure_mode": "missing_failure_evidence" },
-      "corpus_sha256": "sha256:1f8b05b210fe641ebdfcce22b4af7fe20570e6b88ca1dee037ccd1182ab31304",
-      "quality_review_id": "capability-corpus-review-v1",
+      "corpus_sha256": "sha256:0a3e910522c1db0ec54472ffa727d5630337516ef13d26062fcf7c4183bc7c6e",
+      "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {
         "envelope": {
