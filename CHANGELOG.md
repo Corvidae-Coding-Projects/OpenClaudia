@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-106: Bind technical-memory review to host approval (#1078)
 - S-056: Complete typed technical-memory source lifecycle (#1077)
 - S-054: Make memory typed, untrusted technical lessons with retrieval (#1073)
 - S-053: Give memory stable identity and merge semantics (#1072)
