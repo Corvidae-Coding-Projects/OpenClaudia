@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1073,
+  "next_display_id": 1074,
   "next_comment_id": 1045,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -341,6 +341,7 @@
     "5a31067e-f09d-41b1-a5b9-1598147f862c": 932,
     "5a42438a-14c7-496a-a1be-4d4a84175d6c": 665,
     "5ab41d6d-bd5d-407f-b9d2-8a5208b56d68": 51,
+    "5ac506bb-8502-40a4-a979-ad2960f0e4cb": 1073,
     "5b072c3e-0beb-4e95-9473-d3b349860613": 149,
     "5b5fc7e4-0ab1-4a99-82d1-3edb18128ea8": 342,
     "5be039a4-4605-4e9c-ab6e-250b57683636": 273,
@@ -9188,6 +9189,18 @@
       "labels": [
         "feature"
       ]
+    },
+    "5ac506bb-8502-40a4-a979-ad2960f0e4cb": {
+      "uuid": "5ac506bb-8502-40a4-a979-ad2960f0e4cb",
+      "display_id": 1073,
+      "title": "S-054: Make memory typed, untrusted technical lessons with retrieval",
+      "description": "Implement docs/remediation-slices/054-memory-authority-and-schema.md after S-053. Memory is a repository-specific technical-lesson system, not prose/transcript capture: define strict versioned lesson/evidence/citation/applicability/retention/correction schemas; keep private storage host-owned and project/team/imported data untrusted; reject corrupt/partial/future stores without mutation; retrieve bounded cited lessons explicitly through a canonical typed tool in every supported frontend; prevent memory from becoming system/developer instructions; keep inferred promotion for S-055 and MEMORY.md lifecycle for S-056.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T14:07:17.731257893Z",
+      "updated_at": "2026-08-21T14:07:17.731257893Z"
     },
     "5b072c3e-0beb-4e95-9473-d3b349860613": {
       "uuid": "5b072c3e-0beb-4e95-9473-d3b349860613",
@@ -29736,11 +29749,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 706,
       "timestamp": "2026-08-21T14:06:07.214582226Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 707,
+      "timestamp": "2026-08-21T14:07:17.731257893Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T14:06:07.214582226Z",
+    "timestamp": "2026-08-21T14:07:17.731257893Z",
     "agent_id": "6Vw9",
-    "agent_seq": 706
+    "agent_seq": 707
   }
 }
