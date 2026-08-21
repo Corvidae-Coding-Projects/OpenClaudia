@@ -1,6 +1,6 @@
 {
   "next_display_id": 1073,
-  "next_comment_id": 1043,
+  "next_comment_id": 1044,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8070,11 +8070,20 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T10:03:51.204175849Z",
-      "updated_at": "2026-08-21T10:04:53.862771103Z",
+      "updated_at": "2026-08-21T14:05:43.488112367Z",
       "labels": [
         "workflow"
       ],
       "comments": {
+        "77c9d384-adb5-4147-bbca-c2ae4e35f835": {
+          "display_id": 1043,
+          "author": "6Vw9",
+          "content": "Preserve the exact machine-generated CHANGELOG.md line emitted by closing completed child #1072 in a standalone signed documentation commit, without hand editing or mixing it into implementation history; then return the session to umbrella #1071.",
+          "created_at": "2026-08-21T14:05:43.485762534Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAoKU3G9IIgLuPbKafhBzJG6TZzKyDHqxojS0MiXh9BCnBAQuSbOxOCXyYWBqcK4aN5RY/+G0+U0KFp6pq4turBw=="
+        },
         "be001fd5-4810-40af-927c-7b762dc30bb9": {
           "display_id": 1018,
           "author": "6Vw9",
@@ -29708,11 +29717,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 704,
       "timestamp": "2026-08-21T14:05:38.991346766Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 705,
+      "timestamp": "2026-08-21T14:05:43.488112367Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T14:05:38.991346766Z",
+    "timestamp": "2026-08-21T14:05:43.488112367Z",
     "agent_id": "6Vw9",
-    "agent_seq": 704
+    "agent_seq": 705
   }
 }
