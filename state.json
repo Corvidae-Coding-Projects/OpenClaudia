@@ -1,6 +1,6 @@
 {
   "next_display_id": 1058,
-  "next_comment_id": 958,
+  "next_comment_id": 959,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13277,7 +13277,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-20T22:09:48.149662321Z",
-      "updated_at": "2026-08-21T02:57:44.634422953Z",
+      "updated_at": "2026-08-21T02:57:54.055791675Z",
       "labels": [
         "orchestration"
       ],
@@ -13329,6 +13329,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkHbFkBDkDWh0hgeddaKASDXVUh74aLKKxjzXKly55yxe8Xc0bIEsbfC2yC8AemIBlNxhOiK/VIXhsdYa++JNAA=="
+        },
+        "afafbaa7-2090-4c6f-8743-a2e851a6a87a": {
+          "display_id": 958,
+          "author": "6Vw9",
+          "content": "Provider commit gate requires an active issue, but the first close cleared #1048 before its generated CHANGELOG.md output could be committed. Reopened only to bind the unchanged machine output to the parent tracking commit; after the signed commit, re-close with --no-changelog because the canonical parent entry already exists in that output.",
+          "created_at": "2026-08-21T02:57:54.053323882Z",
+          "kind": "intervention",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9jLhfnxW/KRYaAOeexfraH4L4fRqethYbr4cqxypH4wgJIgSGlYSD+7Ij9IJOQSy0ZncOIoolAtZPN9SG0wJDA=="
         },
         "c1e67d8d-861b-42ec-a416-91bcc2e58977": {
           "display_id": 957,
@@ -27794,11 +27803,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 531,
       "timestamp": "2026-08-21T02:57:49.600076699Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 532,
+      "timestamp": "2026-08-21T02:57:54.055791675Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T02:57:49.600076699Z",
+    "timestamp": "2026-08-21T02:57:54.055791675Z",
     "agent_id": "6Vw9",
-    "agent_seq": 531
+    "agent_seq": 532
   }
 }
