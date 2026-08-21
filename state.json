@@ -1,6 +1,6 @@
 {
   "next_display_id": 1081,
-  "next_comment_id": 1095,
+  "next_comment_id": 1096,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8251,11 +8251,20 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T10:03:51.204175849Z",
-      "updated_at": "2026-08-21T14:06:07.214582226Z",
+      "updated_at": "2026-08-21T21:43:09.040621227Z",
       "labels": [
         "workflow"
       ],
       "comments": {
+        "0df530cc-5bca-4734-a7d3-a76cdb025cdf": {
+          "display_id": 1095,
+          "author": "6Vw9",
+          "content": "Reproduced after closing #1080: Crosslink generated the exact CHANGELOG line, then the commit hook rejected the separate changelog commit because the session still targeted the now-closed issue. No commit was created and the generated line remained staged unchanged; proceeding under the open umbrella #1071 as the existing safe workaround.",
+          "created_at": "2026-08-21T21:43:09.037914509Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAIiAhl5oyRmRI53LCGaRL2tdJlJZbp8oPE5NtbDWvg8O6AP1v85nAH/vxfMV8SncEjmenOEbMyTLvB0IV69B1Cw=="
+        },
         "77c9d384-adb5-4147-bbca-c2ae4e35f835": {
           "display_id": 1043,
           "author": "6Vw9",
@@ -30753,11 +30762,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 791,
       "timestamp": "2026-08-21T21:42:41.287358514Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 792,
+      "timestamp": "2026-08-21T21:43:09.040621227Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T21:42:41.287358514Z",
+    "timestamp": "2026-08-21T21:43:09.040621227Z",
     "agent_id": "6Vw9",
-    "agent_seq": 791
+    "agent_seq": 792
   }
 }
