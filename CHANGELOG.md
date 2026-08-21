@@ -171,6 +171,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-002: Enforce repository artifact and dependency hygiene (#1059)
+- Upgrade GitHub Actions off deprecated Node 20 runtimes (#1028)
 - Parallel remediation wave: S-001, S-004, and S-005 (#1048)
 - S-005: Replace generic environment-key rewriting (#1051)
 - S-004: Make startup migrations fail closed (#1050)
