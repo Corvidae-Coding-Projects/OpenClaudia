@@ -25179,11 +25179,12 @@
       "display_id": 1061,
       "title": "Fix Rust 1.98 strict Clippy runner failures",
       "description": "GitHub Actions run 32455955975 fails the Linux strict Clippy gate under Rust 1.98.0 on two diagnostics: src/coordinator/teammate.rs AgentColor::for_index can be const, and src/secrets.rs SensitiveHeaders::contains_name manually converts Result to Option before is_some_and. Apply source-level MSRV-compatible repairs, verify focused behavior on Rust 1.91, reproduce/clear strict Clippy on Rust 1.98, preserve all-features CI semantics, then close with generated changelog output.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T06:56:56.207726032Z",
-      "updated_at": "2026-08-21T07:24:20.920566483Z",
+      "updated_at": "2026-08-21T07:24:33.021063572Z",
+      "closed_at": "2026-08-21T07:24:33.021062250Z",
       "comments": {
         "41ed848a-4c56-4acb-87b9-73f9e9fdf1b0": {
           "display_id": 983,
@@ -28452,11 +28453,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 592,
       "timestamp": "2026-08-21T07:24:20.920566483Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 593,
+      "timestamp": "2026-08-21T07:24:33.021063572Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T07:24:20.920566483Z",
+    "timestamp": "2026-08-21T07:24:33.021063572Z",
     "agent_id": "6Vw9",
-    "agent_seq": 592
+    "agent_seq": 593
   }
 }
