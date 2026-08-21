@@ -1,6 +1,6 @@
 {
   "next_display_id": 1080,
-  "next_comment_id": 1076,
+  "next_comment_id": 1077,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -2290,7 +2290,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T18:03:37.187217446Z",
-      "updated_at": "2026-08-21T18:28:48.757105592Z",
+      "updated_at": "2026-08-21T19:38:09.288191594Z",
       "labels": [
         "remediation"
       ],
@@ -2303,6 +2303,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAb7+u/L4f8KMq2LlCmEJszmdJ/xT5RsUtlLipgd73vrvTR5t50dHvwdTar6VyzJ6wLKwtYPznKUT9FUlfLNuOAQ=="
+        },
+        "38cf1116-3b07-48e2-86fd-be0ef2d9bdaa": {
+          "display_id": 1076,
+          "author": "6Vw9",
+          "content": "S-106 implementation and adversarial pre-commit review complete. Added opaque consumed execution permits and self-bound HostApprovalEvidence; fresh one-use host-only review/revoke; exact call/run/workspace/generation bindings; immediate SQLite CAS publishing causal successor plus immutable audit; reopen validation; generic revision bypass rejection; retention/correction/deletion authority reset; canonical memory_review registry/executor routing. Interactive chat/TUI can approve once; ACP routes but fails closed pending S-090/S-091 authentication; print advertises no tools; subagents cannot manufacture host authority. Review corrections: removed run ID from reusable scopes, bound it only to ephemeral permits; added full evidence digest; bound DB workspace to approval; blocked raw authority injection; typed forged evidence as ReviewApprovalInvalid; corrected frontend documentation. Verification on Rust 1.98.0/CARGO_BUILD_JOBS=4: fmt check PASS; all-feature/all-target check PASS; strict Clippy -D warnings PASS; focused review 9/9 and canonical E2E 7/7 PASS; complete all-feature/all-target suite PASS (library 2694 tests plus all integration binaries; integration_tests 131 pass/2 network ignored); Windows GNU all-feature/all-target check PASS. Slice index validates 107 contiguous slices and 286 acyclic dependency edges. Rust/test artifact manifest SHA-256 5ce5c478429a0ce5f7078fd6f22af107b9f0013a847dca1840c2577ff1084ccc; slice doc SHA-256 5f5802f20503716c4c80b405dbca8ebf15f29267e3fe71f6b7b976ba10c23b5c. Canonical alternate-model VDD remains explicitly pending S-088; portable export/import is preserved in S-107/#1079.",
+          "created_at": "2026-08-21T19:38:09.284603212Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOQFqB9BZRS90rdNN/1o6j3vhF3+Bc03nf53ahJ+IU5CINjUfiameaDDElH25bzEXJShqGnD55Ajud+OJVPHaDA=="
         },
         "9701fee4-6bb9-4e78-88f5-05f7431bf2c0": {
           "display_id": 1067,
@@ -30420,11 +30429,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 762,
       "timestamp": "2026-08-21T18:28:53.109400177Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 763,
+      "timestamp": "2026-08-21T19:38:09.288191594Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T18:28:53.109400177Z",
+    "timestamp": "2026-08-21T19:38:09.288191594Z",
     "agent_id": "6Vw9",
-    "agent_seq": 762
+    "agent_seq": 763
   }
 }
