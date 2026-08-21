@@ -12621,12 +12621,13 @@
       "display_id": 1077,
       "title": "S-056: Complete typed technical-memory source lifecycle",
       "description": "Implement docs/remediation-slices/056-operational-memdir-lifecycle.md after S-054. Treat repository memory files only as untrusted, versioned sources of strict codebase TechnicalLesson candidates: descriptor-safe bounded discovery, file identity/digest/citations, explicit refresh/import/delete/rename/conflict outcomes and user controls, no ambient prompt concatenation or free-form prose authority, and retrieval only through the canonical memory tools. Preserve every intended capability while wiring it through host-owned workspace memory.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T16:51:47.731752120Z",
-      "updated_at": "2026-08-21T18:19:20.877195273Z",
+      "updated_at": "2026-08-21T18:19:32.685289794Z",
+      "closed_at": "2026-08-21T18:19:32.685288606Z",
       "labels": [
         "remediation"
       ],
@@ -30315,11 +30316,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 752,
       "timestamp": "2026-08-21T18:19:20.877195273Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 753,
+      "timestamp": "2026-08-21T18:19:32.685289794Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T18:19:20.877195273Z",
+    "timestamp": "2026-08-21T18:19:32.685289794Z",
     "agent_id": "6Vw9",
-    "agent_seq": 752
+    "agent_seq": 753
   }
 }
