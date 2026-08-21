@@ -1,6 +1,6 @@
 {
   "next_display_id": 1069,
-  "next_comment_id": 1015,
+  "next_comment_id": 1016,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22260,7 +22260,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T08:43:37.521619513Z",
-      "updated_at": "2026-08-21T10:00:41.910948297Z",
+      "updated_at": "2026-08-21T10:01:20.393342522Z",
       "labels": [
         "remediation"
       ],
@@ -22273,6 +22273,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVJRqzGKMJ7cni9X8zdRDUDltpZM4rS/y/RHBrjzL/ttgrXuVU3qss79dVt3WVXbr+Q0nUgsfBwA4ZQzQ10IEBA=="
+        },
+        "1bdabcfe-098b-46d7-aa77-5e289d72526e": {
+          "display_id": 1015,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 6fcb1bf5 (refactor(doctor): add evidence-safe diagnostics). Signature verified for ED25519 SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A. Exact scope: 16 S-006 files, 2386 insertions/824 deletions, including the 1677-line typed doctor contract, all frontend wiring, capability generation 2, adversarial tests, and durable slice evidence.",
+          "created_at": "2026-08-21T10:01:20.390755076Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ82YdYuHnMYxosNecQpLn5aHDz5Dc0upqgEt2RxDUCko9elR/a5tboJPPEFUM+ksV46zy31VIOTC3bCPq4DwBQ=="
         },
         "3c150022-da5e-4fb3-aae0-2c6865f966cf": {
           "display_id": 1013,
@@ -29086,11 +29095,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 647,
       "timestamp": "2026-08-21T10:00:41.910948297Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 648,
+      "timestamp": "2026-08-21T10:01:20.393342522Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T10:00:41.910948297Z",
+    "timestamp": "2026-08-21T10:01:20.393342522Z",
     "agent_id": "6Vw9",
-    "agent_seq": 647
+    "agent_seq": 648
   }
 }
