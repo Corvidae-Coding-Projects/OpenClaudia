@@ -987,10 +987,6 @@
     "ff2170c9-4fd0-4648-ac71-f2a3b0ef0d5f": 602
   },
   "locks": {
-    "1048": {
-      "agent_id": "6Vw9",
-      "claimed_at": "2026-08-21T02:57:49.600076699Z"
-    },
     "1049": {
       "agent_id": "s001-wave",
       "claimed_at": "2026-08-20T22:15:29.576667905Z"
@@ -27828,11 +27824,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 534,
       "timestamp": "2026-08-21T02:58:14.474534378Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 535,
+      "timestamp": "2026-08-21T02:58:18.611999765Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T02:58:14.474534378Z",
+    "timestamp": "2026-08-21T02:58:18.611999765Z",
     "agent_id": "6Vw9",
-    "agent_seq": 534
+    "agent_seq": 535
   }
 }
