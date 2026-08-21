@@ -264,6 +264,7 @@ enum ConfigField {
     PermissionsEnabled,
     PermissionsDefaultAllow,
     PermissionsMcp,
+    MemoryTeamId,
     MemoryTeamMemoryPath,
     WebFetchDistillationEnabled,
     WebFetchMaxDistillationBytes,
@@ -766,6 +767,15 @@ const APP_FIELDS: &[FieldDefinition] = &[
         "OPENCLAUDIA_PERMISSIONS_MCP",
         JsonStringListMap,
         Sensitive,
+        true
+    ),
+    field!(
+        ConfigField::MemoryTeamId,
+        "memory.team_id",
+        "OPENCLAUDIA_MEMORY__TEAM_ID",
+        "OPENCLAUDIA_MEMORY_TEAM_ID",
+        String,
+        Public,
         true
     ),
     field!(
@@ -1889,6 +1899,16 @@ fn apply_value(
                 &invalid,
             )?;
         }
+        ConfigField::MemoryTeamId => {
+            config.memory.team_id = Some(expect_value!(String).parse().map_err(
+                |error: crate::team_memory::TeamAuthorityError| {
+                    invalid(
+                        "a strict team-<32 lowercase hex> identity",
+                        error.to_string(),
+                    )
+                },
+            )?);
+        }
         ConfigField::MemoryTeamMemoryPath => {
             config.memory.team_memory_path = Some(expect_value!(String).into());
         }
@@ -2418,9 +2438,10 @@ mod tests {
             | ConfigField::VddAdversaryProvider
             | ConfigField::VddAdversaryModel
             | ConfigField::VddTrackingPath
-            | ConfigField::MemoryTeamMemoryPath
             | ConfigField::WebFetchDistillationProvider
-            | ConfigField::WebFetchDistillationModel => "typed-env-value",
+            | ConfigField::WebFetchDistillationModel
+            | ConfigField::MemoryTeamMemoryPath => "typed-env-value",
+            ConfigField::MemoryTeamId => "team-0123456789abcdef0123456789abcdef",
             ConfigField::SessionTokenTrackingWarnThreshold
             | ConfigField::VddAdversaryTemperature
             | ConfigField::VddThresholdsFalsePositiveRate => "0.25",
@@ -2721,6 +2742,14 @@ mod tests {
                 assert_eq!(config.permissions.mcp.len(), 1);
                 assert_eq!(config.permissions.mcp["typed-server"], ["typed-tool"]);
             }
+            ConfigField::MemoryTeamId => assert_eq!(
+                config
+                    .memory
+                    .team_id
+                    .as_ref()
+                    .map(crate::team_memory::TeamId::as_str),
+                Some("team-0123456789abcdef0123456789abcdef")
+            ),
             ConfigField::MemoryTeamMemoryPath => assert_eq!(
                 config.memory.team_memory_path.as_deref(),
                 Some(std::path::Path::new("typed-env-value"))
@@ -2881,6 +2910,7 @@ permissions:
   mcp:
     file-server: ["file-tool"]
 memory:
+  team_id: team-fedcba9876543210fedcba9876543210
   team_memory_path: file-memory
 web_fetch:
   distillation_enabled: false

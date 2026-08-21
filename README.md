@@ -224,7 +224,8 @@ environment.
 | `vdd.tracking.log_adversary_responses` | `OPENCLAUDIA_VDD__TRACKING__LOG_ADVERSARY_RESPONSES` | `true` or `false` / sensitive |
 | `providers.openai-compatible.base_url` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__BASE_URL` | non-empty URL string / sensitive |
 | `providers.openai-compatible.api_key` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__API_KEY` | validated API key / secret |
-| `memory.team_memory_path` | `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` | reserved legacy path proposal / rejected; authenticated team authority and replication are tracked by S-103/S-104 |
+| `memory.team_id` | `OPENCLAUDIA_MEMORY__TEAM_ID` | strict host-enrolled team selector / authority-sensitive; cannot create membership |
+| `memory.team_memory_path` | `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` | permanently rejected legacy path proposal; a path is never team authority |
 | `web_fetch.preapproved_domains` | `OPENCLAUDIA_WEB_FETCH__PREAPPROVED_DOMAINS` | JSON string array / authority-sensitive |
 
 The complete supported-name matrix, including provider aliases, parser,
@@ -292,6 +293,12 @@ session:
   persist_path: .openclaudia/session
   max_turns: 0
 
+# Select only a team already enrolled through `openclaudia team`. This does
+# not create membership, and team lesson access remains unavailable until the
+# bounded replication service is enabled.
+# memory:
+#   team_id: team-0123456789abcdef0123456789abcdef
+
 # Current permission schema. The audit recommends a finite turn limit and a
 # canonical fail-closed policy before production use.
 # permissions:
@@ -339,7 +346,17 @@ openclaudia doctor --json      # Emit machine-readable diagnostic receipts
 openclaudia hooks status       # Review inert repository hook proposals and exact digests
 openclaudia hooks approve <sha256:...>  # Approve one current, digest-bound proposal
 openclaudia hooks revoke <sha256:...>   # Revoke one exact approval receipt
+openclaudia team create --principal-id <id>  # Create host-owned team authority
+openclaudia team status [--team-id <id>]     # Show redacted local enrollment state
+openclaudia team invite [--team-id <id>]     # Emit a signed public invitation
+openclaudia team audit [--team-id <id>]      # Show bounded redacted authorization receipts
 ```
+
+`openclaudia team --help` exposes the complete manual enrollment, role,
+revocation, renewal, recovery, and key-rotation lifecycle. The exchanged JSON
+artifacts contain signed public state only; private credentials stay in the
+descriptor-safe host store. This authority surface does not ambiently inject
+memory into prompts and does not enable team lesson transport by itself.
 
 `--verbose` opts the TUI and legacy REPL into local lifecycle analytics at
 debug level. Current lifecycle records contain an event name, a SHA-256 digest

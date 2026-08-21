@@ -163,11 +163,11 @@ fn configured_team_memory_fails_visibly_instead_of_being_ignored() {
         .expect("config command");
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("memory.team_memory_path is currently unavailable"));
-    assert!(text.contains("filesystem path is not"));
+    assert!(text.contains("memory.team_memory_path is unsupported"));
+    assert!(text.contains("filesystem path is never"));
     assert!(text.contains("authenticated team authority"));
-    assert!(text.contains("replication service"));
-    assert!(text.contains("tracked by S-103/S-104"));
+    assert!(text.contains("configure memory.team_id after host enrollment"));
+    assert!(text.contains("replication tracked by S-104"));
 }
 
 #[test]
@@ -188,11 +188,11 @@ fn environment_configured_team_memory_fails_at_the_same_boundary() {
         .expect("config command");
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("memory.team_memory_path is currently unavailable"));
-    assert!(text.contains("filesystem path is not"));
+    assert!(text.contains("memory.team_memory_path is unsupported"));
+    assert!(text.contains("filesystem path is never"));
     assert!(text.contains("authenticated team authority"));
-    assert!(text.contains("replication service"));
-    assert!(text.contains("tracked by S-103/S-104"));
+    assert!(text.contains("configure memory.team_id after host enrollment"));
+    assert!(text.contains("replication tracked by S-104"));
 }
 
 #[test]

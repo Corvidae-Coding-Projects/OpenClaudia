@@ -1,19 +1,18 @@
-//! Team memory store — per-user + optional shared team scope.
+//! Authenticated team technical-memory authority and replica semantics.
 //!
 //! S-053 gives this store stable logical identity, immutable causal revisions,
 //! explicit conflicts, version-bound tombstones, and durable idempotent
 //! cross-store reconciliation. Production [`crate::config::load_config`] still
-//! rejects a configured team path. S-054 supplies host-owned local storage,
-//! schema recovery, and evidence-only retrieval; S-103/S-104 must supply
-//! authenticated team authority and bounded replication. A shared path alone
-//! is not a team authorization model.
+//! rejects the legacy shared-path proposal. S-054 supplies host-owned local
+//! storage, schema recovery, and evidence-only retrieval; S-103 supplies
+//! authenticated team authority, while S-104 owns bounded lesson replication.
+//! A shared path alone is never a team authorization model.
 //!
-//! Crosslink #604. Parity with Claude Code's `teamMemPaths.ts`: a project
-//! may carry an additional *shared* memory directory that several users on
-//! the same project read and write together. The shared store sits **next
-//! to** the per-user store. Only explicitly `Both`-scoped logical memories are
-//! enrolled for idempotent replica exchange; private user records are never
-//! mirrored automatically.
+//! The older path-backed replica engine remains private and test-covered so
+//! S-104 can adapt its causal merge and restart behavior. No production caller
+//! can activate that engine with a path. A repository can select only a typed
+//! team identity; [`TeamAuthorityStore`] then requires host-owned signed
+//! membership before a future replica operation can disclose or mutate data.
 //!
 //! # Scope model
 //!
@@ -21,12 +20,10 @@
 //! participates against:
 //!
 //! * [`MemoryScope::User`] — operate on the per-user store only.
-//! * [`MemoryScope::Team`] — operate on the shared team store only.
-//!   Returns [`TeamMemoryError::TeamUnavailable`] when no team path is
-//!   configured.
-//! * [`MemoryScope::Both`] — reads merge by logical identity; writes first
-//!   persist an operation and then idempotently apply one exact revision to
-//!   both stores.
+//! * [`MemoryScope::Team`] — target an authenticated team replica. It returns
+//!   [`TeamMemoryError::TeamUnavailable`] until S-104 supplies that replica.
+//! * [`MemoryScope::Both`] — target private storage plus an authenticated team
+//!   replica. It likewise fails closed while the data plane is unavailable.
 //!
 //! # Merge semantics
 //!
@@ -34,7 +31,7 @@
 //! descendant supersedes its ancestor. Concurrent branches remain explicit
 //! conflict heads and neither branch is deleted. Equal prose with different
 //! logical IDs remains distinct. Core sections retain their stable section key
-//! and user overlay precedence pending the team-authority work in S-103/S-104.
+//! and user overlay precedence for the S-104 replication implementation.
 //!
 //! # Tombstones
 //!
@@ -44,6 +41,17 @@
 //! database fails closed instead of inheriting replay authority. A later team
 //! revision is therefore not silently hidden by a stale row-number tombstone.
 //! A `Both` deletion is a replicated immutable tombstone revision.
+
+pub mod authority;
+
+pub use authority::{
+    PrincipalId, TeamAuditDecisionCode, TeamAuditReceipt, TeamAuthorityBundle, TeamAuthorityError,
+    TeamAuthorityStatus, TeamAuthorityStore, TeamAuthorizationDenial, TeamAuthorizationOutcome,
+    TeamCredentialRotationRequest, TeamEnrollmentApproval, TeamEnrollmentInvitation,
+    TeamEnrollmentRequest, TeamId, TeamMembership, TeamMemoryOperation, TeamOperationGrant,
+    TeamOperationPermit, TeamOwnerRecovery, TeamPublicKey, TeamRole,
+    MAX_TEAM_AUTHORITY_ARTIFACT_BYTES,
+};
 
 use crate::config::MemoryConfig;
 use crate::memory::{
@@ -74,9 +82,8 @@ const MAX_REPLICATION_REVISION_BYTES: usize = 1_048_576;
 pub enum MemoryScope {
     /// Per-user store only.
     User,
-    /// Shared team store only. Operations error with
-    /// [`TeamMemoryError::TeamUnavailable`] if no team path was
-    /// configured.
+    /// Team replica only. Production operations remain unavailable until
+    /// S-104 binds the replica through [`TeamAuthorityStore`].
     Team,
     /// Both stores. Reads causally merge by logical identity; writes target
     /// both stores through a durable idempotent operation.
@@ -86,10 +93,13 @@ pub enum MemoryScope {
 /// Errors that can arise from team-memory operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TeamMemoryError {
-    /// A scoped operation requested the team store but no team path is
-    /// configured.
+    /// A scoped operation requested a team replica that is unavailable.
     #[error("team memory not configured")]
     TeamUnavailable,
+    /// A shared path cannot establish authenticated membership. The S-104
+    /// replication service consumes S-103 permits instead of opening it.
+    #[error("team-memory paths are not authorization; use an authenticated team identity")]
+    UnauthenticatedPath,
     /// The sidecar belongs to a different physical user or team database.
     #[error("team-memory sync state is bound to a different {role} store")]
     StoreBindingMismatch {
@@ -121,11 +131,12 @@ impl VersionBoundTombstone {
     }
 }
 
-/// The team-memory store: a per-user database plus an optional shared
-/// team database, mediated through a [`MemoryScope`] selector.
+/// Compatibility wrapper around private memory plus the preserved causal
+/// replica engine, mediated through a [`MemoryScope`] selector.
 ///
-/// Construct via [`TeamMemoryStore::open`]. Clone-friendly via internal
-/// [`Arc`]s.
+/// Construct via [`TeamMemoryStore::open`]. A path-configured team replica is
+/// rejected; S-104 will bind typed replica operations to S-103 permits.
+/// Clone-friendly via internal [`Arc`]s.
 pub struct TeamMemoryStore {
     user: Arc<MemoryDb>,
     team: Option<Arc<MemoryDb>>,
@@ -137,18 +148,29 @@ pub struct TeamMemoryStore {
 }
 
 impl TeamMemoryStore {
-    /// Open a team-memory store given a user database path and the
-    /// project-wide memory configuration. When
-    /// [`MemoryConfig::team_memory_path`] is `Some(dir)`, the team
-    /// database is opened at `dir/memory.db` (the directory is created
-    /// if missing); when `None`, the store behaves as a per-user-only
-    /// wrapper.
+    /// Open a user-only compatibility wrapper. A configured
+    /// [`MemoryConfig::team_memory_path`] is rejected because possession of a
+    /// path cannot create authenticated team authority. S-104 will construct
+    /// bounded typed replicas through operation permits issued by
+    /// [`authority::TeamAuthorityStore`].
     ///
     /// # Errors
     ///
-    /// Returns an error if the user or team database cannot be opened,
-    /// or if the team directory cannot be created.
+    /// Returns an error if the user database cannot be opened or an
+    /// unauthenticated team path is configured.
     pub fn open(user_db_path: &Path, cfg: &MemoryConfig) -> Result<Self> {
+        if cfg.team_memory_path.is_some() {
+            return Err(TeamMemoryError::UnauthenticatedPath.into());
+        }
+        Self::open_internal(user_db_path, cfg)
+    }
+
+    #[cfg(test)]
+    fn open_legacy_replica(user_db_path: &Path, cfg: &MemoryConfig) -> Result<Self> {
+        Self::open_internal(user_db_path, cfg)
+    }
+
+    fn open_internal(user_db_path: &Path, cfg: &MemoryConfig) -> Result<Self> {
         let user = Arc::new(MemoryDb::open(user_db_path).context("opening user memory db")?);
         let user_store_id = user
             .store_id()
@@ -1127,8 +1149,9 @@ mod tests {
         };
         let cfg = MemoryConfig {
             team_memory_path: team_path,
+            ..MemoryConfig::default()
         };
-        let store = TeamMemoryStore::open(&user_path, &cfg).expect("open store");
+        let store = TeamMemoryStore::open_legacy_replica(&user_path, &cfg).expect("open store");
         (tmp, store)
     }
 
@@ -1166,9 +1189,10 @@ mod tests {
         let user_path = tmp.path().join("memory.db");
         let cfg = MemoryConfig {
             team_memory_path: Some(tmp.path().to_path_buf()),
+            ..MemoryConfig::default()
         };
 
-        let error = TeamMemoryStore::open(&user_path, &cfg)
+        let error = TeamMemoryStore::open_legacy_replica(&user_path, &cfg)
             .err()
             .expect("same physical database must fail closed");
         assert!(error.to_string().contains("same physical store"));
@@ -1394,8 +1418,9 @@ mod tests {
         let team_path = tmp.path().join("team");
         let cfg = MemoryConfig {
             team_memory_path: Some(team_path.clone()),
+            ..MemoryConfig::default()
         };
-        let store = TeamMemoryStore::open(&user_path, &cfg).unwrap();
+        let store = TeamMemoryStore::open_legacy_replica(&user_path, &cfg).unwrap();
         let original_team_id = store.team_store_id().unwrap();
         store
             .save_archival(MemoryScope::Both, "must not cross team replacement", &[])
@@ -1403,7 +1428,7 @@ mod tests {
         drop(store);
 
         std::fs::rename(&team_path, tmp.path().join("retired-team")).unwrap();
-        let Err(error) = TeamMemoryStore::open(&user_path, &cfg) else {
+        let Err(error) = TeamMemoryStore::open_legacy_replica(&user_path, &cfg) else {
             panic!("replacement store must not inherit sync authority");
         };
         assert!(error.to_string().contains("different team store"));
@@ -1692,8 +1717,9 @@ mod tests {
         let team_path = tmp.path().join("team");
         let cfg = MemoryConfig {
             team_memory_path: Some(team_path.clone()),
+            ..MemoryConfig::default()
         };
-        let store = TeamMemoryStore::open(&user_path, &cfg).unwrap();
+        let store = TeamMemoryStore::open_legacy_replica(&user_path, &cfg).unwrap();
         store
             .team
             .as_ref()
@@ -1720,7 +1746,7 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TRIGGER reject_replication;")
             .unwrap();
-        let reopened = TeamMemoryStore::open(&user_path, &cfg).unwrap();
+        let reopened = TeamMemoryStore::open_legacy_replica(&user_path, &cfg).unwrap();
         assert_eq!(reopened.reconcile_pending_operations().unwrap(), 0);
         let user_rows = reopened.user.memory_list(10).unwrap();
         let team_rows = reopened.team.as_ref().unwrap().memory_list(10).unwrap();

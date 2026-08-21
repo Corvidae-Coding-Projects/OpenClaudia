@@ -1,5 +1,6 @@
-//! End-to-end tests for `TeamMemoryStore` scope-mediated CRUD +
-//! `thinking` module ultrathink-keyword + effort-resolution helpers.
+//! End-to-end tests for the production team-memory fail-closed boundary and
+//! user-only compatibility wrapper, plus `thinking` effort helpers. Detailed
+//! causal replica behavior remains unit-covered for S-104 adaptation.
 //!
 //! Sprint 59 of the verification effort.
 
@@ -71,18 +72,6 @@ impl Drop for EnvGuard {
 // TeamMemoryStore helpers
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Build a store with both user + team paths inside a tempdir.
-fn open_user_plus_team() -> (TempDir, TeamMemoryStore) {
-    let tmp = TempDir::new().expect("tempdir");
-    let user_path = tmp.path().join("user.db");
-    let team_dir = tmp.path().join("team");
-    let cfg = MemoryConfig {
-        team_memory_path: Some(team_dir),
-    };
-    let store = TeamMemoryStore::open(&user_path, &cfg).expect("open");
-    (tmp, store)
-}
-
 /// Build a user-only store (no team path).
 fn open_user_only() -> (TempDir, TeamMemoryStore) {
     let tmp = TempDir::new().expect("tempdir");
@@ -97,17 +86,20 @@ fn open_user_only() -> (TempDir, TeamMemoryStore) {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn open_with_team_path_creates_team_directory_if_missing() {
+fn open_with_team_path_is_rejected_without_creating_the_directory() {
     let tmp = TempDir::new().expect("tempdir");
     let user_path = tmp.path().join("user.db");
     let team_dir = tmp.path().join("new-team-dir");
     assert!(!team_dir.exists(), "premise: team dir absent");
     let cfg = MemoryConfig {
         team_memory_path: Some(team_dir.clone()),
+        ..MemoryConfig::default()
     };
-    let _store = TeamMemoryStore::open(&user_path, &cfg).expect("open");
-    assert!(team_dir.exists(), "team dir MUST be auto-created");
-    assert!(team_dir.join("memory.db").exists());
+    let Err(error) = TeamMemoryStore::open(&user_path, &cfg) else {
+        panic!("shared path is not authenticated authority");
+    };
+    assert!(error.to_string().contains("paths are not authorization"));
+    assert!(!team_dir.exists(), "rejected path must not be created");
 }
 
 #[test]
@@ -120,10 +112,20 @@ fn open_without_team_path_yields_user_only_store() {
 }
 
 #[test]
-fn open_with_team_path_returns_team_path_via_accessor() {
-    let (_tmp, store) = open_user_plus_team();
-    let tp = store.team_path().expect("team path");
-    assert!(tp.ends_with("memory.db"));
+fn team_identity_selector_does_not_open_a_legacy_replica() {
+    let tmp = TempDir::new().expect("tempdir");
+    let user_path = tmp.path().join("user.db");
+    let cfg = MemoryConfig {
+        team_id: Some(
+            "team-0123456789abcdef0123456789abcdef"
+                .parse()
+                .expect("team ID"),
+        ),
+        ..MemoryConfig::default()
+    };
+    let store = TeamMemoryStore::open(&user_path, &cfg).expect("user-only wrapper");
+    assert!(!store.has_team());
+    assert!(store.team_path().is_none());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -171,7 +173,7 @@ fn update_core_team_scope_on_user_only_errors() {
 
 #[test]
 fn save_to_user_scope_appears_in_user_list() {
-    let (_tmp, store) = open_user_plus_team();
+    let (_tmp, store) = open_user_only();
     let id = store
         .save_archival(MemoryScope::User, "user content", &[])
         .expect("save");
@@ -180,51 +182,6 @@ fn save_to_user_scope_appears_in_user_list() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].entry.content, "user content");
     assert_eq!(entries[0].scope, MemoryScope::User);
-}
-
-#[test]
-fn save_to_team_scope_appears_in_team_list() {
-    let (_tmp, store) = open_user_plus_team();
-    store
-        .save_archival(MemoryScope::Team, "team content", &[])
-        .expect("save");
-    let entries = store.list_archival(MemoryScope::Team, 10).expect("list");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].entry.content, "team content");
-    assert_eq!(entries[0].scope, MemoryScope::Team);
-}
-
-#[test]
-fn save_to_user_scope_does_not_appear_in_team_list() {
-    let (_tmp, store) = open_user_plus_team();
-    store
-        .save_archival(MemoryScope::User, "user only", &[])
-        .expect("save");
-    let team = store
-        .list_archival(MemoryScope::Team, 10)
-        .expect("list team");
-    assert!(
-        team.is_empty(),
-        "user-scope save MUST NOT appear in team list; got {team:?}"
-    );
-}
-
-#[test]
-fn save_to_both_scope_appears_in_both_lists() {
-    let (_tmp, store) = open_user_plus_team();
-    store
-        .save_archival(MemoryScope::Both, "shared content", &[])
-        .expect("save");
-    let user = store
-        .list_archival(MemoryScope::User, 10)
-        .expect("list user");
-    let team = store
-        .list_archival(MemoryScope::Team, 10)
-        .expect("list team");
-    assert_eq!(user.len(), 1, "Both must write to user");
-    assert_eq!(team.len(), 1, "Both must write to team");
-    assert_eq!(user[0].entry.content, "shared content");
-    assert_eq!(team[0].entry.content, "shared content");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

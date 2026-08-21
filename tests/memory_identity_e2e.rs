@@ -5,7 +5,7 @@ use openclaudia::memory::{
     ApplyRevisionOutcome, MemoryAttribution, MemoryDb, MemoryDigest, MemoryProvenance,
     MemoryRecordScope, MemoryRevision, MemorySourceEvidence, MemorySourceKind,
 };
-use openclaudia::team_memory::{MemoryScope, TeamMemoryStore};
+use openclaudia::team_memory::TeamMemoryStore;
 use tempfile::TempDir;
 
 fn provenance(source: &str, scope: MemoryRecordScope) -> MemoryProvenance {
@@ -78,57 +78,33 @@ fn equal_prose_from_distinct_evidence_remains_distinct() {
 }
 
 #[test]
-fn team_both_write_has_one_logical_result_and_one_global_limit() {
+fn shared_path_cannot_activate_team_replication() {
     let temp = TempDir::new().unwrap();
     let user_path = temp.path().join("user").join("memory.db");
     std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
     let config = MemoryConfig {
         team_memory_path: Some(temp.path().join("team")),
+        ..MemoryConfig::default()
     };
-    let store = TeamMemoryStore::open(&user_path, &config).unwrap();
-    store
-        .save_archival(
-            MemoryScope::Both,
-            "cargo tests run single-threaded after a four-job build",
-            &["tests".to_string()],
-        )
-        .unwrap();
-    store
-        .save_archival(MemoryScope::User, "private lesson", &[])
-        .unwrap();
-
-    let merged = store.list_archival(MemoryScope::Both, 1).unwrap();
-    assert_eq!(merged.len(), 1);
-    let shared_user = store
-        .user()
-        .memory_search("cargo tests run single-threaded", 10)
-        .unwrap()
-        .pop()
-        .unwrap();
-    let shared_team = store
-        .team()
-        .unwrap()
-        .memory_search("cargo tests run single-threaded", 10)
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(shared_user.logical_id, shared_team.logical_id);
-    assert_eq!(shared_user.record_digest, shared_team.record_digest);
+    let Err(error) = TeamMemoryStore::open(&user_path, &config) else {
+        panic!("a path must not create team authority");
+    };
+    assert!(error.to_string().contains("paths are not authorization"));
+    assert!(!temp.path().join("team").exists());
 }
 
 #[test]
 fn concurrent_offline_corrections_surface_both_heads() {
     let temp = TempDir::new().unwrap();
-    let user_path = temp.path().join("user").join("memory.db");
-    std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
-    let config = MemoryConfig {
-        team_memory_path: Some(temp.path().join("team")),
-    };
-    let store = TeamMemoryStore::open(&user_path, &config).unwrap();
-    let user_id = store
-        .save_archival(MemoryScope::Both, "initial command", &[])
-        .unwrap();
-    let root = store.user().revision_for_row(user_id).unwrap().unwrap();
+    let left = MemoryDb::open(&temp.path().join("left.db")).unwrap();
+    let right = MemoryDb::open(&temp.path().join("right.db")).unwrap();
+    let root = MemoryRevision::new(
+        "initial command".to_string(),
+        Vec::new(),
+        provenance("shared-root", MemoryRecordScope::TeamShared),
+    );
+    left.apply_revision(&root).unwrap();
+    right.apply_revision(&root).unwrap();
     let user_revision = root
         .successor(
             "cargo +1.98.0 test".to_string(),
@@ -143,69 +119,43 @@ fn concurrent_offline_corrections_surface_both_heads() {
             provenance("team-correction", MemoryRecordScope::TeamShared),
         )
         .unwrap();
-    store.user().apply_revision(&user_revision).unwrap();
-    store
-        .team()
-        .unwrap()
-        .apply_revision(&team_revision)
-        .unwrap();
-    assert_eq!(store.reconcile_replica_histories().unwrap(), 2);
-    assert_eq!(
-        store.user().revision_heads(root.logical_id).unwrap().len(),
-        2
-    );
-    assert_eq!(
-        store
-            .team()
-            .unwrap()
-            .revision_heads(root.logical_id)
-            .unwrap()
-            .len(),
-        2
-    );
-
-    let merged = store.list_archival(MemoryScope::Both, 10).unwrap();
-    assert_eq!(merged.len(), 1);
-    assert_eq!(merged[0].entry.conflict_heads.len(), 2);
-    assert!(merged[0]
-        .entry
-        .conflict_heads
+    left.apply_revision(&user_revision).unwrap();
+    right.apply_revision(&team_revision).unwrap();
+    left.apply_revision(&team_revision).unwrap();
+    right.apply_revision(&user_revision).unwrap();
+    let left_heads = left.revision_heads(root.logical_id).unwrap();
+    let right_heads = right.revision_heads(root.logical_id).unwrap();
+    assert_eq!(left_heads.len(), 2);
+    assert_eq!(left_heads, right_heads);
+    assert!(left_heads
         .iter()
         .any(|head| head.record_digest == user_revision.record_digest));
-    assert!(merged[0]
-        .entry
-        .conflict_heads
+    assert!(left_heads
         .iter()
         .any(|head| head.record_digest == team_revision.record_digest));
 }
 
 #[test]
-fn replacing_a_team_database_cannot_inherit_the_old_replica_log() {
+fn replacing_a_database_at_a_configured_path_still_cannot_create_authority() {
     let temp = TempDir::new().unwrap();
     let user_path = temp.path().join("user").join("memory.db");
     std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
     let team_path = temp.path().join("team");
     let config = MemoryConfig {
         team_memory_path: Some(team_path.clone()),
+        ..MemoryConfig::default()
     };
-    let store = TeamMemoryStore::open(&user_path, &config).unwrap();
-    let old_team_id = store.team_store_id().unwrap();
-    store
-        .save_archival(
-            MemoryScope::Both,
-            "this lesson belongs only to the original replica set",
-            &[],
-        )
-        .unwrap();
-    drop(store);
-
+    std::fs::create_dir_all(&team_path).unwrap();
+    let first = MemoryDb::open(&team_path.join("memory.db")).unwrap();
+    let first_id = first.store_id().unwrap();
+    drop(first);
     std::fs::rename(&team_path, temp.path().join("retired-team")).unwrap();
-    let Err(error) = TeamMemoryStore::open(&user_path, &config) else {
-        panic!("replacement team database inherited stale sync authority");
-    };
-    assert!(error.to_string().contains("different team store"));
-
+    std::fs::create_dir_all(&team_path).unwrap();
     let replacement = MemoryDb::open(&team_path.join("memory.db")).unwrap();
-    assert_ne!(replacement.store_id().unwrap(), old_team_id);
-    assert!(replacement.memory_list(10).unwrap().is_empty());
+    assert_ne!(replacement.store_id().unwrap(), first_id);
+    drop(replacement);
+    let Err(error) = TeamMemoryStore::open(&user_path, &config) else {
+        panic!("replacement path still is not authority");
+    };
+    assert!(error.to_string().contains("paths are not authorization"));
 }

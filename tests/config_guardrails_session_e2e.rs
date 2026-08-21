@@ -317,13 +317,27 @@ fn token_tracking_partial_yaml_preserves_set_overrides() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section H — MemoryConfig defaults + team-store path
+// Section H — MemoryConfig defaults + authenticated selector / legacy path
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn memory_config_default_has_no_team_store_path() {
     let cfg = MemoryConfig::default();
+    assert!(cfg.team_id.is_none());
     assert!(cfg.team_memory_path.is_none());
+}
+
+#[test]
+fn memory_config_accepts_only_a_strict_team_selector() {
+    let yaml = "team_id: team-0123456789abcdef0123456789abcdef";
+    let cfg: MemoryConfig = serde_yaml::from_str(yaml).expect("parse");
+    assert_eq!(
+        cfg.team_id
+            .as_ref()
+            .map(openclaudia::team_memory::TeamId::as_str),
+        Some("team-0123456789abcdef0123456789abcdef")
+    );
+    assert!(serde_yaml::from_str::<MemoryConfig>("team_id: /shared/memory.db").is_err());
 }
 
 #[test]

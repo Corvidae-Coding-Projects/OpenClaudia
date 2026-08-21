@@ -6,6 +6,7 @@ pub mod hooks;
 pub mod init;
 pub mod loop_cmd;
 pub mod start;
+pub mod team;
 
 fn provider_api_key_env_var(provider_name: &str) -> &'static str {
     openclaudia::providers::api_key_env_var_for_target(provider_name)

@@ -2766,7 +2766,7 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
 fn architecture_cli_overview_lists_all_binary_subcommands() {
     let architecture = include_str!("../ARCHITECTURE.md");
     for command in [
-        "init", "auth", "start", "acp", "config", "doctor", "hooks", "loop",
+        "init", "auth", "start", "acp", "config", "doctor", "hooks", "team", "loop",
     ] {
         assert!(
             architecture.contains(command),
@@ -2775,7 +2775,7 @@ fn architecture_cli_overview_lists_all_binary_subcommands() {
     }
     assert!(
         architecture.contains("Subcommands: init, auth, start,")
-            && architecture.contains("acp, config, doctor, hooks, loop"),
+            && architecture.contains("acp, config, doctor, hooks, team, loop"),
         "ARCHITECTURE.md must keep the command inventory in the high-level overview"
     );
 }

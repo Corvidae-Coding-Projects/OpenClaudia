@@ -190,6 +190,12 @@ enum Commands {
         command: Option<HookCommands>,
     },
 
+    /// Manage host-owned authenticated team-memory authority
+    Team {
+        #[command(subcommand)]
+        command: TeamCommands,
+    },
+
     /// Start ACP server on stdin/stdout for agent interoperability (acpx)
     Acp {
         /// Target provider (overrides config)
@@ -244,6 +250,117 @@ enum HookCommands {
     Revoke {
         /// Full `sha256:...` proposal digest
         proposal_digest: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TeamCommands {
+    /// Create a new team with this principal as its first owner
+    Create {
+        #[arg(long)]
+        principal_id: String,
+        #[arg(long, default_value_t = 31_536_000)]
+        membership_ttl_seconds: i64,
+    },
+    /// Show local enrollment and authority status
+    Status {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Emit a signed public enrollment invitation
+    Invite {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long, default_value_t = 3_600)]
+        ttl_seconds: i64,
+    },
+    /// Create a host-private credential and public proof-of-possession request
+    BeginEnrollment {
+        #[arg(long)]
+        invitation: PathBuf,
+        #[arg(long)]
+        principal_id: String,
+    },
+    /// Approve an enrollment request and emit a signed public approval
+    ApproveEnrollment {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        invitation: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        role: String,
+        #[arg(long, default_value_t = 31_536_000)]
+        membership_ttl_seconds: i64,
+    },
+    /// Accept a signed enrollment approval on the requesting host
+    AcceptEnrollment {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        approval: PathBuf,
+    },
+    /// Change one member's role
+    SetRole {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        principal_id: String,
+        #[arg(long)]
+        role: String,
+    },
+    /// Revoke one member immediately
+    Revoke {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        principal_id: String,
+    },
+    /// Renew one active membership
+    Renew {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        principal_id: String,
+        #[arg(long, default_value_t = 31_536_000)]
+        membership_ttl_seconds: i64,
+    },
+    /// Recover an expired local owner using this host's authority credential
+    RecoverExpiredOwner {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long, default_value_t = 31_536_000)]
+        membership_ttl_seconds: i64,
+    },
+    /// Rotate the team authority key and emit the successor public bundle
+    RotateAuthority {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Begin rotation of this host principal's credential
+    BeginCredentialRotation {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Approve a principal credential-rotation request
+    ApproveCredentialRotation {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Apply a newer signed public authority bundle
+    ApplyAuthority {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        bundle: PathBuf,
+    },
+    /// Print bounded redacted local authorization receipts
+    Audit {
+        #[arg(long)]
+        team_id: Option<String>,
     },
 }
 
@@ -379,6 +496,87 @@ async fn main() -> anyhow::Result<()> {
                 cli::commands::hooks::cmd_hooks_revoke(&proposal_digest)
             }
         },
+        Some(Commands::Team { command }) => {
+            chdir_to_git_root();
+            match command {
+                TeamCommands::Create {
+                    principal_id,
+                    membership_ttl_seconds,
+                } => cli::commands::team::cmd_team_create(&principal_id, membership_ttl_seconds),
+                TeamCommands::Status { team_id } => {
+                    cli::commands::team::cmd_team_status(team_id.as_deref())
+                }
+                TeamCommands::Invite {
+                    team_id,
+                    ttl_seconds,
+                } => cli::commands::team::cmd_team_invite(team_id.as_deref(), ttl_seconds),
+                TeamCommands::BeginEnrollment {
+                    invitation,
+                    principal_id,
+                } => cli::commands::team::cmd_team_begin_enrollment(&invitation, &principal_id),
+                TeamCommands::ApproveEnrollment {
+                    team_id,
+                    invitation,
+                    request,
+                    role,
+                    membership_ttl_seconds,
+                } => cli::commands::team::cmd_team_approve_enrollment(
+                    team_id.as_deref(),
+                    &invitation,
+                    &request,
+                    &role,
+                    membership_ttl_seconds,
+                ),
+                TeamCommands::AcceptEnrollment { team_id, approval } => {
+                    cli::commands::team::cmd_team_accept_enrollment(team_id.as_deref(), &approval)
+                }
+                TeamCommands::SetRole {
+                    team_id,
+                    principal_id,
+                    role,
+                } => {
+                    cli::commands::team::cmd_team_set_role(team_id.as_deref(), &principal_id, &role)
+                }
+                TeamCommands::Revoke {
+                    team_id,
+                    principal_id,
+                } => cli::commands::team::cmd_team_revoke(team_id.as_deref(), &principal_id),
+                TeamCommands::Renew {
+                    team_id,
+                    principal_id,
+                    membership_ttl_seconds,
+                } => cli::commands::team::cmd_team_renew(
+                    team_id.as_deref(),
+                    &principal_id,
+                    membership_ttl_seconds,
+                ),
+                TeamCommands::RecoverExpiredOwner {
+                    team_id,
+                    membership_ttl_seconds,
+                } => cli::commands::team::cmd_team_recover_expired_owner(
+                    team_id.as_deref(),
+                    membership_ttl_seconds,
+                ),
+                TeamCommands::RotateAuthority { team_id } => {
+                    cli::commands::team::cmd_team_rotate_authority(team_id.as_deref())
+                }
+                TeamCommands::BeginCredentialRotation { team_id } => {
+                    cli::commands::team::cmd_team_begin_credential_rotation(team_id.as_deref())
+                }
+                TeamCommands::ApproveCredentialRotation { team_id, request } => {
+                    cli::commands::team::cmd_team_approve_credential_rotation(
+                        team_id.as_deref(),
+                        &request,
+                    )
+                }
+                TeamCommands::ApplyAuthority { team_id, bundle } => {
+                    cli::commands::team::cmd_team_apply_authority(team_id.as_deref(), &bundle)
+                }
+                TeamCommands::Audit { team_id } => {
+                    cli::commands::team::cmd_team_audit(team_id.as_deref())
+                }
+            }
+        }
         Some(Commands::Loop {
             max_iterations,
             port,
@@ -462,6 +660,7 @@ const fn subcommand_name(command: &Commands) -> &'static str {
         Commands::Config => "config",
         Commands::Doctor { .. } => "doctor",
         Commands::Hooks { .. } => "hooks",
+        Commands::Team { .. } => "team",
         Commands::Acp { .. } => "acp",
         Commands::Loop { .. } => "loop",
     }

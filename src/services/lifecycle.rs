@@ -247,8 +247,8 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
     LifecycleServiceRegistration::classified(
         LifecycleServiceId::TeamMemory,
         LifecycleServiceClassification::Unavailable,
-        "Logical identity, safe local storage, and evidence-only retrieval are implemented, but authenticated authority and bounded replication remain incomplete; configured path activation fails visibly.",
-        Some("S-103/S-104"),
+        "Host-owned authenticated authority is reachable through `openclaudia team`, but lesson data remains unavailable until the bounded replication service consumes those grants; legacy path activation fails visibly.",
+        Some("S-104"),
     ),
     LifecycleServiceRegistration::wired(
         LifecycleServiceId::Guardrails,

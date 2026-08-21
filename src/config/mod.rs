@@ -276,12 +276,12 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         return Err(ConfigError::Message(e));
     }
 
-    // S-053 completed logical identity, causal merge, and durable cross-store
-    // replay. Production activation remains gated on S-103/S-104: a shared
-    // path is not authenticated team authority or a replication service.
+    // The pre-S-103 shared-path proposal is permanently rejected. A repository
+    // may select a strict team ID, but membership and credentials are resolved
+    // only from the host-owned authority store. S-104 owns data replication.
     if config.memory.team_memory_path.is_some() {
         return Err(ConfigError::Message(
-            "memory.team_memory_path is currently unavailable: a filesystem path is not authenticated team authority or a replication service (tracked by S-103/S-104)"
+            "memory.team_memory_path is unsupported: a filesystem path is never authenticated team authority; configure memory.team_id after host enrollment (replication tracked by S-104)"
                 .to_string(),
         ));
     }
