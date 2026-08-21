@@ -1,6 +1,6 @@
 {
   "next_display_id": 1069,
-  "next_comment_id": 1007,
+  "next_comment_id": 1008,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22260,10 +22260,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T08:43:37.521619513Z",
-      "updated_at": "2026-08-21T08:43:41.537829364Z",
+      "updated_at": "2026-08-21T08:53:29.030121529Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "a22987a1-8b89-4990-a881-273acacc49a9": {
+          "display_id": 1007,
+          "author": "6Vw9",
+          "content": "[action] S-006 preflight complete: traced standalone CLI, startup migration gate, legacy REPL, TUI, capability registry, and existing tests; designing shared typed evidence-safe report",
+          "created_at": "2026-08-21T08:53:29.027422171Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAuM3Y6k/sWuJmvuVAndDh1VtqgCt3ARbk9IfFHIq4kY0nROXxgmZyP4X4GIBz9M4Qx5Cmj9wQkkEDJC5jykuUAA=="
+        }
+      }
     },
     "e35b9166-4f7e-4154-bdc4-98ff6f6c2cf5": {
       "uuid": "e35b9166-4f7e-4154-bdc4-98ff6f6c2cf5",
@@ -28972,11 +28983,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 639,
       "timestamp": "2026-08-21T08:43:46.484803762Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 640,
+      "timestamp": "2026-08-21T08:53:29.030121529Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T08:43:46.484803762Z",
+    "timestamp": "2026-08-21T08:53:29.030121529Z",
     "agent_id": "6Vw9",
-    "agent_seq": 639
+    "agent_seq": 640
   }
 }
