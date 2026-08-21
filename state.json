@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1074,
+  "next_display_id": 1075,
   "next_comment_id": 1052,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -93,6 +93,7 @@
     "16a92d59-e8a8-4424-8167-d1ea2944327d": 299,
     "16b1f441-c9ff-46f3-b2b5-06f378b9d5dd": 968,
     "17222638-e7bf-4b07-b426-51fcec7b4c2c": 567,
+    "1768346c-5e64-46c0-ada3-408ad86c5e70": 1074,
     "177ac089-6f45-46eb-a615-89d93e9a7a18": 662,
     "17830aa9-8587-481a-8f7b-edc39e2ee66e": 653,
     "180b654d-aa1e-45a7-9bfc-a3ed24894ca2": 722,
@@ -3206,6 +3207,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA80jz2x3/hLlQribEnY4LQBcOxa5b3OFPYfjO+CPh1Uuhjx6mtmiKuZ97AxghP2fksmvAX9VIhjU1LKWdO2UrAA=="
         }
       }
+    },
+    "1768346c-5e64-46c0-ada3-408ad86c5e70": {
+      "uuid": "1768346c-5e64-46c0-ada3-408ad86c5e70",
+      "display_id": 1074,
+      "title": "S-103: Establish authenticated team-memory authority",
+      "description": "Implement docs/remediation-slices/103-authenticated-team-memory-authority.md. Replace the rejected shared-path proposal with host-approved team/principal/workspace identities, authenticated membership and roles, secret-safe credentials, revocation/rotation, operation-scoped grants, and bounded redacted audit receipts. A configured filesystem path must never create authority. Replication transport remains S-104.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-21T16:01:06.036665411Z",
+      "updated_at": "2026-08-21T16:01:06.036665411Z"
     },
     "177ac089-6f45-46eb-a615-89d93e9a7a18": {
       "uuid": "177ac089-6f45-46eb-a615-89d93e9a7a18",
@@ -29872,11 +29885,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 717,
       "timestamp": "2026-08-21T15:24:33.870952491Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 718,
+      "timestamp": "2026-08-21T16:01:06.036665411Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-21T15:24:33.870952491Z",
+    "timestamp": "2026-08-21T16:01:06.036665411Z",
     "agent_id": "6Vw9",
-    "agent_seq": 717
+    "agent_seq": 718
   }
 }
