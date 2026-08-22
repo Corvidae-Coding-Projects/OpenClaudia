@@ -11478,12 +11478,13 @@
       "display_id": 1083,
       "title": "S-052: Consolidate task and planning state",
       "description": "Implement docs/remediation-slices/052-canonical-task-graph.md under parent #1071. Replace disconnected todo, TaskManager, mode-local planning, delegation, and external issue views with one versioned transactional graph using stable IDs, actor/run ownership, typed statuses/dependencies/blockers/history, bounded pagination, descriptor-safe persistence, generation-checked atomic mutations, cycle/readiness validation, and explicit adapters. Preserve working surfaces by wiring them to the canonical graph; do not delete dormant intended behavior. This is the required foundation for S-055 causal technical-lesson learning.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T05:20:24.264343266Z",
-      "updated_at": "2026-08-22T08:48:22.358871495Z",
+      "updated_at": "2026-08-22T08:48:35.653354397Z",
+      "closed_at": "2026-08-22T08:48:35.653353054Z",
       "labels": [
         "remediation"
       ],
@@ -31952,11 +31953,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 888,
       "timestamp": "2026-08-22T08:48:31.553748099Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 889,
+      "timestamp": "2026-08-22T08:48:35.653354397Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:48:31.553748099Z",
+    "timestamp": "2026-08-22T08:48:35.653354397Z",
     "agent_id": "6Vw9",
-    "agent_seq": 888
+    "agent_seq": 889
   }
 }
