@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1094,
+  "next_display_id": 1095,
   "next_comment_id": 1207,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -320,6 +320,7 @@
     "51c0943b-1246-423f-bd8e-e3363d443b51": 217,
     "520463dd-a97d-4333-b04d-1a1da6a66d17": 411,
     "539c2e9e-58f3-4cef-bcf2-f2398d2f6201": 923,
+    "53e520ea-252d-485e-9124-f7b83709efcd": 1094,
     "54381422-378f-4c1c-b599-e2ce011bf718": 100,
     "544b8c7c-d9ee-4ef3-a1ec-8254387161a3": 1089,
     "552ec323-8483-4b53-b9b8-44cc9c90c336": 56,
@@ -9154,6 +9155,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAteG/DND9nivnAx+7lJZEkhHLZHip8Ep8ICxucYCOmSOuSCD5rzNmGj4VR6WsvfZxEdPeCvxJSB12nMS4XuHCCA=="
         }
       }
+    },
+    "53e520ea-252d-485e-9124-f7b83709efcd": {
+      "uuid": "53e520ea-252d-485e-9124-f7b83709efcd",
+      "display_id": 1094,
+      "title": "Emit Gemini-compatible JSON Schemas for tool declarations",
+      "description": "The Google adapter forwards OpenAI JSON Schema through the legacy parameters field unchanged. Progressive tool catalogs bind catalog_generation with JSON Schema const, which Gemini's current FunctionDeclaration Schema does not support, and existing schemas use keywords better represented by parametersJsonSchema. Convert at the provider boundary to the current parametersJsonSchema shape, rewrite const constraints to single-value enum without weakening host-side validation, and pin the wire contract with focused tests.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "c66389ba-d0ad-45ff-8c03-d8796d1a7f55",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T18:16:27.258131488Z",
+      "updated_at": "2026-08-22T18:16:27.258131488Z"
     },
     "54381422-378f-4c1c-b599-e2ce011bf718": {
       "uuid": "54381422-378f-4c1c-b599-e2ce011bf718",
@@ -32931,11 +32944,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 972,
       "timestamp": "2026-08-22T18:04:42.448301249Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 973,
+      "timestamp": "2026-08-22T18:16:27.258131488Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T18:04:42.448301249Z",
+    "timestamp": "2026-08-22T18:16:27.258131488Z",
     "agent_id": "6Vw9",
-    "agent_seq": 972
+    "agent_seq": 973
   }
 }
