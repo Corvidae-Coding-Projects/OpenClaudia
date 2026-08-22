@@ -172,6 +172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-044: Preserve provider-native continuation state (#1098)
 - S-064: Wire dynamic MCP tools through canonical policy and dispatch (#1096)
 - Make automatic-learning workspace-generation test hermetic on CI (#1097)
 - S-013: Implement real progressive tool discovery (#1091)
