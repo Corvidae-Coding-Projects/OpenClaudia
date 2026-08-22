@@ -1,6 +1,6 @@
 {
   "next_display_id": 1101,
-  "next_comment_id": 1249,
+  "next_comment_id": 1250,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15662,7 +15662,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T22:04:35.596607994Z",
-      "updated_at": "2026-08-22T22:39:36.760047005Z",
+      "updated_at": "2026-08-22T22:41:03.072049007Z",
       "comments": {
         "51a5ca3b-8978-428b-a346-5a9a5b783ed6": {
           "display_id": 1246,
@@ -15717,6 +15717,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwHoZNoq2een+VDid5nQMEeiBwxOVRElG3Skwrm+ojiDPM8+dPzf5IV7VWIkeklECP6zpbGuBDly2JHpv7txeDg=="
+        },
+        "e6360f61-55aa-4217-999a-87d0e5f506fa": {
+          "display_id": 1249,
+          "author": "6Vw9",
+          "content": "Session auto-ended (stale after 307 minutes). No handoff notes provided.",
+          "created_at": "2026-08-22T22:41:03.069576711Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAE5sXaxgniuLjGLygoQE5dH2DpfNjgfeagMdZmLXcbU2Ufr6gAgkgQJXHGE9Vxb43ZzmoPp/EEpm0XPr6OkTTAw=="
         },
         "f16d5930-05c0-4de5-9163-a6386e296561": {
           "display_id": 1242,
@@ -33755,11 +33764,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1038,
       "timestamp": "2026-08-22T22:39:36.760047005Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1039,
+      "timestamp": "2026-08-22T22:41:03.072049007Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T22:39:36.760047005Z",
+    "timestamp": "2026-08-22T22:41:03.072049007Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1038
+    "agent_seq": 1039
   }
 }
