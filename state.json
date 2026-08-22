@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1098,
+  "next_display_id": 1099,
   "next_comment_id": 1233,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -407,6 +407,7 @@
     "63c385dd-3ef1-4e59-8301-2f5a4fb473e5": 509,
     "6498f85a-d3f9-442d-95d5-e2a974e1c870": 944,
     "64bf17a2-e9ba-4679-9cb1-6bec93678e79": 666,
+    "64cd1218-a9e9-48ba-9610-d1e33cdce800": 1098,
     "64fc4b9a-bf32-40d6-81ca-101c6def78ac": 661,
     "658ac86e-7936-4139-a349-8f870a33b46a": 76,
     "65f339a1-2554-4399-b94a-00ca42f2212e": 924,
@@ -11833,6 +11834,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAz0mDXq58vfvzEOPzDiZwy5a8QrZcL6IFyNa57OpsVmQ0ggnksCqnb7dQ9rjyixJoLu0z7Lma7yZBGx17UmomDQ=="
         }
       }
+    },
+    "64cd1218-a9e9-48ba-9610-d1e33cdce800": {
+      "uuid": "64cd1218-a9e9-48ba-9610-d1e33cdce800",
+      "display_id": 1098,
+      "title": "S-044: Preserve provider-native continuation state",
+      "description": "Implement docs/remediation-slices/044-provider-native-state-contract.md. Define a versioned, bounded provider-native continuation lane alongside neutral conversation semantics; add explicit protocol/facet capability declarations for every supported adapter; reject incompatible or lossy fallback; persist the lane in canonical interactive session state with migration-safe defaults; bind provider/model identity and deterministic digests; add conformance fixtures for tool calls, parallel ordering, reasoning/signature blocks, refusals, usage/cache metadata, and resume declarations. Wire the contract through production provider request composition without absorbing S-045 OpenAI Responses continuation, S-046 Gemini/Ollama native tool-history repair, S-047 dynamic capability discovery, S-048 transport hardening, S-049 reasoning privacy, or S-050 terminal-state repair. Work locally with Rust/Cargo 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo invocations, test threads=1, and no Claude kickoff/subagent.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T20:49:57.916029928Z",
+      "updated_at": "2026-08-22T20:49:57.916029928Z"
     },
     "64fc4b9a-bf32-40d6-81ca-101c6def78ac": {
       "uuid": "64fc4b9a-bf32-40d6-81ca-101c6def78ac",
@@ -33440,11 +33453,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1013,
       "timestamp": "2026-08-22T20:42:31.275465912Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1014,
+      "timestamp": "2026-08-22T20:49:57.916029928Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T20:42:31.275465912Z",
+    "timestamp": "2026-08-22T20:49:57.916029928Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1013
+    "agent_seq": 1014
   }
 }
