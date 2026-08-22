@@ -1,6 +1,6 @@
 {
   "next_display_id": 1088,
-  "next_comment_id": 1149,
+  "next_comment_id": 1150,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25346,10 +25346,21 @@
       "parent_uuid": "66ad6d37-42af-4133-830d-fdf7d4cb67ac",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:17:15.887051640Z",
-      "updated_at": "2026-08-22T08:17:20.205604414Z",
+      "updated_at": "2026-08-22T08:43:55.481498106Z",
       "labels": [
         "defect"
-      ]
+      ],
+      "comments": {
+        "1a84a07d-82bd-492c-b65b-b7467b15df06": {
+          "display_id": 1149,
+          "author": "6Vw9",
+          "content": "S-052 repair complete: the validator now accepts only exact canonical worktree:sNNN provenance labels in addition to baseline Git generations and rejects malformed/short/long/case-variant labels. src/main.rs is honestly rebound as worktree:s052, the checked-in evaluator regenerated the final-environment evidence, and the deliberately rejected review binds the new artifacts. Rust 1.98 retrieval unit 7/7, evidence E2E 9/9, strict Clippy, full native suite, and Windows GNU check pass. Held-out/evaluation/review digests: 6cc7bd60..., a210332d..., b87fca7a....",
+          "created_at": "2026-08-22T08:43:55.478807677Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAemnEllR1gaOKcHgS4+nPIw92M3Wj9FjnrqG433g1doU6N5VBRGFrji0MH5zmvQcqE3K/LShs4LQ8Aa3buMm2DA=="
+        }
+      }
     },
     "edf12fe4-ddd0-4dcd-8f8f-7fad7beeb82e": {
       "uuid": "edf12fe4-ddd0-4dcd-8f8f-7fad7beeb82e",
@@ -31812,11 +31823,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 877,
       "timestamp": "2026-08-22T08:42:46.923003264Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 878,
+      "timestamp": "2026-08-22T08:43:55.481498106Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:42:46.923003264Z",
+    "timestamp": "2026-08-22T08:43:55.481498106Z",
     "agent_id": "6Vw9",
-    "agent_seq": 877
+    "agent_seq": 878
   }
 }
