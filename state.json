@@ -1,6 +1,6 @@
 {
   "next_display_id": 1097,
-  "next_comment_id": 1219,
+  "next_comment_id": 1220,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3283,10 +3283,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T19:10:00.528199762Z",
-      "updated_at": "2026-08-22T19:10:04.526996146Z",
+      "updated_at": "2026-08-22T19:10:21.275497238Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "08d9ee72-9910-4eb3-a031-3da4ad35133c": {
+          "display_id": 1219,
+          "author": "6Vw9",
+          "content": "Implement S-064 in four bounded seams: (1) deterministic manager snapshot with exact trusted server/tool identity, schema/source digest, monotonic generation and explicit fail-closed PermissionsConfig allowlist; (2) JSON Schema 2020-12 validation and generation/availability revalidation at tools/call; (3) one async canonical ToolExecutor path preserving catalogue admission, hooks, enterprise caps, exact permission permits, ToolResult typing and built-in spawn_blocking isolation; (4) TUI request/dispatch/follow-up wiring plus explicit non-advertisement/unavailability for frontends that do not own a local model tool loop. Add adversarial tests for absent/unlisted/renamed/stale/direct-selected/plugin-derived calls and real fixture round trips. Keep S-065/S-066/S-067 protocol/transport/OAuth scope separate. Verify Rust 1.98 local/native/Windows gates and monitor draft PR runners after the required human push.",
+          "created_at": "2026-08-22T19:10:21.273048342Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA0v71ETktrAv6EudAtCMiOcyb7MOmX2JglNPSKxoE5kH9EWIL5+T0daEA/n9dU1DK3rRv4ii8EnhwzNFT5HoMAQ=="
+        }
+      }
     },
     "17222638-e7bf-4b07-b426-51fcec7b4c2c": {
       "uuid": "17222638-e7bf-4b07-b426-51fcec7b4c2c",
@@ -33201,11 +33212,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 994,
       "timestamp": "2026-08-22T19:10:16.819479009Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 995,
+      "timestamp": "2026-08-22T19:10:21.275497238Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T19:10:16.819479009Z",
+    "timestamp": "2026-08-22T19:10:21.275497238Z",
     "agent_id": "6Vw9",
-    "agent_seq": 994
+    "agent_seq": 995
   }
 }
