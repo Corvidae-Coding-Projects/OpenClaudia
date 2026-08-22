@@ -1,6 +1,6 @@
 {
   "next_display_id": 1088,
-  "next_comment_id": 1156,
+  "next_comment_id": 1157,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25391,7 +25391,7 @@
       "parent_uuid": "66ad6d37-42af-4133-830d-fdf7d4cb67ac",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:17:15.887051640Z",
-      "updated_at": "2026-08-22T08:46:43.092879444Z",
+      "updated_at": "2026-08-22T08:48:18.191618241Z",
       "labels": [
         "defect"
       ],
@@ -25413,6 +25413,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcFSi2dWz1PN9cJ9cC6AYz9ylWZga/NDEEiU3iU6jueo8Gw8W600l1aVG5m+keNoUouQb2yB2FZwSd9RtqHCuAA=="
+        },
+        "adfe7871-aff8-4236-bc3b-b6a70b7c4828": {
+          "display_id": 1156,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit 5ce6a619 (Good SSH signature); canonical worktree:sNNN provenance, refreshed corpus/evaluation, exact rejected-review binding, and negative validation tests are committed.",
+          "created_at": "2026-08-22T08:48:18.189088383Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABABSQP0C9l14MY14/BmHsxdQf4ZqPowPFZGF0JQEcBU516cShmTPsl8kV+aXyiMwhlWubf+kz1vl5H/Vqu0lvNCw=="
         }
       }
     },
@@ -31912,11 +31921,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 884,
       "timestamp": "2026-08-22T08:48:13.981191390Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 885,
+      "timestamp": "2026-08-22T08:48:18.191618241Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:48:13.981191390Z",
+    "timestamp": "2026-08-22T08:48:18.191618241Z",
     "agent_id": "6Vw9",
-    "agent_seq": 884
+    "agent_seq": 885
   }
 }
