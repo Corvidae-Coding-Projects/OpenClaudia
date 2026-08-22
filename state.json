@@ -1,6 +1,6 @@
 {
   "next_display_id": 1085,
-  "next_comment_id": 1144,
+  "next_comment_id": 1145,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -12398,10 +12398,21 @@
       "parent_uuid": "66ad6d37-42af-4133-830d-fdf7d4cb67ac",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T06:34:40.318459982Z",
-      "updated_at": "2026-08-22T06:34:44.687679125Z",
+      "updated_at": "2026-08-22T06:46:22.811849836Z",
       "labels": [
         "defect"
-      ]
+      ],
+      "comments": {
+        "1dd408ec-8332-4c58-9502-4cdeeac36dd6": {
+          "display_id": 1144,
+          "author": "6Vw9",
+          "content": "Confirmed library contract Database::add_dependency(target_id, blocker_id) while OpenClaudia passed (blocker, target) and printed blocker -> target. Corrected both add/remove call order. A real isolated SQLite regression now proves DB blockers, canonical graph edges, blocker-aware next selection, close transition, and readiness agree; Rust 1.98 focused Crosslink tests pass 12/12. Commit/closure remain pending the S-052 final gate.",
+          "created_at": "2026-08-22T06:46:22.808900220Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5u6gpkhDSH3xjD3KjFXRDkqLs4RvajNXFTA4ghtgR1Xz3KsoMtiCn+qdefvkfAm4JSksV6RMTthgFy8YU51NCg=="
+        }
+      }
     },
     "706dcde7-cad4-4d11-b9bd-ee4d23d4158f": {
       "uuid": "706dcde7-cad4-4d11-b9bd-ee4d23d4158f",
@@ -31668,11 +31679,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 868,
       "timestamp": "2026-08-22T06:34:44.687679125Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 869,
+      "timestamp": "2026-08-22T06:46:22.811849836Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T06:34:44.687679125Z",
+    "timestamp": "2026-08-22T06:46:22.811849836Z",
     "agent_id": "6Vw9",
-    "agent_seq": 868
+    "agent_seq": 869
   }
 }
