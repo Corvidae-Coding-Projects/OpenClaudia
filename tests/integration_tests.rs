@@ -1437,7 +1437,6 @@ mod web_tools {
 
 mod auto_learn_integration {
     use super::*;
-    use openclaudia::auto_learn::AutoLearner;
 
     fn setup_memory_db() -> (TempDir, MemoryDb) {
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
@@ -1522,46 +1521,6 @@ mod auto_learn_integration {
         let prefs = db.get_all_preferences().unwrap();
         assert_eq!(prefs.len(), 1);
         assert_eq!(prefs[0].category, "style");
-    }
-
-    #[test]
-    fn test_auto_learner_tool_failure_records_error() {
-        let (_dir, db) = setup_memory_db();
-        let mut learner = AutoLearner::new(&db);
-
-        let args = json!({"command": "cargo build"});
-        learner.on_tool_failure(
-            "bash",
-            &args,
-            "error[E0308]: mismatched types\n  --> src/main.rs:42:5",
-        );
-
-        let errors = db.get_error_patterns_for_file("src/main.rs").unwrap();
-        assert_eq!(errors.len(), 1);
-    }
-
-    #[test]
-    fn test_auto_learner_session_end_records_relationships() {
-        let (_dir, db) = setup_memory_db();
-        let mut learner = AutoLearner::new(&db);
-
-        // Use absolute paths to avoid canonicalization mismatches
-        // (normalize_path canonicalizes real files but keeps fictitious ones as-is)
-        let abs_a = std::fs::canonicalize("src/main.rs").map_or_else(
-            |_| "/tmp/test_a.rs".to_string(),
-            |p| p.to_string_lossy().to_string(),
-        );
-        let abs_b = "/tmp/nonexistent_test_b.rs".to_string();
-
-        let args_a = json!({"path": &abs_a});
-        let args_b = json!({"path": &abs_b});
-        learner.on_tool_success("edit_file", &args_a, "ok");
-        learner.on_tool_success("edit_file", &args_b, "ok");
-
-        learner.on_session_end();
-
-        let related = db.get_related_files(&abs_a).unwrap();
-        assert_eq!(related.len(), 1);
     }
 
     #[test]
@@ -1679,6 +1638,7 @@ mod tool_definitions {
             "memory_save",
             "memory_search",
             "memory_list",
+            "memory_learning_status",
             "memory_update",
             "memory_delete",
             "memory_review",

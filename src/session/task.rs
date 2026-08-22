@@ -665,6 +665,25 @@ impl TaskManager {
             .find(|task| task.status == TaskStatus::InProgress)
     }
 
+    /// Return the in-progress task owned by this manager's actor lane.
+    ///
+    /// A session graph may contain delegated workers that are active in
+    /// parallel. Consumers that bind evidence to "the current task" must not
+    /// pick whichever active row happens to appear first in the projection;
+    /// they need the task owned by the exact session lane represented by this
+    /// manager.
+    #[must_use]
+    pub fn current_task_for_actor_lane(&self) -> Option<&Task> {
+        self.projection.iter().find(|task| {
+            task.status == TaskStatus::InProgress
+                && matches!(
+                    &task.ownership,
+                    TaskOwnership::Run { owner }
+                        if owner.session_id == self.actor.session_id
+                )
+        })
+    }
+
     #[must_use]
     pub fn format_task_summary(task: &Task) -> String {
         let status_icon = match task.status {

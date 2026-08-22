@@ -224,6 +224,7 @@ impl AgentType {
                     "web_fetch",
                     "memory_search",
                     "memory_list",
+                    "memory_learning_status",
                     "memory_save",
                     "memory_update",
                     "memory_delete",
@@ -240,6 +241,7 @@ impl AgentType {
                     "web_fetch",
                     "memory_search",
                     "memory_list",
+                    "memory_learning_status",
                     "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
@@ -251,6 +253,7 @@ impl AgentType {
                     "web_fetch",
                     "memory_search",
                     "memory_list",
+                    "memory_learning_status",
                     "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
@@ -270,6 +273,7 @@ impl AgentType {
                     "web_fetch",
                     "memory_search",
                     "memory_list",
+                    "memory_learning_status",
                     "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
@@ -2317,19 +2321,16 @@ async fn run_subagent_inner(
             // list lives in its own bucket. Claude Code uses the
             // `agentId ?? sessionId` fallback; here agent_id is always
             // present. Closes crosslink #518 for subagents.
-            let result = crate::services::tool_executor::ToolExecutor::execute(
-                crate::services::tool_executor::ToolExecutorRequest {
-                    run_context: &subagent_run,
-                    tool_call: &executable_tc,
-                    memory_db: memory_db.as_deref(),
-                    app_config: None,
-                    task_mgr: Some(&mut task_manager),
-                    permission_mgr: &permission_mgr,
-                    authorization: None,
-                    session_id: Some(&agent_id),
-                    policy_enforcer: Some(&policy_enforcer),
-                },
-            );
+            let result = execute_subagent_local_tool(&mut SubagentToolExecution {
+                run: &subagent_run,
+                tool_call: &executable_tc,
+                memory_db: memory_db.as_deref(),
+                app_config,
+                task_manager: &mut task_manager,
+                permission_manager: &permission_mgr,
+                agent_id: &agent_id,
+                policy_enforcer: &policy_enforcer,
+            });
             observe_subagent_tool_result(&subagent_run, &agent_id, &result);
 
             messages.push(json!({
@@ -2861,6 +2862,35 @@ fn observe_subagent_tool_result(
     result: &crate::tools::ToolResult,
 ) {
     crate::grounded_loop::observe_tool_result_for_session(run, agent_id, result);
+}
+
+struct SubagentToolExecution<'a> {
+    run: &'a Arc<crate::tools::ToolRunContext>,
+    tool_call: &'a crate::tools::ToolCall,
+    memory_db: Option<&'a crate::memory::MemoryDb>,
+    app_config: &'a AppConfig,
+    task_manager: &'a mut crate::session::TaskManager,
+    permission_manager: &'a crate::permissions::PermissionManager,
+    agent_id: &'a str,
+    policy_enforcer: &'a crate::services::policy::PolicyEnforcer,
+}
+
+fn execute_subagent_local_tool(
+    request: &mut SubagentToolExecution<'_>,
+) -> crate::tools::ToolResult {
+    crate::services::tool_executor::ToolExecutor::execute(
+        crate::services::tool_executor::ToolExecutorRequest {
+            run_context: request.run,
+            tool_call: request.tool_call,
+            memory_db: request.memory_db,
+            app_config: Some(request.app_config),
+            task_mgr: Some(&mut *request.task_manager),
+            permission_mgr: request.permission_manager,
+            authorization: None,
+            session_id: Some(request.agent_id),
+            policy_enforcer: Some(request.policy_enforcer),
+        },
+    )
 }
 
 // === Tool Execution ===
@@ -4168,6 +4198,7 @@ mod tests {
         for name in [
             "memory_search",
             "memory_list",
+            "memory_learning_status",
             "memory_save",
             "memory_update",
             "memory_delete",
@@ -4182,6 +4213,7 @@ mod tests {
         assert!(!general.contains(&"memory_import"));
         assert!(plan.contains(&"memory_search"));
         assert!(plan.contains(&"memory_list"));
+        assert!(plan.contains(&"memory_learning_status"));
         assert!(plan.contains(&"memory_source_status"));
         assert!(!plan.contains(&"memory_save"));
         assert!(!plan.contains(&"memory_update"));
@@ -4198,6 +4230,77 @@ mod tests {
                 "subagent role {agent_type:?} has no direct host approval channel"
             );
         }
+    }
+
+    #[test]
+    fn subagent_executor_propagates_automatic_learning_policy() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("subagent learning workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), workspace.path())
+                .working_directory(workspace.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .provider("subagent-learning-test")
+                .build()
+                .expect("subagent learning run");
+        let memory = crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("subagent workspace memory");
+        let config: AppConfig = serde_yaml::from_str(
+            r"
+proxy:
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+memory:
+  automatic_learning_enabled: true
+",
+        )
+        .expect("subagent learning config");
+        let mut tasks = crate::session::TaskManager::for_run(&run).expect("subagent task manager");
+        let permissions = crate::permissions::PermissionManager::unrestricted_for_run(&run);
+        let policy = crate::services::policy::PolicyEnforcer::new(
+            crate::services::policy::EnterprisePolicy::default(),
+        );
+        let call = crate::tools::ToolCall {
+            id: "subagent-learning-write".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/subagent_learning.rs",
+                    "content": "pub const SUBAGENT_POLICY_PROPAGATED: bool = true;\n"
+                })
+                .to_string(),
+            },
+        };
+
+        let result = execute_subagent_local_tool(&mut SubagentToolExecution {
+            run: &run,
+            tool_call: &call,
+            memory_db: Some(&memory),
+            app_config: &config,
+            task_manager: &mut tasks,
+            permission_manager: &permissions,
+            agent_id: "subagent-learning-policy",
+            policy_enforcer: &policy,
+        });
+        assert!(
+            !result.is_error(),
+            "subagent write failed: {}",
+            result.content()
+        );
+        assert!(result.observations().iter().any(|observation| {
+            observation.kind == "technical_learning_capture" && !observation.authoritative
+        }));
+        crate::tools::retire_run(&run);
     }
 
     #[test]

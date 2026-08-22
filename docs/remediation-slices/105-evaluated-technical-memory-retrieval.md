@@ -119,22 +119,24 @@ SHA-256 digests are:
 - tuning corpus:
   `edf98143eb3eb7b48170b6d8204a25e1622b8baef074a4792efba2d19c4f825d`;
 - held-out corpus:
-  `6cc7bd6028c8c01fe73a4836c4fe80972ebce63f78f7290d3237974742ad8173`;
+  `fbb03c70923022df4d7f40f3fc6780f439ffa22bbb4eb19ecf134540d8b84ca9`;
 - evaluation:
-  `7f9765542cf8041b77d431e21077bd6ad7a77faa3117f507dc5e9a66bf13a9f8`;
+  `83cf41b408fa7f02af8b6dfbf4c81e6b8e21f9195cfe319b40d53d8c6b24fbe1`;
 - deliberately rejected review:
-  `fae2ac9f8e87f950c92b2e0d2099b918776dcfda3bc07c14b3d43feac89339c4`.
+  `cc9ec9c19fbb5b851e078527eb1819e60d2c50692d1c491ec7115621ef96bcf0`.
 
 S-052 subsequently changed the still-cited `src/main.rs` while preserving the
-tested migration-doctor contract. Its final-environment citation now carries
-the honest bounded provenance label `worktree:s052`; the checked-in generator
-rebuilt the evaluation and the deliberately rejected review was rebound to the
-new exact artifacts. Canonical `worktree:sNNN` labels allow later slices to do
-the same without falsely retaining a historical Git generation.
+tested migration-doctor contract. S-055 later removed only the unrelated legacy
+prose-learning startup/finalization callbacks from that file. The current
+final-environment citation therefore carries the honest bounded provenance
+label `worktree:s055`; the checked-in generator rebuilt the evaluation and the
+deliberately rejected review was rebound to the new exact artifacts. Canonical
+`worktree:sNNN` labels allow later slices to do the same without falsely
+retaining a historical Git generation.
 
 The SHA-256 digest of the sorted `sha256sum` manifest for the 15 changed
 non-slice artifacts is
-`70c9b9c793e3089cb2291f9ae4a395a1ab88902302b69e2d1007b14f41006c7c`.
+`fd2dbddf86f24f5e91ae7adbb1dcb7c34f76e56c79bd047a53953b45d40f6604`.
 
 All Rust commands used Rust 1.98.0 and `CARGO_BUILD_JOBS=4`; every test command
 used `--test-threads=1`.

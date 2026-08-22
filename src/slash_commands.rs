@@ -111,13 +111,14 @@ const CORE: &[SlashCommand] = &[
 ];
 
 const MEMORY: &[SlashCommand] = &[
-    cmd("/memory", "Show auto-learning stats"),
-    cmd("/memory patterns", "Show learned coding patterns"),
-    cmd("/memory errors <path>", "Show known errors for a file"),
-    cmd("/memory prefs", "Show learned preferences"),
+    cmd("/memory", "Show causal technical-learning status"),
+    cmd("/memory list", "List typed codebase technical lessons"),
+    cmd("/memory patterns", "Show legacy coding-pattern data"),
+    cmd("/memory errors <path>", "Show legacy error-pattern data"),
+    cmd("/memory prefs", "Show legacy preference data"),
     cmd(
         "/memory files <path>",
-        "Show co-edit relationships for a file",
+        "Show legacy co-edit relationship data",
     ),
     cmd(
         "/memory reset",

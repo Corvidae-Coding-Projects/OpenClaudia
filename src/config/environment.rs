@@ -264,6 +264,7 @@ enum ConfigField {
     PermissionsEnabled,
     PermissionsDefaultAllow,
     PermissionsMcp,
+    MemoryAutomaticLearningEnabled,
     MemoryTeamId,
     MemoryTeamMemoryPath,
     WebFetchDistillationEnabled,
@@ -767,6 +768,15 @@ const APP_FIELDS: &[FieldDefinition] = &[
         "OPENCLAUDIA_PERMISSIONS_MCP",
         JsonStringListMap,
         Sensitive,
+        true
+    ),
+    field!(
+        ConfigField::MemoryAutomaticLearningEnabled,
+        "memory.automatic_learning_enabled",
+        "OPENCLAUDIA_MEMORY__AUTOMATIC_LEARNING_ENABLED",
+        "OPENCLAUDIA_MEMORY_AUTOMATIC_LEARNING_ENABLED",
+        Boolean,
+        Public,
         true
     ),
     field!(
@@ -1899,6 +1909,9 @@ fn apply_value(
                 &invalid,
             )?;
         }
+        ConfigField::MemoryAutomaticLearningEnabled => {
+            config.memory.automatic_learning_enabled = expect_value!(Boolean);
+        }
         ConfigField::MemoryTeamId => {
             config.memory.team_id = Some(expect_value!(String).parse().map_err(
                 |error: crate::team_memory::TeamAuthorityError| {
@@ -2469,7 +2482,8 @@ mod tests {
             | ConfigField::GuardrailsBlastRadiusMaxToolCallsPerRun
             | ConfigField::GuardrailsBlastRadiusMaxMutationsPerRun => "7",
             ConfigField::VddThresholdsMinIterations => "1",
-            ConfigField::VddEnabled
+            ConfigField::MemoryAutomaticLearningEnabled
+            | ConfigField::VddEnabled
             | ConfigField::GuardrailsBlastRadiusEnabled
             | ConfigField::GuardrailsDiffMonitorEnabled
             | ConfigField::GuardrailsQualityGatesEnabled
@@ -2742,6 +2756,9 @@ mod tests {
                 assert_eq!(config.permissions.mcp.len(), 1);
                 assert_eq!(config.permissions.mcp["typed-server"], ["typed-tool"]);
             }
+            ConfigField::MemoryAutomaticLearningEnabled => {
+                assert!(config.memory.automatic_learning_enabled);
+            }
             ConfigField::MemoryTeamId => assert_eq!(
                 config
                     .memory
@@ -2910,6 +2927,7 @@ permissions:
   mcp:
     file-server: ["file-tool"]
 memory:
+  automatic_learning_enabled: false
   team_id: team-fedcba9876543210fedcba9876543210
   team_memory_path: file-memory
 web_fetch:

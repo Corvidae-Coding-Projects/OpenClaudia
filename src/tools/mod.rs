@@ -10,6 +10,7 @@
 //! - `memory_save`: Store one cited, codebase-specific technical lesson
 //! - `memory_search`: Retrieve bounded cited lessons as reference evidence
 //! - `memory_list`: List recent typed lessons
+//! - `memory_learning_status`: Inspect causal capture and degradation metadata
 //! - `memory_update`: Create a causal correction of an exact lesson revision
 //! - `memory_delete`: Tombstone an exact lesson revision
 //! - `memory_review`: Apply or revoke a fresh host-authorized review
@@ -138,6 +139,8 @@ pub use security::{
     ToolCapabilityError, ToolExecutableError, ToolResource, ToolRunContext, ToolRunContextBuilder,
     WorkspaceAccess,
 };
+
+pub(crate) const TECHNICAL_LEARNING_CAPTURE_OBSERVATION_KIND: &str = "technical_learning_capture";
 pub use todo::{clear_all_todo_lists, clear_todo_list, get_todo_list, TodoItem, TodoStatus};
 /// Web-fetch output formatter + cap constant. Curated re-export so the
 /// content-extraction E2E tests (`tests/web_content_extraction_e2e.rs`,
@@ -193,6 +196,7 @@ pub fn retire_run(run: &ToolRunContext) {
     let sandbox_processes = cancel_run_sandbox_processes(run);
     let background_shells = BACKGROUND_SHELLS.kill_for_run(run);
     let background_agents = crate::subagent::BACKGROUND_AGENTS.stop_all_for_run(run);
+    crate::auto_learn::retire_run(run);
     tracing::info!(
         target: "openclaudia::capabilities",
         event = "run_retired",
@@ -400,7 +404,34 @@ fn dispatch_registered_with_permit(
     if !result.is_error() {
         guardrail_reservation.commit();
     }
-    result
+    attach_automatic_learning(
+        ctx.run,
+        ctx.memory_db,
+        ctx.app_config,
+        ctx.task_mgr.as_deref(),
+        result,
+    )
+}
+
+fn attach_automatic_learning(
+    run: &ToolRunContext,
+    memory_db: Option<&MemoryDb>,
+    app_config: Option<&AppConfig>,
+    task_manager: Option<&TaskManager>,
+    result: ToolResult,
+) -> ToolResult {
+    if !app_config.is_some_and(|config| config.memory.automatic_learning_enabled) {
+        return result;
+    }
+    let Some(memory_db) = memory_db else {
+        return result;
+    };
+    let Some(receipt) =
+        crate::auto_learn::observe_tool_result(run, memory_db, task_manager, &result)
+    else {
+        return result;
+    };
+    result.with_observation(receipt.into_tool_observation())
 }
 
 fn dispatch_registered_after_authorization(
@@ -629,7 +660,7 @@ fn execute_tool_full_after_authorization(
             reservation.commit();
         }
     }
-    result
+    attach_automatic_learning(run, memory_db, app_config, None, result)
 }
 
 /// Get all tool definitions, optionally including subagent tools

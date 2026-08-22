@@ -2147,17 +2147,32 @@ impl AcpServer {
         }
 
         let result = match tool_name {
-            "read_file" => self.acp_read_file(run, session_id, &args).await,
-            "write_file" => self.acp_write_file(run, session_id, &args).await,
-            "edit_file" => self.acp_edit_file(run, session_id, &args).await,
+            "read_file" => {
+                self.acp_read_file(run, session_id, tool_call_id, &args)
+                    .await
+            }
+            "write_file" => {
+                self.acp_write_file(run, session_id, tool_call_id, &args)
+                    .await
+            }
+            "edit_file" => {
+                self.acp_edit_file(run, session_id, tool_call_id, &args)
+                    .await
+            }
             // Shells must run through the local executor: delegating these to
             // an arbitrary ACP client's terminal/create API bypasses
             // OpenClaudia's OS sandbox entirely.
-            "bash" => self.acp_bash(run, session_id, &args).await,
-            "bash_output" => self.acp_bash_output(run, session_id, &args),
-            "kill_shell" => self.acp_kill_shell(run, session_id, &args),
-            "list_files" => self.acp_list_files(run, session_id, &args).await,
-            "glob" | "grep" => self.acp_search(run, session_id, &args, tool_name).await,
+            "bash" => self.acp_bash(run, session_id, tool_call_id, &args).await,
+            "bash_output" => self.acp_bash_output(run, session_id, tool_call_id, &args),
+            "kill_shell" => self.acp_kill_shell(run, session_id, tool_call_id, &args),
+            "list_files" => {
+                self.acp_list_files(run, session_id, tool_call_id, &args)
+                    .await
+            }
+            "glob" | "grep" => {
+                self.acp_search(run, session_id, tool_call_id, &args, tool_name)
+                    .await
+            }
             // SQLite work belongs on the blocking pool; it still retains the
             // provider's exact invocation ID for typed provenance.
             "memory_search"
@@ -2168,6 +2183,7 @@ impl AcpServer {
             | "memory_export"
             | "memory_import"
             | "memory_list"
+            | "memory_learning_status"
             | "memory_source_status"
             | "memory_source_refresh" => {
                 self.execute_local_tool_async(
@@ -2235,6 +2251,7 @@ impl AcpServer {
             arguments_json,
             policy_enforcer: Some(self.policy_enforcer.as_ref()),
             memory_db: Some(self.memory_db.as_ref()),
+            app_config: Some(&self.config),
             task_managers: Arc::clone(&self.task_managers),
         })
     }
@@ -2254,6 +2271,7 @@ impl AcpServer {
         let permission_mgr = self.permission_manager_for_run(run);
         let policy_enforcer = Arc::clone(&self.policy_enforcer);
         let memory_db = Arc::clone(&self.memory_db);
+        let app_config = self.config.clone();
         let task_managers = Arc::clone(&self.task_managers);
         let session_id = session_id.to_string();
         let tool_call_id = tool_call_id.to_string();
@@ -2275,6 +2293,7 @@ impl AcpServer {
                 arguments_json: &arguments_json,
                 policy_enforcer: Some(policy_enforcer.as_ref()),
                 memory_db: Some(memory_db.as_ref()),
+                app_config: Some(&app_config),
                 task_managers,
             })
         });
@@ -2334,6 +2353,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
     ) -> AcpToolResult {
         let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
@@ -2367,7 +2387,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
-            "acp-normalized-read-file",
+            tool_call_id,
             "read_file",
             &Value::Object(local_args).to_string(),
         )
@@ -2378,6 +2398,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
     ) -> AcpToolResult {
         let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
@@ -2393,7 +2414,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
-            "acp-normalized-write-file",
+            tool_call_id,
             "write_file",
             &json!({"path": path, "content": content}).to_string(),
         )
@@ -2404,6 +2425,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
     ) -> AcpToolResult {
         let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
@@ -2430,7 +2452,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
-            "acp-normalized-edit-file",
+            tool_call_id,
             "edit_file",
             &json!({
                 "path": path,
@@ -2449,6 +2471,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
     ) -> AcpToolResult {
         let command = match parse_acp_required_string_arg(args, "command") {
@@ -2467,7 +2490,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
-            "acp-normalized-bash",
+            tool_call_id,
             "bash",
             &local_args.to_string(),
         )
@@ -2478,6 +2501,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
     ) -> AcpToolResult {
         let shell_id = match parse_acp_required_alias_string_arg(
@@ -2492,7 +2516,7 @@ impl AcpServer {
         self.execute_local_tool(
             run,
             session_id,
-            "acp-normalized-bash-output",
+            tool_call_id,
             "bash_output",
             &json!({"shell_id": shell_id}).to_string(),
         )
@@ -2502,6 +2526,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
     ) -> AcpToolResult {
         let shell_id = match parse_acp_required_alias_string_arg(
@@ -2516,7 +2541,7 @@ impl AcpServer {
         self.execute_local_tool(
             run,
             session_id,
-            "acp-normalized-kill-shell",
+            tool_call_id,
             "kill_shell",
             &json!({"shell_id": shell_id}).to_string(),
         )
@@ -2526,6 +2551,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
     ) -> AcpToolResult {
         let path = match parse_acp_optional_string_arg(args, "path", ".") {
@@ -2535,7 +2561,7 @@ impl AcpServer {
         self.execute_local_tool_async(
             run,
             session_id,
-            "acp-normalized-list-files",
+            tool_call_id,
             "list_files",
             &json!({"path": path}).to_string(),
         )
@@ -2546,6 +2572,7 @@ impl AcpServer {
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         tool_args: &HashMap<String, Value>,
         tool_name: &str,
     ) -> AcpToolResult {
@@ -2558,14 +2585,8 @@ impl AcpServer {
                 }
             }
         };
-        self.execute_local_tool_async(
-            run,
-            session_id,
-            "acp-normalized-search",
-            tool_name,
-            &arguments_json,
-        )
-        .await
+        self.execute_local_tool_async(run, session_id, tool_call_id, tool_name, &arguments_json)
+            .await
     }
 }
 
@@ -2605,6 +2626,7 @@ struct AcpLocalToolRequest<'a> {
     arguments_json: &'a str,
     policy_enforcer: Option<&'a crate::services::policy::PolicyEnforcer>,
     memory_db: Option<&'a crate::memory::MemoryDb>,
+    app_config: Option<&'a AppConfig>,
     task_managers: SharedAcpTaskManagers,
 }
 
@@ -2620,6 +2642,7 @@ fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpTo
         arguments_json,
         policy_enforcer,
         memory_db,
+        app_config,
         task_managers,
     } = request;
 
@@ -2670,7 +2693,7 @@ fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpTo
                 run_context: run,
                 tool_call: &tc,
                 memory_db,
-                app_config: None,
+                app_config,
                 task_mgr: Some(&mut manager),
                 permission_mgr,
                 authorization: None,
@@ -2684,7 +2707,7 @@ fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpTo
                 run_context: run,
                 tool_call: &tc,
                 memory_db,
-                app_config: None,
+                app_config,
                 task_mgr: None,
                 permission_mgr,
                 authorization: None,
@@ -4088,6 +4111,8 @@ permissions:
   # interactive approval. Match the fixture's former explicit unrestricted
   # manager while keeping the manager bound to the exact test run.
   enabled: false
+memory:
+  automatic_learning_enabled: true
 "#,
         )
         .expect("test config")
@@ -4352,6 +4377,31 @@ permissions:
         }
     }
 
+    async fn assert_acp_automatic_learning_status(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let status = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-learning-status",
+            "memory_learning_status",
+            json!({}),
+        )
+        .await;
+        assert!(
+            !status.is_error,
+            "ACP memory_learning_status failed: {}",
+            status.content
+        );
+        assert!(
+            status.content.contains("Automatic technical learning")
+                && status.content.contains("enabled"),
+            "ACP must expose the configured bounded learning status: {}",
+            status.content
+        );
+    }
+
     #[tokio::test]
     async fn acp_routes_every_typed_memory_operation_to_its_host_store() {
         let (server, _rx, _tmp) = test_server();
@@ -4370,6 +4420,8 @@ permissions:
             "ACP memory_list failed: {}",
             listed.content
         );
+
+        assert_acp_automatic_learning_status(&server, &run).await;
 
         assert_acp_memory_source_routes(&server, &run).await;
 
@@ -4458,6 +4510,107 @@ permissions:
             "ACP memory_search failed: {}",
             searched.content
         );
+    }
+
+    #[tokio::test]
+    async fn acp_automatic_learning_citations_bind_provider_call_ids() {
+        let (server, _rx, _host) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let fixture = tempfile::tempdir_in(run.project_root()).expect("project-local fixture");
+        let relative_dir = fixture
+            .path()
+            .strip_prefix(run.project_root())
+            .expect("fixture below project root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source_path = format!("{relative_dir}/learning_probe.rs");
+        let output_path = format!("{relative_dir}/learning_probe.rmeta");
+        let broken_source = "pub const VALUE: u8 = ;\n";
+        let fixed_source = "pub const VALUE: u8 = 1;\n";
+
+        let initial = execute_acp_memory_tool(
+            &server,
+            &run,
+            "acp-learning-initial-write",
+            "write_file",
+            json!({"path": source_path, "content": broken_source}),
+        )
+        .await;
+        assert!(!initial.is_error, "initial ACP write failed: {initial:?}");
+
+        let command = format!(
+            "rustc --crate-name acp_learning_probe {} --crate-type lib --emit metadata -o {}",
+            shlex::try_quote(&source_path).expect("quote source path"),
+            shlex::try_quote(&output_path).expect("quote output path")
+        );
+        let failure_id = "acp-learning-check-failure";
+        let _failed = execute_acp_memory_tool(
+            &server,
+            &run,
+            failure_id,
+            "bash",
+            json!({"command": command.clone()}),
+        )
+        .await;
+
+        let read = execute_acp_memory_tool(
+            &server,
+            &run,
+            "acp-learning-read",
+            "read_file",
+            json!({"path": source_path}),
+        )
+        .await;
+        assert!(!read.is_error, "ACP read failed: {read:?}");
+
+        let edit_id = "acp-learning-edit";
+        let edit = execute_acp_memory_tool(
+            &server,
+            &run,
+            edit_id,
+            "edit_file",
+            json!({
+                "path": source_path,
+                "old_string": broken_source,
+                "new_string": fixed_source
+            }),
+        )
+        .await;
+        assert!(!edit.is_error, "ACP edit failed: {edit:?}");
+
+        let success_id = "acp-learning-check-success";
+        let passed = execute_acp_memory_tool(
+            &server,
+            &run,
+            success_id,
+            "bash",
+            json!({"command": command}),
+        )
+        .await;
+        assert!(!passed.is_error, "ACP verification failed: {passed:?}");
+
+        let records = server
+            .memory_db
+            .query_technical_lessons(None, 5, chrono::Utc::now().timestamp())
+            .expect("query ACP learning candidate")
+            .records;
+        assert_eq!(records.len(), 1);
+        let locators = records[0]
+            .lesson
+            .citations
+            .iter()
+            .map(|citation| citation.locator.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for call_id in [failure_id, edit_id, success_id] {
+            let expected = format!(
+                "tool-call-digest:{}",
+                crate::memory::MemoryDigest::sha256(call_id.as_bytes())
+            );
+            assert!(
+                locators.contains(expected.as_str()),
+                "missing exact ACP call citation {expected}: {locators:?}"
+            );
+        }
     }
 
     #[test]
@@ -4553,7 +4706,7 @@ blast_radius:
         let args = HashMap::from([("path".to_string(), json!(["src/lib.rs"]))]);
 
         let result = server
-            .acp_read_file(test_run(&server), "acp-bad-path", &args)
+            .acp_read_file(test_run(&server), "acp-bad-path", "call-bad-path", &args)
             .await;
 
         assert!(result.is_error, "bad path must error: {result:?}");
@@ -4576,7 +4729,12 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_read_file(test_run(&server), "acp-bad-offset", &args)
+            .acp_read_file(
+                test_run(&server),
+                "acp-bad-offset",
+                "call-bad-offset",
+                &args,
+            )
             .await;
 
         assert!(result.is_error, "bad offset must error: {result:?}");
@@ -4602,7 +4760,7 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_read_file(test_run(&server), "acp-bad-limit", &args)
+            .acp_read_file(test_run(&server), "acp-bad-limit", "call-bad-limit", &args)
             .await;
 
         assert!(result.is_error, "zero limit must error: {result:?}");
@@ -4626,7 +4784,12 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_write_file(test_run(&server), "acp-bad-content", &args)
+            .acp_write_file(
+                test_run(&server),
+                "acp-bad-content",
+                "call-bad-content",
+                &args,
+            )
             .await;
 
         assert!(result.is_error, "bad content must error: {result:?}");
@@ -4649,7 +4812,12 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_write_file(test_run(&server), "acp-bad-write-path", &args)
+            .acp_write_file(
+                test_run(&server),
+                "acp-bad-write-path",
+                "call-bad-write-path",
+                &args,
+            )
             .await;
 
         assert!(result.is_error, "bad file_path must error: {result:?}");
@@ -4679,7 +4847,7 @@ blast_radius:
             .expect("fixture has a second line")
             .to_string();
         let result = server
-            .acp_read_file(test_run(&server), "acp-window", &args)
+            .acp_read_file(test_run(&server), "acp-window", "call-window", &args)
             .await;
 
         assert!(!result.is_error, "valid window must succeed: {result:?}");
@@ -4712,6 +4880,7 @@ blast_radius:
             .acp_read_file(
                 test_run(&server),
                 "acp-capability-jail",
+                "call-capability-read",
                 &HashMap::from([(
                     "path".to_string(),
                     Value::String(sentinel.to_string_lossy().into_owned()),
@@ -4725,6 +4894,7 @@ blast_radius:
             .acp_write_file(
                 test_run(&server),
                 "acp-capability-jail",
+                "call-capability-write",
                 &HashMap::from([
                     (
                         "path".to_string(),
@@ -4744,6 +4914,7 @@ blast_radius:
             .acp_read_file(
                 test_run(&server),
                 "acp-capability-jail",
+                "call-capability-traversal",
                 &HashMap::from([(
                     "path".to_string(),
                     Value::String("../outside.txt".to_string()),
@@ -4756,6 +4927,7 @@ blast_radius:
             .acp_search(
                 test_run(&server),
                 "acp-capability-jail",
+                "call-capability-search",
                 &HashMap::from([
                     ("pattern".to_string(), Value::String("outside".to_string())),
                     (
@@ -4778,6 +4950,7 @@ blast_radius:
                 .acp_read_file(
                     test_run(&server),
                     "acp-capability-jail",
+                    "call-capability-symlink",
                     &HashMap::from([(
                         "path".to_string(),
                         Value::String(link.to_string_lossy().into_owned()),
@@ -4870,7 +5043,12 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_edit_file(test_run(&server), "acp-bad-old-string", &args)
+            .acp_edit_file(
+                test_run(&server),
+                "acp-bad-old-string",
+                "call-bad-old-string",
+                &args,
+            )
             .await;
 
         assert!(result.is_error, "bad old_string must error: {result:?}");
@@ -4894,7 +5072,12 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_edit_file(test_run(&server), "acp-bad-new-string", &args)
+            .acp_edit_file(
+                test_run(&server),
+                "acp-bad-new-string",
+                "call-bad-new-string",
+                &args,
+            )
             .await;
 
         assert!(result.is_error, "bad new_string must error: {result:?}");
@@ -4919,7 +5102,12 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_edit_file(test_run(&server), "acp-bad-replace-all", &args)
+            .acp_edit_file(
+                test_run(&server),
+                "acp-bad-replace-all",
+                "call-bad-replace-all",
+                &args,
+            )
             .await;
 
         assert!(result.is_error, "bad replace_all must error: {result:?}");
@@ -4938,7 +5126,12 @@ blast_radius:
         let args = HashMap::from([("command".to_string(), json!(["echo nope"]))]);
 
         let result = server
-            .acp_bash(test_run(&server), "acp-bad-command", &args)
+            .acp_bash(
+                test_run(&server),
+                "acp-bad-command",
+                "call-bad-command",
+                &args,
+            )
             .await;
 
         assert!(result.is_error, "bad command must error: {result:?}");
@@ -4961,7 +5154,12 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_bash(test_run(&server), "acp-bad-background", &args)
+            .acp_bash(
+                test_run(&server),
+                "acp-bad-background",
+                "call-bad-background",
+                &args,
+            )
             .await;
 
         assert!(
@@ -4986,7 +5184,12 @@ blast_radius:
         ]);
 
         let result = server
-            .acp_bash(test_run(&server), "acp-local-bash", &args)
+            .acp_bash(
+                test_run(&server),
+                "acp-local-bash",
+                "call-local-bash",
+                &args,
+            )
             .await;
 
         assert!(!result.is_error, "local ACP bash failed: {result:?}");
@@ -5033,7 +5236,12 @@ blast_radius:
 
         let started = std::time::Instant::now();
         let result = server
-            .acp_bash(test_run(&server), "acp-cancel-tree", &args)
+            .acp_bash(
+                test_run(&server),
+                "acp-cancel-tree",
+                "call-cancel-tree",
+                &args,
+            )
             .await;
         assert!(
             result.is_error,
@@ -5059,7 +5267,12 @@ blast_radius:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("shell_id".to_string(), json!(42))]);
 
-        let result = server.acp_bash_output(test_run(&server), "acp-bad-output", &args);
+        let result = server.acp_bash_output(
+            test_run(&server),
+            "acp-bad-output",
+            "call-bad-output",
+            &args,
+        );
 
         assert!(result.is_error, "bad shell_id must error: {result:?}");
         assert!(
@@ -5077,7 +5290,8 @@ blast_radius:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("terminal_id".to_string(), json!({"id": "term"}))]);
 
-        let result = server.acp_kill_shell(test_run(&server), "acp-bad-kill", &args);
+        let result =
+            server.acp_kill_shell(test_run(&server), "acp-bad-kill", "call-bad-kill", &args);
 
         assert!(result.is_error, "bad terminal_id must error: {result:?}");
         assert!(
@@ -5096,7 +5310,12 @@ blast_radius:
         let args = HashMap::from([("path".to_string(), json!(false))]);
 
         let result = server
-            .acp_list_files(test_run(&server), "acp-bad-list-path", &args)
+            .acp_list_files(
+                test_run(&server),
+                "acp-bad-list-path",
+                "call-bad-list-path",
+                &args,
+            )
             .await;
 
         assert!(result.is_error, "bad list path must error: {result:?}");
@@ -5571,6 +5790,7 @@ mod acp_permission_gate_tests {
             arguments_json: arguments,
             policy_enforcer: None,
             memory_db: None,
+            app_config: None,
             task_managers: Arc::clone(&task_managers),
         });
         assert!(!first.is_error, "{}", first.content);
@@ -5593,6 +5813,7 @@ mod acp_permission_gate_tests {
             arguments_json: r#"{"expected_generation":0,"subject":"task B","description":"B"}"#,
             policy_enforcer: None,
             memory_db: None,
+            app_config: None,
             task_managers: Arc::clone(&task_managers),
         });
         assert!(!second.is_error, "{}", second.content);
@@ -5617,6 +5838,7 @@ mod acp_permission_gate_tests {
             arguments_json: r#"{"command":"cargo test"}"#,
             policy_enforcer: None,
             memory_db: None,
+            app_config: None,
             task_managers: task_managers(),
         });
 
@@ -5646,6 +5868,7 @@ mod acp_permission_gate_tests {
             arguments_json: r#"{"command":"git status --short"}"#,
             policy_enforcer: None,
             memory_db: None,
+            app_config: None,
             task_managers: task_managers(),
         });
 
@@ -5673,6 +5896,7 @@ mod acp_permission_gate_tests {
             arguments_json: &arguments,
             policy_enforcer: None,
             memory_db: None,
+            app_config: None,
             task_managers: task_managers(),
         });
 

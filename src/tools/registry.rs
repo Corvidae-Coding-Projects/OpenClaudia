@@ -1477,6 +1477,50 @@ impl ToolHandler for MemoryListHandler {
     }
 }
 
+struct MemoryLearningStatusHandler;
+impl ToolHandler for MemoryLearningStatusHandler {
+    fn name(&self) -> &'static str {
+        "memory_learning_status"
+    }
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_MEMORY
+    }
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::read_only("MemoryLearningRead")
+    }
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory_learning_status",
+                "description": "Inspect bounded automatic technical-learning health for this exact run: pending causal checks, private untrusted candidates, contradictions, and degraded capture events. It returns metadata only and never captures conversation prose.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {}
+                }
+            }
+        })
+    }
+    fn execute(
+        &self,
+        _permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        memory_tool::execute_learning_status(
+            ctx.run,
+            ctx.memory_db,
+            ctx.app_config
+                .is_some_and(|config| config.memory.automatic_learning_enabled),
+            args,
+        )
+    }
+}
+
 struct MemoryUpdateHandler;
 impl ToolHandler for MemoryUpdateHandler {
     fn name(&self) -> &'static str {
@@ -2340,10 +2384,10 @@ impl ToolHandler for CronListHandler {
 // ── plan_mode ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "browser")]
-const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, task_get, task_list, memory_search, memory_list, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, task_get, task_list, memory_search, memory_list, memory_learning_status, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
 
 #[cfg(not(feature = "browser"))]
-const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, bash_output, todo_read, task_get, task_list, memory_search, memory_list, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. Browser-backed web_search and web_browser are unavailable in this build. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, bash_output, todo_read, task_get, task_list, memory_search, memory_list, memory_learning_status, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. Browser-backed web_search and web_browser are unavailable in this build. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
 
 struct EnterPlanModeHandler;
 impl ToolHandler for EnterPlanModeHandler {
@@ -3086,6 +3130,7 @@ static HANDLERS: &[&dyn ToolHandler] = &[
     &MemorySaveHandler,
     &MemorySearchHandler,
     &MemoryListHandler,
+    &MemoryLearningStatusHandler,
     &MemoryUpdateHandler,
     &MemoryDeleteHandler,
     &MemoryReviewHandler,

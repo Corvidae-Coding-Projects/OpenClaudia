@@ -23,6 +23,14 @@ use crate::team_memory::TeamId;
 /// silently claiming production activation.
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct MemoryConfig {
+    /// Permit the canonical executor to derive review-due technical-lesson
+    /// candidates from exact verification failure/edit/success receipts.
+    ///
+    /// This is deliberately opt-in. Enabling it never permits transcript or
+    /// prompt capture, and learned candidates remain private, cited, untrusted
+    /// reference evidence with bounded review retention.
+    #[serde(default)]
+    pub automatic_learning_enabled: bool,
     /// Host-approved team selected for this repository.
     ///
     /// The identifier is only a selector. Loading it never creates or widens
@@ -50,6 +58,7 @@ mod tests {
     #[test]
     fn default_has_no_team_path() {
         let cfg = MemoryConfig::default();
+        assert!(!cfg.automatic_learning_enabled);
         assert!(cfg.team_id.is_none());
         assert!(cfg.team_memory_path.is_none());
     }
@@ -62,6 +71,13 @@ mod tests {
             cfg.team_id.as_ref().map(TeamId::as_str),
             Some("team-0123456789abcdef0123456789abcdef")
         );
+    }
+
+    #[test]
+    fn automatic_learning_requires_explicit_opt_in() {
+        let cfg: MemoryConfig = serde_yaml::from_str("automatic_learning_enabled: true\n")
+            .expect("valid automatic-learning policy");
+        assert!(cfg.automatic_learning_enabled);
     }
 
     #[test]

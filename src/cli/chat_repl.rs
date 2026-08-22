@@ -66,6 +66,7 @@ struct CliToolExecution<'a> {
     run_context: &'a std::sync::Arc<tools::ToolRunContext>,
     tool_call: &'a tools::ToolCall,
     memory_db: Option<&'a memory::MemoryDb>,
+    app_config: &'a config::AppConfig,
     task_manager: &'a std::sync::Mutex<session::TaskManager>,
     permission_mgr: &'a PermissionManager,
     authorization: Option<ExecutionPermit>,
@@ -78,6 +79,7 @@ fn execute_tool_with_memory_after_permission(request: CliToolExecution<'_>) -> t
         run_context,
         tool_call,
         memory_db,
+        app_config,
         task_manager,
         permission_mgr,
         authorization,
@@ -90,7 +92,7 @@ fn execute_tool_with_memory_after_permission(request: CliToolExecution<'_>) -> t
                 run_context,
                 tool_call,
                 memory_db,
-                app_config: None,
+                app_config: Some(app_config),
                 task_mgr,
                 permission_mgr,
                 authorization,
@@ -227,9 +229,6 @@ pub struct ChatRepl {
     audit_logger: openclaudia::session::AuditLogger,
     memory_db: Option<memory::MemoryDb>,
     task_manager: std::sync::Mutex<session::TaskManager>,
-    // `auto_learner` borrows `memory_db` so it can't live on the same
-    // struct (self-referential). It is constructed once in `run` and
-    // threaded into any method that needs it via `&mut Option<_>`.
     permissions: openclaudia::permissions::LocalApprovalCache,
     transient_allowed_tool_rules: Vec<PermissionRule>,
     transient_model_restore: Option<String>,
@@ -625,29 +624,17 @@ impl ChatRepl {
         })
     }
 
-    /// Drive the readline loop until the user exits. `auto_learner`
-    /// is owned by `run` (it borrows `self.memory_db` only) and
-    /// threaded into the few methods that need it via parameter; this
-    /// side-steps the self-referential-struct problem without adding
-    /// `unsafe` or changing the upstream `AutoLearner` lifetime.
+    /// Drive the readline loop until the user exits.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        // Split the borrow: take memory_db out so the learner can
-        // hold a stable borrow, then pass `memory_db.as_ref()` to
-        // every site that used to call `memory_db`.
         let memory_db = self.memory_db.take();
-        let mut auto_learner: Option<openclaudia::auto_learn::AutoLearner<'_>> = memory_db
-            .as_ref()
-            .map(openclaudia::auto_learn::AutoLearner::new);
 
         loop {
             let prompt = self.build_prompt_string();
             let readline = self.rl.readline(&prompt);
             match readline {
                 Ok(line) => {
-                    let should_break = self
-                        .process_line(line, memory_db.as_ref(), &mut auto_learner)
-                        .await?
-                        == Some(true);
+                    let should_break =
+                        self.process_line(line, memory_db.as_ref()).await? == Some(true);
                     self.analytics_subscriber.drain_pending();
                     if should_break {
                         break;
@@ -665,7 +652,6 @@ impl ChatRepl {
             }
         }
         finalize_chat(
-            &mut auto_learner,
             &self.chat_session,
             memory_db.as_ref(),
             &mut self.rl,
@@ -683,8 +669,6 @@ impl ChatRepl {
             .run(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
             .await;
         tools::retire_run(&self.run_context);
-        // Drop the learner before memory_db.
-        drop(auto_learner);
         drop(memory_db);
         println!("\nGoodbye!");
         Ok(())
@@ -726,7 +710,6 @@ impl ChatRepl {
         &mut self,
         line: String,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> anyhow::Result<Option<bool>> {
         let mut input = line.trim().to_string();
         let mut editor_message_added = false;
@@ -786,7 +769,7 @@ impl ChatRepl {
             }
         }
 
-        if !editor_message_added && !self.prepare_user_message(&input, auto_learner).await {
+        if !editor_message_added && !self.prepare_user_message(&input).await {
             self.clear_transient_prompt_options();
             return Ok(Some(false));
         }
@@ -868,13 +851,7 @@ impl ChatRepl {
             headers: &headers,
         };
         let exit = self
-            .send_and_process_turn(
-                transport,
-                request_body,
-                &prompt_blocks,
-                memory_db,
-                auto_learner,
-            )
+            .send_and_process_turn(transport, request_body, &prompt_blocks, memory_db)
             .await;
 
         self.clear_transient_prompt_options();
@@ -1162,7 +1139,14 @@ impl ChatRepl {
                 );
             }
             SlashCommandResult::Keybindings => display_keybindings(&self.config.keybindings),
-            SlashCommandResult::Memory(args) => handle_memory_command(&args, memory_db),
+            SlashCommandResult::Memory(args) => {
+                handle_memory_command(
+                    &args,
+                    memory_db,
+                    &self.run_context,
+                    self.config.memory.automatic_learning_enabled,
+                );
+            }
             SlashCommandResult::Activity(args) => {
                 handle_activity_command(&args, &self.chat_session.id(), memory_db);
             }
@@ -1387,11 +1371,7 @@ impl ChatRepl {
     /// Push the user message (with `@file` expansion) and run
     /// `UserPromptSubmit` hooks. Returns `false` if a hook blocked the
     /// turn (caller should `continue` the outer loop).
-    async fn prepare_user_message(
-        &mut self,
-        input: &str,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
-    ) -> bool {
+    async fn prepare_user_message(&mut self, input: &str) -> bool {
         use openclaudia::hooks::{HookEvent, HookInput};
 
         let expanded_input = if input.contains('@') {
@@ -1407,17 +1387,6 @@ impl ChatRepl {
         self.chat_session.update_title();
         self.chat_session.touch();
         self.chat_session.clear_undo_stack();
-
-        if let Some(ref mut learner) = auto_learner {
-            let messages = self.chat_session.messages_snapshot();
-            let prev_assistant = messages
-                .iter()
-                .rev()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-                .map(std::string::ToString::to_string);
-            learner.on_user_message(&expanded_input, prev_assistant.as_deref());
-        }
 
         let hook_input = HookInput::for_run(&self.run_context, HookEvent::UserPromptSubmit)
             .with_prompt(&expanded_input);
@@ -1593,7 +1562,6 @@ impl ChatRepl {
         request_body: serde_json::Value,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> bool {
         use indicatif::{ProgressBar, ProgressStyle};
         let spinner = ProgressBar::new_spinner();
@@ -1627,24 +1595,12 @@ impl ChatRepl {
                     return false;
                 }
                 if self.config.proxy.target == "google" {
-                    self.process_google_response(
-                        response,
-                        &request_body,
-                        transport,
-                        memory_db,
-                        auto_learner,
-                    )
-                    .await;
+                    self.process_google_response(response, &request_body, transport, memory_db)
+                        .await;
                     false
                 } else {
-                    self.process_streaming_response(
-                        response,
-                        transport,
-                        prompt_blocks,
-                        memory_db,
-                        auto_learner,
-                    )
-                    .await
+                    self.process_streaming_response(response, transport, prompt_blocks, memory_db)
+                        .await
                 }
             }
             Err(e) => {
@@ -1693,7 +1649,6 @@ impl ChatRepl {
         request_body: &serde_json::Value,
         transport: TurnTransport<'_>,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         println!();
         let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
@@ -1738,7 +1693,7 @@ impl ChatRepl {
             tool_calls,
             contents,
         };
-        self.run_gemini_tool_loop(&mut state, request_body, transport, memory_db, auto_learner)
+        self.run_gemini_tool_loop(&mut state, request_body, transport, memory_db)
             .await;
 
         self.finalize_gemini_response(&state.full_content, input_tokens, output_tokens)
@@ -1785,7 +1740,6 @@ impl ChatRepl {
         request_body: &serde_json::Value,
         transport: TurnTransport<'_>,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         let max_iterations = self.config.session.max_turns;
         let mut iteration: u32 = 0;
@@ -1797,7 +1751,7 @@ impl ChatRepl {
                 &mut state.contents,
             );
             let function_responses = self
-                .gemini_execute_tools(&state.tool_calls, memory_db, auto_learner)
+                .gemini_execute_tools(&state.tool_calls, memory_db)
                 .await;
             state.contents.push(serde_json::json!({
                 "role": "user",
@@ -1969,7 +1923,6 @@ impl ChatRepl {
         &mut self,
         gemini_tool_calls: &[tools::ToolCall],
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> Vec<serde_json::Value> {
         let mut function_responses: Vec<serde_json::Value> = Vec::new();
         for tool_call in gemini_tool_calls {
@@ -1984,8 +1937,7 @@ impl ChatRepl {
                     continue;
                 }
             };
-            let result =
-                self.gemini_run_single_tool(tool_call, memory_db, auto_learner, authorization);
+            let result = self.gemini_run_single_tool(tool_call, memory_db, authorization);
             function_responses.push(self.gemini_record_tool_outcome(tool_call, &result).await);
         }
         function_responses
@@ -2086,13 +2038,12 @@ impl ChatRepl {
         }
     }
 
-    /// Dispatch the tool, observe it for auto-learning, and return the
-    /// raw `ToolResult` for downstream recording.
+    /// Dispatch the tool through the canonical executor and return the raw
+    /// `ToolResult` for downstream recording.
     fn gemini_run_single_tool(
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
         authorization: Option<ExecutionPermit>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
@@ -2110,18 +2061,17 @@ impl ChatRepl {
             tracing::error!("Security audit failed for tool_call: {e}");
         }
 
-        let result = execute_tool_with_memory_after_permission(CliToolExecution {
+        execute_tool_with_memory_after_permission(CliToolExecution {
             run_context: &self.run_context,
             tool_call,
             memory_db,
+            app_config: &self.config,
             task_manager: &self.task_manager,
             permission_mgr: &self.permission_mgr,
             authorization,
             session_id: &self.chat_session.id(),
             policy_enforcer: Some(self.policy_enforcer.as_ref()),
-        });
-        Self::auto_learn_observe(auto_learner, tool_call, &result);
-        result
+        })
     }
 
     /// Render the tool result, push it onto the session as a `tool`
@@ -2285,7 +2235,6 @@ impl ChatRepl {
         transport: TurnTransport<'_>,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> bool {
         println!();
         let mut tool_accumulator = tools::ToolCallAccumulator::new();
@@ -2331,7 +2280,6 @@ impl ChatRepl {
                 transport,
                 prompt_blocks,
                 memory_db,
-                auto_learner,
             )
             .await;
             return false;
@@ -2347,7 +2295,6 @@ impl ChatRepl {
             transport,
             prompt_blocks,
             memory_db,
-            auto_learner,
         )
         .await;
 
@@ -2419,7 +2366,6 @@ impl ChatRepl {
         transport: TurnTransport<'_>,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         let final_content = self
             .run_anthropic_structured_tool_loop(
@@ -2428,7 +2374,6 @@ impl ChatRepl {
                 transport,
                 prompt_blocks,
                 memory_db,
-                auto_learner,
             )
             .await;
         if let Some(ref engine) = self.vdd_engine {
@@ -2644,7 +2589,6 @@ impl ChatRepl {
         transport: TurnTransport<'_>,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> String {
         let max_proxy_iterations = self.config.session.max_turns;
         let mut proxy_iteration: u32 = 0;
@@ -2678,13 +2622,8 @@ impl ChatRepl {
                 break;
             };
 
-            self.dispatch_anthropic_tool_batch(
-                &tool_calls,
-                anthropic_accumulator,
-                memory_db,
-                auto_learner,
-            )
-            .await;
+            self.dispatch_anthropic_tool_batch(&tool_calls, anthropic_accumulator, memory_db)
+                .await;
 
             let followup_req = match self.build_anthropic_followup(prompt_blocks) {
                 Ok(req) => req,
@@ -2769,11 +2708,9 @@ impl ChatRepl {
         tool_calls: &[tools::ToolCall],
         anthropic_accumulator: &mut tools::AnthropicToolAccumulator,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         for tool_call in tool_calls {
-            self.execute_anthropic_tool(tool_call, memory_db, auto_learner)
-                .await;
+            self.execute_anthropic_tool(tool_call, memory_db).await;
         }
         self.run_quality_gates_and_inject();
         anthropic_accumulator.clear();
@@ -2791,7 +2728,6 @@ impl ChatRepl {
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         if self.push_plan_mode_block_if_any(tool_call) {
             return;
@@ -2799,7 +2735,7 @@ impl ChatRepl {
         let Some(authorization) = self.push_permission_or_proceed(tool_call).await else {
             return;
         };
-        let result = self.run_tool_with_audit(tool_call, memory_db, auto_learner, authorization);
+        let result = self.run_tool_with_audit(tool_call, memory_db, authorization);
 
         let final_result = process_tool_follow_up(
             &self.run_context,
@@ -2932,14 +2868,12 @@ impl ChatRepl {
         }
     }
 
-    /// Emit the running banner + `tool_call` audit event, dispatch via
-    /// `execute_tool_with_memory`, and observe the result for the
-    /// auto-learner. Shared by both the Anthropic and `OpenAI` paths.
+    /// Emit the running banner + `tool_call` audit event and dispatch via the
+    /// canonical executor. Shared by both the Anthropic and `OpenAI` paths.
     fn run_tool_with_audit(
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
         authorization: Option<ExecutionPermit>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
@@ -2956,18 +2890,17 @@ impl ChatRepl {
             // session itself is not corrupted by an audit-write failure).
             tracing::error!("Security audit failed for tool_call: {e}");
         }
-        let result = execute_tool_with_memory_after_permission(CliToolExecution {
+        execute_tool_with_memory_after_permission(CliToolExecution {
             run_context: &self.run_context,
             tool_call,
             memory_db,
+            app_config: &self.config,
             task_manager: &self.task_manager,
             permission_mgr: &self.permission_mgr,
             authorization,
             session_id: &self.chat_session.id(),
             policy_enforcer: Some(self.policy_enforcer.as_ref()),
-        });
-        Self::auto_learn_observe(auto_learner, tool_call, &result);
-        result
+        })
     }
 
     /// Build the next Anthropic follow-up request body reusing the
@@ -3068,7 +3001,6 @@ impl ChatRepl {
         transport: TurnTransport<'_>,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         let max_iterations = self.config.session.max_turns;
         let mut iteration: u32 = 0;
@@ -3100,7 +3032,7 @@ impl ChatRepl {
                 &state.current_content,
                 &state.current_reasoning_content,
             );
-            self.dispatch_openai_tool_batch(&tool_calls, tool_accumulator, memory_db, auto_learner)
+            self.dispatch_openai_tool_batch(&tool_calls, tool_accumulator, memory_db)
                 .await;
 
             println!("\n\x1b[90mContinuing with tool results...\x1b[0m\n");
@@ -3178,11 +3110,9 @@ impl ChatRepl {
         tool_calls: &[tools::ToolCall],
         tool_accumulator: &mut tools::ToolCallAccumulator,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         for tool_call in tool_calls {
-            self.execute_openai_tool(tool_call, memory_db, auto_learner)
-                .await;
+            self.execute_openai_tool(tool_call, memory_db).await;
         }
         self.run_quality_gates_and_inject();
         tool_accumulator.clear();
@@ -3405,7 +3335,6 @@ impl ChatRepl {
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         if self.push_plan_mode_block_if_any(tool_call) {
             return;
@@ -3413,8 +3342,7 @@ impl ChatRepl {
         let Some(authorization) = self.push_permission_or_proceed(tool_call).await else {
             return;
         };
-        let result =
-            self.run_openai_tool_unaudited(tool_call, memory_db, auto_learner, authorization);
+        let result = self.run_openai_tool_unaudited(tool_call, memory_db, authorization);
 
         let final_result = process_tool_follow_up(
             &self.run_context,
@@ -3453,29 +3381,26 @@ impl ChatRepl {
         );
     }
 
-    /// `OpenAI`-loop variant of `run_tool_with_audit` — same dispatch and
-    /// auto-learner observation, but no audit logger calls (the `OpenAI`
-    /// loop emits its own audit shape upstream).
+    /// `OpenAI`-loop variant of `run_tool_with_audit` without duplicate audit
+    /// logger calls (the `OpenAI` loop emits its own audit shape upstream).
     fn run_openai_tool_unaudited(
         &self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
         authorization: Option<ExecutionPermit>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
-        let result = execute_tool_with_memory_after_permission(CliToolExecution {
+        execute_tool_with_memory_after_permission(CliToolExecution {
             run_context: &self.run_context,
             tool_call,
             memory_db,
+            app_config: &self.config,
             task_manager: &self.task_manager,
             permission_mgr: &self.permission_mgr,
             authorization,
             session_id: &self.chat_session.id(),
             policy_enforcer: Some(self.policy_enforcer.as_ref()),
-        });
-        Self::auto_learn_observe(auto_learner, tool_call, &result);
-        result
+        })
     }
 
     /// Persist a memory-DB activity row for one `OpenAI` tool execution.
@@ -3579,22 +3504,6 @@ impl ChatRepl {
                     error = %err,
                     "failed to append CLI quality-gate observations to reality ledger"
                 );
-            }
-        }
-    }
-
-    fn auto_learn_observe(
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
-        tool_call: &tools::ToolCall,
-        result: &tools::ToolResult,
-    ) {
-        if let Some(ref mut learner) = auto_learner {
-            let args: serde_json::Value =
-                serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
-            if result.is_error() {
-                learner.on_tool_failure(&tool_call.function.name, &args, result.content());
-            } else {
-                learner.on_tool_success(&tool_call.function.name, &args, result.content());
             }
         }
     }
@@ -4128,6 +4037,74 @@ providers: {}
             .expect_err("missing active provider must return an error");
 
         assert_eq!(err, "No provider configured for target 'missing'");
+    }
+
+    #[test]
+    fn cli_executor_propagates_automatic_learning_policy() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("CLI learning workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        let run = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            workspace.path(),
+        )
+        .working_directory(workspace.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("chat-repl-learning-test")
+        .build()
+        .expect("CLI learning run");
+        let memory = memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("CLI workspace memory");
+        let config: config::AppConfig = serde_yaml::from_str(
+            r"
+proxy:
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+memory:
+  automatic_learning_enabled: true
+",
+        )
+        .expect("CLI learning config");
+        let tasks =
+            std::sync::Mutex::new(session::TaskManager::for_run(&run).expect("CLI task manager"));
+        let permissions = PermissionManager::unrestricted_for_run(&run);
+        let call = tools::ToolCall {
+            id: "cli-learning-write".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/cli_learning.rs",
+                    "content": "pub const CLI_POLICY_PROPAGATED: bool = true;\n"
+                })
+                .to_string(),
+            },
+        };
+
+        let result = execute_tool_with_memory_after_permission(CliToolExecution {
+            run_context: &run,
+            tool_call: &call,
+            memory_db: Some(&memory),
+            app_config: &config,
+            task_manager: &tasks,
+            permission_mgr: &permissions,
+            authorization: None,
+            session_id: "cli-learning-policy",
+            policy_enforcer: None,
+        });
+        assert!(!result.is_error(), "CLI write failed: {}", result.content());
+        assert!(result.observations().iter().any(|observation| {
+            observation.kind == "technical_learning_capture" && !observation.authoritative
+        }));
+        openclaudia::tools::retire_run(&run);
     }
 
     #[test]

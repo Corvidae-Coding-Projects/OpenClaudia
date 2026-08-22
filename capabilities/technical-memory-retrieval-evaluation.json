@@ -7,7 +7,7 @@
   "tuning_corpus_id": "openclaudia-technical-memory-tuning-v1",
   "tuning_corpus_digest": "sha256:edf98143eb3eb7b48170b6d8204a25e1622b8baef074a4792efba2d19c4f825d",
   "held_out_corpus_id": "openclaudia-technical-memory-heldout-v1",
-  "held_out_corpus_digest": "sha256:6cc7bd6028c8c01fe73a4836c4fe80972ebce63f78f7290d3237974742ad8173",
+  "held_out_corpus_digest": "sha256:fbb03c70923022df4d7f40f3fc6780f439ffa22bbb4eb19ecf134540d8b84ca9",
   "trial_count": 3,
   "selected_policy": "task_conditioned_diverse_v1",
   "budgets": {
@@ -108,10 +108,10 @@
     {
       "kind": "source_file",
       "locator": "src/main.rs",
-      "source_version": "worktree:s052",
-      "expected_digest": "sha256:3a2190da0f34d4018d0eab67fb1960e9d506b0c0f4a8c5233aac6ad4e667aa86",
-      "observed_digest": "sha256:3a2190da0f34d4018d0eab67fb1960e9d506b0c0f4a8c5233aac6ad4e667aa86",
-      "byte_len": 122466
+      "source_version": "worktree:s055",
+      "expected_digest": "sha256:7fd3a7f20dcd59c534ec0c77572cb1d6310423330f8615837fb071a71eac3189",
+      "observed_digest": "sha256:7fd3a7f20dcd59c534ec0c77572cb1d6310423330f8615837fb071a71eac3189",
+      "byte_len": 121676
     },
     {
       "kind": "source_file",
@@ -294,7 +294,7 @@
         {
           "trial": 1,
           "output_digest": "sha256:566e65c2cf38a2d8169110d4c0e59ea1c7f0677362b0299f2acfe97ba32aa1e5",
-          "elapsed_micros": 117
+          "elapsed_micros": 113
         },
         {
           "trial": 2,
@@ -304,7 +304,7 @@
         {
           "trial": 3,
           "output_digest": "sha256:5e279a69a259bb40a81041cc320cc1d47e86f28b40a3f8f1b177210c47f1faeb",
-          "elapsed_micros": 88
+          "elapsed_micros": 86
         }
       ]
     },
@@ -399,17 +399,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:4e0406cabb9cb7bc663298b3ce1e7b47533ab56d1dd70a294fa1359be2b30422",
-          "elapsed_micros": 3284
+          "elapsed_micros": 3253
         },
         {
           "trial": 2,
           "output_digest": "sha256:297d3261ed0287ce59a1afd1f2d772697a5da8396a4ffae49b321b91bede8a13",
-          "elapsed_micros": 3218
+          "elapsed_micros": 3174
         },
         {
           "trial": 3,
           "output_digest": "sha256:b6688bc65fd6e22457439827be8a1a5f51ce2cce607f300f89222764e3e45ac2",
-          "elapsed_micros": 3218
+          "elapsed_micros": 3171
         }
       ]
     },
@@ -504,17 +504,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:209093d4b673d6d8e1a4567e1cd05defcad02aaeb638cf2e278d8aaa1e3ba520",
-          "elapsed_micros": 3153
+          "elapsed_micros": 3116
         },
         {
           "trial": 2,
           "output_digest": "sha256:a392714ccd642bea028fd53026710d78e11b726fea0c31f233ae4ee9c85883b9",
-          "elapsed_micros": 2654
+          "elapsed_micros": 2647
         },
         {
           "trial": 3,
           "output_digest": "sha256:02befa9d4c19cb8c8137034829135dd68ed53d3c80a2be22b72112687fe1642c",
-          "elapsed_micros": 2637
+          "elapsed_micros": 2645
         }
       ]
     },
@@ -609,17 +609,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:998d82ca827f0325a603b1562e0a0f69135fe319693b84e3d5f78e0794c661e5",
-          "elapsed_micros": 2688
+          "elapsed_micros": 2686
         },
         {
           "trial": 2,
           "output_digest": "sha256:2f8719eac3d4db042870e4cadac6e1dad3b0e7ebc6fd4bacb4aef8d36932c9a6",
-          "elapsed_micros": 2678
+          "elapsed_micros": 2688
         },
         {
           "trial": 3,
           "output_digest": "sha256:2208501a4549ffd5a526e50b9dad94790eba25f007f7a10919ff8d852f3df8d3",
-          "elapsed_micros": 2669
+          "elapsed_micros": 2682
         }
       ]
     },
@@ -714,17 +714,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:800878da635fd696025213351fe8d4dd5fb8275662fc5e7228c08eb2349b0008",
-          "elapsed_micros": 2657
+          "elapsed_micros": 2682
         },
         {
           "trial": 2,
           "output_digest": "sha256:98834cbfa5baaa0714202765fdf12f3748511d3dbe47f8d0bfc58d0fcf7f4e04",
-          "elapsed_micros": 2672
+          "elapsed_micros": 2669
         },
         {
           "trial": 3,
           "output_digest": "sha256:a55779d0c6f071a82058da9af99ed1287ab2ff5c030d30a614449bdc0c6b5ffc",
-          "elapsed_micros": 2697
+          "elapsed_micros": 2681
         }
       ]
     },
@@ -817,17 +817,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:d98f7c06b30f579bd4db70b5028fbe830eff015ba57d61d8a9a7cf6a19b7454c",
-          "elapsed_micros": 2585
+          "elapsed_micros": 2559
         },
         {
           "trial": 2,
           "output_digest": "sha256:698dff0b858f4048981285b9f5d8f6a3abcf05825e9a07d932322953125cf2d7",
-          "elapsed_micros": 2546
+          "elapsed_micros": 2545
         },
         {
           "trial": 3,
           "output_digest": "sha256:3728e619d1c2680548cd5c0b78815623eb835d740c39b8e55d3a058697b0730b",
-          "elapsed_micros": 2544
+          "elapsed_micros": 2550
         }
       ]
     },
@@ -920,17 +920,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:0717bc3fc23478dd15678572d84508afe4586063bd35e2feaf5f890474660b1f",
-          "elapsed_micros": 2560
+          "elapsed_micros": 2558
         },
         {
           "trial": 2,
           "output_digest": "sha256:18c3a579d7ac3b09dd9fb6bbfb62e6e94656639f8e423fc884644be431567d8d",
-          "elapsed_micros": 2550
+          "elapsed_micros": 2554
         },
         {
           "trial": 3,
           "output_digest": "sha256:ca31264fbfd608c382921b735b704ba5a6fd3817958244a160a5a00d4e6f9122",
-          "elapsed_micros": 2546
+          "elapsed_micros": 2580
         }
       ]
     }
@@ -1016,7 +1016,7 @@
         {
           "trial": 2,
           "output_digest": "sha256:6aeae3561539270ba0a7d4936298be5159c3bc1498de4fdbf5d4a45ee7e5d365",
-          "elapsed_micros": 62
+          "elapsed_micros": 64
         },
         {
           "trial": 3,
@@ -1115,17 +1115,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:53692287577d117b91ac0b977eb53872fb634e6d09ea98a5ffb307d7fd46bfff",
-          "elapsed_micros": 2299
+          "elapsed_micros": 2312
         },
         {
           "trial": 2,
           "output_digest": "sha256:b89da651ecd976f484a2f9a141f631703d391d1fa2dca86b5e61d6997f62770b",
-          "elapsed_micros": 2282
+          "elapsed_micros": 2303
         },
         {
           "trial": 3,
           "output_digest": "sha256:9a069098cfffe95f7dd3d14c53995e7843ad20984e4c1cc56d74c064c9651f14",
-          "elapsed_micros": 2287
+          "elapsed_micros": 2303
         }
       ]
     },
@@ -1219,17 +1219,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:f8af0c9d66e8598df4518e6cca7ea3d63b1f52f96a7412c6f729ec2858bfaa52",
-          "elapsed_micros": 2443
+          "elapsed_micros": 2467
         },
         {
           "trial": 2,
           "output_digest": "sha256:70a50c037ca54858907ea4bebcfd40426699f4324fbd2fca420932a2327060d9",
-          "elapsed_micros": 2434
+          "elapsed_micros": 2457
         },
         {
           "trial": 3,
           "output_digest": "sha256:4c9cfe7901cb06f70dae7565c1d4441e3fc812657268defde7c5eff5ed8afafe",
-          "elapsed_micros": 2428
+          "elapsed_micros": 2457
         }
       ]
     },
@@ -1323,17 +1323,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:ff200dddba55a34eac64d4fe13915facfeac11d63a9400a107f8e6beb2f75c11",
-          "elapsed_micros": 2489
+          "elapsed_micros": 2511
         },
         {
           "trial": 2,
           "output_digest": "sha256:cda18a11c3c4cf5c00084e401b2262ac83a438badf4a308028d446150cbce48f",
-          "elapsed_micros": 2483
+          "elapsed_micros": 2504
         },
         {
           "trial": 3,
           "output_digest": "sha256:6a3c372ebbb9f1dbc92a682224c7745406ff70981c783da0d66d3978b323e03e",
-          "elapsed_micros": 2481
+          "elapsed_micros": 2497
         }
       ]
     },
@@ -1427,17 +1427,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:116aceb71535a376fdf7c7d6fd356cb3d3a5a423b2b4a2e56164bf37521a0365",
-          "elapsed_micros": 2474
+          "elapsed_micros": 2509
         },
         {
           "trial": 2,
           "output_digest": "sha256:a9e3b9ff06be915534ab4f23057cbad1f9b856537914d421428695493820c247",
-          "elapsed_micros": 2481
+          "elapsed_micros": 2503
         },
         {
           "trial": 3,
           "output_digest": "sha256:858b998faaf6f87bdf064711de87ca07cff3dcb0d895fadb67a3485bc252b953",
-          "elapsed_micros": 2486
+          "elapsed_micros": 2515
         }
       ]
     },
@@ -1529,17 +1529,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:c8dc7e84016dd49577d0144d03cb82590c016018dc44748574a90cfb2438a15c",
-          "elapsed_micros": 2370
+          "elapsed_micros": 2390
         },
         {
           "trial": 2,
           "output_digest": "sha256:2ffaff5b78b56877fe344651a919a3661992a12139d17431b9721c52f24ff4cc",
-          "elapsed_micros": 2372
+          "elapsed_micros": 2404
         },
         {
           "trial": 3,
           "output_digest": "sha256:70140bde6962e5ce808b90b4766a87946ffa79caf4da3332541d87e429ed2873",
-          "elapsed_micros": 2358
+          "elapsed_micros": 2401
         }
       ]
     },
@@ -1631,17 +1631,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:8b7101b28e0f9642dbd415d3a8effb9324a829f1f428e87aba5a4a145b6b55e3",
-          "elapsed_micros": 2376
+          "elapsed_micros": 2415
         },
         {
           "trial": 2,
           "output_digest": "sha256:c5de28fd8169477e14628cbc21372561f7f355d10be79c4e7c578240156d467d",
-          "elapsed_micros": 2375
+          "elapsed_micros": 2409
         },
         {
           "trial": 3,
           "output_digest": "sha256:264f9e0eb460c7b6fbd0bc2e1dd448d2a2d27e99ce1b02dff8431712e7fb4e22",
-          "elapsed_micros": 2357
+          "elapsed_micros": 2381
         }
       ]
     }

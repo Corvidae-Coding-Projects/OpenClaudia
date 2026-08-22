@@ -254,6 +254,37 @@ pub fn execute_search(
     }
 }
 
+pub fn execute_learning_status(
+    run: &ToolRunContext,
+    db: Option<&MemoryDb>,
+    enabled: bool,
+    args: &HashMap<String, Value>,
+) -> ToolHandlerResult {
+    if db.is_none() {
+        return unavailable();
+    }
+    if let Err(error) = serde_json::from_value::<SourceStatusArgs>(args_value(args)) {
+        return invalid_arguments("memory_learning_status", &error);
+    }
+    let status = crate::auto_learn::status_for_run(run);
+    private_structured(
+        format!(
+            "Automatic technical learning is {} and has {} pending verification observation(s), {} stored candidate(s), and {} degraded event(s) in this run.",
+            if enabled { "enabled" } else { "disabled" },
+            status.pending_checks,
+            status.candidates_stored,
+            status.degraded_events
+        ),
+        json!({
+            "schema_version": crate::auto_learn::AUTOMATIC_LEARNING_SCHEMA_VERSION,
+            "operation": "automatic_learning_status",
+            "authority": "untrusted_reference_evidence",
+            "enabled": enabled,
+            "status": status,
+        }),
+    )
+}
+
 pub fn execute_list(
     _run: &ToolRunContext,
     db: Option<&MemoryDb>,

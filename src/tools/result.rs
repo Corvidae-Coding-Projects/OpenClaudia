@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 
 use super::ToolCall;
 
@@ -665,6 +666,70 @@ impl ToolExecutionResult {
         &self.observations
     }
 
+    /// Digest the immutable execution evidence used by downstream causal
+    /// consumers.
+    ///
+    /// Presentation, follow-up state, and advisory observations are excluded;
+    /// authoritative handler observations are included:
+    /// a frontend may resolve a follow-up or attach a learning-health receipt
+    /// after execution without changing what the handler actually did. The
+    /// invocation, typed outcome, artifacts, attachments, usage, and
+    /// sensitivity remain bound exactly.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serialization of this statically serializable projection
+    /// fails.
+    #[must_use]
+    pub fn evidence_digest(&self) -> String {
+        #[derive(Serialize)]
+        struct EvidenceProjection<'a> {
+            schema_version: u16,
+            invocation: &'a ToolInvocation,
+            outcome: &'a ToolOutcome,
+            artifacts: &'a [ToolArtifact],
+            attachments: &'a [ToolAttachment],
+            observations: Vec<&'a ToolObservation>,
+            usage: &'a ToolUsage,
+            sensitivity: ToolSensitivity,
+        }
+
+        let authoritative_observations = self
+            .observations
+            .iter()
+            .filter(|observation| observation.authoritative)
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&EvidenceProjection {
+            schema_version: self.schema_version,
+            invocation: &self.invocation,
+            outcome: &self.outcome,
+            artifacts: &self.artifacts,
+            attachments: &self.attachments,
+            observations: authoritative_observations,
+            usage: &self.usage,
+            sensitivity: self.sensitivity,
+        })
+        .expect("ToolExecutionResult evidence projection serialization cannot fail");
+        let digest: [u8; 32] = Sha256::digest(encoded).into();
+        let mut rendered = String::with_capacity(71);
+        rendered.push_str("sha256:");
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(rendered, "{byte:02x}");
+        }
+        rendered
+    }
+
+    /// Attach one advisory observation after execution.
+    ///
+    /// The observation is model-visible evidence, never control authority, and
+    /// deliberately does not affect [`Self::evidence_digest`].
+    #[must_use]
+    pub(crate) fn with_observation(mut self, observation: ToolObservation) -> Self {
+        self.observations.push(observation);
+        self
+    }
+
     #[must_use]
     pub const fn display(&self) -> &ToolDisplay {
         &self.display
@@ -784,4 +849,90 @@ pub enum ToolResultError {
     NoPendingFollowUp,
     #[error("tool result follow-up is already resolved or cancelled")]
     FollowUpAlreadyTerminal,
+}
+
+#[cfg(test)]
+mod evidence_digest_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(id: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: super::super::FunctionCall {
+                name: "fixture".to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn evidence_digest_is_round_trip_stable_and_binds_execution_identity() {
+        let original = ToolExecutionResult::bind(
+            &call("call-a", r#"{"value":1}"#),
+            "fixture",
+            ToolHandlerResult::success_text("completed"),
+        );
+        let round_trip: ToolExecutionResult = serde_json::from_slice(
+            &serde_json::to_vec(&original).expect("serialize canonical result"),
+        )
+        .expect("deserialize canonical result");
+        assert_eq!(original.evidence_digest(), round_trip.evidence_digest());
+
+        let different_call = ToolExecutionResult::bind(
+            &call("call-b", r#"{"value":1}"#),
+            "fixture",
+            ToolHandlerResult::success_text("completed"),
+        );
+        let different_arguments = ToolExecutionResult::bind(
+            &call("call-a", r#"{"value":2}"#),
+            "fixture",
+            ToolHandlerResult::success_text("completed"),
+        );
+        let different_outcome = ToolExecutionResult::failure(
+            &call("call-a", r#"{"value":1}"#),
+            ToolFailureCode::External,
+            "failed",
+            ToolRetryability::Safe,
+        );
+        assert_ne!(original.evidence_digest(), different_call.evidence_digest());
+        assert_ne!(
+            original.evidence_digest(),
+            different_arguments.evidence_digest()
+        );
+        assert_ne!(
+            original.evidence_digest(),
+            different_outcome.evidence_digest()
+        );
+    }
+
+    #[test]
+    fn digest_binds_authoritative_observations_but_not_advisory_receipts() {
+        let tool_call = call("call-observations", r#"{"value":1}"#);
+        let mut handler = ToolHandlerResult::success_text("completed");
+        handler.observations.push(ToolObservation {
+            kind: "handler_state".to_string(),
+            authoritative: true,
+            data: json!({"generation": 1}),
+        });
+        let base = ToolExecutionResult::bind(&tool_call, "fixture", handler);
+        let base_digest = base.evidence_digest();
+
+        let advisory = base.with_observation(ToolObservation {
+            kind: super::super::TECHNICAL_LEARNING_CAPTURE_OBSERVATION_KIND.to_string(),
+            authoritative: false,
+            data: json!({"status": "evidence_recorded"}),
+        });
+        assert_eq!(base_digest, advisory.evidence_digest());
+
+        let mut changed_handler = ToolHandlerResult::success_text("completed");
+        changed_handler.observations.push(ToolObservation {
+            kind: "handler_state".to_string(),
+            authoritative: true,
+            data: json!({"generation": 2}),
+        });
+        let changed = ToolExecutionResult::bind(&tool_call, "fixture", changed_handler);
+        assert_ne!(base_digest, changed.evidence_digest());
+    }
 }

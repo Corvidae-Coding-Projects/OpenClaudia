@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use tracing::warn;
 
 /// Single source of truth for source and configuration file extensions used by
-/// automatic-learning filters and hook metadata.
+/// automatic-learning applicability metadata.
 const LANGUAGE_EXTENSIONS: &[(&str, &[&str])] = &[
     ("rust", &["rs"]),
     ("python", &["py", "pyw"]),

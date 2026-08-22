@@ -3042,6 +3042,72 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn tui_pipeline_propagates_automatic_learning_policy() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("TUI learning workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        let run = crate::tools::security::test_run_context_for(workspace.path());
+        let memory = Arc::new(
+            crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+                .expect("TUI workspace memory"),
+        );
+        let config: crate::config::AppConfig = serde_yaml::from_str(
+            r"
+proxy:
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+memory:
+  automatic_learning_enabled: true
+",
+        )
+        .expect("TUI learning config");
+        let permissions = Arc::new(crate::permissions::PermissionManager::unrestricted_for_run(
+            &run,
+        ));
+        let tasks = Arc::new(Mutex::new(
+            crate::session::TaskManager::for_run(&run).expect("TUI task manager"),
+        ));
+        let call = tools::ToolCall {
+            id: "tui-learning-write".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/tui_learning.rs",
+                    "content": "pub const TUI_POLICY_PROPAGATED: bool = true;\n"
+                })
+                .to_string(),
+            },
+        };
+        let (tx, _rx) = mpsc::channel();
+
+        let result = execute_single_tool(SingleToolExecution {
+            run_context: Arc::clone(&run),
+            tool_call: &call,
+            memory_db: Some(memory),
+            app_config: Some(Arc::new(config)),
+            permission: ToolPermissionDispatch {
+                mgr: permissions,
+                authorization: None,
+            },
+            policy_enforcer: None,
+            task_mgr: tasks,
+            session_id: Some("tui-learning-policy"),
+            hook_context: None,
+            tx: &tx,
+        })
+        .await
+        .expect("TUI pipeline result");
+        assert!(!result.is_error(), "TUI write failed: {}", result.content());
+        assert!(result.observations().iter().any(|observation| {
+            observation.kind == "technical_learning_capture" && !observation.authoritative
+        }));
+        crate::tools::retire_run(&run);
+    }
+
     #[test]
     fn quality_gate_records_command_and_failed_gate_findings() {
         let run = crate::tools::security::test_run_context_for(std::path::Path::new(env!(

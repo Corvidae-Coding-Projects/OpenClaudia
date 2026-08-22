@@ -1350,22 +1350,6 @@ fn init_memory_with_banner(
         println!("\x1b[90m📝 {recent_count} recent session(s) loaded from memory\x1b[0m");
     }
 
-    if let Ok(stats) = db.auto_learn_stats() {
-        let total = stats.coding_patterns
-            + stats.error_patterns
-            + stats.learned_preferences
-            + stats.file_relationships;
-        if total > 0 {
-            println!(
-                "\x1b[90m🧠 Auto-learned: {} patterns, {} error fixes, {} preferences, {} file relationships\x1b[0m",
-                stats.coding_patterns,
-                stats.errors_resolved,
-                stats.learned_preferences,
-                stats.file_relationships
-            );
-        }
-    }
-
     Ok(db)
 }
 
@@ -1443,17 +1427,11 @@ fn init_vdd_engine_if_enabled_with_auth(
 /// `warn!` but do not propagate, because the CLI is already about to
 /// exit. Extracted from `cmd_chat` per crosslink #262.
 fn finalize_chat(
-    auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner>,
     chat_session: &Session,
     memory_db: Option<&memory::MemoryDb>,
     rl: &mut rustyline::DefaultEditor,
     history_path: &std::path::Path,
 ) {
-    // Finalize auto-learning (compute file relationships, etc.).
-    if let Some(learner) = auto_learner.as_mut() {
-        learner.on_session_end();
-    }
-
     // Autosave to short-term memory so a future resume can pick up.
     save_session_to_short_term_memory(chat_session, memory_db);
 

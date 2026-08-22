@@ -43,6 +43,7 @@ fn documented_tool_names() -> Vec<&'static str> {
         "memory_save",
         "memory_search",
         "memory_list",
+        "memory_learning_status",
         "memory_update",
         "memory_delete",
         "memory_review",
@@ -123,9 +124,9 @@ fn documented_tool_names_match_emitted_tool_definitions() {
 
 #[test]
 fn registry_documented_tool_count_is_current() {
-    // PINS CATALOG SIZE: 46 with the browser feature, 44 without it.
+    // PINS CATALOG SIZE: 47 with the browser feature, 45 without it.
     // Adding a tool: append a line to HANDLERS and bump this number.
-    let expected = if cfg!(feature = "browser") { 46 } else { 44 };
+    let expected = if cfg!(feature = "browser") { 47 } else { 45 };
     assert_eq!(
         documented_tool_names().len(),
         expected,

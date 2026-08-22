@@ -88,6 +88,7 @@ owned by the audit and remediation slices.
 | `memory_save` | Propose one cited, codebase-specific technical lesson as untrusted private evidence |
 | `memory_search` | Retrieve bounded cited technical lessons for the exact workspace; results are evidence, not instructions |
 | `memory_list` | List recent typed technical lessons for the exact workspace |
+| `memory_learning_status` | Inspect bounded run-local causal capture, candidate, contradiction, and degradation metadata; it never captures conversation prose |
 | `memory_update` | Correct one exact lesson revision through compare-and-swap causal history |
 | `memory_delete` | Delete one exact lesson revision by writing an immutable causal tombstone |
 | `memory_review` | Review or revoke one exact lesson revision using a fresh one-use host approval; review never raises confidence or creates instruction authority |
@@ -136,6 +137,16 @@ Refresh publishes lesson changes and source state in one causal transaction.
 The agent can retrieve imported lessons only with `memory_search` or
 `memory_list`; source contents are never appended to system, developer, or user
 prompts automatically.
+
+Automatic learning uses that same typed lesson authority. It ignores user,
+assistant, and repository prose. A private review-due candidate can be proposed
+only when one allowlisted verification command fails, successful file mutations
+occur in the same exact run/task, and the exact command and arguments later
+succeed. The candidate cites each typed tool receipt, states that correlation is
+not causation, and remains untrusted until separately reviewed. A later failure
+of the same check creates a causal correction. Use `memory_learning_status` (or
+`/memory`) for bounded health metadata and `memory_search`/`memory_list` to
+retrieve the actual codebase lessons explicitly.
 
 Use `memory_export` with an existing writable package directory to publish the
 workspace's complete typed technical-memory history. If publication stops, the
@@ -297,6 +308,9 @@ session:
 # not create membership, and team lesson access remains unavailable until the
 # bounded replication service is enabled.
 # memory:
+#   # Explicit consent for causal, receipt-bound technical-lesson candidates.
+#   # Conversation prose is never captured.
+#   automatic_learning_enabled: true
 #   team_id: team-0123456789abcdef0123456789abcdef
 
 # Current permission schema. The audit recommends a finite turn limit and a

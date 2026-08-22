@@ -33,11 +33,11 @@ Record changed artifact generations, commands/tests run, typed evidence receipts
 Architecture generation: `s005-typed-environment-v1`.
 
 - `src/config/environment.rs` is the single finite conformance map for main
-  configuration. It binds 203 typed fields (59 application fields plus nine
+  configuration. It binds 204 typed fields (60 application fields plus nine
   fields for each of 16 built-in provider namespaces) to exact canonical and
   compatibility names. Every descriptor carries parser, secrecy, source
   precedence, deprecation, and security-relevance metadata. Together with the
-  independently consumed ACP field, the public projection contains 435 unique
+  independently consumed ACP field, the public projection contains 437 unique
   exact environment names.
 - Canonical names use `__` only between typed nesting levels and `_` within a
   field or provider segment. Exact pre-S-005 spellings remain deprecated
@@ -83,12 +83,12 @@ the record is stable, avoiding a self-referential digest.
 
 ## Test design and skepticism record
 
-- Exhaustive typed tests apply all 433 main-config canonical/deprecated/
+- Exhaustive typed tests apply all 435 main-config canonical/deprecated/
   ecosystem names to their intended typed field. Samples deliberately differ
   from defaults, including boolean fields, so success cannot be inferred from
   unchanged state.
 - A second exhaustive test loads a complete, different file value for every
-  one of the 203 main-config fields, applies each canonical environment name
+  one of the 204 main-config fields, applies each canonical environment name
   individually, deserializes `AppConfig`, and asserts the intended typed field.
   Map/list assertions also prove lower-file members are replaced rather than
   silently retained.
@@ -170,7 +170,7 @@ Non-Cargo provenance and integrity checks:
 - `git rev-parse HEAD` -> `9194ac26e08e899a2acb7336523f5f9bafb463fd`
 - `git diff --check` -> pass (no output)
 - static registry enumeration -> 59 application fields, 16 providers, nine
-  provider fields, 435 exact names, 435 unique names, zero duplicates
+  provider fields, 437 exact names, 437 unique names, zero duplicates
 - source audit of `OPENCLAUDIA_` consumers -> every non-config subsystem name
   is explicitly routed; generic underscore environment loading and ad-hoc API
   key repair are absent from the changed loader

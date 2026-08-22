@@ -2056,8 +2056,15 @@ fn handle_slash_command_scoped(
     )
 }
 
-/// Handle /memory command for viewing auto-learned knowledge
-pub fn handle_memory_command(args: &str, memory_db: Option<&memory::MemoryDb>) {
+/// Handle `/memory` inspection. Technical lessons are explicit reference
+/// evidence; the legacy pattern tables remain visible only as compatibility
+/// data and are never fed into automatic learning.
+pub fn handle_memory_command(
+    args: &str,
+    memory_db: Option<&memory::MemoryDb>,
+    run: &openclaudia::tools::ToolRunContext,
+    automatic_learning_enabled: bool,
+) {
     let Some(db) = memory_db else {
         println!("\n\x1b[33mMemory database not available.\x1b[0m\n");
         return;
@@ -2068,19 +2075,51 @@ pub fn handle_memory_command(args: &str, memory_db: Option<&memory::MemoryDb>) {
     let subargs = parts.get(1).copied().unwrap_or("");
 
     match subcmd.as_str() {
-        "" | "stats" => match db.auto_learn_stats() {
-            Ok(stats) => {
-                println!("\n=== Auto-Learning Statistics ===");
-                println!("  Coding patterns:      {}", stats.coding_patterns);
-                println!("  File relationships:   {}", stats.file_relationships);
-                println!("  Error patterns:       {}", stats.error_patterns);
-                println!("  Errors resolved:      {}", stats.errors_resolved);
-                println!("  Learned preferences:  {}", stats.learned_preferences);
-                println!("  Database path:        {}", db.path().display());
-                println!();
+        "" | "status" | "stats" => {
+            let status = openclaudia::auto_learn::status_for_run(run);
+            println!("\n=== Automatic Technical Learning ===");
+            println!(
+                "  Capture policy:       {}",
+                if automatic_learning_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("  Pending exact checks: {}", status.pending_checks);
+            println!("  Candidate transitions: {}", status.candidates_stored);
+            println!("  Contradictions:        {}", status.contradictions_stored);
+            println!("  Degraded events:       {}", status.degraded_events);
+            println!("  Private store:         {}", db.path().display());
+            println!("  Authority:             untrusted reference evidence");
+            println!();
+        }
+        "list" | "lessons" => {
+            match db.query_technical_lessons(None, 20, chrono::Utc::now().timestamp()) {
+                Ok(result) if result.records.is_empty() => {
+                    println!("\nNo technical lessons are stored for this workspace.\n");
+                }
+                Ok(result) => {
+                    println!("\n=== Codebase Technical Lessons ===\n");
+                    for record in result.records {
+                        let review = if record.effectively_host_reviewed {
+                            "host-reviewed"
+                        } else if record.due_for_review {
+                            "review-due"
+                        } else {
+                            "candidate"
+                        };
+                        println!(
+                            "  {} (version {}, {review})",
+                            record.lesson.title,
+                            record.version.get()
+                        );
+                    }
+                    println!();
+                }
+                Err(error) => eprintln!("\nFailed to list technical lessons: {error}\n"),
             }
-            Err(e) => eprintln!("\nFailed to get auto-learn stats: {e}\n"),
-        },
+        }
         "patterns" => memory_show_patterns(db, subargs),
         "errors" => memory_show_errors(db, subargs),
         "prefs" | "preferences" => match db.get_all_preferences() {
@@ -2104,7 +2143,10 @@ pub fn handle_memory_command(args: &str, memory_db: Option<&memory::MemoryDb>) {
         "reset" => memory_reset(db, subargs),
         _ => {
             println!("\nUnknown memory subcommand: {subcmd}");
-            println!("Available: patterns, errors, prefs, files, reset\n");
+            println!(
+                "Available: status, list, patterns, errors, prefs, files, reset\n\
+                 patterns/errors/prefs/files are legacy compatibility views"
+            );
         }
     }
 }
@@ -2193,7 +2235,7 @@ fn memory_reset(db: &memory::MemoryDb, subargs: &str) {
     } else {
         println!("\n\x1b[31mWarning: This will delete ALL learned data!\x1b[0m");
         println!(
-            "This includes coding patterns, error patterns, preferences, and file relationships."
+            "This includes typed technical lessons and their causal history, plus legacy coding patterns, error patterns, preferences, and file relationships."
         );
         println!("\nTo confirm, run: /memory reset confirm\n");
     }
