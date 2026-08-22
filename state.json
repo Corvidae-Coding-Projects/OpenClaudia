@@ -1,6 +1,6 @@
 {
   "next_display_id": 1099,
-  "next_comment_id": 1236,
+  "next_comment_id": 1237,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11845,11 +11845,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T20:49:57.916029928Z",
-      "updated_at": "2026-08-22T21:12:27.067512911Z",
+      "updated_at": "2026-08-22T21:42:28.834284648Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "013df895-ca89-48b7-b263-ad3bbdc31da0": {
+          "display_id": 1236,
+          "author": "6Vw9",
+          "content": "Session auto-ended (stale after 248 minutes). No handoff notes provided.",
+          "created_at": "2026-08-22T21:42:28.831428151Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAYGgcVXRFjonLiM4uiCD/CySiUDuu0tvWf7Ex9FGKeUkUFBNAX/xijEZO4CMwViODuEVRdrvuSJv4Y/tPBInABA=="
+        },
         "386918ae-6545-4e2a-835e-04bc84927a7c": {
           "display_id": 1233,
           "author": "6Vw9",
@@ -33520,11 +33529,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1020,
       "timestamp": "2026-08-22T21:42:24.716738660Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1021,
+      "timestamp": "2026-08-22T21:42:28.834284648Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T21:42:24.716738660Z",
+    "timestamp": "2026-08-22T21:42:28.834284648Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1020
+    "agent_seq": 1021
   }
 }
