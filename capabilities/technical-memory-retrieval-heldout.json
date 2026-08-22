@@ -87,7 +87,7 @@
         "observation": "A team authority observation past its retention boundary cannot establish current membership.",
         "guidance": "Surface a partial result when expired authority evidence is omitted.",
         "applicability": {"paths": ["src/team_memory/authority.rs"], "components": ["team-authority"], "tags": ["verify"]},
-        "citations": [{"kind": "source_file", "locator": "src/team_memory/authority.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:d5007aa25bf758eef799d98fa815a48425d4b785c61ccb6040494b072801286a"}],
+        "citations": [{"kind": "source_file", "locator": "src/team_memory/authority.rs", "source_version": "worktree:s108", "digest": "sha256:b2b4713cf81c88860846def28ca5b6ed9660675d21399c1de5dab92af565db5c"}],
         "confidence": "verified_by_test",
         "sensitivity": "confidential",
         "retention": {"policy": "expire_after", "unix_seconds": 30}

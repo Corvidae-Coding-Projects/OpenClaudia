@@ -583,6 +583,10 @@ gate for compatibility.
   limit and explicit conflict semantics. Cross-store writes use durable
   idempotent operations with retry/reconciliation rather than pretending two
   SQLite commits are atomic.
+- Expose concurrent heads as paged cited untrusted evidence while always
+  returning the complete canonical head set. Resolution must compare-and-swap
+  that exact set and publish one immutable multi-parent successor; stale,
+  incomplete, duplicate, or forged sets never discard an unseen branch.
 - Treat team memory as an authenticated service/capability with membership,
   roles, audit, encryption and offline/concurrent conflict policy. A configured
   shared filesystem path alone is not an authorization or consistency model.

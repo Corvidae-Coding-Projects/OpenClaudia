@@ -1009,6 +1009,7 @@ impl TeamMemoryStore {
             version: entry.version,
             record_digest: entry.record_digest.clone(),
             parent_digest: entry.parent_digest.clone(),
+            additional_parent_digests: Vec::new(),
             content_digest: entry.content_digest.clone(),
             state: MemoryRevisionState::Active,
         }]

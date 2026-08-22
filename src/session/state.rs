@@ -307,6 +307,7 @@ pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "memory_search",
     "memory_list",
     "memory_learning_status",
+    "memory_conflicts",
     "memory_source_status",
     "crosslink",
     "bash_output",

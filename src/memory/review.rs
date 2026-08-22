@@ -117,7 +117,8 @@ impl MemoryDb {
                      revision.parent_digest, revision.record_digest,
                      revision.content_digest, revision.content,
                      revision.tags_json, revision.provenance_json,
-                     revision.record_state
+                     revision.record_state,
+                     revision.additional_parent_digests_json
                 FROM memory_revisions revision
                WHERE EXISTS (
                    SELECT 1 FROM json_each(revision.tags_json) AS tag

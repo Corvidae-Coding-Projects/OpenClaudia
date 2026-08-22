@@ -269,6 +269,7 @@ impl TeamRole {
                 !matches!(self, Self::Reader)
             }
             TeamMemoryOperation::Correct
+            | TeamMemoryOperation::Resolve
             | TeamMemoryOperation::Delete
             | TeamMemoryOperation::Review
             | TeamMemoryOperation::Export
@@ -313,6 +314,7 @@ pub enum TeamMemoryOperation {
     Search,
     Propose,
     Correct,
+    Resolve,
     Delete,
     Review,
     Export,
@@ -331,6 +333,7 @@ impl fmt::Display for TeamMemoryOperation {
             Self::Search => "search",
             Self::Propose => "propose",
             Self::Correct => "correct",
+            Self::Resolve => "resolve",
             Self::Delete => "delete",
             Self::Review => "review",
             Self::Export => "export",

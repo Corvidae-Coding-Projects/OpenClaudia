@@ -34,9 +34,10 @@ Package schema v1 is canonical JSON with unknown fields rejected. It carries:
   technical-lesson, source-lifecycle, and host-review-audit lineages;
 - tombstones, applicability, citations, sensitivity, retention, review state,
   provenance, attribution, and original store identity without rewriting;
-- the internal source-store schema for diagnostics and a stable v1 minimum
-  reader floor of memory schema 6, so unrelated future internal migrations do
-  not invalidate an unchanged portable contract.
+- the internal source-store schema for diagnostics. Packages emitted by the
+  multi-parent implementation declare memory reader schema 7; legacy packages
+  may still declare schema 6 only when every revision has the linear v6 shape.
+  Unrelated future internal migrations do not invalidate this portable contract.
 
 Entries are ordered by logical identity, version, and record digest. Each
 length-prefixed canonical entry contributes to the snapshot digest. Parts are
@@ -45,7 +46,7 @@ the package identity. A final manifest is the sole completion marker.
 
 The checked-in empty-manifest schema vector is:
 
-`sha256:6ffec61abc14ec70bd4660e841d77b830330910ab1b4ebf67e728b137e09b25a`
+`sha256:402f53d475bb34e2ef4b24ac47a0588a6f47614a612cc670af285e0be0817b10`
 
 ## Fixed bounds and recovery
 
@@ -97,8 +98,8 @@ target remain untouched and are neither compared nor imported.
 - Subagent roles and plan mode exclude export/import because they have no
   direct host-approval channel. Read-only lesson retrieval remains available
   where already authorized.
-- Tool catalogs now contain 46 base tools with the browser feature (44 without)
-  and 49 with the three subagent tools (47 without browser).
+- Tool catalogs now contain 48 base tools with the browser feature (46 without)
+  and 51 with the three subagent tools (49 without browser).
 - Imported source provenance remains exact. A later source refresh may
   legitimately contain preserved foreign-origin and newly local-origin
   revisions; source authority is validated by workspace, deterministic member
@@ -112,6 +113,8 @@ target remain untouched and are neither compared nor imported.
 - complete round trip of source state, reviewed lesson/audit, ordinary lesson,
   immutable history, heads, tombstone, provenance, citations, sensitivity, and
   retention;
+- complete round trip of a resolved branching history, including every causal
+  parent and the graph-derived sole head;
 - exclusion of a recognizable legacy prose row from package files and tool
   receipts while leaving a target legacy row untouched;
 - exact replay idempotence and deterministic snapshot equality after
@@ -166,6 +169,11 @@ All Rust commands used the repository-pinned Rust 1.98.0 toolchain,
   previously tracked target-conditional unused/dead-code warnings outside
   S-107; the three initially observed S-107 conditional imports were corrected
   and the rerun emitted no S-107 warning.
+- Issue #1081 follow-on: portable units passed 6/6 and portable E2Es passed 6/6,
+  including truthful v6-reader rejection of multi-parent data and exact
+  root/branches/merge export-import. The focused affected integration set
+  passed 117/117, strict Rust 1.98.0 Clippy passed, and the complete native
+  all-feature/all-target matrix plus Windows GNU all-target check passed.
 
 The SHA-256 manifest of the 20 implementation/test artifacts is
 `81a3eda0a15cbf484b6835a7d720c8c183d40d18141e8879e34b25b1bd65b35b`.
@@ -179,7 +187,9 @@ authenticated team authority and S-104 owns replication, conflict, and
 revocation behavior. S-105 owns evaluated ranking and usefulness of explicit
 technical-memory retrieval. Newly discovered issue #1080 owns atomic source
 lifecycle advancement when a host directly reviews a source-managed lesson;
-ordinary source refresh after portable import is fixed and covered here.
+ordinary source refresh after portable import is fixed and covered here. Issue
+#1081 extends the same package schema with truthful schema-v7 multi-parent
+history while retaining strict reads of linear schema-v6 packages.
 
 The descriptor-safe persistent backend remains Unix-only until S-036 provides
 the Windows implementation. Windows compilation is deterministic, but runtime

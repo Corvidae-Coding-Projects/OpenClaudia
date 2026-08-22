@@ -31,11 +31,12 @@ use super::authority::{
 use super::MemoryScope;
 use crate::memory::{
     LogicalMemoryId, MemoryConflictHead, MemoryDb, MemoryDigest, MemoryRecordScope, MemoryRevision,
-    MemoryRevisionState, MemorySourceEvidence, TechnicalLessonCorrectionRequest,
-    TechnicalLessonDraft, TechnicalLessonError, TechnicalLessonQueryResult,
-    TechnicalLessonQueryStatus, TechnicalLessonRecord, TechnicalLessonRetrievalRequest,
-    TechnicalLessonStoreError, WorkspaceMemoryId, MAX_TECHNICAL_QUERY_RESULT_BYTES,
-    TECHNICAL_LESSON_SCHEMA_VERSION, TECHNICAL_LESSON_TAG,
+    MemoryRevisionState, MemorySourceEvidence, TechnicalLessonConflict,
+    TechnicalLessonCorrectionRequest, TechnicalLessonDraft, TechnicalLessonError,
+    TechnicalLessonQueryResult, TechnicalLessonQueryStatus, TechnicalLessonRecord,
+    TechnicalLessonResolutionRequest, TechnicalLessonRetrievalRequest, TechnicalLessonStoreError,
+    WorkspaceMemoryId, MAX_TECHNICAL_QUERY_RESULT_BYTES, TECHNICAL_LESSON_SCHEMA_VERSION,
+    TECHNICAL_LESSON_TAG,
 };
 use crate::persistence::{
     CommitState, FileClass, PersistenceError, PersistentStorage, StorageGeneration,
@@ -1831,6 +1832,41 @@ impl TeamReplica {
         Ok(output)
     }
 
+    /// Inspect one bounded page of a team conflict after consuming an exact
+    /// read grant. The complete expected head set remains in every page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when authorization, replica freshness, pagination,
+    /// conflict integrity, or local persistence validation fails.
+    pub fn inspect_technical_lesson_conflict(
+        &self,
+        logical_id: LogicalMemoryId,
+        after_head_digest: Option<&MemoryDigest>,
+        limit: usize,
+    ) -> Result<TechnicalLessonConflict, TeamReplicationError> {
+        let request_digest = canonical_digest(&LocalConflictInspectRequest {
+            logical_id,
+            after_head_digest,
+            limit,
+        })?;
+        let permit = self.authorize_local(TeamMemoryOperation::List, request_digest)?;
+        let runtime = self.lock_current_runtime()?;
+        ensure_client_runtime(&runtime)?;
+        self.authority
+            .validate_permit(&permit, TeamMemoryOperation::List, request_digest)?;
+        if runtime.state.freshness == TeamReplicaFreshness::Unauthorized {
+            return Err(TeamReplicationError::Unauthorized);
+        }
+        if runtime.state.freshness == TeamReplicaFreshness::Corrupt {
+            return Err(TeamReplicationError::CorruptReplica);
+        }
+        runtime
+            .database
+            .inspect_technical_lesson_conflict(logical_id, after_head_digest, limit)
+            .map_err(TeamReplicationError::Store)
+    }
+
     /// Create one causal team correction and queue it durably for replication.
     ///
     /// # Errors
@@ -1861,6 +1897,45 @@ impl TeamReplica {
             .map_err(TeamReplicationError::Store)?;
         if let Err(error) =
             self.record_local_mutation(&mut runtime, TeamMemoryOperation::Correct, revision)
+        {
+            restore_runtime(&mut runtime, previous)?;
+            return Err(error);
+        }
+        drop(runtime);
+        Ok(record)
+    }
+
+    /// Resolve one exact complete team head set and durably queue the resulting
+    /// multi-parent revision for authenticated replication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller lacks resolve authority, the supplied
+    /// head set is stale/incomplete, or the local revision/outbox commit fails.
+    pub fn resolve_technical_lesson_conflict(
+        &self,
+        request: TechnicalLessonResolutionRequest,
+    ) -> Result<TechnicalLessonRecord, TeamReplicationError> {
+        let request_digest = canonical_digest(&LocalResolutionRequest::from(&request))?;
+        let permit = self.authorize_local(TeamMemoryOperation::Resolve, request_digest)?;
+        let mut runtime = self.lock_current_runtime()?;
+        ensure_client_runtime(&runtime)?;
+        self.authority
+            .validate_permit(&permit, TeamMemoryOperation::Resolve, request_digest)?;
+        ensure_outbox_capacity(&runtime.state)?;
+        let previous = runtime.state.clone();
+        let record = runtime
+            .database
+            .resolve_technical_lesson_conflict(request)
+            .map_err(TeamReplicationError::Store)?;
+        let revision = runtime
+            .database
+            .revision_by_digest(&record.record_digest)
+            .map_err(TeamReplicationError::Store)?
+            .context("new team resolution revision is unavailable")
+            .map_err(TeamReplicationError::Store)?;
+        if let Err(error) =
+            self.record_local_mutation(&mut runtime, TeamMemoryOperation::Resolve, revision)
         {
             restore_runtime(&mut runtime, previous)?;
             return Err(error);
@@ -2029,6 +2104,13 @@ struct LocalQueryRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct LocalConflictInspectRequest<'a> {
+    logical_id: LogicalMemoryId,
+    after_head_digest: Option<&'a MemoryDigest>,
+    limit: usize,
+}
+
+#[derive(Serialize)]
 struct LocalCorrectionRequest<'a> {
     logical_id: LogicalMemoryId,
     expected_record_digest: &'a MemoryDigest,
@@ -2044,6 +2126,31 @@ impl<'a> From<&'a TechnicalLessonCorrectionRequest> for LocalCorrectionRequest<'
         Self {
             logical_id: request.logical_id,
             expected_record_digest: &request.expected_record_digest,
+            replacement: &request.replacement,
+            correction_reason: &request.correction_reason,
+            source: &request.source,
+            author_id: &request.author_id,
+            captured_at_unix_seconds: request.captured_at_unix_seconds,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LocalResolutionRequest<'a> {
+    logical_id: LogicalMemoryId,
+    expected_head_digests: &'a [MemoryDigest],
+    replacement: &'a TechnicalLessonDraft,
+    correction_reason: &'a str,
+    source: &'a MemorySourceEvidence,
+    author_id: &'a str,
+    captured_at_unix_seconds: i64,
+}
+
+impl<'a> From<&'a TechnicalLessonResolutionRequest> for LocalResolutionRequest<'a> {
+    fn from(request: &'a TechnicalLessonResolutionRequest) -> Self {
+        Self {
+            logical_id: request.logical_id,
+            expected_head_digests: &request.expected_head_digests,
             replacement: &request.replacement,
             correction_reason: &request.correction_reason,
             source: &request.source,
@@ -2240,17 +2347,27 @@ fn validate_mutation_shape(
         TeamMemoryOperation::Propose => {
             revision.version.get() == 1
                 && revision.parent_digest.is_none()
+                && revision.additional_parent_digests.is_empty()
                 && revision.state == MemoryRevisionState::Active
                 && revision.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG)
         }
         TeamMemoryOperation::Correct => {
             revision.version.get() > 1
                 && revision.parent_digest.is_some()
+                && revision.additional_parent_digests.is_empty()
+                && revision.state == MemoryRevisionState::Active
+                && revision.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG)
+        }
+        TeamMemoryOperation::Resolve => {
+            revision.version.get() > 1
+                && revision.parent_digest.is_some()
+                && !revision.additional_parent_digests.is_empty()
                 && revision.state == MemoryRevisionState::Active
                 && revision.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG)
         }
         TeamMemoryOperation::Delete => {
             revision.parent_digest.is_some()
+                && revision.additional_parent_digests.is_empty()
                 && revision.state == MemoryRevisionState::Tombstone
                 && revision.content.is_empty()
                 && revision.tags.is_empty()
@@ -3151,6 +3268,88 @@ mod tests {
             .expect("pull ack")
     }
 
+    fn resolve_active_conflict_and_assert_convergence(
+        logical_id: LogicalMemoryId,
+        member_client: &TeamReplica,
+        owner_client: &TeamReplica,
+        service: &TeamReplica,
+    ) {
+        let inspected = member_client
+            .inspect_technical_lesson_conflict(logical_id, None, 8)
+            .expect("inspect complete conflict");
+        assert_eq!(inspected.branches.len(), 2);
+        assert!(!inspected.branches_truncated);
+        let resolution = TechnicalLessonResolutionRequest {
+            logical_id,
+            expected_head_digests: inspected.expected_head_digests,
+            replacement: draft("explicit team resolution"),
+            correction_reason: "maintainer reconciled both cited platform invariants".to_string(),
+            source: source("explicit team resolution"),
+            author_id: "member-agent".to_string(),
+            captured_at_unix_seconds: chrono::Utc::now().timestamp(),
+        };
+        let resolved = member_client
+            .resolve_technical_lesson_conflict(resolution.clone())
+            .expect("maintainer resolution");
+        let replayed = member_client
+            .resolve_technical_lesson_conflict(resolution)
+            .expect("idempotent local resolution replay");
+        assert_eq!(replayed.record_digest, resolved.record_digest);
+        assert_eq!(member_client.status().expect("status").queued_mutations, 1);
+        assert_eq!(push_once(member_client, service), 1);
+        pull_once(owner_client, service);
+        pull_once(member_client, service);
+        for replica in [owner_client, member_client] {
+            let converged = replica
+                .query_technical_lessons(None, 5, chrono::Utc::now().timestamp())
+                .expect("converged resolution");
+            assert_eq!(converged.result.records.len(), 1);
+            assert!(converged.conflicts.is_empty());
+            assert_eq!(
+                converged.result.records[0].record_digest,
+                resolved.record_digest
+            );
+        }
+    }
+
+    fn resolve_tombstone_conflict_and_assert_restoration(
+        logical_id: LogicalMemoryId,
+        member_client: &TeamReplica,
+        owner_client: &TeamReplica,
+        service: &TeamReplica,
+    ) {
+        let inspected = member_client
+            .inspect_technical_lesson_conflict(logical_id, None, 8)
+            .expect("inspect tombstone conflict");
+        assert!(inspected.branches.iter().all(|branch| branch.state
+            == MemoryRevisionState::Tombstone
+            && branch.lesson.is_none()));
+        let restored = member_client
+            .resolve_technical_lesson_conflict(TechnicalLessonResolutionRequest {
+                logical_id,
+                expected_head_digests: inspected.expected_head_digests,
+                replacement: draft("restored after concurrent deletion"),
+                correction_reason:
+                    "maintainer explicitly restored the lesson after inspecting both tombstones"
+                        .to_string(),
+                source: source("restored after concurrent deletion"),
+                author_id: "agent:member".to_string(),
+                captured_at_unix_seconds: chrono::Utc::now().timestamp(),
+            })
+            .expect("resolve tombstone conflict");
+        assert_eq!(push_once(member_client, service), 1);
+        pull_once(owner_client, service);
+        let owner_result = owner_client
+            .query_technical_lessons(None, 5, chrono::Utc::now().timestamp())
+            .expect("owner sees restored lesson");
+        assert_eq!(owner_result.result.records.len(), 1);
+        assert!(owner_result.conflicts.is_empty());
+        assert_eq!(
+            owner_result.result.records[0].record_digest,
+            restored.record_digest
+        );
+    }
+
     fn replica_path(fixture: &OwnerFixture, role: ReplicaRole, team_id: &TeamId) -> PathBuf {
         let canonical_workspace = fixture.workspace.path().canonicalize().expect("workspace");
         let workspace_id = WorkspaceMemoryId::for_canonical_root(&canonical_workspace);
@@ -3704,6 +3903,13 @@ mod tests {
                 <= MAX_TECHNICAL_QUERY_RESULT_BYTES
         );
 
+        resolve_active_conflict_and_assert_convergence(
+            root.logical_id,
+            &member_client,
+            &owner_client,
+            &service,
+        );
+
         let member_id = member.local_principal_id().expect("member ID");
         let revoked_bundle = fixture
             .authority
@@ -3785,6 +3991,13 @@ mod tests {
             .iter()
             .all(|head| head.state == MemoryRevisionState::Tombstone));
         assert_eq!(result.freshness, TeamReplicaFreshness::Partial);
+
+        resolve_tombstone_conflict_and_assert_restoration(
+            root.logical_id,
+            &member_client,
+            &owner_client,
+            &service,
+        );
     }
 
     #[test]

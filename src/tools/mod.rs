@@ -11,7 +11,8 @@
 //! - `memory_search`: Retrieve bounded cited lessons as reference evidence
 //! - `memory_list`: List recent typed lessons
 //! - `memory_learning_status`: Inspect causal capture and degradation metadata
-//! - `memory_update`: Create a causal correction of an exact lesson revision
+//! - `memory_conflicts`: Inspect bounded cited branches and exact head sets
+//! - `memory_update`: Correct one exact head or resolve a complete conflict set
 //! - `memory_delete`: Tombstone an exact lesson revision
 //! - `memory_review`: Apply or revoke a fresh host-authorized review
 //! - `memory_export`: Publish a bounded portable causal package

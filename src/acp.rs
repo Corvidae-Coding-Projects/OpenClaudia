@@ -2184,6 +2184,7 @@ impl AcpServer {
             | "memory_import"
             | "memory_list"
             | "memory_learning_status"
+            | "memory_conflicts"
             | "memory_source_status"
             | "memory_source_refresh" => {
                 self.execute_local_tool_async(
@@ -4402,6 +4403,128 @@ memory:
         );
     }
 
+    fn create_acp_memory_conflict(
+        server: &AcpServer,
+    ) -> (
+        crate::memory::LogicalMemoryId,
+        Vec<crate::memory::MemoryDigest>,
+    ) {
+        let draft: crate::memory::TechnicalLessonDraft =
+            serde_json::from_value(acp_memory_draft("ACP conflict root")).expect("conflict draft");
+        let source = |label: &str| {
+            crate::memory::MemorySourceEvidence::new(
+                crate::memory::MemorySourceKind::ToolOutcome,
+                format!("acp-test:{label}"),
+                "unit-test".to_string(),
+                crate::memory::MemoryDigest::for_fields(
+                    b"openclaudia.s1081.acp-test.v1",
+                    &[label.as_bytes()],
+                ),
+            )
+        };
+        let root_record = server
+            .memory_db
+            .save_technical_lesson_candidate(&draft, source("root"), "agent:root".to_string(), 1)
+            .expect("conflict root");
+        let root = server
+            .memory_db
+            .revision_by_digest(&root_record.record_digest)
+            .expect("root lookup")
+            .expect("root revision");
+        let root_lesson =
+            crate::memory::TechnicalLesson::decode(&root.content).expect("root lesson");
+        for label in ["left", "right"] {
+            let replacement: crate::memory::TechnicalLessonDraft =
+                serde_json::from_value(acp_memory_draft(&format!("ACP {label} conflict branch")))
+                    .expect("branch draft");
+            let lesson = root_lesson
+                .corrected(
+                    replacement,
+                    root.record_digest.clone(),
+                    format!("retain ACP {label} evidence"),
+                    2,
+                )
+                .expect("branch lesson");
+            let revision = root
+                .successor(
+                    lesson.encode().expect("branch encoding"),
+                    root.tags.clone(),
+                    crate::memory::MemoryProvenance::new(
+                        source(label),
+                        crate::memory::MemoryAttribution::new(
+                            format!("agent:{label}"),
+                            Some(server.memory_db.store_id().expect("store ID")),
+                            Some(
+                                server
+                                    .memory_db
+                                    .workspace_id()
+                                    .expect("workspace ID")
+                                    .to_string(),
+                            ),
+                        ),
+                        crate::memory::MemoryRecordScope::UserPrivate,
+                    ),
+                )
+                .expect("branch revision");
+            server
+                .memory_db
+                .apply_revision(&revision)
+                .expect("apply branch");
+        }
+        let conflict = server
+            .memory_db
+            .inspect_technical_lesson_conflict(root.logical_id, None, 8)
+            .expect("conflict state");
+        assert_eq!(conflict.expected_head_digests.len(), 2);
+        (root.logical_id, conflict.expected_head_digests)
+    }
+
+    async fn assert_acp_conflict_inspection_and_resolution(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let (logical_id, expected_head_digests) = create_acp_memory_conflict(server);
+
+        let inspected = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-conflicts",
+            "memory_conflicts",
+            json!({"logical_id": logical_id.to_string(), "limit": 1}),
+        )
+        .await;
+        assert!(
+            !inspected.is_error && inspected.content.contains("Inspected 1 of 2"),
+            "ACP memory_conflicts failed: {}",
+            inspected.content
+        );
+
+        let resolved = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-resolve",
+            "memory_update",
+            json!({
+                "logical_id": logical_id.to_string(),
+                "expected_head_digests": expected_head_digests,
+                "correction_reason": "Exercise ACP complete-head resolution routing.",
+                "replacement": acp_memory_draft("ACP conflict resolution is canonical")
+            }),
+        )
+        .await;
+        assert!(
+            !resolved.is_error && resolved.content.contains("Resolved technical lesson"),
+            "ACP memory resolution failed: {}",
+            resolved.content
+        );
+        let heads = server
+            .memory_db
+            .revision_heads(logical_id)
+            .expect("resolved heads");
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].version.get(), 3);
+    }
+
     #[tokio::test]
     async fn acp_routes_every_typed_memory_operation_to_its_host_store() {
         let (server, _rx, _tmp) = test_server();
@@ -4510,6 +4633,8 @@ memory:
             "ACP memory_search failed: {}",
             searched.content
         );
+
+        assert_acp_conflict_inspection_and_resolution(&server, &run).await;
     }
 
     #[tokio::test]

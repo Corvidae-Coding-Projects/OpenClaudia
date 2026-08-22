@@ -293,7 +293,7 @@ fn delete_team_lesson_and_verify_private_survives(
 }
 
 #[test]
-fn all_five_canonical_tools_route_team_scope_without_leaking_private_lessons() {
+fn canonical_team_tools_route_scope_without_leaking_private_lessons() {
     let host = tempfile::tempdir().expect("host home");
     let workspace = tempfile::tempdir().expect("workspace");
     let principal: PrincipalId = "owner".parse().expect("principal");
@@ -504,6 +504,7 @@ fn registry_exposes_exact_read_and_write_scope_contracts() {
         ("memory_save", &["user", "team"][..]),
         ("memory_search", &["user", "team", "both"][..]),
         ("memory_list", &["user", "team", "both"][..]),
+        ("memory_conflicts", &["user", "team"][..]),
         ("memory_update", &["user", "team"][..]),
         ("memory_delete", &["user", "team"][..]),
     ] {

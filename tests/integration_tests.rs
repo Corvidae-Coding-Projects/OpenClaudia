@@ -1639,6 +1639,7 @@ mod tool_definitions {
             "memory_search",
             "memory_list",
             "memory_learning_status",
+            "memory_conflicts",
             "memory_update",
             "memory_delete",
             "memory_review",

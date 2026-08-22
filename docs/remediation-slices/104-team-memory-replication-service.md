@@ -23,7 +23,7 @@ and the same canonical tools and lifecycle as private technical memory.
 - Reuse S-053 logical identities and immutable revision graph. Synchronize in
   bounded parent-before-child batches with durable idempotent outbox/inbox state;
   offline or concurrent branches remain visible until explicit typed resolution.
-- Wire approved team configuration into startup and all five canonical memory
+- Wire approved team configuration into startup and the canonical memory
   tools without treating repository content or a shared path as authority.
   Private lessons never leave their scope; team results remain untrusted cited
   evidence and never enter prompts ambiently.
@@ -63,7 +63,7 @@ them lazily. The transport owns a bounded TLS server and supervised client
 worker. Cancellation is independent of the bounded command queue, so a full
 queue cannot make supervisor destruction wait forever.
 
-The five canonical technical-memory tools now share one explicit scope model:
+The canonical technical-memory tools now share one explicit scope model:
 reads accept `user`, `team`, or `both`; writes require exactly `user` or `team`
 and reject `both`. Team records remain typed, cited technical lessons retrieved
 only by tool call. They are neither prompt prose nor ambient context. Private
@@ -90,6 +90,14 @@ bounded, require strictly consistent revision/digest pairs, and advance only a
 durable causal cursor; batches commit parent before child and preserve every
 concurrent head, including tombstone-only conflicts.
 
+Issue #1081 adds an explicit `Resolve` operation available only to maintainers
+and owners. Conflict inspection consumes the same authenticated read grants as
+other team reads. A resolution names the complete current head set, publishes
+one multi-parent active revision under signed exact-operation grants, queues it
+exactly once, and converges
+offline clients and the service without last-writer-wins. Active/tombstone and
+tombstone-only conflicts remain inspectable until that resolution commits.
+
 ## Verification evidence
 
 All Rust commands used Rust 1.98.0 and `CARGO_BUILD_JOBS=4`; every test command
@@ -105,7 +113,7 @@ used `--test-threads=1`.
 - Team-authority E2E: 17 passed; real-binary authority CLI E2E: 5 passed. The
   latter covers descriptor creation, configuration, authenticated refresh, and
   consumed-descriptor replay rejection across isolated host processes.
-- Public five-tool team-memory E2E: 5 passed. The tests exercise every canonical
+- Public team-memory E2E: 5 passed. The tests exercise every canonical
   tool, private-data non-replication, explicit invalid write scope, revoked
   combined-read partial status, and registry schema exposure.
 - TUI/REPL startup, ACP startup, and exact subagent replica reopening each
@@ -120,6 +128,11 @@ used `--test-threads=1`.
   the gate passed again without warnings from S-104 paths. Remaining Windows
   unused/dead-code warnings are pre-existing platform-test findings owned by
   their existing remediation issues.
+- Issue #1081 follow-on verification passed all seven private conflict E2Es,
+  the 17-test team-role matrix, five public team-scope E2Es, six portable E2Es,
+  and the offline active/tombstone convergence scenarios in the library suite.
+  Strict Rust 1.98.0 Clippy, Windows GNU all-target check, and the complete
+  native all-feature/all-target test matrix also passed.
 
 The SHA-256 digest of the sorted `sha256sum` manifest for the 28 changed
 non-slice artifacts is
@@ -146,7 +159,7 @@ named authorization structures and helper extraction rather than allowances.
 - Non-Unix descriptor-safe private storage remains owned by S-036. Windows is
   compile-gated here and the runtime fails closed where that backend is absent.
 - Concurrent causal heads remain visible until the explicit typed resolution
-  operation tracked by issue #1081; replication does not discard either head.
+  operation delivered by issue #1081; replication does not discard any head.
 
 The implementation completes S-104 only. It does not imply completion of the
 parent dormant-feature workstream or of later technical-memory evaluation work.

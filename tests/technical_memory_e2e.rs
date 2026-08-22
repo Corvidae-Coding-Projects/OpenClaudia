@@ -124,7 +124,7 @@ fn assert_v5_recovery_backup(path: &std::path::Path) -> std::path::PathBuf {
         .file_name()
         .expect("database file name")
         .to_string_lossy();
-    let backup_path = path.with_file_name(format!("{file_name}.pre-v6-backup.sqlite"));
+    let backup_path = path.with_file_name(format!("{file_name}.pre-v7-backup.sqlite"));
     let backup = Connection::open_with_flags(&backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .expect("durable pre-migration recovery backup");
     let backup_version: i64 = backup
@@ -1008,6 +1008,7 @@ fn supported_v5_migration_preserves_identity_and_provenance() {
     conn.execute_batch(
         "DROP TRIGGER technical_lesson_count_cap;\n\
          DROP TABLE memory_store_contract;\n\
+         ALTER TABLE memory_revisions DROP COLUMN additional_parent_digests_json;\n\
          DELETE FROM schema_version;\n\
          INSERT INTO schema_version(version) VALUES (5);",
     )
@@ -1046,13 +1047,13 @@ fn supported_v5_migration_preserves_identity_and_provenance() {
     );
     assert!(!temp
         .path()
-        .join("tampered-v5.db.pre-v6-backup.sqlite")
+        .join("tampered-v5.db.pre-v7-backup.sqlite")
         .exists());
 
     let changed_source_path = temp.path().join("changed-source-v5.db");
     let changed_backup_path = temp
         .path()
-        .join("changed-source-v5.db.pre-v6-backup.sqlite");
+        .join("changed-source-v5.db.pre-v7-backup.sqlite");
     fs::copy(&backup_path, &changed_source_path).expect("copy current v5 source");
     fs::copy(&backup_path, &changed_backup_path).expect("copy older v5 recovery point");
     let conn = Connection::open(&changed_source_path).expect("changed v5 writer");
@@ -1071,7 +1072,7 @@ fn supported_v5_migration_preserves_identity_and_provenance() {
 }
 
 #[test]
-fn concurrent_v5_openers_publish_one_recoverable_v6_migration() {
+fn concurrent_v5_openers_publish_one_recoverable_v7_migration() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("concurrent-v5.db");
     let db = MemoryDb::open(&path).expect("current fixture");
@@ -1084,6 +1085,7 @@ fn concurrent_v5_openers_publish_one_recoverable_v6_migration() {
     conn.execute_batch(
         "DROP TRIGGER technical_lesson_count_cap;\n\
          DROP TABLE memory_store_contract;\n\
+         ALTER TABLE memory_revisions DROP COLUMN additional_parent_digests_json;\n\
          DELETE FROM schema_version;\n\
          INSERT INTO schema_version(version) VALUES (5);",
     )
@@ -1121,7 +1123,7 @@ fn concurrent_v5_openers_publish_one_recoverable_v6_migration() {
         .expect("version rows")
         .collect::<rusqlite::Result<_>>()
         .expect("version values");
-    assert_eq!(versions, vec![6]);
+    assert_eq!(versions, vec![7]);
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM archival_memory", [], |row| row
             .get::<_, i64>(0))

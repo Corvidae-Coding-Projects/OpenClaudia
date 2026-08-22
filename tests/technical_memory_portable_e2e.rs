@@ -14,8 +14,10 @@ use std::sync::Arc;
 use std::collections::HashMap;
 
 use openclaudia::memory::{
-    MemoryDb, MemoryDigest, TechnicalMemoryPackageManifest, TechnicalMemorySourceStoreStatus,
-    TECHNICAL_MEMORY_PACKAGE_MANIFEST_NAME,
+    ApplyRevisionOutcome, MemoryAttribution, MemoryDb, MemoryDigest, MemoryProvenance,
+    MemoryRecordScope, MemoryRevision, MemorySourceEvidence, MemorySourceKind, TechnicalLesson,
+    TechnicalLessonDraft, TechnicalLessonResolutionRequest, TechnicalMemoryPackageManifest,
+    TechnicalMemorySourceStoreStatus, TECHNICAL_MEMORY_PACKAGE_MANIFEST_NAME,
 };
 use openclaudia::permissions::{
     ApprovalProvenance, AuthorizationResult, ExecutionPermit, PermissionManager,
@@ -135,6 +137,43 @@ fn lesson_value(title: &str) -> Value {
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
     })
+}
+
+fn portable_source(label: &str) -> MemorySourceEvidence {
+    MemorySourceEvidence::new(
+        MemorySourceKind::ToolOutcome,
+        format!("s1081:{label}"),
+        "git:s1081-portable".to_string(),
+        MemoryDigest::for_fields(b"openclaudia.s1081.portable-source.v1", &[label.as_bytes()]),
+    )
+}
+
+fn portable_conflict_branch(db: &MemoryDb, root: &MemoryRevision, label: &str) -> MemoryRevision {
+    let root_lesson = TechnicalLesson::decode(&root.content).expect("root lesson");
+    let replacement: TechnicalLessonDraft =
+        serde_json::from_value(lesson_value(label)).expect("replacement draft");
+    let lesson = root_lesson
+        .corrected(
+            replacement,
+            root.record_digest.clone(),
+            format!("retain the {label} cited branch"),
+            2,
+        )
+        .expect("branch lesson");
+    root.successor(
+        lesson.encode().expect("branch lesson encoding"),
+        root.tags.clone(),
+        MemoryProvenance::new(
+            portable_source(label),
+            MemoryAttribution::new(
+                format!("agent:{label}"),
+                Some(db.store_id().expect("store ID")),
+                Some(db.workspace_id().expect("workspace ID").to_string()),
+            ),
+            MemoryRecordScope::UserPrivate,
+        ),
+    )
+    .expect("branch revision")
 }
 
 fn approve_once(
@@ -517,6 +556,96 @@ fn complete_round_trip_preserves_typed_causal_state_and_excludes_legacy_prose() 
     assert_imported_causal_state(&source, &target, &reviewed_candidate, &tombstoned_candidate);
     assert_replay_and_reexport(&source, &target, &package_root, &manifest.snapshot_digest);
     assert_imported_source_can_advance_with_mixed_origin_provenance(&source, &target);
+}
+
+#[test]
+fn resolved_branching_history_round_trips_with_every_causal_parent() {
+    let source = Fixture::new();
+    let root_record = source.save_lesson("save-conflict-root", "Portable merge root");
+    let root_digest = root_record["record_digest"]
+        .as_str()
+        .expect("root digest")
+        .parse()
+        .expect("typed root digest");
+    let root = source
+        .db
+        .revision_by_digest(&root_digest)
+        .expect("root lookup")
+        .expect("root revision");
+    let left = portable_conflict_branch(&source.db, &root, "portable left branch");
+    let right = portable_conflict_branch(&source.db, &root, "portable right branch");
+    assert_eq!(
+        source.db.apply_revision(&left).expect("left branch"),
+        ApplyRevisionOutcome::Advanced
+    );
+    assert_eq!(
+        source.db.apply_revision(&right).expect("right branch"),
+        ApplyRevisionOutcome::Conflicted
+    );
+    let conflict = source
+        .db
+        .inspect_technical_lesson_conflict(root.logical_id, None, 8)
+        .expect("complete conflict");
+    let replacement: TechnicalLessonDraft =
+        serde_json::from_value(lesson_value("Portable explicit merge")).expect("resolution draft");
+    let resolved = source
+        .db
+        .resolve_technical_lesson_conflict(TechnicalLessonResolutionRequest {
+            logical_id: root.logical_id,
+            expected_head_digests: conflict.expected_head_digests,
+            replacement,
+            correction_reason: "export every cited branch and its explicit merge".to_string(),
+            source: portable_source("portable resolution"),
+            author_id: "agent:resolver".to_string(),
+            captured_at_unix_seconds: 3,
+        })
+        .expect("resolution");
+    let source_history = source
+        .db
+        .revisions_for_logical_bounded(root.logical_id, 10)
+        .expect("source merge history");
+    assert_eq!(source_history.len(), 4);
+
+    let package_root = source.package_dir("resolved-branching-package");
+    let exported = authorized_execute(
+        &source.run,
+        &source.db,
+        &export_call("export-resolved-branches", &package_root),
+    );
+    assert!(
+        !exported.is_error(),
+        "branch export: {}",
+        exported.content()
+    );
+    let manifest = load_manifest(&package_root);
+    assert_eq!(manifest.minimum_reader_version, 7);
+    assert_eq!(manifest.revision_count, 4);
+    assert_eq!(manifest.head_count, 1);
+
+    let target_host = tempfile::tempdir().expect("target host");
+    let target = MemoryDb::open_for_workspace(target_host.path(), source.workspace.path())
+        .expect("target store");
+    let imported = authorized_execute(
+        &source.run,
+        &target,
+        &import_call("import-resolved-branches", &package_root),
+    );
+    assert!(
+        !imported.is_error(),
+        "branch import: {}",
+        imported.content()
+    );
+    assert_eq!(
+        target
+            .revisions_for_logical_bounded(root.logical_id, 10)
+            .expect("imported merge history"),
+        source_history
+    );
+    let heads = target
+        .revision_heads(root.logical_id)
+        .expect("imported head");
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].record_digest, resolved.record_digest);
 }
 
 #[test]

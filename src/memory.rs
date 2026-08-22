@@ -28,15 +28,16 @@ mod source;
 
 pub use lesson::{
     LessonApplicability, LessonCitation, LessonCitationKind, LessonCorrection, LessonRetention,
-    LessonReviewState, TechnicalLesson, TechnicalLessonConfidence,
-    TechnicalLessonCorrectionRequest, TechnicalLessonDraft, TechnicalLessonError,
-    TechnicalLessonKind, TechnicalLessonQueryResult, TechnicalLessonQueryStatus,
-    TechnicalLessonRecord, TechnicalLessonSensitivity, TechnicalLessonStoreError,
-    WorkspaceMemoryId, MAX_LESSON_APPLICABILITY_ITEMS, MAX_LESSON_CITATIONS,
-    MAX_LESSON_CORRECTION_BYTES, MAX_LESSON_GUIDANCE_BYTES, MAX_LESSON_ITEM_BYTES,
-    MAX_LESSON_LOCATOR_BYTES, MAX_LESSON_OBSERVATION_BYTES, MAX_LESSON_TITLE_BYTES,
-    MAX_LESSON_VERSION_BYTES, MAX_TECHNICAL_LESSONS_PER_STORE, MAX_TECHNICAL_LESSON_BYTES,
-    MAX_TECHNICAL_QUERY_RESULT_BYTES, TECHNICAL_LESSON_SCHEMA_VERSION, TECHNICAL_LESSON_TAG,
+    LessonReviewState, TechnicalLesson, TechnicalLessonConfidence, TechnicalLessonConflict,
+    TechnicalLessonConflictBranch, TechnicalLessonCorrectionRequest, TechnicalLessonDraft,
+    TechnicalLessonError, TechnicalLessonKind, TechnicalLessonQueryResult,
+    TechnicalLessonQueryStatus, TechnicalLessonRecord, TechnicalLessonResolutionRequest,
+    TechnicalLessonSensitivity, TechnicalLessonStoreError, WorkspaceMemoryId,
+    MAX_LESSON_APPLICABILITY_ITEMS, MAX_LESSON_CITATIONS, MAX_LESSON_CORRECTION_BYTES,
+    MAX_LESSON_GUIDANCE_BYTES, MAX_LESSON_ITEM_BYTES, MAX_LESSON_LOCATOR_BYTES,
+    MAX_LESSON_OBSERVATION_BYTES, MAX_LESSON_TITLE_BYTES, MAX_LESSON_VERSION_BYTES,
+    MAX_TECHNICAL_LESSONS_PER_STORE, MAX_TECHNICAL_LESSON_BYTES, MAX_TECHNICAL_QUERY_RESULT_BYTES,
+    TECHNICAL_LESSON_SCHEMA_VERSION, TECHNICAL_LESSON_TAG,
 };
 pub use portable::{
     PortableMemoryExportResult, PortableMemoryExportStatus, PortableMemoryImportResult,
@@ -47,7 +48,7 @@ pub use portable::{
 pub use record::{
     LogicalMemoryId, MemoryAttribution, MemoryDigest, MemoryProvenance, MemoryRecordError,
     MemoryRecordScope, MemoryRevision, MemoryRevisionState, MemorySourceEvidence, MemorySourceKind,
-    MemoryStoreId, MemoryVersion, MEMORY_PROVENANCE_SCHEMA_VERSION,
+    MemoryStoreId, MemoryVersion, MAX_MEMORY_REVISION_PARENTS, MEMORY_PROVENANCE_SCHEMA_VERSION,
 };
 pub(crate) use retrieval::rank_technical_lessons;
 pub use retrieval::{
@@ -110,7 +111,7 @@ pub fn xml_escape_for_prompt(s: &str) -> Cow<'_, str> {
 const MEMORY_DB_NAME: &str = "memory.db";
 
 /// Current schema version - increment when adding migrations
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Oldest explicitly versioned store this build can migrate. Unversioned
 /// non-empty databases are rejected because their partial state cannot be
@@ -136,6 +137,8 @@ const MAX_TECHNICAL_PROVENANCE_BYTES: usize = 4 * 1_024;
 /// Querying does not materialize the entire maximum-sized store. A partial
 /// result explicitly reports when newer records exhausted either scan budget.
 const MAX_TECHNICAL_QUERY_SCAN_BYTES: usize = 4 * 1_024 * 1_024;
+/// Maximum cited conflict branches returned by one inspection page.
+pub const MAX_TECHNICAL_CONFLICT_BRANCH_PAGE: usize = 8;
 
 /// Short-term memory expiration (hours)
 const SHORT_TERM_EXPIRY_HOURS: i64 = 48;
@@ -201,6 +204,8 @@ pub struct MemoryConflictHead {
     pub version: MemoryVersion,
     pub record_digest: MemoryDigest,
     pub parent_digest: Option<MemoryDigest>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_parent_digests: Vec<MemoryDigest>,
     pub content_digest: MemoryDigest,
     pub state: MemoryRevisionState,
 }
@@ -364,6 +369,17 @@ struct TechnicalLessonCandidates {
 struct TechnicalCorrectionReplay<'a> {
     current: &'a MemoryRevision,
     expected_parent: &'a MemoryDigest,
+    workspace_id: &'a WorkspaceMemoryId,
+    replacement: &'a TechnicalLessonDraft,
+    correction_reason: &'a str,
+    expected_provenance: &'a MemoryProvenance,
+    now_unix_seconds: i64,
+}
+
+struct TechnicalResolutionReplay<'a> {
+    logical_id: LogicalMemoryId,
+    current_heads: &'a [MemoryDigest],
+    expected_heads: &'a [MemoryDigest],
     workspace_id: &'a WorkspaceMemoryId,
     replacement: &'a TechnicalLessonDraft,
     correction_reason: &'a str,
@@ -795,7 +811,8 @@ impl MemoryDb {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .context("memory database path has no UTF-8 file name")?;
-        let backup_path = path.with_file_name(format!("{file_name}.pre-v6-backup.sqlite"));
+        let backup_path =
+            path.with_file_name(format!("{file_name}.pre-v{SCHEMA_VERSION}-backup.sqlite"));
         let temp_path =
             path.with_file_name(format!(".{file_name}.backup-{}.tmp", uuid::Uuid::new_v4()));
         let result = (|| {
@@ -811,7 +828,7 @@ impl MemoryDb {
             if backup_version == SCHEMA_VERSION {
                 // Another opener completed the migration after our read-only
                 // source preflight. Its fully validated current snapshot needs
-                // no additional pre-v6 recovery copy.
+                // no additional recovery copy for this target schema.
                 std::fs::remove_file(&temp_path)?;
                 return Ok(());
             }
@@ -1046,6 +1063,14 @@ impl MemoryDb {
             Self::migrate_v6_on(conn)?;
         }
 
+        // Version 7: canonical multi-parent causal revisions. Linear v1
+        // revisions retain an empty additional-parent set and their exact
+        // record digests; only explicit conflict resolutions use the new
+        // domain-separated v2 digest.
+        if from_version < 7 {
+            Self::migrate_v7_on(conn)?;
+        }
+
         // Publish exactly one marker only after every migration and validator
         // succeeded inside the surrounding transaction.
         conn.execute("DELETE FROM schema_version", [])?;
@@ -1095,6 +1120,45 @@ impl MemoryDb {
             ",
         )
         .context("v6: failed to create strict store contract")?;
+        let schema_digest = Self::schema_manifest_digest(conn)?;
+        conn.execute(
+            "UPDATE memory_store_contract SET schema_digest = ?1 WHERE singleton = 1",
+            params![schema_digest],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_v7_on(conn: &Connection) -> Result<()> {
+        tracing::debug!("Running migration v7: multi-parent causal memory revisions");
+        conn.execute_batch(
+            r"
+            ALTER TABLE memory_revisions
+                ADD COLUMN additional_parent_digests_json TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE memory_store_contract RENAME TO memory_store_contract_v6;
+            CREATE TABLE memory_store_contract (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                store_schema_version INTEGER NOT NULL CHECK(store_schema_version = 7),
+                minimum_reader_version INTEGER NOT NULL CHECK(minimum_reader_version = 7),
+                lesson_schema_version INTEGER NOT NULL CHECK(lesson_schema_version = 1),
+                authority_kind TEXT NOT NULL
+                    CHECK(authority_kind IN ('explicit_unbound', 'user_private', 'team_shared')),
+                workspace_id TEXT,
+                schema_digest TEXT NOT NULL,
+                migration_state TEXT NOT NULL CHECK(migration_state = 'ready'),
+                CHECK((authority_kind = 'explicit_unbound' AND workspace_id IS NULL)
+                   OR (authority_kind != 'explicit_unbound' AND workspace_id IS NOT NULL))
+            );
+            INSERT INTO memory_store_contract
+                (singleton, store_schema_version, minimum_reader_version,
+                 lesson_schema_version, authority_kind, workspace_id, schema_digest,
+                 migration_state)
+            SELECT singleton, 7, 7, lesson_schema_version, authority_kind,
+                   workspace_id, 'pending', migration_state
+              FROM memory_store_contract_v6;
+            DROP TABLE memory_store_contract_v6;
+            ",
+        )
+        .context("v7: failed to add multi-parent revision storage")?;
         let schema_digest = Self::schema_manifest_digest(conn)?;
         conn.execute(
             "UPDATE memory_store_contract SET schema_digest = ?1 WHERE singleton = 1",
@@ -1311,6 +1375,9 @@ impl MemoryDb {
         if version >= 6 {
             Self::migrate_v6_on(&conn)?;
         }
+        if version >= 7 {
+            Self::migrate_v7_on(&conn)?;
+        }
         Self::schema_manifest_digest(&conn)
     }
 
@@ -1341,6 +1408,9 @@ impl MemoryDb {
         }
         if version >= 6 {
             Self::validate_v6_schema_shape(conn, version)?;
+        }
+        if version >= 7 {
+            Self::validate_v7_schema_shape(conn, version)?;
         }
         Ok(())
     }
@@ -1566,10 +1636,24 @@ impl MemoryDb {
             ],
             version,
         )?;
-        Self::validate_v6_contract(conn)
+        if version == 6 {
+            Self::validate_memory_store_contract(conn, 6)
+        } else {
+            Ok(())
+        }
     }
 
-    fn validate_v6_contract(conn: &Connection) -> Result<()> {
+    fn validate_v7_schema_shape(conn: &Connection, version: i64) -> Result<()> {
+        Self::require_schema_columns(
+            conn,
+            "memory_revisions",
+            &["additional_parent_digests_json"],
+            version,
+        )?;
+        Self::validate_memory_store_contract(conn, 7)
+    }
+
+    fn validate_memory_store_contract(conn: &Connection, expected_version: i64) -> Result<()> {
         let rows = conn
             .prepare(
                 r"SELECT store_schema_version, minimum_reader_version,
@@ -1603,8 +1687,8 @@ impl MemoryDb {
             state,
         ) = &rows[0];
         anyhow::ensure!(
-            *store_version == SCHEMA_VERSION
-                && *minimum_reader == SCHEMA_VERSION
+            *store_version == expected_version
+                && *minimum_reader == expected_version
                 && *lesson_version == i64::from(TECHNICAL_LESSON_SCHEMA_VERSION)
                 && state == "ready",
             "memory store contract is unsupported or partially migrated"
@@ -1678,7 +1762,16 @@ impl MemoryDb {
             "memory database exceeds the revision validation budget"
         );
 
-        let mut stmt = conn.prepare(
+        let additional_parent_projection = if Self::table_has_column(
+            conn,
+            "memory_revisions",
+            "additional_parent_digests_json",
+        )? {
+            "revision.additional_parent_digests_json"
+        } else {
+            "'[]'"
+        };
+        let sql = format!(
             r"WITH RECURSIVE technical_history(record_digest) AS (
                    SELECT revision.record_digest
                      FROM memory_revisions revision
@@ -1696,14 +1789,17 @@ impl MemoryDb {
                       revision.parent_digest, revision.record_digest,
                       revision.content_digest, revision.content,
                       revision.tags_json, revision.provenance_json,
-                      revision.record_state, LENGTH(revision.content),
+                      revision.record_state,
+                      {additional_parent_projection},
+                      LENGTH(revision.content),
                       LENGTH(revision.tags_json), LENGTH(revision.provenance_json)
                  FROM memory_revisions revision
                  JOIN technical_history history
                    ON history.record_digest = revision.record_digest
                 ORDER BY revision.record_digest
-                LIMIT ?2",
-        )?;
+                LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(params![
             TECHNICAL_LESSON_TAG,
             MAX_MEMORY_MIGRATION_ROWS.saturating_add(1)
@@ -1717,9 +1813,9 @@ impl MemoryDb {
                 validated <= MAX_MEMORY_MIGRATION_ROWS,
                 "technical revision history exceeds its validation budget"
             );
-            let content_bytes: i64 = row.get(9)?;
-            let tags_bytes: i64 = row.get(10)?;
-            let provenance_bytes: i64 = row.get(11)?;
+            let content_bytes: i64 = row.get(10)?;
+            let tags_bytes: i64 = row.get(11)?;
+            let provenance_bytes: i64 = row.get(12)?;
             anyhow::ensure!(
                 (0..=i64::try_from(MAX_TECHNICAL_LESSON_BYTES)?).contains(&content_bytes)
                     && (0..=i64::try_from(MAX_TECHNICAL_REVISION_TAGS_BYTES)?)
@@ -2313,7 +2409,7 @@ impl MemoryDb {
             }))?;
             let logical_id = LogicalMemoryId::for_legacy_record(&canonical);
             let revision = MemoryRevision::legacy(logical_id, content, tags);
-            Self::insert_revision_row(conn, &revision)?;
+            Self::insert_pre_v7_linear_revision_row(conn, &revision)?;
             conn.execute(
                 "INSERT OR IGNORE INTO memory_heads (logical_id, record_digest) VALUES (?1, ?2)",
                 params![logical_id.to_string(), revision.record_digest.as_str()],
@@ -2385,6 +2481,46 @@ impl MemoryDb {
         revision.validate()?;
         let tags_json = serde_json::to_string(&revision.tags)?;
         let provenance_json = serde_json::to_string(&revision.provenance)?;
+        let additional_parent_digests_json =
+            serde_json::to_string(&revision.additional_parent_digests)?;
+        let state = match revision.state {
+            MemoryRevisionState::Active => "active",
+            MemoryRevisionState::Tombstone => "tombstone",
+        };
+        let rows = conn.execute(
+            r"INSERT OR IGNORE INTO memory_revisions
+               (logical_id, version, parent_digest, record_digest, content_digest,
+                content, tags_json, provenance_json, record_state,
+                additional_parent_digests_json)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                revision.logical_id.to_string(),
+                i64::try_from(revision.version.get())?,
+                revision.parent_digest.as_ref().map(MemoryDigest::as_str),
+                revision.record_digest.as_str(),
+                revision.content_digest.as_str(),
+                revision.content,
+                tags_json,
+                provenance_json,
+                state,
+                additional_parent_digests_json,
+            ],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Encode one linear revision while v5 backfill is still operating on the
+    /// pre-v7 table shape. Production writes use [`Self::insert_revision_row`]
+    /// only after every schema migration has completed.
+    fn insert_pre_v7_linear_revision_row(
+        conn: &Connection,
+        revision: &MemoryRevision,
+    ) -> Result<bool> {
+        revision.validate()?;
+        anyhow::ensure!(
+            revision.additional_parent_digests.is_empty(),
+            "pre-v7 memory storage cannot encode a multi-parent revision"
+        );
         let state = match revision.state {
             MemoryRevisionState::Active => "active",
             MemoryRevisionState::Tombstone => "tombstone",
@@ -2401,8 +2537,8 @@ impl MemoryDb {
                 revision.record_digest.as_str(),
                 revision.content_digest.as_str(),
                 revision.content,
-                tags_json,
-                provenance_json,
+                serde_json::to_string(&revision.tags)?,
+                serde_json::to_string(&revision.provenance)?,
                 state,
             ],
         )?;
@@ -2415,7 +2551,8 @@ impl MemoryDb {
     ) -> Result<Option<MemoryRevision>> {
         conn.query_row(
             r"SELECT logical_id, version, parent_digest, record_digest,
-                      content_digest, content, tags_json, provenance_json, record_state
+                      content_digest, content, tags_json, provenance_json, record_state,
+                      additional_parent_digests_json
                FROM memory_revisions WHERE record_digest = ?1",
             params![digest.as_str()],
             Self::revision_from_row,
@@ -2433,6 +2570,7 @@ impl MemoryDb {
         let tags_json: String = row.get(6)?;
         let provenance_json: String = row.get(7)?;
         let state_text: String = row.get(8)?;
+        let additional_parent_digests_json: String = row.get(9)?;
         let logical_id = logical_id_text.parse().map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 0,
@@ -2483,10 +2621,19 @@ impl MemoryDb {
                 ));
             }
         };
+        let additional_parent_digests = serde_json::from_str(&additional_parent_digests_json)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
         Ok(MemoryRevision {
             logical_id,
             version,
             parent_digest,
+            additional_parent_digests,
             record_digest,
             content_digest,
             content: row.get(5)?,
@@ -2501,20 +2648,24 @@ impl MemoryDb {
         ancestor: &MemoryDigest,
         descendant: &MemoryDigest,
     ) -> Result<bool> {
-        let found: bool = conn.query_row(
-            r"WITH RECURSIVE lineage(record_digest, parent_digest) AS (
-                   SELECT record_digest, parent_digest FROM memory_revisions
-                    WHERE record_digest = ?1
-                   UNION ALL
-                   SELECT revision.record_digest, revision.parent_digest
-                     FROM memory_revisions revision
-                     JOIN lineage ON revision.record_digest = lineage.parent_digest
-               )
-               SELECT EXISTS(SELECT 1 FROM lineage WHERE record_digest = ?2)",
-            params![descendant.as_str(), ancestor.as_str()],
-            |row| row.get(0),
-        )?;
-        Ok(found)
+        let mut pending = vec![descendant.clone()];
+        let mut visited = BTreeSet::new();
+        while let Some(candidate) = pending.pop() {
+            if &candidate == ancestor {
+                return Ok(true);
+            }
+            if !visited.insert(candidate.clone()) {
+                continue;
+            }
+            anyhow::ensure!(
+                visited.len() <= usize::try_from(MAX_MEMORY_MIGRATION_ROWS)?,
+                "memory ancestry exceeds its validation budget"
+            );
+            let revision = Self::load_revision_by_digest(conn, &candidate)?
+                .ok_or_else(|| anyhow::anyhow!("memory ancestry references a missing revision"))?;
+            pending.extend(revision.causal_parent_digests().cloned());
+        }
+        Ok(false)
     }
 
     fn head_digests(conn: &Connection, logical_id: LogicalMemoryId) -> Result<Vec<MemoryDigest>> {
@@ -2540,7 +2691,7 @@ impl MemoryDb {
     }
 
     fn validate_revision_parent(conn: &Connection, revision: &MemoryRevision) -> Result<()> {
-        let Some(parent_digest) = &revision.parent_digest else {
+        let Some(_primary_parent) = &revision.parent_digest else {
             anyhow::ensure!(
                 revision.version == MemoryVersion::INITIAL,
                 "non-root memory revision has no parent"
@@ -2556,19 +2707,23 @@ impl MemoryDb {
             );
             return Ok(());
         };
-        let parent = Self::load_revision_by_digest(conn, parent_digest)?
-            .ok_or_else(|| anyhow::anyhow!("memory revision parent is unavailable"))?;
+        let mut maximum_parent_version = MemoryVersion::INITIAL;
+        for parent_digest in revision.causal_parent_digests() {
+            let parent = Self::load_revision_by_digest(conn, parent_digest)?
+                .ok_or_else(|| anyhow::anyhow!("memory revision parent is unavailable"))?;
+            anyhow::ensure!(
+                parent.logical_id == revision.logical_id,
+                "memory revision parent belongs to a different logical record"
+            );
+            anyhow::ensure!(
+                parent.provenance.scope == revision.provenance.scope,
+                "memory revision cannot change replication scope"
+            );
+            maximum_parent_version = maximum_parent_version.max(parent.version);
+        }
         anyhow::ensure!(
-            parent.logical_id == revision.logical_id,
-            "memory revision parent belongs to a different logical record"
-        );
-        anyhow::ensure!(
-            parent.version.get().checked_add(1) == Some(revision.version.get()),
-            "memory revision version does not immediately follow its parent"
-        );
-        anyhow::ensure!(
-            parent.provenance.scope == revision.provenance.scope,
-            "memory revision cannot change replication scope"
+            maximum_parent_version.get().checked_add(1) == Some(revision.version.get()),
+            "memory revision version does not immediately follow its newest parent"
         );
         Ok(())
     }
@@ -2723,6 +2878,10 @@ impl MemoryDb {
             revision.parent_digest.as_ref() == Some(expected_parent),
             "linear memory revision is not bound to its expected parent"
         );
+        anyhow::ensure!(
+            revision.additional_parent_digests.is_empty(),
+            "linear memory revision has additional causal parents"
+        );
 
         if Self::load_revision_by_digest(conn, &revision.record_digest)?.is_some() {
             let heads = Self::head_digests(conn, revision.logical_id)?;
@@ -2759,6 +2918,67 @@ impl MemoryDb {
             Self::refresh_projection(conn, revision.logical_id)? == 1,
             "technical lesson linear mutation did not retain one causal head"
         );
+        Ok(ApplyRevisionOutcome::Advanced)
+    }
+
+    /// Atomically publish one exact multi-parent revision only when its
+    /// complete canonical parent set remains the current head set.
+    fn apply_merge_revision_on(
+        conn: &mut Connection,
+        revision: &MemoryRevision,
+        expected_heads: &[MemoryDigest],
+    ) -> Result<ApplyRevisionOutcome> {
+        revision.validate()?;
+        let revision_parents = revision
+            .causal_parent_digests()
+            .cloned()
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            revision.additional_parent_digests.len() + 1 == expected_heads.len()
+                && revision_parents == expected_heads,
+            "merge revision is not bound to its complete expected head set"
+        );
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("technical lesson: failed to begin conflict resolution")?;
+
+        if Self::load_revision_by_digest(&tx, &revision.record_digest)?.is_some() {
+            let heads = Self::head_digests(&tx, revision.logical_id)?;
+            if heads.as_slice() == [revision.record_digest.clone()] {
+                return Ok(ApplyRevisionOutcome::Idempotent);
+            }
+            return Err(TechnicalLessonStoreError::ConcurrentMutation.into());
+        }
+
+        let heads = Self::head_digests(&tx, revision.logical_id)?;
+        if heads != expected_heads {
+            return Err(TechnicalLessonStoreError::StaleHeadSet.into());
+        }
+        Self::validate_revision_parent(&tx, revision)?;
+        anyhow::ensure!(
+            Self::insert_revision_row(&tx, revision)?,
+            "technical lesson resolution revision was not inserted"
+        );
+        let removed = tx.execute(
+            "DELETE FROM memory_heads WHERE logical_id = ?1",
+            params![revision.logical_id.to_string()],
+        )?;
+        if removed != expected_heads.len() {
+            return Err(TechnicalLessonStoreError::StaleHeadSet.into());
+        }
+        tx.execute(
+            "INSERT INTO memory_heads (logical_id, record_digest) VALUES (?1, ?2)",
+            params![
+                revision.logical_id.to_string(),
+                revision.record_digest.as_str()
+            ],
+        )?;
+        anyhow::ensure!(
+            Self::refresh_projection(&tx, revision.logical_id)? == 1,
+            "technical lesson resolution did not retain one causal head"
+        );
+        tx.commit()
+            .context("technical lesson: committing conflict resolution")?;
         Ok(ApplyRevisionOutcome::Advanced)
     }
 
@@ -2832,7 +3052,8 @@ impl MemoryDb {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r"SELECT logical_id, version, parent_digest, record_digest,
-                      content_digest, content, tags_json, provenance_json, record_state
+                      content_digest, content, tags_json, provenance_json, record_state,
+                      additional_parent_digests_json
                  FROM memory_revisions WHERE logical_id = ?1
                 ORDER BY version, record_digest LIMIT ?2",
         )?;
@@ -2862,6 +3083,9 @@ impl MemoryDb {
         ancestor: &MemoryDigest,
     ) -> Result<bool> {
         let conn = self.lock_conn()?;
+        if Self::load_revision_by_digest(&conn, descendant)?.is_none() {
+            return Ok(false);
+        }
         Self::revision_is_ancestor(&conn, ancestor, descendant)
     }
 
@@ -3045,7 +3269,8 @@ impl MemoryDb {
         let mut stmt = conn.prepare(
             r"SELECT revision.version, revision.record_digest,
                       revision.parent_digest, revision.content_digest,
-                      revision.record_state
+                      revision.record_state,
+                      revision.additional_parent_digests_json
                  FROM memory_heads head
                  JOIN memory_revisions revision
                    ON revision.record_digest = head.record_digest
@@ -3077,6 +3302,7 @@ impl MemoryDb {
                         })
                     };
                     let state_text: String = row.get(4)?;
+                    let additional_parent_digests_json: String = row.get(5)?;
                     let state = match state_text.as_str() {
                         "active" => MemoryRevisionState::Active,
                         "tombstone" => MemoryRevisionState::Tombstone,
@@ -3097,6 +3323,16 @@ impl MemoryDb {
                         parent_digest: parent_text
                             .map(|value| parse_digest(2, value))
                             .transpose()?,
+                        additional_parent_digests: serde_json::from_str(
+                            &additional_parent_digests_json,
+                        )
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
                         content_digest: parse_digest(3, content_text)?,
                         state,
                     })
@@ -3772,6 +4008,277 @@ impl MemoryDb {
         Ok(result)
     }
 
+    /// Inspect one unresolved technical-lesson conflict without treating any
+    /// branch as instruction authority. The complete expected head set is
+    /// always returned; decoded branch payloads are paginated independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the logical record is absent/not conflicted, the
+    /// cursor is stale, a branch is corrupt or outside this workspace, or the
+    /// requested page violates its fixed bounds.
+    pub fn inspect_technical_lesson_conflict(
+        &self,
+        logical_id: LogicalMemoryId,
+        after_head_digest: Option<&MemoryDigest>,
+        limit: usize,
+    ) -> Result<TechnicalLessonConflict> {
+        anyhow::ensure!(
+            (1..=MAX_TECHNICAL_CONFLICT_BRANCH_PAGE).contains(&limit),
+            "technical lesson conflict page limit is invalid"
+        );
+        let workspace_id = self
+            .workspace_id
+            .clone()
+            .context("technical lessons require a workspace-bound store")?;
+        let authority_scope = self.technical_authority_scope()?;
+        let conn = self.lock_conn()?;
+        let heads = Self::head_digests(&conn, logical_id)?;
+        if heads.len() < 2 {
+            return Err(TechnicalLessonStoreError::NotConflicted.into());
+        }
+        let start = match after_head_digest {
+            Some(cursor) => heads
+                .iter()
+                .position(|digest| digest == cursor)
+                .map(|index| index + 1)
+                .ok_or(TechnicalLessonStoreError::StaleHeadSet)?,
+            None => 0,
+        };
+        let end = start.saturating_add(limit).min(heads.len());
+        let mut result = TechnicalLessonConflict {
+            schema_version: TECHNICAL_LESSON_SCHEMA_VERSION,
+            logical_id,
+            scope: authority_scope,
+            authority: "untrusted_reference_evidence",
+            expected_head_digests: heads.clone(),
+            branches: Vec::with_capacity(end.saturating_sub(start)),
+            branches_truncated: start < heads.len(),
+            next_after_head_digest: None,
+        };
+        for digest in &heads[start..end] {
+            let revision = Self::load_revision_by_digest(&conn, digest)?
+                .context("technical lesson conflict head is unavailable")?;
+            self.validate_typed_revision_for_store_on(&conn, &revision)?;
+            anyhow::ensure!(
+                revision.logical_id == logical_id && revision.provenance.scope == authority_scope,
+                "technical lesson conflict branch has inconsistent authority"
+            );
+            let lesson = if revision.state == MemoryRevisionState::Active {
+                Some(Self::validate_technical_lesson_revision(
+                    &revision,
+                    &workspace_id,
+                    authority_scope,
+                )?)
+            } else {
+                None
+            };
+            result.branches.push(TechnicalLessonConflictBranch {
+                version: revision.version,
+                record_digest: revision.record_digest,
+                parent_digest: revision.parent_digest,
+                additional_parent_digests: revision.additional_parent_digests,
+                state: revision.state,
+                provenance: revision.provenance,
+                lesson,
+            });
+            result.branches_truncated = start + result.branches.len() < heads.len();
+            result.next_after_head_digest = result
+                .branches_truncated
+                .then(|| {
+                    result
+                        .branches
+                        .last()
+                        .map(|branch| branch.record_digest.clone())
+                })
+                .flatten();
+            if serde_json::to_vec(&result)?.len() > MAX_TECHNICAL_QUERY_RESULT_BYTES {
+                result.branches.pop();
+                anyhow::ensure!(
+                    !result.branches.is_empty(),
+                    "technical lesson conflict branch exceeds the result byte budget"
+                );
+                result.branches_truncated = true;
+                result.next_after_head_digest = result
+                    .branches
+                    .last()
+                    .map(|branch| branch.record_digest.clone());
+                break;
+            }
+        }
+        drop(conn);
+        anyhow::ensure!(
+            serde_json::to_vec(&result)?.len() <= MAX_TECHNICAL_QUERY_RESULT_BYTES,
+            "technical lesson conflict branch exceeds the result byte budget"
+        );
+        Ok(result)
+    }
+
+    /// Resolve one exact complete set of concurrent technical-lesson heads by
+    /// publishing a single immutable multi-parent candidate revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incomplete/stale/forged heads, conflicting replay,
+    /// invalid cited replacement evidence, or an atomic persistence failure.
+    pub fn resolve_technical_lesson_conflict(
+        &self,
+        request: TechnicalLessonResolutionRequest,
+    ) -> Result<TechnicalLessonRecord> {
+        let TechnicalLessonResolutionRequest {
+            logical_id,
+            mut expected_head_digests,
+            replacement,
+            correction_reason,
+            source,
+            author_id,
+            captured_at_unix_seconds,
+        } = request;
+        if !(2..=MAX_MEMORY_REVISION_PARENTS).contains(&expected_head_digests.len()) {
+            return Err(TechnicalLessonStoreError::StaleHeadSet.into());
+        }
+        let supplied_len = expected_head_digests.len();
+        expected_head_digests.sort();
+        expected_head_digests.dedup();
+        if expected_head_digests.len() != supplied_len {
+            return Err(TechnicalLessonStoreError::StaleHeadSet.into());
+        }
+
+        let workspace_id = self
+            .workspace_id
+            .clone()
+            .context("technical lessons require a workspace-bound store")?;
+        let authority_scope = self.technical_authority_scope()?;
+        let provenance = MemoryProvenance::new(
+            source,
+            MemoryAttribution::new(
+                author_id,
+                Some(self.store_id()?),
+                Some(workspace_id.to_string()),
+            ),
+            authority_scope,
+        );
+        Self::validate_technical_lesson_provenance(&provenance, &workspace_id, authority_scope)?;
+
+        let mut conn = self.lock_conn()?;
+        let current_heads = Self::head_digests(&conn, logical_id)?;
+        if current_heads != expected_head_digests {
+            return Self::replay_technical_lesson_resolution_on(
+                &conn,
+                &TechnicalResolutionReplay {
+                    logical_id,
+                    current_heads: &current_heads,
+                    expected_heads: &expected_head_digests,
+                    workspace_id: &workspace_id,
+                    replacement: &replacement,
+                    correction_reason: &correction_reason,
+                    expected_provenance: &provenance,
+                    now_unix_seconds: captured_at_unix_seconds,
+                },
+            );
+        }
+
+        let mut parents = Vec::with_capacity(expected_head_digests.len());
+        for digest in &expected_head_digests {
+            let parent = Self::load_revision_by_digest(&conn, digest)?
+                .ok_or(TechnicalLessonStoreError::StaleHeadSet)?;
+            self.validate_typed_revision_for_store_on(&conn, &parent)?;
+            anyhow::ensure!(
+                parent.logical_id == logical_id && parent.provenance.scope == authority_scope,
+                "technical lesson conflict parent has inconsistent authority"
+            );
+            parents.push(parent);
+        }
+        let lesson = TechnicalLesson::resolved(
+            workspace_id,
+            replacement,
+            expected_head_digests.clone(),
+            correction_reason,
+            captured_at_unix_seconds,
+        )?;
+        let revision = MemoryRevision::merge_successor(
+            &parents,
+            lesson.encode()?,
+            vec![
+                TECHNICAL_LESSON_TAG.to_string(),
+                format!("technical-kind:{}", technical_lesson_kind_name(lesson.kind)),
+            ],
+            provenance,
+        )?;
+        let outcome = Self::apply_merge_revision_on(&mut conn, &revision, &expected_head_digests)?;
+        drop(conn);
+        if !matches!(
+            outcome,
+            ApplyRevisionOutcome::Advanced | ApplyRevisionOutcome::Idempotent
+        ) {
+            return Err(TechnicalLessonStoreError::ConcurrentMutation.into());
+        }
+        Ok(Self::technical_lesson_record_from_revision(
+            revision,
+            lesson,
+            captured_at_unix_seconds,
+        ))
+    }
+
+    fn replay_technical_lesson_resolution_on(
+        conn: &Connection,
+        replay: &TechnicalResolutionReplay<'_>,
+    ) -> Result<TechnicalLessonRecord> {
+        if replay.current_heads.len() != 1 {
+            return Err(TechnicalLessonStoreError::StaleHeadSet.into());
+        }
+        let current = Self::load_revision_by_digest(conn, &replay.current_heads[0])?
+            .context("technical lesson resolution replay head is unavailable")?;
+        let current_parents = current.causal_parent_digests().cloned().collect::<Vec<_>>();
+        if current.state != MemoryRevisionState::Active
+            || current_parents != replay.expected_heads
+            || current.provenance.source_id != replay.expected_provenance.source_id
+        {
+            return Err(TechnicalLessonStoreError::StaleHeadSet.into());
+        }
+        if &current.provenance != replay.expected_provenance {
+            return Err(TechnicalLessonStoreError::IdempotencyCollision.into());
+        }
+        let lesson = TechnicalLesson::decode(&current.content)?;
+        let expected_lesson = TechnicalLesson::resolved(
+            replay.workspace_id.clone(),
+            replay.replacement.clone(),
+            replay.expected_heads.to_vec(),
+            replay.correction_reason.to_string(),
+            lesson.captured_at_unix_seconds,
+        )?;
+        if lesson != expected_lesson {
+            return Err(TechnicalLessonStoreError::IdempotencyCollision.into());
+        }
+        anyhow::ensure!(
+            current.logical_id == replay.logical_id,
+            "technical lesson resolution replay changed logical identity"
+        );
+        Ok(Self::technical_lesson_record_from_revision(
+            current,
+            lesson,
+            replay.now_unix_seconds,
+        ))
+    }
+
+    fn technical_lesson_record_from_revision(
+        revision: MemoryRevision,
+        lesson: TechnicalLesson,
+        now_unix_seconds: i64,
+    ) -> TechnicalLessonRecord {
+        TechnicalLessonRecord {
+            logical_id: revision.logical_id,
+            version: revision.version,
+            record_digest: revision.record_digest,
+            scope: revision.provenance.scope,
+            provenance: revision.provenance,
+            conflicted: false,
+            due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
+            effectively_host_reviewed: lesson.is_effectively_host_reviewed_at(now_unix_seconds),
+            lesson,
+        }
+    }
+
     /// Create a causal correction of one exact lesson head.
     ///
     /// # Errors
@@ -4036,6 +4543,7 @@ impl MemoryDb {
                     version: head.version,
                     record_digest: head.record_digest.clone(),
                     parent_digest: head.parent_digest.clone(),
+                    additional_parent_digests: head.additional_parent_digests.clone(),
                     content_digest: head.content_digest.clone(),
                     state: head.state,
                 })
@@ -4106,25 +4614,28 @@ impl MemoryDb {
         );
         let mut belongs_to_technical_lineage =
             revision.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG);
-        let mut ancestor_digest = revision.parent_digest.clone();
-        let mut ancestors_examined = 0_i64;
+        let mut pending = revision
+            .causal_parent_digests()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut ancestors_examined = BTreeSet::new();
         while !belongs_to_technical_lineage {
-            let Some(digest) = ancestor_digest else {
+            let Some(digest) = pending.pop() else {
                 break;
             };
-            ancestors_examined = ancestors_examined
-                .checked_add(1)
-                .context("technical lineage depth overflowed")?;
+            if !ancestors_examined.insert(digest.clone()) {
+                continue;
+            }
             anyhow::ensure!(
-                ancestors_examined <= MAX_MEMORY_MIGRATION_ROWS,
+                ancestors_examined.len() <= usize::try_from(MAX_MEMORY_MIGRATION_ROWS)?,
                 "technical lineage exceeds its validation budget"
             );
             let Some(ancestor) = Self::load_revision_by_digest(conn, &digest)? else {
-                break;
+                continue;
             };
             belongs_to_technical_lineage =
                 ancestor.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG);
-            ancestor_digest = ancestor.parent_digest;
+            pending.extend(ancestor.causal_parent_digests().cloned());
         }
         if !belongs_to_technical_lineage {
             return Ok(());
@@ -4165,8 +4676,8 @@ impl MemoryDb {
             authority_scope,
         )?;
         anyhow::ensure!(
-            revision.parent_digest.is_some(),
-            "technical lesson tombstone has no causal parent"
+            revision.parent_digest.is_some() && revision.additional_parent_digests.is_empty(),
+            "technical lesson tombstone must have exactly one causal parent"
         );
         Ok(())
     }
@@ -4200,13 +4711,30 @@ impl MemoryDb {
             revision.tags == expected_tags,
             "technical lesson revision has noncanonical schema tags"
         );
-        match (&revision.parent_digest, &lesson.correction) {
-            (None, None) => {}
-            (Some(parent), Some(correction)) if &correction.corrected_record_digest == parent => {}
-            _ => anyhow::bail!(
-                "technical lesson correction metadata does not match its causal parent"
-            ),
-        }
+        let revision_parents = revision
+            .causal_parent_digests()
+            .cloned()
+            .collect::<Vec<_>>();
+        let correction_parents = lesson.correction.as_ref().map(|correction| {
+            std::iter::once(correction.corrected_record_digest.clone())
+                .chain(
+                    correction
+                        .additional_corrected_record_digests
+                        .iter()
+                        .cloned(),
+                )
+                .collect::<Vec<_>>()
+        });
+        let correction_matches = match (revision_parents.as_slice(), correction_parents.as_deref())
+        {
+            ([], None) => true,
+            (parents, Some(correction)) if !parents.is_empty() => parents == correction,
+            _ => false,
+        };
+        anyhow::ensure!(
+            correction_matches,
+            "technical lesson correction metadata does not match its causal parents"
+        );
         match &lesson.review {
             LessonReviewState::HostReviewed { receipt_id, .. } => {
                 anyhow::ensure!(
@@ -5294,6 +5822,132 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let _db = MemoryDb::open(&db_path).unwrap();
         assert!(db_path.exists());
+    }
+
+    fn v6_linear_revision() -> MemoryRevision {
+        MemoryRevision::new(
+            "schema-v6 linear revision".to_string(),
+            vec!["migration-v6".to_string()],
+            MemoryProvenance::new(
+                MemorySourceEvidence::new(
+                    MemorySourceKind::Explicit,
+                    "migration-v6-source".to_string(),
+                    "schema:v6".to_string(),
+                    MemoryDigest::for_fields(b"openclaudia.memory.v6-test.v1", &[b"source"]),
+                ),
+                MemoryAttribution::new(
+                    "migration-v6".to_string(),
+                    None,
+                    Some("workspace:v6".to_string()),
+                ),
+                MemoryRecordScope::ProjectEvidence,
+            ),
+        )
+    }
+
+    fn create_exact_v6_store(db_path: &Path, revision: &MemoryRevision) {
+        let raw = rusqlite::Connection::open(db_path).unwrap();
+        raw.execute_batch(
+            "PRAGMA foreign_keys = ON; CREATE TABLE schema_version (version INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        MemoryDb::migrate_v1_on(&raw).unwrap();
+        MemoryDb::migrate_v2_on(&raw).unwrap();
+        MemoryDb::migrate_v3_on(&raw).unwrap();
+        MemoryDb::migrate_v4_on(&raw).unwrap();
+        MemoryDb::migrate_v5_on(&raw).unwrap();
+        MemoryDb::migrate_v6_on(&raw).unwrap();
+        raw.execute("INSERT INTO schema_version (version) VALUES (6)", [])
+            .unwrap();
+        revision.validate().unwrap();
+        raw.execute(
+            r"INSERT INTO memory_revisions
+                   (logical_id, version, parent_digest, record_digest, content_digest,
+                    content, tags_json, provenance_json, record_state)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active')",
+            params![
+                revision.logical_id.to_string(),
+                i64::try_from(revision.version.get()).unwrap(),
+                revision.parent_digest.as_ref().map(MemoryDigest::as_str),
+                revision.record_digest.as_str(),
+                revision.content_digest.as_str(),
+                revision.content.as_str(),
+                serde_json::to_string(&revision.tags).unwrap(),
+                serde_json::to_string(&revision.provenance).unwrap(),
+            ],
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO memory_heads (logical_id, record_digest) VALUES (?1, ?2)",
+            params![
+                revision.logical_id.to_string(),
+                revision.record_digest.as_str()
+            ],
+        )
+        .unwrap();
+        raw.execute(
+            r"INSERT INTO archival_memory
+                   (content, logical_id, version, parent_digest, record_digest,
+                    content_digest, provenance_json, record_state)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active')",
+            params![
+                revision.content.as_str(),
+                revision.logical_id.to_string(),
+                i64::try_from(revision.version.get()).unwrap(),
+                revision.parent_digest.as_ref().map(MemoryDigest::as_str),
+                revision.record_digest.as_str(),
+                revision.content_digest.as_str(),
+                serde_json::to_string(&revision.provenance).unwrap(),
+            ],
+        )
+        .unwrap();
+        let row_id = raw.last_insert_rowid();
+        for tag in &revision.tags {
+            raw.execute(
+                "INSERT INTO archival_memory_tags (memory_id, tag) VALUES (?1, ?2)",
+                params![row_id, tag],
+            )
+            .unwrap();
+        }
+        MemoryDb::validate_schema_shape(&raw, 6).unwrap();
+    }
+
+    fn assert_exact_v6_backup(db_path: &Path) {
+        let backup_path = db_path.with_file_name("v6.db.pre-v7-backup.sqlite");
+        let backup =
+            rusqlite::Connection::open_with_flags(backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("v6 recovery backup");
+        assert_eq!(
+            backup
+                .query_row("SELECT version FROM schema_version", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        assert!(!MemoryDb::table_has_column(
+            &backup,
+            "memory_revisions",
+            "additional_parent_digests_json"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn exact_v6_store_migrates_to_v7_without_rewriting_linear_revisions() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("v6.db");
+        let revision = v6_linear_revision();
+        create_exact_v6_store(&db_path, &revision);
+
+        let migrated = MemoryDb::open(&db_path).expect("supported v6 migration");
+        let restored = migrated
+            .revision_by_digest(&revision.record_digest)
+            .unwrap()
+            .expect("preserved revision");
+        assert_eq!(restored, revision);
+        assert!(restored.additional_parent_digests.is_empty());
+        drop(migrated);
+        assert_exact_v6_backup(&db_path);
     }
 
     #[test]

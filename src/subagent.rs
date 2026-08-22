@@ -225,6 +225,7 @@ impl AgentType {
                     "memory_search",
                     "memory_list",
                     "memory_learning_status",
+                    "memory_conflicts",
                     "memory_save",
                     "memory_update",
                     "memory_delete",
@@ -242,6 +243,7 @@ impl AgentType {
                     "memory_search",
                     "memory_list",
                     "memory_learning_status",
+                    "memory_conflicts",
                     "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
@@ -254,6 +256,7 @@ impl AgentType {
                     "memory_search",
                     "memory_list",
                     "memory_learning_status",
+                    "memory_conflicts",
                     "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
@@ -274,6 +277,7 @@ impl AgentType {
                     "memory_search",
                     "memory_list",
                     "memory_learning_status",
+                    "memory_conflicts",
                     "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
@@ -4199,6 +4203,7 @@ mod tests {
             "memory_search",
             "memory_list",
             "memory_learning_status",
+            "memory_conflicts",
             "memory_save",
             "memory_update",
             "memory_delete",
@@ -4214,6 +4219,7 @@ mod tests {
         assert!(plan.contains(&"memory_search"));
         assert!(plan.contains(&"memory_list"));
         assert!(plan.contains(&"memory_learning_status"));
+        assert!(plan.contains(&"memory_conflicts"));
         assert!(plan.contains(&"memory_source_status"));
         assert!(!plan.contains(&"memory_save"));
         assert!(!plan.contains(&"memory_update"));

@@ -253,6 +253,7 @@ fn every_role_is_enforced_at_the_durable_authorization_boundary() {
         TeamMemoryOperation::Search,
         TeamMemoryOperation::Propose,
         TeamMemoryOperation::Correct,
+        TeamMemoryOperation::Resolve,
         TeamMemoryOperation::Delete,
         TeamMemoryOperation::Review,
         TeamMemoryOperation::Export,

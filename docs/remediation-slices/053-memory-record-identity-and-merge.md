@@ -16,8 +16,9 @@ S-053 now makes a physical SQLite row ID a compatibility locator only. Every
 archival memory has a global UUID identity and an immutable causal revision
 graph. Equal prose is never an identity or merge rule. Cross-store retries use
 the exact same revision, offline team-shared branches are exchanged into both
-stores, and concurrent heads remain visible. The later typed resolution action
-belongs to S-054 and cannot be simulated by last-writer-wins here.
+stores, and concurrent heads remain visible. Issue #1081 completes the typed
+resolution path with one immutable multi-parent successor over the complete
+expected head set; it cannot be simulated by last-writer-wins.
 
 This is the identity layer for the intended memory product: structured,
 repository-specific technical lessons retrieved through a tool. It does not
@@ -41,11 +42,15 @@ and production activation.
   store pair, and a replacement database at the same path fails closed before
   tombstone filtering or replay. User and team roles cannot alias the same
   physical store, including through path aliases or copied store identities.
-- `MemoryRevision` binds logical ID, non-zero monotonic version, exact parent,
+- `MemoryRevision` binds logical ID, non-zero monotonic version, its exact
+  canonical causal parent set,
   content/source/record digests, canonical tags, provenance, author, workspace,
   sharing scope, and active/tombstone state. Deserialized/tampered or
   non-canonical revisions fail validation before writes, and a logical ID can
   never acquire a second root or change replication scope mid-lineage.
+- Linear revisions retain their byte-identical v1 wire shape and digest.
+  Explicit resolutions sort and bind two to 64 parents under a domain-separated
+  v2 digest and advance to one more than the newest parent version.
 - `memory_revisions` is immutable history and `memory_heads` is the causal head
   set. Descendants supersede ancestors; equal digests are idempotent; concurrent
   branches remain multiple heads with a deterministic visible projection and
@@ -153,7 +158,9 @@ The final ordered source/test artifact manifest has SHA-256
 The slice document is commit-tracked and its stable digest is recorded in the
 Crosslink result receipt to avoid self-reference.
 
-Unresolved work is intentionally assigned, not hidden: S-054 owns local memory
+Issue #1081 subsequently delivered the formerly deferred complete-head
+inspection and multi-parent resolution operation across private and team
+memory. Remaining work is intentionally assigned, not hidden: S-054 owns local memory
 authority/schema and the bounded lexical retrieval baseline; S-055 owns
 evidence-bound automatic learning; S-056 owns memdir lifecycle; S-103/S-104 own
 authenticated team authority and replication; S-105 owns evaluated advanced

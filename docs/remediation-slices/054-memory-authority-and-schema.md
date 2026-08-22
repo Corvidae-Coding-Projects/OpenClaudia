@@ -14,8 +14,8 @@ Stop repository/inferred memory from becoming system authority and reject unsupp
 
 S-054 implements private memory as strict, codebase-specific technical lessons.
 It does not capture transcripts, prompt fragments, scratch prose, or user-profile
-blobs. A model can propose and later retrieve a lesson only through five typed
-tools; every returned record remains untrusted cited evidence. Neither legacy
+blobs. A model can propose, retrieve, inspect, and resolve a lesson only through
+typed tools; every returned record remains untrusted cited evidence. Neither legacy
 memory nor typed lessons are loaded ambiently into system/developer prompts.
 
 ## Implementation boundary
@@ -43,12 +43,13 @@ memory nor typed lessons are loaded ambiently into system/developer prompts.
   links are rejected, SQLite opens use `SQLITE_OPEN_NOFOLLOW`, and store plus
   workspace identities are checked when reopened by subagents. Platforms that
   lack S-031's race-safe private-storage backend fail closed until S-036.
-- Store schema v6 carries one exact schema/reader/lesson version, authority and
+- Store schema v7 carries one exact schema/reader/lesson version, authority and
   workspace binding, manifest digest, and ready marker. Read-only preflight
   rejects corrupt, unversioned-nonempty, partial, future, oversized, or
-  semantically inconsistent stores before a writer opens. Supported v5
+  semantically inconsistent stores before a writer opens. Supported v5/v6
   migration takes a bounded recovery snapshot and publishes the schema change
-  in one immediate transaction; concurrent openers deterministically converge.
+  in one immediate transaction; v6 linear revisions retain their exact wire
+  shape and digest, and concurrent openers deterministically converge.
 - Mutable archival projections are checked against every immutable causal head.
   Corrections and deletes are compare-and-swap successors/tombstones, conflicts
   remain visible, and malformed provenance, changed projections, missing
@@ -58,11 +59,16 @@ memory nor typed lessons are loaded ambiently into system/developer prompts.
   expired/conflicted/legacy prose, and distinguishes complete, no-hit, and
   truthful partial results. S-105 owns evaluated semantic/task-conditioned
   retrieval rather than claiming the safe lexical baseline is optimal.
-- `memory_save`, `memory_search`, `memory_list`, `memory_update`, and
-  `memory_delete` are registered with typed resources/effects and strict JSON
+- `memory_conflicts` returns the complete canonical head set plus a cited branch
+  page bounded by both item count and serialized bytes. `memory_update` accepts
+  exactly one linear expected digest or one complete two-to-64-head set; stale,
+  incomplete, duplicate, or forged resolution requests commit no revision.
+- `memory_save`, `memory_search`, `memory_list`, `memory_conflicts`,
+  `memory_update`, and `memory_delete` are registered with typed resources/effects and strict JSON
   schemas. TUI, legacy REPL, ACP, the canonical tool executor, and role-scoped
   subagents receive the same host store. Definitions disappear when a subagent
-  has no memory service; plan/read-only roles receive search/list only.
+  has no memory service; plan/read-only roles receive retrieval and conflict
+  inspection but not mutation.
 - All prompt-builder entry points structurally lack a memory-database argument.
   Legacy archival/session/auto-learning tables remain compatibility data only;
   they are neither searched by the technical tools nor inserted into prompts.
@@ -116,6 +122,13 @@ Record changed artifact generations, commands/tests run, typed evidence receipts
   path survived the changed-artifact scan. Generated capability assets were not
   changed by this slice.
 
+Issue #1081 follow-on verification used the same Rust 1.98.0, four-job,
+single-test-thread policy. Conflict, migration, portability, team authority,
+registry, and tool-schema targets passed 117/117; artifact-bound retrieval
+evidence passed 9/9 and the runtime retrieval target passed 4/4. Strict
+all-feature/all-target Clippy, Windows GNU all-feature/all-target check, and the
+complete native all-feature/all-target test matrix all passed.
+
 The repair history is retained as evidence. Review caught and corrected ACP's
 missing `memory_update` route and literal replacement call ID, absent SQLite
 no-follow, permissive host-store modes, noncanonical persisted identity
@@ -168,6 +181,10 @@ The slice document is commit-tracked and its stable digest is recorded in the
 Crosslink result receipt to avoid self-reference.
 
 ### Assigned unresolved work
+
+Issue #1081 completed the previously missing typed conflict inspection and
+resolution path, including schema-v7 migration, exact replay, tombstones,
+frontends, and private/team authority boundaries.
 
 - S-036: implement equivalent Windows handle/reparse/owner permission
   containment so host-owned technical memory can activate there safely.

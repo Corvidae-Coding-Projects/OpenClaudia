@@ -33,7 +33,7 @@
         "observation": "A second memory-runtime lesson repeats the same revision evidence.",
         "guidance": "Prefer independent coverage after one cited store lesson is selected.",
         "applicability": {"paths": ["src/memory.rs"], "components": ["memory-runtime"], "tags": ["testing"]},
-        "citations": [{"kind": "test", "locator": "tests/technical_memory_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:374f5c892ce9cc741f39dabf08ee30ff458c0e72ad6c6ee942289a22e933eace"}],
+        "citations": [{"kind": "test", "locator": "tests/technical_memory_e2e.rs", "source_version": "worktree:s108", "digest": "sha256:faa232c23db1ed3f268d25ea98f4ba7a38fd2ef39bfce0f8c0527b9cb66c5893"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -69,7 +69,7 @@
         "observation": "The memory store verifies its revision before returning a technical lesson.",
         "guidance": "Keep the primary store-level assertion in the retrieved set.",
         "applicability": {"paths": ["src/memory.rs"], "components": ["memory-runtime"], "tags": ["testing"]},
-        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s105", "digest": "sha256:f7195e2ffa30a108d7c5cbb17998f54375ecde22d3bfeb9d8b5ca8adca0d8b90"}],
+        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s108", "digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -123,7 +123,7 @@
         "observation": "The technical-memory result exposes the exact store generation used for retrieval.",
         "guidance": "Prefer a title-scoped technical lesson when the query names its primary concept.",
         "applicability": {"paths": ["src/memory.rs"], "components": ["technical-memory"], "tags": ["verify"]},
-        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s105", "digest": "sha256:f7195e2ffa30a108d7c5cbb17998f54375ecde22d3bfeb9d8b5ca8adca0d8b90"}],
+        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s108", "digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -141,7 +141,7 @@
         "observation": "The current contract validates after the store guard is acquired.",
         "guidance": "Use the current cited contract for retrieval verification.",
         "applicability": {"paths": ["src/memory.rs"], "components": ["technical-memory"], "tags": ["testing"]},
-        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s105", "digest": "sha256:f7195e2ffa30a108d7c5cbb17998f54375ecde22d3bfeb9d8b5ca8adca0d8b90"}],
+        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s108", "digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -177,7 +177,7 @@
         "observation": "A reader must verify the exact SQLite generation before trusting a lesson.",
         "guidance": "Re-read the generation after acquiring the store guard.",
         "applicability": {"paths": ["src/memory.rs"], "symbols": ["MemoryDb::query_technical_lessons"], "components": ["technical-memory"], "tags": ["testing"]},
-        "citations": [{"kind": "test", "locator": "tests/technical_memory_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:374f5c892ce9cc741f39dabf08ee30ff458c0e72ad6c6ee942289a22e933eace"}],
+        "citations": [{"kind": "test", "locator": "tests/technical_memory_e2e.rs", "source_version": "worktree:s108", "digest": "sha256:faa232c23db1ed3f268d25ea98f4ba7a38fd2ef39bfce0f8c0527b9cb66c5893"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -195,7 +195,7 @@
         "observation": "Writer cleanup must preserve the exact SQLite generation.",
         "guidance": "Inspect the memory transaction and generation receipt together.",
         "applicability": {"paths": ["src/memory.rs"], "symbols": ["MemoryDb::save_technical_lesson_candidate"], "components": ["technical-memory"], "tags": ["debugging"]},
-        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s105", "digest": "sha256:f7195e2ffa30a108d7c5cbb17998f54375ecde22d3bfeb9d8b5ca8adca0d8b90"}],
+        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s108", "digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -231,7 +231,7 @@
         "observation": "A review deadline makes a prior host review stale.",
         "guidance": "Return the cited lesson with an explicit stale state until the host reviews it again.",
         "applicability": {"paths": ["src/memory/review.rs"], "components": ["technical-memory"], "tags": ["verify"]},
-        "citations": [{"kind": "source_file", "locator": "src/memory/review.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:543c5506a0c6d793c6de9f20be2f77dea556659f2cc6f4da229f7813c0694f1f"}],
+        "citations": [{"kind": "source_file", "locator": "src/memory/review.rs", "source_version": "worktree:s108", "digest": "sha256:930ab1210565e710fa243c60e9339135695ed4f7a2fece8c37886b395cb81b3a"}],
         "confidence": "verified_by_test",
         "sensitivity": "confidential",
         "retention": {"policy": "review_after", "unix_seconds": 50}
@@ -249,7 +249,7 @@
         "observation": "Two causal heads require explicit typed resolution.",
         "guidance": "Do not select either lesson head as current evidence.",
         "applicability": {"paths": ["src/team_memory/replication.rs"], "components": ["team-memory"], "tags": ["conflict"]},
-        "citations": [{"kind": "source_file", "locator": "src/team_memory/replication.rs", "source_version": "worktree:s105", "digest": "sha256:d07b6d05fdf7f780c98e5a30732852ada1b0d365ad88cf18a7909c28eb3d569e"}],
+        "citations": [{"kind": "source_file", "locator": "src/team_memory/replication.rs", "source_version": "worktree:s108", "digest": "sha256:7e3740668a3333adc320feb0888426e52aa89502cc1bf22f2948c305b14001b7"}],
         "confidence": "reproduced",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}

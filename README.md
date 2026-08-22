@@ -89,7 +89,8 @@ owned by the audit and remediation slices.
 | `memory_search` | Retrieve bounded cited technical lessons for the exact workspace; results are evidence, not instructions |
 | `memory_list` | List recent typed technical lessons for the exact workspace |
 | `memory_learning_status` | Inspect bounded run-local causal capture, candidate, contradiction, and degradation metadata; it never captures conversation prose |
-| `memory_update` | Correct one exact lesson revision through compare-and-swap causal history |
+| `memory_conflicts` | Inspect a byte-bounded page of cited conflict branches while returning the complete canonical head set |
+| `memory_update` | Correct one exact lesson revision, or resolve every current conflict head through an explicit multi-parent compare-and-swap revision |
 | `memory_delete` | Delete one exact lesson revision by writing an immutable causal tombstone |
 | `memory_review` | Review or revoke one exact lesson revision using a fresh one-use host approval; review never raises confidence or creates instruction authority |
 | `memory_export` | Publish a bounded resumable package of typed workspace technical-memory history using a fresh one-use host approval |

@@ -4,6 +4,7 @@
 //! lifecycle state, and host-review audit roots. Legacy memory, transcripts,
 //! prompts, and free-form compatibility tables are deliberately absent.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::str::FromStr as _;
@@ -47,11 +48,12 @@ const MAX_PACKAGE_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PACKAGE_ENTRIES: u64 = 2_000_000;
 const PACKAGE_FILE_CLASS: FileClass = FileClass::PortableMemoryPackage;
 const MAX_PORTABLE_CALL_DURATION: Duration = Duration::from_secs(60);
-// Package schema v1 only uses typed memory objects introduced by store schema
-// v6. Keep this floor stable when unrelated internal store migrations land;
-// bump the package schema or this floor only when the portable contract needs
-// a newer reader.
-const MINIMUM_PORTABLE_MEMORY_STORE_SCHEMA_VERSION: u32 = 6;
+// Package schema v1 began with typed memory objects from store schema v6.
+// Multi-parent revisions require the additive store-v7 reader. Keep accepting
+// truthful v6 packages while every package emitted by this build declares v7.
+const MINIMUM_PORTABLE_MEMORY_STORE_SCHEMA_VERSION: u32 = 7;
+const OLDEST_SUPPORTED_PORTABLE_MEMORY_STORE_SCHEMA_VERSION: u32 = 6;
+const MULTI_PARENT_PORTABLE_MEMORY_STORE_SCHEMA_VERSION: u32 = 7;
 
 const PORTABLE_HISTORY_CTE: &str = r"WITH RECURSIVE portable_history(record_digest) AS (
     SELECT revision.record_digest
@@ -339,7 +341,28 @@ enum LineageKind {
 struct LineageCursor {
     logical_id: LogicalMemoryId,
     kind: LineageKind,
-    last_revision: MemoryRevision,
+    revisions: BTreeMap<MemoryDigest, super::MemoryVersion>,
+    superseded: BTreeSet<MemoryDigest>,
+}
+
+impl LineageCursor {
+    fn from_root(root: &MemoryRevision, kind: LineageKind) -> Self {
+        Self {
+            logical_id: root.logical_id,
+            kind,
+            revisions: BTreeMap::from([(root.record_digest.clone(), root.version)]),
+            superseded: BTreeSet::new(),
+        }
+    }
+
+    fn sole_unsuperseded_head(&self) -> Option<&MemoryDigest> {
+        let mut heads = self
+            .revisions
+            .keys()
+            .filter(|digest| !self.superseded.contains(*digest));
+        let head = heads.next()?;
+        heads.next().is_none().then_some(head)
+    }
 }
 
 fn package_id(
@@ -471,7 +494,8 @@ impl MemoryDb {
                     revision.parent_digest, revision.record_digest,\n\
                     revision.content_digest, revision.content,\n\
                     revision.tags_json, revision.provenance_json,\n\
-                    revision.record_state\n\
+                    revision.record_state,\n\
+                    revision.additional_parent_digests_json\n\
                FROM memory_revisions revision\n\
                JOIN portable_history history\n\
                  ON history.record_digest = revision.record_digest\n\
@@ -518,15 +542,16 @@ impl MemoryDb {
             match &mut lineage {
                 None => {
                     let kind = classify_portable_root(&revision, workspace_id)?;
-                    lineage = Some(LineageCursor {
-                        logical_id: revision.logical_id,
-                        kind,
-                        last_revision: revision.clone(),
-                    });
+                    lineage = Some(LineageCursor::from_root(&revision, kind));
                 }
                 Some(cursor) => {
                     validate_portable_successor(cursor, &revision, workspace_id)?;
-                    cursor.last_revision = revision.clone();
+                    cursor
+                        .superseded
+                        .extend(revision.causal_parent_digests().cloned());
+                    cursor
+                        .revisions
+                        .insert(revision.record_digest.clone(), revision.version);
                 }
             }
 
@@ -577,7 +602,7 @@ impl MemoryDb {
     ) -> Result<(), PortableMemoryError> {
         let heads =
             Self::head_digests(conn, lineage.logical_id).map_err(PortableMemoryError::store)?;
-        if heads.as_slice() != [lineage.last_revision.record_digest.clone()] {
+        if heads.len() != 1 || lineage.sole_unsuperseded_head() != heads.first() {
             return Err(PortableMemoryError::CausalConflict);
         }
         visitor(PortableEntryEnvelope {
@@ -598,7 +623,10 @@ fn classify_portable_root(
     revision: &MemoryRevision,
     workspace_id: &WorkspaceMemoryId,
 ) -> Result<LineageKind, PortableMemoryError> {
-    if revision.version != super::MemoryVersion::INITIAL || revision.parent_digest.is_some() {
+    if revision.version != super::MemoryVersion::INITIAL
+        || revision.parent_digest.is_some()
+        || !revision.additional_parent_digests.is_empty()
+    {
         return Err(PortableMemoryError::CausalConflict);
     }
     let kind = if revision.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG) {
@@ -620,8 +648,27 @@ fn validate_portable_successor(
     workspace_id: &WorkspaceMemoryId,
 ) -> Result<(), PortableMemoryError> {
     if revision.logical_id != lineage.logical_id
-        || revision.parent_digest.as_ref() != Some(&lineage.last_revision.record_digest)
-        || lineage.last_revision.version.get().checked_add(1) != Some(revision.version.get())
+        || (lineage.kind != LineageKind::TechnicalLesson
+            && !revision.additional_parent_digests.is_empty())
+    {
+        return Err(PortableMemoryError::CausalConflict);
+    }
+    let parent_versions = revision
+        .causal_parent_digests()
+        .map(|digest| {
+            lineage
+                .revisions
+                .get(digest)
+                .copied()
+                .ok_or(PortableMemoryError::CausalConflict)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let newest_parent = parent_versions
+        .into_iter()
+        .max()
+        .ok_or(PortableMemoryError::CausalConflict)?;
+    if newest_parent.get().checked_add(1) != Some(revision.version.get())
+        || lineage.revisions.contains_key(&revision.record_digest)
     {
         return Err(PortableMemoryError::CausalConflict);
     }
@@ -773,7 +820,9 @@ fn validate_manifest(manifest: &TechnicalMemoryPackageManifest) -> Result<(), Po
     let supported_store_schema =
         u32::try_from(super::SCHEMA_VERSION).map_err(|_| PortableMemoryError::UnsupportedSchema)?;
     if manifest.schema_version != TECHNICAL_MEMORY_PACKAGE_SCHEMA_VERSION
-        || manifest.minimum_reader_version != MINIMUM_PORTABLE_MEMORY_STORE_SCHEMA_VERSION
+        || !(OLDEST_SUPPORTED_PORTABLE_MEMORY_STORE_SCHEMA_VERSION
+            ..=MINIMUM_PORTABLE_MEMORY_STORE_SCHEMA_VERSION)
+            .contains(&manifest.minimum_reader_version)
         || manifest.minimum_reader_version > supported_store_schema
         || manifest.store_schema_version < manifest.minimum_reader_version
         || manifest.lesson_schema_version != TECHNICAL_LESSON_SCHEMA_VERSION
@@ -1649,6 +1698,7 @@ fn export_result(
 
 struct PackageStreamValidator<'a> {
     workspace_id: &'a WorkspaceMemoryId,
+    permits_multi_parent_revisions: bool,
     lineage: Option<LineageCursor>,
     last_completed_logical_id: Option<LogicalMemoryId>,
     next_sequence: u64,
@@ -1658,9 +1708,11 @@ struct PackageStreamValidator<'a> {
 }
 
 impl<'a> PackageStreamValidator<'a> {
-    fn new(workspace_id: &'a WorkspaceMemoryId) -> Self {
+    fn new(workspace_id: &'a WorkspaceMemoryId, minimum_reader_version: u32) -> Self {
         Self {
             workspace_id,
+            permits_multi_parent_revisions: minimum_reader_version
+                >= MULTI_PARENT_PORTABLE_MEMORY_STORE_SCHEMA_VERSION,
             lineage: None,
             last_completed_logical_id: None,
             next_sequence: 0,
@@ -1687,6 +1739,11 @@ impl<'a> PackageStreamValidator<'a> {
 
         match &envelope.entry {
             PortableEntry::Revision { revision } => {
+                if !self.permits_multi_parent_revisions
+                    && !revision.additional_parent_digests.is_empty()
+                {
+                    return Err(PortableMemoryError::InvalidPackage);
+                }
                 match &mut self.lineage {
                     None => {
                         if self
@@ -1696,15 +1753,16 @@ impl<'a> PackageStreamValidator<'a> {
                             return Err(PortableMemoryError::InvalidPackage);
                         }
                         let kind = classify_portable_root(revision, self.workspace_id)?;
-                        self.lineage = Some(LineageCursor {
-                            logical_id: revision.logical_id,
-                            kind,
-                            last_revision: revision.as_ref().clone(),
-                        });
+                        self.lineage = Some(LineageCursor::from_root(revision, kind));
                     }
                     Some(lineage) if lineage.logical_id == revision.logical_id => {
                         validate_portable_successor(lineage, revision, self.workspace_id)?;
-                        lineage.last_revision = revision.as_ref().clone();
+                        lineage
+                            .superseded
+                            .extend(revision.causal_parent_digests().cloned());
+                        lineage
+                            .revisions
+                            .insert(revision.record_digest.clone(), revision.version);
                     }
                     Some(_) => return Err(PortableMemoryError::InvalidPackage),
                 }
@@ -1722,7 +1780,7 @@ impl<'a> PackageStreamValidator<'a> {
                     .take()
                     .ok_or(PortableMemoryError::InvalidPackage)?;
                 if lineage.logical_id != *logical_id
-                    || lineage.last_revision.record_digest != *record_digest
+                    || lineage.sole_unsuperseded_head() != Some(record_digest)
                 {
                     return Err(PortableMemoryError::CausalConflict);
                 }
@@ -1798,7 +1856,8 @@ fn validate_package_entries(
     control: &PortableOperationControl,
 ) -> Result<SnapshotSummary, PortableMemoryError> {
     validate_manifest(manifest)?;
-    let mut validator = PackageStreamValidator::new(&manifest.workspace_id);
+    let mut validator =
+        PackageStreamValidator::new(&manifest.workspace_id, manifest.minimum_reader_version);
     for descriptor in &manifest.parts {
         control.check()?;
         let part = read_validated_part(storage, manifest, descriptor)?;
@@ -1824,7 +1883,8 @@ fn apply_package_entries_on(
     manifest: &TechnicalMemoryPackageManifest,
     control: &PortableOperationControl,
 ) -> Result<(), PortableMemoryError> {
-    let mut validator = PackageStreamValidator::new(&manifest.workspace_id);
+    let mut validator =
+        PackageStreamValidator::new(&manifest.workspace_id, manifest.minimum_reader_version);
     for descriptor in &manifest.parts {
         control.check()?;
         let part = read_validated_part(storage, manifest, descriptor)?;
@@ -1877,7 +1937,10 @@ fn apply_package_entries_on(
 #[allow(clippy::expect_used, clippy::missing_panics_doc)]
 mod tests {
     use super::*;
-    use crate::memory::{MemorySourceEvidence, MemorySourceKind, TechnicalLessonDraft};
+    use crate::memory::{
+        MemoryAttribution, MemoryProvenance, MemorySourceEvidence, MemorySourceKind, MemoryVersion,
+        TechnicalLessonDraft,
+    };
 
     fn fixture() -> (tempfile::TempDir, PersistentStorage) {
         let root = tempfile::tempdir().expect("portable package root");
@@ -2025,10 +2088,16 @@ mod tests {
             parts: Vec::new(),
         };
         validate_manifest(&manifest).expect("empty manifest is valid");
+        let mut previous_reader = manifest.clone();
+        previous_reader.store_schema_version =
+            OLDEST_SUPPORTED_PORTABLE_MEMORY_STORE_SCHEMA_VERSION;
+        previous_reader.minimum_reader_version =
+            OLDEST_SUPPORTED_PORTABLE_MEMORY_STORE_SCHEMA_VERSION;
+        validate_manifest(&previous_reader).expect("schema-v6 portable package remains readable");
         let canonical = serde_json::to_vec(&manifest).expect("canonical manifest");
         assert_eq!(
             manifest_digest(&canonical).as_str(),
-            "sha256:6ffec61abc14ec70bd4660e841d77b830330910ab1b4ebf67e728b137e09b25a"
+            "sha256:402f53d475bb34e2ef4b24ac47a0588a6f47614a612cc670af285e0be0817b10"
         );
         assert_eq!(
             u64::try_from(MAX_PACKAGE_PART_BYTES).expect("part budget"),
@@ -2088,6 +2157,82 @@ mod tests {
             validate_manifest(&oversized),
             Err(PortableMemoryError::InvalidPackage)
         ));
+    }
+
+    #[test]
+    fn schema_v6_reader_claim_rejects_a_multi_parent_revision() {
+        let workspace = workspace();
+        let provenance = |label: &str| {
+            MemoryProvenance::new(
+                MemorySourceEvidence::new(
+                    MemorySourceKind::Explicit,
+                    format!("portable-reader:{label}"),
+                    "unit:v1".to_string(),
+                    digest(label.as_bytes()),
+                ),
+                MemoryAttribution::new(
+                    "portable-reader-test".to_string(),
+                    Some(store_id()),
+                    Some(workspace.to_string()),
+                ),
+                MemoryRecordScope::UserPrivate,
+            )
+        };
+        let root = MemoryRevision::new("root".to_string(), Vec::new(), provenance("root"));
+        let left = root
+            .successor("left".to_string(), Vec::new(), provenance("left"))
+            .expect("left branch");
+        let right = root
+            .successor("right".to_string(), Vec::new(), provenance("right"))
+            .expect("right branch");
+        let merge = MemoryRevision::merge_successor(
+            &[left, right],
+            "merge".to_string(),
+            Vec::new(),
+            provenance("merge"),
+        )
+        .expect("multi-parent revision");
+        let entry = PortableEntryEnvelope {
+            sequence: 0,
+            entry: PortableEntry::Revision {
+                revision: Box::new(merge),
+            },
+        };
+
+        let mut legacy_claim = PackageStreamValidator::new(
+            &workspace,
+            OLDEST_SUPPORTED_PORTABLE_MEMORY_STORE_SCHEMA_VERSION,
+        );
+        assert!(matches!(
+            legacy_claim.accept(&entry),
+            Err(PortableMemoryError::InvalidPackage)
+        ));
+    }
+
+    #[test]
+    fn branching_lineage_requires_one_graph_derived_head() {
+        let root = digest(b"root");
+        let left = digest(b"left");
+        let right = digest(b"right");
+        let merge = digest(b"merge");
+        let mut lineage = LineageCursor {
+            logical_id: LogicalMemoryId::from_str("00000000-0000-4000-8000-000000000108")
+                .expect("logical identity"),
+            kind: LineageKind::TechnicalLesson,
+            revisions: BTreeMap::from([
+                (root.clone(), MemoryVersion::INITIAL),
+                (left.clone(), MemoryVersion::new(2).expect("version")),
+                (right.clone(), MemoryVersion::new(2).expect("version")),
+            ]),
+            superseded: BTreeSet::from([root]),
+        };
+        assert!(lineage.sole_unsuperseded_head().is_none());
+
+        lineage
+            .revisions
+            .insert(merge.clone(), MemoryVersion::new(3).expect("version"));
+        lineage.superseded.extend([left, right]);
+        assert_eq!(lineage.sole_unsuperseded_head(), Some(&merge));
     }
 
     #[test]

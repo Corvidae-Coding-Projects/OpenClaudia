@@ -15,6 +15,11 @@ use uuid::Uuid;
 
 /// Schema version of the JSON provenance envelope stored with every revision.
 pub const MEMORY_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+/// Maximum parents bound into one causal merge revision.
+///
+/// This matches the store's conflict-head ceiling so a complete current head
+/// set can be resolved without permitting an unbounded revision envelope.
+pub const MAX_MEMORY_REVISION_PARENTS: usize = 64;
 
 /// Persistent identity of one physical memory store.
 ///
@@ -410,8 +415,16 @@ pub struct MemoryRevision {
     pub logical_id: LogicalMemoryId,
     /// Monotonic version. Concurrent branches may share a version.
     pub version: MemoryVersion,
-    /// Exact predecessor digest (`None` only at version one).
+    /// Canonical primary predecessor digest (`None` only at version one).
+    /// Linear revisions have only this parent. Merge revisions additionally
+    /// bind every other predecessor in [`Self::additional_parent_digests`].
     pub parent_digest: Option<MemoryDigest>,
+    /// Canonical sorted additional predecessors for a merge revision.
+    ///
+    /// The field is omitted for legacy and linear revisions so their encoded
+    /// representation and v1 record digest remain byte-for-byte stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_parent_digests: Vec<MemoryDigest>,
     /// Digest binding every semantic field of this revision.
     pub record_digest: MemoryDigest,
     /// Digest of the exact content bytes.
@@ -426,6 +439,34 @@ pub struct MemoryRevision {
     pub state: MemoryRevisionState,
 }
 
+struct RevisionParents {
+    primary: Option<MemoryDigest>,
+    additional: Vec<MemoryDigest>,
+}
+
+impl RevisionParents {
+    const fn root() -> Self {
+        Self {
+            primary: None,
+            additional: Vec::new(),
+        }
+    }
+
+    const fn linear(primary: MemoryDigest) -> Self {
+        Self {
+            primary: Some(primary),
+            additional: Vec::new(),
+        }
+    }
+
+    const fn merge(primary: MemoryDigest, additional: Vec<MemoryDigest>) -> Self {
+        Self {
+            primary: Some(primary),
+            additional,
+        }
+    }
+}
+
 impl MemoryRevision {
     /// Create a new root revision.
     #[must_use]
@@ -433,7 +474,7 @@ impl MemoryRevision {
         Self::build(
             LogicalMemoryId::new(),
             MemoryVersion::INITIAL,
-            None,
+            RevisionParents::root(),
             content,
             tags,
             provenance,
@@ -452,7 +493,7 @@ impl MemoryRevision {
         Self::build(
             logical_id,
             MemoryVersion::INITIAL,
-            None,
+            RevisionParents::root(),
             content,
             tags,
             provenance,
@@ -477,7 +518,65 @@ impl MemoryRevision {
         Ok(Self::build(
             self.logical_id,
             self.version.next()?,
-            Some(self.record_digest.clone()),
+            RevisionParents::linear(self.record_digest.clone()),
+            content,
+            tags,
+            provenance,
+            MemoryRevisionState::Active,
+        ))
+    }
+
+    /// Create one immutable successor that causally supersedes a complete set
+    /// of concurrent heads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when fewer than two distinct parents are supplied,
+    /// the bounded parent budget is exceeded, parents belong to different
+    /// logical records or scopes, or the next version cannot be represented.
+    pub fn merge_successor(
+        parents: &[Self],
+        content: String,
+        tags: Vec<String>,
+        provenance: MemoryProvenance,
+    ) -> Result<Self, MemoryRecordError> {
+        if !(2..=MAX_MEMORY_REVISION_PARENTS).contains(&parents.len()) {
+            return Err(MemoryRecordError::InvalidParentSet);
+        }
+        let first = &parents[0];
+        if provenance.scope != first.provenance.scope
+            || parents
+                .iter()
+                .any(|parent| parent.provenance.scope != first.provenance.scope)
+        {
+            return Err(MemoryRecordError::ScopeChange);
+        }
+        if parents
+            .iter()
+            .any(|parent| parent.logical_id != first.logical_id)
+        {
+            return Err(MemoryRecordError::InvalidParentSet);
+        }
+        let mut parent_digests = parents
+            .iter()
+            .map(|parent| parent.record_digest.clone())
+            .collect::<Vec<_>>();
+        parent_digests.sort();
+        parent_digests.dedup();
+        if parent_digests.len() != parents.len() {
+            return Err(MemoryRecordError::InvalidParentSet);
+        }
+        let version = parents
+            .iter()
+            .map(|parent| parent.version)
+            .max()
+            .ok_or(MemoryRecordError::InvalidParentSet)?
+            .next()?;
+        let primary_parent = parent_digests.remove(0);
+        Ok(Self::build(
+            first.logical_id,
+            version,
+            RevisionParents::merge(primary_parent, parent_digests),
             content,
             tags,
             provenance,
@@ -497,7 +596,7 @@ impl MemoryRevision {
         Ok(Self::build(
             self.logical_id,
             self.version.next()?,
-            Some(self.record_digest.clone()),
+            RevisionParents::linear(self.record_digest.clone()),
             String::new(),
             Vec::new(),
             provenance,
@@ -512,7 +611,7 @@ impl MemoryRevision {
         Self::build(
             logical_id,
             MemoryVersion::INITIAL,
-            None,
+            RevisionParents::root(),
             content,
             tags,
             provenance,
@@ -528,7 +627,7 @@ impl MemoryRevision {
         Ok(Self::build(
             self.logical_id,
             self.version.next()?,
-            Some(self.record_digest.clone()),
+            RevisionParents::linear(self.record_digest.clone()),
             self.content.clone(),
             self.tags.clone(),
             provenance,
@@ -539,7 +638,7 @@ impl MemoryRevision {
     fn build(
         logical_id: LogicalMemoryId,
         version: MemoryVersion,
-        parent_digest: Option<MemoryDigest>,
+        mut parents: RevisionParents,
         content: String,
         mut tags: Vec<String>,
         provenance: MemoryProvenance,
@@ -547,11 +646,13 @@ impl MemoryRevision {
     ) -> Self {
         tags.sort();
         tags.dedup();
+        parents.additional.sort();
+        parents.additional.dedup();
         let content_digest = content_digest(&content);
         let record_digest = revision_digest(
             logical_id,
             version,
-            parent_digest.as_ref(),
+            &parents,
             &content_digest,
             &tags,
             &provenance,
@@ -560,7 +661,8 @@ impl MemoryRevision {
         Self {
             logical_id,
             version,
-            parent_digest,
+            parent_digest: parents.primary,
+            additional_parent_digests: parents.additional,
             record_digest,
             content_digest,
             content,
@@ -568,6 +670,13 @@ impl MemoryRevision {
             provenance,
             state,
         }
+    }
+
+    /// Iterate every canonical causal predecessor, primary first.
+    pub fn causal_parent_digests(&self) -> impl Iterator<Item = &MemoryDigest> {
+        self.parent_digest
+            .iter()
+            .chain(self.additional_parent_digests.iter())
     }
 
     /// Recompute the revision digest and reject tampered/inconsistent input.
@@ -580,7 +689,19 @@ impl MemoryRevision {
         if self.provenance.schema_version != MEMORY_PROVENANCE_SCHEMA_VERSION {
             return Err(MemoryRecordError::UnsupportedProvenanceSchema);
         }
-        if (self.version == MemoryVersion::INITIAL) != self.parent_digest.is_none() {
+        if (self.version == MemoryVersion::INITIAL) != self.parent_digest.is_none()
+            || self.additional_parent_digests.len() >= MAX_MEMORY_REVISION_PARENTS
+            || (self.parent_digest.is_none() && !self.additional_parent_digests.is_empty())
+            || !self
+                .additional_parent_digests
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || self.parent_digest.as_ref().is_some_and(|primary| {
+                self.additional_parent_digests
+                    .first()
+                    .is_some_and(|additional| primary >= additional)
+            })
+        {
             return Err(MemoryRecordError::InvalidParent);
         }
         if self.state == MemoryRevisionState::Tombstone
@@ -591,7 +712,10 @@ impl MemoryRevision {
         let rebuilt = Self::build(
             self.logical_id,
             self.version,
-            self.parent_digest.clone(),
+            RevisionParents {
+                primary: self.parent_digest.clone(),
+                additional: self.additional_parent_digests.clone(),
+            },
             self.content.clone(),
             self.tags.clone(),
             self.provenance.clone(),
@@ -619,6 +743,9 @@ pub enum MemoryRecordError {
     /// Root and successor parent constraints were violated.
     #[error("invalid memory revision parent")]
     InvalidParent,
+    /// A merge did not name a bounded set of distinct causal parents.
+    #[error("invalid memory revision parent set")]
+    InvalidParentSet,
     /// Tombstones must not carry content or tags.
     #[error("invalid memory tombstone payload")]
     InvalidTombstone,
@@ -636,20 +763,41 @@ pub enum MemoryRecordError {
 fn revision_digest(
     logical_id: LogicalMemoryId,
     version: MemoryVersion,
-    parent_digest: Option<&MemoryDigest>,
+    parents: &RevisionParents,
     content_digest: &MemoryDigest,
     tags: &[String],
     provenance: &MemoryProvenance,
     state: MemoryRevisionState,
 ) -> MemoryDigest {
     let mut hasher = Sha256::new();
-    append_field(&mut hasher, b"openclaudia.memory.revision.v1");
+    append_field(
+        &mut hasher,
+        if parents.additional.is_empty() {
+            b"openclaudia.memory.revision.v1"
+        } else {
+            b"openclaudia.memory.revision.v2"
+        },
+    );
     append_field(&mut hasher, logical_id.to_string().as_bytes());
     append_field(&mut hasher, &version.get().to_be_bytes());
     append_field(
         &mut hasher,
-        parent_digest.map_or(&[][..], |digest| digest.as_str().as_bytes()),
+        parents
+            .primary
+            .as_ref()
+            .map_or(&[][..], |digest| digest.as_str().as_bytes()),
     );
+    if !parents.additional.is_empty() {
+        append_field(
+            &mut hasher,
+            &u64::try_from(parents.additional.len() + 1)
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for digest in &parents.additional {
+            append_field(&mut hasher, digest.as_str().as_bytes());
+        }
+    }
     append_field(&mut hasher, content_digest.as_str().as_bytes());
     append_field(
         &mut hasher,
@@ -806,6 +954,138 @@ mod tests {
         assert_ne!(left.record_digest, right.record_digest);
         left.validate().unwrap();
         right.validate().unwrap();
+    }
+
+    #[test]
+    fn linear_revision_wire_shape_remains_v1_compatible() {
+        let logical_id = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let revision = MemoryRevision::new_with_logical_id(
+            logical_id,
+            "stable lesson".to_string(),
+            vec!["rust".to_string(), "causal".to_string()],
+            provenance(MemoryRecordScope::UserPrivate),
+        );
+        let encoded = serde_json::to_value(&revision).unwrap();
+        assert!(encoded.get("additional_parent_digests").is_none());
+        let decoded: MemoryRevision = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, revision);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn merge_successor_canonicalizes_all_parents_and_is_order_independent() {
+        let root = MemoryRevision::new(
+            "root".to_string(),
+            vec!["rust".to_string()],
+            provenance(MemoryRecordScope::TeamShared),
+        );
+        let left = root
+            .successor(
+                "left".to_string(),
+                vec!["rust".to_string()],
+                provenance(MemoryRecordScope::TeamShared),
+            )
+            .unwrap();
+        let right = root
+            .successor(
+                "right".to_string(),
+                vec!["rust".to_string()],
+                provenance(MemoryRecordScope::TeamShared),
+            )
+            .unwrap();
+        let left_first = MemoryRevision::merge_successor(
+            &[left.clone(), right.clone()],
+            "resolved".to_string(),
+            vec!["rust".to_string()],
+            provenance(MemoryRecordScope::TeamShared),
+        )
+        .unwrap();
+        let right_first = MemoryRevision::merge_successor(
+            &[right, left],
+            "resolved".to_string(),
+            vec!["rust".to_string()],
+            provenance(MemoryRecordScope::TeamShared),
+        )
+        .unwrap();
+
+        assert_eq!(left_first, right_first);
+        assert_eq!(left_first.version.get(), 3);
+        assert_eq!(left_first.causal_parent_digests().count(), 2);
+        left_first.validate().unwrap();
+    }
+
+    #[test]
+    fn merge_successor_rejects_duplicate_or_cross_record_parents() {
+        let root = MemoryRevision::new(
+            "root".to_string(),
+            Vec::new(),
+            provenance(MemoryRecordScope::UserPrivate),
+        );
+        let branch = root
+            .successor(
+                "branch".to_string(),
+                Vec::new(),
+                provenance(MemoryRecordScope::UserPrivate),
+            )
+            .unwrap();
+        assert_eq!(
+            MemoryRevision::merge_successor(
+                &[branch.clone(), branch],
+                "invalid".to_string(),
+                Vec::new(),
+                provenance(MemoryRecordScope::UserPrivate),
+            )
+            .unwrap_err(),
+            MemoryRecordError::InvalidParentSet
+        );
+
+        let unrelated = MemoryRevision::new(
+            "other".to_string(),
+            Vec::new(),
+            provenance(MemoryRecordScope::UserPrivate),
+        );
+        assert_eq!(
+            MemoryRevision::merge_successor(
+                &[root, unrelated],
+                "invalid".to_string(),
+                Vec::new(),
+                provenance(MemoryRecordScope::UserPrivate),
+            )
+            .unwrap_err(),
+            MemoryRecordError::InvalidParentSet
+        );
+    }
+
+    #[test]
+    fn noncanonical_merge_parent_metadata_is_rejected() {
+        let root = MemoryRevision::new(
+            "root".to_string(),
+            Vec::new(),
+            provenance(MemoryRecordScope::UserPrivate),
+        );
+        let left = root
+            .successor(
+                "left".to_string(),
+                Vec::new(),
+                provenance(MemoryRecordScope::UserPrivate),
+            )
+            .unwrap();
+        let right = root
+            .successor(
+                "right".to_string(),
+                Vec::new(),
+                provenance(MemoryRecordScope::UserPrivate),
+            )
+            .unwrap();
+        let mut merge = MemoryRevision::merge_successor(
+            &[left, right],
+            "resolved".to_string(),
+            Vec::new(),
+            provenance(MemoryRecordScope::UserPrivate),
+        )
+        .unwrap();
+        merge.additional_parent_digests[0] = merge.parent_digest.clone().unwrap();
+        assert_eq!(merge.validate(), Err(MemoryRecordError::InvalidParent));
     }
 
     #[test]

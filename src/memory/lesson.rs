@@ -12,7 +12,10 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 
-use super::{LogicalMemoryId, MemoryDigest, MemoryRecordScope, MemorySourceEvidence};
+use super::{
+    LogicalMemoryId, MemoryDigest, MemoryProvenance, MemoryRecordScope, MemoryRevisionState,
+    MemorySourceEvidence, MemoryVersion, MAX_MEMORY_REVISION_PARENTS,
+};
 
 /// Exact schema understood by this build.
 pub const TECHNICAL_LESSON_SCHEMA_VERSION: u32 = 1;
@@ -222,6 +225,10 @@ pub enum LessonReviewState {
 #[serde(deny_unknown_fields)]
 pub struct LessonCorrection {
     pub corrected_record_digest: MemoryDigest,
+    /// Additional concurrent heads superseded by one explicit resolution.
+    /// Empty for ordinary linear corrections.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_corrected_record_digests: Vec<MemoryDigest>,
     pub reason: String,
 }
 
@@ -253,6 +260,51 @@ pub struct TechnicalLessonCorrectionRequest {
     pub source: MemorySourceEvidence,
     pub author_id: String,
     pub captured_at_unix_seconds: i64,
+}
+
+/// One compare-and-swap conflict-resolution request. The complete expected
+/// head set prevents a caller from silently discarding an unseen branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TechnicalLessonResolutionRequest {
+    pub logical_id: LogicalMemoryId,
+    pub expected_head_digests: Vec<MemoryDigest>,
+    pub replacement: TechnicalLessonDraft,
+    pub correction_reason: String,
+    pub source: MemorySourceEvidence,
+    pub author_id: String,
+    pub captured_at_unix_seconds: i64,
+}
+
+/// One bounded branch returned for explicit conflict inspection. Active
+/// branches carry their decoded cited lesson; tombstones expose only causal
+/// and provenance metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TechnicalLessonConflictBranch {
+    pub version: MemoryVersion,
+    pub record_digest: MemoryDigest,
+    pub parent_digest: Option<MemoryDigest>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_parent_digests: Vec<MemoryDigest>,
+    pub state: MemoryRevisionState,
+    pub provenance: MemoryProvenance,
+    pub lesson: Option<TechnicalLesson>,
+}
+
+/// Complete current conflict state for one logical technical lesson.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TechnicalLessonConflict {
+    pub schema_version: u32,
+    pub logical_id: LogicalMemoryId,
+    pub scope: MemoryRecordScope,
+    pub authority: &'static str,
+    /// Complete canonical head set required by a resolution request.
+    pub expected_head_digests: Vec<MemoryDigest>,
+    /// Bounded page of cited branch payloads.
+    pub branches: Vec<TechnicalLessonConflictBranch>,
+    pub branches_truncated: bool,
+    pub next_after_head_digest: Option<MemoryDigest>,
 }
 
 /// Strict persisted lesson envelope.
@@ -340,6 +392,56 @@ impl TechnicalLesson {
             review: LessonReviewState::Candidate,
             correction: Some(LessonCorrection {
                 corrected_record_digest,
+                additional_corrected_record_digests: Vec::new(),
+                reason,
+            }),
+            captured_at_unix_seconds,
+        };
+        lesson.validate()?;
+        Ok(lesson)
+    }
+
+    /// Create a candidate that explicitly supersedes every named concurrent
+    /// head. The head set is canonicalized and remains bound into both lesson
+    /// correction metadata and the enclosing multi-parent revision digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid replacement or a non-merge head set.
+    pub fn resolved(
+        workspace_id: WorkspaceMemoryId,
+        mut replacement: TechnicalLessonDraft,
+        mut corrected_record_digests: Vec<MemoryDigest>,
+        reason: String,
+        captured_at_unix_seconds: i64,
+    ) -> Result<Self, TechnicalLessonError> {
+        canonicalize_applicability(&mut replacement.applicability);
+        canonicalize_citations(&mut replacement.citations);
+        let supplied_head_count = corrected_record_digests.len();
+        corrected_record_digests.sort();
+        corrected_record_digests.dedup();
+        if corrected_record_digests.len() != supplied_head_count
+            || !(2..=MAX_MEMORY_REVISION_PARENTS).contains(&corrected_record_digests.len())
+        {
+            return Err(TechnicalLessonError::InvalidCorrectionHeads);
+        }
+        let corrected_record_digest = corrected_record_digests.remove(0);
+        let lesson = Self {
+            schema_version: TECHNICAL_LESSON_SCHEMA_VERSION,
+            workspace_id,
+            title: replacement.title,
+            kind: replacement.kind,
+            observation: replacement.observation,
+            guidance: replacement.guidance,
+            applicability: replacement.applicability,
+            citations: replacement.citations,
+            confidence: replacement.confidence,
+            sensitivity: replacement.sensitivity,
+            retention: replacement.retention,
+            review: LessonReviewState::Candidate,
+            correction: Some(LessonCorrection {
+                corrected_record_digest,
+                additional_corrected_record_digests: corrected_record_digests,
                 reason,
             }),
             captured_at_unix_seconds,
@@ -382,6 +484,7 @@ impl TechnicalLesson {
             review: LessonReviewState::Candidate,
             correction: Some(LessonCorrection {
                 corrected_record_digest: tombstone_digest,
+                additional_corrected_record_digests: Vec::new(),
                 reason,
             }),
             captured_at_unix_seconds,
@@ -411,6 +514,7 @@ impl TechnicalLesson {
         };
         reviewed.correction = Some(LessonCorrection {
             corrected_record_digest: reviewed_record_digest,
+            additional_corrected_record_digests: Vec::new(),
             reason: "host reviewed this exact technical-lesson revision".to_string(),
         });
         reviewed.validate()?;
@@ -431,6 +535,7 @@ impl TechnicalLesson {
         revoked.review = LessonReviewState::Candidate;
         revoked.correction = Some(LessonCorrection {
             corrected_record_digest: reviewed_record_digest,
+            additional_corrected_record_digests: Vec::new(),
             reason: "host review was explicitly revoked".to_string(),
         });
         revoked.validate()?;
@@ -511,6 +616,18 @@ impl TechnicalLesson {
                 MAX_LESSON_CORRECTION_BYTES,
                 "correction reason",
             )?;
+            if correction.additional_corrected_record_digests.len() >= MAX_MEMORY_REVISION_PARENTS
+                || !correction
+                    .additional_corrected_record_digests
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                || correction
+                    .additional_corrected_record_digests
+                    .first()
+                    .is_some_and(|additional| correction.corrected_record_digest >= *additional)
+            {
+                return Err(TechnicalLessonError::InvalidCorrectionHeads);
+            }
         }
         validate_applicability(&self.applicability)?;
         if self.citations.is_empty() || self.citations.len() > MAX_LESSON_CITATIONS {
@@ -649,6 +766,8 @@ pub enum TechnicalLessonError {
     InvalidLineRange,
     #[error("technical lesson timestamp is invalid")]
     InvalidTimestamp,
+    #[error("technical lesson correction head set is invalid")]
+    InvalidCorrectionHeads,
     #[error("technical lesson collection is not canonical")]
     NonCanonicalCollection,
 }
@@ -661,6 +780,10 @@ pub enum TechnicalLessonStoreError {
     IdempotencyCollision,
     #[error("technical lesson has unresolved causal conflicts")]
     UnresolvedConflict,
+    #[error("technical lesson does not currently have multiple causal heads")]
+    NotConflicted,
+    #[error("technical lesson conflict head set is stale, incomplete, or forged")]
+    StaleHeadSet,
     #[error("technical lesson changed since the expected revision")]
     StaleRevision,
     #[error("technical lesson mutation did not become the sole causal head")]
@@ -948,6 +1071,7 @@ mod tests {
             corrected.correction,
             Some(LessonCorrection {
                 corrected_record_digest: parent,
+                additional_corrected_record_digests: Vec::new(),
                 reason: "New test evidence".to_string(),
             })
         );
