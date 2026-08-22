@@ -1,6 +1,6 @@
 {
   "next_display_id": 1096,
-  "next_comment_id": 1213,
+  "next_comment_id": 1214,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22225,7 +22225,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T16:48:31.785025069Z",
-      "updated_at": "2026-08-22T19:00:36.660838338Z",
+      "updated_at": "2026-08-22T19:01:04.389186595Z",
       "labels": [
         "remediation"
       ],
@@ -22238,6 +22238,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAoUGvedlgceksyvD142rLEpWZL/IfGmkE+nPmhpBitPWQ/4LdOKjgp+GtQcTSutBKbIWmpm7N5W8UGcOo5aFvAA=="
+        },
+        "3bfd4348-fb69-4395-a3a1-e6c77199f1ef": {
+          "display_id": 1213,
+          "author": "6Vw9",
+          "content": "Pre-commit review passed. Intentional staged inventory: 24 files, 3,517 insertions, 677 deletions; staged diff SHA-256 917f6ef74b7c02593b693390efe01ee7b8d81e5103e11159c9a3568a012c424f. Changed tests replace the obsolete XML/text-schema assumptions with canonical executor, generation, lease, admission, provider-shape, recall, bounds, and sanitization assertions; no production assertion was weakened to make the implementation pass.",
+          "created_at": "2026-08-22T19:01:04.386300520Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxdl/njYmtpb0pFTt+6gBrH2ZbrjstjQoritPCPauGZ6Oh/Flt6E0q73S6XhxowBT1LuTCQyv0lVDvbgI598ZBQ=="
         },
         "3dd8afd9-ffde-4102-ba41-53ee56b1c51f": {
           "display_id": 1195,
@@ -33063,11 +33072,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 981,
       "timestamp": "2026-08-22T19:00:36.660838338Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 982,
+      "timestamp": "2026-08-22T19:01:04.389186595Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T19:00:36.660838338Z",
+    "timestamp": "2026-08-22T19:01:04.389186595Z",
     "agent_id": "6Vw9",
-    "agent_seq": 981
+    "agent_seq": 982
   }
 }
