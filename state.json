@@ -1,6 +1,6 @@
 {
   "next_display_id": 1084,
-  "next_comment_id": 1143,
+  "next_comment_id": 1144,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11456,7 +11456,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T05:20:24.264343266Z",
-      "updated_at": "2026-08-22T06:21:35.599900448Z",
+      "updated_at": "2026-08-22T06:21:39.874120557Z",
       "labels": [
         "remediation"
       ],
@@ -11487,6 +11487,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAz00lOdLWf6bThUzONAwebSIPjCVQkXKCdkDOntoEmpkMqhj0UldKx+VywgX46MsR8afIwo6aW81Ss2VnXSBMBg=="
+        },
+        "8bed7770-94ae-4ae1-852c-9ef9ea6fda54": {
+          "display_id": 1143,
+          "author": "6Vw9",
+          "content": "[action] S-052 core graph now carries bounded non-authoritative task budget specs and checkpointed causal history; Rust 1.98 graph tests pass 11/11.",
+          "created_at": "2026-08-22T06:21:39.871693265Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGWJnDAXSmOfmaP1wCYVGCQC/obtJxdz/SpYPMu6HxcWL6Qz+QA3l1LhMWkaZTsayElHdqkNvuv1e5StskF7GCQ=="
         }
       }
     },
@@ -31628,11 +31637,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 865,
       "timestamp": "2026-08-22T06:21:35.599900448Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 866,
+      "timestamp": "2026-08-22T06:21:39.874120557Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T06:21:35.599900448Z",
+    "timestamp": "2026-08-22T06:21:39.874120557Z",
     "agent_id": "6Vw9",
-    "agent_seq": 865
+    "agent_seq": 866
   }
 }
