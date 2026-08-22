@@ -1,6 +1,6 @@
 {
   "next_display_id": 1088,
-  "next_comment_id": 1153,
+  "next_comment_id": 1154,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25373,7 +25373,7 @@
       "parent_uuid": "66ad6d37-42af-4133-830d-fdf7d4cb67ac",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:17:15.887051640Z",
-      "updated_at": "2026-08-22T08:43:55.481498106Z",
+      "updated_at": "2026-08-22T08:46:43.092879444Z",
       "labels": [
         "defect"
       ],
@@ -25386,6 +25386,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAemnEllR1gaOKcHgS4+nPIw92M3Wj9FjnrqG433g1doU6N5VBRGFrji0MH5zmvQcqE3K/LShs4LQ8Aa3buMm2DA=="
+        },
+        "263accaf-5c63-4dbc-a5fb-ab6b08919b94": {
+          "display_id": 1153,
+          "author": "6Vw9",
+          "content": "Artifact correction after the final generator run: elapsed-microsecond receipts are final-environment measurements, so regeneration intentionally produced a new exact evaluation artifact while preserving deterministic output digests/metrics. The rejected review is rebound and validates. Final held-out/evaluation/review digests are 6cc7bd6028c8c01fe73a4836c4fe80972ebce63f78f7290d3237974742ad8173, 7f9765542cf8041b77d431e21077bd6ad7a77faa3117f507dc5e9a66bf13a9f8, and fae2ac9f8e87f950c92b2e0d2099b918776dcfda3bc07c14b3d43feac89339c4. Retrieval unit 7/7 and evidence E2E 9/9 pass against these exact bytes.",
+          "created_at": "2026-08-22T08:46:43.090297762Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcFSi2dWz1PN9cJ9cC6AYz9ylWZga/NDEEiU3iU6jueo8Gw8W600l1aVG5m+keNoUouQb2yB2FZwSd9RtqHCuAA=="
         }
       }
     },
@@ -31870,11 +31879,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 881,
       "timestamp": "2026-08-22T08:44:08.091080199Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 882,
+      "timestamp": "2026-08-22T08:46:43.092879444Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:44:08.091080199Z",
+    "timestamp": "2026-08-22T08:46:43.092879444Z",
     "agent_id": "6Vw9",
-    "agent_seq": 881
+    "agent_seq": 882
   }
 }
