@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1083,
+  "next_display_id": 1084,
   "next_comment_id": 1140,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -407,6 +407,7 @@
     "662c558a-baeb-41be-86bb-a93940f43fea": 394,
     "663b2051-144a-4254-9ff4-bb99c8007c34": 125,
     "6664a57f-d35f-4b00-9e84-c2473a88d2e6": 818,
+    "66ad6d37-42af-4133-830d-fdf7d4cb67ac": 1083,
     "66da9b0b-6a96-4aa7-8f13-8d44fde26ece": 448,
     "677346b3-ae1a-4f69-9dc3-159a190351e7": 353,
     "67998364-68fd-452c-a117-3263ced8e4af": 911,
@@ -11440,6 +11441,18 @@
         "qa-review",
         "security"
       ]
+    },
+    "66ad6d37-42af-4133-830d-fdf7d4cb67ac": {
+      "uuid": "66ad6d37-42af-4133-830d-fdf7d4cb67ac",
+      "display_id": 1083,
+      "title": "S-052: Consolidate task and planning state",
+      "description": "Implement docs/remediation-slices/052-canonical-task-graph.md under parent #1071. Replace disconnected todo, TaskManager, mode-local planning, delegation, and external issue views with one versioned transactional graph using stable IDs, actor/run ownership, typed statuses/dependencies/blockers/history, bounded pagination, descriptor-safe persistence, generation-checked atomic mutations, cycle/readiness validation, and explicit adapters. Preserve working surfaces by wiring them to the canonical graph; do not delete dormant intended behavior. This is the required foundation for S-055 causal technical-lesson learning.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T05:20:24.264343266Z",
+      "updated_at": "2026-08-22T05:20:24.264343266Z"
     },
     "66da9b0b-6a96-4aa7-8f13-8d44fde26ece": {
       "uuid": "66da9b0b-6a96-4aa7-8f13-8d44fde26ece",
@@ -31549,11 +31562,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 859,
       "timestamp": "2026-08-22T05:18:54.732251156Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 860,
+      "timestamp": "2026-08-22T05:20:24.264343266Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T05:18:54.732251156Z",
+    "timestamp": "2026-08-22T05:20:24.264343266Z",
     "agent_id": "6Vw9",
-    "agent_seq": 859
+    "agent_seq": 860
   }
 }
