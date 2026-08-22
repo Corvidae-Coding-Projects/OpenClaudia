@@ -171,6 +171,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-052: Consolidate task and planning state (#1083)
+- Allow later slices to refresh retrieval-evidence citation provenance (#1086)
+- Fix reversed Crosslink dependency arguments in tool adapter (#1084)
 - S-105: Evaluate and improve technical-memory retrieval (#1076)
 - S-104: Wire the team-memory replication service (#1075)
 - S-103: Establish authenticated team-memory authority (#1074)
