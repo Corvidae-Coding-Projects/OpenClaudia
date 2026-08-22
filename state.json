@@ -1,6 +1,6 @@
 {
   "next_display_id": 1088,
-  "next_comment_id": 1151,
+  "next_comment_id": 1152,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11483,7 +11483,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T05:20:24.264343266Z",
-      "updated_at": "2026-08-22T08:08:07.100131366Z",
+      "updated_at": "2026-08-22T08:44:03.848374263Z",
       "labels": [
         "remediation"
       ],
@@ -11532,6 +11532,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9T7bqhdC/jtmspGw3nkrqeg7LvIs4H6O5BGNPe5FQMHKrpd8Z04zLm+39Om08/B2K9tUn44hqeK1D+jOlzW1Dw=="
+        },
+        "d1abc994-defd-45ae-87f8-22a456d0ea63": {
+          "display_id": 1151,
+          "author": "6Vw9",
+          "content": "Final pre-commit evidence: schema-v1 canonical graph now validates source-specific external/delegation lifecycle invariants and rejects forged direct creation/persisted execution metadata. Rust 1.98 with CARGO_BUILD_JOBS=4: graph 20/20, registry schema 27/27, task dispatch 33/33, subagent config 18/18, retrieval unit 7/7, evidence E2E 9/9, strict all-target Clippy -D warnings PASS, full all-feature/all-target native suite PASS (2747 lib discovered, 2746 passed, 1 ignored; every remaining target passed), Windows GNU all-target check PASS with only existing conditional warnings outside S-052. Slice/evidence records are updated. Residual upstream SQL pagination #1085, causal tombstone compaction #1087, runtime budget enforcement S-051, and independent VDD S-088 remain explicit.",
+          "created_at": "2026-08-22T08:44:03.845949092Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzNnwuRV83iJAutuqzLv7fFU/TiQGW/KHnIug/EG2jFNqopRQjHw7d7YXeExLQuo3cKxUM9XqmlHGrVxdJhhaAw=="
         },
         "d4293d85-4486-4145-8f29-ad25cdd910da": {
           "display_id": 1148,
@@ -31842,11 +31851,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 879,
       "timestamp": "2026-08-22T08:43:59.559305098Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 880,
+      "timestamp": "2026-08-22T08:44:03.848374263Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:43:59.559305098Z",
+    "timestamp": "2026-08-22T08:44:03.848374263Z",
     "agent_id": "6Vw9",
-    "agent_seq": 879
+    "agent_seq": 880
   }
 }
