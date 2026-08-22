@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1183,
+  "next_comment_id": 1184,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7819,7 +7819,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-22T14:09:21.824462022Z",
+      "updated_at": "2026-08-22T15:53:42.851711566Z",
       "labels": [
         "remediation"
       ],
@@ -7922,6 +7922,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "95f85e57-5688-4c56-94fe-1aa311d75d8b": {
+          "display_id": 1183,
+          "author": "6Vw9",
+          "content": "Dormant-feature workstream checkpoint: child #1081 is closed. Signed implementation commit 445808b5656bb4c8f77a259516374909ecb230d6 delivers typed causal conflict resolution; signed commit 8c5d3ef7e9ec5ed00d50a9bbe555a9bb63ba83b2 preserves Crosslink's exact generated CHANGELOG output. Both signatures verify for dollspace-gay. Full Rust 1.98 all-feature/all-target validation is green; the parent remains open for the remaining dormant features.",
+          "created_at": "2026-08-22T15:53:42.848998210Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAC2jCrwL0Tzxb5xvofN4DVRz9DC5jfv35YTSNoD6efasyyN1WYl+A65jnFXzKy3cDFhtvVWcT484Ih+TNt0mYBQ=="
         },
         "ab49ff14-9e3f-4f60-8704-f76d99d9411e": {
           "display_id": 1032,
@@ -32438,11 +32447,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 930,
       "timestamp": "2026-08-22T15:52:45.291257652Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 931,
+      "timestamp": "2026-08-22T15:53:42.851711566Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T15:52:45.291257652Z",
+    "timestamp": "2026-08-22T15:53:42.851711566Z",
     "agent_id": "6Vw9",
-    "agent_seq": 930
+    "agent_seq": 931
   }
 }
