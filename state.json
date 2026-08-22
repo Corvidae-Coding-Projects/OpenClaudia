@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1090,
+  "next_display_id": 1091,
   "next_comment_id": 1169,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -742,6 +742,7 @@
     "b95f65d9-80d5-4c03-83be-e72784312e74": 904,
     "b971f4a6-d70e-43d4-b956-2ce6e5d972a3": 901,
     "b98f88b6-b944-47e2-b15f-b08e3d6b7800": 136,
+    "ba3503d8-5de4-469c-be3f-14ce03114dd7": 1090,
     "ba37e7f4-6064-4b09-9f2e-33fb320d2dcf": 1051,
     "ba9ccb18-bbec-47ab-8c87-8a06f64e8525": 789,
     "bb0a33ca-c8fd-4773-949a-ac6b30c20346": 1049,
@@ -20616,6 +20617,18 @@
         "qa"
       ]
     },
+    "ba3503d8-5de4-469c-be3f-14ce03114dd7": {
+      "uuid": "ba3503d8-5de4-469c-be3f-14ce03114dd7",
+      "display_id": 1090,
+      "title": "Preserve typed partial outcomes across the ACP tool boundary",
+      "description": "ACP execute_local_tool_with_permission currently projects canonical ToolResult to AcpToolResult { content, is_error }. ToolOutcome::Partial therefore becomes is_error=false; execute_tool_via_acp fires PostToolUse instead of PostToolUseFailure, the provider/UI cannot distinguish partial completion, and record_acp_tool_result_observation reconstructs a false legacy success. Preserve the canonical typed result or an exact lossless ACP projection through hook selection, provider continuation, UI display, and grounded-loop evidence. Add nonzero Bash and partial mutation regression tests.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T13:22:49.666859875Z",
+      "updated_at": "2026-08-22T13:22:49.666859875Z"
+    },
     "ba37e7f4-6064-4b09-9f2e-33fb320d2dcf": {
       "uuid": "ba37e7f4-6064-4b09-9f2e-33fb320d2dcf",
       "display_id": 1051,
@@ -32191,11 +32204,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 909,
       "timestamp": "2026-08-22T13:12:07.326656978Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 910,
+      "timestamp": "2026-08-22T13:22:49.666859875Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T13:12:07.326656978Z",
+    "timestamp": "2026-08-22T13:22:49.666859875Z",
     "agent_id": "6Vw9",
-    "agent_seq": 909
+    "agent_seq": 910
   }
 }
