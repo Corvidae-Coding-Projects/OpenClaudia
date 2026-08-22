@@ -1,6 +1,6 @@
 {
   "next_display_id": 1097,
-  "next_comment_id": 1222,
+  "next_comment_id": 1223,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3283,7 +3283,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T19:10:00.528199762Z",
-      "updated_at": "2026-08-22T19:56:51.489868065Z",
+      "updated_at": "2026-08-22T20:01:54.049720331Z",
       "labels": [
         "remediation"
       ],
@@ -3296,6 +3296,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA0v71ETktrAv6EudAtCMiOcyb7MOmX2JglNPSKxoE5kH9EWIL5+T0daEA/n9dU1DK3rRv4ii8EnhwzNFT5HoMAQ=="
+        },
+        "5a4d04e3-116c-4b8a-97e5-f640a28e9562": {
+          "display_id": 1222,
+          "author": "6Vw9",
+          "content": "Skeptical diff review found a cancellation-accounting defect in the first implementation: the canonical executor committed its dynamic MCP blast-radius/evidence-freshness reservation only after tools/call returned, so cancellation after remote receipt could release an effect that may already have happened. Corrected the manager API to invoke an exact dispatch-boundary callback immediately before polling the remote tools/call future; the executor now commits there, and error partiality is based on typed dispatch evidence rather than broad error variants. Added an adversarial blocking-transport test proving schema rejection does not cross the boundary and cancellation after remote dispatch does.",
+          "created_at": "2026-08-22T20:01:54.046850781Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA0c/divaY43xdT6TtR6+XWanVS0Ye+CMvBb62HpieJ+qpdC5A97LdXGRhXyDSQTSIORol9q5QePpJ7Eh/mwXhDQ=="
         },
         "e2392542-16cd-4c92-ab3e-7f5c9df559d2": {
           "display_id": 1221,
@@ -33245,11 +33254,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 997,
       "timestamp": "2026-08-22T19:56:51.489868065Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 998,
+      "timestamp": "2026-08-22T20:01:54.049720331Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T19:56:51.489868065Z",
+    "timestamp": "2026-08-22T20:01:54.049720331Z",
     "agent_id": "6Vw9",
-    "agent_seq": 997
+    "agent_seq": 998
   }
 }
