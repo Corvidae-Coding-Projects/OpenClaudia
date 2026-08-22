@@ -24095,11 +24095,12 @@
       "display_id": 1092,
       "title": "Regenerate the fuzz lockfile so Rust 1.98 locked CI is reproducible",
       "description": "PR #66 MSRV and repository-policy runners both fail because fuzz/Cargo.lock no longer matches fuzz/Cargo.toml plus the path dependency graph under cargo --locked. Reproduce with the exact workflow command, regenerate only the lockfile with Rust/Cargo 1.98.0, and verify fuzz metadata/check/Clippy/tests plus cargo-deny.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T17:47:38.500723890Z",
-      "updated_at": "2026-08-22T17:52:41.319355363Z",
+      "updated_at": "2026-08-22T17:52:49.009359928Z",
+      "closed_at": "2026-08-22T17:52:49.009355118Z",
       "labels": [
         "ci"
       ],
@@ -32847,11 +32848,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 963,
       "timestamp": "2026-08-22T17:52:41.319355363Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 964,
+      "timestamp": "2026-08-22T17:52:49.009359928Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T17:52:41.319355363Z",
+    "timestamp": "2026-08-22T17:52:49.009359928Z",
     "agent_id": "6Vw9",
-    "agent_seq": 963
+    "agent_seq": 964
   }
 }
