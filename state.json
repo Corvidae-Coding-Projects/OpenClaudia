@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1180,
+  "next_comment_id": 1181,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14457,7 +14457,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T01:12:28.361756220Z",
-      "updated_at": "2026-08-22T15:46:35.429532064Z",
+      "updated_at": "2026-08-22T15:51:15.457634042Z",
       "labels": [
         "remediation"
       ],
@@ -14488,6 +14488,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEq8qyE0vzZ7qXJYVvWMYXZXmeEsEoilBZa33FQnb+gSeLTdr2QRXlNNbq3vRpJtXJvzv3MMSUZHouuExgzeuCA=="
+        },
+        "46c9b8a6-549d-4490-8c80-e549d163c2c9": {
+          "display_id": 1180,
+          "author": "6Vw9",
+          "content": "Final verification: QA repaired the pre-v7 migration insertion regression with a migration-only linear encoder, rebound and regenerated exact artifact evidence, and preserved the intentionally rejected independent-review state. Rust 1.98.0 with CARGO_BUILD_JOBS=4 and one test thread: focused affected integration set 117/117, retrieval evidence 9/9, retrieval runtime 4/4, exact legacy migration pass, strict all-feature/all-target Clippy pass, Windows GNU all-feature/all-target check pass, and final native all-feature/all-target no-fail-fast matrix exit 0. Changed-line security/placeholder scan found no added placeholder, ignored test, debug output, or credential material.",
+          "created_at": "2026-08-22T15:51:15.454313440Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8x8AL6o6SpkoxYcm8A1GiRZH6px3n/L/ntLNPtfmgb49cGrlJiVAiWFozt/o7kAcjVPsqJqdLjzZK3hYEu94Aw=="
         },
         "720c8393-f301-40ea-8178-d52e914bb1d4": {
           "display_id": 1177,
@@ -32389,11 +32398,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 925,
       "timestamp": "2026-08-22T15:46:35.429532064Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 926,
+      "timestamp": "2026-08-22T15:51:15.457634042Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T15:46:35.429532064Z",
+    "timestamp": "2026-08-22T15:51:15.457634042Z",
     "agent_id": "6Vw9",
-    "agent_seq": 925
+    "agent_seq": 926
   }
 }
