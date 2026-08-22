@@ -1,6 +1,6 @@
 {
   "next_display_id": 1094,
-  "next_comment_id": 1203,
+  "next_comment_id": 1204,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24095,7 +24095,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T17:47:38.500723890Z",
-      "updated_at": "2026-08-22T17:52:49.009359928Z",
+      "updated_at": "2026-08-22T17:53:03.039174290Z",
       "closed_at": "2026-08-22T17:52:49.009355118Z",
       "labels": [
         "ci"
@@ -24109,6 +24109,15 @@
           "kind": "validation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAt/KNPw42tLwr8QQ9TfHDpqUPmL6AvYlD8sWQiZswaVR8niwZ5KitrTNcG+wUr09vL2/F1fG5Bd0c9d8856/IAg=="
+        },
+        "c5e11ffa-9fc9-452a-9ca3-5f1d9281fd0d": {
+          "display_id": 1203,
+          "author": "6Vw9",
+          "content": "Regenerated fuzz/Cargo.lock with Cargo 1.98.0 so the fuzz workspace resolves under --locked. Verified locked metadata, check, strict Clippy, four fuzz library tests, and cargo-deny; delivered in signed commit 775588b.",
+          "created_at": "2026-08-22T17:53:03.036669957Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAikW0LufiE/j1gCqiRbvx7xXN1HjnF1gnmUAd9UuIf0Xip4ERIkkEK2gDK63biVQxbkbl/iBJGaYmSNnypKdBBg=="
         },
         "f4c2c96a-456b-46a7-a86e-29410586c7be": {
           "display_id": 1201,
@@ -32854,11 +32863,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 965,
       "timestamp": "2026-08-22T17:52:52.957647357Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 966,
+      "timestamp": "2026-08-22T17:53:03.039174290Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T17:52:52.957647357Z",
+    "timestamp": "2026-08-22T17:53:03.039174290Z",
     "agent_id": "6Vw9",
-    "agent_seq": 965
+    "agent_seq": 966
   }
 }
