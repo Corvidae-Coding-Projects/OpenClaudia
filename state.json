@@ -9114,12 +9114,13 @@
       "display_id": 1089,
       "title": "S-055: Rebuild automatic learning around causal technical evidence",
       "description": "Implement docs/remediation-slices/055-evidence-bound-automatic-learning.md. Replace legacy prose/keyword auto-learning with an explicit canonical consumer of typed user/tool/task/run evidence that proposes repository-scoped technical lessons with exact provenance, citations, review/expiry/contradiction lifecycle, privacy and retention policy, bounded diagnostics, and observable partial/degraded outcomes across supported frontends. Preserve intended learning behavior by wiring it; never harvest transcripts or treat repeated prose as truth.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:53:08.818081581Z",
-      "updated_at": "2026-08-22T14:08:22.713124186Z",
+      "updated_at": "2026-08-22T14:08:26.953557735Z",
+      "closed_at": "2026-08-22T14:08:26.953556322Z",
       "labels": [
         "remediation"
       ],
@@ -32287,11 +32288,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 916,
       "timestamp": "2026-08-22T14:08:22.713124186Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 917,
+      "timestamp": "2026-08-22T14:08:26.953557735Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T14:08:22.713124186Z",
+    "timestamp": "2026-08-22T14:08:26.953557735Z",
     "agent_id": "6Vw9",
-    "agent_seq": 916
+    "agent_seq": 917
   }
 }
