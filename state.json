@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1087,
+  "next_display_id": 1088,
   "next_comment_id": 1149,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -1002,6 +1002,7 @@
     "fc4aa97b-6e77-4f7f-bace-2f330e95082b": 159,
     "fc5ec86a-198b-4432-a529-6a90d72511a5": 742,
     "fcb62d53-30ba-42a6-aebe-7d2c8a79f3fe": 969,
+    "fccea464-bf8c-4c5f-a9d2-7b7db47e47b5": 1087,
     "fcd4f113-ad90-48e8-8415-86f79664a852": 214,
     "fd3bd687-5015-4943-b719-89ceb76830e7": 221,
     "fd427573-136e-445b-81a4-bd3e1d02c701": 861,
@@ -26862,6 +26863,18 @@
         "qa-review"
       ]
     },
+    "fccea464-bf8c-4c5f-a9d2-7b7db47e47b5": {
+      "uuid": "fccea464-bf8c-4c5f-a9d2-7b7db47e47b5",
+      "display_id": 1087,
+      "title": "Compact terminal task tombstones before lifetime capacity exhaustion",
+      "description": "The S-052 canonical graph deliberately fails closed at 512 retained task nodes, including deleted tombstones, so memory and persistence remain bounded. A sufficiently long-lived session can nevertheless exhaust lifetime task capacity permanently. Design causal tombstone compaction that preserves monotonic IDs, active dependency safety, generation/history checkpoint integrity, resume determinism, and stale-cursor rejection; never silently reuse IDs or erase unresolved/externally projected work.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T08:42:42.616574416Z",
+      "updated_at": "2026-08-22T08:42:42.616574416Z"
+    },
     "fcd4f113-ad90-48e8-8415-86f79664a852": {
       "uuid": "fcd4f113-ad90-48e8-8415-86f79664a852",
       "display_id": 214,
@@ -31786,11 +31799,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 875,
       "timestamp": "2026-08-22T08:17:20.205604414Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 876,
+      "timestamp": "2026-08-22T08:42:42.616574416Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:17:20.205604414Z",
+    "timestamp": "2026-08-22T08:42:42.616574416Z",
     "agent_id": "6Vw9",
-    "agent_seq": 875
+    "agent_seq": 876
   }
 }
