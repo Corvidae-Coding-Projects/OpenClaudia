@@ -2486,9 +2486,9 @@ async fn run_vdd_review(
 
 /// Build a per-turn chat request body for the configured target provider.
 ///
-/// Kept as a private wrapper for the legacy REPL module; the actual request
-/// construction lives in [`openclaudia::pipeline::build_request`] so REPL and
-/// TUI provider behavior cannot drift.
+/// Test-only full-catalog compatibility baseline. Production frontends use the
+/// run-aware progressive builders directly.
+#[cfg(test)]
 fn build_chat_request_body(
     target: &str,
     messages: &[serde_json::Value],

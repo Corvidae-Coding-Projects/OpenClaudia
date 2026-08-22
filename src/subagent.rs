@@ -2130,10 +2130,29 @@ async fn run_subagent_inner(
         };
         let prepared_request_messages =
             subagent_prompt_blocks.prepare_json_messages(&request_messages);
+        let progressive_tools = match subagent_run.tool_catalog().snapshot(
+            &subagent_run,
+            &request_messages,
+            &filtered_tools,
+        ) {
+            Ok(snapshot) => snapshot.definitions,
+            Err(e) => {
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                return SubagentResult {
+                    agent_id,
+                    success: false,
+                    output: format!("Tool catalog error: {e}"),
+                    turns_used: turns,
+                    is_background: config.run_in_background,
+                    worktree: worktree.clone(),
+                };
+            }
+        };
         let request_body = json!({
             "model": model,
             "messages": prepared_request_messages,
-            "tools": filtered_tools,
+            "tools": progressive_tools,
             "max_tokens": SUBAGENT_MAX_TOKENS
         });
         let typed_request = match build_chat_completion_request(&request_body) {
@@ -4235,6 +4254,38 @@ mod tests {
                     && !available_subagent_tools(*agent_type, true).contains(&"memory_import"),
                 "subagent role {agent_type:?} has no direct host approval channel"
             );
+        }
+    }
+
+    #[test]
+    fn every_subagent_role_publishes_its_entire_host_allowlist() {
+        let root = tempfile::tempdir().expect("subagent catalog root");
+        let all_tools = crate::tools::get_tool_definitions();
+        let all_tools = all_tools.as_array().expect("tool definitions array");
+
+        for agent_type in AgentType::ALL {
+            let run = crate::tools::security::test_run_context_for(root.path());
+            let allowed = available_subagent_tools(*agent_type, true);
+            let filtered = all_tools
+                .iter()
+                .filter(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| allowed.contains(&name))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let filtered = add_subagent_typed_decision_contracts(filtered);
+            let snapshot = run
+                .tool_catalog()
+                .snapshot(&run, &[], &filtered)
+                .unwrap_or_else(|error| panic!("{} catalog failed: {error}", agent_type.name()));
+            assert!(
+                snapshot.full_catalog_fallback,
+                "{} has no tool_search bootstrap, so its bounded host allowlist must publish whole",
+                agent_type.name()
+            );
+            assert_eq!(snapshot.definitions.len(), filtered.len());
         }
     }
 

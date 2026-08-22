@@ -577,8 +577,20 @@ fn tool_search_max_results_schema_advertises_bounds() {
     );
     assert_eq!(
         max_results_schema.get("maximum").and_then(Value::as_u64),
-        Some(50),
+        Some(8),
         "tool_search max_results schema must advertise the enforced ceiling"
+    );
+    assert_eq!(
+        def.pointer("/function/parameters/additionalProperties")
+            .and_then(Value::as_bool),
+        Some(false),
+        "tool_search must reject unrecognized control fields"
+    );
+    assert_eq!(
+        def.pointer("/function/parameters/properties/catalog_generation/type")
+            .and_then(Value::as_str),
+        Some("string"),
+        "tool_search must advertise the generation binding field"
     );
 }
 

@@ -1598,7 +1598,10 @@ impl AcpServer {
 
             // Build the request
             let tools =
-                match acp_tool_definitions_for_chat_request(crate::tools::get_tool_definitions()) {
+                match crate::tools::get_progressive_tool_definitions(run, &self.messages, false)
+                    .and_then(|snapshot| {
+                        acp_tool_definitions_for_chat_request(snapshot.definitions_value())
+                    }) {
                     Ok(tools) => tools,
                     Err(e) => {
                         let text = format!("Internal ACP tool registry error: {e}");
@@ -2130,6 +2133,14 @@ impl AcpServer {
         arguments_json: &str,
     ) -> ToolResult {
         let tool_call = acp_tool_call(tool_call_id, tool_name, arguments_json);
+        if let Err(reason) = run.tool_catalog().admit_tool_call(tool_name) {
+            return ToolResult::failure(
+                &tool_call,
+                ToolFailureCode::Unavailable,
+                reason,
+                ToolRetryability::Safe,
+            );
+        }
         let (args, tool_input) = match parse_acp_tool_arguments(tool_name, arguments_json) {
             Ok(parsed) => parsed,
             Err(failure) => return bind_acp_failure(&tool_call, failure),
@@ -2240,16 +2251,12 @@ impl AcpServer {
             | "memory_source_refresh" => Ok(self
                 .execute_local_tool_async(run, session_id, tool_call_id, tool_name, arguments_json)
                 .await),
-            // Other internal tools run locally — not file/terminal operations.
-            "web_fetch" | "web_search" | "web_browser" | "task_create" | "task_update"
-            | "task_get" | "task_list" | "todo_write" | "todo_read" | "enter_plan_mode"
-            | "exit_plan_mode" => Ok(self.execute_local_tool(
-                run,
-                session_id,
-                tool_call_id,
-                tool_name,
-                arguments_json,
-            )),
+            // Every other built-in registry tool stays on the canonical local
+            // executor. The progressive catalog can therefore activate any
+            // classified built-in without growing a second ACP name list.
+            name if crate::tools::registry::registry().get(name).is_some() => Ok(
+                self.execute_local_tool(run, session_id, tool_call_id, tool_name, arguments_json)
+            ),
             name if name.starts_with("mcp__") => {
                 // MCP tools run locally through the MCP manager
                 Ok(self.execute_local_tool(
@@ -4248,10 +4255,13 @@ memory:
 
     fn test_toolchain_rustc() -> std::path::PathBuf {
         if let Ok(rustup) = which::which("rustup") {
-            let output = std::process::Command::new(rustup)
-                .args(["which", "rustc"])
-                .output()
-                .expect("query rustup for the active rustc");
+            let output = crate::tools::command::run_with_timeout(
+                &rustup,
+                &["which", "rustc"],
+                None,
+                std::time::Duration::from_secs(5),
+            )
+            .expect("query rustup for the active rustc");
             if output.status.success() {
                 let path = std::path::PathBuf::from(
                     String::from_utf8(output.stdout)
@@ -4699,6 +4709,7 @@ memory:
         assert_acp_conflict_inspection_and_resolution(&server, &run).await;
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn acp_automatic_learning_citations_bind_provider_call_ids() {
         let rustc = test_toolchain_rustc();

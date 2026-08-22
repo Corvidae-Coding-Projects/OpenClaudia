@@ -113,11 +113,28 @@ pub fn build_anthropic_request(
     claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
+    build_anthropic_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_anthropic_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    openai_tools: &Value,
+) -> Result<Value, String> {
     let anthropic_messages =
         convert_messages_to_anthropic_checked(messages).map_err(|e| e.to_string())?;
-    let openai_tools = tools::get_all_tool_definitions(true);
     let anthropic_tools =
-        convert_tool_definitions_to_anthropic_checked(&openai_tools).map_err(|e| e.to_string())?;
+        convert_tool_definitions_to_anthropic_checked(openai_tools).map_err(|e| e.to_string())?;
 
     let mut req = serde_json::json!({
         "model": model,
@@ -187,12 +204,26 @@ pub fn build_anthropic_request(
 /// `xhigh` tier.
 #[must_use]
 pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str) -> Value {
+    build_openai_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_openai_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    tool_definitions: &Value,
+) -> Value {
     let mut req = serde_json::json!({
         "model": model,
         "messages": messages,
         "max_tokens": crate::DEFAULT_MAX_TOKENS,
         "stream": true,
-        "tools": tools::get_all_tool_definitions(true)
+        "tools": tool_definitions
     });
     match effort_level {
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => {
@@ -374,8 +405,22 @@ pub fn build_openai_responses_request(
     messages: &[Value],
     effort_level: &str,
 ) -> Result<Value, String> {
+    build_openai_responses_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_openai_responses_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    openai_tools: &Value,
+) -> Result<Value, String> {
     let (instructions, input) = responses_input_items(messages)?;
-    let tools = responses_tools_from_openai_tools(&tools::get_all_tool_definitions(true))?;
+    let tools = responses_tools_from_openai_tools(openai_tools)?;
     let mut req = serde_json::json!({
         "model": model,
         "input": input,
@@ -406,6 +451,34 @@ pub fn build_chat_completion_request(
     model: &str,
     messages: &[Value],
 ) -> Result<proxy::ChatCompletionRequest, String> {
+    build_chat_completion_request_with_tools(
+        model,
+        messages,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+/// Build the canonical policy-accounting request with the same progressive
+/// definitions the exact run will publish to the provider.
+///
+/// # Errors
+///
+/// Returns an error if the run-owned catalog cannot be published or a message
+/// cannot be represented as a typed chat-completions message.
+pub fn build_chat_completion_request_for_run(
+    run: &tools::ToolRunContext,
+    model: &str,
+    messages: &[Value],
+) -> Result<proxy::ChatCompletionRequest, String> {
+    let snapshot = tools::get_progressive_tool_definitions(run, messages, true)?;
+    build_chat_completion_request_with_tools(model, messages, &snapshot.definitions_value())
+}
+
+fn build_chat_completion_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    tool_definitions: &Value,
+) -> Result<proxy::ChatCompletionRequest, String> {
     let messages = messages
         .iter()
         .enumerate()
@@ -415,7 +488,7 @@ pub fn build_chat_completion_request(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let tools = tools::get_all_tool_definitions(true)
+    let tools = tool_definitions
         .as_array()
         .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?
         .clone();
@@ -461,8 +534,9 @@ fn build_adapter_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
+    tool_definitions: &Value,
 ) -> Result<Value, String> {
-    let request = build_chat_completion_request(model, messages)?;
+    let request = build_chat_completion_request_with_tools(model, messages, tool_definitions)?;
     let adapter = get_adapter(provider).map_err(|e| e.to_string())?;
     let body = thinking_config_for_pipeline_effort(provider, effort_level).map_or_else(
         || adapter.transform_request(&request),
@@ -478,7 +552,18 @@ fn build_adapter_request(
 /// Returns an error if the built-in tool definitions cannot be represented as
 /// Gemini function declarations.
 pub fn build_google_request(messages: &[Value], effort_level: &str) -> Result<Value, String> {
-    let openai_tools = tools::get_all_tool_definitions(true);
+    build_google_request_with_tools(
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_google_request_with_tools(
+    messages: &[Value],
+    effort_level: &str,
+    openai_tools: &Value,
+) -> Result<Value, String> {
     let tools_vec = openai_tools
         .as_array()
         .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?;
@@ -565,6 +650,34 @@ pub fn build_request(
     )
 }
 
+/// Build a chat-completions request from the exact run-owned progressive tool
+/// catalog rather than the compatibility full-catalog baseline.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication, provider lookup, or provider
+/// request conversion fails.
+pub fn build_request_for_run(
+    run: &tools::ToolRunContext,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_request_for_wire_for_run(
+        run,
+        WireApi::ChatCompletions,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+    )
+}
+
 /// Build the appropriate request body for the given provider and wire API.
 ///
 /// # Errors
@@ -580,6 +693,60 @@ pub fn build_request_for_wire(
     claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
+    build_request_for_wire_with_tools(
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+/// Build the provider request from one exact run-owned progressive catalog
+/// snapshot. This is the production path for TUI and legacy frontends.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication, message conversion, provider
+/// lookup, or provider-specific request conversion fails.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    let snapshot = tools::get_progressive_tool_definitions(run, messages, true)?;
+    build_request_for_wire_with_tools(
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &snapshot.definitions_value(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_request_for_wire_with_tools(
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    tool_definitions: &Value,
+) -> Result<Value, String> {
     // Resolve ultrathink keyword / env override against the base effort
     // so every provider path sees the same effective level (Claude Code
     // does the same in `resolveAppliedEffort`). If env says `unset` /
@@ -590,18 +757,32 @@ pub fn build_request_for_wire(
     let prepared_messages = prompt_blocks.map(|context| context.prepare_json_messages(messages));
     let effective_messages = prepared_messages.as_deref().unwrap_or(messages);
     if wire_api == WireApi::OpenAiResponses {
-        return build_openai_responses_request(model, effective_messages, effective);
+        return build_openai_responses_request_with_tools(
+            model,
+            effective_messages,
+            effective,
+            tool_definitions,
+        );
     }
     match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => build_anthropic_request(
+        "anthropic" => build_anthropic_request_with_tools(
             model,
             effective_messages,
             effective,
             claude_code_token,
             prompt_blocks,
+            tool_definitions,
         ),
-        "google" | "gemini" => build_google_request(effective_messages, effective),
-        _ => build_adapter_request(provider, model, effective_messages, effective),
+        "google" | "gemini" => {
+            build_google_request_with_tools(effective_messages, effective, tool_definitions)
+        }
+        _ => build_adapter_request(
+            provider,
+            model,
+            effective_messages,
+            effective,
+            tool_definitions,
+        ),
     }
 }
 

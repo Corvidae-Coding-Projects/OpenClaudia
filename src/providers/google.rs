@@ -20,6 +20,56 @@ fn gemini_tool_call_id(ordinal: usize, function_name: &str) -> String {
     format!("call_{ordinal}_{function_name}")
 }
 
+/// Adapt the JSON Schema keywords used by the canonical registry to Gemini's
+/// `parametersJsonSchema` dialect.
+///
+/// Gemini does not accept JSON Schema's `const` keyword for function
+/// declarations. A one-element `enum` has the same model-facing constraint;
+/// canonical host validation remains authoritative when the call returns.
+fn normalize_gemini_json_schema(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+
+    if let Some(constant) = object.remove("const") {
+        object.insert("enum".to_string(), Value::Array(vec![constant]));
+    }
+
+    for map_key in ["properties", "$defs", "definitions", "patternProperties"] {
+        if let Some(children) = object.get_mut(map_key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                normalize_gemini_json_schema(child);
+            }
+        }
+    }
+
+    for schema_key in [
+        "items",
+        "additionalProperties",
+        "not",
+        "contains",
+        "propertyNames",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(child) = object.get_mut(schema_key) {
+            normalize_gemini_json_schema(child);
+        }
+    }
+
+    for schema_array_key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = object
+            .get_mut(schema_array_key)
+            .and_then(Value::as_array_mut)
+        {
+            for child in children {
+                normalize_gemini_json_schema(child);
+            }
+        }
+    }
+}
+
 /// Convert `OpenAI` tools to Gemini function declarations.
 ///
 /// # Errors
@@ -60,7 +110,7 @@ pub fn convert_tools_to_gemini_functions(tools: &[Value]) -> Result<Vec<Value>, 
             }
         };
 
-        let parameters = match func.get("parameters") {
+        let mut parameters_json_schema = match func.get("parameters") {
             None => json!({}),
             Some(value @ Value::Object(_)) => value.clone(),
             Some(_) => {
@@ -69,11 +119,12 @@ pub fn convert_tools_to_gemini_functions(tools: &[Value]) -> Result<Vec<Value>, 
                 )));
             }
         };
+        normalize_gemini_json_schema(&mut parameters_json_schema);
 
         functions.push(json!({
             "name": name,
             "description": description,
-            "parameters": parameters
+            "parametersJsonSchema": parameters_json_schema
         }));
     }
 
@@ -591,7 +642,56 @@ mod tests {
         assert_eq!(functions.len(), 1);
         assert_eq!(functions[0]["name"], "bash");
         assert_eq!(functions[0]["description"], "run shell");
-        assert_eq!(functions[0]["parameters"]["type"], "object");
+        assert_eq!(functions[0]["parametersJsonSchema"]["type"], "object");
+        assert!(functions[0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn convert_tools_to_gemini_rewrites_nested_const_constraints() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "catalog_generation": {
+                            "type": "string",
+                            "const": "sha256:bound"
+                        },
+                        "policy": {
+                            "oneOf": [
+                                {"const": "private"},
+                                {"const": "team"}
+                            ]
+                        },
+                        "const": {"type": "string"}
+                    }
+                }
+            }
+        })];
+
+        let functions =
+            convert_tools_to_gemini_functions(&tools).expect("valid tool should convert");
+        let schema = &functions[0]["parametersJsonSchema"];
+
+        assert_eq!(
+            schema["properties"]["catalog_generation"]["enum"],
+            json!(["sha256:bound"])
+        );
+        assert_eq!(
+            schema["properties"]["policy"]["oneOf"][0]["enum"],
+            json!(["private"])
+        );
+        assert_eq!(schema["properties"]["const"]["type"], "string");
+        assert!(
+            schema
+                .pointer("/properties/catalog_generation/const")
+                .is_none(),
+            "Gemini schema must not retain unsupported const"
+        );
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]

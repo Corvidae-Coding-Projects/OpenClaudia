@@ -106,7 +106,6 @@ fn safe_read_only_tools_do_not_need_permission() {
         "task_get",
         "task_list",
         "skill",
-        "tool_search",
     ] {
         assert!(
             !tool_needs_permission(t),
@@ -130,6 +129,7 @@ fn write_edit_and_non_preapproved_network_tools_need_permission() {
         "enter_plan_mode",
         "exit_plan_mode",
         "crosslink",
+        "tool_search",
     ] {
         assert!(
             tool_needs_permission(t),

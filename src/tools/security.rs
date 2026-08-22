@@ -296,6 +296,7 @@ impl ToolRunContextBuilder {
 pub struct ToolRunContext {
     runtime: Arc<RunContext>,
     generation: CapabilityGeneration,
+    tool_catalog: super::catalog::RunToolCatalog,
     project_root: PathBuf,
     working_directory: PathBuf,
     private_temp: PrivateTempDir,
@@ -657,6 +658,7 @@ impl ToolRunContext {
         let context = Self {
             runtime,
             generation,
+            tool_catalog: super::catalog::RunToolCatalog::default(),
             project_root,
             working_directory,
             private_temp,
@@ -699,6 +701,16 @@ impl ToolRunContext {
     #[must_use]
     pub const fn generation(&self) -> CapabilityGeneration {
         self.generation
+    }
+
+    /// Progressive tool-catalog state owned by this exact run generation.
+    ///
+    /// Catalog selection is mutable runtime state, but it cannot grant host
+    /// authority: dispatch still revalidates the immutable capability binding,
+    /// effect policy, approval, and guardrails for every invocation.
+    #[must_use]
+    pub const fn tool_catalog(&self) -> &super::catalog::RunToolCatalog {
+        &self.tool_catalog
     }
 
     /// Session identifier that owns these capabilities.

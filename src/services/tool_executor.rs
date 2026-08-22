@@ -219,6 +219,18 @@ impl ToolExecutor {
         // must never be inferred from this caller-controlled label.
         let session_id = session_id.or_else(|| Some(run_context.session_id()));
 
+        if let Err(reason) = run_context
+            .tool_catalog()
+            .admit_tool_call(&tool_call.function.name)
+        {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::Unavailable,
+                reason,
+                ToolRetryability::Safe,
+            );
+        }
+
         if let Err(reason) =
             Self::parse_arguments(&tool_call.function.name, &tool_call.function.arguments)
         {

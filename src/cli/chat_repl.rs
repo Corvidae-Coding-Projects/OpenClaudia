@@ -37,7 +37,7 @@ use crate::cli::repl::slash::{
 use crate::cli::repl::vim::{self, VimState};
 use crate::cli::repl::{load_chat_session, save_chat_session, Session};
 use crate::{
-    build_chat_endpoint_and_headers, build_chat_request_body, build_hook_engine, chdir_to_git_root,
+    build_chat_endpoint_and_headers, build_hook_engine, chdir_to_git_root,
     check_tool_permission_interactive, finalize_chat, init_memory_with_banner,
     init_permission_manager, init_plugin_manager, init_rustyline_with_history,
     init_vdd_engine_if_enabled, maybe_auto_compact, maybe_resume_session,
@@ -404,11 +404,13 @@ fn final_response_requires_grounding(content: &str, cancelled: bool) -> bool {
 }
 
 fn check_provider_request_policy(
+    run: &tools::ToolRunContext,
     policy_enforcer: &openclaudia::services::policy::PolicyEnforcer,
     model: &str,
     messages: &[serde_json::Value],
 ) -> Result<(), String> {
-    let request = openclaudia::pipeline::build_chat_completion_request(model, messages)?;
+    let request =
+        openclaudia::pipeline::build_chat_completion_request_for_run(run, model, messages)?;
     let estimated_input = openclaudia::compaction::estimate_request_tokens(&request);
     openclaudia::services::policy::ProviderRequestPolicy::new(policy_enforcer.policy())
         .check(
@@ -800,9 +802,12 @@ impl ChatRepl {
                 return Ok(Some(false));
             }
         };
-        if let Err(err) =
-            check_provider_request_policy(&self.policy_enforcer, &self.model, &request_messages)
-        {
+        if let Err(err) = check_provider_request_policy(
+            &self.run_context,
+            &self.policy_enforcer,
+            &self.model,
+            &request_messages,
+        ) {
             self.clear_transient_prompt_options();
             tracing::warn!(error = %err, "Enterprise policy blocked chat request");
             eprintln!("\n\x1b[31m{err}\x1b[0m");
@@ -812,13 +817,14 @@ impl ChatRepl {
         let effort = self
             .transient_effort_override
             .unwrap_or_else(|| self.chat_session.effort_level());
-        let request_body = match build_chat_request_body(
+        let request_body = match openclaudia::pipeline::build_request_for_run(
+            &self.run_context,
             &self.config.proxy.target,
-            &request_messages,
             &self.model,
-            &prompt_blocks,
+            &request_messages,
             effort.as_str(),
             self.claude_code_token.as_ref(),
+            Some(&prompt_blocks),
         ) {
             Ok(request_body) => request_body,
             Err(err) => {
@@ -1452,7 +1458,12 @@ impl ChatRepl {
                 return false;
             }
         };
-        match check_provider_request_policy(&self.policy_enforcer, &self.model, &request_messages) {
+        match check_provider_request_policy(
+            &self.run_context,
+            &self.policy_enforcer,
+            &self.model,
+            &request_messages,
+        ) {
             Ok(()) => true,
             Err(err) => {
                 tracing::warn!(error = %err, context, "Enterprise policy blocked follow-up request");
@@ -2120,6 +2131,17 @@ impl ChatRepl {
         response
     }
 
+    fn gemini_followup_functions(&self) -> Result<Vec<serde_json::Value>, String> {
+        let catalog_messages = self.request_messages_with_grounding()?;
+        let openai_tools =
+            tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
+                .definitions_value();
+        let tools_vec = openai_tools
+            .as_array()
+            .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?;
+        convert_tools_to_gemini_functions(tools_vec).map_err(|error| error.to_string())
+    }
+
     /// Send the next Gemini turn with tool results. Returns the new
     /// (text, `tool_calls`) on success, `None` on transport / parse error.
     async fn gemini_send_followup(
@@ -2128,18 +2150,12 @@ impl ChatRepl {
         request_body: &serde_json::Value,
         transport: TurnTransport<'_>,
     ) -> Option<(String, Vec<tools::ToolCall>)> {
-        let openai_tools = tools::get_all_tool_definitions(true);
-        let functions = match openai_tools
-            .as_array()
-            .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())
-            .and_then(|tools_vec| {
-                convert_tools_to_gemini_functions(tools_vec).map_err(|e| e.to_string())
-            }) {
+        let functions = match self.gemini_followup_functions() {
             Ok(functions) => functions,
             Err(error) => {
                 tracing::error!(
                     error = %error,
-                    "failed to convert built-in tools to Gemini function declarations"
+                    "failed to build progressive Gemini follow-up tools"
                 );
                 return None;
             }
@@ -2909,11 +2925,13 @@ impl ChatRepl {
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let request_messages =
-            prompt_blocks.prepare_json_messages(&self.request_messages_with_grounding()?);
+        let catalog_messages = self.request_messages_with_grounding()?;
+        let request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
         let anthropic_messages =
             convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
-        let openai_tools = tools::get_all_tool_definitions(true);
+        let openai_tools =
+            tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
+                .definitions_value();
         let anthropic_tools = convert_tool_definitions_to_anthropic_checked(&openai_tools)
             .map_err(|e| e.to_string())?;
 
@@ -3198,12 +3216,14 @@ impl ChatRepl {
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let request_messages =
-            prompt_blocks.prepare_json_messages(&self.request_messages_with_grounding()?);
+        let catalog_messages = self.request_messages_with_grounding()?;
+        let request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
+        let openai_tools =
+            tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
+                .definitions_value();
         if self.config.proxy.target.eq_ignore_ascii_case("anthropic") {
             let anthropic_messages = convert_messages_to_anthropic_checked(&request_messages)
                 .map_err(|e| e.to_string())?;
-            let openai_tools = tools::get_all_tool_definitions(true);
             let anthropic_tools = convert_tool_definitions_to_anthropic_checked(&openai_tools)
                 .map_err(|e| e.to_string())?;
             let mut req = serde_json::json!({
@@ -3221,7 +3241,7 @@ impl ChatRepl {
                 "messages": request_messages,
                 "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
                 "stream": true,
-                "tools": tools::get_all_tool_definitions(true)
+                "tools": openai_tools
             }))
         }
     }

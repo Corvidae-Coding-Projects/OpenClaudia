@@ -33,6 +33,7 @@ pub use bash::sandbox::{
     sandbox_diagnostics, sandbox_diagnostics_for_run, sandbox_preflight, SandboxDiagnostics,
 };
 pub(crate) use bash::sandbox::{sandboxed_hook_command, sandboxed_process_command, SandboxProfile};
+pub mod catalog;
 pub(crate) mod command;
 mod continuation;
 mod cron;
@@ -681,6 +682,47 @@ pub fn get_all_tool_definitions(subagents: bool) -> Value {
     }
 
     tools
+}
+
+/// Publish the run-owned progressive view of built-in and optional subagent
+/// definitions for one provider request.
+///
+/// # Errors
+///
+/// Returns an error if the trusted registry cannot be represented as a valid,
+/// bounded, generation-bound catalog.
+pub fn get_progressive_tool_definitions(
+    run: &ToolRunContext,
+    messages: &[Value],
+    subagents: bool,
+) -> Result<catalog::ToolCatalogSnapshot, String> {
+    get_progressive_tool_definitions_with_additional(run, messages, subagents, &[])
+}
+
+/// Publish a progressive catalog view with additional already-validated
+/// dynamic definitions, such as the healthy snapshot from an MCP manager.
+///
+/// Dynamic definitions gain no authority by appearing here: colliding or
+/// malformed names are rejected, unclassified names are retained only as
+/// typed unavailability diagnostics, and invocation still passes through the
+/// canonical executor and permission boundary.
+///
+/// # Errors
+///
+/// Returns an error when the combined trusted and dynamic definitions are
+/// malformed, colliding, unclassified, or exceed catalog bounds.
+pub fn get_progressive_tool_definitions_with_additional(
+    run: &ToolRunContext,
+    messages: &[Value],
+    subagents: bool,
+    additional: &[Value],
+) -> Result<catalog::ToolCatalogSnapshot, String> {
+    let mut definitions = get_all_tool_definitions(subagents)
+        .as_array()
+        .ok_or_else(|| "trusted tool definitions must be a JSON array".to_string())?
+        .clone();
+    definitions.extend_from_slice(additional);
+    run.tool_catalog().snapshot(run, messages, &definitions)
 }
 
 // =========================================================================

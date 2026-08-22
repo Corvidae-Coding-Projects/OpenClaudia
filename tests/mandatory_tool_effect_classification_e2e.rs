@@ -775,10 +775,10 @@ fn matrix_covers_each_named_area_with_an_enforced_effect() {
     assert!(row_for("read_mcp_resource").effect.requires_authorization());
     assert!(row_for("crosslink").effect.requires_authorization());
 
-    // skill and tool_search read from disk and from the registry; they are
-    // declared read-only, which is a claim rather than an omission.
+    // skill only reads from disk. Real progressive discovery mutates the
+    // run-owned active-schema selection, so tool_search is session-local state.
     assert_eq!(row_for("skill").effect, ToolEffect::ReadOnly);
-    assert_eq!(row_for("tool_search").effect, ToolEffect::ReadOnly);
+    assert_eq!(row_for("tool_search").effect, ToolEffect::SessionMutation);
 
     // Typed-operation rows enumerate their per-operation effects.
     let crosslink_row = row_for("crosslink");

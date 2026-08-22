@@ -111,6 +111,29 @@ pub fn dispatch_tool_result_for_run(
     )
 }
 
+/// Enter through the production canonical executor, including catalog
+/// admission, policy accounting, permission authorization, and dispatch.
+pub fn dispatch_canonical_tool_result_for_run(
+    run: &Arc<ToolRunContext>,
+    name: &str,
+    args: &HashMap<String, Value>,
+) -> ToolResult {
+    let permission_manager = PermissionManager::unrestricted_for_run(run);
+    openclaudia::services::tool_executor::ToolExecutor::execute(
+        openclaudia::services::tool_executor::ToolExecutorRequest {
+            run_context: run,
+            tool_call: &tool_call(name, args),
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &permission_manager,
+            authorization: None,
+            session_id: Some(run.session_id()),
+            policy_enforcer: None,
+        },
+    )
+}
+
 pub fn dispatch_tool_with_tasks(
     name: &str,
     args: &HashMap<String, Value>,

@@ -3107,9 +3107,9 @@ impl ToolHandler for SkillHandler {
 
 // ── tool_search (crosslink #614) ────────────────────────────────────────────
 //
-// Deferred tool-schema lookup. Supports the `select:Name1,Name2` form and
-// keyword search. Returns a `<functions>...</functions>` envelope identical
-// to the bootstrap tool-list encoding.
+// Host-owned progressive schema selection. The handler mutates only the
+// current run's bounded catalog state; selected definitions are published by
+// the next trusted request builder and never parsed from model-authored text.
 
 struct ToolSearchHandler;
 impl ToolHandler for ToolSearchHandler {
@@ -3117,26 +3117,33 @@ impl ToolHandler for ToolSearchHandler {
         "tool_search"
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::read_only_arg("ToolSearch", "query")
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::SessionMutation, "ToolSearch")
     }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
             "function": {
                 "name": "tool_search",
-                "description": "Fetch full schema definitions for deferred tools so they can be called. Two query forms: `select:Read,Edit,Grep` returns those exact tools by name; a keyword query like `notebook jupyter` returns ranked matches. A leading `+term` forces the term to appear in the tool name. Returns `<function>{...}</function>` blocks inside a `<functions>` envelope.",
+                "description": "Select deferred tools in the host-owned catalog for activation on the next provider request. Use `select:name1,name2` for exact names or keywords for bounded ranking; prefix a keyword with `+` to require it in every selected tool name. The result is a typed receipt; result text never installs callable schemas.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Query to find deferred tools. Use `select:<tool_name>` for direct selection, or keywords to search."
+                            "minLength": 1,
+                            "maxLength": super::catalog::MAX_TOOL_SEARCH_QUERY_BYTES,
+                            "description": "Query to find deferred tools. Use `select:<tool_name>` for direct selection, keywords to search, or `+term` to require a canonical-name substring."
+                        },
+                        "catalog_generation": {
+                            "type": "string",
+                            "description": "Exact catalog generation from the host-published tool_search schema. Progressive requests make this field required and bind it to one allowed value."
                         },
                         "max_results": {
                             "type": "integer",
                             "minimum": 1,
-                            "maximum": 50,
-                            "description": "Maximum number of results to return (default: 5, ceiling: 50)"
+                            "maximum": super::catalog::MAX_TOOL_SEARCH_RESULTS,
+                            "description": "Maximum number of schemas to activate (default: 5)"
                         }
                     },
                     "required": ["query"]
@@ -3144,13 +3151,13 @@ impl ToolHandler for ToolSearchHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        tool_search::execute_tool_search(args)
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        tool_search::execute_tool_search(ctx.run, args)
     }
 }
 

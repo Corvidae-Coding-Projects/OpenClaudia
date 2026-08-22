@@ -51,14 +51,33 @@ fn registry_singleton_and_lookup_are_stable() {
 
 #[test]
 fn canonical_tool_search_returns_a_bound_result() {
+    let root = tempfile::tempdir().expect("tool catalog root");
+    let run = support::test_run_context(root.path());
+    let definitions = openclaudia::tools::get_all_tool_definitions(true)
+        .as_array()
+        .expect("definitions")
+        .clone();
+    let snapshot = run
+        .tool_catalog()
+        .snapshot(
+            &run,
+            &[json!({"role": "user", "content": "technical lessons"})],
+            &definitions,
+        )
+        .expect("published catalog");
     let args = HashMap::from([
-        ("query".to_string(), json!("any-search-string")),
+        ("query".to_string(), json!("technical lessons")),
         ("max_results".to_string(), json!(5)),
+        (
+            "catalog_generation".to_string(),
+            json!(snapshot.generation.to_string()),
+        ),
     ]);
-    let result = support::dispatch_tool_result("tool_search", &args);
+    let result = support::dispatch_canonical_tool_result_for_run(&run, "tool_search", &args);
     assert_eq!(result.tool_call_id(), "test-tool_search");
     assert_eq!(result.handler(), "tool_search");
-    assert!(!result.content().is_empty());
+    assert!(!result.is_error(), "tool_search failed: {result:#?}");
+    assert!(result.structured().is_some());
 }
 
 #[test]

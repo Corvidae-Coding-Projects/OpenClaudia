@@ -3937,13 +3937,15 @@ fn render_live_final_response_for_display(
 }
 
 fn check_provider_request_policy_for_messages(
+    run: &crate::tools::ToolRunContext,
     policy_enforcer: &crate::services::policy::PolicyEnforcer,
     model: &str,
     messages: &[serde_json::Value],
     tx: &std::sync::mpsc::Sender<super::events::AppEvent>,
     session_id: &str,
 ) -> bool {
-    let request = match crate::pipeline::build_chat_completion_request(model, messages) {
+    let request = match crate::pipeline::build_chat_completion_request_for_run(run, model, messages)
+    {
         Ok(request) => request,
         Err(e) => {
             send_or_warn(
@@ -4356,6 +4358,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             }
         };
         if !check_provider_request_policy_for_messages(
+            ctx.run_context,
             &ctx.policy_enforcer,
             ctx.model,
             &request_messages,
@@ -4364,7 +4367,8 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
         ) {
             break;
         }
-        let body = match crate::pipeline::build_request_for_wire(
+        let body = match crate::pipeline::build_request_for_wire_for_run(
+            ctx.run_context,
             ctx.wire_api,
             ctx.provider,
             ctx.model,
@@ -4493,6 +4497,7 @@ fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInit
         }
     };
     if !check_provider_request_policy_for_messages(
+        p.run_context,
         p.policy_enforcer,
         p.model,
         &request_messages,
@@ -4501,7 +4506,8 @@ fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInit
     ) {
         return None;
     }
-    match crate::pipeline::build_request_for_wire(
+    match crate::pipeline::build_request_for_wire_for_run(
+        p.run_context,
         p.wire_api,
         p.provider,
         p.model,

@@ -1,325 +1,418 @@
-//! End-to-end tests for `tools::tool_search::execute_tool_search`
-//! query forms — direct `select:` selection and keyword
-//! search — invoked through the registry dispatch path.
+//! End-to-end coverage for the host-owned progressive tool catalog.
 //!
-//! Sprint 140 of the verification effort. Sprint 132
-//! smoke-tested dispatch; this file pins the documented
-//! query contracts (#614):
-//!   - `select:Read,Edit,Grep` → direct schema lookup.
-//!   - keyword search returns ranked matches.
-//!   - `+term` forces presence in name.
-//!   - `max_results` defaults to 5, rejects invalid values, and caps at 50.
-//!   - missing query / wrong type returns error.
-//!   - no-match returns documented message (NOT an error).
+//! These tests deliberately enter through the canonical executor. They prove
+//! that `tool_search` changes run-owned host state, returns typed receipts, and
+//! cannot make a schema callable until a later provider-request snapshot.
 
-#![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::missing_panics_doc)]
 
-use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use openclaudia::tools::catalog::{
+    ToolCatalogSnapshot, MAX_EXPLICIT_ACTIVE_TOOLS, MAX_TOOL_SEARCH_RESULTS,
+};
+use openclaudia::tools::{ToolFailureCode, ToolOutcome, ToolResult, ToolRunContext};
+use serde_json::{json, Value};
 
 mod support;
 
-fn dispatch_tool_search(args: &HashMap<String, Value>) -> (String, bool) {
-    support::dispatch_tool("tool_search", args)
+struct Fixture {
+    _root: tempfile::TempDir,
+    run: Arc<ToolRunContext>,
+    definitions: Vec<Value>,
+    snapshot: ToolCatalogSnapshot,
 }
 
-fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
-    let mut m = HashMap::new();
-    for (k, v) in entries {
-        m.insert((*k).to_string(), v.clone());
-    }
-    m
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section A — Missing / wrong-type query arg
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn missing_query_arg_returns_error() {
-    let (msg, is_err) = dispatch_tool_search(&HashMap::new());
-    assert!(is_err);
-    assert!(
-        msg.contains("Host safety") && msg.contains("Missing 'query' argument"),
-        "MUST mention missing query; got {msg:?}"
-    );
-}
-
-#[test]
-fn query_arg_as_number_treated_as_missing() {
-    let args = args_with(&[("query", json!(42))]);
-    let (msg, is_err) = dispatch_tool_search(&args);
-    assert!(is_err);
-    assert!(msg.contains("query"));
-}
-
-#[test]
-fn query_arg_as_array_is_rejected_by_classification() {
-    let args = args_with(&[("query", json!(["a", "b"]))]);
-    let (msg, is_err) = dispatch_tool_search(&args);
-    assert!(is_err);
-    assert!(
-        msg.contains("Host safety")
-            && msg.contains("malformed arguments")
-            && msg.contains("'query'"),
-        "array query MUST fail before handler execution; got {msg:?}"
-    );
-}
-
-#[test]
-fn query_arg_as_null_treated_as_missing() {
-    let args = args_with(&[("query", Value::Null)]);
-    let (msg, is_err) = dispatch_tool_search(&args);
-    assert!(is_err);
-    assert!(msg.contains("query"));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — select: prefix direct selection
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn select_single_tool_returns_function_envelope() {
-    let args = args_with(&[("query", json!("select:bash"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err);
-    assert!(text.starts_with("<functions>"));
-    assert!(text.ends_with("</functions>"));
-    assert!(text.contains("\"name\":\"bash\""));
-}
-
-#[test]
-fn select_multi_tool_csv_returns_each_function() {
-    let args = args_with(&[("query", json!("select:bash,read_file"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err);
-    assert!(text.contains("\"name\":\"bash\""));
-    assert!(text.contains("\"name\":\"read_file\""));
-}
-
-#[test]
-fn select_tool_names_are_case_insensitive() {
-    let args = args_with(&[("query", json!("select:Bash,Read_File"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err);
-    assert!(text.contains("\"name\":\"bash\""));
-    assert!(text.contains("\"name\":\"read_file\""));
-}
-
-#[test]
-fn select_preserves_order_in_envelope() {
-    // PINS DOC: order from query is preserved in output.
-    let args = args_with(&[("query", json!("select:bash,read_file"))]);
-    let (text, _) = dispatch_tool_search(&args);
-    let bash_pos = text.find("\"name\":\"bash\"").expect("bash present");
-    let read_pos = text.find("\"name\":\"read_file\"").expect("read present");
-    assert!(
-        bash_pos < read_pos,
-        "bash MUST appear before read_file (query order)"
-    );
-}
-
-#[test]
-fn select_unknown_name_silently_skipped() {
-    // PINS DOC: unknown names ignored; valid names still returned.
-    let args = args_with(&[("query", json!("select:nonexistent_tool_xyz,bash"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err);
-    assert!(text.contains("\"name\":\"bash\""));
-    assert!(!text.contains("nonexistent_tool_xyz"));
-}
-
-#[test]
-fn select_only_unknown_names_returns_no_matches_message() {
-    let args = args_with(&[("query", json!("select:nonexistent_a,nonexistent_b"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    // No-match returns `(text, false)` — NOT an error.
-    assert!(!is_err);
-    assert!(
-        text.contains("no matches"),
-        "MUST surface no-match message; got {text:?}"
-    );
-}
-
-#[test]
-fn select_with_whitespace_around_names_trims_before_lookup() {
-    // PINS DOC: select tokens are trimmed.
-    let args = args_with(&[("query", json!("select:  bash  ,  read_file  "))]);
-    let (text, _) = dispatch_tool_search(&args);
-    assert!(text.contains("\"name\":\"bash\""));
-    assert!(text.contains("\"name\":\"read_file\""));
-}
-
-#[test]
-fn select_with_empty_tokens_ignored() {
-    // Empty entries (extra commas) are filtered.
-    let args = args_with(&[("query", json!("select:bash,,read_file"))]);
-    let (text, _) = dispatch_tool_search(&args);
-    assert!(text.contains("\"name\":\"bash\""));
-    assert!(text.contains("\"name\":\"read_file\""));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section C — Keyword search
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn keyword_search_returns_function_envelope() {
-    // "bash" should match the bash tool (or others containing it).
-    let args = args_with(&[("query", json!("bash"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err);
-    assert!(text.contains("<functions>") || text.contains("no matches"));
-}
-
-#[test]
-fn keyword_search_completely_unrelated_query_returns_no_matches() {
-    let args = args_with(&[("query", json!("xyzzy_completely_unrelated_word_marker"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err, "no-match MUST NOT be error");
-    assert!(text.contains("no matches"));
-}
-
-#[test]
-fn keyword_search_with_plus_term_forces_presence_in_name() {
-    // PINS DOC: +bash forces "bash" in name; rank by remaining terms.
-    let args = args_with(&[("query", json!("+bash unrelated"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err);
-    // If matches found, every match name MUST contain "bash".
-    if text.contains("<functions>") {
-        // Check tools in envelope all contain "bash" in name.
-        for part in text.split("<function>").skip(1) {
-            if let Some(name_start) = part.find("\"name\":\"") {
-                let rest = &part[name_start + 8..];
-                if let Some(end) = rest.find('"') {
-                    let name = &rest[..end];
-                    assert!(
-                        name.contains("bash"),
-                        "+bash gate violated; tool name {name:?} lacks 'bash'"
-                    );
-                }
-            }
+impl Fixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("tool catalog root");
+        let run = support::test_run_context(root.path());
+        let definitions = openclaudia::tools::get_all_tool_definitions(true)
+            .as_array()
+            .expect("tool definition array")
+            .clone();
+        let snapshot = run
+            .tool_catalog()
+            .snapshot(
+                &run,
+                &[json!({
+                    "role": "user",
+                    "content": "Inspect a Rust source file and fix its implementation"
+                })],
+                &definitions,
+            )
+            .expect("initial progressive snapshot");
+        assert!(!snapshot.full_catalog_fallback);
+        Self {
+            _root: root,
+            run,
+            definitions,
+            snapshot,
         }
     }
+
+    fn search(&self, query: &str, max_results: Option<usize>) -> ToolResult {
+        let mut args = HashMap::from([
+            ("query".to_string(), json!(query)),
+            (
+                "catalog_generation".to_string(),
+                json!(self.snapshot.generation.to_string()),
+            ),
+        ]);
+        if let Some(max_results) = max_results {
+            args.insert("max_results".to_string(), json!(max_results));
+        }
+        support::dispatch_canonical_tool_result_for_run(&self.run, "tool_search", &args)
+    }
+
+    fn deferred_names(&self) -> Vec<String> {
+        self.definitions
+            .iter()
+            .filter_map(|definition| definition.pointer("/function/name").and_then(Value::as_str))
+            .filter(|name| {
+                !self
+                    .snapshot
+                    .active_names
+                    .iter()
+                    .any(|active| active == name)
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn republish(&mut self) {
+        self.snapshot = self
+            .run
+            .tool_catalog()
+            .snapshot(&self.run, &[], &self.definitions)
+            .expect("next progressive snapshot");
+    }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Section D — max_results parameter
-// ───────────────────────────────────────────────────────────────────────────
+fn failure(result: &ToolResult) -> (&openclaudia::tools::ToolFailure, ToolFailureCode) {
+    let ToolOutcome::Error { failure } = result.outcome() else {
+        panic!("expected typed failure, got {result:#?}");
+    };
+    (failure, failure.code)
+}
 
 #[test]
-fn max_results_explicit_1_caps_envelope_to_1_function_block() {
-    let args = args_with(&[("query", json!("file")), ("max_results", json!(1))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err);
-    if text.contains("<functions>") {
-        let function_count = text.matches("<function>").count();
-        assert!(
-            function_count <= 1,
-            "max_results=1 MUST cap at 1 function block; got {function_count}"
-        );
+fn canonical_search_requires_query_and_bound_generation() {
+    let fixture = Fixture::new();
+    let missing_query = HashMap::from([(
+        "catalog_generation".to_string(),
+        json!(fixture.snapshot.generation.to_string()),
+    )]);
+    let result = support::dispatch_canonical_tool_result_for_run(
+        &fixture.run,
+        "tool_search",
+        &missing_query,
+    );
+    assert_eq!(failure(&result).1, ToolFailureCode::InvalidArguments);
+
+    let missing_generation = HashMap::from([("query".to_string(), json!("memory"))]);
+    let result = support::dispatch_canonical_tool_result_for_run(
+        &fixture.run,
+        "tool_search",
+        &missing_generation,
+    );
+    assert_eq!(failure(&result).1, ToolFailureCode::InvalidArguments);
+}
+
+#[test]
+fn malformed_and_oversized_queries_fail_before_catalog_mutation() {
+    let fixture = Fixture::new();
+    let malformed = HashMap::from([
+        ("query".to_string(), json!(["memory"])),
+        (
+            "catalog_generation".to_string(),
+            json!(fixture.snapshot.generation.to_string()),
+        ),
+    ]);
+    let result =
+        support::dispatch_canonical_tool_result_for_run(&fixture.run, "tool_search", &malformed);
+    assert_eq!(failure(&result).1, ToolFailureCode::InvalidArguments);
+
+    let result = fixture.search(&"x".repeat(513), None);
+    assert_eq!(failure(&result).1, ToolFailureCode::InvalidArguments);
+
+    let malformed_generation = HashMap::from([
+        ("query".to_string(), json!("memory")),
+        ("catalog_generation".to_string(), json!("x".repeat(4_096))),
+    ]);
+    let result = support::dispatch_canonical_tool_result_for_run(
+        &fixture.run,
+        "tool_search",
+        &malformed_generation,
+    );
+    let (typed_failure, code) = failure(&result);
+    assert_eq!(code, ToolFailureCode::InvalidArguments);
+    assert!(typed_failure.message.len() < 256);
+
+    let result = fixture.search("   ", None);
+    assert_eq!(failure(&result).1, ToolFailureCode::InvalidArguments);
+}
+
+#[test]
+fn max_results_rejects_every_out_of_contract_shape() {
+    let fixture = Fixture::new();
+    for value in [
+        json!(0),
+        json!(MAX_TOOL_SEARCH_RESULTS + 1),
+        json!(-1),
+        json!("2"),
+    ] {
+        let args = HashMap::from([
+            ("query".to_string(), json!("memory")),
+            (
+                "catalog_generation".to_string(),
+                json!(fixture.snapshot.generation.to_string()),
+            ),
+            ("max_results".to_string(), value),
+        ]);
+        let result =
+            support::dispatch_canonical_tool_result_for_run(&fixture.run, "tool_search", &args);
+        assert_eq!(failure(&result).1, ToolFailureCode::InvalidArguments);
     }
 }
 
 #[test]
-fn max_results_above_ceiling_clamps_to_50() {
-    // PINS DOC: MAX_RESULTS_CEILING = 50; values above cap.
-    let args = args_with(&[("query", json!("a")), ("max_results", json!(9999))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(!is_err);
-    // No panic + result may surface "no matches" or up to 50 functions.
-    if text.contains("<functions>") {
-        let function_count = text.matches("<function>").count();
-        assert!(
-            function_count <= 50,
-            "max_results MUST clamp at 50; got {function_count}"
-        );
+fn stale_generation_is_a_typed_conflict_with_current_generation_recovery() {
+    let fixture = Fixture::new();
+    let args = HashMap::from([
+        ("query".to_string(), json!("memory")),
+        (
+            "catalog_generation".to_string(),
+            json!("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+        ),
+    ]);
+    let result =
+        support::dispatch_canonical_tool_result_for_run(&fixture.run, "tool_search", &args);
+    let (failure, code) = failure(&result);
+    assert_eq!(code, ToolFailureCode::Conflict);
+    assert_eq!(
+        failure
+            .recovery
+            .as_ref()
+            .and_then(|value| value.get("catalog_generation")),
+        Some(&json!(fixture.snapshot.generation.to_string()))
+    );
+}
+
+#[test]
+fn exact_selection_returns_metadata_not_xml_or_callable_schema_text() {
+    let fixture = Fixture::new();
+    let deferred = fixture
+        .deferred_names()
+        .into_iter()
+        .next()
+        .expect("deferred tool");
+    let result = fixture.search(&format!("select:{deferred}"), None);
+    assert!(!result.is_error(), "selection failed: {result:#?}");
+    assert!(!result.content().contains("<functions>"));
+    assert!(!result.content().contains("\"parameters\""));
+    let receipt = &result.structured().expect("typed receipt")["tool_selection"];
+    assert_eq!(
+        receipt["catalog_generation"],
+        fixture.snapshot.generation.to_string()
+    );
+    assert_eq!(
+        receipt["valid_for_catalog_generation"],
+        fixture.snapshot.generation.to_string()
+    );
+    assert_eq!(receipt["expires_on_catalog_generation_change"], true);
+    assert_eq!(receipt["explicit_active_after_selection"], 1);
+    assert_eq!(receipt["activated"][0]["name"], deferred);
+    assert!(receipt["activated"][0]["schema_digest"].is_string());
+    assert!(receipt["activated"][0]["effect"].is_string());
+    assert!(receipt["activated"][0]["authorization_required"].is_boolean());
+}
+
+#[test]
+fn exact_selection_is_case_insensitive_and_preserves_requested_order() {
+    let fixture = Fixture::new();
+    let deferred = fixture.deferred_names();
+    assert!(deferred.len() >= 2);
+    let requested = [&deferred[1], &deferred[0]];
+    let query = format!(
+        "select:{},{}",
+        requested[0].to_ascii_uppercase(),
+        requested[1].to_ascii_uppercase()
+    );
+    let result = fixture.search(&query, Some(2));
+    assert!(!result.is_error(), "exact selection failed: {result:#?}");
+    let activated = result.structured().expect("typed receipt")["tool_selection"]["activated"]
+        .as_array()
+        .expect("activated array");
+    assert_eq!(activated[0]["name"], requested[0].as_str());
+    assert_eq!(activated[1]["name"], requested[1].as_str());
+}
+
+#[test]
+fn unknown_exact_name_rejects_the_whole_selection_with_explicit_miss() {
+    let mut fixture = Fixture::new();
+    let valid = fixture
+        .deferred_names()
+        .into_iter()
+        .next()
+        .expect("deferred tool");
+    let result = fixture.search(&format!("select:{valid},not_a_real_tool"), None);
+    let (failure, code) = failure(&result);
+    assert_eq!(code, ToolFailureCode::Unavailable);
+    assert_eq!(
+        failure
+            .recovery
+            .as_ref()
+            .and_then(|value| value.pointer("/misses/0")),
+        Some(&json!("not_a_real_tool"))
+    );
+
+    fixture.republish();
+    assert!(
+        !fixture.snapshot.active_names.contains(&valid),
+        "a partially valid direct selection must not mutate catalog state"
+    );
+}
+
+#[test]
+fn duplicate_exact_names_do_not_bypass_the_result_cap() {
+    let fixture = Fixture::new();
+    let deferred = fixture
+        .deferred_names()
+        .into_iter()
+        .next()
+        .expect("deferred tool");
+    let result = fixture.search(&format!("select:{deferred},{deferred},{deferred}"), Some(1));
+    assert!(!result.is_error());
+    assert_eq!(
+        result.structured().expect("typed receipt")["tool_selection"]["activated"]
+            .as_array()
+            .expect("activated array")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn over_cap_selection_is_rejected_atomically() {
+    let mut fixture = Fixture::new();
+    let deferred = fixture.deferred_names();
+    assert!(deferred.len() > MAX_TOOL_SEARCH_RESULTS);
+    let query = format!("select:{}", deferred[..=MAX_TOOL_SEARCH_RESULTS].join(","));
+    let result = fixture.search(&query, Some(MAX_TOOL_SEARCH_RESULTS));
+    assert_eq!(failure(&result).1, ToolFailureCode::InvalidArguments);
+
+    fixture.republish();
+    assert!(!fixture.snapshot.active_names.contains(&deferred[0]));
+}
+
+#[test]
+fn cumulative_activation_cap_is_atomic_across_calls() {
+    let mut fixture = Fixture::new();
+    let deferred = fixture.deferred_names();
+    assert!(deferred.len() > MAX_EXPLICIT_ACTIVE_TOOLS);
+
+    let first = format!("select:{}", deferred[..MAX_TOOL_SEARCH_RESULTS].join(","));
+    assert!(!fixture
+        .search(&first, Some(MAX_TOOL_SEARCH_RESULTS))
+        .is_error());
+    let remaining = MAX_EXPLICIT_ACTIVE_TOOLS - MAX_TOOL_SEARCH_RESULTS + 1;
+    let second = format!(
+        "select:{}",
+        deferred[MAX_TOOL_SEARCH_RESULTS..MAX_TOOL_SEARCH_RESULTS + remaining].join(",")
+    );
+    let result = fixture.search(&second, Some(remaining));
+    assert_eq!(failure(&result).1, ToolFailureCode::InvalidArguments);
+
+    fixture.republish();
+    for name in &deferred[..MAX_TOOL_SEARCH_RESULTS] {
+        assert!(fixture.snapshot.active_names.contains(name));
     }
+    assert!(!fixture
+        .snapshot
+        .active_names
+        .contains(&deferred[MAX_TOOL_SEARCH_RESULTS]));
 }
 
 #[test]
-fn max_results_zero_returns_validation_error() {
-    let args = args_with(&[("query", json!("file")), ("max_results", json!(0))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(is_err);
+fn selection_is_not_callable_in_the_same_batch_but_is_on_the_next_request() {
+    let mut fixture = Fixture::new();
+    let deferred = ["task_list", "memory_list", "todo_read"]
+        .into_iter()
+        .find(|name| {
+            !fixture
+                .snapshot
+                .active_names
+                .iter()
+                .any(|active| active == name)
+        })
+        .expect("safe deferred list tool");
+    let result = fixture.search(&format!("select:{deferred}"), None);
+    assert!(!result.is_error());
+
+    let denied =
+        support::dispatch_canonical_tool_result_for_run(&fixture.run, deferred, &HashMap::new());
+    assert_eq!(failure(&denied).1, ToolFailureCode::Unavailable);
+    assert!(denied.content().contains("was not active"));
+
+    fixture.republish();
+    assert!(fixture
+        .snapshot
+        .active_names
+        .iter()
+        .any(|name| name == deferred));
+    let after_publish =
+        support::dispatch_canonical_tool_result_for_run(&fixture.run, deferred, &HashMap::new());
     assert!(
-        text.contains("tool_search max_results must be an integer between 1 and 50"),
-        "zero max_results MUST be rejected; got {text:?}"
+        !after_publish.content().contains("was not active"),
+        "normal resource, policy, and handler checks must run after catalog admission"
     );
 }
 
 #[test]
-fn max_results_default_is_5_when_omitted() {
-    // No max_results → DEFAULT_MAX_RESULTS = 5.
-    let args = args_with(&[("query", json!("file"))]);
-    let (text, _is_err) = dispatch_tool_search(&args);
-    if text.contains("<functions>") {
-        let function_count = text.matches("<function>").count();
-        assert!(
-            function_count <= 5,
-            "default max_results MUST be 5; got {function_count}"
-        );
-    }
+fn keyword_search_recalls_codebase_technical_memory_tools_with_a_bounded_receipt() {
+    let fixture = Fixture::new();
+    let result = fixture.search("retrieve technical lessons for this codebase", Some(3));
+    assert!(!result.is_error(), "memory retrieval failed: {result:#?}");
+    let activated = result.structured().expect("typed receipt")["tool_selection"]["activated"]
+        .as_array()
+        .expect("activated array");
+    assert!(activated.len() <= 3);
+    assert!(activated
+        .iter()
+        .any(|entry| entry["name"] == "memory_search"));
 }
 
 #[test]
-fn max_results_negative_returns_validation_error() {
-    let args = args_with(&[("query", json!("file")), ("max_results", json!(-1))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(is_err);
+fn required_keyword_terms_gate_every_selected_canonical_name() {
+    let fixture = Fixture::new();
+    let result = fixture.search("+memory technical lessons", Some(5));
     assert!(
-        text.contains("tool_search max_results must be an integer between 1 and 50"),
-        "negative max_results MUST be rejected; got {text:?}"
+        !result.is_error(),
+        "required-name search failed: {result:#?}"
     );
+    let activated = result.structured().expect("typed receipt")["tool_selection"]["activated"]
+        .as_array()
+        .expect("activated array");
+    assert!(!activated.is_empty());
+    assert!(activated.iter().all(|entry| entry["name"]
+        .as_str()
+        .is_some_and(|name| name.contains("memory"))));
 }
 
 #[test]
-fn max_results_string_returns_validation_error() {
-    let args = args_with(&[("query", json!("file")), ("max_results", json!("10"))]);
-    let (text, is_err) = dispatch_tool_search(&args);
-    assert!(is_err);
-    assert!(
-        text.contains("tool_search max_results must be an integer between 1 and 50"),
-        "string max_results MUST be rejected; got {text:?}"
+fn keyword_no_match_is_typed_unavailable_not_a_fake_success() {
+    let fixture = Fixture::new();
+    let result = fixture.search("xyzzy_completely_unrelated_marker", None);
+    let (failure, code) = failure(&result);
+    assert_eq!(code, ToolFailureCode::Unavailable);
+    assert_eq!(
+        failure
+            .recovery
+            .as_ref()
+            .and_then(|value| value.get("query")),
+        Some(&json!("xyzzy_completely_unrelated_marker"))
     );
-}
-
-#[test]
-fn max_results_above_u64_max_no_panic() {
-    let args = args_with(&[("query", json!("file")), ("max_results", json!(u64::MAX))]);
-    let (_text, _is_err) = dispatch_tool_search(&args);
-    // try_from(u64::MAX as usize) may fail on 32-bit but
-    // map_or returns default 5 — no panic.
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section E — Envelope shape
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn envelope_wraps_each_match_in_single_function_tag() {
-    let args = args_with(&[("query", json!("select:bash,read_file"))]);
-    let (text, _is_err) = dispatch_tool_search(&args);
-    // Two matches → exactly two <function>...</function> tags.
-    assert_eq!(text.matches("<function>").count(), 2);
-    assert_eq!(text.matches("</function>").count(), 2);
-    // Outer wrapper is exactly one functions block.
-    assert_eq!(text.matches("<functions>").count(), 1);
-    assert_eq!(text.matches("</functions>").count(), 1);
-}
-
-#[test]
-fn envelope_definition_json_is_inline_one_line_per_tag() {
-    let args = args_with(&[("query", json!("select:bash"))]);
-    let (text, _is_err) = dispatch_tool_search(&args);
-    // Each <function>...</function> block is on a single line
-    // (no internal newlines).
-    let line_with_function = text
-        .lines()
-        .find(|l| l.contains("<function>"))
-        .expect("line present");
-    assert!(line_with_function.contains("</function>"));
 }
