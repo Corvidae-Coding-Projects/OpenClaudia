@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Make the ACP automatic-learning citation test full-suite deterministic (#1093)
 - Regenerate the fuzz lockfile so Rust 1.98 locked CI is reproducible (#1092)
 - Preserve typed partial outcomes across the ACP tool boundary (#1090)
 - Add typed causal resolution for technical-memory conflict heads (#1081)
