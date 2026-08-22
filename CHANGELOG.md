@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Add typed causal resolution for technical-memory conflict heads (#1081)
 - S-055: Rebuild automatic learning around causal technical evidence (#1089)
 - S-052: Consolidate task and planning state (#1083)
 - Allow later slices to refresh retrieval-evidence citation provenance (#1086)
