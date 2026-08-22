@@ -1,6 +1,6 @@
 {
   "next_display_id": 1092,
-  "next_comment_id": 1197,
+  "next_comment_id": 1198,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22107,7 +22107,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T16:48:31.785025069Z",
-      "updated_at": "2026-08-22T17:33:23.188693730Z",
+      "updated_at": "2026-08-22T17:34:07.838644603Z",
       "labels": [
         "remediation"
       ],
@@ -22147,6 +22147,18 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAbF8T/klsxGNX6ztVVrASYdZkYWQ5rz4XI7unvJPg03S55EtzioiyZBp1jAOFtfDBf9vZSyniI6uHSpvGlNz+Dg=="
+        },
+        "e8091409-350c-4ae0-b0f3-fbeffb169ef5": {
+          "display_id": 1197,
+          "author": "6Vw9",
+          "content": "Blocked: no active issue",
+          "created_at": "2026-08-22T17:34:07.836114116Z",
+          "kind": "intervention",
+          "trigger_type": "tool_blocked",
+          "intervention_context": "Auditing whether current work remains scoped to unfinished features after stale session #47 auto-ended and session #48 had no active issue",
+          "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
         }
       }
     },
@@ -32699,11 +32711,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 952,
       "timestamp": "2026-08-22T17:34:00.175164830Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 953,
+      "timestamp": "2026-08-22T17:34:07.838644603Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T17:34:00.175164830Z",
+    "timestamp": "2026-08-22T17:34:07.838644603Z",
     "agent_id": "6Vw9",
-    "agent_seq": 952
+    "agent_seq": 953
   }
 }
