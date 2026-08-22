@@ -32,6 +32,9 @@ use crate::permissions::PermissionManager;
 use crate::providers::get_adapter;
 use crate::session::{SessionManager, SessionMode};
 use crate::tools::args::ToolArgs as _;
+use crate::tools::{
+    ToolFailure, ToolFailureCode, ToolHandlerResult, ToolOutcome, ToolResult, ToolRetryability,
+};
 
 // Preserve the public ACP wire-type path while the canonical definitions live
 // with the rest of the session snapshot.
@@ -422,9 +425,9 @@ fn build_acp_prompt_context(
 
 /// Run the `PreToolUse` hook gate for a single tool dispatch.
 ///
-/// Returns `None` when the tool may proceed, or `Some(AcpToolResult)`
-/// with `is_error: true` and the deny reason in `content` when a hook
-/// blocks the call.
+/// Returns `None` when the tool may proceed, or the typed lifecycle block when
+/// a hook denies the call. The caller binds that block to the exact provider
+/// invocation instead of manufacturing an ACP-specific result projection.
 ///
 /// Extracted as a free function (not an `AcpServer` method) so it can
 /// be exercised by `pre_tool_gate_tests` without spinning up a full
@@ -433,58 +436,81 @@ fn build_acp_prompt_context(
 async fn pre_tool_use_gate(
     run: &Arc<crate::tools::ToolRunContext>,
     hook_engine: &HookEngine,
+    session_id: &str,
     tool_name: &str,
     tool_input: &Value,
-) -> Option<AcpToolResult> {
+) -> Option<crate::services::tool_executor::ToolExecutionBlock> {
     crate::services::tool_executor::ToolExecutor::run_pre_tool_use(
         run,
         hook_engine,
-        None,
+        Some(session_id),
         tool_name,
         tool_input,
     )
     .await
     .err()
-    .map(|blocked| AcpToolResult {
-        content: blocked.content,
-        is_error: true,
-    })
 }
 
 fn parse_acp_tool_arguments(
     tool_name: &str,
     arguments_json: &str,
-) -> Result<(HashMap<String, Value>, Value), AcpToolResult> {
+) -> Result<(HashMap<String, Value>, Value), ToolFailure> {
     crate::services::tool_executor::ToolExecutor::parse_arguments_map(tool_name, arguments_json)
-        .map_err(|content| AcpToolResult {
-            content,
-            is_error: true,
-        })
+        .map_err(acp_arg_error)
 }
 
 fn parse_acp_bool_arg(
     args: &HashMap<String, Value>,
     key: &'static str,
     default: bool,
-) -> Result<bool, AcpToolResult> {
+) -> Result<bool, ToolFailure> {
     args.arg_bool_or_strict(key, default)
-        .map_err(|err| AcpToolResult {
-            content: err.to_string(),
-            is_error: true,
-        })
+        .map_err(|err| acp_arg_error(err.to_string()))
 }
 
-fn acp_arg_error(content: impl Into<String>) -> AcpToolResult {
-    AcpToolResult {
-        content: content.into(),
-        is_error: true,
+fn acp_arg_error(content: impl Into<String>) -> ToolFailure {
+    ToolFailure::new(
+        ToolFailureCode::InvalidArguments,
+        content.into(),
+        ToolRetryability::Never,
+    )
+}
+
+fn acp_internal_error(content: impl Into<String>) -> ToolFailure {
+    ToolFailure::new(
+        ToolFailureCode::Internal,
+        content.into(),
+        ToolRetryability::Unknown,
+    )
+}
+
+fn acp_tool_call(
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments_json: &str,
+) -> crate::tools::ToolCall {
+    crate::tools::ToolCall {
+        id: tool_call_id.to_string(),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: arguments_json.to_string(),
+        },
     }
+}
+
+fn bind_acp_failure(tool_call: &crate::tools::ToolCall, failure: ToolFailure) -> ToolResult {
+    ToolResult::bind(
+        tool_call,
+        &tool_call.function.name,
+        ToolHandlerResult::error(failure),
+    )
 }
 
 fn parse_acp_required_string_arg<'a>(
     args: &'a HashMap<String, Value>,
     key: &'static str,
-) -> Result<&'a str, AcpToolResult> {
+) -> Result<&'a str, ToolFailure> {
     match args.get(key) {
         None => Err(acp_arg_error(format!("Missing {key} argument"))),
         Some(Value::String(value)) => Ok(value),
@@ -499,7 +525,7 @@ fn parse_acp_required_alias_string_arg<'a>(
     primary: &'static str,
     alias: &'static str,
     missing_name: &'static str,
-) -> Result<&'a str, AcpToolResult> {
+) -> Result<&'a str, ToolFailure> {
     if let Some(value) = args.get(primary) {
         return value.as_str().ok_or_else(|| {
             acp_arg_error(format!("Invalid '{primary}' argument: expected string"))
@@ -517,7 +543,7 @@ fn parse_acp_optional_string_arg<'a>(
     args: &'a HashMap<String, Value>,
     key: &'static str,
     default: &'a str,
-) -> Result<&'a str, AcpToolResult> {
+) -> Result<&'a str, ToolFailure> {
     match args.get(key) {
         None => Ok(default),
         Some(Value::String(value)) => Ok(value),
@@ -527,40 +553,32 @@ fn parse_acp_optional_string_arg<'a>(
     }
 }
 
-fn parse_acp_read_offset_arg(value: Option<&Value>) -> Result<usize, AcpToolResult> {
+fn parse_acp_read_offset_arg(value: Option<&Value>) -> Result<usize, ToolFailure> {
     let Some(value) = value else {
         return Ok(0);
     };
     let Some(offset) = value.as_u64() else {
-        return Err(AcpToolResult {
-            content: "Error: offset must be a 1-indexed positive integer".to_string(),
-            is_error: true,
-        });
+        return Err(acp_arg_error(
+            "Error: offset must be a 1-indexed positive integer",
+        ));
     };
     if offset == 0 {
-        return Err(AcpToolResult {
-            content: "Error: offset must be a 1-indexed positive integer".to_string(),
-            is_error: true,
-        });
+        return Err(acp_arg_error(
+            "Error: offset must be a 1-indexed positive integer",
+        ));
     }
     Ok(usize::try_from(offset.saturating_sub(1)).unwrap_or(usize::MAX))
 }
 
-fn parse_acp_read_limit_arg(value: Option<&Value>) -> Result<Option<usize>, AcpToolResult> {
+fn parse_acp_read_limit_arg(value: Option<&Value>) -> Result<Option<usize>, ToolFailure> {
     let Some(value) = value else {
         return Ok(None);
     };
     let Some(limit) = value.as_u64() else {
-        return Err(AcpToolResult {
-            content: "Error: limit must be a positive integer".to_string(),
-            is_error: true,
-        });
+        return Err(acp_arg_error("Error: limit must be a positive integer"));
     };
     if limit == 0 {
-        return Err(AcpToolResult {
-            content: "Error: limit must be a positive integer".to_string(),
-            is_error: true,
-        });
+        return Err(acp_arg_error("Error: limit must be a positive integer"));
     }
     Ok(Some(usize::try_from(limit).unwrap_or(usize::MAX)))
 }
@@ -1812,6 +1830,7 @@ impl AcpServer {
                             acp_session_id,
                             "tool_call",
                             &json!({
+                                "toolCallId": tc.id,
                                 "title": tc.name,
                                 "status": "running",
                             }),
@@ -1826,30 +1845,18 @@ impl AcpServer {
                                 &tc.arguments,
                             )
                             .await;
-                        record_acp_tool_result_observation(
-                            run,
-                            oc_session_id,
-                            &tc.name,
-                            &tc.id,
-                            &result,
-                        );
+                        record_acp_tool_result_observation(run, oc_session_id, &result);
 
                         self.send_session_update(
                             acp_session_id,
                             "tool_call",
-                            &json!({
-                                "title": tc.name,
-                                "status": "completed",
-                                "output": result.content,
-                            }),
+                            &acp_tool_call_update_payload(&result),
                         );
 
-                        // Add tool result to messages
-                        self.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result.content,
-                        }));
+                        // The provider receives the exact typed result envelope
+                        // in its text-only tool-result slot. The canonical value
+                        // remains available above for UI and evidence consumers.
+                        self.messages.push(result.openai_message());
                     }
 
                     // Continue the loop — re-prompt with tool results
@@ -2121,10 +2128,11 @@ impl AcpServer {
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
-    ) -> AcpToolResult {
+    ) -> ToolResult {
+        let tool_call = acp_tool_call(tool_call_id, tool_name, arguments_json);
         let (args, tool_input) = match parse_acp_tool_arguments(tool_name, arguments_json) {
             Ok(parsed) => parsed,
-            Err(result) => return result,
+            Err(failure) => return bind_acp_failure(&tool_call, failure),
         };
 
         // ── Enterprise policy gate ─────────────────────────────────────
@@ -2133,44 +2141,87 @@ impl AcpServer {
             Some(session_id),
         );
         if let Err(e) = tool_policy.check_tool(tool_name) {
-            return AcpToolResult {
-                content: format!("Blocked by policy: {e}"),
-                is_error: true,
-            };
+            return ToolResult::failure(
+                &tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by policy: {e}"),
+                ToolRetryability::Never,
+            );
         }
 
         // ── PreToolUse gate ─────────────────────────────────────────────
         if let Some(blocked) =
-            pre_tool_use_gate(run, &self.hook_engine, tool_name, &tool_input).await
+            pre_tool_use_gate(run, &self.hook_engine, session_id, tool_name, &tool_input).await
         {
-            return blocked;
+            return blocked.into_tool_result(&tool_call);
         }
 
-        let result = match tool_name {
+        let result = self
+            .dispatch_normalized_acp_tool(
+                run,
+                session_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                &args,
+            )
+            .await;
+        let result = match result {
+            Ok(result) => result.with_wire_invocation(&tool_call),
+            Err(failure) => bind_acp_failure(&tool_call, failure),
+        };
+
+        // ── PostToolUse fire-and-forget ─────────────────────────────────
+        let hook_succeeded = matches!(result.outcome(), ToolOutcome::Success { .. });
+        let hook_output = result.provider_content();
+        crate::services::tool_executor::ToolExecutor::fire_post_tool(
+            run,
+            &self.hook_engine,
+            hook_succeeded,
+            tool_name,
+            tool_input,
+            &hook_output,
+            Some(session_id),
+        )
+        .await;
+
+        result
+    }
+
+    async fn dispatch_normalized_acp_tool(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+        args: &HashMap<String, Value>,
+    ) -> Result<ToolResult, ToolFailure> {
+        match tool_name {
             "read_file" => {
-                self.acp_read_file(run, session_id, tool_call_id, &args)
+                self.acp_read_file(run, session_id, tool_call_id, args)
                     .await
             }
             "write_file" => {
-                self.acp_write_file(run, session_id, tool_call_id, &args)
+                self.acp_write_file(run, session_id, tool_call_id, args)
                     .await
             }
             "edit_file" => {
-                self.acp_edit_file(run, session_id, tool_call_id, &args)
+                self.acp_edit_file(run, session_id, tool_call_id, args)
                     .await
             }
             // Shells must run through the local executor: delegating these to
             // an arbitrary ACP client's terminal/create API bypasses
             // OpenClaudia's OS sandbox entirely.
-            "bash" => self.acp_bash(run, session_id, tool_call_id, &args).await,
-            "bash_output" => self.acp_bash_output(run, session_id, tool_call_id, &args),
-            "kill_shell" => self.acp_kill_shell(run, session_id, tool_call_id, &args),
+            "bash" => self.acp_bash(run, session_id, tool_call_id, args).await,
+            "bash_output" => self.acp_bash_output(run, session_id, tool_call_id, args),
+            "kill_shell" => self.acp_kill_shell(run, session_id, tool_call_id, args),
             "list_files" => {
-                self.acp_list_files(run, session_id, tool_call_id, &args)
+                self.acp_list_files(run, session_id, tool_call_id, args)
                     .await
             }
             "glob" | "grep" => {
-                self.acp_search(run, session_id, tool_call_id, &args, tool_name)
+                self.acp_search(run, session_id, tool_call_id, args, tool_name)
                     .await
             }
             // SQLite work belongs on the blocking pool; it still retains the
@@ -2186,45 +2237,35 @@ impl AcpServer {
             | "memory_learning_status"
             | "memory_conflicts"
             | "memory_source_status"
-            | "memory_source_refresh" => {
-                self.execute_local_tool_async(
+            | "memory_source_refresh" => Ok(self
+                .execute_local_tool_async(run, session_id, tool_call_id, tool_name, arguments_json)
+                .await),
+            // Other internal tools run locally — not file/terminal operations.
+            "web_fetch" | "web_search" | "web_browser" | "task_create" | "task_update"
+            | "task_get" | "task_list" | "todo_write" | "todo_read" | "enter_plan_mode"
+            | "exit_plan_mode" => Ok(self.execute_local_tool(
+                run,
+                session_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            )),
+            name if name.starts_with("mcp__") => {
+                // MCP tools run locally through the MCP manager
+                Ok(self.execute_local_tool(
                     run,
                     session_id,
                     tool_call_id,
                     tool_name,
                     arguments_json,
-                )
-                .await
+                ))
             }
-            // Other internal tools run locally — not file/terminal operations.
-            "web_fetch" | "web_search" | "web_browser" | "task_create" | "task_update"
-            | "task_get" | "task_list" | "todo_write" | "todo_read" | "enter_plan_mode"
-            | "exit_plan_mode" => {
-                self.execute_local_tool(run, session_id, tool_call_id, tool_name, arguments_json)
-            }
-            name if name.starts_with("mcp__") => {
-                // MCP tools run locally through the MCP manager
-                self.execute_local_tool(run, session_id, tool_call_id, tool_name, arguments_json)
-            }
-            _ => AcpToolResult {
-                content: format!("Unknown tool: {tool_name}"),
-                is_error: true,
-            },
-        };
-
-        // ── PostToolUse fire-and-forget ─────────────────────────────────
-        crate::services::tool_executor::ToolExecutor::fire_post_tool(
-            run,
-            &self.hook_engine,
-            !result.is_error,
-            tool_name,
-            tool_input,
-            &result.content,
-            Some(session_id),
-        )
-        .await;
-
-        result
+            _ => Err(ToolFailure::new(
+                ToolFailureCode::Unavailable,
+                format!("Unknown tool: {tool_name}"),
+                ToolRetryability::Never,
+            )),
+        }
     }
 
     /// Execute a tool locally (for internal tools that don't need ACP delegation).
@@ -2241,7 +2282,7 @@ impl AcpServer {
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
-    ) -> AcpToolResult {
+    ) -> ToolResult {
         let permission_mgr = self.permission_manager_for_run(run);
         execute_local_tool_with_permission(AcpLocalToolRequest {
             run,
@@ -2268,7 +2309,8 @@ impl AcpServer {
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
-    ) -> AcpToolResult {
+    ) -> ToolResult {
+        let failure_call = acp_tool_call(tool_call_id, tool_name, arguments_json);
         let permission_mgr = self.permission_manager_for_run(run);
         let policy_enforcer = Arc::clone(&self.policy_enforcer);
         let memory_db = Arc::clone(&self.memory_db);
@@ -2307,10 +2349,12 @@ impl AcpServer {
                         .stop_and_join();
                     return match outcome {
                         Ok(result) => result,
-                        Err(error) => AcpToolResult {
-                            content: format!("Local tool worker failed: {error}"),
-                            is_error: true,
-                        },
+                        Err(error) => ToolResult::failure(
+                            &failure_call,
+                            ToolFailureCode::Internal,
+                            format!("Local tool worker failed: {error}"),
+                            ToolRetryability::Unknown,
+                        ),
                     };
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
@@ -2324,12 +2368,14 @@ impl AcpServer {
                             &mut worker,
                         )
                         .await;
-                        return AcpToolResult {
-                            content: format!(
+                        return ToolResult::failure(
+                            &failure_call,
+                            ToolFailureCode::Cancelled,
+                            format!(
                                 "Tool execution cancelled; terminated {cancelled_processes} sandbox process tree(s)"
                             ),
-                            is_error: true,
-                        };
+                            ToolRetryability::Never,
+                        );
                     }
                 }
             }
@@ -2356,22 +2402,14 @@ impl AcpServer {
         session_id: &str,
         tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
-        {
-            Ok(path) => path,
-            Err(result) => return result,
-        };
+    ) -> Result<ToolResult, ToolFailure> {
+        let path = parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")?;
 
         // Match the registry read_file contract: offset is a 1-indexed
         // positive line number, limit is a positive max-line count. Validate
         // before asking the ACP client to read the file.
-        if let Err(result) = parse_acp_read_offset_arg(args.get("offset")) {
-            return result;
-        }
-        if let Err(result) = parse_acp_read_limit_arg(args.get("limit")) {
-            return result;
-        }
+        parse_acp_read_offset_arg(args.get("offset"))?;
+        parse_acp_read_limit_arg(args.get("limit"))?;
 
         let mut local_args = serde_json::Map::new();
         local_args.insert("path".to_string(), Value::String(path.to_string()));
@@ -2385,14 +2423,15 @@ impl AcpServer {
             local_args.insert("pages".to_string(), pages.clone());
         }
 
-        self.execute_local_tool_async(
-            run,
-            session_id,
-            tool_call_id,
-            "read_file",
-            &Value::Object(local_args).to_string(),
-        )
-        .await
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "read_file",
+                &Value::Object(local_args).to_string(),
+            )
+            .await)
     }
 
     async fn acp_write_file(
@@ -2401,25 +2440,19 @@ impl AcpServer {
         session_id: &str,
         tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
-        {
-            Ok(path) => path,
-            Err(result) => return result,
-        };
-        let content = match parse_acp_required_string_arg(args, "content") {
-            Ok(content) => content,
-            Err(result) => return result,
-        };
+    ) -> Result<ToolResult, ToolFailure> {
+        let path = parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")?;
+        let content = parse_acp_required_string_arg(args, "content")?;
 
-        self.execute_local_tool_async(
-            run,
-            session_id,
-            tool_call_id,
-            "write_file",
-            &json!({"path": path, "content": content}).to_string(),
-        )
-        .await
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "write_file",
+                &json!({"path": path, "content": content}).to_string(),
+            )
+            .await)
     }
 
     async fn acp_edit_file(
@@ -2428,42 +2461,27 @@ impl AcpServer {
         session_id: &str,
         tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
-        {
-            Ok(path) => path,
-            Err(result) => return result,
-        };
+    ) -> Result<ToolResult, ToolFailure> {
+        let path = parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")?;
+        let old_string = parse_acp_required_string_arg(args, "old_string")?;
+        let new_string = parse_acp_required_string_arg(args, "new_string")?;
+        let replace_all = parse_acp_bool_arg(args, "replace_all", false)?;
 
-        let old_string = match parse_acp_required_string_arg(args, "old_string") {
-            Ok(old_string) => old_string,
-            Err(result) => return result,
-        };
-
-        let new_string = match parse_acp_required_string_arg(args, "new_string") {
-            Ok(new_string) => new_string,
-            Err(result) => return result,
-        };
-
-        let replace_all = match parse_acp_bool_arg(args, "replace_all", false) {
-            Ok(value) => value,
-            Err(result) => return result,
-        };
-
-        self.execute_local_tool_async(
-            run,
-            session_id,
-            tool_call_id,
-            "edit_file",
-            &json!({
-                "path": path,
-                "old_string": old_string,
-                "new_string": new_string,
-                "replace_all": replace_all
-            })
-            .to_string(),
-        )
-        .await
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "edit_file",
+                &json!({
+                    "path": path,
+                    "old_string": old_string,
+                    "new_string": new_string,
+                    "replace_all": replace_all
+                })
+                .to_string(),
+            )
+            .await)
     }
 
     // -- Sandboxed terminal operations --
@@ -2474,28 +2492,22 @@ impl AcpServer {
         session_id: &str,
         tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let command = match parse_acp_required_string_arg(args, "command") {
-            Ok(command) => command,
-            Err(result) => return result,
-        };
-
-        let run_in_background = match parse_acp_bool_arg(args, "run_in_background", false) {
-            Ok(value) => value,
-            Err(result) => return result,
-        };
+    ) -> Result<ToolResult, ToolFailure> {
+        let command = parse_acp_required_string_arg(args, "command")?;
+        let run_in_background = parse_acp_bool_arg(args, "run_in_background", false)?;
         let local_args = json!({
             "command": command,
             "run_in_background": run_in_background,
         });
-        self.execute_local_tool_async(
-            run,
-            session_id,
-            tool_call_id,
-            "bash",
-            &local_args.to_string(),
-        )
-        .await
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "bash",
+                &local_args.to_string(),
+            )
+            .await)
     }
 
     fn acp_bash_output(
@@ -2504,23 +2516,16 @@ impl AcpServer {
         session_id: &str,
         tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let shell_id = match parse_acp_required_alias_string_arg(
-            args,
-            "shell_id",
-            "terminal_id",
-            "shell_id",
-        ) {
-            Ok(shell_id) => shell_id,
-            Err(result) => return result,
-        };
-        self.execute_local_tool(
+    ) -> Result<ToolResult, ToolFailure> {
+        let shell_id =
+            parse_acp_required_alias_string_arg(args, "shell_id", "terminal_id", "shell_id")?;
+        Ok(self.execute_local_tool(
             run,
             session_id,
             tool_call_id,
             "bash_output",
             &json!({"shell_id": shell_id}).to_string(),
-        )
+        ))
     }
 
     fn acp_kill_shell(
@@ -2529,23 +2534,16 @@ impl AcpServer {
         session_id: &str,
         tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let shell_id = match parse_acp_required_alias_string_arg(
-            args,
-            "shell_id",
-            "terminal_id",
-            "shell_id",
-        ) {
-            Ok(shell_id) => shell_id,
-            Err(result) => return result,
-        };
-        self.execute_local_tool(
+    ) -> Result<ToolResult, ToolFailure> {
+        let shell_id =
+            parse_acp_required_alias_string_arg(args, "shell_id", "terminal_id", "shell_id")?;
+        Ok(self.execute_local_tool(
             run,
             session_id,
             tool_call_id,
             "kill_shell",
             &json!({"shell_id": shell_id}).to_string(),
-        )
+        ))
     }
 
     async fn acp_list_files(
@@ -2554,19 +2552,17 @@ impl AcpServer {
         session_id: &str,
         tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let path = match parse_acp_optional_string_arg(args, "path", ".") {
-            Ok(path) => path,
-            Err(result) => return result,
-        };
-        self.execute_local_tool_async(
-            run,
-            session_id,
-            tool_call_id,
-            "list_files",
-            &json!({"path": path}).to_string(),
-        )
-        .await
+    ) -> Result<ToolResult, ToolFailure> {
+        let path = parse_acp_optional_string_arg(args, "path", ".")?;
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "list_files",
+                &json!({"path": path}).to_string(),
+            )
+            .await)
     }
 
     async fn acp_search(
@@ -2576,18 +2572,13 @@ impl AcpServer {
         tool_call_id: &str,
         tool_args: &HashMap<String, Value>,
         tool_name: &str,
-    ) -> AcpToolResult {
-        let arguments_json = match serde_json::to_string(tool_args) {
-            Ok(arguments) => arguments,
-            Err(err) => {
-                return AcpToolResult {
-                    content: format!("Failed to serialize {tool_name} arguments: {err}"),
-                    is_error: true,
-                }
-            }
-        };
-        self.execute_local_tool_async(run, session_id, tool_call_id, tool_name, &arguments_json)
-            .await
+    ) -> Result<ToolResult, ToolFailure> {
+        let arguments_json = serde_json::to_string(tool_args).map_err(|err| {
+            acp_internal_error(format!("Failed to serialize {tool_name} arguments: {err}"))
+        })?;
+        Ok(self
+            .execute_local_tool_async(run, session_id, tool_call_id, tool_name, &arguments_json)
+            .await)
     }
 }
 
@@ -2631,7 +2622,7 @@ struct AcpLocalToolRequest<'a> {
     task_managers: SharedAcpTaskManagers,
 }
 
-fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpToolResult {
+fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> ToolResult {
     use crate::tools::{FunctionCall, ToolCall};
 
     let AcpLocalToolRequest {
@@ -2666,10 +2657,12 @@ fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpTo
                 let manager = match crate::session::TaskManager::open_for_run(run) {
                     Ok(manager) => manager,
                     Err(error) => {
-                        return AcpToolResult {
-                            content: format!("Task graph unavailable: {error}"),
-                            is_error: true,
-                        };
+                        return ToolResult::failure(
+                            &tc,
+                            ToolFailureCode::Unavailable,
+                            format!("Task graph unavailable: {error}"),
+                            ToolRetryability::Safe,
+                        );
                     }
                 };
                 managers.insert(
@@ -2678,10 +2671,12 @@ fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpTo
                 );
             }
             let Some(manager) = managers.get(session_id).map(Arc::clone) else {
-                return AcpToolResult {
-                    content: "Task graph unavailable after initialization".to_string(),
-                    is_error: true,
-                };
+                return ToolResult::failure(
+                    &tc,
+                    ToolFailureCode::Internal,
+                    "Task graph unavailable after initialization",
+                    ToolRetryability::Unknown,
+                );
             };
             drop(managers);
             manager
@@ -2717,10 +2712,7 @@ fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpTo
             },
         )
     };
-    AcpToolResult {
-        content: result.content().to_string(),
-        is_error: result.is_error(),
-    }
+    result
 }
 
 #[cfg(test)]
@@ -2766,45 +2758,44 @@ fn record_acp_background_command_start(
 fn record_acp_tool_result_observation(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
-    tool_name: &str,
-    tool_call_id: &str,
-    result: &AcpToolResult,
+    result: &ToolResult,
 ) {
-    let tool_call = crate::tools::ToolCall {
-        id: tool_call_id.to_string(),
-        call_type: "function".to_string(),
-        function: crate::tools::FunctionCall {
-            name: tool_name.to_string(),
-            arguments: "{}".to_string(),
-        },
-    };
-    let tool_result = crate::tools::ToolResult::bind(
-        &tool_call,
-        &tool_call.function.name,
-        crate::tools::ToolHandlerResult::legacy(result.content.clone(), result.is_error),
-    );
     let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
         Ok(ledger) => ledger,
         Err(err) => {
             tracing::warn!(
                 session_id,
-                tool = tool_name,
+                tool = result.handler(),
                 error = %err,
                 "failed to open session reality ledger for ACP tool result"
             );
             return;
         }
     };
-    if let Err(err) =
-        crate::grounded_loop::append_tool_result_observation(run, &mut ledger, &tool_result)
+    if let Err(err) = crate::grounded_loop::append_tool_result_observation(run, &mut ledger, result)
     {
         tracing::warn!(
             session_id,
-            tool = tool_name,
+            tool = result.handler(),
             error = %err,
             "failed to append ACP tool result observation to reality ledger"
         );
     }
+}
+
+fn acp_tool_call_update_payload(result: &ToolResult) -> Value {
+    let status = if matches!(result.outcome(), ToolOutcome::Success { .. }) {
+        "completed"
+    } else {
+        "failed"
+    };
+    json!({
+        "toolCallId": result.tool_call_id(),
+        "title": result.handler(),
+        "status": status,
+        "output": result.render_text(),
+        "rawOutput": result.model_payload(),
+    })
 }
 
 #[cfg(test)]
@@ -3111,13 +3102,6 @@ fn acp_tool_definitions_for_chat_request(definitions: Value) -> Result<Vec<Value
     }
 
     Ok(tools)
-}
-
-/// Result of executing a tool via ACP.
-#[derive(Debug)]
-struct AcpToolResult {
-    content: String,
-    is_error: bool,
 }
 
 // ============================================================================
@@ -3756,9 +3740,8 @@ mod search_security_tests {
 #[cfg(test)]
 mod acp_ledger_helper_tests {
     use super::{
-        record_acp_background_command_start, record_acp_tool_result_observation,
-        validate_and_render_acp_final_response, AcpToolResult,
-        ACP_BACKGROUND_COMMAND_PENDING_STDERR,
+        acp_tool_call, record_acp_background_command_start, record_acp_tool_result_observation,
+        validate_and_render_acp_final_response, ACP_BACKGROUND_COMMAND_PENDING_STDERR,
     };
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
@@ -3791,17 +3774,21 @@ mod acp_ledger_helper_tests {
             .expect("test session id must be ledger safe");
         let _ = std::fs::remove_file(&path);
 
-        let result = AcpToolResult {
-            content: "x".repeat(crate::grounded_loop::TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES + 128),
-            is_error: true,
-        };
-        record_acp_tool_result_observation(
-            test_run(),
-            session_id,
+        let tool_call = acp_tool_call("call_acp", "read_file", r#"{"path":"src/acp.rs"}"#);
+        let result = crate::tools::ToolResult::bind(
+            &tool_call,
             "read_file",
-            "call_acp",
-            &result,
+            crate::tools::ToolHandlerResult::partial_text(
+                "x".repeat(crate::grounded_loop::TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES + 128),
+                vec![crate::tools::ToolFailure::new(
+                    crate::tools::ToolFailureCode::External,
+                    "read stopped after returning bytes".to_string(),
+                    crate::tools::ToolRetryability::Safe,
+                )],
+            ),
         );
+        let evidence_digest = result.evidence_digest();
+        record_acp_tool_result_observation(test_run(), session_id, &result);
 
         let ledger = crate::ledger::RealityLedger::open_project_session(session_id)
             .expect("reopen session ledger");
@@ -3824,7 +3811,10 @@ mod acp_ledger_helper_tests {
             panic!("expected tool result observation");
         };
         assert_eq!(result["tool_call_id"], "call_acp");
-        assert_eq!(result["is_error"], true);
+        assert_eq!(result["status"], "partial");
+        assert_eq!(result["is_error"], false);
+        assert_eq!(result["is_partial"], true);
+        assert_eq!(result["evidence_digest"], evidence_digest);
         assert_eq!(result["truncated"], true);
         assert_eq!(
             result["content"].as_str().expect("content").len(),
@@ -4044,22 +4034,22 @@ mod tool_argument_tests {
     fn malformed_json_returns_tool_error() {
         let err =
             parse_acp_tool_arguments("bash", "not json {{").expect_err("malformed JSON must error");
-        assert!(err.is_error);
+        assert_eq!(err.code, crate::tools::ToolFailureCode::InvalidArguments);
         assert!(
-            err.content.contains("Invalid tool arguments JSON"),
+            err.message.contains("Invalid tool arguments JSON"),
             "diagnostic must name malformed arguments: {:?}",
-            err.content
+            err.message
         );
     }
 
     #[test]
     fn non_object_json_returns_tool_error() {
         let err = parse_acp_tool_arguments("bash", "[]").expect_err("array args must error");
-        assert!(err.is_error);
+        assert_eq!(err.code, crate::tools::ToolFailureCode::InvalidArguments);
         assert!(
-            err.content.contains("expected a JSON object"),
+            err.message.contains("expected a JSON object"),
             "diagnostic must reject non-object args: {:?}",
-            err.content
+            err.message
         );
     }
 
@@ -4086,9 +4076,10 @@ mod session_mode_tests {
         acp_mode_label, build_acp_prompt_context, AcpServer, ACP_CONFIG_MODEL_ID,
         ACP_CONFIG_MODE_ID, INVALID_PARAMS,
     };
-    use crate::config::{AppConfig, HooksConfig};
+    use crate::config::{AppConfig, Hook, HookEntry, HookPolicy, HooksConfig};
     use crate::hooks::HookEngine;
     use crate::session::{SessionManager, SessionMode};
+    use crate::tools::{ToolFailureCode, ToolOutcome};
     use serde_json::{json, Value};
     use std::collections::{HashMap, VecDeque};
     #[cfg(unix)]
@@ -4177,6 +4168,26 @@ memory:
             .expect("test server carries an explicit run capability")
     }
 
+    #[cfg(unix)]
+    fn write_hook_capture_script(
+        directory: &std::path::Path,
+        name: &str,
+        capture: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let script = directory.join(name);
+        let capture = shlex::try_quote(
+            capture
+                .to_str()
+                .expect("hook capture path must be valid UTF-8"),
+        )
+        .expect("quote hook capture path");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > {capture}\n"))
+            .expect("write hook capture script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("make hook capture script executable");
+        script
+    }
+
     fn acp_memory_draft(title: &str) -> Value {
         let digest = crate::memory::MemoryDigest::for_fields(
             b"openclaudia.s054.acp-test.v1",
@@ -4208,7 +4219,7 @@ memory:
         call_id: &str,
         name: &str,
         arguments: Value,
-    ) -> super::AcpToolResult {
+    ) -> crate::tools::ToolResult {
         server
             .execute_tool_via_acp(run, "unit-test", call_id, name, &arguments.to_string())
             .await
@@ -4250,9 +4261,9 @@ memory:
         )
         .await;
         assert!(
-            !listed.is_error,
+            !listed.is_error(),
             "ACP configured team list failed: {}",
-            listed.content
+            listed.content()
         );
     }
 
@@ -4280,9 +4291,9 @@ memory:
         )
         .await;
         assert!(
-            !source_status.is_error,
+            !source_status.is_error(),
             "ACP memory_source_status failed: {}",
-            source_status.content
+            source_status.content()
         );
 
         let source_refresh = execute_acp_memory_tool(
@@ -4294,9 +4305,9 @@ memory:
         )
         .await;
         assert!(
-            !source_refresh.is_error,
+            !source_refresh.is_error(),
             "ACP memory_source_refresh failed: {}",
-            source_refresh.content
+            source_refresh.content()
         );
         assert!(matches!(
             server
@@ -4324,13 +4335,13 @@ memory:
             }),
         )
         .await;
-        assert!(denied.is_error);
+        assert!(denied.is_error());
         assert!(
             denied
-                .content
+                .content()
                 .contains("no interactive prompt is available"),
             "ACP must route memory_review through the canonical permission gate: {}",
-            denied.content
+            denied.content()
         );
         let after_denial = server
             .memory_db
@@ -4367,13 +4378,13 @@ memory:
                 arguments,
             )
             .await;
-            assert!(denied.is_error, "ACP {name} unexpectedly executed");
+            assert!(denied.is_error(), "ACP {name} unexpectedly executed");
             assert!(
                 denied
-                    .content
+                    .content()
                     .contains("no interactive prompt is available"),
                 "ACP must route {name} through the canonical fresh-host gate: {}",
-                denied.content
+                denied.content()
             );
         }
     }
@@ -4391,15 +4402,15 @@ memory:
         )
         .await;
         assert!(
-            !status.is_error,
+            !status.is_error(),
             "ACP memory_learning_status failed: {}",
-            status.content
+            status.content()
         );
         assert!(
-            status.content.contains("Automatic technical learning")
-                && status.content.contains("enabled"),
+            status.content().contains("Automatic technical learning")
+                && status.content().contains("enabled"),
             "ACP must expose the configured bounded learning status: {}",
-            status.content
+            status.content()
         );
     }
 
@@ -4494,9 +4505,9 @@ memory:
         )
         .await;
         assert!(
-            !inspected.is_error && inspected.content.contains("Inspected 1 of 2"),
+            !inspected.is_error() && inspected.content().contains("Inspected 1 of 2"),
             "ACP memory_conflicts failed: {}",
-            inspected.content
+            inspected.content()
         );
 
         let resolved = execute_acp_memory_tool(
@@ -4513,9 +4524,9 @@ memory:
         )
         .await;
         assert!(
-            !resolved.is_error && resolved.content.contains("Resolved technical lesson"),
+            !resolved.is_error() && resolved.content().contains("Resolved technical lesson"),
             "ACP memory resolution failed: {}",
-            resolved.content
+            resolved.content()
         );
         let heads = server
             .memory_db
@@ -4523,6 +4534,87 @@ memory:
             .expect("resolved heads");
         assert_eq!(heads.len(), 1);
         assert_eq!(heads[0].version.get(), 3);
+    }
+
+    async fn assert_acp_memory_crud_routes(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let saved = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-save",
+            "memory_save",
+            acp_memory_draft("ACP memory dispatch is canonical"),
+        )
+        .await;
+        assert!(
+            !saved.is_error(),
+            "ACP memory_save failed: {}",
+            saved.content()
+        );
+        let first = server
+            .memory_db
+            .query_technical_lessons(
+                Some("ACP memory dispatch"),
+                5,
+                chrono::Utc::now().timestamp(),
+            )
+            .expect("query ACP-saved lesson")
+            .records
+            .pop()
+            .expect("ACP save persisted one lesson");
+
+        assert_acp_memory_review_requires_host_decision(server, run, &first).await;
+        assert_acp_portable_memory_requires_host_decision(server, run).await;
+
+        let updated = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-update",
+            "memory_update",
+            json!({
+                "logical_id": first.logical_id.to_string(),
+                "expected_record_digest": first.record_digest.to_string(),
+                "correction_reason": "Exercise ACP update routing.",
+                "replacement": acp_memory_draft("ACP memory update is canonical")
+            }),
+        )
+        .await;
+        assert!(
+            !updated.is_error(),
+            "ACP memory_update failed: {}",
+            updated.content()
+        );
+        let second = server
+            .memory_db
+            .query_technical_lessons(Some("ACP memory update"), 5, chrono::Utc::now().timestamp())
+            .expect("query ACP-updated lesson")
+            .records
+            .pop()
+            .expect("ACP update persisted one lesson");
+        assert_eq!(second.logical_id, first.logical_id);
+        assert_eq!(second.version.get(), 2);
+        assert_agent_proposal(&first);
+        assert_agent_proposal(&second);
+        assert_ne!(first.provenance.source_id, second.provenance.source_id);
+
+        let deleted = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-delete",
+            "memory_delete",
+            json!({
+                "logical_id": second.logical_id.to_string(),
+                "expected_record_digest": second.record_digest.to_string()
+            }),
+        )
+        .await;
+        assert!(
+            !deleted.is_error(),
+            "ACP memory_delete failed: {}",
+            deleted.content()
+        );
     }
 
     #[tokio::test]
@@ -4539,86 +4631,16 @@ memory:
         )
         .await;
         assert!(
-            !listed.is_error,
+            !listed.is_error(),
             "ACP memory_list failed: {}",
-            listed.content
+            listed.content()
         );
 
         assert_acp_automatic_learning_status(&server, &run).await;
 
         assert_acp_memory_source_routes(&server, &run).await;
 
-        let saved = execute_acp_memory_tool(
-            &server,
-            &run,
-            "call-memory-save",
-            "memory_save",
-            acp_memory_draft("ACP memory dispatch is canonical"),
-        )
-        .await;
-        assert!(!saved.is_error, "ACP memory_save failed: {}", saved.content);
-        let first = server
-            .memory_db
-            .query_technical_lessons(
-                Some("ACP memory dispatch"),
-                5,
-                chrono::Utc::now().timestamp(),
-            )
-            .expect("query ACP-saved lesson")
-            .records
-            .pop()
-            .expect("ACP save persisted one lesson");
-
-        assert_acp_memory_review_requires_host_decision(&server, &run, &first).await;
-        assert_acp_portable_memory_requires_host_decision(&server, &run).await;
-
-        let updated = execute_acp_memory_tool(
-            &server,
-            &run,
-            "call-memory-update",
-            "memory_update",
-            json!({
-                "logical_id": first.logical_id.to_string(),
-                "expected_record_digest": first.record_digest.to_string(),
-                "correction_reason": "Exercise ACP update routing.",
-                "replacement": acp_memory_draft("ACP memory update is canonical")
-            }),
-        )
-        .await;
-        assert!(
-            !updated.is_error,
-            "ACP memory_update failed: {}",
-            updated.content
-        );
-        let second = server
-            .memory_db
-            .query_technical_lessons(Some("ACP memory update"), 5, chrono::Utc::now().timestamp())
-            .expect("query ACP-updated lesson")
-            .records
-            .pop()
-            .expect("ACP update persisted one lesson");
-        assert_eq!(second.logical_id, first.logical_id);
-        assert_eq!(second.version.get(), 2);
-        assert_agent_proposal(&first);
-        assert_agent_proposal(&second);
-        assert_ne!(first.provenance.source_id, second.provenance.source_id);
-
-        let deleted = execute_acp_memory_tool(
-            &server,
-            &run,
-            "call-memory-delete",
-            "memory_delete",
-            json!({
-                "logical_id": second.logical_id.to_string(),
-                "expected_record_digest": second.record_digest.to_string()
-            }),
-        )
-        .await;
-        assert!(
-            !deleted.is_error,
-            "ACP memory_delete failed: {}",
-            deleted.content
-        );
+        assert_acp_memory_crud_routes(&server, &run).await;
 
         let searched = execute_acp_memory_tool(
             &server,
@@ -4629,9 +4651,9 @@ memory:
         )
         .await;
         assert!(
-            !searched.is_error,
+            !searched.is_error(),
             "ACP memory_search failed: {}",
-            searched.content
+            searched.content()
         );
 
         assert_acp_conflict_inspection_and_resolution(&server, &run).await;
@@ -4661,7 +4683,7 @@ memory:
             json!({"path": source_path, "content": broken_source}),
         )
         .await;
-        assert!(!initial.is_error, "initial ACP write failed: {initial:?}");
+        assert!(!initial.is_error(), "initial ACP write failed: {initial:?}");
 
         let command = format!(
             "rustc --crate-name acp_learning_probe {} --crate-type lib --emit metadata -o {}",
@@ -4686,7 +4708,7 @@ memory:
             json!({"path": source_path}),
         )
         .await;
-        assert!(!read.is_error, "ACP read failed: {read:?}");
+        assert!(!read.is_error(), "ACP read failed: {read:?}");
 
         let edit_id = "acp-learning-edit";
         let edit = execute_acp_memory_tool(
@@ -4701,7 +4723,7 @@ memory:
             }),
         )
         .await;
-        assert!(!edit.is_error, "ACP edit failed: {edit:?}");
+        assert!(!edit.is_error(), "ACP edit failed: {edit:?}");
 
         let success_id = "acp-learning-check-success";
         let passed = execute_acp_memory_tool(
@@ -4712,7 +4734,7 @@ memory:
             json!({"command": command}),
         )
         .await;
-        assert!(!passed.is_error, "ACP verification failed: {passed:?}");
+        assert!(!passed.is_error(), "ACP verification failed: {passed:?}");
 
         let records = server
             .memory_db
@@ -4830,17 +4852,18 @@ blast_radius:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("path".to_string(), json!(["src/lib.rs"]))]);
 
-        let result = server
+        let failure = server
             .acp_read_file(test_run(&server), "acp-bad-path", "call-bad-path", &args)
-            .await;
+            .await
+            .expect_err("bad path must fail argument normalization");
 
-        assert!(result.is_error, "bad path must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'path' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad read path");
     }
@@ -4853,22 +4876,23 @@ blast_radius:
             ("offset".to_string(), json!("2")),
         ]);
 
-        let result = server
+        let failure = server
             .acp_read_file(
                 test_run(&server),
                 "acp-bad-offset",
                 "call-bad-offset",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad offset must fail argument normalization");
 
-        assert!(result.is_error, "bad offset must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("offset must be a 1-indexed positive integer"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert!(
             rx.try_recv().is_err(),
@@ -4884,15 +4908,16 @@ blast_radius:
             ("limit".to_string(), json!(0)),
         ]);
 
-        let result = server
+        let failure = server
             .acp_read_file(test_run(&server), "acp-bad-limit", "call-bad-limit", &args)
-            .await;
+            .await
+            .expect_err("zero limit must fail argument normalization");
 
-        assert!(result.is_error, "zero limit must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result.content.contains("limit must be a positive integer"),
+            failure.message.contains("limit must be a positive integer"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert!(
             rx.try_recv().is_err(),
@@ -4908,22 +4933,23 @@ blast_radius:
             ("content".to_string(), json!({"text": "body"})),
         ]);
 
-        let result = server
+        let failure = server
             .acp_write_file(
                 test_run(&server),
                 "acp-bad-content",
                 "call-bad-content",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad content must fail argument normalization");
 
-        assert!(result.is_error, "bad content must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'content' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad write content");
     }
@@ -4936,22 +4962,23 @@ blast_radius:
             ("content".to_string(), json!("body")),
         ]);
 
-        let result = server
+        let failure = server
             .acp_write_file(
                 test_run(&server),
                 "acp-bad-write-path",
                 "call-bad-write-path",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad file_path must fail argument normalization");
 
-        assert!(result.is_error, "bad file_path must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'file_path' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad write file_path");
     }
@@ -4973,23 +5000,24 @@ blast_radius:
             .to_string();
         let result = server
             .acp_read_file(test_run(&server), "acp-window", "call-window", &args)
-            .await;
+            .await
+            .expect("valid read arguments");
 
-        assert!(!result.is_error, "valid window must succeed: {result:?}");
+        assert!(!result.is_error(), "valid window must succeed: {result:?}");
         assert!(
-            result.content.contains(&format!("| {expected}")),
+            result.content().contains(&format!("| {expected}")),
             "offset=2 limit=1 must show the fixture's line 2; got {}",
-            result.content
+            result.content()
         );
         assert!(
             result
-                .content
+                .content()
                 .lines()
                 .filter(|line| line.contains('|'))
                 .count()
                 == 1,
             "offset/limit window must return exactly one numbered content line; got {}",
-            result.content
+            result.content()
         );
         assert_no_client_request(&mut rx, "local ACP read");
     }
@@ -5011,9 +5039,10 @@ blast_radius:
                     Value::String(sentinel.to_string_lossy().into_owned()),
                 )]),
             )
-            .await;
-        assert!(read.is_error);
-        assert!(!read.content.contains("outside-secret"));
+            .await
+            .expect("read arguments are valid");
+        assert!(read.is_error());
+        assert!(!read.content().contains("outside-secret"));
 
         let write = server
             .acp_write_file(
@@ -5028,8 +5057,9 @@ blast_radius:
                     ("content".to_string(), Value::String("changed".to_string())),
                 ]),
             )
-            .await;
-        assert!(write.is_error);
+            .await
+            .expect("write arguments are valid");
+        assert!(write.is_error());
         assert_eq!(
             std::fs::read_to_string(&sentinel).expect("outside sentinel"),
             "outside-secret"
@@ -5045,8 +5075,9 @@ blast_radius:
                     Value::String("../outside.txt".to_string()),
                 )]),
             )
-            .await;
-        assert!(traversal.is_error);
+            .await
+            .expect("traversal arguments are valid");
+        assert!(traversal.is_error());
 
         let search = server
             .acp_search(
@@ -5062,9 +5093,10 @@ blast_radius:
                 ]),
                 "grep",
             )
-            .await;
-        assert!(search.is_error);
-        assert!(!search.content.contains("outside-secret"));
+            .await
+            .expect("search arguments are valid");
+        assert!(search.is_error());
+        assert!(!search.content().contains("outside-secret"));
 
         #[cfg(unix)]
         {
@@ -5081,9 +5113,10 @@ blast_radius:
                         Value::String(link.to_string_lossy().into_owned()),
                     )]),
                 )
-                .await;
-            assert!(linked.is_error);
-            assert!(!linked.content.contains("outside-secret"));
+                .await
+                .expect("symlink read arguments are valid");
+            assert!(linked.is_error());
+            assert!(!linked.content().contains("outside-secret"));
         }
 
         assert_no_client_request(&mut rx, "locally confined ACP filesystem tools");
@@ -5167,22 +5200,23 @@ blast_radius:
             ("new_string".to_string(), json!("new")),
         ]);
 
-        let result = server
+        let failure = server
             .acp_edit_file(
                 test_run(&server),
                 "acp-bad-old-string",
                 "call-bad-old-string",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad old_string must fail argument normalization");
 
-        assert!(result.is_error, "bad old_string must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'old_string' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad edit old_string");
     }
@@ -5196,22 +5230,23 @@ blast_radius:
             ("new_string".to_string(), json!(["new"])),
         ]);
 
-        let result = server
+        let failure = server
             .acp_edit_file(
                 test_run(&server),
                 "acp-bad-new-string",
                 "call-bad-new-string",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad new_string must fail argument normalization");
 
-        assert!(result.is_error, "bad new_string must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'new_string' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad edit new_string");
     }
@@ -5226,22 +5261,23 @@ blast_radius:
             ("replace_all".to_string(), json!("true")),
         ]);
 
-        let result = server
+        let failure = server
             .acp_edit_file(
                 test_run(&server),
                 "acp-bad-replace-all",
                 "call-bad-replace-all",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad replace_all must fail argument normalization");
 
-        assert!(result.is_error, "bad replace_all must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'replace_all' argument: expected boolean"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
     }
 
@@ -5250,22 +5286,23 @@ blast_radius:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("command".to_string(), json!(["echo nope"]))]);
 
-        let result = server
+        let failure = server
             .acp_bash(
                 test_run(&server),
                 "acp-bad-command",
                 "call-bad-command",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad command must fail argument normalization");
 
-        assert!(result.is_error, "bad command must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'command' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad bash command");
     }
@@ -5278,25 +5315,23 @@ blast_radius:
             ("run_in_background".to_string(), json!("true")),
         ]);
 
-        let result = server
+        let failure = server
             .acp_bash(
                 test_run(&server),
                 "acp-bad-background",
                 "call-bad-background",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad run_in_background must fail argument normalization");
 
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result.is_error,
-            "bad run_in_background must error: {result:?}"
-        );
-        assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'run_in_background' argument: expected boolean"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
     }
 
@@ -5315,11 +5350,224 @@ blast_radius:
                 "call-local-bash",
                 &args,
             )
+            .await
+            .expect("valid bash arguments");
+
+        assert!(!result.is_error(), "local ACP bash failed: {result:?}");
+        assert!(result.content().contains("acp_sandbox_probe"));
+        assert_no_client_request(&mut rx, "ACP bash sandbox routing");
+    }
+
+    #[tokio::test]
+    async fn acp_invalid_arguments_are_typed_and_bound_to_the_wire_invocation() {
+        let (server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let arguments = "[]";
+
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-invalid-arguments",
+                "call-invalid-arguments",
+                "bash",
+                arguments,
+            )
             .await;
 
-        assert!(!result.is_error, "local ACP bash failed: {result:?}");
-        assert!(result.content.contains("acp_sandbox_probe"));
-        assert_no_client_request(&mut rx, "ACP bash sandbox routing");
+        let ToolOutcome::Error { failure } = result.outcome() else {
+            panic!("invalid arguments must produce a typed error: {result:#?}");
+        };
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
+        assert_eq!(result.tool_call_id(), "call-invalid-arguments");
+        assert_eq!(result.handler(), "bash");
+        assert_eq!(result.invocation().raw_arguments, arguments);
+        assert_eq!(result.invocation().arguments, None);
+    }
+
+    #[tokio::test]
+    async fn acp_alias_normalization_restores_the_exact_wire_invocation() {
+        let (server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let arguments = r#"{ "file_path" : "Cargo.toml", "limit" : 1 }"#;
+
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-wire-alias",
+                "call-wire-alias",
+                "read_file",
+                arguments,
+            )
+            .await;
+
+        assert!(
+            matches!(result.outcome(), ToolOutcome::Success { .. }),
+            "normalized read must succeed: {result:#?}"
+        );
+        assert_eq!(result.tool_call_id(), "call-wire-alias");
+        assert_eq!(result.handler(), "read_file");
+        assert_eq!(result.invocation().raw_arguments, arguments);
+        let wire_arguments = result
+            .invocation()
+            .arguments
+            .as_ref()
+            .expect("wire object remains parsed");
+        assert_eq!(wire_arguments["file_path"], "Cargo.toml");
+        assert!(
+            wire_arguments.get("path").is_none(),
+            "canonical local alias must not overwrite provider evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_nonzero_bash_retains_partial_across_provider_and_ui_projections() {
+        let (server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let arguments = r#"{"command":"false"}"#;
+
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-partial-provider",
+                "call-partial-provider",
+                "bash",
+                arguments,
+            )
+            .await;
+
+        assert!(
+            result.is_partial(),
+            "nonzero Bash must remain partial; got {result:#?}"
+        );
+        assert!(!result.is_error(), "partial is distinct from a total error");
+        assert_eq!(result.tool_call_id(), "call-partial-provider");
+        assert_eq!(result.handler(), "bash");
+        assert_eq!(result.invocation().raw_arguments, arguments);
+
+        let provider_message = result.openai_message();
+        let provider_payload: Value = serde_json::from_str(
+            provider_message["content"]
+                .as_str()
+                .expect("provider tool content must be text"),
+        )
+        .expect("provider content must contain the typed result envelope");
+        assert_eq!(provider_payload, result.model_payload());
+        assert_eq!(provider_payload["result"]["outcome"]["status"], "partial");
+
+        let ui_payload = super::acp_tool_call_update_payload(&result);
+        assert_eq!(ui_payload["toolCallId"], "call-partial-provider");
+        assert_eq!(ui_payload["status"], "failed");
+        assert_eq!(ui_payload["output"], result.render_text());
+        assert_eq!(ui_payload["rawOutput"], result.model_payload());
+        assert_eq!(
+            ui_payload["rawOutput"]["result"]["outcome"]["status"],
+            "partial"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_partial_mutation_routes_failure_hook_with_exact_typed_result() {
+        let (mut server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let fixture = tempfile::tempdir_in(run.working_directory())
+            .expect("project-local partial-mutation fixture");
+        let source = fixture.path().join("mutation-observed");
+        let missing = fixture.path().join("missing-source");
+        let destination = fixture.path().join("destination");
+        std::fs::write(&source, "effect-observed\n").expect("partial-mutation source fixture");
+        std::fs::create_dir(&destination).expect("partial-mutation destination fixture");
+        let mutation = destination.join("mutation-observed");
+        let success_capture = fixture.path().join("post-success.json");
+        let failure_capture = fixture.path().join("post-failure.json");
+        let success_script =
+            write_hook_capture_script(fixture.path(), "capture-success.sh", &success_capture);
+        let failure_script =
+            write_hook_capture_script(fixture.path(), "capture-failure.sh", &failure_capture);
+
+        let hook = |script: &std::path::Path| Hook::Command {
+            command: script.to_string_lossy().into_owned(),
+            shell: false,
+            timeout: 10,
+        };
+        let mut hooks = HooksConfig::default();
+        hooks.post_tool_use.push(HookEntry {
+            matcher: Some("bash".to_string()),
+            hooks: vec![hook(&success_script)],
+        });
+        hooks.post_tool_use_failure.push(HookEntry {
+            matcher: Some("bash".to_string()),
+            hooks: vec![hook(&failure_script)],
+        });
+        hooks.policy = Some(HookPolicy {
+            allowed_commands: Some(std::collections::HashSet::from([
+                "capture-success.sh".to_string(),
+                "capture-failure.sh".to_string(),
+            ])),
+            ..Default::default()
+        });
+        server.hook_engine = HookEngine::new(hooks);
+
+        let quote_path = |path: &std::path::Path| {
+            shlex::try_quote(
+                path.to_str()
+                    .expect("partial-mutation path must be valid UTF-8"),
+            )
+            .expect("quote partial-mutation path")
+            .into_owned()
+        };
+        let arguments = json!({
+            "command": format!(
+                "cp {} {} {}",
+                quote_path(&source),
+                quote_path(&missing),
+                quote_path(&destination)
+            )
+        })
+        .to_string();
+
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-partial-mutation",
+                "call-partial-mutation",
+                "bash",
+                &arguments,
+            )
+            .await;
+
+        assert!(
+            result.is_partial(),
+            "effectful nonzero Bash must be partial"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&mutation).expect("the command's mutation must be observable"),
+            "effect-observed\n"
+        );
+        assert!(
+            !success_capture.exists(),
+            "partial execution must not fire PostToolUse"
+        );
+        let hook_input: Value = serde_json::from_str(
+            &std::fs::read_to_string(&failure_capture)
+                .expect("PostToolUseFailure capture must exist"),
+        )
+        .expect("hook input must be JSON");
+        assert_eq!(hook_input["event"], "post_tool_use_failure");
+        assert_eq!(hook_input["session_id"], "acp-partial-mutation");
+        assert_eq!(hook_input["tool_name"], "bash");
+        let hook_result: Value = serde_json::from_str(
+            hook_input["tool_output"]
+                .as_str()
+                .expect("hook output must be the text projection"),
+        )
+        .expect("hook output must contain the typed result envelope");
+        assert_eq!(hook_result, result.model_payload());
+        assert_eq!(
+            hook_result["result"]["invocation"]["raw_arguments"],
+            arguments
+        );
+        assert_eq!(hook_result["result"]["outcome"]["status"], "partial");
     }
 
     #[tokio::test]
@@ -5367,13 +5615,14 @@ blast_radius:
                 "call-cancel-tree",
                 &args,
             )
-            .await;
+            .await
+            .expect("valid cancellation arguments");
         assert!(
-            result.is_error,
+            result.is_error(),
             "cancelled tool must be reported as an error"
         );
         assert!(
-            result.content.contains("cancelled"),
+            result.content().contains("cancelled"),
             "unexpected cancellation result: {result:?}"
         );
         assert!(
@@ -5392,20 +5641,22 @@ blast_radius:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("shell_id".to_string(), json!(42))]);
 
-        let result = server.acp_bash_output(
-            test_run(&server),
-            "acp-bad-output",
-            "call-bad-output",
-            &args,
-        );
+        let failure = server
+            .acp_bash_output(
+                test_run(&server),
+                "acp-bad-output",
+                "call-bad-output",
+                &args,
+            )
+            .expect_err("bad shell_id must fail argument normalization");
 
-        assert!(result.is_error, "bad shell_id must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'shell_id' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad bash_output shell_id");
     }
@@ -5415,16 +5666,17 @@ blast_radius:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("terminal_id".to_string(), json!({"id": "term"}))]);
 
-        let result =
-            server.acp_kill_shell(test_run(&server), "acp-bad-kill", "call-bad-kill", &args);
+        let failure = server
+            .acp_kill_shell(test_run(&server), "acp-bad-kill", "call-bad-kill", &args)
+            .expect_err("bad terminal_id must fail argument normalization");
 
-        assert!(result.is_error, "bad terminal_id must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'terminal_id' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad kill_shell terminal_id");
     }
@@ -5434,22 +5686,23 @@ blast_radius:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("path".to_string(), json!(false))]);
 
-        let result = server
+        let failure = server
             .acp_list_files(
                 test_run(&server),
                 "acp-bad-list-path",
                 "call-bad-list-path",
                 &args,
             )
-            .await;
+            .await
+            .expect_err("bad list path must fail argument normalization");
 
-        assert!(result.is_error, "bad list path must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'path' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad list_files path");
     }
@@ -5918,7 +6171,7 @@ mod acp_permission_gate_tests {
             app_config: None,
             task_managers: Arc::clone(&task_managers),
         });
-        assert!(!first.is_error, "{}", first.content);
+        assert!(!first.is_error(), "{}", first.content());
 
         let manager_a = task_managers
             .lock()
@@ -5941,7 +6194,7 @@ mod acp_permission_gate_tests {
             app_config: None,
             task_managers: Arc::clone(&task_managers),
         });
-        assert!(!second.is_error, "{}", second.content);
+        assert!(!second.is_error(), "{}", second.content());
         let managers = task_managers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5967,16 +6220,16 @@ mod acp_permission_gate_tests {
             task_managers: task_managers(),
         });
 
-        assert!(blocked.is_error);
+        assert!(blocked.is_error());
         assert!(
-            blocked.content.contains("Permission denied"),
+            blocked.content().contains("Permission denied"),
             "denial should be surfaced as a normal tool error: {}",
-            blocked.content
+            blocked.content()
         );
         assert!(
-            blocked.content.contains("no interactive prompt"),
+            blocked.content().contains("no interactive prompt"),
             "denial should come from the headless permission context: {}",
-            blocked.content
+            blocked.content()
         );
     }
 
@@ -5998,7 +6251,7 @@ mod acp_permission_gate_tests {
         });
 
         assert!(
-            !outcome.is_error,
+            !outcome.is_error(),
             "explicit default_allow rule must still allow ACP bash; got {outcome:?}"
         );
     }
@@ -6026,7 +6279,7 @@ mod acp_permission_gate_tests {
         });
 
         assert!(
-            !outcome.is_error,
+            !outcome.is_error(),
             "ACP's normalized write call must match only its explicit Write scope; got {outcome:?}"
         );
         assert_eq!(
@@ -6100,8 +6353,8 @@ mod pre_tool_gate_tests {
     /// **Fix #694 — forensic evidence #1**
     ///
     /// A `PreToolUse` hook that denies a tool MUST cause `pre_tool_use_gate`
-    /// to return `Some(AcpToolResult { is_error: true, .. })` and the
-    /// block reason MUST surface in the result's `content`. Before the
+    /// to return the typed lifecycle block and its reason. The ACP dispatcher
+    /// then binds that block to the exact provider invocation. Before the
     /// fix, `execute_local_tool` skipped this gate entirely and
     /// dispatched `execute_tool_with_memory` directly — a hook denial
     /// had no effect on the ACP path. This test fails (gate is `None`)
@@ -6123,16 +6376,18 @@ mod pre_tool_gate_tests {
         cfg.policy = Some(allow_only("deny.sh"));
         let engine = HookEngine::new(cfg);
 
-        let blocked =
-            pre_tool_use_gate(test_run(), &engine, "bash", &json!({"command": "ls"})).await;
+        let blocked = pre_tool_use_gate(
+            test_run(),
+            &engine,
+            "hook-denial-session",
+            "bash",
+            &json!({"command": "ls"}),
+        )
+        .await;
 
         let blocked = blocked.expect(
             "PreToolUse denial MUST short-circuit the ACP dispatch — \
              gate returned None, which means the regression is back",
-        );
-        assert!(
-            blocked.is_error,
-            "blocked tool result must report is_error=true"
         );
         assert!(
             blocked.content.contains("blocked by PreToolUse hook"),
@@ -6168,6 +6423,7 @@ mod pre_tool_gate_tests {
         let outcome = pre_tool_use_gate(
             test_run(),
             &engine,
+            "allowed-tool-session",
             "read_file",
             &json!({"file_path": "/tmp/some.txt"}),
         )
@@ -6199,7 +6455,8 @@ mod pre_tool_gate_tests {
             ("memory_save", json!({"key": "k", "value": "v"})),
             ("mcp__svc__op", json!({"arg": "v"})),
         ] {
-            let outcome = pre_tool_use_gate(test_run(), &engine, tool, &args).await;
+            let outcome =
+                pre_tool_use_gate(test_run(), &engine, "empty-hook-session", tool, &args).await;
             assert!(
                 outcome.is_none(),
                 "empty PreToolUse config must allow {tool}; got {outcome:?}"
@@ -6230,10 +6487,15 @@ mod pre_tool_gate_tests {
         cfg.policy = Some(allow_only("deny.sh"));
         let engine = HookEngine::new(cfg);
 
-        let outcome =
-            pre_tool_use_gate(test_run(), &engine, "bash", &json!({"command": "rm -rf /"})).await;
+        let outcome = pre_tool_use_gate(
+            test_run(),
+            &engine,
+            "matcher-denial-session",
+            "bash",
+            &json!({"command": "rm -rf /"}),
+        )
+        .await;
         let blocked = outcome.expect("matcher-matched deny hook MUST block");
-        assert!(blocked.is_error);
         assert!(
             blocked.content.contains("bash-not-allowed"),
             "deny reason must propagate; got: {}",

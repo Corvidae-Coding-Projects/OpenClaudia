@@ -253,12 +253,20 @@ pub fn append_tool_result_observation(
     let content =
         crate::tools::safe_truncate(result.content(), TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES)
             .to_string();
+    let status = match result.outcome() {
+        crate::tools::ToolOutcome::Success { .. } => "success",
+        crate::tools::ToolOutcome::Error { .. } => "error",
+        crate::tools::ToolOutcome::Partial { .. } => "partial",
+    };
     ledger.observe_tool_result(
         run,
         result,
         serde_json::json!({
             "tool_call_id": result.tool_call_id(),
+            "status": status,
             "is_error": result.is_error(),
+            "is_partial": result.is_partial(),
+            "evidence_digest": result.evidence_digest(),
             "content": content,
             "truncated": result.content().len() > content.len(),
         }),

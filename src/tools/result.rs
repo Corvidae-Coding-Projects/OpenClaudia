@@ -651,6 +651,27 @@ impl ToolExecutionResult {
         matches!(self.outcome, ToolOutcome::Partial { .. })
     }
 
+    /// Restore the exact provider/wire invocation after an adapter executes a
+    /// normalized equivalent locally.
+    ///
+    /// ACP accepts a small set of wire aliases (for example `file_path` for
+    /// the registry's canonical `path`). The local executor must authorize and
+    /// dispatch the normalized arguments, while provider continuation and
+    /// evidence must retain the exact bytes supplied by the provider. This
+    /// operation changes only invocation identity; the trusted handler and all
+    /// execution outcome data remain untouched.
+    #[must_use]
+    pub(crate) fn with_wire_invocation(mut self, tool_call: &ToolCall) -> Self {
+        self.invocation.call_id.clone_from(&tool_call.id);
+        self.invocation
+            .raw_arguments
+            .clone_from(&tool_call.function.arguments);
+        self.invocation.arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
+            .ok()
+            .filter(Value::is_object);
+        self
+    }
+
     #[must_use]
     pub fn artifacts(&self) -> &[ToolArtifact] {
         &self.artifacts

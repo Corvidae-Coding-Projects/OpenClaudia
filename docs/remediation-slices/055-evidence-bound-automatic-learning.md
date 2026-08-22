@@ -161,10 +161,12 @@ its fail-closed verdict.
 - The allowlist classifies bounded command structure; it is not verifier binary
   attestation. Automatic output therefore remains an untrusted, review-due
   candidate and can never promote itself.
-- ACP currently collapses typed `partial` during its provider-facing result
-  projection. Internal canonical capture and exact call citations work, but
-  provider/UI parity is not claimed; the production defect is tracked as
-  Crosslink #1090.
+- Crosslink #1090 removed ACP's lossy `{content, is_error}` result projection.
+  ACP now retains the canonical typed result through hook selection,
+  provider continuation, UI `rawOutput`, and grounded evidence, including exact
+  wire invocation provenance and distinct `partial` status. Broader ACP
+  session, transport, and advertised-capability work remains with S-089 through
+  S-091.
 - The evaluation proves deterministic retrieval and correction behavior, not
   downstream model uplift. A broader independently reviewed task benchmark can
   strengthen this evidence after S-088 exists.

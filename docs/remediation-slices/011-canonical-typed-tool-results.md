@@ -232,3 +232,16 @@ schema owned by S-001/S-088.
   deterministic gates, and VDD queue entry to be regenerated.
 - No new remediation slice is proposed; every residual maps to an existing
   dependency or follow-on slice.
+
+### ACP boundary follow-up — 2026-08-22
+
+Crosslink #1090 repaired a later ACP-specific regression that had projected the
+canonical result back to `{content, is_error}`. ACP now carries one
+`ToolExecutionResult` through normalized local execution, restores the exact
+provider call ID and raw argument bytes, routes `partial` to
+`PostToolUseFailure`, sends the typed envelope to provider history and UI
+`rawOutput`, and appends that same value to grounded evidence. Integrated tests
+cover typed early argument failure, alias normalization without provenance
+drift, nonzero Bash, and a real mutation followed by process failure. This
+follow-up does not claim completion of ACP session isolation, bounded transport,
+or effective capability advertisement in S-089 through S-091.
