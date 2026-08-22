@@ -1,6 +1,6 @@
 {
   "next_display_id": 1081,
-  "next_comment_id": 1123,
+  "next_comment_id": 1124,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11025,7 +11025,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T16:01:20.623148827Z",
-      "updated_at": "2026-08-22T00:16:33.149042674Z",
+      "updated_at": "2026-08-22T00:16:38.103019021Z",
       "labels": [
         "remediation"
       ],
@@ -11086,6 +11086,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAMQRhLegK+COMDStO9Dj0DVZCvHX0cvIaZcybpb+LpIRXOeRcruLIoYxsV+E4jevAp6UQkk9iecUQ5Uj7qm17Dw=="
+        },
+        "9dbf8d74-939d-4fb5-9f4c-115e1884ace0": {
+          "display_id": 1123,
+          "author": "6Vw9",
+          "content": "Implementation checkpoint: encrypted/authenticated causal replica and bounded TLS transport are present locally. Rust 1.98.0 with CARGO_BUILD_JOBS=4 and --test-threads=1: replication unit scenarios PASS 5/5; real pinned-TLS/supervisor transport scenarios PASS 2/2 (2703 filtered). Review found and repaired a shutdown ownership defect: a full command queue could discard Shutdown and make Drop join indefinitely; an independent atomic cancellation path plus saturated-queue regression now passes. Slice remains in progress and uncommitted. Remaining: multi-process/store-refresh skepticism, exact write-scope contract, public tool/startup/CLI/frontend E2E, authority regressions, strict native/full/Windows gates, complete diff review, and S-088 VDD.",
+          "created_at": "2026-08-22T00:16:38.100745960Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/aw6YjpAx/ykrIsm6dQmjQN7nBvxTIYMOcVT6XrPgDQ5qr60h1s5o9wmVdD0Dl4ZwVJESU5Ow0XHlkwMFHZsCQ=="
         },
         "ae90e5ab-e768-44da-97dd-6c809ac96acd": {
           "display_id": 1114,
@@ -31222,11 +31231,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 832,
       "timestamp": "2026-08-22T00:16:33.149042674Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 833,
+      "timestamp": "2026-08-22T00:16:38.103019021Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T00:16:33.149042674Z",
+    "timestamp": "2026-08-22T00:16:38.103019021Z",
     "agent_id": "6Vw9",
-    "agent_seq": 832
+    "agent_seq": 833
   }
 }
