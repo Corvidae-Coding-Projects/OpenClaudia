@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1170,
+  "next_comment_id": 1171,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9119,7 +9119,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:53:08.818081581Z",
-      "updated_at": "2026-08-22T13:57:46.223721236Z",
+      "updated_at": "2026-08-22T13:57:50.539023104Z",
       "labels": [
         "remediation"
       ],
@@ -9132,6 +9132,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcwnjUkhTpDFFFL/uDYd2d8wIDAI8rh/v68z8+QUDs47TxBgBHrAsMk6zvJICPTgaADV+IUq+kuBfC6ofLal5AQ=="
+        },
+        "364e9528-95ad-4a4c-9cb0-f6d4540aec93": {
+          "display_id": 1170,
+          "author": "6Vw9",
+          "content": "S-055 documentation now records the actual opt-in canonical architecture, no-prose boundary, exact tool/result/workspace/task binding, evaluation metrics (retrieval 1/1, false learning 0/5, harmful 0/6, causal correction 1/1, user correction 4/4), S-105 artifact regeneration, VDD dependency S-088, run-retirement boundary, and ACP typed-partial defect #1090 without overstating parity.",
+          "created_at": "2026-08-22T13:57:50.536095116Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl/qOqI0ghSmFM6u6WyuQXXdsZqxbO+sS8N1FKSd5TA9mOYfoxwkiQwZ0RZBDVBR8Vx9LyygviOAAUzT1VvtiAw=="
         },
         "3bb8e426-53d9-4a6c-99d9-38dd8a1fa9df": {
           "display_id": 1160,
@@ -32231,11 +32240,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 912,
       "timestamp": "2026-08-22T13:57:46.223721236Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 913,
+      "timestamp": "2026-08-22T13:57:50.539023104Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T13:57:46.223721236Z",
+    "timestamp": "2026-08-22T13:57:50.539023104Z",
     "agent_id": "6Vw9",
-    "agent_seq": 912
+    "agent_seq": 913
   }
 }
