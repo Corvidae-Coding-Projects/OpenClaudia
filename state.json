@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1081,
+  "next_display_id": 1082,
   "next_comment_id": 1124,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -500,6 +500,7 @@
     "7f0125e0-a203-47a3-8aa7-41141927db20": 166,
     "7f243bc9-9bb4-47c5-b94e-a0c6286418bf": 121,
     "7f55337f-3cc2-47e1-a287-6b6e7b82e15e": 511,
+    "7f786cee-23a3-43c9-aeec-7cd2979dd67c": 1081,
     "7f9da092-5b97-426c-b27e-9e2c59bd83bd": 846,
     "7fb42a7a-a7d8-47e9-978f-7843cbf73e4f": 1079,
     "7fec1cfd-d63d-4d21-b47b-1381d4b409c4": 805,
@@ -13903,6 +13904,18 @@
       "labels": [
         "claude-code-parity,services"
       ]
+    },
+    "7f786cee-23a3-43c9-aeec-7cd2979dd67c": {
+      "uuid": "7f786cee-23a3-43c9-aeec-7cd2979dd67c",
+      "display_id": 1081,
+      "title": "Add typed causal resolution for technical-memory conflict heads",
+      "description": "S-053/S-054 preserve concurrent technical-lesson heads, and S-104 exposes their digests, but the canonical memory_update contract rejects every conflicted logical ID. Add an explicit bounded resolution request that names the complete expected head set, exposes each branch as cited untrusted evidence, publishes one immutable merge/resolution revision causally superseding all named heads, rejects stale/incomplete head sets, replicates idempotently, and never uses last-writer-wins or prose equality. Cover private and authenticated-team scopes, offline convergence, replay, tombstones, schema migration, tool/frontends, output budgets, and adversarial incomplete/forged resolutions.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T01:12:28.361756220Z",
+      "updated_at": "2026-08-22T01:12:28.361756220Z"
     },
     "7f9da092-5b97-426c-b27e-9e2c59bd83bd": {
       "uuid": "7f9da092-5b97-426c-b27e-9e2c59bd83bd",
@@ -31236,11 +31249,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 833,
       "timestamp": "2026-08-22T00:16:38.103019021Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 834,
+      "timestamp": "2026-08-22T01:12:28.361756220Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T00:16:38.103019021Z",
+    "timestamp": "2026-08-22T01:12:28.361756220Z",
     "agent_id": "6Vw9",
-    "agent_seq": 833
+    "agent_seq": 834
   }
 }
