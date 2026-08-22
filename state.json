@@ -9400,12 +9400,13 @@
       "display_id": 1095,
       "title": "Route ACP test toolchain discovery through the shared test subprocess runner",
       "description": "The all-target Rust 1.98 runner exposed a direct std::process::Command constructor in the cfg(test)-only ACP toolchain resolver added for #1093. Production is unaffected, but the structural subprocess boundary correctly requires even test-owned process creation in agent modules to use the centralized cfg(test) host runner. Replace the direct constructor with the bounded shared helper and retain exact rustup toolchain resolution.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "c66389ba-d0ad-45ff-8c03-d8796d1a7f55",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T18:39:29.729761803Z",
-      "updated_at": "2026-08-22T19:01:30.119212617Z",
+      "updated_at": "2026-08-22T19:01:51.312228736Z",
+      "closed_at": "2026-08-22T19:01:51.312227382Z",
       "comments": {
         "0bde7356-e470-4ffb-a0cf-e7db58d1da7a": {
           "display_id": 1215,
@@ -33125,11 +33126,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 986,
       "timestamp": "2026-08-22T19:01:44.638196507Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 987,
+      "timestamp": "2026-08-22T19:01:51.312228736Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T19:01:44.638196507Z",
+    "timestamp": "2026-08-22T19:01:51.312228736Z",
     "agent_id": "6Vw9",
-    "agent_seq": 986
+    "agent_seq": 987
   }
 }
