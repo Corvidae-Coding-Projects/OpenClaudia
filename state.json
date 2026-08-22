@@ -1,6 +1,6 @@
 {
   "next_display_id": 1084,
-  "next_comment_id": 1140,
+  "next_comment_id": 1141,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11456,10 +11456,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T05:20:24.264343266Z",
-      "updated_at": "2026-08-22T05:20:28.662384245Z",
+      "updated_at": "2026-08-22T05:23:50.044225424Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "03b5c59c-9940-443b-af02-78cefbfcbfe6": {
+          "display_id": 1140,
+          "author": "6Vw9",
+          "content": "Implement one bounded versioned TaskGraph as the source of truth. Mutations build and validate a complete proposed snapshot, require an expected graph generation, publish through S-031 descriptor-safe persistence, and only then replace live state. Preserve stable task IDs, dependency/readiness semantics, active forms, history, pagination, actor/run provenance, and explicit conflict/error results. Route task, todo, plan, delegation, and Crosslink through adapters; external issue metadata remains provenance and never becomes security identity. Do not retain synchronized duplicate maps or delete intended surfaces.",
+          "created_at": "2026-08-22T05:23:50.041636686Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAC68stdZ8WOguRjQgL2aT9VRQXeA/Eig/CkGoLQa/fJ5wDFIPyndzsEBGLmTfKEp8qAeoiry/3k2pSbES6NL9AA=="
+        }
+      }
     },
     "66da9b0b-6a96-4aa7-8f13-8d44fde26ece": {
       "uuid": "66da9b0b-6a96-4aa7-8f13-8d44fde26ece",
@@ -31584,11 +31595,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 862,
       "timestamp": "2026-08-22T05:20:33.653107694Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 863,
+      "timestamp": "2026-08-22T05:23:50.044225424Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T05:20:33.653107694Z",
+    "timestamp": "2026-08-22T05:23:50.044225424Z",
     "agent_id": "6Vw9",
-    "agent_seq": 862
+    "agent_seq": 863
   }
 }
