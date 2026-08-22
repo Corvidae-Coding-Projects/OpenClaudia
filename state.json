@@ -1,6 +1,6 @@
 {
   "next_display_id": 1098,
-  "next_comment_id": 1223,
+  "next_comment_id": 1224,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7185,10 +7185,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T20:09:04.265494868Z",
-      "updated_at": "2026-08-22T20:09:08.403326911Z",
+      "updated_at": "2026-08-22T20:13:48.945776192Z",
       "labels": [
         "ci"
-      ]
+      ],
+      "comments": {
+        "4fc69731-2c40-4a67-971f-d9d963293002": {
+          "display_id": 1223,
+          "author": "6Vw9",
+          "content": "Root cause reproduced from the runner contract: the real-workspace-generation test built its ToolRunContext with the deterministic restricted PATH, while GitHub's Rust 1.98 executable is supplied by rustup under the runner home. Both rustc invocations can therefore return typed partial command failures; the second assertion checked only !is_error and mistakenly accepted partial failure, leaving the learning state at evidence_recorded. Fix: use the explicit host-toolchain run capability for this one test and reject both error and partial outcomes for the successful verification.",
+          "created_at": "2026-08-22T20:13:48.943108346Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAyzOLn8WeZGwpDJCAs5QdtYotd7ioMGS1Q1Qj5sZWPP1R3m2c8jieWZgJvWziOuiYoJv26wEwZbND6sWmBXPeBA=="
+        }
+      }
     },
     "3b829f02-7116-4a6d-8e25-0ee0625f8b26": {
       "uuid": "3b829f02-7116-4a6d-8e25-0ee0625f8b26",
@@ -33285,11 +33296,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1000,
       "timestamp": "2026-08-22T20:09:08.403326911Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1001,
+      "timestamp": "2026-08-22T20:13:48.945776192Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T20:09:08.403326911Z",
+    "timestamp": "2026-08-22T20:13:48.945776192Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1000
+    "agent_seq": 1001
   }
 }
