@@ -1,6 +1,6 @@
 {
   "next_display_id": 1085,
-  "next_comment_id": 1145,
+  "next_comment_id": 1146,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11457,7 +11457,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T05:20:24.264343266Z",
-      "updated_at": "2026-08-22T06:21:39.874120557Z",
+      "updated_at": "2026-08-22T06:46:27.012401225Z",
       "labels": [
         "remediation"
       ],
@@ -11497,6 +11497,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGWJnDAXSmOfmaP1wCYVGCQC/obtJxdz/SpYPMu6HxcWL6Qz+QA3l1LhMWkaZTsayElHdqkNvuv1e5StskF7GCQ=="
+        },
+        "fde7c5aa-922c-4e3b-a2bb-3f5773564ed5": {
+          "display_id": 1145,
+          "author": "6Vw9",
+          "content": "[action] S-052 Crosslink adapter now reconciles bounded dependency-closed issue observations into the canonical graph with typed partial outcomes; priority/readiness and terminal lifecycle are implemented. Rust 1.98 graph 13/13 and Crosslink 12/12 pass.",
+          "created_at": "2026-08-22T06:46:27.009761344Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPyPaTADDpOhQhYaxBiNCIr36qRS8n/xb4VYDnl4C1XBEok2FtomEj/Cj9DE9etROgktG01/ISzCHKGg25+Z5Dg=="
         }
       }
     },
@@ -31684,11 +31693,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 869,
       "timestamp": "2026-08-22T06:46:22.811849836Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 870,
+      "timestamp": "2026-08-22T06:46:27.012401225Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T06:46:22.811849836Z",
+    "timestamp": "2026-08-22T06:46:27.012401225Z",
     "agent_id": "6Vw9",
-    "agent_seq": 869
+    "agent_seq": 870
   }
 }
