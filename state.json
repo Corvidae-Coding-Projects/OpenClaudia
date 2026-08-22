@@ -1,6 +1,6 @@
 {
   "next_display_id": 1101,
-  "next_comment_id": 1245,
+  "next_comment_id": 1246,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15662,8 +15662,17 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T22:04:35.596607994Z",
-      "updated_at": "2026-08-22T22:07:47.263094082Z",
+      "updated_at": "2026-08-22T22:12:53.658190397Z",
       "comments": {
+        "aafe0a14-0718-473e-91eb-f0d90fda83be": {
+          "display_id": 1245,
+          "author": "6Vw9",
+          "content": "Preflight complete. Objective: lossless OpenAI Responses continuation under the existing store:false/ZDR-safe transport. Canonical design: capture response.completed identity plus exact ordered output items before tool dispatch; accumulate them in the S-044 ProviderNativeState envelope; bind each native response group to the non-system ordinal of its portable assistant projection; on every request, the OpenAI adapter substitutes the exact native group for that flattened assistant projection and retains subsequent user/function_call_output items. Persist response IDs as evidence (not previous_response_id, which is incompatible with the current stateless contract), replay encrypted reasoning/compaction/message/function-call items unchanged including phase, require a valid response.completed event, and atomically sync portable plus native state. Affected paths: providers/openai.rs + contract, pipeline request/stream state machine, TUI follow-up/session event/state install, deterministic fixtures and persistence tests. Prompt/grounding only add system context, so non-system ordinals remain stable. Risks: bounded-state exhaustion must fail before tool effects; internal projection metadata must never reach HTTP; provider/model/protocol drift remains denied. Constraints: Rust 1.98, store:false, no Claude/subagents, no adjacent slice completion claims, exact Crosslink changelog only after implementation.",
+          "created_at": "2026-08-22T22:12:53.655524497Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOZPqbhgSont1lo/g45boy6h+T4WZU1Zy+3OVKB0JVpKZnlsenDiz83iJ+3ESrFKGRy6rYE0mpM2qiPOXISjEAQ=="
+        },
         "c860a725-56aa-47f1-96ce-45a74a18ea7e": {
           "display_id": 1244,
           "author": "6Vw9",
@@ -33699,11 +33708,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1034,
       "timestamp": "2026-08-22T22:07:47.263094082Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1035,
+      "timestamp": "2026-08-22T22:12:53.658190397Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T22:07:47.263094082Z",
+    "timestamp": "2026-08-22T22:12:53.658190397Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1034
+    "agent_seq": 1035
   }
 }
