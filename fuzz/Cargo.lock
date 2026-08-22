@@ -2970,6 +2970,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "openclaudia"
 version = "0.5.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arboard",
  "arborium",
@@ -2986,6 +2987,8 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "htmd",
+ "hyper",
+ "hyper-util",
  "indicatif",
  "libc",
  "rand 0.10.2",
@@ -2993,6 +2996,8 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "rustyline",
  "serde",
  "serde_json",
@@ -3002,6 +3007,7 @@ dependencies = [
  "similar",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -3875,6 +3881,7 @@ version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
