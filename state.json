@@ -1,6 +1,6 @@
 {
   "next_display_id": 1094,
-  "next_comment_id": 1201,
+  "next_comment_id": 1202,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24099,10 +24099,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T17:47:38.500723890Z",
-      "updated_at": "2026-08-22T17:47:42.665259811Z",
+      "updated_at": "2026-08-22T17:50:51.490503698Z",
       "labels": [
         "ci"
-      ]
+      ],
+      "comments": {
+        "f4c2c96a-456b-46a7-a86e-29410586c7be": {
+          "display_id": 1201,
+          "author": "6Vw9",
+          "content": "Regenerate fuzz/Cargo.lock with Cargo 1.98.0, verify the exact locked metadata/check/Clippy/test/audit commands used by CI, commit only the lockfile repair, close the issue, and preserve Crosslink's generated changelog as a separate signed commit.",
+          "created_at": "2026-08-22T17:50:51.479867096Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABApJ14SbVz/lDhY7zgBhC/VsOw5+V8G8463BoTPuikJwqDankM5X2A6fYm7eNog5ljqWB8sGcos3RgJB/UlftCDg=="
+        }
+      }
     },
     "e0f2c5e6-9871-4d93-81e6-06e757e91e47": {
       "uuid": "e0f2c5e6-9871-4d93-81e6-06e757e91e47",
@@ -32817,11 +32828,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 961,
       "timestamp": "2026-08-22T17:48:08.696508593Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 962,
+      "timestamp": "2026-08-22T17:50:51.490503698Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T17:48:08.696508593Z",
+    "timestamp": "2026-08-22T17:50:51.490503698Z",
     "agent_id": "6Vw9",
-    "agent_seq": 961
+    "agent_seq": 962
   }
 }
