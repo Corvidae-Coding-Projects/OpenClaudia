@@ -111,9 +111,14 @@ fn checked_in_corpora_bind_real_repository_sources() {
                     ),
                     "checked-in evaluation citation must be file-verifiable"
                 );
+                let slice_worktree = citation
+                    .source_version
+                    .strip_prefix("worktree:s")
+                    .is_some_and(|slice| {
+                        slice.len() == 3 && slice.bytes().all(|byte| byte.is_ascii_digit())
+                    });
                 assert!(
-                    citation.source_version.starts_with("git:")
-                        || citation.source_version == "worktree:s105",
+                    citation.source_version.starts_with("git:") || slice_worktree,
                     "citation source version must identify its repository generation"
                 );
                 if let Some(revision) = citation.source_version.strip_prefix("git:") {

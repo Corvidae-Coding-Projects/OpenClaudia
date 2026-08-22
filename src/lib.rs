@@ -56,6 +56,7 @@ pub mod skills;
 pub mod slash_commands;
 pub mod state;
 pub mod subagent;
+pub mod task_graph;
 pub mod task_spec;
 pub mod team_memory;
 pub mod thinking;

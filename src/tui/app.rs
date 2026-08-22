@@ -897,6 +897,11 @@ impl App {
         let transcript_subscriber =
             crate::transcript::TranscriptStateSubscriber::new(chat_session.state_store());
         let run_context = build_startup_session_run_context(&chat_session, provider);
+        let task_manager = run_context
+            .as_ref()
+            .ok()
+            .and_then(|run| crate::session::TaskManager::for_run(run).ok())
+            .unwrap_or_default();
         Self {
             messages: MessageList::new(),
             input: TextInput::new(),
@@ -928,11 +933,22 @@ impl App {
             pending_user_question: None,
             hook_engine: None,
             policy_enforcer,
-            task_mgr: std::sync::Arc::new(
-                std::sync::Mutex::new(crate::session::TaskManager::new()),
-            ),
+            task_mgr: std::sync::Arc::new(std::sync::Mutex::new(task_manager)),
             overlay: None,
         }
+    }
+
+    /// Upgrade the selected startup/resume session to its descriptor-safe
+    /// durable canonical task graph.
+    ///
+    /// # Errors
+    /// Returns an error when the run context or durable graph root cannot be
+    /// opened and validated.
+    pub fn bind_durable_task_graph(&mut self) -> Result<(), String> {
+        let run = self.tool_run_context()?;
+        let manager = crate::session::TaskManager::open_for_run(&run)?;
+        self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(manager));
+        Ok(())
     }
 
     /// Open the help-cheatsheet overlay. Subsequent keystrokes go to
@@ -958,6 +974,25 @@ impl App {
                 return false;
             }
         };
+        let durable_tasks = self
+            .task_mgr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_durable();
+        let next_task_manager = if durable_tasks {
+            crate::session::TaskManager::open_for_run(&next_run)
+        } else {
+            crate::session::TaskManager::for_run(&next_run)
+        };
+        let next_task_manager = match next_task_manager {
+            Ok(manager) => manager,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Cannot bind the loaded session task graph: {error}"
+                )));
+                return false;
+            }
+        };
         let permission_bypass = self.chat_session.permission_bypass_enabled();
         if let Some(config) = self.app_config.as_ref() {
             if let Err(error) = crate::guardrails::configure(&next_run, &config.guardrails) {
@@ -977,6 +1012,7 @@ impl App {
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
         self.run_context = Ok(std::sync::Arc::clone(&next_run));
+        self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(next_task_manager));
         self.rebind_permission_manager(&next_run);
         self.refresh_prompt_context_for_run();
         self.rebind_mcp_runtime(&next_run);

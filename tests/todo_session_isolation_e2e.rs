@@ -22,8 +22,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 mod support;
 
 // ───────────────────────────────────────────────────────────────────────────
-// Global lock — TODO_LISTS is process-wide; tests serialize via this lock
-// so they don't race on the shared HashMap.
+// The compatibility graph map is process-wide; serialize legacy adapter
+// assertions while production frontends use explicit task managers.
 // ───────────────────────────────────────────────────────────────────────────
 
 fn todo_lock() -> MutexGuard<'static, ()> {
@@ -61,6 +61,8 @@ fn todo_status_deserializes_from_snake_case_strings() {
         ("\"pending\"", TodoStatus::Pending),
         ("\"in_progress\"", TodoStatus::InProgress),
         ("\"completed\"", TodoStatus::Completed),
+        ("\"failed\"", TodoStatus::Failed),
+        ("\"canceled\"", TodoStatus::Canceled),
     ] {
         let parsed: TodoStatus = serde_json::from_str(input).expect("de");
         assert_eq!(parsed, *expected);
@@ -75,11 +77,13 @@ fn todo_status_rejects_uppercase_or_kebab_case() {
 }
 
 #[test]
-fn todo_status_round_trips_all_3_variants() {
+fn todo_status_round_trips_all_variants() {
     for v in &[
         TodoStatus::Pending,
         TodoStatus::InProgress,
         TodoStatus::Completed,
+        TodoStatus::Failed,
+        TodoStatus::Canceled,
     ] {
         let json = serde_json::to_string(v).expect("ser");
         let back: TodoStatus = serde_json::from_str(&json).expect("de");
@@ -96,6 +100,8 @@ fn todo_status_is_copy_and_pairwise_distinct() {
     assert_ne!(TodoStatus::Pending, TodoStatus::InProgress);
     assert_ne!(TodoStatus::InProgress, TodoStatus::Completed);
     assert_ne!(TodoStatus::Pending, TodoStatus::Completed);
+    assert_ne!(TodoStatus::Completed, TodoStatus::Failed);
+    assert_ne!(TodoStatus::Failed, TodoStatus::Canceled);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -105,6 +111,8 @@ fn todo_status_is_copy_and_pairwise_distinct() {
 #[test]
 fn todo_item_serializes_active_form_as_camel_case_active_form() {
     let item = TodoItem {
+        task_id: "task-1".to_string(),
+        revision: 1,
         content: "do thing".to_string(),
         status: TodoStatus::Pending,
         active_form: "Doing thing".to_string(),
@@ -124,6 +132,8 @@ fn todo_item_serializes_active_form_as_camel_case_active_form() {
 #[test]
 fn todo_item_deserializes_from_active_form_camel_case() {
     let json = r#"{
+        "task_id": "task-1",
+        "revision": 1,
         "content": "task",
         "status": "in_progress",
         "activeForm": "Tasking"
@@ -137,6 +147,8 @@ fn todo_item_deserializes_from_active_form_camel_case() {
 #[test]
 fn todo_item_round_trips_full_shape() {
     let original = TodoItem {
+        task_id: "task-2".to_string(),
+        revision: 7,
         content: "implement feature".to_string(),
         status: TodoStatus::InProgress,
         active_form: "Implementing feature".to_string(),
@@ -146,11 +158,15 @@ fn todo_item_round_trips_full_shape() {
     assert_eq!(back.content, original.content);
     assert_eq!(back.status, original.status);
     assert_eq!(back.active_form, original.active_form);
+    assert_eq!(back.task_id, original.task_id);
+    assert_eq!(back.revision, original.revision);
 }
 
 #[test]
-fn todo_item_clone_preserves_all_three_fields() {
+fn todo_item_clone_preserves_all_fields() {
     let original = TodoItem {
+        task_id: "task-3".to_string(),
+        revision: 9,
         content: "c".to_string(),
         status: TodoStatus::Completed,
         active_form: "C".to_string(),
@@ -159,6 +175,8 @@ fn todo_item_clone_preserves_all_three_fields() {
     assert_eq!(cloned.content, original.content);
     assert_eq!(cloned.status, original.status);
     assert_eq!(cloned.active_form, original.active_form);
+    assert_eq!(cloned.task_id, original.task_id);
+    assert_eq!(cloned.revision, original.revision);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -174,6 +192,7 @@ fn write_one(run: &std::sync::Arc<ToolRunContext>, content: &str) {
             function: FunctionCall {
                 name: "todo_write".to_string(),
                 arguments: json!({
+                    "expected_generation": 0,
                     "todos": [{
                         "content": content,
                         "status": "in_progress",

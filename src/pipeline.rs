@@ -2401,28 +2401,34 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
     let policy_for_blocking = policy_enforcer;
     let task_mgr_for_blocking = task_mgr;
     let run_context_for_blocking = Arc::clone(&run_context);
+    let uses_task_graph = tools::uses_canonical_task_graph(tool_name);
     let result = tokio::task::spawn_blocking(move || {
-        // Lock the TaskManager only inside the blocking thread so we
-        // don't hold the mutex across `.await`. Failure-mode parity with
-        // the legacy "no session" branch: poisoned mutex → recover the
-        // inner data rather than panicking, so a single panicking task
-        // tool doesn't take down the entire TUI session.
-        let mut task_guard = task_mgr_for_blocking
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::services::tool_executor::ToolExecutor::execute(
-            crate::services::tool_executor::ToolExecutorRequest {
-                run_context: &run_context_for_blocking,
-                tool_call: &tool_call_clone,
-                memory_db: mem_db.as_deref(),
-                app_config: app_config_for_blocking.as_deref(),
-                task_mgr: Some(&mut *task_guard),
-                permission_mgr: perm_mgr.as_ref(),
-                authorization: authorization_for_blocking,
-                session_id: session_for_blocking.as_deref(),
-                policy_enforcer: policy_for_blocking.as_deref(),
-            },
-        )
+        let execute = |task_mgr: Option<&mut crate::session::TaskManager>| {
+            crate::services::tool_executor::ToolExecutor::execute(
+                crate::services::tool_executor::ToolExecutorRequest {
+                    run_context: &run_context_for_blocking,
+                    tool_call: &tool_call_clone,
+                    memory_db: mem_db.as_deref(),
+                    app_config: app_config_for_blocking.as_deref(),
+                    task_mgr,
+                    permission_mgr: perm_mgr.as_ref(),
+                    authorization: authorization_for_blocking,
+                    session_id: session_for_blocking.as_deref(),
+                    policy_enforcer: policy_for_blocking.as_deref(),
+                },
+            )
+        };
+        if uses_task_graph {
+            // The lock is acquired on the blocking worker only for handlers
+            // that consume task state. Unrelated file/process/network tools
+            // remain independent of planning persistence.
+            let mut task_guard = task_mgr_for_blocking
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            execute(Some(&mut task_guard))
+        } else {
+            execute(None)
+        }
     })
     .await
     .unwrap_or_else(|e| {

@@ -14,9 +14,18 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
 
-use openclaudia::tools::crosslink::{classify_operation, OPERATIONS};
+use openclaudia::{
+    permissions::PermissionManager,
+    session::TaskManager,
+    task_graph::{TaskActor, TaskSource},
+    tools::{
+        crosslink::{classify_operation, OPERATIONS},
+        execute_tool_with_tasks,
+    },
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 mod support;
 
@@ -119,4 +128,48 @@ fn every_declared_operation_classifies_without_touching_the_database() {
             .unwrap_or_else(|e| panic!("{}: {e}", op.name));
         assert_eq!(classified.effect, op.effect);
     }
+}
+
+#[test]
+fn registry_dispatch_reconciles_crosslink_records_into_bound_canonical_graph() {
+    let root = tempfile::tempdir().expect("isolated Crosslink workspace");
+    let run = support::test_run_context(root.path());
+    let mut manager = TaskManager::open(
+        root.path(),
+        PathBuf::from("tasks.json"),
+        "registry-crosslink-adapter",
+        TaskActor::from_run(&run),
+    )
+    .expect("canonical task manager");
+    let args = args_with(&[
+        ("operation", json!("create")),
+        ("title", json!("Registry-created external work")),
+        ("description", json!("Must appear in the canonical graph")),
+        ("priority", json!("high")),
+    ]);
+    let result = execute_tool_with_tasks(
+        &run,
+        &support::tool_call("crosslink", &args),
+        None,
+        None,
+        Some(&mut manager),
+        &PermissionManager::unrestricted(),
+    );
+
+    assert!(!result.is_error(), "result: {result:?}");
+    assert!(!result.is_partial(), "result: {result:?}");
+    assert_eq!(
+        result
+            .structured()
+            .and_then(|value| value.get("task_graph"))
+            .and_then(Value::as_str),
+        Some("reconciled")
+    );
+    let projected = manager
+        .list_tasks()
+        .iter()
+        .find(|task| matches!(task.source, TaskSource::ExternalIssue { .. }))
+        .expect("registry must pass the bound manager to the Crosslink adapter");
+    assert_eq!(projected.subject, "Registry-created external work");
+    assert!(root.path().join(".crosslink/issues.db").is_file());
 }

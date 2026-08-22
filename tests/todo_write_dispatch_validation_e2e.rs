@@ -40,6 +40,7 @@ fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
     let mut m = HashMap::new();
+    m.insert("expected_generation".to_string(), json!(0));
     for (k, v) in entries {
         m.insert((*k).to_string(), v.clone());
     }
@@ -181,7 +182,7 @@ fn todo_item_wrong_type_status_field_returns_indexed_error() {
     assert!(is_err);
     assert_eq!(
         msg,
-        "Todo 0 'status' must be a string. Must be: pending, in_progress, completed"
+        "Todo 0 'status' must be a string. Must be: pending, in_progress, completed, failed, canceled"
     );
 }
 
@@ -220,7 +221,7 @@ fn todo_item_wrong_type_active_form_field_returns_indexed_error() {
 }
 
 #[test]
-fn todo_item_invalid_status_value_returns_documented_3_choice_error() {
+fn todo_item_invalid_status_value_returns_documented_lifecycle_choices() {
     let _l = todo_lock();
     let args = args_with(&[(
         "todos",
@@ -236,10 +237,14 @@ fn todo_item_invalid_status_value_returns_documented_3_choice_error() {
         msg.contains("Todo 0 has invalid status") && msg.contains("not_a_status"),
         "MUST echo offending status; got {msg:?}"
     );
-    // PINS DOC: error lists 3 valid statuses.
+    // PINS DOC: error lists every canonical lifecycle status accepted by this view.
     assert!(
-        msg.contains("pending") && msg.contains("in_progress") && msg.contains("completed"),
-        "MUST list 3 documented statuses; got {msg:?}"
+        msg.contains("pending")
+            && msg.contains("in_progress")
+            && msg.contains("completed")
+            && msg.contains("failed")
+            && msg.contains("canceled"),
+        "MUST list all documented statuses; got {msg:?}"
     );
 }
 
@@ -306,6 +311,57 @@ fn todo_item_content_at_exactly_2000_bytes_accepted() {
     clear_all_todo_lists();
 }
 
+#[test]
+fn todo_write_rejects_empty_and_oversized_active_fields_before_publication() {
+    let _lock = todo_lock();
+    clear_all_todo_lists();
+    for (content, active_form) in [
+        ("   ".to_string(), "Working".to_string()),
+        (
+            "bounded".to_string(),
+            "a".repeat(openclaudia::task_graph::MAX_TASK_ACTIVE_FORM_BYTES + 1),
+        ),
+    ] {
+        let args = args_with(&[(
+            "todos",
+            json!([{
+                "content": content,
+                "status": "pending",
+                "activeForm": active_form
+            }]),
+        )]);
+        let (message, is_error) = dispatch("todo_write", &args);
+        assert!(is_error, "invalid todo unexpectedly succeeded: {message}");
+        let (read, read_error) = dispatch("todo_read", &HashMap::new());
+        assert!(!read_error);
+        assert!(
+            read.contains("No todos"),
+            "failed write mutated state: {read}"
+        );
+    }
+}
+
+#[test]
+fn todo_write_rejects_oversized_complete_view_before_item_parsing() {
+    let _lock = todo_lock();
+    clear_all_todo_lists();
+    let item = json!({
+        "content": "bounded",
+        "status": "pending",
+        "activeForm": "Tracking bounds"
+    });
+    let todos = vec![item; openclaudia::task_graph::MAX_TASKS + 1];
+    let (message, is_error) = dispatch("todo_write", &args_with(&[("todos", json!(todos))]));
+    assert!(is_error);
+    assert!(message.contains("canonical limit"), "{message}");
+    let (read, read_error) = dispatch("todo_read", &HashMap::new());
+    assert!(!read_error);
+    assert!(
+        read.contains("No todos"),
+        "oversized write mutated state: {read}"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section D — All-done auto-clear branch (#972)
 // ───────────────────────────────────────────────────────────────────────────
@@ -367,11 +423,11 @@ fn empty_todos_array_does_not_trigger_auto_clear() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section E — Multiple in_progress warning
+// Section E — Multiple in_progress rejection
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn multiple_in_progress_items_emits_warning() {
+fn multiple_in_progress_items_are_rejected_without_partial_state() {
     let _l = todo_lock();
     clear_all_todo_lists();
     let args = args_with(&[(
@@ -383,10 +439,16 @@ fn multiple_in_progress_items_emits_warning() {
         ]),
     )]);
     let (msg, is_err) = dispatch("todo_write", &args);
-    assert!(!is_err);
+    assert!(is_err);
     assert!(
-        msg.contains("Warning") && msg.contains("3 tasks marked as in_progress"),
-        "MUST surface multi-in_progress warning; got {msg:?}"
+        msg.contains("multiple in-progress"),
+        "MUST surface the canonical actor-lane invariant; got {msg:?}"
+    );
+    let (read, read_error) = dispatch("todo_read", &HashMap::new());
+    assert!(!read_error);
+    assert!(
+        read.contains("No todos"),
+        "failed write mutated state: {read}"
     );
     clear_all_todo_lists();
 }

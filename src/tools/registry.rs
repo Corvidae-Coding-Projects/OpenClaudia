@@ -367,6 +367,7 @@ impl ToolHandler for BashHandler {
                 "description": "Execute a bash shell command and return the output. On Windows, Git Bash is used so standard Unix commands (ls, grep, find, cat, etc.) work normally. Use this for running commands, installing packages, git operations, file exploration, etc. Use run_in_background for long-running commands.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "command": {
                             "type": "string",
@@ -987,13 +988,13 @@ impl ToolHandler for CrosslinkHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        crosslink_tool::execute_crosslink(ctx.run, args)
+    ) -> ToolHandlerResult {
+        crosslink_tool::execute_crosslink_with_tasks(ctx.run, args, ctx.task_mgr.as_deref_mut())
     }
 }
 
@@ -1843,24 +1844,47 @@ impl ToolHandler for TodoWriteHandler {
                 "description": "Create and manage a structured task list. Use this as a fallback when crosslink is unavailable. Helps track progress and show the user what you're working on. Only one task should be 'in_progress' at a time.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
+                        "expected_generation": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Canonical graph generation returned by todo_read or task_list"
+                        },
                         "todos": {
                             "type": "array",
+                            "maxItems": crate::task_graph::MAX_TASKS,
                             "description": "The complete todo list (replaces existing list)",
                             "items": {
                                 "type": "object",
+                                "additionalProperties": false,
                                 "properties": {
+                                    "task_id": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": crate::task_graph::MAX_TASK_ID_BYTES,
+                                        "description": "Stable task id from todo_read; omit only for a new row"
+                                    },
+                                    "expected_task_revision": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "description": "Exact revision from todo_read; omit only for a new row"
+                                    },
                                     "content": {
                                         "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": todo::TODO_CONTENT_MAX_BYTES,
                                         "description": "Task description in imperative form (e.g., 'Fix the bug')"
                                     },
                                     "status": {
                                         "type": "string",
-                                        "enum": ["pending", "in_progress", "completed"],
+                                        "enum": ["pending", "in_progress", "completed", "failed", "canceled"],
                                         "description": "Task status"
                                     },
                                     "activeForm": {
                                         "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": crate::task_graph::MAX_TASK_ACTIVE_FORM_BYTES,
                                         "description": "Task in present continuous form (e.g., 'Fixing the bug')"
                                     }
                                 },
@@ -1868,7 +1892,7 @@ impl ToolHandler for TodoWriteHandler {
                             }
                         }
                     },
-                    "required": ["todos"]
+                    "required": ["expected_generation", "todos"]
                 }
             }
         })
@@ -1879,7 +1903,10 @@ impl ToolHandler for TodoWriteHandler {
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        todo::execute_todo_write(ctx.run.session_id(), args)
+        ctx.task_mgr.as_deref_mut().map_or_else(
+            || todo::execute_todo_write_for_run(ctx.run, args),
+            |manager| todo::execute_todo_write(manager, args),
+        )
     }
 }
 
@@ -1899,6 +1926,7 @@ impl ToolHandler for TodoReadHandler {
                 "description": "Read the current todo list. Returns all tasks with their status.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {},
                     "required": []
                 }
@@ -1911,7 +1939,10 @@ impl ToolHandler for TodoReadHandler {
         _args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        todo::execute_todo_read(ctx.run.session_id())
+        ctx.task_mgr.as_deref_mut().map_or_else(
+            || todo::execute_todo_read_for_run(ctx.run),
+            todo::execute_todo_read,
+        )
     }
 }
 
@@ -2309,10 +2340,10 @@ impl ToolHandler for CronListHandler {
 // ── plan_mode ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "browser")]
-const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, memory_search, memory_list, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, task_get, task_list, memory_search, memory_list, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
 
 #[cfg(not(feature = "browser"))]
-const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, bash_output, todo_read, memory_search, memory_list, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. Browser-backed web_search and web_browser are unavailable in this build. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, bash_output, todo_read, task_get, task_list, memory_search, memory_list, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. Browser-backed web_search and web_browser are unavailable in this build. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
 
 struct EnterPlanModeHandler;
 impl ToolHandler for EnterPlanModeHandler {
@@ -2401,6 +2432,22 @@ impl ToolHandler for ExitPlanModeHandler {
 
 const NO_SESSION: (&str, bool) = ("Task management not available (no session)", true);
 
+fn task_budget_schema(description: &'static str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": description,
+        "properties": {
+            "max_turns": {"type": "integer", "minimum": 1, "maximum": crate::task_graph::MAX_TASK_BUDGET_TURNS},
+            "max_tokens": {"type": "integer", "minimum": 1, "maximum": crate::task_graph::MAX_TASK_BUDGET_TOKENS},
+            "max_elapsed_millis": {"type": "integer", "minimum": 1, "maximum": crate::task_graph::MAX_TASK_BUDGET_ELAPSED_MILLIS},
+            "max_cost_microusd": {"type": "integer", "minimum": 1, "maximum": crate::task_graph::MAX_TASK_BUDGET_COST_MICROUSD},
+            "max_child_runs": {"type": "integer", "minimum": 1, "maximum": crate::task_graph::MAX_TASK_BUDGET_CHILD_RUNS},
+            "max_concurrent_calls": {"type": "integer", "minimum": 1, "maximum": crate::task_graph::MAX_TASK_BUDGET_CONCURRENT_CALLS}
+        }
+    })
+}
+
 struct TaskCreateHandler;
 impl ToolHandler for TaskCreateHandler {
     fn name(&self) -> &'static str {
@@ -2414,24 +2461,42 @@ impl ToolHandler for TaskCreateHandler {
             "type": "function",
             "function": {
                 "name": "task_create",
-                "description": "Create a new structured task with dependency tracking. Tasks are stored in the session and support blocking/blocked_by relationships. Only one task can be in_progress at a time.",
+                "description": "Create a new structured task with dependency tracking. Tasks are stored in the session and support blocking/blocked_by relationships. Each actor/session lane has at most one non-delegated in-progress task; supervised delegated workers may run in parallel.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
+                        "expected_generation": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Canonical graph generation returned by task_list, task_get, or todo_read"
+                        },
                         "subject": {
                             "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::task_graph::MAX_TASK_SUBJECT_BYTES,
                             "description": "Brief title in imperative form (e.g., 'Add permission system')"
                         },
                         "description": {
                             "type": "string",
+                            "maxLength": crate::task_graph::MAX_TASK_DESCRIPTION_BYTES,
                             "description": "Detailed description of the task"
                         },
                         "active_form": {
                             "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::task_graph::MAX_TASK_ACTIVE_FORM_BYTES,
                             "description": "Present continuous form for spinner display (e.g., 'Adding permission system')"
-                        }
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["critical", "high", "medium", "low"],
+                            "default": "medium",
+                            "description": "Planning priority used for deterministic readiness ranking"
+                        },
+                        "budget": task_budget_schema("Optional bounded execution request. This is planning data; runtime admission remains authoritative.")
                     },
-                    "required": ["subject", "description"]
+                    "required": ["expected_generation", "subject", "description"]
                 }
             }
         })
@@ -2462,43 +2527,91 @@ impl ToolHandler for TaskUpdateHandler {
             "type": "function",
             "function": {
                 "name": "task_update",
-                "description": "Update an existing task's status, subject, description, or dependencies. Setting status to 'in_progress' will demote any currently in-progress task to 'pending'. Setting status to 'deleted' removes the task entirely.",
+                "description": "Update an existing task's status, subject, description, or dependencies. Setting status to 'in_progress' demotes the current non-delegated task in the same actor/session lane to 'pending'. Setting status to 'deleted' creates a dependency-free tombstone.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "task_id": {
                             "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::task_graph::MAX_TASK_ID_BYTES,
                             "description": "The task ID (e.g., 'task-1')"
                         },
                         "status": {
                             "type": "string",
-                            "enum": ["pending", "in_progress", "completed", "deleted"],
+                            "enum": ["pending", "in_progress", "completed", "failed", "canceled", "deleted"],
                             "description": "New task status"
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["critical", "high", "medium", "low"],
+                            "description": "New planning priority"
+                        },
+                        "expected_generation": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Canonical graph generation observed before this mutation"
+                        },
+                        "expected_task_revision": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Exact task revision observed before this mutation"
                         },
                         "subject": {
                             "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::task_graph::MAX_TASK_SUBJECT_BYTES,
                             "description": "Updated task title"
                         },
                         "description": {
                             "type": "string",
+                            "maxLength": crate::task_graph::MAX_TASK_DESCRIPTION_BYTES,
                             "description": "Updated task description"
                         },
                         "active_form": {
                             "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::task_graph::MAX_TASK_ACTIVE_FORM_BYTES,
                             "description": "Updated spinner text (present continuous form)"
+                        },
+                        "clear_active_form": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Explicitly clear the active-form text"
+                        },
+                        "budget": task_budget_schema("Replace the bounded task execution request. This does not grant runtime authority."),
+                        "clear_budget": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Explicitly clear the task-level execution request"
                         },
                         "add_blocks": {
                             "type": "array",
-                            "items": { "type": "string" },
+                            "maxItems": crate::task_graph::MAX_TASK_EDGES,
+                            "items": { "type": "string", "minLength": 1, "maxLength": crate::task_graph::MAX_TASK_ID_BYTES },
                             "description": "Task IDs that this task blocks (downstream dependencies)"
                         },
                         "add_blocked_by": {
                             "type": "array",
-                            "items": { "type": "string" },
+                            "maxItems": crate::task_graph::MAX_TASK_EDGES,
+                            "items": { "type": "string", "minLength": 1, "maxLength": crate::task_graph::MAX_TASK_ID_BYTES },
                             "description": "Task IDs that block this task (upstream dependencies)"
+                        },
+                        "remove_blocks": {
+                            "type": "array",
+                            "maxItems": crate::task_graph::MAX_TASK_EDGES,
+                            "items": { "type": "string", "minLength": 1, "maxLength": crate::task_graph::MAX_TASK_ID_BYTES },
+                            "description": "Existing downstream dependency IDs to remove"
+                        },
+                        "remove_blocked_by": {
+                            "type": "array",
+                            "maxItems": crate::task_graph::MAX_TASK_EDGES,
+                            "items": { "type": "string", "minLength": 1, "maxLength": crate::task_graph::MAX_TASK_ID_BYTES },
+                            "description": "Existing upstream dependency IDs to remove"
                         }
                     },
-                    "required": ["task_id"]
+                    "required": ["task_id", "expected_generation", "expected_task_revision"]
                 }
             }
         })
@@ -2532,9 +2645,12 @@ impl ToolHandler for TaskGetHandler {
                 "description": "Get full details of a specific task including its dependencies, status, and timestamps.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "task_id": {
                             "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::task_graph::MAX_TASK_ID_BYTES,
                             "description": "The task ID (e.g., 'task-1')"
                         }
                     },
@@ -2572,7 +2688,26 @@ impl ToolHandler for TaskListHandler {
                 "description": "List all tasks with their status and dependency summary. Shows pending, in-progress, and completed counts.",
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "additionalProperties": false,
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "default": 50,
+                            "description": "Maximum tasks returned in this page"
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "maxLength": crate::task_graph::MAX_PAGE_CURSOR_BYTES,
+                            "description": "Opaque generation-bound cursor returned by the prior page"
+                        },
+                        "ready_only": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Return only blocker-ready pending tasks in deterministic priority order; mutually exclusive with cursor"
+                        }
+                    },
                     "required": []
                 }
             }
@@ -2581,12 +2716,12 @@ impl ToolHandler for TaskListHandler {
     fn execute_legacy(
         &self,
         _permit: &ToolDispatchPermit,
-        _args: &HashMap<String, Value>,
+        args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
         ctx.task_mgr.as_deref_mut().map_or_else(
             || (NO_SESSION.0.to_string(), NO_SESSION.1),
-            |tm| task::execute_task_list(tm),
+            |tm| task::execute_task_list(args, tm),
         )
     }
 }

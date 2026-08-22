@@ -96,6 +96,9 @@ const _INTERNAL_ERROR: i64 = -32603;
 // ACP Server
 // ============================================================================
 
+type SharedAcpTaskManagers =
+    Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<crate::session::TaskManager>>>>>;
+
 /// ACP server state.
 pub struct AcpServer {
     /// Application config (providers, hooks, etc.)
@@ -113,6 +116,9 @@ pub struct AcpServer {
     session_map: HashMap<String, String>,
     /// ACP session ID -> exact immutable host capability generation.
     run_contexts: HashMap<String, Arc<crate::tools::ToolRunContext>>,
+    /// Durable canonical task graph handles, keyed by ACP session id and
+    /// rebound whenever that key maps to a different `OpenClaudia` run.
+    task_managers: SharedAcpTaskManagers,
     /// Host-owned technical lesson store shared by every isolated ACP session
     /// for this exact launch workspace.
     memory_db: Arc<crate::memory::MemoryDb>,
@@ -702,6 +708,7 @@ impl AcpServer {
         oc_session_id: String,
         run_context: Arc<crate::tools::ToolRunContext>,
     ) {
+        let replaced_acp_session_id = acp_session_id.clone();
         upsert_session_mapping_into(
             &mut self.session_map,
             &mut self.session_order,
@@ -720,6 +727,16 @@ impl AcpServer {
                 crate::tools::retire_run(&retired);
             }
         }
+        let mut task_managers = self
+            .task_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A reloaded ACP id can point at a different OpenClaudia run, so its
+        // old actor-bound handle must not survive replacement. Retain only
+        // live LRU keys to keep this cache under the same session cap.
+        task_managers.remove(&replaced_acp_session_id);
+        task_managers.retain(|session_id, _| self.session_map.contains_key(session_id));
+        drop(task_managers);
         self.replace_run_context(acp_session_id, run_context);
     }
 
@@ -907,6 +924,7 @@ impl AcpServer {
             hook_engine,
             session_map: HashMap::new(),
             run_contexts: HashMap::new(),
+            task_managers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             memory_db,
             session_order: VecDeque::new(),
             messages: Vec::new(),
@@ -2217,6 +2235,7 @@ impl AcpServer {
             arguments_json,
             policy_enforcer: Some(self.policy_enforcer.as_ref()),
             memory_db: Some(self.memory_db.as_ref()),
+            task_managers: Arc::clone(&self.task_managers),
         })
     }
 
@@ -2235,6 +2254,7 @@ impl AcpServer {
         let permission_mgr = self.permission_manager_for_run(run);
         let policy_enforcer = Arc::clone(&self.policy_enforcer);
         let memory_db = Arc::clone(&self.memory_db);
+        let task_managers = Arc::clone(&self.task_managers);
         let session_id = session_id.to_string();
         let tool_call_id = tool_call_id.to_string();
         let tool_name = tool_name.to_string();
@@ -2255,6 +2275,7 @@ impl AcpServer {
                 arguments_json: &arguments_json,
                 policy_enforcer: Some(policy_enforcer.as_ref()),
                 memory_db: Some(memory_db.as_ref()),
+                task_managers,
             })
         });
         loop {
@@ -2574,7 +2595,7 @@ fn validate_and_render_acp_final_response(
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AcpLocalToolRequest<'a> {
     run: &'a Arc<crate::tools::ToolRunContext>,
     permission_mgr: &'a PermissionManager,
@@ -2584,6 +2605,7 @@ struct AcpLocalToolRequest<'a> {
     arguments_json: &'a str,
     policy_enforcer: Option<&'a crate::services::policy::PolicyEnforcer>,
     memory_db: Option<&'a crate::memory::MemoryDb>,
+    task_managers: SharedAcpTaskManagers,
 }
 
 fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpToolResult {
@@ -2598,6 +2620,7 @@ fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpTo
         arguments_json,
         policy_enforcer,
         memory_db,
+        task_managers,
     } = request;
 
     let tc = ToolCall {
@@ -2609,19 +2632,67 @@ fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> AcpTo
         },
     };
 
-    let result = crate::services::tool_executor::ToolExecutor::execute(
-        crate::services::tool_executor::ToolExecutorRequest {
-            run_context: run,
-            tool_call: &tc,
-            memory_db,
-            app_config: None,
-            task_mgr: None,
-            permission_mgr,
-            authorization: None,
-            session_id: Some(session_id),
-            policy_enforcer,
-        },
-    );
+    let planning_tool = crate::tools::uses_canonical_task_graph(tool_name);
+    let result = if planning_tool {
+        let manager = {
+            let mut managers = task_managers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !managers.contains_key(session_id) {
+                let manager = match crate::session::TaskManager::open_for_run(run) {
+                    Ok(manager) => manager,
+                    Err(error) => {
+                        return AcpToolResult {
+                            content: format!("Task graph unavailable: {error}"),
+                            is_error: true,
+                        };
+                    }
+                };
+                managers.insert(
+                    session_id.to_string(),
+                    Arc::new(std::sync::Mutex::new(manager)),
+                );
+            }
+            let Some(manager) = managers.get(session_id).map(Arc::clone) else {
+                return AcpToolResult {
+                    content: "Task graph unavailable after initialization".to_string(),
+                    is_error: true,
+                };
+            };
+            drop(managers);
+            manager
+        };
+        let mut manager = manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::services::tool_executor::ToolExecutor::execute(
+            crate::services::tool_executor::ToolExecutorRequest {
+                run_context: run,
+                tool_call: &tc,
+                memory_db,
+                app_config: None,
+                task_mgr: Some(&mut manager),
+                permission_mgr,
+                authorization: None,
+                session_id: Some(session_id),
+                policy_enforcer,
+            },
+        )
+    } else {
+        crate::services::tool_executor::ToolExecutor::execute(
+            crate::services::tool_executor::ToolExecutorRequest {
+                run_context: run,
+                tool_call: &tc,
+                memory_db,
+                app_config: None,
+                task_mgr: None,
+                permission_mgr,
+                authorization: None,
+                session_id: Some(session_id),
+                policy_enforcer,
+            },
+        )
+    };
     AcpToolResult {
         content: result.content().to_string(),
         is_error: result.is_error(),
@@ -4050,6 +4121,7 @@ permissions:
             hook_engine: HookEngine::new(HooksConfig::default()),
             session_map: HashMap::new(),
             run_contexts,
+            task_managers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             memory_db,
             session_order: VecDeque::new(),
             messages: Vec::new(),
@@ -5460,8 +5532,12 @@ blast_radius:
 
 #[cfg(test)]
 mod acp_permission_gate_tests {
-    use super::{acp_list_files_command, execute_local_tool_with_permission, AcpLocalToolRequest};
+    use super::{
+        acp_list_files_command, execute_local_tool_with_permission, AcpLocalToolRequest,
+        SharedAcpTaskManagers,
+    };
     use crate::permissions::PermissionManager;
+    use std::sync::Arc;
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
         crate::tools::security::test_run_context()
@@ -5471,6 +5547,61 @@ mod acp_permission_gate_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = PermissionManager::new(tmp.path().join("permissions.json"), true, default_allow);
         (mgr, tmp)
+    }
+
+    fn task_managers() -> SharedAcpTaskManagers {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    #[test]
+    fn planning_tools_use_independent_per_session_manager_locks() {
+        let root_a = tempfile::tempdir().expect("ACP task root A");
+        let root_b = tempfile::tempdir().expect("ACP task root B");
+        let run_a = crate::tools::security::test_run_context_for(root_a.path());
+        let run_b = crate::tools::security::test_run_context_for(root_b.path());
+        let permission_manager = PermissionManager::unrestricted();
+        let task_managers = task_managers();
+        let arguments = r#"{"expected_generation":0,"subject":"task A","description":"A"}"#;
+        let first = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: &run_a,
+            permission_mgr: &permission_manager,
+            session_id: "acp-a",
+            tool_call_id: "task-a",
+            tool_name: "task_create",
+            arguments_json: arguments,
+            policy_enforcer: None,
+            memory_db: None,
+            task_managers: Arc::clone(&task_managers),
+        });
+        assert!(!first.is_error, "{}", first.content);
+
+        let manager_a = task_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("acp-a")
+            .map(Arc::clone)
+            .expect("manager A");
+        let _manager_a_guard = manager_a
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let second = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: &run_b,
+            permission_mgr: &permission_manager,
+            session_id: "acp-b",
+            tool_call_id: "task-b",
+            tool_name: "task_create",
+            arguments_json: r#"{"expected_generation":0,"subject":"task B","description":"B"}"#,
+            policy_enforcer: None,
+            memory_db: None,
+            task_managers: Arc::clone(&task_managers),
+        });
+        assert!(!second.is_error, "{}", second.content);
+        let managers = task_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(managers.len(), 2);
+        assert!(!Arc::ptr_eq(&managers["acp-a"], &managers["acp-b"]));
+        drop(managers);
     }
 
     #[test]
@@ -5486,6 +5617,7 @@ mod acp_permission_gate_tests {
             arguments_json: r#"{"command":"cargo test"}"#,
             policy_enforcer: None,
             memory_db: None,
+            task_managers: task_managers(),
         });
 
         assert!(blocked.is_error);
@@ -5514,6 +5646,7 @@ mod acp_permission_gate_tests {
             arguments_json: r#"{"command":"git status --short"}"#,
             policy_enforcer: None,
             memory_db: None,
+            task_managers: task_managers(),
         });
 
         assert!(
@@ -5540,6 +5673,7 @@ mod acp_permission_gate_tests {
             arguments_json: &arguments,
             policy_enforcer: None,
             memory_db: None,
+            task_managers: task_managers(),
         });
 
         assert!(

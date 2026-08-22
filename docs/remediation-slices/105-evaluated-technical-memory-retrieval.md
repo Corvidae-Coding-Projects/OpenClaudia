@@ -107,7 +107,7 @@ aggregate results:
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Tuning | `lexical_v1` | 4/8 | 4/9 | 6/8 | 5 | 2 | 9/9 | 14,419 | 50 |
 | Tuning | `task_conditioned_diverse_v1` | 8/8 | 8/8 | 10/10 | 0 | 1 | 8/8 | 12,646 | 84 |
-| Held out | `lexical_v1` | 2/7 | 2/8 | 5/7 | 6 | 2 | 8/8 | 12,992 | 44 |
+| Held out | `lexical_v1` | 2/7 | 2/8 | 5/7 | 6 | 2 | 8/8 | 12,961 | 44 |
 | Held out | `task_conditioned_diverse_v1` | 7/7 | 7/7 | 10/10 | 0 | 1 | 7/7 | 11,142 | 73 |
 
 Nineteen unique citation receipts bind exact repository-relative paths, byte
@@ -119,15 +119,22 @@ SHA-256 digests are:
 - tuning corpus:
   `edf98143eb3eb7b48170b6d8204a25e1622b8baef074a4792efba2d19c4f825d`;
 - held-out corpus:
-  `d1171dcd7987fb03ea69a06f2a9208edfa97a1eb319a0399283e8fb21e97332e`;
+  `6cc7bd6028c8c01fe73a4836c4fe80972ebce63f78f7290d3237974742ad8173`;
 - evaluation:
-  `807af11314abef41404ff66d1cf010018ec2919facf6c87d37a4aec08ab53b40`;
+  `7f9765542cf8041b77d431e21077bd6ad7a77faa3117f507dc5e9a66bf13a9f8`;
 - deliberately rejected review:
-  `711fb617056076ec6a2d302a8f93ae3871c6eaaabdf4151365dc7b93eedd7aed`.
+  `fae2ac9f8e87f950c92b2e0d2099b918776dcfda3bc07c14b3d43feac89339c4`.
+
+S-052 subsequently changed the still-cited `src/main.rs` while preserving the
+tested migration-doctor contract. Its final-environment citation now carries
+the honest bounded provenance label `worktree:s052`; the checked-in generator
+rebuilt the evaluation and the deliberately rejected review was rebound to the
+new exact artifacts. Canonical `worktree:sNNN` labels allow later slices to do
+the same without falsely retaining a historical Git generation.
 
 The SHA-256 digest of the sorted `sha256sum` manifest for the 15 changed
 non-slice artifacts is
-`49fd7f6d6e450a934696df570773b9b699154cf505d5ae8355bc72ee8e86ff98`.
+`70c9b9c793e3089cb2291f9ae4a395a1ab88902302b69e2d1007b14f41006c7c`.
 
 All Rust commands used Rust 1.98.0 and `CARGO_BUILD_JOBS=4`; every test command
 used `--test-threads=1`.

@@ -7,7 +7,7 @@
 //! (`task_manager_e2e`) covered the create/update/delete +
 //! dependency-graph semantics; this file walks the
 //! `format_task_summary` + `format_task_detail` rendering
-//! matrix (3 status icons, all optional fields rendered
+//! matrix (all status icons, all optional fields rendered
 //! when present + omitted when absent, Created-timestamp
 //! shape).
 
@@ -22,11 +22,13 @@ use openclaudia::session::{Task, TaskManager, TaskStatus, TaskUpdateParams, Task
 // ───────────────────────────────────────────────────────────────────────────
 
 fn fresh_task_with_subject(mgr: &mut TaskManager, subject: &str) -> String {
-    let t = mgr.create_task(
-        subject.to_string(),
-        format!("description of {subject}"),
-        None,
-    );
+    let t = mgr
+        .create_task(
+            subject.to_string(),
+            format!("description of {subject}"),
+            None,
+        )
+        .expect("valid task fixture");
     t.id.clone()
 }
 
@@ -38,6 +40,7 @@ fn transition(mgr: &mut TaskManager, id: &str, status: TaskUpdateStatus) {
         active_form: None,
         add_blocks: None,
         add_blocked_by: None,
+        ..TaskUpdateParams::default()
     };
     let _ = mgr.update_task(id, params);
 }
@@ -86,6 +89,18 @@ fn summary_completed_task_has_x_icon() {
 }
 
 #[test]
+fn summary_failed_and_canceled_tasks_have_distinct_terminal_icons() {
+    let mut mgr = TaskManager::new();
+    let failed = fresh_task_with_subject(&mut mgr, "failed");
+    transition(&mut mgr, &failed, TaskUpdateStatus::Failed);
+    assert!(TaskManager::format_task_summary(mgr.get_task(&failed).unwrap()).starts_with("[!]"));
+
+    let canceled = fresh_task_with_subject(&mut mgr, "canceled");
+    transition(&mut mgr, &canceled, TaskUpdateStatus::Canceled);
+    assert!(TaskManager::format_task_summary(mgr.get_task(&canceled).unwrap()).starts_with("[-]"));
+}
+
+#[test]
 fn summary_includes_id_subject_and_status_label() {
     let mut mgr = TaskManager::new();
     let id = fresh_task_with_subject(&mut mgr, "my-subject");
@@ -100,11 +115,13 @@ fn summary_includes_id_subject_and_status_label() {
 #[test]
 fn summary_with_active_form_includes_double_dash_separator() {
     let mut mgr = TaskManager::new();
-    let task = mgr.create_task(
-        "implement".to_string(),
-        "x".to_string(),
-        Some("Implementing the thing".to_string()),
-    );
+    let task = mgr
+        .create_task(
+            "implement".to_string(),
+            "x".to_string(),
+            Some("Implementing the thing".to_string()),
+        )
+        .expect("valid task fixture");
     let summary = TaskManager::format_task_summary(task);
     // PINS RENDERING: active form rendered as "-- {form}".
     assert!(
@@ -139,6 +156,7 @@ fn summary_with_blocks_renders_blocks_section() {
         active_form: None,
         add_blocks: Some(vec![id_b.clone()]),
         add_blocked_by: None,
+        ..TaskUpdateParams::default()
     };
     let _ = mgr.update_task(&id_a, params);
     let task = mgr.get_task(&id_a).unwrap();
@@ -162,6 +180,7 @@ fn summary_with_blocked_by_renders_blocked_by_section() {
         active_form: None,
         add_blocks: Some(vec![id_a.clone()]),
         add_blocked_by: None,
+        ..TaskUpdateParams::default()
     };
     let _ = mgr.update_task(&id_b, params);
     // After "B blocks A", A's blocked_by should include B.
@@ -187,6 +206,7 @@ fn summary_with_multiple_blocks_joins_with_comma() {
         active_form: None,
         add_blocks: Some(vec![id_b, id_c]),
         add_blocked_by: None,
+        ..TaskUpdateParams::default()
     };
     let _ = mgr.update_task(&id_a, params);
     let task = mgr.get_task(&id_a).unwrap();
@@ -219,12 +239,20 @@ fn summary_without_blocks_or_blocked_by_omits_those_sections() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn detail_includes_all_five_required_labels() {
+fn detail_includes_all_required_labels() {
     let mut mgr = TaskManager::new();
     let id = fresh_task_with_subject(&mut mgr, "x");
     let task = mgr.get_task(&id).unwrap();
     let detail = TaskManager::format_task_detail(task);
-    for label in &["ID:", "Subject:", "Status:", "Description:", "Created:"] {
+    for label in &[
+        "ID:",
+        "Subject:",
+        "Status:",
+        "Priority:",
+        "Description:",
+        "Created:",
+        "Updated:",
+    ] {
         assert!(
             detail.contains(label),
             "MUST include label {label:?}; got {detail:?}"
@@ -233,13 +261,24 @@ fn detail_includes_all_five_required_labels() {
 }
 
 #[test]
+fn detail_renders_terminal_time_only_for_terminal_statuses() {
+    let mut mgr = TaskManager::new();
+    let id = fresh_task_with_subject(&mut mgr, "terminal");
+    assert!(!TaskManager::format_task_detail(mgr.get_task(&id).unwrap()).contains("Terminal:"));
+    transition(&mut mgr, &id, TaskUpdateStatus::Failed);
+    assert!(TaskManager::format_task_detail(mgr.get_task(&id).unwrap()).contains("Terminal:"));
+}
+
+#[test]
 fn detail_renders_active_form_when_present() {
     let mut mgr = TaskManager::new();
-    let task = mgr.create_task(
-        "subj".to_string(),
-        "desc".to_string(),
-        Some("Working on it".to_string()),
-    );
+    let task = mgr
+        .create_task(
+            "subj".to_string(),
+            "desc".to_string(),
+            Some("Working on it".to_string()),
+        )
+        .expect("valid task fixture");
     let detail = TaskManager::format_task_detail(task);
     assert!(detail.contains("Active form:"));
     assert!(detail.contains("Working on it"));
@@ -282,6 +321,7 @@ fn detail_renders_blocks_section_when_present() {
         active_form: None,
         add_blocks: Some(vec![id_b]),
         add_blocked_by: None,
+        ..TaskUpdateParams::default()
     };
     let _ = mgr.update_task(&id_a, params);
     let task = mgr.get_task(&id_a).unwrap();
@@ -321,11 +361,13 @@ fn detail_is_multi_line() {
 fn update_subject_only_preserves_description_and_active_form() {
     let mut mgr = TaskManager::new();
     let id = {
-        let t = mgr.create_task(
-            "old subj".to_string(),
-            "preserved desc".to_string(),
-            Some("preserved form".to_string()),
-        );
+        let t = mgr
+            .create_task(
+                "old subj".to_string(),
+                "preserved desc".to_string(),
+                Some("preserved form".to_string()),
+            )
+            .expect("valid task fixture");
         t.id.clone()
     };
     let params = TaskUpdateParams {
@@ -335,6 +377,7 @@ fn update_subject_only_preserves_description_and_active_form() {
         active_form: None,
         add_blocks: None,
         add_blocked_by: None,
+        ..TaskUpdateParams::default()
     };
     let _ = mgr.update_task(&id, params);
     let task = mgr.get_task(&id).unwrap();
@@ -354,6 +397,7 @@ fn update_description_only_preserves_subject() {
         active_form: None,
         add_blocks: None,
         add_blocked_by: None,
+        ..TaskUpdateParams::default()
     };
     let _ = mgr.update_task(&id, params);
     let task = mgr.get_task(&id).unwrap();
@@ -374,6 +418,7 @@ fn update_active_form_only_adds_or_replaces_active_form() {
         active_form: Some("Doing thing".to_string()),
         add_blocks: None,
         add_blocked_by: None,
+        ..TaskUpdateParams::default()
     };
     let _ = mgr.update_task(&id, params);
     let task = mgr.get_task(&id).unwrap();
@@ -422,4 +467,6 @@ fn task_status_variants_pairwise_distinct() {
     assert_ne!(TaskStatus::Pending, TaskStatus::InProgress);
     assert_ne!(TaskStatus::InProgress, TaskStatus::Completed);
     assert_ne!(TaskStatus::Pending, TaskStatus::Completed);
+    assert_ne!(TaskStatus::Completed, TaskStatus::Failed);
+    assert_ne!(TaskStatus::Failed, TaskStatus::Canceled);
 }

@@ -311,6 +311,10 @@ pub trait ToolArgs {
     /// Returns [`ToolArgError::WrongType`] when `key` is present but not a
     /// JSON boolean.
     fn arg_bool_or_strict(&self, key: &'static str, default: bool) -> Result<bool, ToolArgError>;
+
+    /// Required non-negative integer argument, rejecting floats, strings,
+    /// negative values, and omission.
+    fn arg_u64_strict(&self, key: &'static str) -> Result<u64, ToolArgError>;
 }
 
 impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
@@ -356,6 +360,20 @@ impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
                 expected: "boolean",
             })
         })
+    }
+
+    fn arg_u64_strict(&self, key: &'static str) -> Result<u64, ToolArgError> {
+        match self.get(key) {
+            None => Err(ToolArgError::MissingOrWrongType { key }),
+            Some(Value::Number(value)) => value.as_u64().ok_or(ToolArgError::WrongType {
+                key,
+                expected: "non-negative integer",
+            }),
+            Some(_) => Err(ToolArgError::WrongType {
+                key,
+                expected: "non-negative integer",
+            }),
+        }
     }
 }
 

@@ -62,28 +62,51 @@ use openclaudia::{
 };
 use rustyline::error::ReadlineError;
 
-fn execute_tool_with_memory_after_permission(
-    run_context: &std::sync::Arc<tools::ToolRunContext>,
-    tool_call: &tools::ToolCall,
-    memory_db: Option<&memory::MemoryDb>,
-    permission_mgr: &PermissionManager,
+struct CliToolExecution<'a> {
+    run_context: &'a std::sync::Arc<tools::ToolRunContext>,
+    tool_call: &'a tools::ToolCall,
+    memory_db: Option<&'a memory::MemoryDb>,
+    task_manager: &'a std::sync::Mutex<session::TaskManager>,
+    permission_mgr: &'a PermissionManager,
     authorization: Option<ExecutionPermit>,
-    session_id: &str,
-    policy_enforcer: Option<&openclaudia::services::policy::PolicyEnforcer>,
-) -> tools::ToolResult {
-    openclaudia::services::tool_executor::ToolExecutor::execute(
-        openclaudia::services::tool_executor::ToolExecutorRequest {
-            run_context,
-            tool_call,
-            memory_db,
-            app_config: None,
-            task_mgr: None,
-            permission_mgr,
-            authorization,
-            session_id: Some(session_id),
-            policy_enforcer,
-        },
-    )
+    session_id: &'a str,
+    policy_enforcer: Option<&'a openclaudia::services::policy::PolicyEnforcer>,
+}
+
+fn execute_tool_with_memory_after_permission(request: CliToolExecution<'_>) -> tools::ToolResult {
+    let CliToolExecution {
+        run_context,
+        tool_call,
+        memory_db,
+        task_manager,
+        permission_mgr,
+        authorization,
+        session_id,
+        policy_enforcer,
+    } = request;
+    let execute = |task_mgr: Option<&mut session::TaskManager>| {
+        openclaudia::services::tool_executor::ToolExecutor::execute(
+            openclaudia::services::tool_executor::ToolExecutorRequest {
+                run_context,
+                tool_call,
+                memory_db,
+                app_config: None,
+                task_mgr,
+                permission_mgr,
+                authorization,
+                session_id: Some(session_id),
+                policy_enforcer,
+            },
+        )
+    };
+    if tools::uses_canonical_task_graph(&tool_call.function.name) {
+        let mut task_manager = task_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execute(Some(&mut task_manager))
+    } else {
+        execute(None)
+    }
 }
 
 fn observe_cli_model_visible_tool_result(
@@ -203,6 +226,7 @@ pub struct ChatRepl {
     vim_state: VimState,
     audit_logger: openclaudia::session::AuditLogger,
     memory_db: Option<memory::MemoryDb>,
+    task_manager: std::sync::Mutex<session::TaskManager>,
     // `auto_learner` borrows `memory_db` so it can't live on the same
     // struct (self-referential). It is constructed once in `run` and
     // threaded into any method that needs it via `&mut Option<_>`.
@@ -559,6 +583,9 @@ impl ChatRepl {
                 .build()
                 .map_err(anyhow::Error::msg)?;
         let memory_db = Some(init_memory_with_banner(&run_context, &config)?);
+        let task_manager = std::sync::Mutex::new(
+            session::TaskManager::open_for_run(&run_context).map_err(anyhow::Error::msg)?,
+        );
         guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
         let permission_mgr =
             init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);
@@ -589,6 +616,7 @@ impl ChatRepl {
             vim_state: VimState::new(),
             audit_logger,
             memory_db,
+            task_manager,
             permissions,
             transient_allowed_tool_rules: Vec::new(),
             transient_model_restore: None,
@@ -2082,15 +2110,16 @@ impl ChatRepl {
             tracing::error!("Security audit failed for tool_call: {e}");
         }
 
-        let result = execute_tool_with_memory_after_permission(
-            &self.run_context,
+        let result = execute_tool_with_memory_after_permission(CliToolExecution {
+            run_context: &self.run_context,
             tool_call,
             memory_db,
-            &self.permission_mgr,
+            task_manager: &self.task_manager,
+            permission_mgr: &self.permission_mgr,
             authorization,
-            &self.chat_session.id(),
-            Some(self.policy_enforcer.as_ref()),
-        );
+            session_id: &self.chat_session.id(),
+            policy_enforcer: Some(self.policy_enforcer.as_ref()),
+        });
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result
     }
@@ -2102,7 +2131,12 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         result: &tools::ToolResult,
     ) -> serde_json::Value {
-        let final_result = process_tool_follow_up(&self.run_context, &self.chat_session, result);
+        let final_result = process_tool_follow_up(
+            &self.run_context,
+            &self.chat_session,
+            &self.task_manager,
+            result,
+        );
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
         let tool_input = parse_tool_args(&tool_call.function).unwrap_or_else(
@@ -2767,7 +2801,12 @@ impl ChatRepl {
         };
         let result = self.run_tool_with_audit(tool_call, memory_db, auto_learner, authorization);
 
-        let final_result = process_tool_follow_up(&self.run_context, &self.chat_session, &result);
+        let final_result = process_tool_follow_up(
+            &self.run_context,
+            &self.chat_session,
+            &self.task_manager,
+            &result,
+        );
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
 
@@ -2917,15 +2956,16 @@ impl ChatRepl {
             // session itself is not corrupted by an audit-write failure).
             tracing::error!("Security audit failed for tool_call: {e}");
         }
-        let result = execute_tool_with_memory_after_permission(
-            &self.run_context,
+        let result = execute_tool_with_memory_after_permission(CliToolExecution {
+            run_context: &self.run_context,
             tool_call,
             memory_db,
-            &self.permission_mgr,
+            task_manager: &self.task_manager,
+            permission_mgr: &self.permission_mgr,
             authorization,
-            &self.chat_session.id(),
-            Some(self.policy_enforcer.as_ref()),
-        );
+            session_id: &self.chat_session.id(),
+            policy_enforcer: Some(self.policy_enforcer.as_ref()),
+        });
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result
     }
@@ -3376,7 +3416,12 @@ impl ChatRepl {
         let result =
             self.run_openai_tool_unaudited(tool_call, memory_db, auto_learner, authorization);
 
-        let final_result = process_tool_follow_up(&self.run_context, &self.chat_session, &result);
+        let final_result = process_tool_follow_up(
+            &self.run_context,
+            &self.chat_session,
+            &self.task_manager,
+            &result,
+        );
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
 
@@ -3419,15 +3464,16 @@ impl ChatRepl {
         authorization: Option<ExecutionPermit>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
-        let result = execute_tool_with_memory_after_permission(
-            &self.run_context,
+        let result = execute_tool_with_memory_after_permission(CliToolExecution {
+            run_context: &self.run_context,
             tool_call,
             memory_db,
-            &self.permission_mgr,
+            task_manager: &self.task_manager,
+            permission_mgr: &self.permission_mgr,
             authorization,
-            &self.chat_session.id(),
-            Some(self.policy_enforcer.as_ref()),
-        );
+            session_id: &self.chat_session.id(),
+            policy_enforcer: Some(self.policy_enforcer.as_ref()),
+        });
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result
     }

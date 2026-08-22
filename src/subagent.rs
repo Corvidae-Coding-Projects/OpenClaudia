@@ -437,6 +437,10 @@ pub struct BackgroundAgent {
     /// Serializes terminal-state transitions (`finish`, `fail`, `stop`) so an
     /// external cancellation cannot be overwritten by a late model response.
     terminal_lock: Mutex<()>,
+    /// Stable canonical task-graph node for this delegation, once admission
+    /// has reached the durable graph. The background registry remains a live
+    /// process handle; it is never a second planning truth.
+    canonical_task_id: Mutex<Option<String>>,
 }
 
 /// Manager for background agents
@@ -553,6 +557,7 @@ impl BackgroundAgentManager {
             finished_at: Mutex::new(None),
             abort_handle: Mutex::new(None),
             terminal_lock: Mutex::new(()),
+            canonical_task_id: Mutex::new(None),
         });
         agents.insert(id.to_string(), agent);
         Ok(true)
@@ -572,6 +577,50 @@ impl BackgroundAgentManager {
     ) -> Option<Arc<BackgroundAgent>> {
         let agent = self.get(id)?;
         (agent.owner_run == owner.run_id()).then_some(agent)
+    }
+
+    fn bind_canonical_task(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+        task_id: &str,
+    ) -> Result<(), String> {
+        let agent = self
+            .get_for_run(owner, id)
+            .ok_or_else(|| format!("Agent '{id}' not found"))?;
+        let Some(mut slot) = agent_field_guard(
+            &agent.canonical_task_id,
+            "bind_canonical_task",
+            id,
+            "canonical_task_id",
+        ) else {
+            return Err(format!("Agent '{id}' canonical task lock poisoned"));
+        };
+        match slot.as_deref() {
+            None => {
+                *slot = Some(task_id.to_string());
+                Ok(())
+            }
+            Some(existing) if existing == task_id => Ok(()),
+            Some(_) => Err(format!(
+                "Agent '{id}' is already bound to a different canonical task"
+            )),
+        }
+    }
+
+    fn canonical_task_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+    ) -> Option<String> {
+        let agent = self.get_for_run(owner, id)?;
+        agent_field_guard(
+            &agent.canonical_task_id,
+            "canonical_task_for_run",
+            id,
+            "canonical_task_id",
+        )
+        .and_then(|slot| slot.clone())
     }
 
     /// Mark an agent as finished with a result
@@ -815,11 +864,27 @@ impl BackgroundAgentManager {
             .collect::<Vec<_>>();
         let mut stopped = 0;
         for agent_id in agent_ids {
+            let canonical_task = self.canonical_task_for_run(owner, &agent_id);
             if self
                 .stop(owner, &agent_id, "owning frontend run retired")
                 .is_ok()
             {
                 stopped += 1;
+                if let Some(task_id) = canonical_task {
+                    if let Err(error) = transition_canonical_delegation(
+                        owner,
+                        &task_id,
+                        &agent_id,
+                        crate::session::TaskUpdateStatus::Canceled,
+                    ) {
+                        tracing::error!(
+                            agent_id,
+                            %task_id,
+                            %error,
+                            "Could not cancel canonical delegation task during run retirement"
+                        );
+                    }
+                }
             }
             let _ = self.remove_for_run(owner, &agent_id);
         }
@@ -1301,6 +1366,8 @@ pub fn get_task_tool_definition() -> Value {
                 "properties": {
                     "description": {
                         "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::task_graph::MAX_TASK_SUBJECT_BYTES,
                         "description": "A short (3-5 word) description of the task"
                     },
                     "prompt": {
@@ -1422,6 +1489,168 @@ pub struct SubagentResult {
     pub turns_used: u64,
     pub is_background: bool,
     pub worktree: Option<WorktreeIsolation>,
+}
+
+/// Owns the durable lifecycle record for one admitted child run. Any return,
+/// cancellation, or panic that does not explicitly commit a terminal state
+/// falls back to `failed` on drop. The graph write is synchronous and bounded;
+/// errors are logged because `Drop` cannot safely convert an already-unwinding
+/// control path into a second panic.
+struct DelegationTaskGuard {
+    manager: crate::session::TaskManager,
+    task_id: String,
+    task_revision: u64,
+    agent_id: String,
+    armed: bool,
+}
+
+impl DelegationTaskGuard {
+    fn begin(
+        parent_run: &crate::tools::ToolRunContext,
+        agent_id: &str,
+        subject: &str,
+    ) -> Result<Self, String> {
+        let manager = crate::session::TaskManager::open_for_run(parent_run)?;
+        Self::begin_with_manager(parent_run, manager, agent_id, subject)
+    }
+
+    fn begin_with_manager(
+        parent_run: &crate::tools::ToolRunContext,
+        mut manager: crate::session::TaskManager,
+        agent_id: &str,
+        subject: &str,
+    ) -> Result<Self, String> {
+        manager.refresh()?;
+        let budget = crate::task_graph::TaskBudgetSpec {
+            max_turns: Some(MAX_SUBAGENT_TURNS as u64),
+            max_tokens: Some(
+                u64::from(SUBAGENT_MAX_TOKENS)
+                    .checked_mul(MAX_SUBAGENT_TURNS as u64)
+                    .ok_or_else(|| "subagent task token budget overflowed".to_string())?,
+            ),
+            max_elapsed_millis: None,
+            max_cost_microusd: None,
+            max_child_runs: None,
+            max_concurrent_calls: None,
+        };
+        let existing = manager
+            .list_tasks()
+            .iter()
+            .find(|task| {
+                matches!(
+                    &task.source,
+                    crate::task_graph::TaskSource::Delegation { agent_id: existing }
+                        if existing == agent_id
+                )
+            })
+            .map(|task| task.id.clone());
+        let (task_id, task_revision) = if let Some(task_id) = existing {
+            let revision = manager
+                .update_delegation_task(
+                    &task_id,
+                    agent_id,
+                    None,
+                    crate::session::TaskUpdateStatus::InProgress,
+                    Some(budget),
+                )?
+                .revision;
+            (task_id, revision)
+        } else {
+            let generation = manager.generation();
+            let task = manager.create_task_from_input(crate::task_graph::CreateTask {
+                expected_generation: generation,
+                subject: subject.to_string(),
+                description: String::new(),
+                active_form: Some(format!("Running delegated agent {agent_id}")),
+                status: crate::task_graph::CanonicalTaskStatus::InProgress,
+                priority: crate::task_graph::TaskPriority::Medium,
+                source: crate::task_graph::TaskSource::Delegation {
+                    agent_id: agent_id.to_string(),
+                },
+                budget: Some(budget),
+            })?;
+            (task.id.clone(), task.revision)
+        };
+        if let Err(binding_error) =
+            BACKGROUND_AGENTS.bind_canonical_task(parent_run, agent_id, &task_id)
+        {
+            let settlement = manager.update_delegation_task(
+                &task_id,
+                agent_id,
+                Some(task_revision),
+                crate::session::TaskUpdateStatus::Failed,
+                None,
+            );
+            return Err(match settlement {
+                Ok(_) => binding_error,
+                Err(settlement_error) => format!(
+                    "{binding_error}; canonical delegation settlement also failed: {settlement_error}"
+                ),
+            });
+        }
+        Ok(Self {
+            manager,
+            task_id,
+            task_revision,
+            agent_id: agent_id.to_string(),
+            armed: true,
+        })
+    }
+
+    fn transition(&mut self, status: crate::session::TaskUpdateStatus) -> Result<(), String> {
+        self.manager.update_delegation_task(
+            &self.task_id,
+            &self.agent_id,
+            Some(self.task_revision),
+            status,
+            None,
+        )?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn finish(mut self, status: crate::session::TaskUpdateStatus) -> Result<(), String> {
+        self.transition(status)
+    }
+}
+
+impl Drop for DelegationTaskGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.manager.refresh().is_ok()
+            && self.manager.get_task(&self.task_id).is_some_and(|task| {
+                matches!(
+                    task.status,
+                    crate::session::TaskStatus::Completed
+                        | crate::session::TaskStatus::Failed
+                        | crate::session::TaskStatus::Canceled
+                )
+            })
+        {
+            self.armed = false;
+            return;
+        }
+        if let Err(error) = self.transition(crate::session::TaskUpdateStatus::Failed) {
+            tracing::error!(
+                task_id = %self.task_id,
+                %error,
+                "Could not close canonical delegation task after child termination"
+            );
+        }
+    }
+}
+
+fn transition_canonical_delegation(
+    owner: &crate::tools::ToolRunContext,
+    task_id: &str,
+    agent_id: &str,
+    status: crate::session::TaskUpdateStatus,
+) -> Result<(), String> {
+    let mut manager = crate::session::TaskManager::open_for_run(owner)?;
+    manager.update_delegation_task(task_id, agent_id, None, status, None)?;
+    Ok(())
 }
 
 /// Run a subagent synchronously, returning the final result
@@ -1579,6 +1808,20 @@ async fn run_subagent_inner(
         receipt.store(true, Ordering::SeqCst);
     }
     let task_content = format!("Subagent task: {}\n\n{}", config.task, config.prompt);
+    let delegation = match DelegationTaskGuard::begin(parent_run, &agent_id, &config.task) {
+        Ok(delegation) => delegation,
+        Err(error) => {
+            BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot create canonical delegation task: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree: None,
+            };
+        }
+    };
 
     // Set up worktree isolation if requested
     let worktree = if config.isolation.as_deref() == Some("worktree") {
@@ -1704,6 +1947,19 @@ async fn run_subagent_inner(
             worktree,
         };
     }
+    let mut task_manager = match crate::session::TaskManager::open_for_run(&subagent_run) {
+        Ok(manager) => manager,
+        Err(error) => {
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot open canonical subagent task graph: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree,
+            };
+        }
+    };
     let task_obs = crate::grounded_loop::observe_session_user_task(
         &subagent_run,
         &agent_id,
@@ -1806,10 +2062,16 @@ async fn run_subagent_inner(
                     .and_then(|e| e.clone())
                     .unwrap_or_else(|| "Agent stopped before the next turn".to_string());
                 store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                let output = match delegation.finish(crate::session::TaskUpdateStatus::Canceled) {
+                    Ok(()) => error,
+                    Err(tracking_error) => format!(
+                        "{error}; canonical cancellation could not be committed: {tracking_error}"
+                    ),
+                };
                 return SubagentResult {
                     agent_id,
                     success: false,
-                    output: error,
+                    output,
                     turns_used: turns,
                     is_background: config.run_in_background,
                     worktree: worktree.clone(),
@@ -2061,7 +2323,7 @@ async fn run_subagent_inner(
                     tool_call: &executable_tc,
                     memory_db: memory_db.as_deref(),
                     app_config: None,
-                    task_mgr: None,
+                    task_mgr: Some(&mut task_manager),
                     permission_mgr: &permission_mgr,
                     authorization: None,
                     session_id: Some(&agent_id),
@@ -2078,8 +2340,9 @@ async fn run_subagent_inner(
         }
     }
 
-    // Mark as finished and store transcript for future resume
-    BACKGROUND_AGENTS.finish(parent_run, &agent_id, final_output.clone());
+    // Store the transcript and settle owned resources before publishing the
+    // terminal graph state. The caller cannot observe success until the
+    // canonical delegation node commits `completed`.
     store_transcript(parent_run, &agent_id, messages, config.agent_type);
 
     // Handle worktree cleanup: remove if no changes, keep if changes exist
@@ -2091,6 +2354,22 @@ async fn run_subagent_inner(
             None
         }
     });
+
+    if let Err(error) = delegation.finish(crate::session::TaskUpdateStatus::Completed) {
+        let message = format!(
+            "Subagent returned a result, but canonical delegation completion could not be committed: {error}"
+        );
+        BACKGROUND_AGENTS.fail(parent_run, &agent_id, message.clone());
+        return SubagentResult {
+            agent_id,
+            success: false,
+            output: message,
+            turns_used: turns,
+            is_background: config.run_in_background,
+            worktree: final_worktree,
+        };
+    }
+    BACKGROUND_AGENTS.finish(parent_run, &agent_id, final_output.clone());
 
     SubagentResult {
         agent_id,
@@ -2625,6 +2904,18 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
         Ok(description) => description,
         Err(err) => return no_task_effect(err.into_tool_error()),
     };
+    if description.trim().is_empty()
+        || description.len() > crate::task_graph::MAX_TASK_SUBJECT_BYTES
+        || description.contains('\0')
+    {
+        return no_task_effect((
+            format!(
+                "Invalid 'description' argument: must be non-empty, NUL-free, and at most {} bytes",
+                crate::task_graph::MAX_TASK_SUBJECT_BYTES
+            ),
+            true,
+        ));
+    }
 
     let prompt = match args.arg_str_strict("prompt") {
         Ok(prompt) => prompt,
@@ -3046,23 +3337,65 @@ pub fn execute_agent_output_tool_typed<S: BuildHasher>(
     bind_subagent_legacy_result(content, is_error, effect_started)
 }
 
-/// Execute the `TaskStop` tool.
+fn execute_task_stop_tool_with_receipt<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool, bool) {
+    let agent_id = match args.arg_str_strict("agent_id") {
+        Ok(agent_id) => agent_id,
+        Err(err) => {
+            let (message, is_error) = err.into_tool_error();
+            return (message, is_error, false);
+        }
+    };
+    let reason = match args.arg_str_opt_strict("reason") {
+        Ok(reason) => reason.unwrap_or("stopped by task_stop"),
+        Err(err) => {
+            let (message, is_error) = err.into_tool_error();
+            return (message, is_error, false);
+        }
+    };
+    let canonical_task = BACKGROUND_AGENTS.canonical_task_for_run(owner, agent_id);
+    let message = match BACKGROUND_AGENTS.stop(owner, agent_id, reason) {
+        Ok(message) => message,
+        Err(error) => return (error, true, false),
+    };
+    if let Some(task_id) = canonical_task {
+        if let Err(error) = transition_canonical_delegation(
+            owner,
+            &task_id,
+            agent_id,
+            crate::session::TaskUpdateStatus::Canceled,
+        ) {
+            return (
+                format!(
+                    "{message}\nAgent stopped, but canonical delegation cancellation failed: {error}"
+                ),
+                true,
+                true,
+            );
+        }
+    }
+    (message, false, true)
+}
+
+/// Execute the `TaskStop` tool through its legacy tuple projection.
 pub fn execute_task_stop_tool<S: BuildHasher>(
     owner: &crate::tools::ToolRunContext,
     args: &HashMap<String, Value, S>,
 ) -> (String, bool) {
-    let agent_id = match args.arg_str_strict("agent_id") {
-        Ok(agent_id) => agent_id,
-        Err(err) => return err.into_tool_error(),
-    };
-    let reason = match args.arg_str_opt_strict("reason") {
-        Ok(reason) => reason.unwrap_or("stopped by task_stop"),
-        Err(err) => return err.into_tool_error(),
-    };
+    let (content, is_error, _) = execute_task_stop_tool_with_receipt(owner, args);
+    (content, is_error)
+}
 
-    BACKGROUND_AGENTS
-        .stop(owner, agent_id, reason)
-        .map_or_else(|err| (err, true), |msg| (msg, false))
+/// Canonical stop adapter that preserves an already-observed cancellation as
+/// a partial outcome if durable task-graph reconciliation then fails.
+pub fn execute_task_stop_tool_typed<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> crate::tools::ToolHandlerResult {
+    let (content, is_error, effect_started) = execute_task_stop_tool_with_receipt(owner, args);
+    bind_subagent_legacy_result(content, is_error, effect_started)
 }
 
 #[cfg(test)]
@@ -3157,6 +3490,149 @@ mod tests {
         fn cleanup_finished(&self) -> usize {
             self.inner.cleanup_finished_for_run(&self.owner)
         }
+    }
+
+    #[test]
+    fn canonical_delegation_guard_commits_success_drop_failure_and_stable_resume() {
+        let root = tempfile::tempdir().expect("delegation graph root");
+        let owner = isolated_test_run("delegation-graph-test");
+        let graph_id = "delegation-lifecycle";
+        let target = std::path::PathBuf::from("tasks.json");
+        let open_manager = || {
+            crate::session::TaskManager::open(
+                root.path(),
+                target.clone(),
+                graph_id,
+                crate::task_graph::TaskActor::from_run(&owner),
+            )
+            .expect("open task manager")
+        };
+        let agent_id = BACKGROUND_AGENTS
+            .register(&owner, AgentType::Plan, "delegated lifecycle")
+            .expect("register agent");
+
+        let guard = DelegationTaskGuard::begin_with_manager(
+            &owner,
+            open_manager(),
+            &agent_id,
+            "delegated lifecycle",
+        )
+        .expect("begin delegation");
+        let stable_task_id = guard.task_id.clone();
+        assert_eq!(
+            guard
+                .manager
+                .get_task(&stable_task_id)
+                .expect("running task")
+                .status,
+            crate::session::TaskStatus::InProgress
+        );
+        guard
+            .finish(crate::session::TaskUpdateStatus::Completed)
+            .expect("complete delegation");
+        let completed = open_manager();
+        let completed_task = completed.get_task(&stable_task_id).expect("completed task");
+        assert_eq!(completed_task.status, crate::session::TaskStatus::Completed);
+        assert!(completed_task.terminal_at.is_some());
+
+        let resumed = DelegationTaskGuard::begin_with_manager(
+            &owner,
+            open_manager(),
+            &agent_id,
+            "delegated lifecycle revised",
+        )
+        .expect("resume delegation");
+        assert_eq!(resumed.task_id, stable_task_id);
+        let mut external_stop = open_manager();
+        external_stop
+            .update_delegation_task(
+                &stable_task_id,
+                &agent_id,
+                None,
+                crate::session::TaskUpdateStatus::Canceled,
+                None,
+            )
+            .expect("external cancellation");
+        let stale_completion = resumed
+            .finish(crate::session::TaskUpdateStatus::Completed)
+            .expect_err("late completion must not overwrite cancellation");
+        assert!(stale_completion.contains("stale"), "{stale_completion}");
+        assert_eq!(
+            open_manager()
+                .get_task(&stable_task_id)
+                .expect("canceled task")
+                .status,
+            crate::session::TaskStatus::Canceled
+        );
+
+        let dropped = DelegationTaskGuard::begin_with_manager(
+            &owner,
+            open_manager(),
+            &agent_id,
+            "delegated lifecycle final attempt",
+        )
+        .expect("resume after cancellation");
+        assert_eq!(dropped.task_id, stable_task_id);
+        drop(dropped);
+        let failed = open_manager();
+        assert_eq!(
+            failed
+                .get_task(&stable_task_id)
+                .expect("failed task")
+                .status,
+            crate::session::TaskStatus::Failed
+        );
+        assert_eq!(
+            BACKGROUND_AGENTS.canonical_task_for_run(&owner, &agent_id),
+            Some(stable_task_id)
+        );
+        let _ = BACKGROUND_AGENTS.remove_for_run(&owner, &agent_id);
+    }
+
+    #[test]
+    fn delegation_binding_failure_settles_created_task_as_failed() {
+        let root = tempfile::tempdir().expect("delegation graph root");
+        let owner = isolated_test_run("delegation-binding-failure");
+        let target = std::path::PathBuf::from("tasks.json");
+        let open_manager = || {
+            crate::session::TaskManager::open(
+                root.path(),
+                target.clone(),
+                "delegation-binding-failure",
+                crate::task_graph::TaskActor::from_run(&owner),
+            )
+            .expect("open task manager")
+        };
+        let agent_id = BACKGROUND_AGENTS
+            .register(&owner, AgentType::Plan, "delegated lifecycle")
+            .expect("register agent");
+        BACKGROUND_AGENTS
+            .bind_canonical_task(&owner, &agent_id, "preexisting-conflict")
+            .expect("prebind conflicting task");
+
+        let error = DelegationTaskGuard::begin_with_manager(
+            &owner,
+            open_manager(),
+            &agent_id,
+            "delegated lifecycle",
+        )
+        .err()
+        .expect("conflicting binding must fail");
+        assert!(error.contains("different canonical task"), "{error}");
+        let manager = open_manager();
+        let task = manager
+            .list_tasks()
+            .iter()
+            .find(|task| {
+                matches!(
+                    &task.source,
+                    crate::task_graph::TaskSource::Delegation { agent_id: source }
+                        if source == &agent_id
+                )
+            })
+            .expect("settled delegation task");
+        assert_eq!(task.status, crate::session::TaskStatus::Failed);
+        let _ = BACKGROUND_AGENTS.remove_for_run(&owner, &agent_id);
     }
 
     #[test]

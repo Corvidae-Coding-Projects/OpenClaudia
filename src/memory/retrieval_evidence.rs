@@ -761,12 +761,12 @@ fn corpus_citation_keys(
             validate_text("citation locator", &citation.locator)?;
             validate_text("citation source version", &citation.source_version)?;
             if citation.source_version != baseline_version
-                && citation.source_version != "worktree:s105"
+                && !is_canonical_slice_worktree_version(&citation.source_version)
             {
                 return Err(evidence_error(
                     TechnicalRetrievalEvidenceCode::InvalidReference,
                     &citation.locator,
-                    "citation source version does not match the corpus repository generation",
+                    "citation source version does not match the corpus repository generation or a canonical slice worktree",
                 ));
             }
             keys.insert((
@@ -778,6 +778,12 @@ fn corpus_citation_keys(
         }
     }
     Ok(keys)
+}
+
+fn is_canonical_slice_worktree_version(source_version: &str) -> bool {
+    source_version
+        .strip_prefix("worktree:s")
+        .is_some_and(|slice| slice.len() == 3 && slice.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn validate_bundle(
@@ -2120,6 +2126,22 @@ mod tests {
         let error = verify_repository_citation(root.path(), key)
             .expect_err("a citation must not escape its repository root");
         assert_eq!(error.code, TechnicalRetrievalEvidenceCode::InvalidReference);
+    }
+
+    #[test]
+    fn slice_worktree_versions_are_bounded_and_canonical() {
+        assert!(is_canonical_slice_worktree_version("worktree:s052"));
+        assert!(is_canonical_slice_worktree_version("worktree:s105"));
+        for invalid in [
+            "worktree:s52",
+            "worktree:s0052",
+            "worktree:S052",
+            "worktree:s05x",
+            "worktree:current",
+            "git:s052",
+        ] {
+            assert!(!is_canonical_slice_worktree_version(invalid), "{invalid}");
+        }
     }
 
     #[cfg(unix)]

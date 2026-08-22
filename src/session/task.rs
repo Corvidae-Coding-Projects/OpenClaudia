@@ -1,102 +1,146 @@
-//! Structured task management with dependency tracking.
+//! Compatibility facade over the canonical transactional task graph.
+//!
+//! Existing tool and frontend callers keep the `TaskManager` vocabulary while
+//! every operation reads and writes [`crate::task_graph::TaskGraph`]. There is
+//! no second task representation inside this manager: [`Task`] values are
+//! rebuilt read-only projections after a graph commit.
+
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
 
-/// Status of a managed task
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+use crate::persistence::{CommitState, StorageGeneration};
+use crate::runtime::{Actor, ActorId, ActorRole, RunId};
+use crate::task_graph::{
+    CanonicalTaskStatus, CreateTask, ExternalTaskDraft, FieldUpdate, ReconcileApprovedPlan,
+    ReconcileExternalTasks, TaskActor, TaskBudgetSpec, TaskGraph, TaskGraphGeneration,
+    TaskGraphProposal, TaskGraphReceipt, TaskGraphStore, TaskId, TaskNode, TaskOwnership,
+    TaskPageCursor, TaskPriority, TaskSource, TodoTaskDraft, UpdateTask,
+};
+
+/// Status exposed by the established task-tool compatibility surface.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
     InProgress,
     Completed,
+    Failed,
+    Canceled,
 }
 
 impl std::fmt::Display for TaskStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Pending => write!(f, "pending"),
-            Self::InProgress => write!(f, "in_progress"),
-            Self::Completed => write!(f, "completed"),
+            Self::Pending => formatter.write_str("pending"),
+            Self::InProgress => formatter.write_str("in_progress"),
+            Self::Completed => formatter.write_str("completed"),
+            Self::Failed => formatter.write_str("failed"),
+            Self::Canceled => formatter.write_str("canceled"),
         }
     }
 }
 
-/// A structured task with dependency tracking
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Read-only compatibility projection of one canonical task node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
-    /// Unique task identifier (auto-incrementing, e.g. "task-1")
     pub id: String,
-    /// Brief title in imperative form (e.g. "Add permission system")
     pub subject: String,
-    /// Detailed description of the task
     pub description: String,
-    /// Present continuous form for spinner display (e.g. "Adding permission system")
     pub active_form: Option<String>,
-    /// Current task status
     pub status: TaskStatus,
-    /// IDs of tasks that this task blocks (downstream dependencies)
+    pub priority: TaskPriority,
     pub blocks: Vec<String>,
-    /// IDs of tasks that block this task (upstream dependencies)
     pub blocked_by: Vec<String>,
-    /// When the task was created
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub terminal_at: Option<DateTime<Utc>>,
+    pub revision: u64,
+    pub ownership: TaskOwnership,
+    pub source: TaskSource,
+    pub budget: Option<TaskBudgetSpec>,
 }
 
-/// Outcome of [`TaskManager::apply_status_transition`] — distinguishes
-/// "no status field supplied" from "status set" from "task deleted" without
-/// overloading `Option<Result<…>>`. crosslink #874.
-enum StatusOutcome {
-    /// Caller omitted the `status` field; keep whatever the task had.
-    Unchanged,
-    /// Caller supplied `status: "deleted"`; the task has been removed.
-    Deleted,
-    /// Caller supplied a real status; this is the new value.
-    Transitioned(TaskStatus),
-}
-
-/// Status values accepted by task updates (includes Deleted which removes the task).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Status values accepted by task updates. `Deleted` creates a canonical
+/// tombstone and transactionally removes reciprocal edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskUpdateStatus {
     Pending,
     InProgress,
     Completed,
+    Failed,
+    Canceled,
     Deleted,
 }
 
 impl TaskUpdateStatus {
-    /// Parse from string. Returns None for unrecognized values.
     #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
             "pending" => Some(Self::Pending),
             "in_progress" => Some(Self::InProgress),
             "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
             "deleted" => Some(Self::Deleted),
             _ => None,
         }
     }
 }
 
-/// Parameters for updating an existing task.
-#[derive(Default)]
+/// Parameters for a graph-aware task update.
+#[derive(Debug, Clone, Default)]
 pub struct TaskUpdateParams {
     pub status: Option<TaskUpdateStatus>,
+    pub priority: Option<TaskPriority>,
     pub subject: Option<String>,
     pub description: Option<String>,
     pub active_form: Option<String>,
+    pub clear_active_form: bool,
+    pub budget: Option<TaskBudgetSpec>,
+    pub clear_budget: bool,
     pub add_blocks: Option<Vec<String>>,
+    pub remove_blocks: Option<Vec<String>>,
     pub add_blocked_by: Option<Vec<String>>,
+    pub remove_blocked_by: Option<Vec<String>>,
+    /// Required by model-facing mutations. Omission is retained only for
+    /// direct compatibility callers operating on the manager they just read.
+    pub expected_generation: Option<TaskGraphGeneration>,
+    /// Required by model-facing updates. Omission uses the current task
+    /// revision only for direct compatibility callers.
+    pub expected_task_revision: Option<u64>,
 }
 
-/// Manages structured tasks with dependency tracking.
-///
-/// Enforces the invariant that only one task can be `InProgress` at a time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Last committed mutation receipt exposed to adapters and tool renderers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskManagerReceipt {
+    pub graph: TaskGraphReceipt,
+    pub persistence: Option<CommitState>,
+}
+
+/// Bounded task-list page carrying an opaque generation-bound cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskManagerPage {
+    pub tasks: Vec<Task>,
+    pub next_cursor: Option<String>,
+    pub generation: TaskGraphGeneration,
+}
+
+/// Established manager name backed by exactly one canonical graph.
+#[derive(Debug, Clone)]
 pub struct TaskManager {
-    tasks: Vec<Task>,
-    next_id: u64,
+    graph: TaskGraph,
+    actor: TaskActor,
+    projection: Vec<Task>,
+    store: Option<TaskGraphStore>,
+    storage_generation: StorageGeneration,
+    last_receipt: Option<TaskManagerReceipt>,
 }
 
 impl Default for TaskManager {
@@ -106,425 +150,575 @@ impl Default for TaskManager {
 }
 
 impl TaskManager {
-    /// Create a new empty `TaskManager`.
+    /// Create an ephemeral compatibility manager. Production frontends should
+    /// use [`Self::for_run`] or [`Self::open`] so provenance and persistence
+    /// are explicit.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            tasks: Vec::new(),
-            next_id: 1,
+            graph: TaskGraph::empty_for_compatibility(),
+            actor: TaskActor::new(
+                Actor {
+                    id: ActorId::new(),
+                    role: ActorRole::Planner,
+                },
+                RunId::new(),
+            ),
+            projection: Vec::new(),
+            store: None,
+            storage_generation: StorageGeneration::Missing,
+            last_receipt: None,
         }
     }
 
-    /// Create a new task. Returns the created task.
+    /// Create an ephemeral manager bound to one immutable run identity.
+    ///
+    /// # Errors
+    /// Returns an error when the run's session identity is not a valid graph
+    /// identity.
+    pub fn for_run(run: &crate::tools::ToolRunContext) -> Result<Self, String> {
+        let graph = TaskGraph::new(format!("session:{}", run.session_id()))
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            graph,
+            actor: TaskActor::from_run(run),
+            projection: Vec::new(),
+            store: None,
+            storage_generation: StorageGeneration::Missing,
+            last_receipt: None,
+        })
+    }
+
+    /// Open a descriptor-safe graph document under an existing host-authorized
+    /// root and reject malformed, future, or identity-mismatched state.
+    ///
+    /// # Errors
+    /// Returns an error when the root, graph identity, or persisted document
+    /// fails validation or cannot be read.
+    pub fn open(
+        root: impl AsRef<Path>,
+        target: impl Into<std::path::PathBuf>,
+        graph_id: impl Into<String>,
+        actor: TaskActor,
+    ) -> Result<Self, String> {
+        let store =
+            TaskGraphStore::open(root, target, graph_id).map_err(|error| error.to_string())?;
+        let loaded = store.load().map_err(|error| error.to_string())?;
+        let mut manager = Self {
+            graph: loaded.graph,
+            actor,
+            projection: Vec::new(),
+            store: Some(store),
+            storage_generation: loaded.storage_generation,
+            last_receipt: None,
+        };
+        manager.rebuild_projection();
+        Ok(manager)
+    }
+
+    /// Open the durable host-local graph for one exact frontend run. Every
+    /// frontend uses the same session-derived document path, so resuming the
+    /// same session reconciles through storage-generation conflicts instead
+    /// of creating another in-memory planning store.
+    ///
+    /// # Errors
+    /// Returns an error when the host-local data root is unavailable or not
+    /// private, or when the durable graph cannot be opened and validated.
+    pub fn open_for_run(run: &crate::tools::ToolRunContext) -> Result<Self, String> {
+        let data_root = dirs::data_local_dir()
+            .ok_or_else(|| "host-local data directory is unavailable".to_string())?
+            .join("openclaudia")
+            .join("task_graphs");
+        prepare_private_graph_root(&data_root)?;
+        let target = format!("{}.json", run.session_id());
+        Self::open(
+            &data_root,
+            target,
+            format!("session:{}", run.session_id()),
+            TaskActor::from_run(run),
+        )
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> TaskGraphGeneration {
+        self.graph.generation()
+    }
+
+    #[must_use]
+    pub const fn graph(&self) -> &TaskGraph {
+        &self.graph
+    }
+
+    #[must_use]
+    pub const fn actor(&self) -> &TaskActor {
+        &self.actor
+    }
+
+    #[must_use]
+    pub const fn last_receipt(&self) -> Option<&TaskManagerReceipt> {
+        self.last_receipt.as_ref()
+    }
+
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// Refresh a durable manager before a read or proposed mutation. Ephemeral
+    /// managers are already the complete source of truth and do nothing.
+    ///
+    /// # Errors
+    /// Returns an error when the persisted graph cannot be read or validated.
+    pub fn refresh(&mut self) -> Result<(), String> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let loaded = store.load().map_err(|error| error.to_string())?;
+        self.graph = loaded.graph;
+        self.storage_generation = loaded.storage_generation;
+        self.last_receipt = None;
+        self.rebuild_projection();
+        Ok(())
+    }
+
+    /// Create a task against the manager's currently observed generation.
+    ///
+    /// # Errors
+    /// Returns an error when validation or durable publication fails.
     pub fn create_task(
         &mut self,
         subject: String,
         description: String,
         active_form: Option<String>,
-    ) -> &Task {
-        let id = format!("task-{}", self.next_id);
-        self.next_id += 1;
-
-        let task = Task {
-            id,
+    ) -> Result<&Task, String> {
+        let expected = self.graph.generation();
+        self.create_task_from_input(CreateTask {
+            expected_generation: expected,
             subject,
             description,
             active_form,
-            status: TaskStatus::Pending,
-            blocks: Vec::new(),
-            blocked_by: Vec::new(),
-            created_at: Utc::now(),
-        };
-        let idx = self.tasks.len();
-        self.tasks.push(task);
-        &self.tasks[idx]
+            status: CanonicalTaskStatus::Pending,
+            priority: TaskPriority::Medium,
+            source: TaskSource::TaskTool,
+            budget: None,
+        })
     }
 
-    /// Get a task by ID.
-    #[must_use]
-    pub fn get_task(&self, task_id: &str) -> Option<&Task> {
-        self.index_of(task_id).map(|i| &self.tasks[i])
-    }
-
-    /// Get a mutable reference to a task by ID.
-    fn get_task_mut(&mut self, task_id: &str) -> Option<&mut Task> {
-        let idx = self.index_of(task_id)?;
-        self.tasks.get_mut(idx)
-    }
-
-    /// Locate the position of `task_id` in `self.tasks`, if any.
-    ///
-    /// crosslink #874: still O(N) in the worst case (`Vec` is the storage),
-    /// but centralising the scan here is a prerequisite for the planned move
-    /// to a `HashMap<TaskId, usize>` index — every caller now goes through a
-    /// single helper instead of open-coding `.iter().find(..)`.
-    fn index_of(&self, task_id: &str) -> Option<usize> {
-        self.tasks.iter().position(|t| t.id == task_id)
-    }
-
-    /// Build a temporary `id` -> `index` map for one call's worth of lookups.
-    ///
-    /// Used by [`update_task`] which performs O(M) dependency-existence
-    /// checks (one per added edge). Building the map up front is O(N); each
-    /// lookup is then O(1), turning the previous O(M*N) loop into O(N+M).
-    fn build_id_index(&self) -> std::collections::HashMap<&str, usize> {
-        self.tasks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.id.as_str(), i))
-            .collect()
-    }
-
-    /// Update a task's fields. Returns an error message if validation fails.
-    ///
-    /// Enforces that only one task can be `InProgress` at a time. When a task
-    /// is set to `InProgress`, any currently in-progress task is moved back to
-    /// `Pending`.
+    /// Publish one host-constructed creation request. Model-facing task
+    /// creation builds pending-only input above; trusted plan/delegation
+    /// adapters use this seam to publish an already-running child or a
+    /// reconciled terminal record without a second, racy mutation.
     ///
     /// # Errors
+    /// Returns an error when the request is stale or invalid, or when durable
+    /// publication fails.
+    pub fn create_task_from_input(&mut self, input: CreateTask) -> Result<&Task, String> {
+        self.refresh()?;
+        let proposal = self
+            .graph
+            .propose_create(input, &self.actor, Utc::now())
+            .map_err(|error| error.to_string())?;
+        let id = proposal.receipt().affected[0].clone();
+        self.publish(proposal)?;
+        self.get_task(id.as_str())
+            .ok_or_else(|| "committed task disappeared from the canonical projection".to_string())
+    }
+
+    /// Update a task transactionally. Every field and edge is applied to a
+    /// cloned snapshot, the complete graph is validated, durable publication
+    /// succeeds, and only then does the live projection change.
     ///
-    /// Returns `Err` if the task is not found, the status is invalid,
-    /// a dependency references itself or a nonexistent task, or the task
-    /// is deleted (deletion is signaled via `Err` with a message).
-    ///
-    /// crosslink #874: the previous 150-line god function has been split into
-    /// focused helpers (status transition, dependency validation, reverse-
-    /// edge sync). Dependency existence checks build a `HashMap<&str, usize>`
-    /// once instead of doing an O(N) scan per edge, turning the inner loop
-    /// from O(M*N) into O(N+M).
+    /// # Errors
+    /// Returns an error when the task is missing, the request is stale or
+    /// invalid, or durable publication fails.
     pub fn update_task(
         &mut self,
         task_id: &str,
         params: TaskUpdateParams,
     ) -> Result<Option<&Task>, String> {
-        // Validate the task exists
-        if self.index_of(task_id).is_none() {
-            return Err(format!("Task '{task_id}' not found"));
+        if params.clear_budget && params.budget.is_some() {
+            return Err("task budget replacement and clearing are mutually exclusive".to_string());
         }
-
-        let TaskUpdateParams {
-            status,
-            subject,
-            description,
-            active_form,
-            add_blocks,
-            add_blocked_by,
-        } = params;
-
-        // Phase 1: handle status transition (Deleted is a short-circuit return).
-        let new_status = match self.apply_status_transition(task_id, status.as_ref())? {
-            StatusOutcome::Deleted => return Ok(None),
-            StatusOutcome::Unchanged => None,
-            StatusOutcome::Transitioned(s) => Some(s),
+        self.refresh()?;
+        let id = TaskId::parse(task_id.to_string()).map_err(|error| error.to_string())?;
+        let current = self
+            .graph
+            .task(&id)
+            .ok_or_else(|| format!("Task '{task_id}' not found"))?;
+        let expected_generation = params
+            .expected_generation
+            .unwrap_or_else(|| self.graph.generation());
+        let expected_task_revision = params.expected_task_revision.unwrap_or(current.revision);
+        let blocks = apply_edge_changes(
+            &current.blocks,
+            params.add_blocks.as_deref(),
+            params.remove_blocks.as_deref(),
+        )?;
+        let blocked_by = apply_edge_changes(
+            &current.blocked_by,
+            params.add_blocked_by.as_deref(),
+            params.remove_blocked_by.as_deref(),
+        )?;
+        let active_form = if params.clear_active_form {
+            FieldUpdate::Clear
+        } else {
+            params
+                .active_form
+                .map_or(FieldUpdate::Keep, FieldUpdate::Set)
         };
-
-        // Phase 2: validate every added dependency against an O(1) id index.
-        self.validate_dependency_edges(task_id, add_blocks.as_deref(), add_blocked_by.as_deref())?;
-
-        // Phase 3: apply scalar field updates and the new edges.
-        let task = self
-            .get_task_mut(task_id)
-            .ok_or_else(|| format!("Task '{task_id}' disappeared before update"))?;
-        Self::apply_task_fields(
-            task,
-            new_status,
-            subject,
-            description,
-            active_form,
-            add_blocks.as_deref(),
-            add_blocked_by.as_deref(),
-        );
-
-        // Phase 4: sync reverse edges (both directions) so blocks/blocked_by
-        // are always symmetric.
-        self.sync_reverse_edges(task_id);
-
-        let task = self
-            .get_task(task_id)
-            .ok_or_else(|| format!("Task '{task_id}' disappeared after update"))?;
-        Ok(Some(task))
+        let status = params.status.map(canonical_status);
+        let budget = if params.clear_budget {
+            FieldUpdate::Clear
+        } else {
+            params.budget.map_or(FieldUpdate::Keep, FieldUpdate::Set)
+        };
+        let deleted = status == Some(CanonicalTaskStatus::Deleted);
+        let proposal = self
+            .graph
+            .propose_update(
+                UpdateTask {
+                    expected_generation,
+                    task_id: id,
+                    expected_task_revision,
+                    status,
+                    priority: params.priority,
+                    subject: params.subject.map_or(FieldUpdate::Keep, FieldUpdate::Set),
+                    description: params
+                        .description
+                        .map_or(FieldUpdate::Keep, FieldUpdate::Set),
+                    active_form,
+                    budget,
+                    blocks,
+                    blocked_by,
+                },
+                &self.actor,
+                Utc::now(),
+            )
+            .map_err(|error| error.to_string())?;
+        if proposal.receipt().affected.is_empty()
+            && proposal.receipt().generation == proposal.receipt().previous_generation
+        {
+            self.last_receipt = Some(TaskManagerReceipt {
+                graph: proposal.receipt().clone(),
+                persistence: None,
+            });
+            return Ok(self.get_task(task_id));
+        }
+        self.publish(proposal)?;
+        if deleted {
+            Ok(None)
+        } else {
+            Ok(self.get_task(task_id))
+        }
     }
 
-    /// Apply (or short-circuit) a status transition. Returns the new
-    /// `TaskStatus` to set (None means no status field was supplied) or
-    /// `Deleted` to tell the caller the task is gone.
-    fn apply_status_transition(
+    /// Transition one exact supervised child lifecycle. General task/todo
+    /// mutations cannot forge this projection because the stable agent id is
+    /// checked against the task source before proposal construction.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown or mismatched delegation, stale
+    /// revision, invalid transition, or failed durable publication.
+    pub fn update_delegation_task(
         &mut self,
         task_id: &str,
-        status: Option<&TaskUpdateStatus>,
-    ) -> Result<StatusOutcome, String> {
-        let new_status = match status {
-            None => return Ok(StatusOutcome::Unchanged),
-            Some(TaskUpdateStatus::Deleted) => {
-                self.tasks.retain(|t| t.id != task_id);
-                return Ok(StatusOutcome::Deleted);
-            }
-            Some(TaskUpdateStatus::Pending) => TaskStatus::Pending,
-            Some(TaskUpdateStatus::InProgress) => TaskStatus::InProgress,
-            Some(TaskUpdateStatus::Completed) => TaskStatus::Completed,
-        };
-
-        if new_status == TaskStatus::InProgress {
-            // Enforce blocked_by: every blocker must be Completed (crosslink #593).
-            let blockers: Vec<String> = self
+        expected_agent_id: &str,
+        expected_task_revision: Option<u64>,
+        status: TaskUpdateStatus,
+        budget: Option<TaskBudgetSpec>,
+    ) -> Result<&Task, String> {
+        self.refresh()?;
+        let id = TaskId::parse(task_id.to_string()).map_err(|error| error.to_string())?;
+        let current = self
+            .graph
+            .task(&id)
+            .ok_or_else(|| format!("Task '{task_id}' not found"))?;
+        let proposal = self
+            .graph
+            .propose_update_delegation(
+                UpdateTask {
+                    expected_generation: self.graph.generation(),
+                    task_id: id,
+                    expected_task_revision: expected_task_revision.unwrap_or(current.revision),
+                    status: Some(canonical_status(status)),
+                    priority: None,
+                    subject: FieldUpdate::Keep,
+                    description: FieldUpdate::Keep,
+                    active_form: FieldUpdate::Keep,
+                    budget: budget.map_or(FieldUpdate::Keep, FieldUpdate::Set),
+                    blocks: None,
+                    blocked_by: None,
+                },
+                &self.actor,
+                Utc::now(),
+                expected_agent_id,
+            )
+            .map_err(|error| error.to_string())?;
+        if proposal.receipt().affected.is_empty()
+            && proposal.receipt().generation == proposal.receipt().previous_generation
+        {
+            self.last_receipt = Some(TaskManagerReceipt {
+                graph: proposal.receipt().clone(),
+                persistence: None,
+            });
+            return self
                 .get_task(task_id)
-                .map(|t| t.blocked_by.clone())
-                .unwrap_or_default();
-            for blocker_id in &blockers {
-                match self.get_task(blocker_id).map(|t| &t.status) {
-                    Some(TaskStatus::Completed) => {}
-                    Some(status) => {
-                        return Err(format!(
-                            "Task '{task_id}' cannot transition to in_progress: blocker '{blocker_id}' is {status}"
-                        ));
-                    }
-                    None => {
-                        return Err(format!(
-                            "Task '{task_id}' references nonexistent blocker '{blocker_id}'"
-                        ));
-                    }
-                }
-            }
-
-            // Demote any currently in-progress task to Pending.
-            for task in &mut self.tasks {
-                if task.status == TaskStatus::InProgress && task.id != task_id {
-                    task.status = TaskStatus::Pending;
-                }
-            }
+                .ok_or_else(|| "delegation task disappeared from the canonical view".to_string());
         }
-
-        Ok(StatusOutcome::Transitioned(new_status))
+        self.publish(proposal)?;
+        self.get_task(task_id)
+            .ok_or_else(|| "delegation task disappeared from the canonical view".to_string())
     }
 
-    /// Validate every edge in `add_blocks` / `add_blocked_by` against the
-    /// task store. Uses an `id -> index` [`HashMap`] built once so each
-    /// existence check is O(1).
+    /// Atomically replace the caller's complete todo projection. Existing
+    /// rows must carry stable task ids and revisions obtained from a read.
     ///
-    /// [`HashMap`]: std::collections::HashMap
-    fn validate_dependency_edges(
-        &self,
-        task_id: &str,
-        add_blocks: Option<&[String]>,
-        add_blocked_by: Option<&[String]>,
+    /// # Errors
+    /// Returns an error when the replacement is stale or invalid, or when
+    /// durable publication fails.
+    pub fn replace_todos_checked(
+        &mut self,
+        expected_generation: TaskGraphGeneration,
+        items: Vec<TodoTaskDraft>,
     ) -> Result<(), String> {
-        let index = self.build_id_index();
-
-        // Crosslink #366: cycle detection must consider the combined
-        // graph of (current edges) + (every pending edge from this call)
-        // simultaneously. The prior implementation checked each pending
-        // edge in isolation against the CURRENT graph, so a single call
-        // passing add_blocks=[B] and add_blocked_by=[B] both passed (no
-        // existing edges) yet together formed an A↔B cycle. Build a
-        // pending-edge set and pass it to would_create_cycle_with_pending
-        // so all checks see the combined graph.
-        let mut pending: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
-
-        if let Some(block_ids) = add_blocks {
-            for bid in block_ids {
-                if bid == task_id {
-                    return Err("A task cannot block itself".to_string());
-                }
-                if !index.contains_key(bid.as_str()) {
-                    return Err(format!("Referenced task '{bid}' not found"));
-                }
-                pending.entry(task_id).or_default().push(bid.as_str());
-            }
+        self.refresh()?;
+        let proposal = self
+            .graph
+            .propose_replace_todos(
+                crate::task_graph::ReplaceTodoList {
+                    expected_generation,
+                    items,
+                },
+                &self.actor,
+                Utc::now(),
+            )
+            .map_err(|error| error.to_string())?;
+        if proposal.receipt().affected.is_empty()
+            && proposal.receipt().generation == proposal.receipt().previous_generation
+        {
+            self.last_receipt = Some(TaskManagerReceipt {
+                graph: proposal.receipt().clone(),
+                persistence: None,
+            });
+            return Ok(());
         }
-        if let Some(blocked_ids) = add_blocked_by {
-            for bid in blocked_ids {
-                if bid == task_id {
-                    return Err("A task cannot be blocked by itself".to_string());
-                }
-                if !index.contains_key(bid.as_str()) {
-                    return Err(format!("Referenced task '{bid}' not found"));
-                }
-                // `bid blocks task_id` translates to the reverse edge:
-                // a `blocks` edge from `bid` -> `task_id`.
-                pending.entry(bid.as_str()).or_default().push(task_id);
-            }
-        }
-
-        // Now check that the combined graph (current + pending) is
-        // acyclic from every pending edge.
-        for (from, tos) in &pending {
-            for to in tos {
-                if Self::would_create_cycle_with_pending(self, from, to, &pending) {
-                    return Err(format!(
-                        "Adding '{from}' blocks '{to}' would create a circular dependency"
-                    ));
-                }
-            }
-        }
-
-        Ok(())
+        self.publish(proposal)
     }
 
-    /// Cycle-check variant that considers both current `blocks` edges
-    /// AND every edge in `pending`. Used by `validate_dependency_edges`
-    /// to catch cycles formed by edges added in the SAME call (crosslink
-    /// #366) — e.g. `update_task(A, add_blocks=[B], add_blocked_by=[B])`
-    /// would have passed both per-edge checks against the empty current
-    /// graph yet produced an A↔B cycle.
-    fn would_create_cycle_with_pending(
-        &self,
-        from_id: &str,
-        to_id: &str,
-        pending: &std::collections::HashMap<&str, Vec<&str>>,
-    ) -> bool {
-        let mut visited = std::collections::HashSet::new();
-        let mut stack: Vec<String> = vec![to_id.to_string()];
-        while let Some(current) = stack.pop() {
-            if current == from_id {
-                return true;
-            }
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-            // Current persisted out-edges.
-            if let Some(task) = self.get_task(&current) {
-                for blocked in &task.blocks {
-                    stack.push(blocked.clone());
-                }
-            }
-            // Pending out-edges added in this call.
-            if let Some(pending_outs) = pending.get(current.as_str()) {
-                for blocked in pending_outs {
-                    stack.push((*blocked).to_string());
-                }
-            }
+    /// Reconcile a dependency-closed external issue observation into the
+    /// canonical graph. The external identifiers remain provenance only.
+    ///
+    /// # Errors
+    /// Returns an error when the observation is stale, incomplete, invalid,
+    /// or cannot be durably published.
+    pub fn reconcile_external_checked(
+        &mut self,
+        expected_generation: TaskGraphGeneration,
+        system: String,
+        items: Vec<ExternalTaskDraft>,
+    ) -> Result<(), String> {
+        self.refresh()?;
+        let proposal = self
+            .graph
+            .propose_reconcile_external(
+                ReconcileExternalTasks {
+                    expected_generation,
+                    system,
+                    items,
+                },
+                &self.actor,
+                Utc::now(),
+            )
+            .map_err(|error| error.to_string())?;
+        if proposal.receipt().affected.is_empty()
+            && proposal.receipt().generation == proposal.receipt().previous_generation
+        {
+            self.last_receipt = Some(TaskManagerReceipt {
+                graph: proposal.receipt().clone(),
+                persistence: None,
+            });
+            return Ok(());
         }
-        false
+        self.publish(proposal)
     }
 
-    /// Apply the validated scalar / edge updates to a single task. Operates
-    /// on `&mut Task` directly so the caller controls the borrow lifetime.
-    fn apply_task_fields(
-        task: &mut Task,
-        new_status: Option<TaskStatus>,
-        subject: Option<String>,
-        description: Option<String>,
-        active_form: Option<String>,
-        add_blocks: Option<&[String]>,
-        add_blocked_by: Option<&[String]>,
-    ) {
-        if let Some(s) = new_status {
-            task.status = s;
+    /// Bind the exact digest of a host-read, user-approved plan artifact to a
+    /// stable graph lifecycle checkpoint.
+    ///
+    /// # Errors
+    /// Returns an error when the plan identity or digest is invalid, graph
+    /// reconciliation fails, or durable publication fails.
+    pub fn reconcile_approved_plan(
+        &mut self,
+        plan_id: &str,
+        observed_version: String,
+    ) -> Result<&Task, String> {
+        self.refresh()?;
+        let proposal = self
+            .graph
+            .propose_reconcile_approved_plan(
+                ReconcileApprovedPlan {
+                    expected_generation: self.graph.generation(),
+                    plan_id: plan_id.to_string(),
+                    observed_version,
+                },
+                &self.actor,
+                Utc::now(),
+            )
+            .map_err(|error| error.to_string())?;
+        let task_id = proposal
+            .graph()
+            .all_tasks()
+            .find_map(|task| match &task.source {
+                TaskSource::Plan {
+                    plan_id: candidate, ..
+                } if candidate == plan_id => Some(task.id.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| "approved plan projection disappeared".to_string())?;
+        if proposal.receipt().affected.is_empty()
+            && proposal.receipt().generation == proposal.receipt().previous_generation
+        {
+            self.last_receipt = Some(TaskManagerReceipt {
+                graph: proposal.receipt().clone(),
+                persistence: None,
+            });
+        } else {
+            self.publish(proposal)?;
         }
-        if let Some(subj) = subject {
-            task.subject = subj;
-        }
-        if let Some(desc) = description {
-            task.description = desc;
-        }
-        if active_form.is_some() {
-            task.active_form = active_form;
-        }
-        if let Some(block_ids) = add_blocks {
-            for bid in block_ids {
-                if !task.blocks.iter().any(|b| b == bid) {
-                    task.blocks.push(bid.clone());
-                }
-            }
-        }
-        if let Some(blocked_ids) = add_blocked_by {
-            for bid in blocked_ids {
-                if !task.blocked_by.iter().any(|b| b == bid) {
-                    task.blocked_by.push(bid.clone());
-                }
-            }
-        }
+        self.get_task(task_id.as_str())
+            .ok_or_else(|| "approved plan task disappeared from the canonical view".to_string())
     }
 
-    /// Restore the symmetric invariant: for every `A blocks B`, `B.blocked_by`
-    /// must contain `A`, and vice versa. Called after `apply_task_fields` so
-    /// new edges are propagated to the other end.
-    fn sync_reverse_edges(&mut self, task_id: &str) {
-        let task_id_owned = task_id.to_string();
-        let current_blocks: Vec<String> = self
-            .get_task(&task_id_owned)
-            .map(|t| t.blocks.clone())
-            .unwrap_or_default();
-        let current_blocked_by: Vec<String> = self
-            .get_task(&task_id_owned)
-            .map(|t| t.blocked_by.clone())
-            .unwrap_or_default();
-
-        for bid in &current_blocks {
-            if let Some(other) = self.get_task_mut(bid) {
-                if !other.blocked_by.contains(&task_id_owned) {
-                    other.blocked_by.push(task_id_owned.clone());
-                }
-            }
-        }
-        for bid in &current_blocked_by {
-            if let Some(other) = self.get_task_mut(bid) {
-                if !other.blocks.contains(&task_id_owned) {
-                    other.blocks.push(task_id_owned.clone());
-                }
-            }
-        }
+    /// Return a bounded deterministic readiness ranking.
+    ///
+    /// # Errors
+    /// Returns an error when `limit` exceeds the canonical page bound or the
+    /// graph fails validation.
+    pub fn ready_tasks(&self, limit: usize) -> Result<TaskManagerPage, String> {
+        let page = self.graph.ready(limit).map_err(|error| error.to_string())?;
+        Ok(TaskManagerPage {
+            tasks: page.tasks.into_iter().filter_map(project_task).collect(),
+            next_cursor: None,
+            generation: page.generation,
+        })
     }
 
-    /// List all tasks.
+    /// External ids already projected for one system. This supports bounded
+    /// refresh without requiring an unbounded external history scan.
+    #[must_use]
+    pub fn projected_external_ids(&self, expected_system: &str) -> Vec<String> {
+        self.graph
+            .all_tasks()
+            .filter_map(|task| match &task.source {
+                TaskSource::ExternalIssue {
+                    system,
+                    external_id,
+                    ..
+                } if system == expected_system => Some(external_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn get_task(&self, task_id: &str) -> Option<&Task> {
+        self.projection.iter().find(|task| task.id == task_id)
+    }
+
     #[must_use]
     pub fn list_tasks(&self) -> &[Task] {
-        &self.tasks
+        &self.projection
     }
 
-    /// Get the currently in-progress task, if any.
+    /// Read one bounded creation-ordered page. A cursor from an older graph
+    /// generation is rejected instead of returning a mixed snapshot.
+    ///
+    /// # Errors
+    /// Returns an error for malformed or stale cursors, invalid limits, or an
+    /// invalid graph.
+    pub fn page_tasks(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<TaskManagerPage, String> {
+        let cursor = cursor
+            .map(TaskPageCursor::parse)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let page = self
+            .graph
+            .page(cursor, limit)
+            .map_err(|error| error.to_string())?;
+        let tasks = page.tasks.into_iter().filter_map(project_task).collect();
+        Ok(TaskManagerPage {
+            tasks,
+            next_cursor: page.next.map(TaskPageCursor::encode),
+            generation: page.generation,
+        })
+    }
+
     #[must_use]
     pub fn current_task(&self) -> Option<&Task> {
-        self.tasks
+        self.projection
             .iter()
-            .find(|t| t.status == TaskStatus::InProgress)
+            .find(|task| task.status == TaskStatus::InProgress)
     }
 
-    /// Format a task summary for display.
     #[must_use]
     pub fn format_task_summary(task: &Task) -> String {
         let status_icon = match task.status {
             TaskStatus::Pending => "[ ]",
             TaskStatus::InProgress => "[>]",
             TaskStatus::Completed => "[x]",
+            TaskStatus::Failed => "[!]",
+            TaskStatus::Canceled => "[-]",
         };
-
         let mut summary = format!(
-            "{status_icon} {} {} ({})",
-            task.id, task.subject, task.status
+            "{status_icon} {} {} ({}, {})",
+            task.id, task.subject, task.status, task.priority
         );
-
-        if let Some(ref af) = task.active_form {
-            let _ = write!(summary, " -- {af}");
+        if let Some(active_form) = &task.active_form {
+            let _ = write!(summary, " -- {active_form}");
         }
-
         if !task.blocks.is_empty() {
             let _ = write!(summary, "\n    blocks: {}", task.blocks.join(", "));
         }
         if !task.blocked_by.is_empty() {
             let _ = write!(summary, "\n    blocked_by: {}", task.blocked_by.join(", "));
         }
-
         summary
     }
 
-    /// Format full task details for display.
     #[must_use]
     pub fn format_task_detail(task: &Task) -> String {
         let mut detail = String::new();
         let _ = writeln!(detail, "ID: {}", task.id);
         let _ = writeln!(detail, "Subject: {}", task.subject);
         let _ = writeln!(detail, "Status: {}", task.status);
+        let _ = writeln!(detail, "Priority: {}", task.priority);
+        let _ = writeln!(detail, "Version: {}", task.revision);
         let _ = writeln!(detail, "Description: {}", task.description);
-        if let Some(ref af) = task.active_form {
-            let _ = writeln!(detail, "Active form: {af}");
+        if let Some(active_form) = &task.active_form {
+            let _ = writeln!(detail, "Active form: {active_form}");
         }
         let _ = writeln!(
             detail,
             "Created: {}",
             task.created_at.format("%Y-%m-%d %H:%M:%S UTC")
         );
+        let _ = writeln!(
+            detail,
+            "Updated: {}",
+            task.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        if let Some(terminal_at) = task.terminal_at {
+            let _ = writeln!(
+                detail,
+                "Terminal: {}",
+                terminal_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+        }
         if !task.blocks.is_empty() {
             let _ = writeln!(detail, "Blocks: {}", task.blocks.join(", "));
         }
@@ -533,608 +727,250 @@ impl TaskManager {
         }
         detail
     }
+
+    fn publish(&mut self, proposal: TaskGraphProposal) -> Result<(), String> {
+        let persistence = if let Some(store) = &self.store {
+            let receipt = store
+                .commit(self.storage_generation, proposal.graph())
+                .map_err(|error| error.to_string())?;
+            self.storage_generation = receipt.generation();
+            Some(receipt.state())
+        } else {
+            None
+        };
+        let (graph, graph_receipt) = proposal.into_parts();
+        self.graph = graph;
+        self.last_receipt = Some(TaskManagerReceipt {
+            graph: graph_receipt,
+            persistence,
+        });
+        self.rebuild_projection();
+        Ok(())
+    }
+
+    fn rebuild_projection(&mut self) {
+        self.projection = self.graph.all_tasks().filter_map(project_task).collect();
+        self.projection.sort_unstable_by(|left, right| {
+            numeric_task_sequence(&left.id)
+                .cmp(&numeric_task_sequence(&right.id))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+}
+
+fn project_task(node: &TaskNode) -> Option<Task> {
+    let status = match node.status {
+        CanonicalTaskStatus::Pending => TaskStatus::Pending,
+        CanonicalTaskStatus::InProgress => TaskStatus::InProgress,
+        CanonicalTaskStatus::Completed => TaskStatus::Completed,
+        CanonicalTaskStatus::Failed => TaskStatus::Failed,
+        CanonicalTaskStatus::Canceled => TaskStatus::Canceled,
+        CanonicalTaskStatus::Deleted => return None,
+    };
+    Some(Task {
+        id: node.id.to_string(),
+        subject: node.subject.clone(),
+        description: node.description.clone(),
+        active_form: node.active_form.clone(),
+        status,
+        priority: node.priority,
+        blocks: node.blocks.iter().map(ToString::to_string).collect(),
+        blocked_by: node.blocked_by.iter().map(ToString::to_string).collect(),
+        created_at: node.created_at,
+        updated_at: node.updated_at,
+        completed_at: node.completed_at,
+        terminal_at: node.terminal_at,
+        revision: node.revision,
+        ownership: node.ownership.clone(),
+        source: node.source.clone(),
+        budget: node.budget.clone(),
+    })
+}
+
+const fn canonical_status(status: TaskUpdateStatus) -> CanonicalTaskStatus {
+    match status {
+        TaskUpdateStatus::Pending => CanonicalTaskStatus::Pending,
+        TaskUpdateStatus::InProgress => CanonicalTaskStatus::InProgress,
+        TaskUpdateStatus::Completed => CanonicalTaskStatus::Completed,
+        TaskUpdateStatus::Failed => CanonicalTaskStatus::Failed,
+        TaskUpdateStatus::Canceled => CanonicalTaskStatus::Canceled,
+        TaskUpdateStatus::Deleted => CanonicalTaskStatus::Deleted,
+    }
+}
+
+fn apply_edge_changes(
+    current: &BTreeSet<TaskId>,
+    additions: Option<&[String]>,
+    removals: Option<&[String]>,
+) -> Result<Option<BTreeSet<TaskId>>, String> {
+    if additions.is_none() && removals.is_none() {
+        return Ok(None);
+    }
+    let mut edges = current.clone();
+    if let Some(additions) = additions {
+        for id in additions {
+            edges.insert(TaskId::parse(id.clone()).map_err(|error| error.to_string())?);
+        }
+    }
+    if let Some(removals) = removals {
+        for id in removals {
+            edges.remove(&TaskId::parse(id.clone()).map_err(|error| error.to_string())?);
+        }
+    }
+    Ok(Some(edges))
+}
+
+fn numeric_task_sequence(id: &str) -> u64 {
+    id.strip_prefix("task-")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+fn prepare_private_graph_root(root: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("task graph persistence root is not a real directory".to_string());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder
+                    .create(root)
+                    .map_err(|error| format!("creating task graph root failed: {error}"))?;
+            }
+            #[cfg(not(unix))]
+            fs::create_dir_all(root)
+                .map_err(|error| format!("creating task graph root failed: {error}"))?;
+        }
+        Err(error) => {
+            return Err(format!("inspecting task graph root failed: {error}"));
+        }
+    }
+
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("re-inspecting task graph root failed: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("task graph persistence root is not a real directory".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        // SAFETY: `geteuid` has no preconditions and retains no pointer.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(
+                "task graph persistence root must be owner-only and owned by the effective user"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_task_manager_create() {
-        let mut tm = TaskManager::new();
-        let task = tm.create_task(
-            "Implement feature".to_string(),
-            "Add the new feature".to_string(),
-            Some("Implementing feature".to_string()),
-        );
-        assert_eq!(task.id, "task-1");
-        assert_eq!(task.subject, "Implement feature");
-        assert_eq!(task.status, TaskStatus::Pending);
-        assert_eq!(task.active_form, Some("Implementing feature".to_string()));
+    fn create(manager: &mut TaskManager, subject: &str) -> String {
+        manager
+            .create_task(subject.to_string(), "description".to_string(), None)
+            .expect("create task")
+            .id
+            .clone()
     }
 
     #[test]
-    fn test_task_manager_auto_increment() {
-        let mut tm = TaskManager::new();
-        tm.create_task("A".to_string(), "Desc".to_string(), None);
-        tm.create_task("B".to_string(), "Desc".to_string(), None);
-        tm.create_task("C".to_string(), "Desc".to_string(), None);
-
-        let tasks = tm.list_tasks();
-        assert_eq!(tasks.len(), 3);
-        assert_eq!(tasks[0].id, "task-1");
-        assert_eq!(tasks[1].id, "task-2");
-        assert_eq!(tasks[2].id, "task-3");
+    fn compatibility_manager_projects_canonical_versions() {
+        let mut manager = TaskManager::new();
+        let id = create(&mut manager, "Implement feature");
+        let task = manager.get_task(&id).expect("task");
+        assert_eq!(task.revision, 1);
+        assert_eq!(manager.generation().get(), 1);
+        assert!(matches!(task.source, TaskSource::TaskTool));
+        assert!(matches!(task.ownership, TaskOwnership::Run { .. }));
     }
 
     #[test]
-    fn test_task_manager_update_status() {
-        let mut tm = TaskManager::new();
-        tm.create_task("Task A".to_string(), "Desc".to_string(), None);
-
-        let result = tm.update_task(
-            "task-1",
+    fn invalid_update_does_not_demote_the_current_task() {
+        let mut manager = TaskManager::new();
+        let first = create(&mut manager, "first");
+        let second = create(&mut manager, "second");
+        manager
+            .update_task(
+                &first,
+                TaskUpdateParams {
+                    status: Some(TaskUpdateStatus::InProgress),
+                    ..TaskUpdateParams::default()
+                },
+            )
+            .expect("start first");
+        let before = serde_json::to_vec(manager.graph()).expect("before");
+        let result = manager.update_task(
+            &second,
             TaskUpdateParams {
                 status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        );
-        assert!(result.is_ok());
-        assert_eq!(
-            tm.get_task("task-1").unwrap().status,
-            TaskStatus::InProgress
-        );
-    }
-
-    #[test]
-    fn test_task_manager_single_in_progress() {
-        let mut tm = TaskManager::new();
-        tm.create_task("Task A".to_string(), "Desc".to_string(), None);
-        tm.create_task("Task B".to_string(), "Desc".to_string(), None);
-
-        tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            tm.get_task("task-1").unwrap().status,
-            TaskStatus::InProgress
-        );
-
-        tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(tm.get_task("task-1").unwrap().status, TaskStatus::Pending);
-        assert_eq!(
-            tm.get_task("task-2").unwrap().status,
-            TaskStatus::InProgress
-        );
-    }
-
-    #[test]
-    fn test_task_manager_delete() {
-        let mut tm = TaskManager::new();
-        tm.create_task("To delete".to_string(), "Desc".to_string(), None);
-        assert_eq!(tm.list_tasks().len(), 1);
-
-        let result = tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::Deleted),
-                ..Default::default()
-            },
-        );
-        // "deleted" returns Ok(None) — task removed, no reference to return
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-        assert_eq!(tm.list_tasks().len(), 0);
-    }
-
-    #[test]
-    fn test_task_update_status_parse() {
-        assert_eq!(
-            TaskUpdateStatus::parse("pending"),
-            Some(TaskUpdateStatus::Pending)
-        );
-        assert_eq!(
-            TaskUpdateStatus::parse("in_progress"),
-            Some(TaskUpdateStatus::InProgress)
-        );
-        assert_eq!(
-            TaskUpdateStatus::parse("completed"),
-            Some(TaskUpdateStatus::Completed)
-        );
-        assert_eq!(
-            TaskUpdateStatus::parse("deleted"),
-            Some(TaskUpdateStatus::Deleted)
-        );
-        assert_eq!(TaskUpdateStatus::parse("invalid"), None);
-        assert_eq!(TaskUpdateStatus::parse(""), None);
-    }
-
-    #[test]
-    fn test_task_manager_not_found() {
-        let mut tm = TaskManager::new();
-        let result = tm.update_task(
-            "task-999",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::Completed),
-                ..Default::default()
+                add_blocked_by: Some(vec![first]),
+                ..TaskUpdateParams::default()
             },
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not found"));
+        assert_eq!(serde_json::to_vec(manager.graph()).expect("after"), before);
     }
 
     #[test]
-    fn test_task_manager_dependencies() {
-        let mut tm = TaskManager::new();
-        tm.create_task("Setup".to_string(), "First step".to_string(), None);
-        tm.create_task("Build".to_string(), "Second step".to_string(), None);
-
-        // task-2 blocked by task-1
-        tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                add_blocked_by: Some(vec!["task-1".to_string()]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let task1 = tm.get_task("task-1").unwrap();
-        let task2 = tm.get_task("task-2").unwrap();
-        assert!(task2.blocked_by.contains(&"task-1".to_string()));
-        assert!(task1.blocks.contains(&"task-2".to_string()));
+    fn delete_keeps_canonical_tombstone_and_hides_projection() {
+        let mut manager = TaskManager::new();
+        let id = create(&mut manager, "delete me");
+        manager
+            .update_task(
+                &id,
+                TaskUpdateParams {
+                    status: Some(TaskUpdateStatus::Deleted),
+                    ..TaskUpdateParams::default()
+                },
+            )
+            .expect("delete");
+        assert!(manager.get_task(&id).is_none());
+        assert!(manager
+            .graph()
+            .all_tasks()
+            .any(|node| node.id.as_str() == id && node.status == CanonicalTaskStatus::Deleted));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_task_manager_self_dependency_blocked() {
-        let mut tm = TaskManager::new();
-        tm.create_task("Task".to_string(), "Desc".to_string(), None);
+    fn private_graph_root_is_created_owner_only_and_never_repairs_public_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
 
-        let result = tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                add_blocks: Some(vec!["task-1".to_string()]),
-                ..Default::default()
-            },
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cannot block itself"));
-    }
-
-    #[test]
-    fn test_task_manager_current_task() {
-        let mut tm = TaskManager::new();
-        assert!(tm.current_task().is_none());
-
-        tm.create_task("Task".to_string(), "Desc".to_string(), None);
-        assert!(tm.current_task().is_none()); // still pending
-
-        tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(tm.current_task().is_some());
-        assert_eq!(tm.current_task().unwrap().id, "task-1");
-    }
-
-    #[test]
-    fn test_task_manager_format_summary() {
-        let mut tm = TaskManager::new();
-        let task = tm.create_task(
-            "Fix bug".to_string(),
-            "Fix the null pointer".to_string(),
-            Some("Fixing bug".to_string()),
-        );
-        let summary = TaskManager::format_task_summary(task);
-        assert!(summary.contains("[ ]")); // pending icon
-        assert!(summary.contains("task-1"));
-        assert!(summary.contains("Fix bug"));
-        assert!(summary.contains("Fixing bug"));
-    }
-
-    // ── Phase 2 spec-pinning tests (#552 / spec #537 B-session/task) ─────────
-
-    /// Spec — `TaskStatus::Display` renders the canonical strings used by the
-    /// tool layer and the session summary.
-    #[test]
-    fn task_status_display_strings() {
-        assert_eq!(TaskStatus::Pending.to_string(), "pending");
-        assert_eq!(TaskStatus::InProgress.to_string(), "in_progress");
-        assert_eq!(TaskStatus::Completed.to_string(), "completed");
-    }
-
-    /// Spec — creating a task always starts it as `Pending`.
-    #[test]
-    fn new_task_starts_pending() {
-        let mut tm = TaskManager::new();
-        let t = tm.create_task("Deploy".to_string(), "desc".to_string(), None);
-        assert_eq!(t.status, TaskStatus::Pending);
-    }
-
-    /// Spec — setting a second task to `InProgress` demotes the current one to
-    /// `Pending`. Enforces the single-in-progress invariant.
-    #[test]
-    fn single_in_progress_invariant() {
-        let mut tm = TaskManager::new();
-        tm.create_task("A".to_string(), "d".to_string(), None);
-        tm.create_task("B".to_string(), "d".to_string(), None);
-        tm.create_task("C".to_string(), "d".to_string(), None);
-
-        tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        tm.update_task(
-            "task-3",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        // Only task-3 should be InProgress; task-1 and task-2 must be Pending.
-        assert_eq!(tm.get_task("task-1").unwrap().status, TaskStatus::Pending);
-        assert_eq!(tm.get_task("task-2").unwrap().status, TaskStatus::Pending);
+        let host = tempfile::tempdir().expect("host root");
+        let created = host.path().join("state").join("task_graphs");
+        prepare_private_graph_root(&created).expect("create private graph root");
         assert_eq!(
-            tm.get_task("task-3").unwrap().status,
-            TaskStatus::InProgress
+            fs::symlink_metadata(&created)
+                .expect("created metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
 
-        // `current_task()` reflects the single in-progress entry.
-        let cur = tm.current_task().unwrap();
-        assert_eq!(cur.id, "task-3");
-    }
-
-    /// Spec — updating a non-existent task returns `Err`.
-    #[test]
-    fn update_nonexistent_task_returns_err() {
-        let mut tm = TaskManager::new();
-        let res = tm.update_task("task-99", TaskUpdateParams::default());
-        assert!(res.is_err());
-    }
-
-    /// Spec — `Deleted` status removes the task from the list and returns `Ok(None)`.
-    #[test]
-    fn delete_removes_task_returns_ok_none() {
-        let mut tm = TaskManager::new();
-        tm.create_task("X".to_string(), "d".to_string(), None);
-        let res = tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::Deleted),
-                ..Default::default()
-            },
-        );
-        assert!(res.is_ok());
-        assert!(res.unwrap().is_none(), "Deleted must return Ok(None)");
-        assert!(tm.list_tasks().is_empty(), "task must be gone from list");
-    }
-
-    /// Spec — cycle detection: A blocks B, then adding B blocks A must fail.
-    #[test]
-    fn cycle_detection_rejects_circular_dependency() {
-        let mut tm = TaskManager::new();
-        tm.create_task("A".to_string(), "d".to_string(), None);
-        tm.create_task("B".to_string(), "d".to_string(), None);
-
-        // task-1 blocks task-2
-        tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                add_blocks: Some(vec!["task-2".to_string()]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        // Now try to make task-2 block task-1 — should be rejected as a cycle
-        let res = tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                add_blocks: Some(vec!["task-1".to_string()]),
-                ..Default::default()
-            },
-        );
-        assert!(res.is_err(), "circular dependency must be rejected");
-        let msg = res.unwrap_err();
-        assert!(
-            msg.contains("circular") || msg.contains("cycle"),
-            "error must mention circularity, got: {msg}"
-        );
-    }
-
-    /// Spec — `add_blocks` syncs the reverse `blocked_by` on the target task.
-    #[test]
-    fn add_blocks_syncs_reverse_blocked_by() {
-        let mut tm = TaskManager::new();
-        tm.create_task("First".to_string(), "d".to_string(), None);
-        tm.create_task("Second".to_string(), "d".to_string(), None);
-
-        tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                add_blocks: Some(vec!["task-2".to_string()]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let t2 = tm.get_task("task-2").unwrap();
-        assert!(
-            t2.blocked_by.contains(&"task-1".to_string()),
-            "task-2.blocked_by must contain task-1 after add_blocks"
-        );
-    }
-
-    // ── crosslink #593: blocked_by enforcement on InProgress transition ─────
-
-    /// #593 — A task with empty `blocked_by` can always transition to `InProgress`.
-    #[test]
-    fn issue_593_empty_blocked_by_allows_in_progress() {
-        let mut tm = TaskManager::new();
-        tm.create_task("Solo".to_string(), "d".to_string(), None);
-        let res = tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        );
-        assert!(res.is_ok(), "empty blocked_by must allow InProgress");
+        fs::set_permissions(&created, fs::Permissions::from_mode(0o755)).expect("make root public");
+        let error = prepare_private_graph_root(&created).expect_err("reject public root");
+        assert!(error.contains("owner-only"));
         assert_eq!(
-            tm.get_task("task-1").unwrap().status,
-            TaskStatus::InProgress
+            fs::symlink_metadata(&created)
+                .expect("rejected metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "validation must not mutate an untrusted pathname"
         );
-    }
-
-    /// #593 — All blockers Completed → `InProgress` transition succeeds.
-    #[test]
-    fn issue_593_all_blockers_completed_allows_in_progress() {
-        let mut tm = TaskManager::new();
-        tm.create_task("A".to_string(), "d".to_string(), None);
-        tm.create_task("B".to_string(), "d".to_string(), None);
-        tm.create_task("C".to_string(), "d".to_string(), None);
-
-        // task-3 is blocked by task-1 and task-2
-        tm.update_task(
-            "task-3",
-            TaskUpdateParams {
-                add_blocked_by: Some(vec!["task-1".to_string(), "task-2".to_string()]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        // Complete both blockers
-        tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::Completed),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::Completed),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        // task-3 should now be allowed to transition
-        let res = tm.update_task(
-            "task-3",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        );
-        assert!(
-            res.is_ok(),
-            "all-Completed blockers must allow InProgress, got: {res:?}"
-        );
-        assert_eq!(
-            tm.get_task("task-3").unwrap().status,
-            TaskStatus::InProgress
-        );
-    }
-
-    /// #593 — A Pending blocker rejects the `InProgress` transition with a
-    /// clear error message naming the blocker.
-    #[test]
-    fn issue_593_pending_blocker_rejects_in_progress() {
-        let mut tm = TaskManager::new();
-        tm.create_task("Setup".to_string(), "d".to_string(), None);
-        tm.create_task("Build".to_string(), "d".to_string(), None);
-
-        // task-2 blocked by task-1 (Pending by default)
-        tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                add_blocked_by: Some(vec!["task-1".to_string()]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let res = tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        );
-        assert!(res.is_err(), "Pending blocker must reject InProgress");
-        let msg = res.unwrap_err();
-        assert!(
-            msg.contains("task-1") && msg.contains("pending"),
-            "error must name blocker and its status, got: {msg}"
-        );
-        // Status must not have changed.
-        assert_eq!(tm.get_task("task-2").unwrap().status, TaskStatus::Pending);
-    }
-
-    /// #593 — An `InProgress` blocker rejects the transition.
-    #[test]
-    fn issue_593_in_progress_blocker_rejects_in_progress() {
-        let mut tm = TaskManager::new();
-        tm.create_task("Setup".to_string(), "d".to_string(), None);
-        tm.create_task("Build".to_string(), "d".to_string(), None);
-
-        // task-2 blocked by task-1
-        tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                add_blocked_by: Some(vec!["task-1".to_string()]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        // task-1 is now InProgress (single-in-progress rule still holds)
-        tm.update_task(
-            "task-1",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let res = tm.update_task(
-            "task-2",
-            TaskUpdateParams {
-                status: Some(TaskUpdateStatus::InProgress),
-                ..Default::default()
-            },
-        );
-        assert!(res.is_err(), "InProgress blocker must reject InProgress");
-        let msg = res.unwrap_err();
-        assert!(
-            msg.contains("task-1") && msg.contains("in_progress"),
-            "error must name blocker and its in_progress status, got: {msg}"
-        );
-        // task-1 must remain InProgress (rejection happens before demote pass).
-        assert_eq!(
-            tm.get_task("task-1").unwrap().status,
-            TaskStatus::InProgress
-        );
-        assert_eq!(tm.get_task("task-2").unwrap().status, TaskStatus::Pending);
-    }
-
-    /// Crosslink #366: a single `update_task` call that adds BOTH
-    /// `add_blocks=[B]` and `add_blocked_by=[B]` forms an A↔B cycle.
-    /// Each edge passes the old per-edge check in isolation against
-    /// the empty current graph; the combined-graph check catches it.
-    #[test]
-    fn issue_366_combined_pending_edges_cycle_is_detected() {
-        let mut tm = TaskManager::new();
-        let a = tm
-            .create_task("A".to_string(), "a".to_string(), None)
-            .id
-            .clone();
-        let b = tm
-            .create_task("B".to_string(), "b".to_string(), None)
-            .id
-            .clone();
-
-        let result = tm.update_task(
-            &a,
-            TaskUpdateParams {
-                status: None,
-                subject: None,
-                description: None,
-                active_form: None,
-                add_blocks: Some(vec![b.clone()]),
-                add_blocked_by: Some(vec![b]),
-            },
-        );
-        assert!(
-            result.is_err(),
-            "combined A->B + B->A in one call must be rejected as a cycle, \
-             got: {result:?}"
-        );
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("circular dependency"),
-            "error must mention the cycle, got: {msg}"
-        );
-    }
-
-    /// Crosslink #366: a single edge that does NOT form a cycle still
-    /// passes (regression guard for the new combined-graph check).
-    #[test]
-    fn issue_366_single_edge_with_no_cycle_succeeds() {
-        let mut tm = TaskManager::new();
-        let a = tm
-            .create_task("A".to_string(), "a".to_string(), None)
-            .id
-            .clone();
-        let b = tm
-            .create_task("B".to_string(), "b".to_string(), None)
-            .id
-            .clone();
-
-        let result = tm.update_task(
-            &a,
-            TaskUpdateParams {
-                status: None,
-                subject: None,
-                description: None,
-                active_form: None,
-                add_blocks: Some(vec![b]),
-                add_blocked_by: None,
-            },
-        );
-        assert!(
-            result.is_ok(),
-            "A->B alone (no reverse edge) must be accepted, got: {result:?}"
-        );
-    }
-
-    /// Spec — `format_task_detail` contains all key fields.
-    #[test]
-    fn format_task_detail_contains_required_fields() {
-        let mut tm = TaskManager::new();
-        let task = tm.create_task(
-            "Write tests".to_string(),
-            "Full description here".to_string(),
-            Some("Writing tests".to_string()),
-        );
-        let detail = TaskManager::format_task_detail(task);
-        assert!(detail.contains("Write tests"));
-        assert!(detail.contains("Full description here"));
-        assert!(detail.contains("Writing tests"));
-        assert!(detail.contains("pending"), "detail must include status");
     }
 }

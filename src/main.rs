@@ -490,7 +490,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None if cli.tui_mode => {
             // Legacy rustyline REPL (--tui-mode is now the escape hatch name, kept for compat)
-            cmd_chat(
+            Box::pin(cmd_chat(
                 cli.model,
                 cli.target,
                 cli.resume,
@@ -498,7 +498,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.coordinator,
                 cli.dangerously_skip_permissions,
                 cli.mode,
-            )
+            ))
             .await
         }
         None => {
@@ -993,6 +993,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     app.vdd_builder_auth = builder_vdd_auth;
     app.app_config = Some(std::sync::Arc::new(config.clone()));
     app.apply_startup_resume(resume, session_id);
+    app.bind_durable_task_graph().map_err(anyhow::Error::msg)?;
     let endpoint = if app.model == model {
         endpoint
     } else {
@@ -2590,7 +2591,7 @@ async fn cmd_chat(
         mode_arg,
     })
     .await?;
-    repl.run().await
+    Box::pin(repl.run()).await
 }
 
 // ============================================================================

@@ -1775,6 +1775,7 @@ mod todo_tools {
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Fix the bug",
@@ -1822,6 +1823,7 @@ mod todo_tools {
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Setup project",
@@ -1858,13 +1860,14 @@ mod todo_tools {
     }
 
     #[test]
-    fn test_todo_write_multiple_in_progress_warning() {
+    fn test_todo_write_multiple_in_progress_is_atomic_error() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
         clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Task 1",
@@ -1882,13 +1885,13 @@ mod todo_tools {
 
         let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error(), "Should succeed: {}", result.content());
+        assert!(result.is_error(), "Must reject: {}", result.content());
         assert!(
-            result.content().to_lowercase().contains("warning")
-                || result.content().contains("2 tasks marked as in_progress"),
-            "Should warn about multiple in_progress: {}",
+            result.content().contains("multiple in-progress"),
+            "Should name the canonical actor-lane invariant: {}",
             result.content()
         );
+        assert!(get_todo_list(support::shared_run_context().session_id()).is_empty());
     }
 
     #[test]
@@ -1900,6 +1903,7 @@ mod todo_tools {
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Task",
@@ -1931,6 +1935,7 @@ mod todo_tools {
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Task",
@@ -1985,6 +1990,7 @@ mod todo_tools {
         let write_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Research API",
@@ -2047,6 +2053,7 @@ mod todo_tools {
         let write_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Persistent task",
@@ -2076,6 +2083,7 @@ mod todo_tools {
         let write1 = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Old task 1",
@@ -2096,6 +2104,7 @@ mod todo_tools {
         let write2 = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 1,
                 "todos": [
                     {
                         "content": "New task",
@@ -2121,6 +2130,7 @@ mod todo_tools {
         let write1 = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Task",
@@ -2136,6 +2146,7 @@ mod todo_tools {
         let write_empty = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 1,
                 "todos": []
             }),
         );

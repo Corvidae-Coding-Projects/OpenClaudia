@@ -79,6 +79,23 @@ pub mod tool_search;
 mod web;
 pub mod worktree;
 
+/// Whether a registry handler consumes the caller's canonical task graph.
+/// Frontends use this before taking their task-manager mutex so unrelated
+/// tools never serialize behind planning-state persistence.
+#[must_use]
+pub fn uses_canonical_task_graph(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "task_create"
+            | "task_update"
+            | "task_get"
+            | "task_list"
+            | "todo_write"
+            | "todo_read"
+            | "crosslink"
+    )
+}
+
 // Re-exports
 pub use accumulator::{
     AnthropicContentBlock, AnthropicToolAccumulator, PartialToolCall, ToolCallAccumulator,
@@ -594,10 +611,7 @@ fn execute_tool_full_after_authorization(
                 },
             ),
         "agent_output" => subagent::execute_agent_output_tool_typed(run, &args),
-        "task_stop" => {
-            let (content, is_error) = subagent::execute_task_stop_tool(run, &args);
-            ToolHandlerResult::legacy(content, is_error)
-        }
+        "task_stop" => subagent::execute_task_stop_tool_typed(run, &args),
         _ => {
             let mut ctx = ToolContext {
                 run,
@@ -1002,6 +1016,24 @@ mod tests {
 
     fn test_run() -> &'static std::sync::Arc<ToolRunContext> {
         security::test_run_context()
+    }
+
+    #[test]
+    fn canonical_task_graph_consumers_are_an_exact_closed_set() {
+        for name in [
+            "task_create",
+            "task_update",
+            "task_get",
+            "task_list",
+            "todo_write",
+            "todo_read",
+            "crosslink",
+        ] {
+            assert!(uses_canonical_task_graph(name), "{name}");
+        }
+        for name in ["bash", "read_file", "memory_search", "agent", "task_stop"] {
+            assert!(!uses_canonical_task_graph(name), "{name}");
+        }
     }
 
     #[test]
@@ -2009,6 +2041,7 @@ mod tests {
     fn test_task_create() {
         let mut task_mgr = TaskManager::new();
         let mut args = HashMap::new();
+        args.insert("expected_generation".to_string(), json!(0));
         args.insert("subject".to_string(), json!("Fix the bug"));
         args.insert(
             "description".to_string(),
@@ -2030,11 +2063,18 @@ mod tests {
     #[test]
     fn test_task_update_status() {
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Task A".to_string(), "Desc A".to_string(), None);
+        task_mgr
+            .create_task("Task A".to_string(), "Desc A".to_string(), None)
+            .expect("valid task fixture");
 
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-1"));
         args.insert("status".to_string(), json!("in_progress"));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
+        args.insert("expected_task_revision".to_string(), json!(1));
 
         let (output, is_error) = task::execute_task_update(&args, &mut task_mgr);
         assert!(!is_error, "task_update should succeed: {output}");
@@ -2044,17 +2084,30 @@ mod tests {
     #[test]
     fn test_task_only_one_in_progress() {
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Task A".to_string(), "Desc A".to_string(), None);
-        task_mgr.create_task("Task B".to_string(), "Desc B".to_string(), None);
+        task_mgr
+            .create_task("Task A".to_string(), "Desc A".to_string(), None)
+            .expect("valid task fixture");
+        task_mgr
+            .create_task("Task B".to_string(), "Desc B".to_string(), None)
+            .expect("valid task fixture");
 
         // Set task-1 to in_progress
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-1"));
         args.insert("status".to_string(), json!("in_progress"));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
+        args.insert("expected_task_revision".to_string(), json!(1));
         task::execute_task_update(&args, &mut task_mgr);
 
         // Set task-2 to in_progress -- task-1 should be demoted to pending
         args.insert("task_id".to_string(), json!("task-2"));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
         task::execute_task_update(&args, &mut task_mgr);
 
         let task1 = task_mgr.get_task("task-1").unwrap();
@@ -2065,10 +2118,10 @@ mod tests {
 
     #[test]
     fn test_task_list_empty() {
-        let task_mgr = TaskManager::new();
-        let (output, is_error) = task::execute_task_list(&task_mgr);
+        let mut task_mgr = TaskManager::new();
+        let (output, is_error) = task::execute_task_list(&HashMap::new(), &mut task_mgr);
         assert!(!is_error);
-        assert_eq!(output, "No tasks.");
+        assert!(output.starts_with("No tasks."));
     }
 
     #[test]
@@ -2078,10 +2131,10 @@ mod tests {
         // earlier OC behaviour returned `is_error=true` with a "not found"
         // string, which forced the model into a recovery path for what is
         // a legitimate outcome (e.g. polling a deleted task).
-        let task_mgr = TaskManager::new();
+        let mut task_mgr = TaskManager::new();
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-999"));
-        let (output, is_error) = task::execute_task_get(&args, &task_mgr);
+        let (output, is_error) = task::execute_task_get(&args, &mut task_mgr);
         assert!(
             !is_error,
             "task_get for missing id must be a successful lookup, not an error: {output}"
@@ -2099,10 +2152,12 @@ mod tests {
         // crosslink #588 regression guard: the success path for an existing
         // task must still emit the human-readable detail block, not null.
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Real task".to_string(), "Desc".to_string(), None);
+        task_mgr
+            .create_task("Real task".to_string(), "Desc".to_string(), None)
+            .expect("valid task fixture");
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-1"));
-        let (output, is_error) = task::execute_task_get(&args, &task_mgr);
+        let (output, is_error) = task::execute_task_get(&args, &mut task_mgr);
         assert!(!is_error, "found task must succeed: {output}");
         assert_ne!(
             output, "null",
@@ -2117,11 +2172,18 @@ mod tests {
     #[test]
     fn test_task_delete() {
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Task to delete".to_string(), "Desc".to_string(), None);
+        task_mgr
+            .create_task("Task to delete".to_string(), "Desc".to_string(), None)
+            .expect("valid task fixture");
 
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-1"));
         args.insert("status".to_string(), json!("deleted"));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
+        args.insert("expected_task_revision".to_string(), json!(1));
         let (output, is_error) = task::execute_task_update(&args, &mut task_mgr);
         assert!(!is_error, "delete should not be an error: {output}");
         assert!(output.contains("deleted"));
@@ -2131,13 +2193,22 @@ mod tests {
     #[test]
     fn test_task_dependencies() {
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Setup DB".to_string(), "Create schema".to_string(), None);
-        task_mgr.create_task("Add API".to_string(), "REST endpoints".to_string(), None);
+        task_mgr
+            .create_task("Setup DB".to_string(), "Create schema".to_string(), None)
+            .expect("valid task fixture");
+        task_mgr
+            .create_task("Add API".to_string(), "REST endpoints".to_string(), None)
+            .expect("valid task fixture");
 
         // task-2 is blocked by task-1
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-2"));
         args.insert("add_blocked_by".to_string(), json!(["task-1"]));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
+        args.insert("expected_task_revision".to_string(), json!(1));
         let (_, is_error) = task::execute_task_update(&args, &mut task_mgr);
         assert!(!is_error);
 

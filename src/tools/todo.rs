@@ -4,6 +4,13 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, MutexGuard};
 
+use crate::session::{TaskManager, TaskStatus};
+use crate::task_graph::{
+    CanonicalTaskStatus, TaskGraphGeneration, TaskId, TodoTaskDraft, MAX_TASKS,
+    MAX_TASK_ACTIVE_FORM_BYTES,
+};
+use crate::tools::args::ToolArgs as _;
+
 /// Hard cap on a single todo's `content` field, in *bytes* (matches the
 /// Claude Code parity limit).
 ///
@@ -32,16 +39,20 @@ pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
+    Failed,
+    Canceled,
 }
 
 impl TodoStatus {
-    const VALID_VALUES: &'static str = "pending, in_progress, completed";
+    const VALID_VALUES: &'static str = "pending, in_progress, completed, failed, canceled";
 
     fn from_wire(value: &str) -> Option<Self> {
         match value {
             "pending" => Some(Self::Pending),
             "in_progress" => Some(Self::InProgress),
             "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
             _ => None,
         }
     }
@@ -55,6 +66,8 @@ impl TodoStatus {
             Self::Completed => "[x]",
             Self::InProgress => "[>]",
             Self::Pending => "[ ]",
+            Self::Failed => "[!]",
+            Self::Canceled => "[-]",
         }
     }
 }
@@ -62,24 +75,15 @@ impl TodoStatus {
 /// Todo item for task tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
+    /// Stable canonical identity returned by `todo_read` and required for a
+    /// later replacement of an existing row.
+    pub task_id: String,
+    /// Optimistic task revision paired with `task_id`.
+    pub revision: u64,
     pub content: String,
     pub status: TodoStatus,
     #[serde(rename = "activeForm")]
     pub active_form: String,
-}
-
-/// Per-session todo storage. Every caller supplies the exact logical session
-/// key; there is no thread-local or default fallback identity.
-type TodoLists = HashMap<String, Vec<TodoItem>>;
-
-static TODO_LISTS: std::sync::LazyLock<Mutex<TodoLists>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn todo_lists_guard(operation: &'static str) -> Result<MutexGuard<'static, TodoLists>, String> {
-    TODO_LISTS.lock().map_err(|err| {
-        tracing::error!(operation, error = %err, "Todo list lock poisoned");
-        err.to_string()
-    })
 }
 
 const fn todo_validation_error(message: String) -> (String, bool) {
@@ -130,12 +134,17 @@ fn parse_todo_status(i: usize, item: &Value) -> Result<TodoStatus, (String, bool
 /// Surfaces every per-item validation failure as a `(message, true)`
 /// tuple matching the entry-point return shape so the caller can bubble
 /// it back to the model without restringing. crosslink #973 / #979.
-fn parse_todo_item(i: usize, item: &Value) -> Result<TodoItem, (String, bool)> {
+fn parse_todo_item(i: usize, item: &Value) -> Result<TodoTaskDraft, (String, bool)> {
     if !item.is_object() {
         return Err(todo_validation_error(format!("Todo {i} must be an object")));
     }
 
     let content = required_todo_string_field(i, item, "content")?;
+    if content.trim().is_empty() {
+        return Err(todo_validation_error(format!(
+            "Todo {i} content must not be empty"
+        )));
+    }
     if content.len() > TODO_CONTENT_MAX_BYTES {
         return Err(todo_validation_error(format!(
             "Todo {i} content exceeds maximum length of {TODO_CONTENT_MAX_BYTES} bytes"
@@ -143,16 +152,58 @@ fn parse_todo_item(i: usize, item: &Value) -> Result<TodoItem, (String, bool)> {
     }
 
     let status = parse_todo_status(i, item)?;
-    let active_form = required_todo_string_field(i, item, "activeForm")?.to_string();
+    let active_form = required_todo_string_field(i, item, "activeForm")?;
+    if active_form.trim().is_empty() {
+        return Err(todo_validation_error(format!(
+            "Todo {i} activeForm must not be empty"
+        )));
+    }
+    if active_form.len() > MAX_TASK_ACTIVE_FORM_BYTES {
+        return Err(todo_validation_error(format!(
+            "Todo {i} activeForm exceeds maximum length of {MAX_TASK_ACTIVE_FORM_BYTES} bytes"
+        )));
+    }
 
-    Ok(TodoItem {
+    let task_id = match item.get("task_id") {
+        None => None,
+        Some(Value::String(id)) => Some(
+            TaskId::parse(id.clone()).map_err(|error| todo_validation_error(error.to_string()))?,
+        ),
+        Some(_) => {
+            return Err(todo_validation_error(format!(
+                "Todo {i} 'task_id' must be a string"
+            )));
+        }
+    };
+    let expected_task_revision = match item.get("expected_task_revision") {
+        None => None,
+        Some(Value::Number(value)) => Some(value.as_u64().ok_or_else(|| {
+            todo_validation_error(format!(
+                "Todo {i} 'expected_task_revision' must be a non-negative integer"
+            ))
+        })?),
+        Some(_) => {
+            return Err(todo_validation_error(format!(
+                "Todo {i} 'expected_task_revision' must be a non-negative integer"
+            )));
+        }
+    };
+
+    Ok(TodoTaskDraft {
+        task_id,
+        expected_task_revision,
         content: content.to_string(),
-        status,
-        active_form,
+        status: canonical_status(status),
+        active_form: active_form.to_string(),
     })
 }
 
-pub fn execute_todo_write(session_key: &str, args: &HashMap<String, Value>) -> (String, bool) {
+/// Apply one generation-checked complete todo projection to the canonical
+/// task graph. No process-global todo store participates.
+pub fn execute_todo_write(
+    task_manager: &mut TaskManager,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let Some(todos_value) = args.get("todos") else {
         return ("Missing 'todos' argument".to_string(), true);
     };
@@ -160,117 +211,113 @@ pub fn execute_todo_write(session_key: &str, args: &HashMap<String, Value>) -> (
     let Some(todos_array) = todos_value.as_array() else {
         return ("'todos' must be an array".to_string(), true);
     };
+    if todos_array.len() > MAX_TASKS {
+        return (
+            format!("'todos' exceeds the canonical limit of {MAX_TASKS} items"),
+            true,
+        );
+    }
 
-    let mut new_todos: Vec<TodoItem> = Vec::with_capacity(todos_array.len());
-    let mut in_progress_count = 0;
+    let mut new_todos = Vec::with_capacity(todos_array.len());
     for (i, item) in todos_array.iter().enumerate() {
         let todo_item = match parse_todo_item(i, item) {
             Ok(t) => t,
             Err(err) => return err,
         };
-        if todo_item.status == TodoStatus::InProgress {
-            in_progress_count += 1;
-        }
         new_todos.push(todo_item);
     }
-
-    // Warn if more than one task is in_progress
-    let warning = if in_progress_count > 1 {
-        format!(
-            "\nWarning: {in_progress_count} tasks marked as in_progress. Best practice is to have only one."
-        )
-    } else {
-        String::new()
+    let expected_generation = match args.arg_u64_strict("expected_generation") {
+        Ok(value) => TaskGraphGeneration::from_u64(value),
+        Err(error) => return error.into_tool_error(),
     };
-
-    // Claude Code parity: when every item is `completed`, clear the list
-    // instead of keeping a list of done items. Keeps the session cleanup
-    // clean and signals the agent to stop referring back to finished work.
-    // See claude-code/tools/TodoWriteTool/TodoWriteTool.ts (`allDone` branch).
-    //
-    // crosslink #972: the all_done decision MUST be made inside the lock
-    // alongside the mutation. Earlier code decided outside the lock, which
-    // raced two concurrent todo_write calls — thread A could decide
-    // "all_done → remove" from its input while thread B's pending insert
-    // landed first, erasing B's todos. The decide-and-write pair is one
-    // critical section now.
-    let all_done =
-        !new_todos.is_empty() && new_todos.iter().all(|t| t.status == TodoStatus::Completed);
-
-    // Update the caller-selected logical session bucket. The executor passes
-    // this key explicitly; it is state partitioning, not host authority.
-    // The all_done compare-and-{remove|insert} pair runs atomically under the
-    // map lock so two concurrent todo_write calls cannot race the bucket
-    // (crosslink #972).
-    match todo_lists_guard("execute_todo_write") {
-        Ok(mut map) => {
-            if all_done {
-                map.remove(session_key);
-            } else {
-                map.insert(session_key.to_string(), new_todos.clone());
-            }
-        }
-        Err(e) => return (format!("Failed to update todo list: {e}"), true),
-    }
-
-    if all_done {
-        return (
-            format!(
-                "Todos have been modified successfully — all {} items completed, list cleared.",
-                new_todos.len()
-            ),
-            false,
-        );
-    }
-
-    // Format output for the non-all-done case.
+    let total = new_todos.len();
     let completed = new_todos
         .iter()
-        .filter(|t| t.status == TodoStatus::Completed)
+        .filter(|task| task.status == CanonicalTaskStatus::Completed)
         .count();
     let in_progress = new_todos
         .iter()
-        .filter(|t| t.status == TodoStatus::InProgress)
+        .filter(|task| task.status == CanonicalTaskStatus::InProgress)
         .count();
     let pending = new_todos
         .iter()
-        .filter(|t| t.status == TodoStatus::Pending)
+        .filter(|task| task.status == CanonicalTaskStatus::Pending)
         .count();
+    let failed = new_todos
+        .iter()
+        .filter(|task| task.status == CanonicalTaskStatus::Failed)
+        .count();
+    let canceled = new_todos
+        .iter()
+        .filter(|task| task.status == CanonicalTaskStatus::Canceled)
+        .count();
+    let current = new_todos
+        .iter()
+        .find(|task| task.status == CanonicalTaskStatus::InProgress)
+        .map(|task| task.active_form.clone());
+    let all_completed = total != 0 && completed == total;
+    if let Err(error) = task_manager.replace_todos_checked(expected_generation, new_todos) {
+        return (error, true);
+    }
 
     let mut output = format!(
-        "Todo list updated: {} total ({} completed, {} in progress, {} pending){}",
-        new_todos.len(),
+        "Todo list updated at canonical generation {}: {} total ({} completed, {} in progress, {} pending, {} failed, {} canceled)",
+        task_manager.generation(),
+        total,
         completed,
         in_progress,
         pending,
-        warning
+        failed,
+        canceled
     );
 
     // Show current in-progress task if any
-    if let Some(current) = new_todos
-        .iter()
-        .find(|t| t.status == TodoStatus::InProgress)
-    {
-        let _ = write!(output, "\n\nCurrently: {}", current.active_form);
+    if let Some(current) = current {
+        let _ = write!(output, "\n\nCurrently: {current}");
+    }
+
+    if all_completed {
+        let _ = write!(
+            output,
+            "\nall {completed} items completed; todo list cleared while canonical completion history is retained."
+        );
     }
 
     (output, false)
 }
 
-/// Read the current todo list for the active session bucket.
-pub fn execute_todo_read(session_key: &str) -> (String, bool) {
-    let todos = match todo_lists_guard("execute_todo_read") {
-        Ok(map) => map.get(session_key).cloned().unwrap_or_default(),
-        Err(e) => return (format!("Failed to read todo list: {e}"), true),
-    };
+/// Read the todo projection of the canonical graph with stable identities and
+/// optimistic versions needed by a subsequent write.
+pub fn execute_todo_read(task_manager: &mut TaskManager) -> (String, bool) {
+    if let Err(error) = task_manager.refresh() {
+        return (error, true);
+    }
+    let todos = project_todo_list(task_manager);
 
     if todos.is_empty() {
-        return ("No todos in list.".to_string(), false);
+        return (
+            format!(
+                "No todos in view. Canonical graph generation: {}.",
+                task_manager.generation()
+            ),
+            false,
+        );
     }
 
-    let mut output = String::new();
+    let mut output = format!(
+        "Canonical graph generation: {}\n",
+        task_manager.generation()
+    );
     for (i, item) in todos.iter().enumerate() {
-        let _ = writeln!(output, "{}. {} {}", i + 1, item.status.icon(), item.content);
+        let _ = writeln!(
+            output,
+            "{}. {} {} [task_id={}, revision={}]",
+            i + 1,
+            item.status.icon(),
+            item.content,
+            item.task_id,
+            item.revision
+        );
     }
 
     // Summary
@@ -286,36 +333,152 @@ pub fn execute_todo_read(session_key: &str) -> (String, bool) {
         .iter()
         .filter(|t| t.status == TodoStatus::Pending)
         .count();
+    let failed = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Failed)
+        .count();
+    let canceled = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Canceled)
+        .count();
 
     let _ = write!(
         output,
-        "\n({completed} completed, {in_progress} in progress, {pending} pending)"
+        "\n({completed} completed, {in_progress} in progress, {pending} pending, {failed} failed, {canceled} canceled)"
     );
 
     (output, false)
 }
 
-/// Get the todo list for one explicit logical session bucket.
+/// Project all current canonical tasks into the compact todo view. Once every
+/// current row is completed the view is empty, while task nodes and immutable
+/// completion history remain available through the task view.
 #[must_use]
-pub fn get_todo_list(session_key: &str) -> Vec<TodoItem> {
-    todo_lists_guard("get_todo_list")
-        .map(|m| m.get(session_key).cloned().unwrap_or_default())
-        .unwrap_or_default()
-}
-
-/// Clear one explicit logical session bucket.
-pub fn clear_todo_list(session_key: &str) {
-    if let Ok(mut map) = todo_lists_guard("clear_todo_list") {
-        map.remove(session_key);
+fn project_todo_list(task_manager: &TaskManager) -> Vec<TodoItem> {
+    let items = task_manager
+        .list_tasks()
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.source,
+                crate::task_graph::TaskSource::TaskTool | crate::task_graph::TaskSource::TodoView
+            )
+        })
+        .map(|task| TodoItem {
+            task_id: task.id.clone(),
+            revision: task.revision,
+            content: task.subject.clone(),
+            status: todo_status(task.status),
+            active_form: task
+                .active_form
+                .clone()
+                .unwrap_or_else(|| task.subject.clone()),
+        })
+        .collect::<Vec<_>>();
+    if !items.is_empty()
+        && items
+            .iter()
+            .all(|item| item.status == TodoStatus::Completed)
+    {
+        Vec::new()
+    } else {
+        items
     }
 }
 
-/// Clear every session's list. Used by tests and by explicit "reset
-/// all state" code paths — the single-session `clear_todo_list` only
-/// removes its named bucket.
+/// Legacy composition boundary for callers that expose only a run context.
+/// Values are canonical task graphs, not an independent todo representation.
+/// Production frontends pass an explicit durable [`TaskManager`] instead.
+type CompatibilityGraphs = HashMap<String, TaskManager>;
+
+static COMPATIBILITY_GRAPHS: std::sync::LazyLock<Mutex<CompatibilityGraphs>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn compatibility_graphs_guard(
+    operation: &'static str,
+) -> Result<MutexGuard<'static, CompatibilityGraphs>, String> {
+    COMPATIBILITY_GRAPHS.lock().map_err(|error| {
+        tracing::error!(operation, %error, "Canonical compatibility graph lock poisoned");
+        error.to_string()
+    })
+}
+
+fn with_run_task_manager<R>(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    operation: &'static str,
+    use_manager: impl FnOnce(&mut TaskManager) -> R,
+) -> Result<R, String> {
+    let mut graphs = compatibility_graphs_guard(operation)?;
+    if !graphs.contains_key(run.session_id()) {
+        graphs.insert(run.session_id().to_string(), TaskManager::for_run(run)?);
+    }
+    graphs
+        .get_mut(run.session_id())
+        .map(use_manager)
+        .ok_or_else(|| "canonical compatibility graph disappeared".to_string())
+}
+
+pub fn execute_todo_write_for_run(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
+    with_run_task_manager(run, "todo_write", |manager| {
+        execute_todo_write(manager, args)
+    })
+    .unwrap_or_else(|error| (error, true))
+}
+
+pub fn execute_todo_read_for_run(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+) -> (String, bool) {
+    with_run_task_manager(run, "todo_read", execute_todo_read).unwrap_or_else(|error| (error, true))
+}
+
+/// Inspect the canonical compatibility graph for one explicit session key.
+/// New code should use an explicit task manager and `todo_read` instead.
+#[must_use]
+pub fn get_todo_list(session_key: &str) -> Vec<TodoItem> {
+    compatibility_graphs_guard("get_todo_list")
+        .ok()
+        .and_then(|graphs| graphs.get(session_key).map(project_todo_list))
+        .unwrap_or_default()
+}
+
+/// Reset one legacy compatibility graph.
+///
+/// This is a lifecycle/test operation, not the model-facing clear path;
+/// explicit managers submit an empty,
+/// generation-checked todo replacement so tombstone history is retained.
+pub fn clear_todo_list(session_key: &str) {
+    if let Ok(mut graphs) = compatibility_graphs_guard("clear_todo_list") {
+        graphs.remove(session_key);
+    }
+}
+
+/// Reset every legacy compatibility graph during an explicit global teardown.
 pub fn clear_all_todo_lists() {
-    if let Ok(mut map) = todo_lists_guard("clear_all_todo_lists") {
-        map.clear();
+    if let Ok(mut graphs) = compatibility_graphs_guard("clear_all_todo_lists") {
+        graphs.clear();
+    }
+}
+
+const fn canonical_status(status: TodoStatus) -> CanonicalTaskStatus {
+    match status {
+        TodoStatus::Pending => CanonicalTaskStatus::Pending,
+        TodoStatus::InProgress => CanonicalTaskStatus::InProgress,
+        TodoStatus::Completed => CanonicalTaskStatus::Completed,
+        TodoStatus::Failed => CanonicalTaskStatus::Failed,
+        TodoStatus::Canceled => CanonicalTaskStatus::Canceled,
+    }
+}
+
+const fn todo_status(status: TaskStatus) -> TodoStatus {
+    match status {
+        TaskStatus::Pending => TodoStatus::Pending,
+        TaskStatus::InProgress => TodoStatus::InProgress,
+        TaskStatus::Completed => TodoStatus::Completed,
+        TaskStatus::Failed => TodoStatus::Failed,
+        TaskStatus::Canceled => TodoStatus::Canceled,
     }
 }
 
@@ -323,18 +486,61 @@ pub fn clear_all_todo_lists() {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     const TEST_SESSION: &str = "todo-unit-session";
 
-    /// The task list is process-global state (matches the original
-    /// design), so these tests serialize on a shared mutex to avoid
-    /// interleaving under `cargo test`'s parallel runner.
+    /// These compatibility-adapter tests share their local fixture map, so
+    /// they serialize to avoid interleaving under Cargo's parallel runner.
     fn task_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn managers() -> &'static Mutex<HashMap<String, TaskManager>> {
+        static MANAGERS: OnceLock<Mutex<HashMap<String, TaskManager>>> = OnceLock::new();
+        MANAGERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn clear_all_todo_lists() {
+        managers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn get_todo_list(session: &str) -> Vec<TodoItem> {
+        managers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session)
+            .map(super::project_todo_list)
+            .unwrap_or_default()
+    }
+
+    fn execute_todo_write(session: &str, args: &HashMap<String, Value>) -> (String, bool) {
+        let mut managers = managers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let manager = managers.entry(session.to_string()).or_default();
+        let mut versioned = args.clone();
+        versioned.insert(
+            "expected_generation".to_string(),
+            serde_json::json!(manager.generation().get()),
+        );
+        let result = super::execute_todo_write(manager, &versioned);
+        drop(managers);
+        result
+    }
+
+    fn execute_todo_read(session: &str) -> (String, bool) {
+        let mut managers = managers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::execute_todo_read(managers.entry(session.to_string()).or_default())
     }
 
     fn args_with(v: Value) -> HashMap<String, Value> {
@@ -354,6 +560,7 @@ mod tests {
         ]));
         let (msg, err) = execute_todo_write(TEST_SESSION, &args);
         assert!(!err);
+        assert!(msg.contains("2 total"), "got: {msg}");
         assert!(msg.contains("all 2 items completed"));
         assert!(get_todo_list(TEST_SESSION).is_empty());
     }
@@ -366,11 +573,22 @@ mod tests {
         let args = args_with(json!([
             {"content": "one", "status": "completed", "activeForm": "Doing one"},
             {"content": "two", "status": "in_progress", "activeForm": "Doing two"},
+            {"content": "three", "status": "failed", "activeForm": "Doing three"},
+            {"content": "four", "status": "canceled", "activeForm": "Doing four"},
         ]));
-        let (_, err) = execute_todo_write(TEST_SESSION, &args);
+        let (message, err) = execute_todo_write(TEST_SESSION, &args);
         assert!(!err);
         let stored = get_todo_list(TEST_SESSION);
-        assert_eq!(stored.len(), 2, "partial completion must keep the list");
+        assert_eq!(stored.len(), 4, "partial completion must keep the list");
+        assert!(message.contains("1 completed"), "got: {message}");
+        assert!(message.contains("1 in progress"), "got: {message}");
+        assert!(message.contains("0 pending"), "got: {message}");
+        assert!(message.contains("1 failed"), "got: {message}");
+        assert!(message.contains("1 canceled"), "got: {message}");
+        let (read, read_error) = execute_todo_read(TEST_SESSION);
+        assert!(!read_error);
+        assert!(read.contains("1 failed"), "got: {read}");
+        assert!(read.contains("1 canceled"), "got: {read}");
     }
 
     #[test]
@@ -598,10 +816,10 @@ mod tests {
         );
     }
 
-    /// Contract: multiple `in_progress` items trigger a warning (OC-specific
-    /// behaviour absent from CC).
+    /// A replacement with multiple active rows violates the canonical actor
+    /// lane invariant and must fail without publishing either row.
     #[test]
-    fn todo_write_warns_on_multiple_in_progress() {
+    fn todo_write_rejects_multiple_in_progress_atomically() {
         let _lock = task_lock();
         clear_all_todo_lists();
 
@@ -612,11 +830,9 @@ mod tests {
                 {"content": "b", "status": "in_progress", "activeForm": "B"},
             ])),
         );
-        assert!(!is_err, "multiple in_progress is not an error");
-        assert!(
-            msg.contains("Warning"),
-            "must warn about multiple in_progress; got: {msg}"
-        );
+        assert!(is_err, "multiple in_progress must be rejected");
+        assert!(msg.contains("multiple in-progress"), "got: {msg}");
+        assert!(get_todo_list(TEST_SESSION).is_empty());
     }
 
     /// Contract: a single `in_progress` item produces no warning.

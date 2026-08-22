@@ -1391,7 +1391,8 @@ mod tests {
         // Verify we can access and use the task manager
         manager
             .task_manager
-            .create_task("Test".to_string(), "Test task".to_string(), None);
+            .create_task("Test".to_string(), "Test task".to_string(), None)
+            .expect("valid task fixture");
         assert_eq!(manager.task_manager.list_tasks().len(), 1);
     }
 

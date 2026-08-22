@@ -28,9 +28,13 @@
 
 use crate::tools::args::ToolArgs as _;
 use crate::tools::effect::{ToolEffect, TypedEffect};
+use crate::tools::{
+    ToolFailure, ToolFailureCode, ToolHandlerResult, ToolObservation, ToolRetryability,
+};
 use crosslink::db::Database;
 use serde_json::Value;
-use std::collections::HashMap;
+use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::path::PathBuf;
@@ -38,6 +42,17 @@ use std::path::PathBuf;
 /// Project-local crosslink data directory. Matches crosslink's own
 /// convention (`crosslink init` creates `.crosslink/issues.db`).
 const CROSSLINK_DIR: &str = ".crosslink";
+// Keep the adapter at or below both the external crate's 512-byte title cap
+// and the canonical graph's subject cap so a locally accepted record can be
+// projected without a predictable partial outcome.
+pub const MAX_CROSSLINK_TITLE_BYTES: usize = 512;
+pub const MAX_CROSSLINK_DESCRIPTION_BYTES: usize = crate::task_graph::MAX_TASK_DESCRIPTION_BYTES;
+pub const MAX_CROSSLINK_TEXT_BYTES: usize = 8_192;
+pub const MAX_CROSSLINK_QUERY_BYTES: usize = 512;
+pub const MAX_CROSSLINK_LABEL_BYTES: usize = 128;
+pub const MAX_CROSSLINK_LABELS: usize = 64;
+const MAX_CROSSLINK_TREE_DEPTH: usize = 64;
+const MAX_CROSSLINK_TREE_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Retired Chainlink data directory. A store in this namespace blocks implicit
 /// Crosslink creation so historical mutable state is never copied silently.
@@ -380,11 +395,17 @@ struct Args<'a, S: BuildHasher>(&'a HashMap<String, Value, S>);
 
 impl<S: BuildHasher> Args<'_, S> {
     fn required_str(&self, key: &'static str) -> Result<&str, String> {
-        self.0.arg_str_strict(key).map_err(|e| e.to_string())
+        let value = self.0.arg_str_strict(key).map_err(|e| e.to_string())?;
+        validate_crosslink_string(key, value)?;
+        Ok(value)
     }
 
     fn optional_str(&self, key: &'static str) -> Result<Option<&str>, String> {
-        self.0.arg_str_opt_strict(key).map_err(|e| e.to_string())
+        let value = self.0.arg_str_opt_strict(key).map_err(|e| e.to_string())?;
+        if let Some(value) = value {
+            validate_crosslink_string(key, value)?;
+        }
+        Ok(value)
     }
 
     /// Read a required integer issue id. Rejects floats and numeric strings —
@@ -394,7 +415,8 @@ impl<S: BuildHasher> Args<'_, S> {
         match self.0.get(key) {
             Some(Value::Number(n)) => n
                 .as_i64()
-                .ok_or_else(|| format!("'{key}' must be an integer issue id")),
+                .filter(|id| *id > 0)
+                .ok_or_else(|| format!("'{key}' must be a positive integer issue id")),
             Some(_) => Err(format!("'{key}' must be an integer issue id")),
             None => Err(format!("missing required '{key}' field")),
         }
@@ -405,8 +427,9 @@ impl<S: BuildHasher> Args<'_, S> {
             None | Some(Value::Null) => Ok(None),
             Some(Value::Number(n)) => n
                 .as_i64()
+                .filter(|id| *id > 0)
                 .map(Some)
-                .ok_or_else(|| format!("'{key}' must be an integer issue id")),
+                .ok_or_else(|| format!("'{key}' must be a positive integer issue id")),
             Some(_) => Err(format!("'{key}' must be an integer issue id")),
         }
     }
@@ -414,17 +437,140 @@ impl<S: BuildHasher> Args<'_, S> {
     fn string_list(&self, key: &'static str) -> Result<Vec<String>, String> {
         match self.0.get(key) {
             None | Some(Value::Null) => Ok(Vec::new()),
-            Some(Value::Array(items)) => items
-                .iter()
-                .map(|item| {
-                    item.as_str()
-                        .map(ToString::to_string)
-                        .ok_or_else(|| format!("'{key}' must be an array of strings"))
-                })
-                .collect(),
+            Some(Value::Array(items)) => {
+                if items.len() > MAX_CROSSLINK_LABELS {
+                    return Err(format!(
+                        "'{key}' exceeds the limit of {MAX_CROSSLINK_LABELS} labels"
+                    ));
+                }
+                items
+                    .iter()
+                    .map(|item| {
+                        let item = item
+                            .as_str()
+                            .ok_or_else(|| format!("'{key}' must be an array of strings"))?;
+                        validate_crosslink_string("label", item)?;
+                        Ok(item.to_string())
+                    })
+                    .collect()
+            }
             Some(_) => Err(format!("'{key}' must be an array of strings")),
         }
     }
+}
+
+fn validate_crosslink_string(key: &'static str, value: &str) -> Result<(), String> {
+    let (max_bytes, allow_empty) = match key {
+        "title" => (MAX_CROSSLINK_TITLE_BYTES, false),
+        "description" => (MAX_CROSSLINK_DESCRIPTION_BYTES, true),
+        "text" => (MAX_CROSSLINK_TEXT_BYTES, false),
+        "query" => (MAX_CROSSLINK_QUERY_BYTES, false),
+        "label" => (MAX_CROSSLINK_LABEL_BYTES, false),
+        "priority" | "status" => (16, false),
+        _ => return Err(format!("unknown Crosslink string field '{key}'")),
+    };
+    if !allow_empty && value.trim().is_empty() {
+        return Err(format!("'{key}' must not be empty"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("'{key}' exceeds the limit of {max_bytes} bytes"));
+    }
+    Ok(())
+}
+
+fn validate_typed_arguments<S: BuildHasher>(
+    operation: &str,
+    args: &HashMap<String, Value, S>,
+) -> Result<(), String> {
+    let allowed: &[&str] = match operation {
+        "create" => &["operation", "title", "description", "priority", "labels"],
+        "close" | "reopen" | "show" | "tree" | "session_work" => &["operation", "id"],
+        "comment" => &["operation", "id", "text"],
+        "label" | "unlabel" => &["operation", "id", "label"],
+        "list" => &["operation", "status", "priority", "label"],
+        "search" => &["operation", "query"],
+        "subissue" => &["operation", "parent_id", "title", "description", "priority"],
+        "relate" | "block" | "unblock" => &["operation", "id", "other_id"],
+        "update" => &["operation", "id", "title", "description", "priority"],
+        "session_end" | "session_action" => &["operation", "text"],
+        "next" | "ready" | "session_start" | "session_status" | "help" | "--help" | "-h" => {
+            &["operation"]
+        }
+        _ => return Err(format!("unknown operation '{operation}'")),
+    };
+    if let Some(key) = args.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!(
+            "field '{key}' is not valid for Crosslink operation '{operation}'"
+        ));
+    }
+
+    let typed = Args(args);
+    for field in ["title", "description", "label", "text", "query"] {
+        if args.contains_key(field) {
+            typed.optional_str(field)?;
+        }
+    }
+    if let Some(priority) = typed.optional_str("priority")? {
+        if !matches!(priority, "critical" | "high" | "medium" | "low") {
+            return Err(format!("invalid Crosslink priority '{priority}'"));
+        }
+    }
+    if let Some(status) = typed.optional_str("status")? {
+        if !matches!(status, "open" | "closed" | "archived" | "all") {
+            return Err(format!("invalid Crosslink status '{status}'"));
+        }
+    }
+    if args.contains_key("labels") {
+        typed.string_list("labels")?;
+    }
+    for field in ["id", "parent_id", "other_id"] {
+        if args.contains_key(field) {
+            typed.optional_id(field)?;
+        }
+    }
+
+    if matches!(operation, "create" | "subissue") {
+        typed.required_str("title")?;
+    }
+    if matches!(
+        operation,
+        "close"
+            | "reopen"
+            | "show"
+            | "comment"
+            | "label"
+            | "unlabel"
+            | "relate"
+            | "block"
+            | "unblock"
+            | "update"
+            | "session_work"
+    ) {
+        typed.required_id("id")?;
+    }
+    if matches!(operation, "comment" | "session_action") {
+        typed.required_str("text")?;
+    }
+    if matches!(operation, "label" | "unlabel") {
+        typed.required_str("label")?;
+    }
+    if operation == "search" {
+        typed.required_str("query")?;
+    }
+    if operation == "subissue" {
+        typed.required_id("parent_id")?;
+    }
+    if matches!(operation, "relate" | "block" | "unblock") {
+        typed.required_id("other_id")?;
+    }
+    if operation == "update"
+        && !["title", "description", "priority"]
+            .iter()
+            .any(|field| args.contains_key(*field))
+    {
+        return Err("Crosslink update requires at least one changed field".to_string());
+    }
+    Ok(())
 }
 
 /// Entry point — dispatches the typed `operation` field.
@@ -454,6 +600,12 @@ pub fn execute_crosslink<S: BuildHasher>(
             true,
         );
     };
+    if let Err(reason) = validate_typed_arguments(&classified.operation, args) {
+        return (
+            format!("crosslink {}: {reason}", classified.operation),
+            true,
+        );
+    }
 
     // Static documentation never opens the database. Keeping this decision in
     // the same operation row as the classifier prevents a nominal help call
@@ -523,11 +675,236 @@ pub fn execute_crosslink<S: BuildHasher>(
     }
 }
 
+/// Execute a Crosslink operation and reconcile its bounded issue view.
+///
+/// The database operation always happens first;
+/// therefore a later graph failure is reported as a typed partial effect and
+/// never collapsed into an ordinary error that implies nothing changed.
+#[must_use]
+pub fn execute_crosslink_with_tasks<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+    task_manager: Option<&mut crate::session::TaskManager>,
+) -> ToolHandlerResult {
+    let value = Value::Object(
+        args.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let classified = match classify_operation(&value) {
+        Ok(classified) => classified,
+        Err(reason) => {
+            return ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::InvalidArguments,
+                format!("crosslink: {reason}"),
+                ToolRetryability::Never,
+            ));
+        }
+    };
+    let Some(declared) = operation(&classified.operation) else {
+        return ToolHandlerResult::error(ToolFailure::new(
+            ToolFailureCode::InvalidArguments,
+            "crosslink: classified operation disappeared from its declaration table".to_string(),
+            ToolRetryability::Never,
+        ));
+    };
+    if let Err(reason) = validate_typed_arguments(&classified.operation, args) {
+        return ToolHandlerResult::error(ToolFailure::new(
+            ToolFailureCode::InvalidArguments,
+            format!("crosslink {}: {reason}", classified.operation),
+            ToolRetryability::Never,
+        ));
+    }
+    let (content, is_error) = execute_crosslink(run, args);
+    if is_error {
+        return ToolHandlerResult::error(ToolFailure::new(
+            ToolFailureCode::External,
+            content,
+            ToolRetryability::Unknown,
+        ));
+    }
+    if !declared.requires_store {
+        return ToolHandlerResult::success_text(content);
+    }
+
+    let Some(task_manager) = task_manager else {
+        return crosslink_partial(
+            &content,
+            &classified.operation,
+            "Crosslink operation completed, but no canonical task graph was bound to this frontend",
+        );
+    };
+    if let Err(error) = reconcile_task_graph(run, args, task_manager) {
+        return crosslink_partial(&content, &classified.operation, &error);
+    }
+    let generation = task_manager.generation().get();
+    let mut result = ToolHandlerResult::success_structured(
+        content,
+        serde_json::json!({
+            "operation": classified.operation,
+            "external_effect": "completed",
+            "task_graph": "reconciled",
+            "task_graph_generation": generation,
+        }),
+    );
+    result.observations.push(ToolObservation {
+        kind: "canonical_task_graph_reconciled".to_string(),
+        authoritative: true,
+        data: serde_json::json!({
+            "external_system": "crosslink",
+            "generation": generation,
+        }),
+    });
+    result
+}
+
+fn crosslink_partial(content: &str, operation: &str, reason: &str) -> ToolHandlerResult {
+    let retryability = self::operation(operation).map_or(ToolRetryability::Never, |declared| {
+        if declared.mutates_records {
+            ToolRetryability::Never
+        } else {
+            ToolRetryability::Safe
+        }
+    });
+    ToolHandlerResult::partial_structured(
+        format!("{content}\nCanonical task graph reconciliation failed: {reason}"),
+        serde_json::json!({
+            "operation": operation,
+            "external_effect": "completed",
+            "task_graph": "not_reconciled",
+        }),
+        vec![ToolFailure::new(
+            ToolFailureCode::Conflict,
+            format!("Canonical task graph reconciliation failed: {reason}"),
+            retryability,
+        )],
+        None,
+    )
+}
+
+fn reconcile_task_graph<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+    task_manager: &mut crate::session::TaskManager,
+) -> Result<(), String> {
+    task_manager.refresh()?;
+    let expected_generation = task_manager.generation();
+    let db = open_db_for_query(run)?;
+    let mut issue_ids = db
+        .list_issues(Some("open"), None, None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|issue| issue.id)
+        .collect::<BTreeSet<_>>();
+    for external_id in task_manager.projected_external_ids("crosslink") {
+        let id = external_id
+            .parse::<i64>()
+            .map_err(|_| "persisted Crosslink projection has a non-numeric issue id".to_string())?;
+        issue_ids.insert(id);
+    }
+    for field in ["id", "parent_id", "other_id"] {
+        if let Some(id) = args.get(field).and_then(Value::as_i64) {
+            issue_ids.insert(id);
+        }
+    }
+    if issue_ids.len() > crate::task_graph::MAX_TASKS {
+        return Err(format!(
+            "Crosslink active projection exceeds the canonical task bound ({})",
+            crate::task_graph::MAX_TASKS
+        ));
+    }
+
+    let mut queue = issue_ids.iter().copied().collect::<VecDeque<_>>();
+    let mut drafts = Vec::new();
+    let mut observed = BTreeSet::new();
+    while let Some(issue_id) = queue.pop_front() {
+        if !observed.insert(issue_id) {
+            continue;
+        }
+        if observed.len() > crate::task_graph::MAX_TASKS {
+            return Err(format!(
+                "Crosslink dependency closure exceeds the canonical task bound ({})",
+                crate::task_graph::MAX_TASKS
+            ));
+        }
+        let issue = db
+            .require_issue(issue_id)
+            .map_err(|error| error.to_string())?;
+        let blockers = db
+            .get_blockers(issue_id)
+            .map_err(|error| error.to_string())?;
+        for blocker in &blockers {
+            if !observed.contains(blocker) {
+                queue.push_back(*blocker);
+            }
+        }
+        let blocker_ids = blockers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        drafts.push(crate::task_graph::ExternalTaskDraft {
+            external_id: issue.id.to_string(),
+            observed_version: issue_version(&issue, &blockers)?,
+            subject: issue.title,
+            description: issue.description.unwrap_or_default(),
+            status: match issue.status {
+                crosslink::models::IssueStatus::Open => {
+                    crate::task_graph::CanonicalTaskStatus::Pending
+                }
+                crosslink::models::IssueStatus::Closed => {
+                    crate::task_graph::CanonicalTaskStatus::Completed
+                }
+                crosslink::models::IssueStatus::Archived => {
+                    crate::task_graph::CanonicalTaskStatus::Canceled
+                }
+            },
+            priority: match issue.priority {
+                crosslink::models::Priority::Critical => crate::task_graph::TaskPriority::Critical,
+                crosslink::models::Priority::High => crate::task_graph::TaskPriority::High,
+                crosslink::models::Priority::Medium => crate::task_graph::TaskPriority::Medium,
+                crosslink::models::Priority::Low => crate::task_graph::TaskPriority::Low,
+            },
+            blocked_by_external_ids: blocker_ids,
+        });
+    }
+    drafts.sort_unstable_by(|left, right| left.external_id.cmp(&right.external_id));
+    task_manager.reconcile_external_checked(expected_generation, "crosslink".to_string(), drafts)
+}
+
+fn issue_version(issue: &crosslink::models::Issue, blockers: &[i64]) -> Result<String, String> {
+    let mut blockers = blockers.to_vec();
+    blockers.sort_unstable();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "id": issue.id,
+        "title": issue.title,
+        "description": issue.description,
+        "status": issue.status,
+        "priority": issue.priority,
+        "parent_id": issue.parent_id,
+        "created_at": issue.created_at,
+        "updated_at": issue.updated_at,
+        "closed_at": issue.closed_at,
+        "scheduled_at": issue.scheduled_at,
+        "due_at": issue.due_at,
+        "blockers": blockers,
+    }))
+    .map_err(|error| format!("failed to encode Crosslink issue version: {error}"))?;
+    let digest = Sha256::digest(bytes);
+    let mut version = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut version, "{byte:02x}")
+            .map_err(|_| "failed to format Crosslink issue version".to_string())?;
+    }
+    Ok(version)
+}
+
 /// The model-facing schema for the typed operation contract.
 #[must_use]
 pub fn tool_parameters() -> Value {
     serde_json::json!({
         "type": "object",
+        "additionalProperties": false,
         "properties": {
             "operation": {
                 "type": "string",
@@ -536,22 +913,28 @@ pub fn tool_parameters() -> Value {
             },
             "id": {
                 "type": "integer",
+                "minimum": 1,
                 "description": "Issue id. Required by show, close, reopen, comment, label, unlabel, update, session_work; optional root for tree."
             },
             "parent_id": {
                 "type": "integer",
+                "minimum": 1,
                 "description": "Parent issue id. Required by subissue."
             },
             "other_id": {
                 "type": "integer",
+                "minimum": 1,
                 "description": "Second issue id. Required by relate, block and unblock (the blocked issue; `id` is the blocker)."
             },
             "title": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_CROSSLINK_TITLE_BYTES,
                 "description": "Issue title. Required by create and subissue; optional new title for update."
             },
             "description": {
                 "type": "string",
+                "maxLength": MAX_CROSSLINK_DESCRIPTION_BYTES,
                 "description": "Issue description for create, subissue and update."
             },
             "priority": {
@@ -561,19 +944,26 @@ pub fn tool_parameters() -> Value {
             },
             "labels": {
                 "type": "array",
-                "items": {"type": "string"},
+                "maxItems": MAX_CROSSLINK_LABELS,
+                "items": {"type": "string", "minLength": 1, "maxLength": MAX_CROSSLINK_LABEL_BYTES},
                 "description": "Labels to attach on create."
             },
             "label": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_CROSSLINK_LABEL_BYTES,
                 "description": "Single label for the label and unlabel operations, or as a list filter."
             },
             "text": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_CROSSLINK_TEXT_BYTES,
                 "description": "Comment body for comment; action text for session_action; handoff notes for session_end."
             },
             "query": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_CROSSLINK_QUERY_BYTES,
                 "description": "Search query for search."
             },
             "status": {
@@ -751,11 +1141,11 @@ fn op_block<S: BuildHasher>(
     let upstream = args.required_id("id")?;
     let downstream = args.required_id("other_id")?;
     if add {
-        db.add_dependency(upstream, downstream)
+        db.add_dependency(downstream, upstream)
             .map_err(|e| e.to_string())?;
         Ok(format!("#{upstream} now blocks #{downstream}"))
     } else {
-        db.remove_dependency(upstream, downstream)
+        db.remove_dependency(downstream, upstream)
             .map_err(|e| e.to_string())?;
         Ok(format!("Removed block #{upstream} → #{downstream}"))
     }
@@ -817,15 +1207,9 @@ fn op_session_status(db: &Database) -> Result<String, String> {
 }
 
 fn op_next(db: &Database) -> Result<String, String> {
-    // Preserve the legacy `next` / `ready` behavior: select the
-    // highest-priority open issue. Blocker-aware graph selection is not
-    // implemented here and is owned by S-052, so neither the schema nor the
-    // help text claims otherwise.
-    let open = db
-        .list_issues(Some("open"), None, None)
-        .map_err(|e| e.to_string())?;
-    if open.is_empty() {
-        return Ok("(no open issues)".to_string());
+    let ready = db.list_ready_issues().map_err(|e| e.to_string())?;
+    if ready.is_empty() {
+        return Ok("(no blocker-ready open issues)".to_string());
     }
     let priority_rank = |p: &str| match p {
         "critical" => 0,
@@ -834,7 +1218,7 @@ fn op_next(db: &Database) -> Result<String, String> {
         "low" => 3,
         _ => 4,
     };
-    let mut sorted = open;
+    let mut sorted = ready;
     sorted.sort_by_key(|i| (priority_rank(i.priority.as_str()), i.id));
     let pick = &sorted[0];
     Ok(format!(
@@ -848,7 +1232,7 @@ fn help_text() -> String {
      create | close | reopen | comment | label | unlabel\n  \
      list | show | search | subissue | relate | block | unblock\n  \
      session_start | session_end | session_work | session_action | session_status\n  \
-     next | ready              # highest-priority open issue\n  \
+     next | ready              # highest-priority blocker-ready open issue\n  \
      tree | update\n\n\
      Supply operation-specific values in the typed fields advertised by this tool's schema."
         .to_string()
@@ -857,15 +1241,22 @@ fn help_text() -> String {
 fn op_tree<S: BuildHasher>(db: &Database, args: &Args<'_, S>) -> Result<String, String> {
     let root_id = args.optional_id("id")?;
     let mut out = String::new();
+    let mut visited = BTreeSet::new();
+    let mut nodes = 0;
     if let Some(id) = root_id {
-        render_subtree(db, id, 0, &mut out)?;
+        render_subtree(db, id, 0, &mut out, &mut visited, &mut nodes)?;
     } else {
         let issues = db
             .list_issues(Some("open"), None, None)
             .map_err(|e| e.to_string())?;
+        if issues.len() > crate::task_graph::MAX_TASKS {
+            return Err(format!(
+                "Crosslink tree exceeds the bounded node view ({})",
+                crate::task_graph::MAX_TASKS
+            ));
+        }
         for issue in issues.iter().filter(|i| i.parent_id.is_none()) {
-            // Top-level only: render anything without a parent.
-            render_subtree(db, issue.id, 0, &mut out)?;
+            render_subtree(db, issue.id, 0, &mut out, &mut visited, &mut nodes)?;
         }
     }
     Ok(if out.is_empty() {
@@ -875,17 +1266,54 @@ fn op_tree<S: BuildHasher>(db: &Database, args: &Args<'_, S>) -> Result<String, 
     })
 }
 
-fn render_subtree(db: &Database, id: i64, depth: usize, out: &mut String) -> Result<(), String> {
+fn render_subtree(
+    db: &Database,
+    id: i64,
+    depth: usize,
+    out: &mut String,
+    visited: &mut BTreeSet<i64>,
+    nodes: &mut usize,
+) -> Result<(), String> {
+    if depth > MAX_CROSSLINK_TREE_DEPTH {
+        return Err(format!(
+            "Crosslink tree exceeds the maximum depth of {MAX_CROSSLINK_TREE_DEPTH}"
+        ));
+    }
+    if !visited.insert(id) {
+        return Err(format!(
+            "Crosslink tree repeats issue #{id}; persisted hierarchy is cyclic or inconsistent"
+        ));
+    }
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or_else(|| "Crosslink tree node count overflowed".to_string())?;
+    if *nodes > crate::task_graph::MAX_TASKS {
+        return Err(format!(
+            "Crosslink tree exceeds the bounded node view ({})",
+            crate::task_graph::MAX_TASKS
+        ));
+    }
     let issue = db.require_issue(id).map_err(|e| e.to_string())?;
     let indent = "  ".repeat(depth);
-    let _ = writeln!(
-        out,
+    let line = format!(
         "{indent}#{} [{}] [{}] {}",
         issue.id, issue.status, issue.priority, issue.title
     );
+    if out.len().saturating_add(line.len()).saturating_add(1) > MAX_CROSSLINK_TREE_OUTPUT_BYTES {
+        return Err(format!(
+            "Crosslink tree output exceeds {MAX_CROSSLINK_TREE_OUTPUT_BYTES} bytes"
+        ));
+    }
+    let _ = writeln!(out, "{line}");
     let subs = db.get_subissues(id).map_err(|e| e.to_string())?;
+    if subs.len() > crate::task_graph::MAX_TASKS {
+        return Err(format!(
+            "Crosslink issue #{id} exceeds the bounded child view ({})",
+            crate::task_graph::MAX_TASKS
+        ));
+    }
     for s in subs {
-        render_subtree(db, s.id, depth + 1, out)?;
+        render_subtree(db, s.id, depth + 1, out, visited, nodes)?;
     }
     Ok(())
 }
@@ -1113,6 +1541,193 @@ mod tests {
     }
 
     #[test]
+    fn invalid_typed_arguments_are_rejected_before_store_creation() {
+        let root = tempfile::tempdir().expect("crosslink test root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let cases = [
+            HashMap::from([("operation".to_string(), json!("create"))]),
+            HashMap::from([
+                ("operation".to_string(), json!("create")),
+                (
+                    "title".to_string(),
+                    json!("x".repeat(MAX_CROSSLINK_TITLE_BYTES + 1)),
+                ),
+            ]),
+            HashMap::from([
+                ("operation".to_string(), json!("create")),
+                ("title".to_string(), json!("bounded")),
+                ("ignored".to_string(), json!("must reject")),
+            ]),
+            HashMap::from([
+                ("operation".to_string(), json!("close")),
+                ("id".to_string(), json!(0)),
+            ]),
+            HashMap::from([
+                ("operation".to_string(), json!("update")),
+                ("id".to_string(), json!(1)),
+            ]),
+        ];
+        for args in cases {
+            let (message, is_error) = execute_crosslink(&run, &args);
+            assert!(is_error, "invalid arguments succeeded: {message}");
+            assert!(
+                !root.path().join(CROSSLINK_DIR).exists(),
+                "invalid arguments created the Crosslink store: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_rendering_rejects_excessive_hierarchy_depth() {
+        let root = tempfile::tempdir().expect("crosslink test root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        assert_ok(&run, "create", &[("title", json!("root"))]);
+        let excessive_depth =
+            i64::try_from(MAX_CROSSLINK_TREE_DEPTH).expect("tree depth fits in i64") + 1;
+        for parent_id in 1..=excessive_depth {
+            assert_ok(
+                &run,
+                "subissue",
+                &[
+                    ("parent_id", json!(parent_id)),
+                    ("title", json!(format!("child-{parent_id}"))),
+                ],
+            );
+        }
+        let (message, is_error) = call(&run, &[("operation", json!("tree")), ("id", json!(1))]);
+        assert!(is_error, "excessive tree unexpectedly rendered");
+        assert!(message.contains("maximum depth"), "{message}");
+    }
+
+    fn call_with_tasks(
+        run: &crate::tools::ToolRunContext,
+        task_manager: Option<&mut crate::session::TaskManager>,
+        operation: &str,
+        entries: &[(&str, Value)],
+    ) -> ToolHandlerResult {
+        let mut args = HashMap::from([("operation".to_string(), json!(operation))]);
+        args.extend(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), value.clone())),
+        );
+        execute_crosslink_with_tasks(run, &args, task_manager)
+    }
+
+    #[test]
+    fn dependency_direction_readiness_and_canonical_projection_agree() {
+        let root = tempfile::tempdir().expect("crosslink test root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let mut manager = crate::session::TaskManager::for_run(&run).expect("task manager");
+
+        for title in ["upstream", "downstream"] {
+            let result = call_with_tasks(
+                &run,
+                Some(&mut manager),
+                "create",
+                &[("title", json!(title))],
+            );
+            assert!(
+                matches!(result.outcome, crate::tools::ToolOutcome::Success { .. }),
+                "{}",
+                result.content()
+            );
+        }
+        let blocked = call_with_tasks(
+            &run,
+            Some(&mut manager),
+            "block",
+            &[("id", json!(1)), ("other_id", json!(2))],
+        );
+        assert!(
+            matches!(blocked.outcome, crate::tools::ToolOutcome::Success { .. }),
+            "{}",
+            blocked.content()
+        );
+
+        let db = open_db_for_query(&run).expect("database");
+        assert_eq!(
+            db.get_blockers(1).expect("upstream blockers"),
+            Vec::<i64>::new()
+        );
+        assert_eq!(db.get_blockers(2).expect("downstream blockers"), vec![1]);
+        drop(db);
+
+        let by_external_id = manager
+            .list_tasks()
+            .iter()
+            .filter_map(|task| match &task.source {
+                crate::task_graph::TaskSource::ExternalIssue { external_id, .. } => {
+                    Some((external_id.clone(), task))
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            by_external_id["2"].blocked_by,
+            vec![by_external_id["1"].id.clone()]
+        );
+
+        let next = call_with_tasks(&run, Some(&mut manager), "next", &[]);
+        assert!(next.content().contains("#1"), "{}", next.content());
+        let closed = call_with_tasks(&run, Some(&mut manager), "close", &[("id", json!(1))]);
+        assert!(
+            matches!(closed.outcome, crate::tools::ToolOutcome::Success { .. }),
+            "{}",
+            closed.content()
+        );
+        let ready = manager.ready_tasks(10).expect("ready tasks");
+        assert_eq!(ready.tasks.len(), 1);
+        assert!(matches!(
+            ready.tasks[0].source,
+            crate::task_graph::TaskSource::ExternalIssue {
+                ref external_id,
+                ..
+            } if external_id == "2"
+        ));
+    }
+
+    #[test]
+    fn missing_task_graph_reports_partial_after_external_mutation() {
+        let root = tempfile::tempdir().expect("crosslink test root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let result = call_with_tasks(
+            &run,
+            None,
+            "create",
+            &[("title", json!("externally committed"))],
+        );
+        assert!(matches!(
+            result.outcome,
+            crate::tools::ToolOutcome::Partial { ref failures, .. }
+                if failures.len() == 1
+                    && failures[0].retryability == ToolRetryability::Never
+        ));
+        let db = open_db_for_query(&run).expect("database");
+        assert_eq!(
+            db.require_issue(1).expect("committed issue").title,
+            "externally committed"
+        );
+    }
+
+    #[test]
+    fn query_reconciliation_partial_is_safe_to_retry() {
+        let root = tempfile::tempdir().expect("crosslink test root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        assert!(matches!(
+            call_with_tasks(&run, None, "create", &[("title", json!("existing issue"))]).outcome,
+            crate::tools::ToolOutcome::Partial { .. }
+        ));
+        let result = call_with_tasks(&run, None, "list", &[]);
+        assert!(matches!(
+            result.outcome,
+            crate::tools::ToolOutcome::Partial { ref failures, .. }
+                if failures.len() == 1
+                    && failures[0].retryability == ToolRetryability::Safe
+        ));
+    }
+
+    #[test]
     fn legacy_chainlink_store_blocks_implicit_copy_and_new_store_creation() {
         let root = tempfile::tempdir().expect("crosslink test root");
         let legacy_dir = root.path().join(LEGACY_CHAINLINK_DIR);
@@ -1171,6 +1786,19 @@ mod tests {
         assert_eq!(
             enumerated, declared,
             "advertised operations must equal the classified operations"
+        );
+        assert_eq!(params["additionalProperties"], json!(false));
+        assert_eq!(
+            params["properties"]["title"]["maxLength"],
+            json!(MAX_CROSSLINK_TITLE_BYTES)
+        );
+        assert_eq!(
+            params["properties"]["labels"]["maxItems"],
+            json!(MAX_CROSSLINK_LABELS)
+        );
+        assert_eq!(
+            params["properties"]["query"]["maxLength"],
+            json!(MAX_CROSSLINK_QUERY_BYTES)
         );
     }
 }
