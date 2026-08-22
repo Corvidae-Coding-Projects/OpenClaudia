@@ -7216,12 +7216,13 @@
       "display_id": 1097,
       "title": "Make automatic-learning workspace-generation test hermetic on CI",
       "description": "GitHub Actions run 32594951984 at head 53c8fc9b passed repository policy, Rust 1.98/MSRV, Windows, macOS, Linux fmt/check/Clippy, then failed the serialized full Linux suite in tests/evidence_bound_automatic_learning_e2e.rs::canonical_executor_preserves_causal_binding_across_real_workspace_generations. Expected candidate_stored but observed evidence_recorded at line 560. Reproduce against exact runner conditions, identify shared-state/order/environment cause, fix production or test at cause without weakening the causal-binding assertion, and return the full Rust 1.98 runner matrix to green.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T20:09:04.265494868Z",
-      "updated_at": "2026-08-22T20:41:41.406013801Z",
+      "updated_at": "2026-08-22T20:41:45.385311834Z",
+      "closed_at": "2026-08-22T20:41:45.385307363Z",
       "labels": [
         "ci"
       ],
@@ -33371,11 +33372,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1006,
       "timestamp": "2026-08-22T20:41:41.406013801Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1007,
+      "timestamp": "2026-08-22T20:41:45.385311834Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T20:41:41.406013801Z",
+    "timestamp": "2026-08-22T20:41:45.385311834Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1006
+    "agent_seq": 1007
   }
 }
