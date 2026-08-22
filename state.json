@@ -1,6 +1,6 @@
 {
   "next_display_id": 1084,
-  "next_comment_id": 1142,
+  "next_comment_id": 1143,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11456,7 +11456,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T05:20:24.264343266Z",
-      "updated_at": "2026-08-22T05:23:54.046236065Z",
+      "updated_at": "2026-08-22T06:21:35.599900448Z",
       "labels": [
         "remediation"
       ],
@@ -11469,6 +11469,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAC68stdZ8WOguRjQgL2aT9VRQXeA/Eig/CkGoLQa/fJ5wDFIPyndzsEBGLmTfKEp8qAeoiry/3k2pSbES6NL9AA=="
+        },
+        "40a086dd-5c64-4b97-b0d8-7e73898043be": {
+          "display_id": 1142,
+          "author": "6Vw9",
+          "content": "Canonical TaskGraph now compiles on Rust 1.98 with bounded task-level execution requests and long-horizon history compaction. The retained history tail is capped at 4096 events; older events advance a SHA-256 causal prefix checkpoint while the complete current graph remains the resumable state. Task budgets are planning data only and cannot grant runtime authority; S-051 remains the reservation/enforcement owner. Focused graph suite passes 11/11, including >4096-generation resume and invalid-budget atomicity.",
+          "created_at": "2026-08-22T06:21:35.596093902Z",
+          "kind": "action",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABANCdWch4MvVkNzLgkpWJeP9d2AkaSgWUDy0QpanK6HKCfwTIJDCwsCa2e0Sxr4toQFYFqfoYAb0j5JpHyLD/YCw=="
         },
         "798673ee-2aff-4d6b-bc72-a46cc188bdb9": {
           "display_id": 1141,
@@ -31614,11 +31623,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 864,
       "timestamp": "2026-08-22T05:23:54.046236065Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 865,
+      "timestamp": "2026-08-22T06:21:35.599900448Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T05:23:54.046236065Z",
+    "timestamp": "2026-08-22T06:21:35.599900448Z",
     "agent_id": "6Vw9",
-    "agent_seq": 864
+    "agent_seq": 865
   }
 }
