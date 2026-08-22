@@ -1,6 +1,6 @@
 {
   "next_display_id": 1101,
-  "next_comment_id": 1247,
+  "next_comment_id": 1248,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15662,7 +15662,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T22:04:35.596607994Z",
-      "updated_at": "2026-08-22T22:12:58.023102847Z",
+      "updated_at": "2026-08-22T22:39:32.748356483Z",
       "comments": {
         "51a5ca3b-8978-428b-a346-5a9a5b783ed6": {
           "display_id": 1246,
@@ -15672,6 +15672,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ97/yTtjzEBAK2YXyw0f4zamwvs8YQmTu+CbZPH89/i0jz6/vbtLVDjYZI26v4dEflwRT97aepTEibnF4rFdCA=="
+        },
+        "6f5c71e9-8dde-459a-a677-6715c6565387": {
+          "display_id": 1247,
+          "author": "6Vw9",
+          "content": "Core implementation checkpoint: Rust 1.98 all-target check and strict all-target Clippy pass. Deterministic tests pass for completed-stream capture, early EOF rejection, response-id/encrypted-reasoning/compaction/phase persistence, multi-turn exact replay after serde resume, missing-history denial, atomic portable/native session sync, and secret-redacted response.failed diagnostics. Not closing: auditing the slice's explicit proxy/print/ACP/child-run consumer boundary. Current code shows only TUI selects WireApi::OpenAiResponses; print and legacy REPL reject Codex Responses auth, ACP and child-run loops are Chat-Completions-only, and proxy is client-driven passthrough rather than an owned follow-up loop. Will not claim those paths consume continuation without real wiring or an honest inapplicability proof.",
+          "created_at": "2026-08-22T22:39:32.744815311Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsdqbyKN/+DUE7LvbcI7lYbYPLGL3zzPlzXPFPPI6Vg4n6zewL9E5w4LhxSeG7IQx9Lj6hejZjK9pIkwNCt5wBw=="
         },
         "aafe0a14-0718-473e-91eb-f0d90fda83be": {
           "display_id": 1245,
@@ -33727,11 +33736,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1036,
       "timestamp": "2026-08-22T22:12:58.023102847Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1037,
+      "timestamp": "2026-08-22T22:39:32.748356483Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T22:12:58.023102847Z",
+    "timestamp": "2026-08-22T22:39:32.748356483Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1036
+    "agent_seq": 1037
   }
 }
