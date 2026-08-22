@@ -1,6 +1,6 @@
 {
   "next_display_id": 1097,
-  "next_comment_id": 1221,
+  "next_comment_id": 1222,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3283,7 +3283,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T19:10:00.528199762Z",
-      "updated_at": "2026-08-22T19:56:32.132365370Z",
+      "updated_at": "2026-08-22T19:56:51.489868065Z",
       "labels": [
         "remediation"
       ],
@@ -3296,6 +3296,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA0v71ETktrAv6EudAtCMiOcyb7MOmX2JglNPSKxoE5kH9EWIL5+T0daEA/n9dU1DK3rRv4ii8EnhwzNFT5HoMAQ=="
+        },
+        "e2392542-16cd-4c92-ab3e-7f5c9df559d2": {
+          "display_id": 1221,
+          "author": "6Vw9",
+          "content": "S-064 implementation now spans deterministic run-owned allowlisted MCP snapshots, exact schema/source/generation admission, JSON Schema 2020-12 argument validation without ambient retrieval, canonical async ToolExecutor dispatch with hooks/enterprise/permission/guardrail checks, TUI request/result follow-up wiring, and explicit non-advertisement or unavailability for frontends without an owned tool loop. Focused MCP/config/pipeline/TUI tests, native checks, strict all-feature Clippy, repository policy, cargo-deny, and the complete locked fuzz matrix are green. The pushed prior-head GitHub runner matrix remains in progress; full root/native/Windows gates and skeptical pre-commit diff review still pending. No S-064 commit or push yet.",
+          "created_at": "2026-08-22T19:56:51.487314834Z",
+          "kind": "action",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6nuc4ym67mDQBR0OT3nzVzztWvw+/mnE0+CirrFXbJWQWxyhOBH5DL6fBl2NqyymW12RSfdWgjEYv8VUR6QoDw=="
         },
         "e38c6de6-1ebf-4bef-9ae7-58356bce620a": {
           "display_id": 1220,
@@ -33231,11 +33240,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 996,
       "timestamp": "2026-08-22T19:56:32.132365370Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 997,
+      "timestamp": "2026-08-22T19:56:51.489868065Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T19:56:32.132365370Z",
+    "timestamp": "2026-08-22T19:56:51.489868065Z",
     "agent_id": "6Vw9",
-    "agent_seq": 996
+    "agent_seq": 997
   }
 }
