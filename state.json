@@ -1,6 +1,6 @@
 {
   "next_display_id": 1098,
-  "next_comment_id": 1228,
+  "next_comment_id": 1229,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7221,7 +7221,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T20:09:04.265494868Z",
-      "updated_at": "2026-08-22T20:13:48.945776192Z",
+      "updated_at": "2026-08-22T20:41:41.406013801Z",
       "labels": [
         "ci"
       ],
@@ -7234,6 +7234,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAyzOLn8WeZGwpDJCAs5QdtYotd7ioMGS1Q1Qj5sZWPP1R3m2c8jieWZgJvWziOuiYoJv26wEwZbND6sWmBXPeBA=="
+        },
+        "e7c94184-faad-4b1e-bdff-e00c415e9618": {
+          "display_id": 1228,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit 6b6441b5 (feat(mcp): wire dynamic tools through canonical dispatch). The real Rust-toolchain workspace-generation fixture now uses the explicit host-toolchain run context and rejects both typed error and partial outcomes. The 13-test automatic-learning target and complete locked all-feature/all-target native suite pass under Rust/Cargo 1.98.0.",
+          "created_at": "2026-08-22T20:41:41.403561427Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAw/evFLrzL48tAAYBzd1Tfel+EXg5dS7VsZbdtbdC0LAyVh5dQ6u1pc+LOQ7i4Dwf/xa1eINYCtST7tDigXlsBg=="
         }
       }
     },
@@ -33357,11 +33366,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1005,
       "timestamp": "2026-08-22T20:41:37.607073489Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1006,
+      "timestamp": "2026-08-22T20:41:41.406013801Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T20:41:37.607073489Z",
+    "timestamp": "2026-08-22T20:41:41.406013801Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1005
+    "agent_seq": 1006
   }
 }
