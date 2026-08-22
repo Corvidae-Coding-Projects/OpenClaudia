@@ -1,6 +1,6 @@
 {
   "next_display_id": 1090,
-  "next_comment_id": 1167,
+  "next_comment_id": 1168,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9118,7 +9118,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:53:08.818081581Z",
-      "updated_at": "2026-08-22T12:49:12.953511723Z",
+      "updated_at": "2026-08-22T12:53:34.681857862Z",
       "labels": [
         "remediation"
       ],
@@ -9170,6 +9170,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "84f25632-3beb-4732-8466-61e91298c624": {
+          "display_id": 1167,
+          "author": "6Vw9",
+          "content": "Skeptical completion amendment: automatic capture must be explicit operator consent, so canonical dispatch will fail closed unless memory.automatic_learning_enabled is true (default false, with exact typed environment aliases). Direct library observation remains an explicit opt-in API for deterministic evaluation. Status reports the effective policy. Tool evidence digests will bind every handler-produced observation and omit only the one final non-authoritative technical_learning_capture receipt appended by the canonical executor. Evaluation will execute the production state machine and retrieval/tool paths against a bounded checked-in corpus; it will report downstream retrieval benefit, false-learning count, harmful-memory count, correction success, and frontend route coverage without claiming model-task uplift.",
+          "created_at": "2026-08-22T12:53:34.678849746Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABApyhz99/C0lfz242Q2hxJ7Dfiwa88X/zujNhAfu0rKqyqHFnhmghwVFLKepH92d9IKGRecNyukt/FymK/WyurDQ=="
         },
         "8c2f84fa-8775-4114-9522-991099ea22f8": {
           "display_id": 1162,
@@ -32163,11 +32172,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 907,
       "timestamp": "2026-08-22T12:49:12.953511723Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 908,
+      "timestamp": "2026-08-22T12:53:34.681857862Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T12:49:12.953511723Z",
+    "timestamp": "2026-08-22T12:53:34.681857862Z",
     "agent_id": "6Vw9",
-    "agent_seq": 907
+    "agent_seq": 908
   }
 }
