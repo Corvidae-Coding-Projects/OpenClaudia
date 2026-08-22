@@ -345,6 +345,18 @@ impl ProviderAdapter for AnthropicAdapter {
         "anthropic"
     }
 
+    fn state_contract(
+        &self,
+        protocol: crate::runtime::ProviderWireProtocol,
+    ) -> Result<&'static crate::runtime::ProviderStateContract, ProviderError> {
+        match protocol {
+            crate::runtime::ProviderWireProtocol::AnthropicMessages => {
+                Ok(&super::ANTHROPIC_STATE_CONTRACT)
+            }
+            other => Err(super::unsupported_state_protocol(self.name(), other)),
+        }
+    }
+
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         let messages = Self::convert_messages(&request.messages)?;
         let mut body = json!({

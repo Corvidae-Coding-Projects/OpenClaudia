@@ -317,6 +317,18 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         self.name
     }
 
+    fn state_contract(
+        &self,
+        protocol: crate::runtime::ProviderWireProtocol,
+    ) -> Result<&'static crate::runtime::ProviderStateContract, ProviderError> {
+        match protocol {
+            crate::runtime::ProviderWireProtocol::OpenAiChatCompletions => {
+                Ok(&super::OPENAI_CHAT_STATE_CONTRACT)
+            }
+            other => Err(super::unsupported_state_protocol(self.name(), other)),
+        }
+    }
+
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         // OpenAI Chat Completions is our canonical wire format, so the
         // body is just the serialized request.

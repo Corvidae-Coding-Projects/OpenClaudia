@@ -129,7 +129,21 @@ impl Session {
         &self,
         update: impl FnOnce(&mut SessionState, &mut Vec<StateEvent>) -> R,
     ) -> R {
-        self.state.update(update)
+        self.state.update(|state, events| {
+            let native_history_prefix = state
+                .conversation
+                .provider_native_state
+                .as_ref()
+                .map(|_| state.conversation.messages.clone());
+            let result = update(state, events);
+            if native_history_prefix
+                .as_ref()
+                .is_some_and(|prefix| !state.conversation.messages.starts_with(prefix.as_slice()))
+            {
+                state.conversation.provider_native_state = None;
+            }
+            result
+        })
     }
 
     #[must_use]
@@ -167,6 +181,92 @@ impl Session {
             .inspect(|state| state.conversation.messages.clone())
     }
 
+    /// Clone the provider-native lane without holding the state lock across
+    /// request construction or network awaits.
+    #[must_use]
+    pub fn provider_native_state_snapshot(&self) -> Option<crate::runtime::ProviderNativeState> {
+        self.state
+            .inspect(|state| state.conversation.provider_native_state.clone())
+    }
+
+    /// Install validated native state for this session's exact provider/model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state belongs to another provider or model.
+    pub fn install_provider_native_state(
+        &self,
+        provider_state: crate::runtime::ProviderNativeState,
+    ) -> Result<(), crate::runtime::ProviderStateError> {
+        provider_state.validate_identity(&self.provider, &self.model)?;
+        self.state.update(|state, _| {
+            let Some(current) = &state.conversation.provider_native_state else {
+                state.conversation.provider_native_state = Some(provider_state);
+                return Ok(());
+            };
+            if current.protocol() != provider_state.protocol() {
+                return Err(crate::runtime::ProviderStateError::ProtocolMismatch {
+                    stored: current.protocol(),
+                    requested: provider_state.protocol(),
+                });
+            }
+            match provider_state.generation().cmp(&current.generation()) {
+                std::cmp::Ordering::Less => {
+                    Err(crate::runtime::ProviderStateError::StaleGeneration {
+                        current: current.generation(),
+                        attempted: provider_state.generation(),
+                    })
+                }
+                std::cmp::Ordering::Equal if provider_state == *current => Ok(()),
+                std::cmp::Ordering::Equal => {
+                    Err(crate::runtime::ProviderStateError::GenerationConflict {
+                        generation: current.generation(),
+                    })
+                }
+                std::cmp::Ordering::Greater => {
+                    state.conversation.provider_native_state = Some(provider_state);
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Remove provider-native state while retaining portable conversation
+    /// history.
+    pub fn clear_provider_native_state(&self) {
+        self.state.update(|state, _| {
+            state.conversation.provider_native_state = None;
+        });
+    }
+
+    /// Change the model and invalidate native continuation state if identity
+    /// changed.
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        let model = model.into();
+        if self.model != model {
+            self.model = model;
+            self.clear_provider_native_state();
+            self.touch();
+        }
+    }
+
+    /// Change provider/model as one state transition and invalidate native
+    /// continuation state if either identity changed.
+    pub fn set_provider_and_model(
+        &mut self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) {
+        let provider = provider.into();
+        let model = model.into();
+        if self.provider != provider || self.model != model {
+            self.provider = provider;
+            self.model = model;
+            self.clear_provider_native_state();
+            self.touch();
+        }
+    }
+
     #[must_use]
     pub fn message_count(&self) -> usize {
         self.state
@@ -187,8 +287,16 @@ impl Session {
 
     pub fn replace_messages(&self, messages: Vec<Value>) {
         self.state.update(|state, events| {
+            let preserves_native_state = state
+                .conversation
+                .provider_native_state
+                .as_ref()
+                .is_none_or(|_| messages.starts_with(&state.conversation.messages));
             let previous_len = state.conversation.messages.len();
             state.conversation.messages = messages;
+            if !preserves_native_state {
+                state.conversation.provider_native_state = None;
+            }
             if previous_len > 0 && state.conversation.messages.is_empty() {
                 events.push(StateEvent::Cleared);
             }
@@ -210,9 +318,26 @@ impl Session {
         });
     }
 
+    /// Mutate portable history while preserving native continuation state only
+    /// when the previous history remains an exact prefix. Appending new input
+    /// can continue a provider turn; rewriting prior input creates a branch and
+    /// invalidates opaque provider state tied to the old history.
     pub fn update_messages<R>(&self, update: impl FnOnce(&mut Vec<Value>) -> R) -> R {
-        self.state
-            .update(|state, _| update(&mut state.conversation.messages))
+        self.state.update(|state, _| {
+            let native_history_prefix = state
+                .conversation
+                .provider_native_state
+                .as_ref()
+                .map(|_| state.conversation.messages.clone());
+            let result = update(&mut state.conversation.messages);
+            if native_history_prefix
+                .as_ref()
+                .is_some_and(|prefix| !state.conversation.messages.starts_with(prefix.as_slice()))
+            {
+                state.conversation.provider_native_state = None;
+            }
+            result
+        })
     }
 
     #[must_use]
@@ -347,6 +472,7 @@ impl Session {
                     (conversation.messages.pop(), conversation.messages.pop())
                 {
                     conversation.undo_stack.push((user, assistant));
+                    conversation.provider_native_state = None;
                     return true;
                 }
             }
@@ -374,6 +500,7 @@ impl Session {
                     .to_string();
                 conversation.messages.push(user);
                 conversation.messages.push(assistant);
+                conversation.provider_native_state = None;
                 events.push(StateEvent::MessageAppended { role: user_role });
                 events.push(StateEvent::MessageAppended {
                     role: assistant_role,
@@ -435,13 +562,21 @@ impl Serialize for Session {
     where
         S: Serializer,
     {
+        use serde::ser::Error as _;
+
+        let state = self.state_snapshot();
+        if let Some(native) = &state.conversation.provider_native_state {
+            native
+                .validate_identity(&self.provider, &self.model)
+                .map_err(S::Error::custom)?;
+        }
         SessionDocument::from_state(
             self.title.clone(),
             self.created_at,
             self.updated_at,
             self.model.clone(),
             self.provider.clone(),
-            self.state_snapshot(),
+            state,
         )
         .serialize(serializer)
     }
@@ -465,6 +600,36 @@ impl<'de> Deserialize<'de> for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{
+        ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
+        ProviderStateFacet, ProviderWireProtocol,
+    };
+    use serde_json::json;
+
+    fn provider_state_at(
+        provider: &str,
+        model: &str,
+        generation: u64,
+        tokens: u64,
+    ) -> ProviderNativeState {
+        ProviderNativeState::new(
+            provider,
+            model,
+            ProviderWireProtocol::OpenAiResponses,
+            ContinuationGeneration::new(generation).expect("non-zero generation"),
+            vec![ProviderNativeItem::new(
+                ProviderStateFacet::Usage,
+                ProviderNativeItemPurpose::Evidence,
+                json!({"input_tokens": tokens, "cached_tokens": 4}),
+            )
+            .expect("valid item")],
+        )
+        .expect("valid provider state")
+    }
+
+    fn provider_state(provider: &str, model: &str) -> ProviderNativeState {
+        provider_state_at(provider, model, 1, 10)
+    }
 
     #[test]
     fn agent_mode_has_one_canonical_runtime_location() {
@@ -476,6 +641,136 @@ mod tests {
         session.toggle_mode();
         assert_eq!(session.agent_mode(), AgentMode::Plan);
         assert_eq!(session.state_snapshot().modes.agent_mode, AgentMode::Plan);
+    }
+
+    #[test]
+    fn provider_native_state_persists_with_session() {
+        let session = Session::new("gpt-test", "openai");
+        let expected = provider_state("openai", "gpt-test");
+        session
+            .install_provider_native_state(expected.clone())
+            .expect("matching state");
+
+        let encoded = serde_json::to_string(&session).expect("serialize session");
+        let decoded: Session = serde_json::from_str(&encoded).expect("deserialize session");
+        assert_eq!(decoded.provider_native_state_snapshot(), Some(expected));
+    }
+
+    #[test]
+    fn provider_native_state_rejects_mismatch_and_clears_on_switch() {
+        let mut session = Session::new("gpt-test", "openai");
+        assert!(session
+            .install_provider_native_state(provider_state("openai", "other-model"))
+            .is_err());
+        session
+            .install_provider_native_state(provider_state("openai", "gpt-test"))
+            .expect("matching state");
+        session.set_model("gpt-other");
+        assert!(session.provider_native_state_snapshot().is_none());
+
+        session
+            .install_provider_native_state(provider_state("openai", "gpt-other"))
+            .expect("matching replacement state");
+        session.set_provider_and_model("anthropic", "claude-test");
+        assert!(session.provider_native_state_snapshot().is_none());
+    }
+
+    #[test]
+    fn provider_native_state_prevents_persisting_direct_identity_drift() {
+        let mut session = Session::new("gpt-test", "openai");
+        session
+            .install_provider_native_state(provider_state("openai", "gpt-test"))
+            .expect("matching state");
+        session.model = "gpt-other".to_string();
+
+        let error = serde_json::to_string(&session).expect_err("identity drift must fail closed");
+        assert!(error.to_string().contains("belongs to model"));
+    }
+
+    #[test]
+    fn provider_native_state_install_is_monotonic_and_idempotent() {
+        let session = Session::new("gpt-test", "openai");
+        let generation_two = provider_state_at("openai", "gpt-test", 2, 20);
+        session
+            .install_provider_native_state(generation_two.clone())
+            .expect("initial state");
+        session
+            .install_provider_native_state(generation_two.clone())
+            .expect("exact replay is idempotent");
+
+        let stale = provider_state_at("openai", "gpt-test", 1, 10);
+        assert!(matches!(
+            session.install_provider_native_state(stale),
+            Err(crate::runtime::ProviderStateError::StaleGeneration { .. })
+        ));
+        let conflict = provider_state_at("openai", "gpt-test", 2, 99);
+        assert!(matches!(
+            session.install_provider_native_state(conflict),
+            Err(crate::runtime::ProviderStateError::GenerationConflict { .. })
+        ));
+        assert_eq!(
+            session.provider_native_state_snapshot(),
+            Some(generation_two)
+        );
+
+        let generation_three = provider_state_at("openai", "gpt-test", 3, 30);
+        session
+            .install_provider_native_state(generation_three.clone())
+            .expect("newer generation advances atomically");
+        assert_eq!(
+            session.provider_native_state_snapshot(),
+            Some(generation_three)
+        );
+    }
+
+    #[test]
+    fn provider_native_state_survives_append_only_history_changes() {
+        let session = Session::new("gpt-test", "openai");
+        session.push_message(json!({"role": "assistant", "content": "ready"}));
+        let expected = provider_state("openai", "gpt-test");
+        session
+            .install_provider_native_state(expected.clone())
+            .expect("matching state");
+
+        session.push_message(json!({"role": "user", "content": "continue"}));
+        session.update_messages(|messages| {
+            messages.push(json!({"role": "system", "content": "new input"}));
+        });
+        session.update_state(|state, _| {
+            state
+                .conversation
+                .messages
+                .push(json!({"role": "user", "content": "one more"}));
+        });
+
+        assert_eq!(session.provider_native_state_snapshot(), Some(expected));
+    }
+
+    #[test]
+    fn provider_native_state_clears_when_history_is_rewritten() {
+        let session = Session::new("gpt-test", "openai");
+        let original = json!({"role": "assistant", "content": "original"});
+        session.push_message(original.clone());
+        session
+            .install_provider_native_state(provider_state_at("openai", "gpt-test", 1, 10))
+            .expect("matching state");
+
+        session.update_messages(|messages| messages[0]["content"] = json!("edited"));
+        assert!(session.provider_native_state_snapshot().is_none());
+
+        session.replace_messages(vec![original.clone()]);
+        session
+            .install_provider_native_state(provider_state_at("openai", "gpt-test", 2, 20))
+            .expect("matching state");
+        session.replace_messages(vec![json!({"role": "system", "content": "compacted"})]);
+        assert!(session.provider_native_state_snapshot().is_none());
+
+        session.replace_messages(vec![original]);
+        session
+            .install_provider_native_state(provider_state_at("openai", "gpt-test", 3, 30))
+            .expect("matching state");
+        session.update_state(|state, _| state.conversation.messages.clear());
+        assert!(session.provider_native_state_snapshot().is_none());
     }
 
     #[test]

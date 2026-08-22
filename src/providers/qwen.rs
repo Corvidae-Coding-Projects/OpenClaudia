@@ -41,6 +41,13 @@ impl ProviderAdapter for QwenAdapter {
         self.0.name()
     }
 
+    fn state_contract(
+        &self,
+        protocol: crate::runtime::ProviderWireProtocol,
+    ) -> Result<&'static crate::runtime::ProviderStateContract, ProviderError> {
+        self.0.state_contract(protocol)
+    }
+
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         self.0.transform_request(request)
     }

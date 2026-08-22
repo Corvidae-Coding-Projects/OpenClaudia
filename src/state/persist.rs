@@ -79,6 +79,11 @@ impl SessionDocument {
                 });
             }
         }
+        if let Some(native) = &state.conversation.provider_native_state {
+            native
+                .validate_identity(&self.provider, &self.model)
+                .map_err(|error| PersistError::InvalidProviderNativeState(error.to_string()))?;
+        }
         Ok(state)
     }
 }
@@ -237,6 +242,8 @@ pub enum PersistError {
         "session id mismatch between compatibility field '{legacy}' and canonical state '{canonical}'"
     )]
     InconsistentSessionId { legacy: String, canonical: String },
+    #[error("invalid provider-native session state: {0}")]
+    InvalidProviderNativeState(String),
 }
 
 /// Encode a [`SessionState`] as pretty-printed JSON ready to write.
@@ -292,6 +299,10 @@ const fn default_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{
+        ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
+        ProviderStateFacet, ProviderWireProtocol,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -501,6 +512,39 @@ mod tests {
         assert!(matches!(
             document.into_state(),
             Err(PersistError::InconsistentSessionId { .. })
+        ));
+    }
+
+    #[test]
+    fn session_document_rejects_native_state_bound_to_other_metadata() {
+        let mut state = SessionState::default();
+        state.conversation.provider_native_state = Some(
+            ProviderNativeState::new(
+                "openai",
+                "gpt-test",
+                ProviderWireProtocol::OpenAiResponses,
+                ContinuationGeneration::new(1).expect("non-zero generation"),
+                vec![ProviderNativeItem::new(
+                    ProviderStateFacet::Usage,
+                    ProviderNativeItemPurpose::Evidence,
+                    serde_json::json!({"input_tokens": 1}),
+                )
+                .expect("valid item")],
+            )
+            .expect("valid provider state"),
+        );
+        let document = SessionDocument::from_state(
+            "title".to_string(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            "claude-test".to_string(),
+            "anthropic".to_string(),
+            state,
+        );
+
+        assert!(matches!(
+            document.into_state(),
+            Err(PersistError::InvalidProviderNativeState(_))
         ));
     }
 }

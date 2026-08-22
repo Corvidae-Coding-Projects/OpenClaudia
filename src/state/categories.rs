@@ -143,6 +143,11 @@ pub struct Conversation {
     /// adapter pick what it needs.
     #[serde(default)]
     pub messages: Vec<serde_json::Value>,
+    /// Lossless provider-owned continuation/evidence lane. Portable messages
+    /// remain authoritative for display and cross-provider migration; this
+    /// state is used only with its exact provider, model, and wire protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_native_state: Option<crate::runtime::ProviderNativeState>,
     /// Stack of `(user, assistant)` pairs popped by `/undo`. Popping
     /// again via `/redo` pushes them back onto `messages`.
     #[serde(default)]

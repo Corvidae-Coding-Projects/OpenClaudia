@@ -817,7 +817,8 @@ impl ChatRepl {
         let effort = self
             .transient_effort_override
             .unwrap_or_else(|| self.chat_session.effort_level());
-        let request_body = match openclaudia::pipeline::build_request_for_run(
+        let provider_native_state = self.chat_session.provider_native_state_snapshot();
+        let request_body = match openclaudia::pipeline::build_request_for_run_with_state(
             &self.run_context,
             &self.config.proxy.target,
             &self.model,
@@ -825,6 +826,7 @@ impl ChatRepl {
             effort.as_str(),
             self.claude_code_token.as_ref(),
             Some(&prompt_blocks),
+            provider_native_state.as_ref(),
         ) {
             Ok(request_body) => request_body,
             Err(err) => {
@@ -1095,7 +1097,7 @@ impl ChatRepl {
             self.transient_model_restore
                 .get_or_insert_with(|| self.model.clone());
             self.model = model.to_string();
-            self.chat_session.model.clone_from(&self.model);
+            self.chat_session.set_model(self.model.clone());
         } else if let Some(model) = model {
             tracing::debug!(
                 model = %model,
@@ -1117,8 +1119,8 @@ impl ChatRepl {
     fn clear_transient_prompt_options(&mut self) {
         self.transient_allowed_tool_rules.clear();
         if let Some(model) = self.transient_model_restore.take() {
+            self.chat_session.set_model(model.clone());
             self.model = model;
-            self.chat_session.model.clone_from(&self.model);
         }
         self.transient_effort_override = None;
     }
@@ -1132,8 +1134,8 @@ impl ChatRepl {
     ) -> SlashOutcome {
         match result {
             SlashCommandResult::SwitchModel(new_model) => {
+                self.chat_session.set_model(new_model.clone());
                 self.model = new_model;
-                self.chat_session.model.clone_from(&self.model);
             }
             SlashCommandResult::Status => self.print_status(),
             SlashCommandResult::ToggleMode => {
@@ -1471,6 +1473,22 @@ impl ChatRepl {
                 false
             }
         }
+    }
+
+    fn apply_provider_native_state_to_followup(
+        &self,
+        request: &mut serde_json::Value,
+    ) -> Result<(), String> {
+        if let Some(state) = self.chat_session.provider_native_state_snapshot() {
+            openclaudia::pipeline::apply_provider_native_state_to_request(
+                openclaudia::pipeline::WireApi::ChatCompletions,
+                &self.config.proxy.target,
+                &self.model,
+                request,
+                &state,
+            )?;
+        }
+        Ok(())
     }
 
     fn current_grounding_system_content(&self) -> Option<String> {
@@ -2186,6 +2204,10 @@ impl ChatRepl {
         });
         if let Some(sys) = request_body.get("systemInstruction") {
             followup_req["systemInstruction"] = sys.clone();
+        }
+        if let Err(error) = self.apply_provider_native_state_to_followup(&mut followup_req) {
+            tracing::error!(error = %error, "failed to apply provider-native Gemini state");
+            return None;
         }
 
         let req = match transport
@@ -2946,6 +2968,7 @@ impl ChatRepl {
         if self.claude_code_token.is_some() {
             openclaudia::claude_credentials::inject_oauth_prefix_only(&mut followup_req);
         }
+        self.apply_provider_native_state_to_followup(&mut followup_req)?;
         Ok(followup_req)
     }
 
@@ -3221,7 +3244,7 @@ impl ChatRepl {
         let openai_tools =
             tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
                 .definitions_value();
-        if self.config.proxy.target.eq_ignore_ascii_case("anthropic") {
+        let mut request = if self.config.proxy.target.eq_ignore_ascii_case("anthropic") {
             let anthropic_messages = convert_messages_to_anthropic_checked(&request_messages)
                 .map_err(|e| e.to_string())?;
             let anthropic_tools = convert_tool_definitions_to_anthropic_checked(&openai_tools)
@@ -3234,16 +3257,18 @@ impl ChatRepl {
                 "tools": anthropic_tools
             });
             req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
-            Ok(req)
+            req
         } else {
-            Ok(serde_json::json!({
+            serde_json::json!({
                 "model": self.model,
                 "messages": request_messages,
                 "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
                 "stream": true,
                 "tools": openai_tools
-            }))
-        }
+            })
+        };
+        self.apply_provider_native_state_to_followup(&mut request)?;
+        Ok(request)
     }
 
     /// Stream an OpenAI-style follow-up into `current_content` and feed
@@ -3695,8 +3720,8 @@ fn apply_fast_mode_result(
 ) {
     session.set_effort_level(EffortLevel::parse(effort).unwrap_or(EffortLevel::Medium));
     if let Some(fast_model) = fast_model {
+        session.set_model(fast_model.clone());
         *model = fast_model;
-        session.model.clone_from(model);
     }
 }
 

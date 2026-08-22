@@ -285,6 +285,21 @@ impl ProviderAdapter for GoogleAdapter {
         "google"
     }
 
+    fn state_contract(
+        &self,
+        protocol: crate::runtime::ProviderWireProtocol,
+    ) -> Result<&'static crate::runtime::ProviderStateContract, ProviderError> {
+        match protocol {
+            crate::runtime::ProviderWireProtocol::GeminiGenerateContent => {
+                Ok(&super::GEMINI_GENERATE_CONTENT_STATE_CONTRACT)
+            }
+            crate::runtime::ProviderWireProtocol::GeminiInteractions => {
+                Ok(&super::GEMINI_INTERACTIONS_STATE_CONTRACT)
+            }
+            other => Err(super::unsupported_state_protocol(self.name(), other)),
+        }
+    }
+
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         let mut body = json!({
             "contents": Self::convert_messages(&request.messages)?

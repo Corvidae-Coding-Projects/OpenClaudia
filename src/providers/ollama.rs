@@ -147,6 +147,16 @@ impl ProviderAdapter for OllamaAdapter {
         "ollama"
     }
 
+    fn state_contract(
+        &self,
+        protocol: crate::runtime::ProviderWireProtocol,
+    ) -> Result<&'static crate::runtime::ProviderStateContract, ProviderError> {
+        match protocol {
+            crate::runtime::ProviderWireProtocol::OllamaChat => Ok(&super::OLLAMA_STATE_CONTRACT),
+            other => Err(super::unsupported_state_protocol(self.name(), other)),
+        }
+    }
+
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         let mut body = json!({
             "model": &request.model,

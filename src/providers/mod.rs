@@ -33,6 +33,9 @@ use thiserror::Error;
 
 use crate::config::ThinkingConfig;
 use crate::proxy::ChatCompletionRequest;
+use crate::runtime::{
+    ProviderNativeState, ProviderStateContract, ProviderStateSupport, ProviderWireProtocol,
+};
 use crate::secrets::SensitiveHeaders;
 use crate::session::TokenUsage;
 
@@ -107,6 +110,48 @@ pub struct ModelInfo {
 pub trait ProviderAdapter: Send + Sync {
     /// Get the provider name
     fn name(&self) -> &str;
+
+    /// Declare lossless native-state behavior for one concrete wire protocol.
+    ///
+    /// Implementations must reject protocols they do not speak.  There is no
+    /// default declaration because silently inheriting a generic chat fallback
+    /// is precisely what native continuation state must prevent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Unsupported`] for a protocol the adapter does
+    /// not implement.
+    fn state_contract(
+        &self,
+        protocol: ProviderWireProtocol,
+    ) -> Result<&'static ProviderStateContract, ProviderError>;
+
+    /// Apply validated provider-native state to an already transformed request.
+    ///
+    /// The default is intentionally fail-closed: evidence-only items require no
+    /// request mutation, while any continuation item requires an adapter
+    /// override. Provider-specific continuation slices must add the override at
+    /// the same time they declare a facet round-trippable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported facets or unapplied continuation state.
+    fn apply_provider_native_state(
+        &self,
+        _request: &mut Value,
+        state: &ProviderNativeState,
+    ) -> Result<(), ProviderError> {
+        self.state_contract(state.protocol())?
+            .validate_state(state)
+            .map_err(|error| ProviderError::Unsupported(error.to_string()))?;
+        if state.has_continuation_items() {
+            return Err(ProviderError::Unsupported(format!(
+                "{} declares native continuation items but has no lossless request applicator",
+                self.name()
+            )));
+        }
+        Ok(())
+    }
 
     /// Transform an OpenAI-compatible request to provider format.
     ///
@@ -270,6 +315,54 @@ pub trait ProviderAdapter: Send + Sync {
                 .unwrap_or(0),
         })
     }
+}
+
+const NATIVE_MESSAGES_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native message replay is not wired yet");
+const TOOL_CALLS_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native tool-call replay is not wired yet");
+const PARALLEL_TOOLS_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native parallel tool-call ordering is not wired yet");
+const REASONING_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native reasoning continuation is not wired yet");
+const COMPACTION_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native compaction state is not wired yet");
+const SERVER_CONTINUATION_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("server continuation identifiers are not wired yet");
+
+const fn retained_evidence_contract(protocol: ProviderWireProtocol) -> ProviderStateContract {
+    ProviderStateContract {
+        protocol,
+        native_message: NATIVE_MESSAGES_PENDING,
+        tool_calls: TOOL_CALLS_PENDING,
+        parallel_tool_calls: PARALLEL_TOOLS_PENDING,
+        reasoning: REASONING_PENDING,
+        refusal: ProviderStateSupport::EvidenceOnly,
+        usage: ProviderStateSupport::EvidenceOnly,
+        cache_metadata: ProviderStateSupport::EvidenceOnly,
+        compaction: COMPACTION_PENDING,
+        server_continuation: SERVER_CONTINUATION_PENDING,
+        terminal_state: ProviderStateSupport::EvidenceOnly,
+    }
+}
+
+static ANTHROPIC_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::AnthropicMessages);
+static OPENAI_CHAT_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::OpenAiChatCompletions);
+static OPENAI_RESPONSES_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::OpenAiResponses);
+static GEMINI_GENERATE_CONTENT_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::GeminiGenerateContent);
+static GEMINI_INTERACTIONS_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::GeminiInteractions);
+static OLLAMA_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::OllamaChat);
+
+fn unsupported_state_protocol(adapter: &str, protocol: ProviderWireProtocol) -> ProviderError {
+    ProviderError::Unsupported(format!(
+        "provider adapter {adapter} does not implement wire protocol {protocol}"
+    ))
 }
 
 /// Typed enum of every provider this proxy knows how to route to.
@@ -674,6 +767,10 @@ pub async fn fetch_models_with_headers(
 mod tests {
     use super::*;
     use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
+    use crate::runtime::{
+        ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
+        ProviderStateFacet,
+    };
     use serde_json::json;
 
     struct ApiKeyHeaderModelAdapter;
@@ -681,6 +778,16 @@ mod tests {
     impl ProviderAdapter for ApiKeyHeaderModelAdapter {
         fn name(&self) -> &'static str {
             "api-key-header-test"
+        }
+
+        fn state_contract(
+            &self,
+            protocol: ProviderWireProtocol,
+        ) -> Result<&'static ProviderStateContract, ProviderError> {
+            match protocol {
+                ProviderWireProtocol::OpenAiChatCompletions => Ok(&OPENAI_CHAT_STATE_CONTRACT),
+                other => Err(unsupported_state_protocol(self.name(), other)),
+            }
         }
 
         fn transform_request(
@@ -715,6 +822,137 @@ mod tests {
         fn supports_model_listing(&self) -> bool {
             true
         }
+    }
+
+    fn native_state(
+        facet: ProviderStateFacet,
+        purpose: ProviderNativeItemPurpose,
+    ) -> ProviderNativeState {
+        ProviderNativeState::new(
+            "openai",
+            "gpt-test",
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![
+                ProviderNativeItem::new(facet, purpose, json!({"native": true}))
+                    .expect("valid native item"),
+            ],
+        )
+        .expect("valid native state")
+    }
+
+    fn native_state_for(
+        provider: &str,
+        protocol: ProviderWireProtocol,
+        facet: ProviderStateFacet,
+        purpose: ProviderNativeItemPurpose,
+    ) -> ProviderNativeState {
+        ProviderNativeState::new(
+            provider,
+            "model-test",
+            protocol,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![
+                ProviderNativeItem::new(facet, purpose, json!({"provider_item": provider}))
+                    .expect("valid native item"),
+            ],
+        )
+        .expect("valid native state")
+    }
+
+    #[test]
+    fn every_registered_adapter_declares_its_native_protocol() {
+        for provider in SUPPORTED_PROVIDERS {
+            let adapter = get_adapter(provider).expect("registered adapter");
+            let protocol = match *provider {
+                "anthropic" => ProviderWireProtocol::AnthropicMessages,
+                "google" | "gemini" => ProviderWireProtocol::GeminiGenerateContent,
+                "ollama" => ProviderWireProtocol::OllamaChat,
+                _ => ProviderWireProtocol::OpenAiChatCompletions,
+            };
+            let contract = adapter
+                .state_contract(protocol)
+                .unwrap_or_else(|error| panic!("{provider} lacks {protocol}: {error}"));
+            assert_eq!(contract.protocol, protocol, "provider {provider}");
+
+            for facet in [
+                ProviderStateFacet::Refusal,
+                ProviderStateFacet::Usage,
+                ProviderStateFacet::CacheMetadata,
+                ProviderStateFacet::TerminalState,
+            ] {
+                contract
+                    .validate_state(&native_state_for(
+                        provider,
+                        protocol,
+                        facet,
+                        ProviderNativeItemPurpose::Evidence,
+                    ))
+                    .unwrap_or_else(|error| {
+                        panic!("{provider} must retain {facet:?} evidence: {error}")
+                    });
+            }
+            for facet in [
+                ProviderStateFacet::NativeMessage,
+                ProviderStateFacet::ToolCalls,
+                ProviderStateFacet::ParallelToolCalls,
+                ProviderStateFacet::Reasoning,
+                ProviderStateFacet::Compaction,
+                ProviderStateFacet::ServerContinuation,
+            ] {
+                let error = contract
+                    .validate_state(&native_state_for(
+                        provider,
+                        protocol,
+                        facet,
+                        ProviderNativeItemPurpose::Continuation,
+                    ))
+                    .expect_err("unwired continuation facet must be explicit");
+                assert!(
+                    matches!(
+                        error,
+                        crate::runtime::ProviderStateContractError::UnsupportedFacet { .. }
+                    ),
+                    "provider {provider}, facet {facet:?}: {error}"
+                );
+            }
+        }
+        assert_eq!(
+            get_adapter("openai")
+                .expect("OpenAI adapter")
+                .state_contract(ProviderWireProtocol::OpenAiResponses)
+                .expect("Responses contract")
+                .protocol,
+            ProviderWireProtocol::OpenAiResponses
+        );
+    }
+
+    #[test]
+    fn adapter_native_state_application_is_fail_closed() {
+        let adapter = get_adapter("openai").expect("OpenAI adapter");
+        let mut body = json!({"model": "gpt-test", "messages": []});
+        let original = body.clone();
+        adapter
+            .apply_provider_native_state(
+                &mut body,
+                &native_state(
+                    ProviderStateFacet::Usage,
+                    ProviderNativeItemPurpose::Evidence,
+                ),
+            )
+            .expect("retained evidence does not become provider input");
+        assert_eq!(body, original);
+
+        let error = adapter
+            .apply_provider_native_state(
+                &mut body,
+                &native_state(
+                    ProviderStateFacet::ServerContinuation,
+                    ProviderNativeItemPurpose::Continuation,
+                ),
+            )
+            .expect_err("unwired continuation must not be ignored");
+        assert!(error.to_string().contains("not wired yet"));
     }
 
     fn create_test_request() -> ChatCompletionRequest {

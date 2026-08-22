@@ -12,6 +12,7 @@ mod context;
 mod event;
 mod ids;
 mod kernel;
+mod provider_state;
 mod reference;
 mod trace;
 
@@ -32,5 +33,12 @@ pub use ids::{
     ContinuationGeneration, RunId, StateGeneration, WorkspaceGeneration,
 };
 pub use kernel::{KernelError, ReplayError, RunContext, RunPhase, RunSnapshot, RuntimeKernel};
+pub use provider_state::{
+    ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState, ProviderStateContract,
+    ProviderStateContractError, ProviderStateError, ProviderStateFacet, ProviderStateSupport,
+    ProviderWireProtocol, MAX_PROVIDER_NATIVE_ITEMS, MAX_PROVIDER_NATIVE_ITEM_BYTES,
+    MAX_PROVIDER_NATIVE_ITEM_DEPTH, MAX_PROVIDER_NATIVE_MODEL_BYTES,
+    MAX_PROVIDER_NATIVE_STATE_BYTES, PROVIDER_NATIVE_STATE_SCHEMA_VERSION,
+};
 pub use reference::{ReferenceRunAdapter, ReferenceRunResult};
 pub use trace::{ReferenceTraceSink, TraceSink, TraceSinkError, TracingTraceSink};

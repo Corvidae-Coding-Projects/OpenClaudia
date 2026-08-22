@@ -666,7 +666,36 @@ pub fn build_request_for_run(
     claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
-    build_request_for_wire_for_run(
+    build_request_for_run_with_state(
+        run,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        None,
+    )
+}
+
+/// Build a chat-completions request and apply exact provider-native state.
+///
+/// # Errors
+///
+/// Returns an error when state identity, protocol, or adapter capabilities do
+/// not permit a lossless request.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_run_with_state(
+    run: &tools::ToolRunContext,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+) -> Result<Value, String> {
+    build_request_for_wire_for_run_with_state(
         run,
         WireApi::ChatCompletions,
         provider,
@@ -675,6 +704,7 @@ pub fn build_request_for_run(
         effort_level,
         claude_code_token,
         prompt_blocks,
+        provider_native_state,
     )
 }
 
@@ -702,6 +732,7 @@ pub fn build_request_for_wire(
         claude_code_token,
         prompt_blocks,
         &tools::get_all_tool_definitions(true),
+        None,
     )
 }
 
@@ -723,7 +754,39 @@ pub fn build_request_for_wire_for_run(
     claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
-    build_request_for_wire_for_run_with_additional(
+    build_request_for_wire_for_run_with_state(
+        run,
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        None,
+    )
+}
+
+/// Build the provider request from an exact progressive catalog and optional
+/// provider-native state.
+///
+/// # Errors
+///
+/// Returns an error when state cannot be applied losslessly or normal request
+/// construction fails.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run_with_state(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+) -> Result<Value, String> {
+    build_request_for_wire_for_run_with_additional_and_state(
         run,
         wire_api,
         provider,
@@ -733,6 +796,7 @@ pub fn build_request_for_wire_for_run(
         claude_code_token,
         prompt_blocks,
         &[],
+        provider_native_state,
     )
 }
 
@@ -756,6 +820,41 @@ pub fn build_request_for_wire_for_run_with_additional(
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
     additional: &[Value],
 ) -> Result<Value, String> {
+    build_request_for_wire_for_run_with_additional_and_state(
+        run,
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        additional,
+        None,
+    )
+}
+
+/// Build a run-owned provider request and apply an exact provider-native state
+/// envelope after provider conversion.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication or provider conversion fails, or
+/// when native state cannot be applied losslessly to the selected identity and
+/// protocol.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run_with_additional_and_state(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    additional: &[Value],
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+) -> Result<Value, String> {
     let snapshot =
         tools::get_progressive_tool_definitions_with_additional(run, messages, true, additional)?;
     build_request_for_wire_with_tools(
@@ -767,6 +866,7 @@ pub fn build_request_for_wire_for_run_with_additional(
         claude_code_token,
         prompt_blocks,
         &snapshot.definitions_value(),
+        provider_native_state,
     )
 }
 
@@ -780,6 +880,7 @@ fn build_request_for_wire_with_tools(
     claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
     tool_definitions: &Value,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
 ) -> Result<Value, String> {
     // Resolve ultrathink keyword / env override against the base effort
     // so every provider path sees the same effective level (Claude Code
@@ -790,33 +891,79 @@ fn build_request_for_wire_with_tools(
     let effective = resolved.as_deref().unwrap_or("medium");
     let prepared_messages = prompt_blocks.map(|context| context.prepare_json_messages(messages));
     let effective_messages = prepared_messages.as_deref().unwrap_or(messages);
-    if wire_api == WireApi::OpenAiResponses {
-        return build_openai_responses_request_with_tools(
+    let mut body = if wire_api == WireApi::OpenAiResponses {
+        build_openai_responses_request_with_tools(
             model,
             effective_messages,
             effective,
             tool_definitions,
-        );
+        )?
+    } else {
+        match provider.to_ascii_lowercase().as_str() {
+            "anthropic" => build_anthropic_request_with_tools(
+                model,
+                effective_messages,
+                effective,
+                claude_code_token,
+                prompt_blocks,
+                tool_definitions,
+            ),
+            "google" | "gemini" => {
+                build_google_request_with_tools(effective_messages, effective, tool_definitions)
+            }
+            _ => build_adapter_request(
+                provider,
+                model,
+                effective_messages,
+                effective,
+                tool_definitions,
+            ),
+        }?
+    };
+    if let Some(state) = provider_native_state {
+        apply_provider_native_state_to_request(wire_api, provider, model, &mut body, state)?;
     }
-    match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => build_anthropic_request_with_tools(
-            model,
-            effective_messages,
-            effective,
-            claude_code_token,
-            prompt_blocks,
-            tool_definitions,
-        ),
-        "google" | "gemini" => {
-            build_google_request_with_tools(effective_messages, effective, tool_definitions)
-        }
-        _ => build_adapter_request(
-            provider,
-            model,
-            effective_messages,
-            effective,
-            tool_definitions,
-        ),
+    Ok(body)
+}
+
+/// Validate and apply provider-native state to a provider request assembled by
+/// a frontend-specific follow-up path.
+///
+/// # Errors
+///
+/// Returns an error for provider/model/protocol drift, unsupported facets, or
+/// an adapter that has not implemented lossless native-state application.
+pub fn apply_provider_native_state_to_request(
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    request: &mut Value,
+    state: &crate::runtime::ProviderNativeState,
+) -> Result<(), String> {
+    let protocol = provider_wire_protocol(wire_api, provider);
+    state
+        .validate_binding(provider, model, protocol)
+        .map_err(|error| error.to_string())?;
+    let adapter = get_adapter(provider).map_err(|error| error.to_string())?;
+    adapter
+        .apply_provider_native_state(request, state)
+        .map_err(|error| error.to_string())
+}
+
+/// Resolve the concrete provider-owned protocol for one outbound request.
+#[must_use]
+pub fn provider_wire_protocol(
+    wire_api: WireApi,
+    provider: &str,
+) -> crate::runtime::ProviderWireProtocol {
+    if wire_api == WireApi::OpenAiResponses {
+        return crate::runtime::ProviderWireProtocol::OpenAiResponses;
+    }
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => crate::runtime::ProviderWireProtocol::AnthropicMessages,
+        "google" | "gemini" => crate::runtime::ProviderWireProtocol::GeminiGenerateContent,
+        "ollama" => crate::runtime::ProviderWireProtocol::OllamaChat,
+        _ => crate::runtime::ProviderWireProtocol::OpenAiChatCompletions,
     }
 }
 
@@ -3241,6 +3388,90 @@ pub fn build_assistant_message_with_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{
+        ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
+        ProviderStateFacet, ProviderWireProtocol,
+    };
+
+    fn pipeline_native_state(
+        provider: &str,
+        model: &str,
+        protocol: ProviderWireProtocol,
+        facet: ProviderStateFacet,
+        purpose: ProviderNativeItemPurpose,
+    ) -> ProviderNativeState {
+        ProviderNativeState::new(
+            provider,
+            model,
+            protocol,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![
+                ProviderNativeItem::new(facet, purpose, serde_json::json!({"opaque": "native"}))
+                    .expect("valid native item"),
+            ],
+        )
+        .expect("valid native state")
+    }
+
+    #[test]
+    fn provider_request_state_seam_retains_evidence_outside_prompt() {
+        let messages = [serde_json::json!({"role": "user", "content": "hello"})];
+        let state = pipeline_native_state(
+            "openai",
+            "gpt-test",
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ProviderStateFacet::Usage,
+            ProviderNativeItemPurpose::Evidence,
+        );
+        let body = build_request_for_wire_with_tools(
+            WireApi::ChatCompletions,
+            "openai",
+            "gpt-test",
+            &messages,
+            "medium",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&state),
+        )
+        .expect("evidence-only state is retained outside provider input");
+        assert_eq!(body["messages"][0]["content"], "hello");
+        assert!(!body.to_string().contains("native"));
+    }
+
+    #[test]
+    fn provider_request_state_seam_rejects_lossy_or_mismatched_resume() {
+        let messages = [serde_json::json!({"role": "user", "content": "hello"})];
+        let continuation = pipeline_native_state(
+            "openai",
+            "gpt-test",
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ProviderStateFacet::ServerContinuation,
+            ProviderNativeItemPurpose::Continuation,
+        );
+        let build = |provider: &str, model: &str, state: &ProviderNativeState| {
+            build_request_for_wire_with_tools(
+                WireApi::ChatCompletions,
+                provider,
+                model,
+                &messages,
+                "medium",
+                None,
+                None,
+                &serde_json::json!([]),
+                Some(state),
+            )
+        };
+        assert!(build("openai", "gpt-test", &continuation)
+            .expect_err("unwired continuation must fail")
+            .contains("not wired yet"));
+        assert!(build("openai", "gpt-other", &continuation)
+            .expect_err("model mismatch must fail")
+            .contains("belongs to model"));
+        assert!(build("anthropic", "gpt-test", &continuation)
+            .expect_err("provider mismatch must fail")
+            .contains("belongs to provider"));
+    }
 
     fn test_run() -> Arc<tools::ToolRunContext> {
         Arc::clone(tools::security::test_run_context())

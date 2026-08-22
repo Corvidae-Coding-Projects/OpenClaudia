@@ -45,6 +45,21 @@ impl ProviderAdapter for OpenAIAdapter {
         self.0.name()
     }
 
+    fn state_contract(
+        &self,
+        protocol: crate::runtime::ProviderWireProtocol,
+    ) -> Result<&'static crate::runtime::ProviderStateContract, ProviderError> {
+        match protocol {
+            crate::runtime::ProviderWireProtocol::OpenAiChatCompletions => {
+                self.0.state_contract(protocol)
+            }
+            crate::runtime::ProviderWireProtocol::OpenAiResponses => {
+                Ok(&super::OPENAI_RESPONSES_STATE_CONTRACT)
+            }
+            other => Err(super::unsupported_state_protocol(self.name(), other)),
+        }
+    }
+
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         self.0.transform_request(request)
     }

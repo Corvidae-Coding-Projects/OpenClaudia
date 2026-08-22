@@ -1371,11 +1371,10 @@ impl App {
 
         crate::tools::retire_run(&current_run);
         self.run_context = Ok(std::sync::Arc::clone(&next_run));
+        self.chat_session
+            .set_provider_and_model(provider.clone(), model.clone());
         self.provider = provider;
         self.model = model;
-        self.chat_session.provider.clone_from(&self.provider);
-        self.chat_session.model.clone_from(&self.model);
-        self.chat_session.touch();
         self.refresh_app_config_target();
         self.rebind_permission_manager(&next_run);
 
@@ -2870,9 +2869,8 @@ impl App {
         } else {
             args.to_string()
         };
+        self.chat_session.set_model(model.clone());
         self.model = model;
-        self.chat_session.model.clone_from(&self.model);
-        self.chat_session.touch();
         self.persist_session();
         self.messages.add(DisplayMessage::system(format!(
             "Model switched to {}",
@@ -3429,10 +3427,12 @@ impl App {
         // Clone the canonical state snapshot so the async task can build
         // follow-up requests without holding the state lock across awaits.
         let session_messages = self.chat_session.messages_snapshot();
+        let provider_native_state = self.chat_session.provider_native_state_snapshot();
 
         handle.spawn(run_api_turn_async(ApiTurnParams {
             run_context,
             session_messages,
+            provider_native_state,
             client,
             endpoint,
             headers,
@@ -3780,6 +3780,7 @@ impl Drop for App {
 struct ApiTurnParams {
     run_context: std::sync::Arc<crate::tools::ToolRunContext>,
     session_messages: Vec<serde_json::Value>,
+    provider_native_state: Option<crate::runtime::ProviderNativeState>,
     client: reqwest::Client,
     endpoint: String,
     headers: crate::secrets::SensitiveHeaders,
@@ -3807,6 +3808,7 @@ struct InitialTurnRequest<'a> {
     run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     session_id: &'a str,
     session_messages: &'a [serde_json::Value],
+    provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
     policy_enforcer: &'a std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     model: &'a str,
     wire_api: crate::pipeline::WireApi,
@@ -3835,6 +3837,7 @@ struct AgenticCtx<'a> {
     wire_api: crate::pipeline::WireApi,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
+    provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
@@ -4391,6 +4394,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             effort_level: ctx.effort_level,
             claude_code_token: ctx.claude_code_token,
             prompt_blocks: ctx.prompt_blocks,
+            provider_native_state: ctx.provider_native_state,
             mcp_manager: ctx.mcp_manager,
         })
         .await
@@ -4533,6 +4537,7 @@ async fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<Prepar
         effort_level: p.effort_level.as_str(),
         claude_code_token: p.claude_code_token,
         prompt_blocks: p.prompt_blocks,
+        provider_native_state: p.provider_native_state,
         mcp_manager: p.mcp_manager,
     })
     .await
@@ -4561,6 +4566,7 @@ struct LiveMcpRequest<'a> {
     effort_level: &'a str,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
+    provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
     mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
 }
 
@@ -4597,7 +4603,7 @@ async fn build_request_with_live_mcp(
     } else {
         Vec::new()
     };
-    crate::pipeline::build_request_for_wire_for_run_with_additional(
+    crate::pipeline::build_request_for_wire_for_run_with_additional_and_state(
         request.run,
         request.wire_api,
         request.provider,
@@ -4607,6 +4613,7 @@ async fn build_request_with_live_mcp(
         request.claude_code_token,
         request.prompt_blocks,
         &definitions,
+        request.provider_native_state,
     )
 }
 
@@ -4622,6 +4629,7 @@ async fn run_api_turn_async(mut p: ApiTurnParams) {
         run_context: &p.run_context,
         session_id: &p.session_id,
         session_messages: &p.session_messages,
+        provider_native_state: p.provider_native_state.as_ref(),
         policy_enforcer: &p.policy_enforcer,
         model: &p.model,
         wire_api: p.wire_api,
@@ -4671,6 +4679,7 @@ async fn run_api_turn_async(mut p: ApiTurnParams) {
                     wire_api: p.wire_api,
                     claude_code_token: p.claude_code_token.as_ref(),
                     prompt_blocks: p.prompt_blocks.as_ref(),
+                    provider_native_state: p.provider_native_state.as_ref(),
                     memory_db: p.memory_db,
                     app_config: p.app_config,
                     permission_mgr: p.permission_mgr,
@@ -4706,6 +4715,7 @@ struct TurnContext<'a> {
     wire_api: crate::pipeline::WireApi,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
+    provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
@@ -4773,6 +4783,7 @@ async fn handle_followup_turn(
         wire_api: ctx.wire_api,
         claude_code_token: ctx.claude_code_token,
         prompt_blocks: ctx.prompt_blocks,
+        provider_native_state: ctx.provider_native_state,
         memory_db: ctx.memory_db.clone(),
         app_config: ctx.app_config.clone(),
         permission_mgr: ctx.permission_mgr.clone(),
@@ -5595,6 +5606,7 @@ mod tests {
                 wire_api: crate::pipeline::WireApi::ChatCompletions,
                 claude_code_token: None,
                 prompt_blocks: None,
+                provider_native_state: None,
                 memory_db: None,
                 app_config: None,
                 permission_mgr: None,
@@ -5657,6 +5669,7 @@ mod tests {
                 wire_api: crate::pipeline::WireApi::ChatCompletions,
                 claude_code_token: None,
                 prompt_blocks: None,
+                provider_native_state: None,
                 memory_db: None,
                 app_config: None,
                 permission_mgr: None,
