@@ -1,6 +1,6 @@
 {
   "next_display_id": 1086,
-  "next_comment_id": 1146,
+  "next_comment_id": 1147,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8953,7 +8953,18 @@
       "parent_uuid": "66ad6d37-42af-4133-830d-fdf7d4cb67ac",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T07:23:28.599972953Z",
-      "updated_at": "2026-08-22T07:23:28.599972953Z"
+      "updated_at": "2026-08-22T07:25:07.092094131Z",
+      "comments": {
+        "f855044a-340d-496f-bcff-a8ee9268827d": {
+          "display_id": 1146,
+          "author": "6Vw9",
+          "content": "S-052 audit evidence: crosslink 0.9.0-beta.1 db/issues.rs list_issues/search_issues, db/relations.rs list_ready_issues, and db/issues.rs get_subissues collect complete SQL query results into Vec<Issue> and expose no limit/cursor. OpenClaudia now rejects oversized task/tree projections, caps tree depth/nodes/output, and caps rendered list/search rows, but those checks occur after the dependency crate has allocated the full result. SQL-level bounded pagination remains required here.",
+          "created_at": "2026-08-22T07:25:07.089342639Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAc6VeS73z51FubTt0YNn90S6NtZ2XlqcSoGl3Reaw10v6PM6qs7EtdriQufVvXOcTt9igfhaXcNXfO5Dnafv2BQ=="
+        }
+      }
     },
     "51984837-02e4-4f0f-862e-453fac231e62": {
       "uuid": "51984837-02e4-4f0f-862e-453fac231e62",
@@ -31716,11 +31727,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 871,
       "timestamp": "2026-08-22T07:23:28.599972953Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 872,
+      "timestamp": "2026-08-22T07:25:07.092094131Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T07:23:28.599972953Z",
+    "timestamp": "2026-08-22T07:25:07.092094131Z",
     "agent_id": "6Vw9",
-    "agent_seq": 871
+    "agent_seq": 872
   }
 }
