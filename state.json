@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1100,
+  "next_display_id": 1101,
   "next_comment_id": 1242,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -540,6 +540,7 @@
     "874537b8-4e1d-4dc2-8058-234c7ffa11fd": 162,
     "877278c1-4bf8-44d7-921f-6cc3fcbcd6f1": 755,
     "87765c1a-ab26-4d2f-9867-93e0bc73594d": 624,
+    "87b9f874-574a-45b6-8cdd-5a2c636b50fb": 1100,
     "87fc2730-649b-4fb1-99e7-81d8f4086603": 228,
     "882c2f29-e7b5-4142-a8e3-17033d947244": 765,
     "88ba4eea-27ad-4f08-8523-1e262e5a3b9e": 1048,
@@ -15650,6 +15651,18 @@
         "cc-parity",
         "feature"
       ]
+    },
+    "87b9f874-574a-45b6-8cdd-5a2c636b50fb": {
+      "uuid": "87b9f874-574a-45b6-8cdd-5a2c636b50fb",
+      "display_id": 1100,
+      "title": "S-045: Preserve OpenAI Responses continuation",
+      "description": "Implement docs/remediation-slices/045-openai-responses-continuation.md on top of S-044. Retain exact response identity and required provider output items, advance continuation through tool/reasoning turns, and make every owned OpenAI Responses frontend consume one lossless adapter. Do not flatten native state into prose or claim adjacent provider/terminal/privacy slices complete.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T22:04:35.596607994Z",
+      "updated_at": "2026-08-22T22:04:35.596607994Z"
     },
     "87fc2730-649b-4fb1-99e7-81d8f4086603": {
       "uuid": "87fc2730-649b-4fb1-99e7-81d8f4086603",
@@ -33627,11 +33640,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1028,
       "timestamp": "2026-08-22T22:03:20.217462901Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1029,
+      "timestamp": "2026-08-22T22:04:35.596607994Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T22:03:20.217462901Z",
+    "timestamp": "2026-08-22T22:04:35.596607994Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1028
+    "agent_seq": 1029
   }
 }
