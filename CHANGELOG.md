@@ -100,6 +100,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI: every turn now dual-writes — the existing JSON snapshot at `~/.local/share/openclaudia/chat_sessions/<uuid>.json` stays for backward compat, and new entries also append to the JSONL transcript via `App::persist_transcript_tail`. Watermark tracking skips re-appending on resume
 
 ### Fixed
+- Emit Gemini-compatible JSON Schemas for tool declarations (#1094)
 - Process-tree termination accepts Unix sentinel PID 0 (#1022)
 - ACP cancellation can leave daemonized sandbox descendants alive under suite load (#1021)
 - tests: serialize sandbox escape probes around process-wide security context and hostile project fixtures, preventing parallel test runs from mistaking a sibling probe's temporary hardlink, socket, FIFO, file descriptor, or environment canary for repository state.
@@ -171,6 +172,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-013: Implement real progressive tool discovery (#1091)
+- Route ACP test toolchain discovery through the shared test subprocess runner (#1095)
 - Make the ACP automatic-learning citation test full-suite deterministic (#1093)
 - Regenerate the fuzz lockfile so Rust 1.98 locked CI is reproducible (#1092)
 - Preserve typed partial outcomes across the ACP tool boundary (#1090)
