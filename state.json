@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1082,
+  "next_display_id": 1083,
   "next_comment_id": 1137,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -77,6 +77,7 @@
     "10e36fa2-7ca9-4b75-a487-0f43e7da228a": 205,
     "10f1dbcf-e640-47fb-9ab7-a6a5e911f3c9": 461,
     "11a61b5b-5435-4b0e-b8fd-dac426ac481e": 671,
+    "120032b1-2cdf-4f06-95e6-893649d0edb3": 1082,
     "1227829b-b6b7-4cc2-a741-3fa1266bd9b5": 395,
     "1291d36f-cbf4-4b75-b050-31a5687513dd": 233,
     "130a6fc3-6ee9-459a-be78-938fc0dd7b40": 48,
@@ -2886,6 +2887,17 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7O2L906BlPnERu6se/RJ0VrjMHozl5x0qE/cP9FZHN3U2GvuWfdFshqZR/lDnXEenLyY+qFxbCzWHWee3ORYDw=="
         }
       }
+    },
+    "120032b1-2cdf-4f06-95e6-893649d0edb3": {
+      "uuid": "120032b1-2cdf-4f06-95e6-893649d0edb3",
+      "display_id": 1082,
+      "title": "Make LMStudio CLI SSE fixture resilient to full-suite load",
+      "description": "The Rust 1.98.0 locked all-feature/all-target suite failed tests/cli_exit_status_e2e.rs::print_mixed_case_lmstudio_target_uses_lmstudio_config because the fixture server timed out after 10 seconds waiting for a request. The exact isolated test passed immediately (1/1 in 0.11s), so this is a load-sensitive runner/test deadline rather than an S-105 behavior failure. Diagnose fixture supervision and use an evidence-based bounded readiness/deadline contract without weakening the provider-config assertion.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T05:11:22.655003632Z",
+      "updated_at": "2026-08-22T05:11:22.655003632Z"
     },
     "1227829b-b6b7-4cc2-a741-3fa1266bd9b5": {
       "uuid": "1227829b-b6b7-4cc2-a741-3fa1266bd9b5",
@@ -31475,11 +31487,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 852,
       "timestamp": "2026-08-22T05:01:45.186404250Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 853,
+      "timestamp": "2026-08-22T05:11:22.655003632Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T05:01:45.186404250Z",
+    "timestamp": "2026-08-22T05:11:22.655003632Z",
     "agent_id": "6Vw9",
-    "agent_seq": 852
+    "agent_seq": 853
   }
 }
