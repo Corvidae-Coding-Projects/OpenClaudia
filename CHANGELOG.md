@@ -171,6 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Regenerate the fuzz lockfile so Rust 1.98 locked CI is reproducible (#1092)
 - Preserve typed partial outcomes across the ACP tool boundary (#1090)
 - Add typed causal resolution for technical-memory conflict heads (#1081)
 - S-055: Rebuild automatic learning around causal technical evidence (#1089)
