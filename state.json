@@ -1,6 +1,6 @@
 {
   "next_display_id": 1101,
-  "next_comment_id": 1242,
+  "next_comment_id": 1243,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15666,7 +15666,18 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T22:04:35.596607994Z",
-      "updated_at": "2026-08-22T22:04:35.596607994Z"
+      "updated_at": "2026-08-22T22:04:51.963582350Z",
+      "comments": {
+        "f16d5930-05c0-4de5-9163-a6386e296561": {
+          "display_id": 1242,
+          "author": "6Vw9",
+          "content": "Preflight first: enumerate every OpenAI Responses request/stream/output/session/frontend path; derive exact response-id and required-output-item semantics; compare stateful previous_response_id against stateless replay; select one fail-closed adapter lifecycle before edits. No subagents.",
+          "created_at": "2026-08-22T22:04:51.961067392Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgGwxfmdkSaZReVgKE9G1iYX7acissfINIB9ldnOa22HP2Jtkcrl/Np0ol3CtPJpJGzHayvrgLvpdHUIJl1bHBA=="
+        }
+      }
     },
     "87fc2730-649b-4fb1-99e7-81d8f4086603": {
       "uuid": "87fc2730-649b-4fb1-99e7-81d8f4086603",
@@ -33654,11 +33665,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1030,
       "timestamp": "2026-08-22T22:04:47.028631296Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1031,
+      "timestamp": "2026-08-22T22:04:51.963582350Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T22:04:47.028631296Z",
+    "timestamp": "2026-08-22T22:04:51.963582350Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1030
+    "agent_seq": 1031
   }
 }
