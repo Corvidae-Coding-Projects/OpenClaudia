@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1096,
+  "next_display_id": 1097,
   "next_comment_id": 1219,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -94,6 +94,7 @@
     "166e094c-3e88-497f-8e4f-b01198d17e05": 199,
     "16a92d59-e8a8-4424-8167-d1ea2944327d": 299,
     "16b1f441-c9ff-46f3-b2b5-06f378b9d5dd": 968,
+    "16fa45c1-dd3d-4adb-bbf2-53b5a945953f": 1096,
     "17222638-e7bf-4b07-b426-51fcec7b4c2c": 567,
     "1768346c-5e64-46c0-ada3-408ad86c5e70": 1074,
     "177ac089-6f45-46eb-a615-89d93e9a7a18": 662,
@@ -3267,6 +3268,18 @@
         "qa-review",
         "security"
       ]
+    },
+    "16fa45c1-dd3d-4adb-bbf2-53b5a945953f": {
+      "uuid": "16fa45c1-dd3d-4adb-bbf2-53b5a945953f",
+      "display_id": 1096,
+      "title": "S-064: Wire dynamic MCP tools through canonical policy and dispatch",
+      "description": "Implement docs/remediation-slices/064-mcp-dynamic-tool-dispatch-and-policy.md after completed S-010/S-013/S-016. Build a deterministic run-owned snapshot from connected, explicitly trusted, explicitly allowlisted MCP server/tool identities; preserve exact discovery schema and generation evidence while exposing only bounded sanitized definitions. Revalidate the last advertised catalogue lease, current server/tool identity, fail-closed config allowlist, JSON Schema 2020-12 input, run capability, hook, enterprise cap, exact permission permit, availability, and manager generation immediately before async tools/call. Route TUI/tool-loop calls through one canonical async executor and return lossless typed results for model follow-up; frontends without an owned callable loop must not claim callable MCP schemas and direct/stale/renamed/unlisted/plugin-derived calls must produce explicit unavailable/denied outcomes. Keep protocol-version migration, transport ownership, OAuth/elicitation, and plugin supply-chain work in S-065/S-066/S-067/S-062/S-063 unless compilation or this boundary requires a minimal adapter. Verify deterministic discovery-to-schema-to-dispatch-to-result tests, adversarial bypass tests, Rust/Cargo 1.98 native and Windows GNU gates, then monitor the pushed draft PR runner matrix to green.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T19:10:00.528199762Z",
+      "updated_at": "2026-08-22T19:10:00.528199762Z"
     },
     "17222638-e7bf-4b07-b426-51fcec7b4c2c": {
       "uuid": "17222638-e7bf-4b07-b426-51fcec7b4c2c",
@@ -33166,11 +33179,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 991,
       "timestamp": "2026-08-22T19:03:26.463898531Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 992,
+      "timestamp": "2026-08-22T19:10:00.528199762Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T19:03:26.463898531Z",
+    "timestamp": "2026-08-22T19:10:00.528199762Z",
     "agent_id": "6Vw9",
-    "agent_seq": 991
+    "agent_seq": 992
   }
 }
