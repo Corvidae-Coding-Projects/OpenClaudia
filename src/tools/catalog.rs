@@ -35,6 +35,8 @@ pub const MAX_SELECTION_SCHEMA_BYTES: usize = 16 * 1024;
 pub const MAX_CATALOG_TOOLS: usize = 512;
 /// Maximum aggregate bytes accepted from all catalog sources.
 pub const MAX_CATALOG_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum bytes in one canonical tool identity across every catalog source.
+pub(crate) const MAX_CANONICAL_TOOL_NAME_BYTES: usize = 192;
 const TASK_RELEVANT_LIMIT: usize = 6;
 const HISTORICAL_TOOL_LIMIT: usize = 6;
 const MAX_SCHEMA_DEPTH: usize = 64;
@@ -65,6 +67,21 @@ pub struct ToolCatalogSnapshot {
     pub catalog_tools: usize,
     /// Whether the bounded catalog fit and was therefore published whole.
     pub full_catalog_fallback: bool,
+}
+
+/// Exact host-side evidence retained for one call admitted from the latest
+/// published provider view. This never crosses the provider boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolCallAdmission {
+    pub source_digest: ContentDigest,
+    source: ToolSurface,
+}
+
+impl ToolCallAdmission {
+    #[must_use]
+    pub const fn is_mcp(&self) -> bool {
+        matches!(self.source, ToolSurface::Mcp)
+    }
 }
 
 impl ToolCatalogSnapshot {
@@ -316,7 +333,7 @@ impl RunToolCatalog {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = state.published.as_ref().map_or(Ok(()), |published| {
+        state.published.as_ref().map_or(Ok(()), |published| {
             if published.generation != state.generation {
                 Err(format!(
                     "Tool catalog generation {} is stale; current generation is {}",
@@ -330,9 +347,59 @@ impl RunToolCatalog {
                     state.generation
                 ))
             }
-        });
-        drop(state);
-        result
+        })
+    }
+
+    /// Admit a call and retain the exact source digest required by dynamic
+    /// dispatchers to reject renamed, replaced, or reconnected registrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stale/unadvertised errors as [`Self::admit_tool_call`].
+    pub(crate) fn admit_tool_call_with_receipt(
+        &self,
+        tool_name: &str,
+    ) -> Result<ToolCallAdmission, String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.published.as_ref().map_or_else(
+            || {
+                state.entries.get(tool_name).map_or_else(
+                    || Err(format!("Tool '{tool_name}' is not present in the host catalog")),
+                    |entry| {
+                        Ok(ToolCallAdmission {
+                            source_digest: entry.source_digest,
+                            source: entry.source,
+                        })
+                    },
+                )
+            },
+            |published| {
+                if published.generation != state.generation {
+                    Err(format!(
+                        "Tool catalog generation {} is stale; current generation is {}",
+                        published.generation, state.generation
+                    ))
+                } else if published.active_names.contains(tool_name) {
+                    let entry = state.entries.get(tool_name).ok_or_else(|| {
+                        format!(
+                            "Tool '{tool_name}' was published without a current catalog registration"
+                        )
+                    })?;
+                    Ok(ToolCallAdmission {
+                        source_digest: entry.source_digest,
+                        source: entry.source,
+                    })
+                } else {
+                    Err(format!(
+                        "Tool '{tool_name}' was not active in catalog generation {}; call tool_search and retry on the next provider request",
+                        state.generation
+                    ))
+                }
+            },
+        )
     }
 
     #[cfg(test)]
@@ -595,7 +662,7 @@ fn validate_definition(definition: &Value) -> Result<(&str, &str), String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "tool definition must contain a string function.name".to_string())?;
     if name.is_empty()
-        || name.len() > 192
+        || name.len() > MAX_CANONICAL_TOOL_NAME_BYTES
         || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
@@ -669,6 +736,12 @@ fn sanitize_mcp_definition(definition: &Value, name: &str) -> Result<Value, Stri
 }
 
 fn strip_untrusted_schema_annotations(schema: &mut Value) {
+    if let Some(children) = schema.as_array_mut() {
+        for child in children {
+            strip_untrusted_schema_annotations(child);
+        }
+        return;
+    }
     let Some(object) = schema.as_object_mut() else {
         return;
     };
@@ -694,9 +767,13 @@ fn strip_untrusted_schema_annotations(schema: &mut Value) {
     }
     for keyword in [
         "items",
+        "additionalItems",
         "contains",
         "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
         "propertyNames",
+        "contentSchema",
         "not",
         "if",
         "then",
@@ -713,7 +790,7 @@ fn strip_untrusted_schema_annotations(schema: &mut Value) {
             }
         }
     }
-    for keyword in ["$defs", "definitions", "dependentSchemas"] {
+    for keyword in ["$defs", "definitions", "dependentSchemas", "dependencies"] {
         if let Some(children) = object.get_mut(keyword).and_then(Value::as_object_mut) {
             for child in children.values_mut() {
                 strip_untrusted_schema_annotations(child);
@@ -1317,6 +1394,18 @@ mod tests {
     }
 
     #[test]
+    fn fresh_host_calls_retain_static_compatibility_but_dynamic_calls_need_a_receipt() {
+        let root = tempfile::tempdir().expect("catalog root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+
+        assert!(run.tool_catalog().admit_tool_call("write_file").is_ok());
+        assert!(run
+            .tool_catalog()
+            .admit_tool_call_with_receipt("mcp__remote__write")
+            .is_err());
+    }
+
+    #[test]
     fn publication_filters_tools_unavailable_to_the_run_capability() {
         let root = tempfile::tempdir().expect("catalog root");
         let run =
@@ -1612,6 +1701,20 @@ mod tests {
                             "default": "REMOTE_DEFAULT_INSTRUCTION",
                             "x-prompt": "REMOTE_VENDOR_INSTRUCTION"
                         }
+                    },
+                    "unevaluatedProperties": {
+                        "description": "REMOTE_UNEVALUATED_INSTRUCTION"
+                    },
+                    "contentSchema": {
+                        "description": "REMOTE_CONTENT_INSTRUCTION"
+                    },
+                    "items": [
+                        {"description": "REMOTE_LEGACY_ITEMS_INSTRUCTION"}
+                    ],
+                    "dependencies": {
+                        "description": {
+                            "description": "REMOTE_DEPENDENCY_INSTRUCTION"
+                        }
                     }
                 }
             }
@@ -1638,6 +1741,10 @@ mod tests {
         assert!(!encoded.contains("REMOTE_NESTED_INSTRUCTION"));
         assert!(!encoded.contains("REMOTE_DEFAULT_INSTRUCTION"));
         assert!(!encoded.contains("REMOTE_VENDOR_INSTRUCTION"));
+        assert!(!encoded.contains("REMOTE_UNEVALUATED_INSTRUCTION"));
+        assert!(!encoded.contains("REMOTE_CONTENT_INSTRUCTION"));
+        assert!(!encoded.contains("REMOTE_LEGACY_ITEMS_INSTRUCTION"));
+        assert!(!encoded.contains("REMOTE_DEPENDENCY_INSTRUCTION"));
         assert!(encoded.contains("untrusted reference metadata"));
         assert!(
             published

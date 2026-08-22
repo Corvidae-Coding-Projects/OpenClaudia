@@ -42,6 +42,8 @@ pub enum ToolResource {
     Secrets,
     /// Host-owned, workspace-bound technical-memory service.
     Memory,
+    /// Run-owned Model Context Protocol manager and its registered servers.
+    Mcp,
 }
 
 /// Typed fail-closed resource error.
@@ -779,6 +781,7 @@ impl ToolRunContext {
             ToolResource::Network => CapabilityKind::Network,
             ToolResource::Secrets => CapabilityKind::Secrets,
             ToolResource::Memory => CapabilityKind::Memory,
+            ToolResource::Mcp => CapabilityKind::Mcp,
         };
         self.runtime
             .descriptor()

@@ -40,6 +40,9 @@ pub use crate::keybindings::{
 };
 pub use memory::MemoryConfig;
 pub use path_validation::{validate_persist_path, PathValidationError, ALLOW_OUT_OF_ROOT_ENV};
+pub(crate) use permissions::{
+    valid_mcp_server_identity, valid_mcp_tool_identity, MAX_MCP_IDENTITY_COMPONENT_BYTES,
+};
 pub use permissions::{
     PermissionsConfig, ProjectPermissionProposal, PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION,
 };

@@ -6,8 +6,8 @@
   "reviewer_config_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "evaluation_generator_id": "s105-evaluation-runner",
   "tuning_corpus_digest": "sha256:6d7c88a1c602c59cc951cee19355bf6fe856aec9c380c74a0a87f4273d47dfcc",
-  "held_out_corpus_digest": "sha256:306cd701a7a015a25a4b68e5e074322a18a6095e706d0befcb81e7d1de08720a",
-  "evaluation_digest": "sha256:7ef6fad68500410590d9211a7cd854da22a5aa3fe534d5cdc30aa5397f975fbf",
+  "held_out_corpus_digest": "sha256:6471612b4ddd5c9e06134ee8ba4f740b8eb5dc187f87921004e800680db65592",
+  "evaluation_digest": "sha256:239db50819b322a8469166a671778dd487ec6d601ad4fb6f69c0090ce94ab673",
   "verdict": "rejected",
   "reviewed_dimensions": [],
   "limitations": [

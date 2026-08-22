@@ -41,12 +41,20 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_run_context(support::test_run_context)
+    }
+
+    fn new_with_host_toolchain() -> Self {
+        Self::new_with_run_context(support::host_toolchain_run_context)
+    }
+
+    fn new_with_run_context(build_run: fn(&std::path::Path) -> Arc<ToolRunContext>) -> Self {
         let host = tempfile::tempdir().expect("host home");
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
         let db = MemoryDb::open_for_workspace(host.path(), workspace.path())
             .expect("workspace-bound private memory");
-        let run = support::test_run_context(workspace.path());
+        let run = build_run(workspace.path());
         let config = learning_config(true);
         Self {
             _host: host,
@@ -472,7 +480,7 @@ fn sensitive_verification_arguments_are_redacted_from_durable_candidate() {
 
 #[test]
 fn canonical_executor_preserves_causal_binding_across_real_workspace_generations() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new_with_host_toolchain();
     let broken_source = "pub const VALUE: u8 = ;\n";
     let fixed_source = "pub const VALUE: u8 = 1;\n";
     let initial_write = execute(
@@ -552,9 +560,10 @@ fn canonical_executor_preserves_causal_binding_across_real_workspace_generations
         &json!({"command": command}),
     );
     assert!(
-        !passed_check.is_error(),
-        "fixed source did not compile: {}",
-        passed_check.content()
+        !passed_check.is_error() && !passed_check.is_partial(),
+        "fixed source did not compile successfully: outcome={:?}; content={}",
+        passed_check.outcome(),
+        passed_check.content(),
     );
     let success_capture = learning_capture(&passed_check);
     assert_eq!(success_capture["status"]["status"], "candidate_stored");

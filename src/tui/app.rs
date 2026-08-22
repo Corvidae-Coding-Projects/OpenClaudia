@@ -1077,7 +1077,14 @@ impl App {
             return;
         };
         let next_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::mcp::McpManager::new(std::sync::Arc::clone(run)),
+            crate::mcp::McpManager::new_with_permissions(
+                std::sync::Arc::clone(run),
+                self.app_config
+                    .as_ref()
+                    .map_or_else(crate::config::PermissionsConfig::default, |config| {
+                        config.permissions.clone()
+                    }),
+            ),
         ));
         let _ = crate::mcp::install_manager(run, &next_manager);
         let previous_manager = std::mem::replace(&mut runtime.manager, next_manager.clone());
@@ -3415,6 +3422,10 @@ impl App {
         let vdd_builder_auth = self.vdd_builder_auth.clone();
         let policy_enforcer = std::sync::Arc::clone(&self.policy_enforcer);
         let task_mgr = self.task_mgr.clone();
+        let mcp_manager = self
+            .mcp_runtime
+            .as_ref()
+            .map(|runtime| std::sync::Arc::clone(&runtime.manager));
         // Clone the canonical state snapshot so the async task can build
         // follow-up requests without holding the state lock across awaits.
         let session_messages = self.chat_session.messages_snapshot();
@@ -3440,6 +3451,7 @@ impl App {
             hook_engine,
             policy_enforcer,
             task_mgr,
+            mcp_manager,
             session_id: session_id_for_task,
             tx,
         }));
@@ -3786,6 +3798,7 @@ struct ApiTurnParams {
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
+    mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     session_id: String,
     tx: std::sync::mpsc::Sender<super::events::AppEvent>,
 }
@@ -3801,6 +3814,7 @@ struct InitialTurnRequest<'a> {
     effort_level: EffortLevel,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
+    mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
 }
 
@@ -3828,6 +3842,7 @@ struct AgenticCtx<'a> {
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
+    mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     session_id: &'a str,
     task_obs: Option<crate::ledger::ObsId>,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
@@ -4367,16 +4382,19 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
         ) {
             break;
         }
-        let body = match crate::pipeline::build_request_for_wire_for_run(
-            ctx.run_context,
-            ctx.wire_api,
-            ctx.provider,
-            ctx.model,
-            &request_messages,
-            ctx.effort_level,
-            ctx.claude_code_token,
-            ctx.prompt_blocks,
-        ) {
+        let body = match build_request_with_live_mcp(LiveMcpRequest {
+            run: ctx.run_context,
+            wire_api: ctx.wire_api,
+            provider: ctx.provider,
+            model: ctx.model,
+            messages: &request_messages,
+            effort_level: ctx.effort_level,
+            claude_code_token: ctx.claude_code_token,
+            prompt_blocks: ctx.prompt_blocks,
+            mcp_manager: ctx.mcp_manager,
+        })
+        .await
+        {
             Ok(body) => body,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to build agentic follow-up request");
@@ -4478,7 +4496,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
     }
 }
 
-fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInitialTurn> {
+async fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInitialTurn> {
     let task_obs = observe_turn_user_task(p.run_context, p.session_id, p.session_messages, p.model);
     let request_messages = match request_messages_with_grounding(
         p.run_context,
@@ -4506,16 +4524,19 @@ fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInit
     ) {
         return None;
     }
-    match crate::pipeline::build_request_for_wire_for_run(
-        p.run_context,
-        p.wire_api,
-        p.provider,
-        p.model,
-        &request_messages,
-        p.effort_level.as_str(),
-        p.claude_code_token,
-        p.prompt_blocks,
-    ) {
+    match build_request_with_live_mcp(LiveMcpRequest {
+        run: p.run_context,
+        wire_api: p.wire_api,
+        provider: p.provider,
+        model: p.model,
+        messages: &request_messages,
+        effort_level: p.effort_level.as_str(),
+        claude_code_token: p.claude_code_token,
+        prompt_blocks: p.prompt_blocks,
+        mcp_manager: p.mcp_manager,
+    })
+    .await
+    {
         Ok(request_body) => Some(PreparedInitialTurn {
             task_obs,
             request_body,
@@ -4531,105 +4552,143 @@ fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInit
     }
 }
 
+struct LiveMcpRequest<'a> {
+    run: &'a std::sync::Arc<crate::tools::ToolRunContext>,
+    wire_api: crate::pipeline::WireApi,
+    provider: &'a str,
+    model: &'a str,
+    messages: &'a [serde_json::Value],
+    effort_level: &'a str,
+    claude_code_token: Option<&'a crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
+    mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+}
+
+async fn build_request_with_live_mcp(
+    request: LiveMcpRequest<'_>,
+) -> Result<serde_json::Value, String> {
+    let definitions = if let Some(manager) = request.mcp_manager {
+        let manager = manager.read().await;
+        if !manager.matches_run(request.run) {
+            return Err("MCP manager belongs to a different run generation".to_string());
+        }
+        let snapshot = manager.tool_catalog_snapshot().await;
+        drop(manager);
+        tracing::debug!(
+            target: "openclaudia::mcp",
+            event = "mcp_tool_catalog_snapshot",
+            run_id = %request.run.run_id(),
+            capability_generation = %request.run.generation(),
+            mcp_catalog_generation = %snapshot.generation,
+            callable = snapshot.definitions.len(),
+            unavailable = snapshot.unavailable.len(),
+            "Built exact MCP dynamic tool snapshot"
+        );
+        for item in &snapshot.unavailable {
+            tracing::warn!(
+                target: "openclaudia::mcp",
+                server = %item.server,
+                tool = %item.tool,
+                reason = %item.reason,
+                "MCP tool is unavailable in this run generation"
+            );
+        }
+        snapshot.definitions
+    } else {
+        Vec::new()
+    };
+    crate::pipeline::build_request_for_wire_for_run_with_additional(
+        request.run,
+        request.wire_api,
+        request.provider,
+        request.model,
+        request.messages,
+        request.effort_level,
+        request.claude_code_token,
+        request.prompt_blocks,
+        &definitions,
+    )
+}
+
 /// Run a complete API turn: pre-turn hooks, first `run_turn`, and an agentic
 /// follow-up loop when tool calls are present.
-async fn run_api_turn_async(p: ApiTurnParams) {
-    let ApiTurnParams {
-        run_context,
-        mut session_messages,
-        client,
-        endpoint,
-        headers,
-        provider,
-        model,
-        effort_level,
-        wire_api,
-        claude_code_token,
-        prompt_blocks,
-        memory_db,
-        app_config,
-        permission_mgr,
-        vdd_engine,
-        vdd_builder_auth,
-        transient_allowed_tool_rules,
-        hook_engine,
-        policy_enforcer,
-        task_mgr,
-        session_id,
-        tx,
-    } = p;
-    if let Some(ref engine) = hook_engine {
-        if !run_preturn_hooks(&run_context, engine, &mut session_messages, &tx).await {
+async fn run_api_turn_async(mut p: ApiTurnParams) {
+    if let Some(ref engine) = p.hook_engine {
+        if !run_preturn_hooks(&p.run_context, engine, &mut p.session_messages, &p.tx).await {
             return;
         }
     }
     let Some(initial_turn) = build_initial_turn_request(&InitialTurnRequest {
-        run_context: &run_context,
-        session_id: &session_id,
-        session_messages: &session_messages,
-        policy_enforcer: &policy_enforcer,
-        model: &model,
-        wire_api,
-        provider: &provider,
-        effort_level,
-        claude_code_token: claude_code_token.as_ref(),
-        prompt_blocks: prompt_blocks.as_ref(),
-        tx: &tx,
-    }) else {
+        run_context: &p.run_context,
+        session_id: &p.session_id,
+        session_messages: &p.session_messages,
+        policy_enforcer: &p.policy_enforcer,
+        model: &p.model,
+        wire_api: p.wire_api,
+        provider: &p.provider,
+        effort_level: p.effort_level,
+        claude_code_token: p.claude_code_token.as_ref(),
+        prompt_blocks: p.prompt_blocks.as_ref(),
+        mcp_manager: p.mcp_manager.as_ref(),
+        tx: &p.tx,
+    })
+    .await
+    else {
         return;
     };
     match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
-        run_context: std::sync::Arc::clone(&run_context),
-        client: &client,
-        endpoint: &endpoint,
-        headers: &headers,
+        run_context: std::sync::Arc::clone(&p.run_context),
+        client: &p.client,
+        endpoint: &p.endpoint,
+        headers: &p.headers,
         request_body: &initial_turn.request_body,
-        provider: &provider,
-        model_identity: &model,
-        memory_db: memory_db.clone(),
-        app_config: app_config.clone(),
-        permission_mgr: permission_mgr.clone(),
-        transient_allowed_tool_rules: &transient_allowed_tool_rules,
-        hook_engine: hook_engine.clone(),
-        policy_enforcer: Some(std::sync::Arc::clone(&policy_enforcer)),
-        task_mgr: task_mgr.clone(),
-        session_id: Some(session_id.clone()),
-        tx: tx.clone(),
+        provider: &p.provider,
+        model_identity: &p.model,
+        memory_db: p.memory_db.clone(),
+        app_config: p.app_config.clone(),
+        permission_mgr: p.permission_mgr.clone(),
+        transient_allowed_tool_rules: &p.transient_allowed_tool_rules,
+        hook_engine: p.hook_engine.clone(),
+        policy_enforcer: Some(std::sync::Arc::clone(&p.policy_enforcer)),
+        task_mgr: p.task_mgr.clone(),
+        session_id: Some(p.session_id.clone()),
+        tx: p.tx.clone(),
     })
     .await
     {
         Ok(turn_result) => {
             handle_turn_result(
                 turn_result,
-                session_messages,
+                p.session_messages,
                 TurnContext {
-                    run_context: &run_context,
-                    client: &client,
-                    endpoint: &endpoint,
-                    headers: &headers,
-                    provider: &provider,
-                    model: &model,
-                    effort_level,
-                    wire_api,
-                    claude_code_token: claude_code_token.as_ref(),
-                    prompt_blocks: prompt_blocks.as_ref(),
-                    memory_db,
-                    app_config,
-                    permission_mgr,
-                    vdd_engine,
-                    vdd_builder_auth: &vdd_builder_auth,
-                    transient_allowed_tool_rules: &transient_allowed_tool_rules,
-                    hook_engine,
-                    policy_enforcer,
-                    task_mgr,
-                    session_id: &session_id,
+                    run_context: &p.run_context,
+                    client: &p.client,
+                    endpoint: &p.endpoint,
+                    headers: &p.headers,
+                    provider: &p.provider,
+                    model: &p.model,
+                    effort_level: p.effort_level,
+                    wire_api: p.wire_api,
+                    claude_code_token: p.claude_code_token.as_ref(),
+                    prompt_blocks: p.prompt_blocks.as_ref(),
+                    memory_db: p.memory_db,
+                    app_config: p.app_config,
+                    permission_mgr: p.permission_mgr,
+                    vdd_engine: p.vdd_engine,
+                    vdd_builder_auth: &p.vdd_builder_auth,
+                    transient_allowed_tool_rules: &p.transient_allowed_tool_rules,
+                    hook_engine: p.hook_engine,
+                    policy_enforcer: p.policy_enforcer,
+                    task_mgr: p.task_mgr,
+                    mcp_manager: p.mcp_manager,
+                    session_id: &p.session_id,
                     task_obs: initial_turn.task_obs,
-                    tx: &tx,
+                    tx: &p.tx,
                 },
             )
             .await;
         }
-        Err(e) => send_api_error(&tx, e, &session_id),
+        Err(e) => send_api_error(&p.tx, e, &p.session_id),
     }
 }
 
@@ -4656,6 +4715,7 @@ struct TurnContext<'a> {
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
+    mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     session_id: &'a str,
     task_obs: Option<crate::ledger::ObsId>,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
@@ -4668,7 +4728,7 @@ struct TurnContext<'a> {
 /// partial in-flight state is persisted instead of silently dropped.
 async fn handle_turn_result(
     turn_result: crate::pipeline::TurnResult,
-    mut session_messages: Vec<serde_json::Value>,
+    session_messages: Vec<serde_json::Value>,
     ctx: TurnContext<'_>,
 ) {
     tracing::debug!(
@@ -4678,97 +4738,112 @@ async fn handle_turn_result(
         "Turn result"
     );
     if turn_result.needs_followup {
-        let asst = crate::pipeline::build_assistant_message_with_tools(
-            &turn_result.content,
-            turn_result.reasoning_content.as_deref(),
-            &turn_result.tool_calls,
-            ctx.provider,
-        );
-        session_messages.push(asst);
-        session_messages.extend(turn_result.tool_results.iter().cloned());
-        tracing::info!(
-            tool_count = turn_result.tool_calls.len(),
-            result_count = turn_result.tool_results.len(),
-            "Starting agentic follow-up loop"
-        );
-        let agentic = AgenticCtx {
-            run_context: ctx.run_context,
-            client: ctx.client,
-            endpoint: ctx.endpoint,
-            headers: ctx.headers,
-            provider: ctx.provider,
-            model: ctx.model,
-            effort_level: ctx.effort_level.as_str(),
-            wire_api: ctx.wire_api,
-            claude_code_token: ctx.claude_code_token,
-            prompt_blocks: ctx.prompt_blocks,
-            memory_db: ctx.memory_db.clone(),
-            app_config: ctx.app_config.clone(),
-            permission_mgr: ctx.permission_mgr.clone(),
-            transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
-            hook_engine: ctx.hook_engine.clone(),
-            policy_enforcer: std::sync::Arc::clone(&ctx.policy_enforcer),
-            task_mgr: ctx.task_mgr.clone(),
-            session_id: ctx.session_id,
-            task_obs: ctx.task_obs,
-            tx: ctx.tx,
-        };
-        run_agentic_loop(&agentic, &mut session_messages).await;
-        if let Some(content) =
-            latest_assistant_message_content(&session_messages).map(str::to_string)
-        {
-            run_tui_vdd_review(&ctx, &content, &mut session_messages).await;
-        }
-        send_or_warn(
-            ctx.tx,
-            super::events::AppEvent::SyncMessages(session_messages),
-            ctx.session_id,
-        );
-        send_or_warn(
-            ctx.tx,
-            super::events::AppEvent::ResponseDone,
-            ctx.session_id,
-        );
+        handle_followup_turn(turn_result, session_messages, &ctx).await;
     } else if !turn_result.content.is_empty() {
-        let rendered_content = match render_final_response_for_history(
-            ctx.run_context,
-            ctx.session_id,
-            &turn_result.content,
-            ctx.model,
-        ) {
-            Ok(rendered) => rendered,
-            Err(reason) => {
-                send_or_warn(
-                    ctx.tx,
-                    super::events::AppEvent::ApiError(
-                        format!("Final answer failed grounding gate: {reason}").into(),
-                    ),
-                    ctx.session_id,
-                );
-                send_or_warn(
-                    ctx.tx,
-                    super::events::AppEvent::ResponseDone,
-                    ctx.session_id,
-                );
-                return;
-            }
-        };
-        let mut message = serde_json::json!({ "role": "assistant", "content": rendered_content });
-        if let Some(reasoning) = turn_result
-            .reasoning_content
-            .as_deref()
-            .filter(|text| !text.is_empty())
-        {
-            message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
-        }
-        session_messages.push(message);
-        run_tui_vdd_review(&ctx, &rendered_content, &mut session_messages).await;
-        send_or_warn(
-            ctx.tx,
-            super::events::AppEvent::SyncMessages(session_messages),
-            ctx.session_id,
-        );
+        handle_direct_turn(turn_result, session_messages, &ctx).await;
     }
+}
+
+async fn handle_followup_turn(
+    turn_result: crate::pipeline::TurnResult,
+    mut session_messages: Vec<serde_json::Value>,
+    ctx: &TurnContext<'_>,
+) {
+    let assistant = crate::pipeline::build_assistant_message_with_tools(
+        &turn_result.content,
+        turn_result.reasoning_content.as_deref(),
+        &turn_result.tool_calls,
+        ctx.provider,
+    );
+    session_messages.push(assistant);
+    session_messages.extend(turn_result.tool_results.iter().cloned());
+    tracing::info!(
+        tool_count = turn_result.tool_calls.len(),
+        result_count = turn_result.tool_results.len(),
+        "Starting agentic follow-up loop"
+    );
+    let agentic = AgenticCtx {
+        run_context: ctx.run_context,
+        client: ctx.client,
+        endpoint: ctx.endpoint,
+        headers: ctx.headers,
+        provider: ctx.provider,
+        model: ctx.model,
+        effort_level: ctx.effort_level.as_str(),
+        wire_api: ctx.wire_api,
+        claude_code_token: ctx.claude_code_token,
+        prompt_blocks: ctx.prompt_blocks,
+        memory_db: ctx.memory_db.clone(),
+        app_config: ctx.app_config.clone(),
+        permission_mgr: ctx.permission_mgr.clone(),
+        transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
+        hook_engine: ctx.hook_engine.clone(),
+        policy_enforcer: std::sync::Arc::clone(&ctx.policy_enforcer),
+        task_mgr: ctx.task_mgr.clone(),
+        mcp_manager: ctx.mcp_manager.as_ref(),
+        session_id: ctx.session_id,
+        task_obs: ctx.task_obs,
+        tx: ctx.tx,
+    };
+    run_agentic_loop(&agentic, &mut session_messages).await;
+    if let Some(content) = latest_assistant_message_content(&session_messages).map(str::to_string) {
+        run_tui_vdd_review(ctx, &content, &mut session_messages).await;
+    }
+    send_or_warn(
+        ctx.tx,
+        super::events::AppEvent::SyncMessages(session_messages),
+        ctx.session_id,
+    );
+    send_or_warn(
+        ctx.tx,
+        super::events::AppEvent::ResponseDone,
+        ctx.session_id,
+    );
+}
+
+async fn handle_direct_turn(
+    turn_result: crate::pipeline::TurnResult,
+    mut session_messages: Vec<serde_json::Value>,
+    ctx: &TurnContext<'_>,
+) {
+    let rendered_content = match render_final_response_for_history(
+        ctx.run_context,
+        ctx.session_id,
+        &turn_result.content,
+        ctx.model,
+    ) {
+        Ok(rendered) => rendered,
+        Err(reason) => {
+            send_or_warn(
+                ctx.tx,
+                super::events::AppEvent::ApiError(
+                    format!("Final answer failed grounding gate: {reason}").into(),
+                ),
+                ctx.session_id,
+            );
+            send_or_warn(
+                ctx.tx,
+                super::events::AppEvent::ResponseDone,
+                ctx.session_id,
+            );
+            return;
+        }
+    };
+    let mut message = serde_json::json!({ "role": "assistant", "content": rendered_content });
+    if let Some(reasoning) = turn_result
+        .reasoning_content
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
+    }
+    session_messages.push(message);
+    run_tui_vdd_review(ctx, &rendered_content, &mut session_messages).await;
+    send_or_warn(
+        ctx.tx,
+        super::events::AppEvent::SyncMessages(session_messages),
+        ctx.session_id,
+    );
 }
 
 async fn run_tui_vdd_review(
@@ -5524,6 +5599,7 @@ mod tests {
                 app_config: None,
                 permission_mgr: None,
                 vdd_engine: None,
+                mcp_manager: None,
                 vdd_builder_auth: &crate::vdd::VddProviderAuth::None,
                 transient_allowed_tool_rules: &[],
                 hook_engine: None,
@@ -5585,6 +5661,7 @@ mod tests {
                 app_config: None,
                 permission_mgr: None,
                 vdd_engine: None,
+                mcp_manager: None,
                 vdd_builder_auth: &crate::vdd::VddProviderAuth::None,
                 transient_allowed_tool_rules: &[],
                 hook_engine: None,

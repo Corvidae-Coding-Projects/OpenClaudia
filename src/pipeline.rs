@@ -723,7 +723,41 @@ pub fn build_request_for_wire_for_run(
     claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
-    let snapshot = tools::get_progressive_tool_definitions(run, messages, true)?;
+    build_request_for_wire_for_run_with_additional(
+        run,
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &[],
+    )
+}
+
+/// Build a run-owned provider request with already-validated dynamic
+/// definitions. The progressive catalog retains source digests and strips
+/// host-only registration metadata before provider conversion.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication or provider request conversion
+/// rejects a malformed, stale, unavailable, or oversized definition set.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run_with_additional(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    additional: &[Value],
+) -> Result<Value, String> {
+    let snapshot =
+        tools::get_progressive_tool_definitions_with_additional(run, messages, true, additional)?;
     build_request_for_wire_with_tools(
         wire_api,
         provider,
@@ -2555,8 +2589,12 @@ struct SingleToolExecution<'a> {
     tx: &'a mpsc::Sender<AppEvent>,
 }
 
-/// Execute one tool call on a blocking thread, fire `PostToolUse` hooks, and
-/// return the canonical typed result for provider projection.
+const fn tool_result_completed_successfully(result: &tools::ToolResult) -> bool {
+    !result.is_error() && !result.is_partial()
+}
+
+/// Execute one tool call through its canonical sync or async dispatcher, fire
+/// the matching post-tool hook, and retain the typed provider result.
 /// Returns `None` when the event channel is broken (caller should `break`).
 async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolResult> {
     let SingleToolExecution {
@@ -2573,57 +2611,70 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
     } = p;
     let tool_name = &tool_call.function.name;
     let perm_mgr = permission.mgr;
-    let tool_call_clone = tool_call.clone();
-    let panic_tool_call = tool_call.clone();
-    let mem_db = memory_db;
-    let app_config_for_blocking = app_config;
-    let authorization_for_blocking = permission.authorization;
-    let session_for_blocking = session_id.map(str::to_string);
-    let policy_for_blocking = policy_enforcer;
-    let task_mgr_for_blocking = task_mgr;
-    let run_context_for_blocking = Arc::clone(&run_context);
-    let uses_task_graph = tools::uses_canonical_task_graph(tool_name);
-    let result = tokio::task::spawn_blocking(move || {
-        let execute = |task_mgr: Option<&mut crate::session::TaskManager>| {
-            crate::services::tool_executor::ToolExecutor::execute(
-                crate::services::tool_executor::ToolExecutorRequest {
-                    run_context: &run_context_for_blocking,
-                    tool_call: &tool_call_clone,
-                    memory_db: mem_db.as_deref(),
-                    app_config: app_config_for_blocking.as_deref(),
-                    task_mgr,
-                    permission_mgr: perm_mgr.as_ref(),
-                    authorization: authorization_for_blocking,
-                    session_id: session_for_blocking.as_deref(),
-                    policy_enforcer: policy_for_blocking.as_deref(),
-                },
-            )
-        };
-        if uses_task_graph {
-            // The lock is acquired on the blocking worker only for handlers
-            // that consume task state. Unrelated file/process/network tools
-            // remain independent of planning persistence.
-            let mut task_guard = task_mgr_for_blocking
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            execute(Some(&mut task_guard))
-        } else {
-            execute(None)
-        }
-    })
-    .await
-    .unwrap_or_else(|e| {
-        tools::ToolResult::failure(
-            &panic_tool_call,
-            tools::ToolFailureCode::Internal,
-            format!("Tool execution panicked: {e}"),
-            tools::ToolRetryability::Never,
+    let result = if tool_name.starts_with("mcp__") {
+        crate::services::tool_executor::ToolExecutor::execute_mcp(
+            crate::services::tool_executor::ToolExecutorRequest {
+                run_context: &run_context,
+                tool_call,
+                memory_db: memory_db.as_deref(),
+                app_config: app_config.as_deref(),
+                task_mgr: None,
+                permission_mgr: perm_mgr.as_ref(),
+                authorization: permission.authorization,
+                session_id,
+                policy_enforcer: policy_enforcer.as_deref(),
+            },
         )
-    });
+        .await
+    } else {
+        let tool_call_clone = tool_call.clone();
+        let panic_tool_call = tool_call.clone();
+        let session_for_blocking = session_id.map(str::to_string);
+        let run_context_for_blocking = Arc::clone(&run_context);
+        let uses_task_graph = tools::uses_canonical_task_graph(tool_name);
+        tokio::task::spawn_blocking(move || {
+            let execute = |task_mgr: Option<&mut crate::session::TaskManager>| {
+                crate::services::tool_executor::ToolExecutor::execute(
+                    crate::services::tool_executor::ToolExecutorRequest {
+                        run_context: &run_context_for_blocking,
+                        tool_call: &tool_call_clone,
+                        memory_db: memory_db.as_deref(),
+                        app_config: app_config.as_deref(),
+                        task_mgr,
+                        permission_mgr: perm_mgr.as_ref(),
+                        authorization: permission.authorization,
+                        session_id: session_for_blocking.as_deref(),
+                        policy_enforcer: policy_enforcer.as_deref(),
+                    },
+                )
+            };
+            if uses_task_graph {
+                // The lock is acquired on the blocking worker only for handlers
+                // that consume task state. Unrelated file/process/network tools
+                // remain independent of planning persistence.
+                let mut task_guard = task_mgr
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                execute(Some(&mut task_guard))
+            } else {
+                execute(None)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tools::ToolResult::failure(
+                &panic_tool_call,
+                tools::ToolFailureCode::Internal,
+                format!("Tool execution panicked: {e}"),
+                tools::ToolRetryability::Never,
+            )
+        })
+    };
+    let completed_successfully = tool_result_completed_successfully(&result);
     if tx
         .send(AppEvent::ToolDone {
             name: tool_name.clone(),
-            success: !result.is_error(),
+            success: completed_successfully,
             content: result.content().to_string(),
         })
         .is_err()
@@ -2634,7 +2685,7 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
         crate::services::tool_executor::ToolExecutor::fire_post_tool(
             &run_context,
             engine,
-            !result.is_error(),
+            completed_successfully,
             tool_name,
             tool_input,
             result.content(),
@@ -3193,6 +3244,36 @@ mod tests {
 
     fn test_run() -> Arc<tools::ToolRunContext> {
         Arc::clone(tools::security::test_run_context())
+    }
+
+    #[test]
+    fn partial_tool_outcomes_are_not_reported_as_successful_completion() {
+        let call = tools::ToolCall {
+            id: "partial-hook-fixture".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "mcp__fixture__remote".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let failure = tools::ToolFailure::new(
+            tools::ToolFailureCode::External,
+            "remote outcome unknown".to_string(),
+            tools::ToolRetryability::Unknown,
+        );
+        let partial = tools::ToolResult::bind(
+            &call,
+            "mcp__fixture__remote",
+            tools::ToolHandlerResult::partial_text("uncertain", vec![failure]),
+        );
+        let success = tools::ToolResult::bind(
+            &call,
+            "mcp__fixture__remote",
+            tools::ToolHandlerResult::success_text("done"),
+        );
+
+        assert!(!tool_result_completed_successfully(&partial));
+        assert!(tool_result_completed_successfully(&success));
     }
 
     fn typed_test_blocks(prefix: &str, suffix: &str) -> crate::prompt::SystemPromptBlocks {

@@ -177,7 +177,7 @@
         "observation": "Doctor diagnostics must not acquire a migration lock or repair persistent state.",
         "guidance": "Keep health inspection read-only and separate from the migration runner.",
         "applicability": {"paths": ["src/main.rs"], "components": ["doctor"], "tags": ["doctor", "lock", "migration"]},
-        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s013", "digest": "sha256:ef26e86a7b14e771e3444313850d10094040ae0f0c170c1708fd8076c8edcf0d"}],
+        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s064", "digest": "sha256:ae0fe24999ad3ca165fa2acd41935adcfeab89aa32b20955af9299b23aa6ef1e"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}

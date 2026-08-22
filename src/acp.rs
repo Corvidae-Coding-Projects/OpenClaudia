@@ -2257,16 +2257,9 @@ impl AcpServer {
             name if crate::tools::registry::registry().get(name).is_some() => Ok(
                 self.execute_local_tool(run, session_id, tool_call_id, tool_name, arguments_json)
             ),
-            name if name.starts_with("mcp__") => {
-                // MCP tools run locally through the MCP manager
-                Ok(self.execute_local_tool(
-                    run,
-                    session_id,
-                    tool_call_id,
-                    tool_name,
-                    arguments_json,
-                ))
-            }
+            name if name.starts_with("mcp__") => Ok(self
+                .execute_mcp_tool(run, session_id, tool_call_id, tool_name, arguments_json)
+                .await),
             _ => Err(ToolFailure::new(
                 ToolFailureCode::Unavailable,
                 format!("Unknown tool: {tool_name}"),
@@ -2303,6 +2296,32 @@ impl AcpServer {
             app_config: Some(&self.config),
             task_managers: Arc::clone(&self.task_managers),
         })
+    }
+
+    async fn execute_mcp_tool(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> ToolResult {
+        let tool_call = acp_tool_call(tool_call_id, tool_name, arguments_json);
+        let permission_mgr = self.permission_manager_for_run(run);
+        crate::services::tool_executor::ToolExecutor::execute_mcp(
+            crate::services::tool_executor::ToolExecutorRequest {
+                run_context: run,
+                tool_call: &tool_call,
+                memory_db: Some(self.memory_db.as_ref()),
+                app_config: Some(&self.config),
+                task_mgr: None,
+                permission_mgr: &permission_mgr,
+                authorization: None,
+                session_id: Some(session_id),
+                policy_enforcer: Some(self.policy_enforcer.as_ref()),
+            },
+        )
+        .await
     }
 
     /// Execute a synchronous local tool on Tokio's blocking pool so a

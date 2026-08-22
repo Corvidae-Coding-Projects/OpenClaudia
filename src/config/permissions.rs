@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -6,7 +6,27 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// Serialized fingerprint generation for inert repository permission proposals.
-pub const PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION: u16 = 1;
+pub const PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION: u16 = 2;
+pub const MAX_MCP_IDENTITY_COMPONENT_BYTES: usize = 128;
+const MAX_CONFIGURED_MCP_SERVERS: usize = 128;
+const MAX_CONFIGURED_MCP_TOOLS: usize = 512;
+
+pub fn valid_mcp_server_identity(value: &str) -> bool {
+    valid_mcp_identity_component(value, false)
+}
+
+pub fn valid_mcp_tool_identity(value: &str) -> bool {
+    valid_mcp_identity_component(value, true)
+}
+
+fn valid_mcp_identity_component(value: &str, allow_double_separator: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_MCP_IDENTITY_COMPONENT_BYTES
+        && (allow_double_separator || !value.contains("__"))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
 
 /// Grant-like permission values discovered in repository configuration.
 ///
@@ -21,6 +41,7 @@ pub struct ProjectPermissionProposal {
     pub proposal_digest: String,
     pub requests_prompt_bypass: bool,
     pub default_allow: Vec<String>,
+    pub mcp_tools: BTreeMap<String, Vec<String>>,
     pub web_fetch_preapproved_domains: Vec<String>,
 }
 
@@ -31,23 +52,25 @@ struct ProjectPermissionProposalFingerprint<'a> {
     source_digest: &'a str,
     requests_prompt_bypass: bool,
     default_allow: &'a [String],
+    mcp_tools: &'a BTreeMap<String, Vec<String>>,
     web_fetch_preapproved_domains: &'a [String],
 }
 
 struct ProjectPermissionRequests {
     enabled: Option<bool>,
     default_allow: Option<Vec<String>>,
+    mcp: Option<BTreeMap<String, Vec<String>>>,
     web_fetch_preapproved_domains: Option<Vec<String>>,
 }
 
 impl ProjectPermissionRequests {
     fn take(root: &mut serde_yaml::Mapping) -> Result<Self, String> {
         let permissions_key = serde_yaml::Value::String("permissions".to_string());
-        let (nested_enabled, nested_default_allow) = root
+        let (nested_enabled, nested_default_allow, nested_mcp) = root
             .get_mut(&permissions_key)
             .and_then(serde_yaml::Value::as_mapping_mut)
             .map_or_else(
-                || Ok::<_, String>((None, None)),
+                || Ok::<_, String>((None, None, None)),
                 |permissions| {
                     Ok((
                         take_typed::<bool>(permissions, "enabled", "permissions.enabled")?,
@@ -55,6 +78,11 @@ impl ProjectPermissionRequests {
                             permissions,
                             "default_allow",
                             "permissions.default_allow",
+                        )?,
+                        take_typed::<BTreeMap<String, Vec<String>>>(
+                            permissions,
+                            "mcp",
+                            "permissions.mcp",
                         )?,
                     ))
                 },
@@ -73,6 +101,12 @@ impl ProjectPermissionRequests {
             dotted_default_allow,
             "permissions.default_allow",
         )?;
+        let dotted_mcp = take_typed::<BTreeMap<String, Vec<String>>>(
+            root,
+            "permissions.mcp",
+            "permissions.mcp",
+        )?;
+        let mcp = merge_project_value(nested_mcp, dotted_mcp, "permissions.mcp")?;
 
         let nested_web = root
             .get_mut(serde_yaml::Value::String("web_fetch".to_string()))
@@ -95,6 +129,7 @@ impl ProjectPermissionRequests {
         Ok(Self {
             enabled,
             default_allow,
+            mcp,
             web_fetch_preapproved_domains,
         })
     }
@@ -116,6 +151,18 @@ impl ProjectPermissionRequests {
                 serde_yaml::Value::Sequence(Vec::new()),
             )?;
         }
+        if let Some(mcp) = &self.mcp {
+            let denials = mcp
+                .iter()
+                .filter(|(_, tools)| tools.is_empty())
+                .map(|(server, tools)| (server.clone(), tools.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if !denials.is_empty() {
+                let value = serde_yaml::to_value(denials)
+                    .map_err(|error| format!("failed to normalize permissions.mcp: {error}"))?;
+                insert_nested_value(root, "permissions", "mcp", value)?;
+            }
+        }
         if matches!(self.web_fetch_preapproved_domains.as_ref(), Some(values) if values.is_empty())
         {
             insert_nested_value(
@@ -128,12 +175,24 @@ impl ProjectPermissionRequests {
         Ok(())
     }
 
-    fn into_grants(self) -> (bool, Vec<String>, Vec<String>) {
+    fn into_grants(
+        self,
+    ) -> (
+        bool,
+        Vec<String>,
+        BTreeMap<String, Vec<String>>,
+        Vec<String>,
+    ) {
         (
             self.enabled == Some(false),
             self.default_allow
                 .filter(|values| !values.is_empty())
                 .unwrap_or_default(),
+            self.mcp
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, tools)| !tools.is_empty())
+                .collect(),
             self.web_fetch_preapproved_domains
                 .filter(|values| !values.is_empty())
                 .unwrap_or_default(),
@@ -189,12 +248,11 @@ pub struct PermissionsConfig {
     ///
     /// Maps **server name** (the key under `mcp.servers` in
     /// `config.yaml`) to the list of tool names exposed by that
-    /// server that the leader is allowed to invoke. A server absent
-    /// from the map is **not restricted** — every tool it exposes is
-    /// admissible; that matches the historical posture before #619
-    /// where MCP tools went through the generic permission pipeline
-    /// only. To restrict a server to a specific subset, list it here
-    /// with the explicit tools.
+    /// server that the agent is allowed to invoke. A server absent
+    /// from the map is denied. This explicit, fail-closed registration is
+    /// separate from the generic permission prompt: connecting a server or
+    /// approving a destructive call does not authorize an unlisted dynamic
+    /// capability to become model-visible.
     ///
     /// An entry with an **empty** tool vector denies every tool on
     /// that server — use this when you want to block a server entirely
@@ -233,9 +291,10 @@ impl Default for PermissionsConfig {
 /// Remove grant-like permission values from one repository YAML document and
 /// return a digest-bound inert proposal for diagnostics.
 ///
-/// Restrictive MCP allowlists remain in the project document because adding a
-/// project entry can only narrow that server's visible tools. Prompt bypass,
-/// default allows, and web-fetch preapprovals are removed before source merge.
+/// Empty repository MCP lists remain as monotonic server denials. Nonempty MCP
+/// lists are grant-like under the fail-closed registration model, so they join
+/// prompt bypass, default allows, and web-fetch preapprovals in the inert
+/// proposal removed before source merge.
 pub(super) fn take_project_permission_proposal(
     document: &mut serde_yaml::Value,
     source: &Path,
@@ -250,10 +309,11 @@ pub(super) fn take_project_permission_proposal(
     // consistently; write the monotonic forms back in a single nested shape.
     let requests = ProjectPermissionRequests::take(root)?;
     requests.restore_restrictions(root)?;
-    let (requests_prompt_bypass, default_allow, web_fetch_preapproved_domains) =
+    let (requests_prompt_bypass, default_allow, mcp_tools, web_fetch_preapproved_domains) =
         requests.into_grants();
     if !requests_prompt_bypass
         && default_allow.is_empty()
+        && mcp_tools.is_empty()
         && web_fetch_preapproved_domains.is_empty()
     {
         return Ok(None);
@@ -267,6 +327,7 @@ pub(super) fn take_project_permission_proposal(
         source_digest: &source_digest,
         requests_prompt_bypass,
         default_allow: &default_allow,
+        mcp_tools: &mcp_tools,
         web_fetch_preapproved_domains: &web_fetch_preapproved_domains,
     };
     let fingerprint_bytes = serde_json::to_vec(&fingerprint)
@@ -282,6 +343,8 @@ pub(super) fn take_project_permission_proposal(
         proposal_digest,
         requests_prompt_bypass,
         default_allow_count = default_allow.len(),
+        mcp_server_grant_count = mcp_tools.len(),
+        mcp_tool_grant_count = mcp_tools.values().map(Vec::len).sum::<usize>(),
         web_fetch_preapproval_count = web_fetch_preapproved_domains.len(),
         "Repository permission grants are inert; approve exact tool calls or configure trusted host state"
     );
@@ -293,6 +356,7 @@ pub(super) fn take_project_permission_proposal(
         proposal_digest,
         requests_prompt_bypass,
         default_allow,
+        mcp_tools,
         web_fetch_preapproved_domains,
     }))
 }
@@ -406,8 +470,50 @@ impl PermissionsConfig {
             tracing::warn!(
                 count = self.default_allow.len(),
                 "permissions.default_allow has entries but permissions.enabled=false; \
-                 entries will be ignored. Set enabled=true to honour them."
+                entries will be ignored. Set enabled=true to honour them."
             );
+        }
+        if self.mcp.len() > MAX_CONFIGURED_MCP_SERVERS {
+            return Err(format!(
+                "permissions.mcp configures {} servers; ceiling is {MAX_CONFIGURED_MCP_SERVERS}",
+                self.mcp.len()
+            ));
+        }
+        let mut configured_tools = 0usize;
+        for (server, tools) in &self.mcp {
+            if !valid_mcp_server_identity(server) {
+                return Err(format!(
+                    "permissions.mcp server '{server}' must be 1..={MAX_MCP_IDENTITY_COMPONENT_BYTES} ASCII identifier bytes and cannot contain '__'"
+                ));
+            }
+            configured_tools = configured_tools
+                .checked_add(tools.len())
+                .ok_or_else(|| "permissions.mcp configured tool count overflowed".to_string())?;
+            if configured_tools > MAX_CONFIGURED_MCP_TOOLS {
+                return Err(format!(
+                    "permissions.mcp configures {configured_tools} tools; ceiling is {MAX_CONFIGURED_MCP_TOOLS}"
+                ));
+            }
+            let mut unique = HashSet::with_capacity(tools.len());
+            for tool in tools {
+                if !valid_mcp_tool_identity(tool) {
+                    return Err(format!(
+                        "permissions.mcp.{server} tool '{tool}' must be 1..={MAX_MCP_IDENTITY_COMPONENT_BYTES} ASCII identifier bytes"
+                    ));
+                }
+                let full_name = format!("mcp__{server}__{tool}");
+                if full_name.len() > crate::tools::catalog::MAX_CANONICAL_TOOL_NAME_BYTES {
+                    return Err(format!(
+                        "permissions.mcp identity '{server}/{tool}' exceeds the {}-byte canonical tool-name ceiling",
+                        crate::tools::catalog::MAX_CANONICAL_TOOL_NAME_BYTES
+                    ));
+                }
+                if !unique.insert(tool) {
+                    return Err(format!(
+                        "permissions.mcp.{server} contains duplicate tool identity '{tool}'"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -417,8 +523,8 @@ impl PermissionsConfig {
     ///
     /// Semantics:
     ///
-    /// * Server **absent from the map** → `true` (unrestricted; the
-    ///   generic permission pipeline still applies).
+    /// * Server **absent from the map** → `false` (unconfigured dynamic
+    ///   capabilities fail closed).
     /// * Server present with **empty** tool list → `false` for every
     ///   tool (server is blocked).
     /// * Server present with a non-empty tool list → `true` iff
@@ -432,7 +538,7 @@ impl PermissionsConfig {
     pub fn mcp_tool_allowed(&self, server: &str, tool: &str) -> bool {
         self.mcp
             .get(server)
-            .is_none_or(|allowed| allowed.iter().any(|t| t == tool))
+            .is_some_and(|allowed| allowed.iter().any(|t| t == tool))
     }
 }
 
@@ -473,6 +579,8 @@ permissions:
   default_allow: ["Bash(*)"]
   mcp:
     blocked: []
+    requested:
+      - invoke
 web_fetch:
   preapproved_domains: ["attacker.example"]
   distillation_enabled: true
@@ -489,6 +597,7 @@ web_fetch:
         );
         assert!(proposal.requests_prompt_bypass);
         assert_eq!(proposal.default_allow, ["Bash(*)"]);
+        assert_eq!(proposal.mcp_tools["requested"], ["invoke"]);
         assert_eq!(proposal.web_fetch_preapproved_domains, ["attacker.example"]);
         assert!(proposal.source_digest.starts_with("sha256:"));
         assert!(proposal.proposal_digest.starts_with("sha256:"));
@@ -498,6 +607,7 @@ web_fetch:
         assert!(!normalized.contains("default_allow"));
         assert!(!normalized.contains("preapproved_domains"));
         assert!(normalized.contains("blocked: []"));
+        assert!(!normalized.contains("requested"));
         assert!(normalized.contains("distillation_enabled: true"));
     }
 
@@ -555,6 +665,8 @@ web_fetch:
         let bytes = br#"
 "permissions.enabled": false
 "permissions.default_allow": ["Bash(git push)"]
+"permissions.mcp":
+  remote: ["invoke"]
 "web_fetch.preapproved_domains": ["attacker.example"]
 "#;
         let mut document = serde_yaml::from_slice(bytes).expect("fixture YAML");
@@ -567,10 +679,12 @@ web_fetch:
         .expect("dotted grants produce proposal");
         assert!(proposal.requests_prompt_bypass);
         assert_eq!(proposal.default_allow, ["Bash(git push)"]);
+        assert_eq!(proposal.mcp_tools["remote"], ["invoke"]);
         assert_eq!(proposal.web_fetch_preapproved_domains, ["attacker.example"]);
         let normalized = serde_yaml::to_string(&document).expect("normalized YAML");
         assert!(!normalized.contains("permissions.enabled"));
         assert!(!normalized.contains("permissions.default_allow"));
+        assert!(!normalized.contains("permissions.mcp"));
         assert!(!normalized.contains("web_fetch.preapproved_domains"));
     }
 
@@ -646,12 +760,10 @@ web_fetch:
     // ── Crosslink #619: per-server MCP permissions ──────────────────────
 
     #[test]
-    fn mcp_unrestricted_when_server_absent() {
+    fn mcp_denies_when_server_absent() {
         let cfg = PermissionsConfig::default();
-        // No `mcp` entries → every server/tool is unrestricted at
-        // this layer.
-        assert!(cfg.mcp_tool_allowed("github", "create_issue"));
-        assert!(cfg.mcp_tool_allowed("anything", "anything"));
+        assert!(!cfg.mcp_tool_allowed("github", "create_issue"));
+        assert!(!cfg.mcp_tool_allowed("anything", "anything"));
     }
 
     #[test]
@@ -672,8 +784,7 @@ web_fetch:
         assert!(!cfg.mcp_tool_allowed("github", "delete_file"));
         // Case-sensitive: capitalisation differences must not match.
         assert!(!cfg.mcp_tool_allowed("github", "Read_File"));
-        // Unmentioned server is still wide-open.
-        assert!(cfg.mcp_tool_allowed("railway", "deploy"));
+        assert!(!cfg.mcp_tool_allowed("railway", "deploy"));
     }
 
     #[test]
@@ -691,6 +802,25 @@ web_fetch:
     }
 
     #[test]
+    fn mcp_allowlist_validation_rejects_ambiguous_duplicate_and_oversized_identities() {
+        let mut cfg = PermissionsConfig::default();
+        cfg.mcp
+            .insert("bad__server".to_string(), vec!["invoke".to_string()]);
+        assert!(cfg.validate().is_err());
+
+        cfg.mcp.clear();
+        cfg.mcp.insert(
+            "server".to_string(),
+            vec!["invoke".to_string(), "invoke".to_string()],
+        );
+        assert!(cfg.validate().is_err());
+
+        cfg.mcp.clear();
+        cfg.mcp.insert("s".repeat(100), vec!["t".repeat(100)]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn mcp_deserializes_from_yaml() {
         let yaml = r"
 mcp:
@@ -703,6 +833,6 @@ mcp:
         assert!(cfg.mcp_tool_allowed("github", "read_file"));
         assert!(!cfg.mcp_tool_allowed("github", "delete_file"));
         assert!(!cfg.mcp_tool_allowed("blocked", "anything"));
-        assert!(cfg.mcp_tool_allowed("absent", "anything"));
+        assert!(!cfg.mcp_tool_allowed("absent", "anything"));
     }
 }

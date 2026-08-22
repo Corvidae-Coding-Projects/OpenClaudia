@@ -1037,7 +1037,10 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
     let plugin_manager = std::sync::Arc::new(init_plugin_manager(run_context.project_root()));
     let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
-        openclaudia::mcp::McpManager::new(std::sync::Arc::clone(&run_context)),
+        openclaudia::mcp::McpManager::new_with_permissions(
+            std::sync::Arc::clone(&run_context),
+            config.permissions.clone(),
+        ),
     ));
     let trusted_mcp_servers =
         openclaudia::proxy::connect_mcp_servers(&mcp_manager, &plugin_manager).await;

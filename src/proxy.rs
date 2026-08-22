@@ -592,13 +592,13 @@ async fn run_pre_tool_use_hooks(
     result
 }
 
-/// Prepare a chat completion request: run hooks, inject context, MCP tools,
-/// plugins, and VDD.
+/// Prepare a transparent-proxy request: run hooks and inject typed context,
+/// plugin context, and VDD material.
 ///
 /// The `#[allow(clippy::too_many_lines)]` below is deliberately retained
 /// — this function is a long linear sequence of independent injection
-/// phases (hook, prompt-mod, context inject, MCP tools, plugin
-/// tools, VDD context). Breaking it further without an enclosing
+/// phases (hook, prompt-mod, context inject, plugin tools, VDD
+/// context). Breaking it further without an enclosing
 /// orchestrator would just move line count around. A follow-up PR can
 /// formalize a `RequestContextPipeline` if it becomes worth the weight.
 #[allow(clippy::too_many_lines)]
@@ -649,18 +649,12 @@ async fn prepare_request_context(
         500,
     ));
 
-    // Add MCP tools
-    let mcp_tools = state
-        .mcp_manager
-        .read()
-        .await
-        .tools_as_openai_functions()
-        .await;
-    if !mcp_tools.is_empty() {
-        let mut tools = request.tools.take().unwrap_or_default();
-        tools.extend(mcp_tools);
-        request.tools = Some(tools);
-    }
+    // This endpoint is a transparent provider proxy: it returns upstream tool
+    // calls to its client and does not own a local model follow-up loop. MCP
+    // schemas therefore remain intentionally unadvertised here. The TUI loop
+    // publishes and dispatches the exact same manager snapshot end to end;
+    // proxy lifecycle completion in S-094/S-095 can opt in only when it owns
+    // the canonical execution/result/follow-up transaction.
 
     // Add plugin commands as context
     let plugin_commands: Vec<String> = state
@@ -1486,8 +1480,10 @@ async fn proxy_chat_completions(
     // run afterwards so model-authored summary text is demoted to bounded
     // session reference data before provider dispatch.
     compact_request_context(&mut request, &state).await;
-    // Prepare request: run hooks, project typed context, MCP tools, plugins,
-    // VDD, and every system-role value left by the client or compactor.
+    // Prepare request: run hooks, project typed context, plugins, VDD, and
+    // every system-role value left by the client or compactor. This
+    // transparent proxy does not own a local tool-result/model-follow-up loop,
+    // so it must not advertise host MCP schemas as callable.
     prepare_request_context(&mut request, &state).await?;
     let estimated_input = crate::compaction::estimate_request_tokens(&request);
     enforce_token_policy(&state, &request, estimated_input).await?;
@@ -1542,7 +1538,12 @@ async fn proxy_chat_completions(
     }
 }
 
-/// Handle MCP tool calls from the model response.
+/// Handle an explicitly host-initiated MCP call for compatibility callers.
+///
+/// Model-owned loops must use [`crate::services::tool_executor::ToolExecutor`]
+/// so catalog admission and generation receipts remain part of dispatch. The
+/// transparent proxy does not call this helper because it does not own the
+/// client application's model/tool follow-up loop.
 ///
 /// # Effect classification (S-016)
 ///
@@ -1567,6 +1568,18 @@ pub async fn handle_mcp_tool_call(
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, ProxyError> {
+    run.require(crate::tools::ToolResource::Mcp)
+        .map_err(|error| {
+            ProxyError::InvalidBody(format!("MCP execution capability is unavailable: {error}"))
+        })?;
+    {
+        let manager = mcp_manager.read().await;
+        if !manager.matches_run(run) {
+            return Err(ProxyError::InvalidBody(
+                "MCP manager belongs to a different run generation".to_string(),
+            ));
+        }
+    }
     let tool_call = crate::tools::ToolCall {
         id: uuid::Uuid::new_v4().to_string(),
         call_type: "function".to_string(),
@@ -2468,7 +2481,10 @@ async fn build_proxy_state_with_loop_control(
     let plugin_manager = Arc::new(plugin_manager);
 
     // Initialize MCP manager and connect to configured servers
-    let mcp_manager = Arc::new(RwLock::new(McpManager::new(Arc::clone(&run_context))));
+    let mcp_manager = Arc::new(RwLock::new(McpManager::new_with_permissions(
+        Arc::clone(&run_context),
+        config.permissions.clone(),
+    )));
     connect_mcp_servers(&mcp_manager, &plugin_manager).await;
     let _ = crate::mcp::install_manager(&run_context, &mcp_manager);
     crate::guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
@@ -2538,6 +2554,24 @@ pub async fn connect_mcp_servers(
     trusted
 }
 
+fn colliding_mcp_server_names<'a>(
+    trusted_sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut owners = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (server, plugin) in trusted_sources {
+        owners
+            .entry(server.to_string())
+            .or_default()
+            .push(plugin.to_string());
+    }
+    owners.retain(|_, plugins| {
+        plugins.sort();
+        plugins.dedup();
+        plugins.len() > 1
+    });
+    owners
+}
+
 /// Connect only MCP servers covered by an explicit host trust grant.
 ///
 /// Entries use `plugin-id/server-name`. This function is public for trusted
@@ -2549,16 +2583,41 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
     plugin_manager: &Arc<PluginManager>,
     trusted: &std::collections::HashSet<String, S>,
 ) {
+    let discovered = plugin_manager.all_mcp_servers_for_run(mcp_manager.read().await.run_context());
+    let trusted_names = discovered
+        .iter()
+        .filter(|(plugin, server)| trusted.contains(&format!("{}/{}", plugin.id, server.name)))
+        .map(|(_, server)| server.name.clone())
+        .collect::<std::collections::HashSet<String>>();
+    let collisions =
+        colliding_mcp_server_names(discovered.iter().filter_map(|(plugin, server)| {
+            let trust_id = format!("{}/{}", plugin.id, server.name);
+            trusted
+                .contains(&trust_id)
+                .then_some((server.name.as_str(), plugin.id.as_str()))
+        }));
     let mcp = mcp_manager.write().await;
-    for (plugin, server) in plugin_manager.all_mcp_servers_for_run(mcp.run_context()) {
+    for (server, plugins) in &collisions {
+        if let Err(error) = mcp.disconnect(server).await {
+            warn!(server, %error, "Failed to terminate colliding MCP server identity");
+        }
+        warn!(
+            server,
+            plugins = ?plugins,
+            "MCP server identity is declared by multiple trusted plugins and remains unavailable"
+        );
+    }
+    for (plugin, server) in discovered {
         let trust_id = format!("{}/{}", plugin.id, server.name);
         if !trusted.contains(&trust_id) {
-            if let Err(error) = mcp.disconnect(&server.name).await {
-                warn!(
-                    server = %server.name,
-                    %error,
-                    "Failed to terminate MCP server while revoking trust"
-                );
+            if !trusted_names.contains(server.name.as_str()) {
+                if let Err(error) = mcp.disconnect(&server.name).await {
+                    warn!(
+                        server = %server.name,
+                        %error,
+                        "Failed to terminate MCP server while revoking trust"
+                    );
+                }
             }
             warn!(
                 plugin = %plugin.id,
@@ -2567,6 +2626,9 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                 env = "OPENCLAUDIA_TRUST_MCP_SERVERS",
                 "MCP server remains disconnected pending an explicit host trust grant"
             );
+            continue;
+        }
+        if collisions.contains_key(&server.name) {
             continue;
         }
         info!(
@@ -2585,7 +2647,7 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                     warn!(
                         server = %server.name,
                         plugin = %plugin.name(),
-                        "MCP alwaysLoad is a tool-search hint; OpenClaudia currently eager-loads MCP tools"
+                        "MCP discovery is eager but model publication is progressive; alwaysLoad is not yet a publication override"
                     );
                 }
                 if !server.headers.is_empty() || server.headers_helper.is_some() {
@@ -2602,12 +2664,13 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                         .map(std::string::String::as_str)
                         .collect();
                     match mcp
-                        .connect_stdio_with_protected_env_and_timeout(
+                        .connect_stdio_with_plugin_grant(
                             &server.name,
                             command,
                             &args,
                             server.env.clone(),
                             tool_timeout,
+                            trust_id.clone(),
                         )
                         .await
                     {
@@ -2626,16 +2689,17 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                         warn!(
                             server = %server.name,
                             plugin = %plugin.name(),
-                            "MCP alwaysLoad is a tool-search hint; OpenClaudia currently eager-loads MCP tools"
+                            "MCP discovery is eager but model publication is progressive; alwaysLoad is not yet a publication override"
                         );
                     }
                     match mcp
-                        .connect_http_with_sensitive_headers_helper_and_timeout(
+                        .connect_http_with_plugin_grant(
                             &server.name,
                             url,
                             server.headers.clone(),
                             server.headers_helper.as_deref(),
                             tool_timeout,
+                            trust_id.clone(),
                         )
                         .await
                     {
@@ -2877,6 +2941,21 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_mcp_server_names_must_have_one_plugin_owner() {
+        let collisions = colliding_mcp_server_names([
+            ("shared", "plugin-b"),
+            ("unique", "plugin-c"),
+            ("shared", "plugin-a"),
+        ]);
+
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(
+            collisions.get("shared"),
+            Some(&vec!["plugin-a".to_string(), "plugin-b".to_string()])
+        );
+    }
 
     fn test_run() -> &'static Arc<crate::tools::ToolRunContext> {
         crate::tools::security::test_run_context()

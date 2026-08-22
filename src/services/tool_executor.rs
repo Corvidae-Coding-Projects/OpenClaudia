@@ -312,11 +312,224 @@ impl ToolExecutor {
         )
     }
 
+    /// Execute one dynamically registered MCP tool through the same catalog,
+    /// enterprise-policy, permission, host-safety, capability, guardrail and
+    /// typed-result boundaries used by static handlers.
+    ///
+    /// # Errors
+    ///
+    /// Failures are represented inside the returned [`ToolResult`]. Calls
+    /// that may have reached a remote handler before transport failure are
+    /// conservatively reported as typed partial outcomes.
+    pub async fn execute_mcp(request: ToolExecutorRequest<'_>) -> ToolResult {
+        let ToolExecutorRequest {
+            run_context,
+            tool_call,
+            memory_db,
+            app_config,
+            task_mgr: _,
+            permission_mgr,
+            authorization,
+            session_id,
+            policy_enforcer,
+        } = request;
+        let session_id = session_id.or_else(|| Some(run_context.session_id()));
+        let Some(manager) = crate::mcp::registered_manager(run_context) else {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::Unavailable,
+                "MCP manager is unavailable for this exact run generation",
+                ToolRetryability::Safe,
+            );
+        };
+        let manager = manager.read().await;
+        if !manager.matches_run(run_context) {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::Unavailable,
+                "MCP manager belongs to a different run generation",
+                ToolRetryability::Never,
+            );
+        }
+        let preflight = match prepare_mcp_dispatch(McpPreflightRequest {
+            run_context,
+            tool_call,
+            permission_mgr,
+            authorization,
+            session_id,
+            policy_enforcer,
+        }) {
+            Ok(preflight) => preflight,
+            Err(result) => return *result,
+        };
+        let remotely_dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatch_evidence = std::sync::Arc::clone(&remotely_dispatched);
+        let outcome = manager
+            .call_tool_registered_with_dispatch(
+                &tool_call.function.name,
+                preflight.arguments,
+                preflight.source_digest,
+                move || {
+                    dispatch_evidence.store(true, std::sync::atomic::Ordering::Release);
+                    preflight.reservation.commit();
+                },
+            )
+            .await;
+        drop(manager);
+
+        let handler_result = match outcome {
+            Ok(value) => {
+                tools::ToolHandlerResult::success_structured(mcp_result_text(&value), value)
+            }
+            Err(error) => mcp_error_result(
+                &error,
+                remotely_dispatched.load(std::sync::atomic::Ordering::Acquire),
+            ),
+        };
+        let result = ToolResult::bind(tool_call, &tool_call.function.name, handler_result);
+        tools::attach_automatic_learning(run_context, memory_db, app_config, None, result)
+    }
+
     /// Convert a missing run binding into a typed unavailable result without
     /// evaluating permission policy or dispatching any handler.
     #[must_use]
     pub fn execute_unbound(tool_call: &ToolCall) -> ToolResult {
         tools::execute_tool_without_context(tool_call)
+    }
+}
+
+struct McpPreflightRequest<'a> {
+    run_context: &'a std::sync::Arc<tools::ToolRunContext>,
+    tool_call: &'a ToolCall,
+    permission_mgr: &'a PermissionManager,
+    authorization: Option<ExecutionPermit>,
+    session_id: Option<&'a str>,
+    policy_enforcer: Option<&'a PolicyEnforcer>,
+}
+
+struct McpDispatchPreflight {
+    arguments: Value,
+    source_digest: crate::runtime::ContentDigest,
+    reservation: tools::DynamicToolEffectReservation,
+}
+
+fn prepare_mcp_dispatch(
+    mut request: McpPreflightRequest<'_>,
+) -> Result<McpDispatchPreflight, Box<ToolResult>> {
+    let admission = match request
+        .run_context
+        .tool_catalog()
+        .admit_tool_call_with_receipt(&request.tool_call.function.name)
+    {
+        Ok(admission) if admission.is_mcp() => admission,
+        Ok(_) => {
+            return Err(Box::new(ToolResult::failure(
+                request.tool_call,
+                ToolFailureCode::Unavailable,
+                format!(
+                    "Tool '{}' is not registered as a dynamic MCP capability",
+                    request.tool_call.function.name
+                ),
+                ToolRetryability::Never,
+            )));
+        }
+        Err(reason) => {
+            return Err(Box::new(ToolResult::failure(
+                request.tool_call,
+                ToolFailureCode::Unavailable,
+                reason,
+                ToolRetryability::Safe,
+            )));
+        }
+    };
+    let arguments = ToolExecutor::parse_arguments(
+        &request.tool_call.function.name,
+        &request.tool_call.function.arguments,
+    )
+    .map_err(|reason| {
+        Box::new(ToolResult::failure(
+            request.tool_call,
+            ToolFailureCode::InvalidArguments,
+            reason,
+            ToolRetryability::Never,
+        ))
+    })?;
+    let Value::Object(argument_object) = &arguments else {
+        unreachable!("parse_arguments only returns JSON objects");
+    };
+    let argument_map: HashMap<String, Value> = argument_object.clone().into_iter().collect();
+
+    let tool_policy = ToolExecutionPolicy::new(request.policy_enforcer, request.session_id);
+    tool_policy
+        .check_tool(&request.tool_call.function.name)
+        .map_err(|error| {
+            Box::new(ToolResult::failure(
+                request.tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by policy: {error}"),
+                ToolRetryability::Never,
+            ))
+        })?;
+    let authorization = authorize_mcp_dispatch(&mut request)?;
+    let consumed = request
+        .permission_mgr
+        .consume_execution_permit(&authorization, request.tool_call, request.session_id)
+        .map_err(|reason| {
+            Box::new(ToolResult::failure(
+                request.tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: execution permit rejected: {reason}"),
+                ToolRetryability::Never,
+            ))
+        })?;
+    tool_policy
+        .check_and_record_tool(&request.tool_call.function.name)
+        .map_err(|error| {
+            Box::new(ToolResult::failure(
+                request.tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by policy: {error}"),
+                ToolRetryability::Never,
+            ))
+        })?;
+    let reservation = tools::reserve_dynamic_tool_effect(
+        request.run_context,
+        request.tool_call,
+        &argument_map,
+        &consumed,
+    )?;
+    Ok(McpDispatchPreflight {
+        arguments,
+        source_digest: admission.source_digest,
+        reservation,
+    })
+}
+
+fn authorize_mcp_dispatch(
+    request: &mut McpPreflightRequest<'_>,
+) -> Result<ExecutionPermit, Box<ToolResult>> {
+    if let Some(permit) = request.authorization.take() {
+        return Ok(permit);
+    }
+    match request
+        .permission_mgr
+        .authorize_tool_call(request.tool_call, request.session_id)
+    {
+        AuthorizationResult::Allowed(permit) => Ok(permit),
+        AuthorizationResult::Denied(reason) => Err(Box::new(ToolResult::failure(
+            request.tool_call,
+            ToolFailureCode::PermissionDenied,
+            format!("Permission denied: {reason}"),
+            ToolRetryability::Never,
+        ))),
+        AuthorizationResult::NeedsPrompt { tool, target } => Err(Box::new(ToolResult::failure(
+            request.tool_call,
+            ToolFailureCode::PermissionDenied,
+            format!(
+                "Permission denied: no interactive prompt is available for {tool} on '{target}'"
+            ),
+            ToolRetryability::Never,
+        ))),
     }
 }
 
@@ -328,6 +541,70 @@ const fn json_value_type_name(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+fn mcp_result_text(value: &Value) -> String {
+    let text = value
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        "MCP tool completed with structured output.".to_string()
+    } else {
+        text
+    }
+}
+
+fn mcp_error_result(
+    error: &crate::mcp::McpError,
+    remotely_dispatched: bool,
+) -> tools::ToolHandlerResult {
+    let (code, retryability) = match error {
+        crate::mcp::McpError::InvalidToolArguments { .. } => {
+            (ToolFailureCode::InvalidArguments, ToolRetryability::Never)
+        }
+        crate::mcp::McpError::ToolNotAllowed { .. } => {
+            (ToolFailureCode::PolicyDenied, ToolRetryability::Never)
+        }
+        crate::mcp::McpError::Timeout { .. } => (
+            ToolFailureCode::DeadlineExceeded,
+            ToolRetryability::AfterBackoff,
+        ),
+        crate::mcp::McpError::ToolReportedError { .. }
+        | crate::mcp::McpError::Transport(_)
+        | crate::mcp::McpError::Protocol(_)
+        | crate::mcp::McpError::ResponseIdMismatch { .. }
+        | crate::mcp::McpError::Io(_) => (ToolFailureCode::External, ToolRetryability::Unknown),
+        crate::mcp::McpError::ServerUnreachable(_) => {
+            (ToolFailureCode::Unavailable, ToolRetryability::AfterBackoff)
+        }
+        crate::mcp::McpError::ToolNotFound(_)
+        | crate::mcp::McpError::NotConnected(_)
+        | crate::mcp::McpError::StaleToolRegistration(_)
+        | crate::mcp::McpError::InvalidToolSchema { .. } => {
+            (ToolFailureCode::Unavailable, ToolRetryability::Safe)
+        }
+    };
+    let failure = tools::ToolFailure::new(code, error.to_string(), retryability);
+    if remotely_dispatched {
+        let (message, structured) = match error {
+            crate::mcp::McpError::ToolReportedError { result, .. } => (
+                "MCP tool reported a typed failure after remote dispatch.",
+                result.clone(),
+            ),
+            _ => (
+                "MCP call may have produced a remote effect before failing.",
+                serde_json::json!({"state": "remote_outcome_unknown"}),
+            ),
+        };
+        tools::ToolHandlerResult::partial_structured(message, structured, vec![failure], None)
+    } else {
+        tools::ToolHandlerResult::error(failure)
     }
 }
 

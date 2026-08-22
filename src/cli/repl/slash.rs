@@ -578,6 +578,14 @@ fn permission_status_lines(
                 proposal.default_allow.len()
             ));
         }
+        if !proposal.mcp_tools.is_empty() {
+            let tool_count = proposal.mcp_tools.values().map(Vec::len).sum::<usize>();
+            lines.push(format!(
+                "  Requested MCP grants: {} tool(s) across {} server(s) (ignored; configure trusted host state)",
+                tool_count,
+                proposal.mcp_tools.len()
+            ));
+        }
         if !proposal.web_fetch_preapproved_domains.is_empty() {
             lines.push(format!(
                 "  Requested web preapprovals: {} (ignored; configure trusted host state)",
@@ -4415,6 +4423,10 @@ mod tests {
                 proposal_digest: "sha256:proposal".to_string(),
                 requests_prompt_bypass: true,
                 default_allow: vec!["Bash(git push)".to_string()],
+                mcp_tools: std::collections::BTreeMap::from([(
+                    "remote".to_string(),
+                    vec!["invoke".to_string()],
+                )]),
                 web_fetch_preapproved_domains: vec!["attacker.example".to_string()],
             }),
             ..Default::default()
@@ -4428,9 +4440,13 @@ mod tests {
         )
         .join("\n");
 
-        assert!(joined.contains("Repository permission proposal: inert (schema 1"));
+        assert!(joined.contains(&format!(
+            "Repository permission proposal: inert (schema {}",
+            openclaudia::config::PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION
+        )));
         assert!(joined.contains("Requested prompt bypass: ignored"));
         assert!(joined.contains("Requested default allows: 1 (ignored"));
+        assert!(joined.contains("Requested MCP grants: 1 tool(s) across 1 server(s) (ignored"));
         assert!(joined.contains("Requested web preapprovals: 1 (ignored"));
         assert!(joined.contains("Approval prompts enabled: yes"));
     }

@@ -357,6 +357,62 @@ fn host_safety_dispatch_permit(
     ))
 }
 
+/// Guardrail reservation for an async dynamic dispatcher that cannot use the
+/// static handler registry. Dropping it without [`Self::commit`] releases the
+/// pending blast-radius charge.
+pub(crate) struct DynamicToolEffectReservation {
+    reservation: crate::guardrails::EffectReservation,
+}
+
+impl DynamicToolEffectReservation {
+    pub fn commit(mut self) {
+        self.reservation.commit();
+    }
+}
+
+pub(crate) fn reserve_dynamic_tool_effect(
+    run: &ToolRunContext,
+    tool_call: &ToolCall,
+    args: &HashMap<String, Value>,
+    authorization: &ConsumedExecutionPermit,
+) -> Result<DynamicToolEffectReservation, Box<ToolResult>> {
+    let arguments = Value::Object(
+        args.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let resolved = host_safety::HostSafetyPolicy::enforce(&tool_call.function.name, &arguments)
+        .map_err(|reason| {
+            Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by non-bypassable host safety: {reason}"),
+                ToolRetryability::Never,
+            ))
+        })?;
+    run.require(ToolResource::Mcp).map_err(|error| {
+        Box::new(ToolResult::failure(
+            tool_call,
+            ToolFailureCode::Unavailable,
+            format!("MCP execution capability is unavailable: {error}"),
+            ToolRetryability::Never,
+        ))
+    })?;
+    // Reconstructing the registry permit verifies that the consumed approval
+    // remains bound to this exact run/tool/argument tuple. Dynamic dispatch
+    // does not expose the permit to an untrusted server.
+    let _permit = host_safety_dispatch_permit(run, tool_call, args, Some(authorization))?;
+    let reservation = crate::guardrails::reserve_tool_effect(run, &resolved).map_err(|reason| {
+        Box::new(ToolResult::failure(
+            tool_call,
+            ToolFailureCode::PolicyDenied,
+            format!("Blocked by blast radius guardrails: {reason}"),
+            ToolRetryability::Never,
+        ))
+    })?;
+    Ok(DynamicToolEffectReservation { reservation })
+}
+
 fn dispatch_registered_with_permit(
     tool_call: &ToolCall,
     args: &HashMap<String, Value>,
@@ -415,7 +471,7 @@ fn dispatch_registered_with_permit(
     )
 }
 
-fn attach_automatic_learning(
+pub(crate) fn attach_automatic_learning(
     run: &ToolRunContext,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,

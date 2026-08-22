@@ -23,6 +23,17 @@ use std::collections::HashMap;
 use wiremock::matchers::{body_string_contains, header, method};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+fn manager_with_allowed_tool(server: &str, tool: &str) -> McpManager {
+    let mut permissions = openclaudia::config::PermissionsConfig::default();
+    permissions
+        .mcp
+        .insert(server.to_string(), vec![tool.to_string()]);
+    McpManager::new_with_permissions(
+        std::sync::Arc::clone(support::shared_run_context()),
+        permissions,
+    )
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Helpers — JSON-RPC envelope builders
 // ───────────────────────────────────────────────────────────────────────────
@@ -273,7 +284,7 @@ async fn call_tool_returns_server_result_through_transport() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    let mgr = manager_with_allowed_tool("srv", "echo");
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -303,7 +314,7 @@ async fn call_tool_accepts_streamable_http_sse_response_body() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    let mgr = manager_with_allowed_tool("srv", "echo");
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -336,7 +347,7 @@ async fn call_tool_propagates_jsonrpc_error_response() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    let mgr = manager_with_allowed_tool("srv", "echo");
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -363,7 +374,7 @@ async fn call_tool_with_unknown_tool_name_returns_error_without_http_call() {
     // fail with a transport error rather than the
     // "tool not found" error we expect.
 
-    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    let mgr = manager_with_allowed_tool("srv", "definitely-not-a-tool");
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");

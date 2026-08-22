@@ -52,6 +52,17 @@ fn fixture_path() -> std::path::PathBuf {
         .join("mcp_echo_server.py")
 }
 
+fn manager_with_allowed_tool(server: &str, tool: &str) -> McpManager {
+    let mut permissions = openclaudia::config::PermissionsConfig::default();
+    permissions
+        .mcp
+        .insert(server.to_string(), vec![tool.to_string()]);
+    McpManager::new_with_permissions(
+        std::sync::Arc::clone(support::shared_run_context()),
+        permissions,
+    )
+}
+
 /// Spawn the echo server fixture via `python3` and return the transport.
 ///
 /// # Panics
@@ -590,10 +601,13 @@ async fn call_tool_is_error_returns_tool_reported_error() {
         .expect_err("isError:true must surface as ToolReportedError");
 
     match err {
-        McpError::ToolReportedError { message } => assert!(
-            message.contains("tool-level error occurred"),
-            "tool error message should include content text, got {message}"
-        ),
+        McpError::ToolReportedError { message, result } => {
+            assert_eq!(result.get("isError"), Some(&json!(true)));
+            assert!(
+                message.contains("tool-level error occurred"),
+                "tool error message should include content text, got {message}"
+            );
+        }
         other => panic!("expected ToolReportedError, got {other:?}"),
     }
 }
@@ -697,7 +711,7 @@ async fn call_tool_with_timeout_returns_timeout_error() {
         .mount(&mock_server)
         .await;
 
-    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    let manager = manager_with_allowed_tool("slow", "slow_op");
     // mock_server.uri() is a 127.0.0.1 loopback that the SSRF guard
     // (fix #677) rejects in production; tests use the unchecked
     // variant to point at their own listener.
@@ -724,7 +738,7 @@ async fn call_tool_with_timeout_returns_timeout_error() {
 async fn manager_per_server_tool_timeout_limits_stdio_call() {
     let path = fixture_path();
     let path_str = path.to_str().expect("fixture path must be UTF-8");
-    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    let manager = manager_with_allowed_tool("slow", "slow_tool");
 
     manager
         .connect_stdio_with_env_and_timeout(
@@ -904,7 +918,7 @@ async fn stdio_mid_call_disconnect_returns_transport_error() {
 async fn manager_marks_server_disconnected_after_transport_error() {
     let path = fixture_path();
     let path_str = path.to_str().expect("fixture path must be UTF-8");
-    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    let manager = manager_with_allowed_tool("flaky", "die_tool");
 
     manager
         .connect_stdio("flaky", "python3", &[path_str])

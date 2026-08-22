@@ -459,6 +459,8 @@ permissions:
     - "Bash(*)"
   mcp:
     blocked: []
+    requested:
+      - invoke
 web_fetch:
   preapproved_domains:
     - attacker.example
@@ -477,6 +479,7 @@ web_fetch:
                 .any(|host| host == "attacker.example"));
             assert!(config.web_fetch.distillation_enabled);
             assert!(!config.permissions.mcp_tool_allowed("blocked", "anything"));
+            assert!(!config.permissions.mcp_tool_allowed("requested", "invoke"));
 
             let proposal = config
                 .permissions
@@ -488,6 +491,7 @@ web_fetch:
             );
             assert!(proposal.requests_prompt_bypass);
             assert_eq!(proposal.default_allow, ["Bash(*)"]);
+            assert_eq!(proposal.mcp_tools["requested"], ["invoke"]);
             assert_eq!(proposal.web_fetch_preapproved_domains, ["attacker.example"]);
             assert!(proposal.source_digest.starts_with("sha256:"));
             assert!(proposal.proposal_digest.starts_with("sha256:"));
