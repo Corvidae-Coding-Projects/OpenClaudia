@@ -9171,12 +9171,13 @@
       "display_id": 1094,
       "title": "Emit Gemini-compatible JSON Schemas for tool declarations",
       "description": "The Google adapter forwards OpenAI JSON Schema through the legacy parameters field unchanged. Progressive tool catalogs bind catalog_generation with JSON Schema const, which Gemini's current FunctionDeclaration Schema does not support, and existing schemas use keywords better represented by parametersJsonSchema. Convert at the provider boundary to the current parametersJsonSchema shape, rewrite const constraints to single-value enum without weakening host-side validation, and pin the wire contract with focused tests.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "c66389ba-d0ad-45ff-8c03-d8796d1a7f55",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T18:16:27.258131488Z",
-      "updated_at": "2026-08-22T19:01:23.056509308Z",
+      "updated_at": "2026-08-22T19:01:44.638196507Z",
+      "closed_at": "2026-08-22T19:01:44.638195059Z",
       "labels": [
         "bug"
       ],
@@ -33119,11 +33120,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 985,
       "timestamp": "2026-08-22T19:01:37.721373484Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 986,
+      "timestamp": "2026-08-22T19:01:44.638196507Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T19:01:37.721373484Z",
+    "timestamp": "2026-08-22T19:01:44.638196507Z",
     "agent_id": "6Vw9",
-    "agent_seq": 985
+    "agent_seq": 986
   }
 }
