@@ -11852,12 +11852,13 @@
       "display_id": 1098,
       "title": "S-044: Preserve provider-native continuation state",
       "description": "Implement docs/remediation-slices/044-provider-native-state-contract.md. Define a versioned, bounded provider-native continuation lane alongside neutral conversation semantics; add explicit protocol/facet capability declarations for every supported adapter; reject incompatible or lossy fallback; persist the lane in canonical interactive session state with migration-safe defaults; bind provider/model identity and deterministic digests; add conformance fixtures for tool calls, parallel ordering, reasoning/signature blocks, refusals, usage/cache metadata, and resume declarations. Wire the contract through production provider request composition without absorbing S-045 OpenAI Responses continuation, S-046 Gemini/Ollama native tool-history repair, S-047 dynamic capability discovery, S-048 transport hardening, S-049 reasoning privacy, or S-050 terminal-state repair. Work locally with Rust/Cargo 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo invocations, test threads=1, and no Claude kickoff/subagent.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T20:49:57.916029928Z",
-      "updated_at": "2026-08-22T22:01:50.206889649Z",
+      "updated_at": "2026-08-22T22:02:07.123297581Z",
+      "closed_at": "2026-08-22T22:02:07.123291775Z",
       "labels": [
         "remediation"
       ],
@@ -33593,11 +33594,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1025,
       "timestamp": "2026-08-22T22:01:50.206889649Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1026,
+      "timestamp": "2026-08-22T22:02:07.123297581Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T22:01:50.206889649Z",
+    "timestamp": "2026-08-22T22:02:07.123297581Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1025
+    "agent_seq": 1026
   }
 }
