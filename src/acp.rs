@@ -4115,10 +4115,31 @@ memory:
         mpsc::UnboundedReceiver<String>,
         tempfile::TempDir,
     ) {
+        test_server_with_read_only_roots(Vec::new())
+    }
+
+    fn test_server_with_read_only_roots(
+        read_only_roots: Vec<std::path::PathBuf>,
+    ) -> (
+        AcpServer,
+        mpsc::UnboundedReceiver<String>,
+        tempfile::TempDir,
+    ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let launch_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
-        let launch_capabilities = crate::tools::security::test_run_context_for(&launch_root);
+        let launch_capabilities =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &launch_root)
+                .read_only_roots(read_only_roots)
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(true)
+                .secrets(true)
+                .provider("unit-test")
+                .build()
+                .expect("test ACP launch capability");
         let run = launch_capabilities
             .derive_frontend_session(
                 crate::state::SessionId::new(),
@@ -4223,6 +4244,25 @@ memory:
         server
             .execute_tool_via_acp(run, "unit-test", call_id, name, &arguments.to_string())
             .await
+    }
+
+    fn test_toolchain_rustc() -> std::path::PathBuf {
+        if let Ok(rustup) = which::which("rustup") {
+            let output = std::process::Command::new(rustup)
+                .args(["which", "rustc"])
+                .output()
+                .expect("query rustup for the active rustc");
+            if output.status.success() {
+                let path = std::path::PathBuf::from(
+                    String::from_utf8(output.stdout)
+                        .expect("rustup rustc path is UTF-8")
+                        .trim(),
+                );
+                assert!(path.is_absolute(), "rustup returned a relative rustc path");
+                return path;
+            }
+        }
+        which::which("rustc").expect("ACP automatic-learning test requires rustc on PATH")
     }
 
     #[tokio::test]
@@ -4661,7 +4701,17 @@ memory:
 
     #[tokio::test]
     async fn acp_automatic_learning_citations_bind_provider_call_ids() {
-        let (server, _rx, _host) = test_server();
+        let rustc = test_toolchain_rustc();
+        let toolchain_root = rustc
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("rustc lives below a toolchain root")
+            .to_path_buf();
+        let read_only_roots = (!matches!(toolchain_root.to_str(), Some("/" | "/bin" | "/usr")))
+            .then_some(toolchain_root)
+            .into_iter()
+            .collect();
+        let (server, _rx, _host) = test_server_with_read_only_roots(read_only_roots);
         let run = Arc::clone(test_run(&server));
         let fixture = tempfile::tempdir_in(run.project_root()).expect("project-local fixture");
         let relative_dir = fixture
@@ -4685,13 +4735,23 @@ memory:
         .await;
         assert!(!initial.is_error(), "initial ACP write failed: {initial:?}");
 
+        // Resolve the real toolchain binary before crossing the sandbox
+        // boundary. CI installs rustc through a rustup proxy whose operation
+        // depends on host-only RUSTUP_* state that the run-bound environment
+        // intentionally does not inherit.
         let command = format!(
-            "rustc --crate-name acp_learning_probe {} --crate-type lib --emit metadata -o {}",
+            "{} --crate-name acp_learning_probe {} --crate-type lib --emit metadata -o {}",
+            shlex::try_quote(
+                rustc
+                    .to_str()
+                    .expect("rustc path must be representable in a shell command"),
+            )
+            .expect("quote rustc path"),
             shlex::try_quote(&source_path).expect("quote source path"),
             shlex::try_quote(&output_path).expect("quote output path")
         );
         let failure_id = "acp-learning-check-failure";
-        let _failed = execute_acp_memory_tool(
+        let failed = execute_acp_memory_tool(
             &server,
             &run,
             failure_id,
@@ -4699,6 +4759,10 @@ memory:
             json!({"command": command.clone()}),
         )
         .await;
+        assert!(
+            failed.is_error() || failed.is_partial(),
+            "broken ACP verification unexpectedly succeeded: {failed:?}"
+        );
 
         let read = execute_acp_memory_tool(
             &server,
@@ -4734,7 +4798,10 @@ memory:
             json!({"command": command}),
         )
         .await;
-        assert!(!passed.is_error(), "ACP verification failed: {passed:?}");
+        assert!(
+            matches!(passed.outcome(), ToolOutcome::Success { .. }),
+            "fixed ACP verification did not succeed: {passed:?}"
+        );
 
         let records = server
             .memory_db
