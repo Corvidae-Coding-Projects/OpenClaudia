@@ -1,6 +1,6 @@
 {
   "next_display_id": 1095,
-  "next_comment_id": 1207,
+  "next_comment_id": 1208,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9166,10 +9166,21 @@
       "parent_uuid": "c66389ba-d0ad-45ff-8c03-d8796d1a7f55",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T18:16:27.258131488Z",
-      "updated_at": "2026-08-22T18:16:31.285963109Z",
+      "updated_at": "2026-08-22T18:19:05.821044571Z",
       "labels": [
         "bug"
-      ]
+      ],
+      "comments": {
+        "43cd2c5b-b095-4bd1-a50d-a2904d51a6cf": {
+          "display_id": 1207,
+          "author": "6Vw9",
+          "content": "Confirmed against Google's current GenerateContent FunctionDeclaration contract: parametersJsonSchema is the current JSON Schema field and parameters is the narrower OpenAPI Schema field; const is unsupported for function declarations while enum is supported. Implemented provider-boundary const-to-single-value-enum normalization without weakening canonical host validation. Rust 1.98 Google unit tests 21/21 and progressive cross-provider tests 5/5 pass.",
+          "created_at": "2026-08-22T18:19:05.818322422Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAw185KI3ep93FSNTWnk2fVFRO0tc8xY+7HEusdAreXzeMntsFnjLjex5BgomJhojj5KgMiGwfilmqwrJ55YHsAA=="
+        }
+      }
     },
     "54381422-378f-4c1c-b599-e2ce011bf718": {
       "uuid": "54381422-378f-4c1c-b599-e2ce011bf718",
@@ -32957,11 +32968,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 974,
       "timestamp": "2026-08-22T18:16:31.285963109Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 975,
+      "timestamp": "2026-08-22T18:19:05.821044571Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T18:16:31.285963109Z",
+    "timestamp": "2026-08-22T18:19:05.821044571Z",
     "agent_id": "6Vw9",
-    "agent_seq": 974
+    "agent_seq": 975
   }
 }
