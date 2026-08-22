@@ -25396,12 +25396,13 @@
       "display_id": 1086,
       "title": "Allow later slices to refresh retrieval-evidence citation provenance",
       "description": "The S-105 retrieval corpus accepts only its original worktree:s105 provenance label. A later slice that changes a still-valid cited source must either lie by retaining an old git/source label or fail the final-environment digest gate. Accept a bounded canonical worktree:sNNN label, reject malformed labels, refresh the S-052 src/main.rs citation honestly, regenerate the evaluation, and rebind the deliberately rejected review.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "66ad6d37-42af-4133-830d-fdf7d4cb67ac",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:17:15.887051640Z",
-      "updated_at": "2026-08-22T08:48:18.191618241Z",
+      "updated_at": "2026-08-22T08:48:31.553748099Z",
+      "closed_at": "2026-08-22T08:48:31.553743674Z",
       "labels": [
         "defect"
       ],
@@ -31946,11 +31947,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 887,
       "timestamp": "2026-08-22T08:48:27.270767296Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 888,
+      "timestamp": "2026-08-22T08:48:31.553748099Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:48:27.270767296Z",
+    "timestamp": "2026-08-22T08:48:31.553748099Z",
     "agent_id": "6Vw9",
-    "agent_seq": 887
+    "agent_seq": 888
   }
 }
