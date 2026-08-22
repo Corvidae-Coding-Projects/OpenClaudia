@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1177,
+  "next_comment_id": 1178,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14457,7 +14457,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T01:12:28.361756220Z",
-      "updated_at": "2026-08-22T14:10:13.409516480Z",
+      "updated_at": "2026-08-22T14:13:44.913979147Z",
       "labels": [
         "remediation"
       ],
@@ -14470,6 +14470,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEq8qyE0vzZ7qXJYVvWMYXZXmeEsEoilBZa33FQnb+gSeLTdr2QRXlNNbq3vRpJtXJvzv3MMSUZHouuExgzeuCA=="
+        },
+        "720c8393-f301-40ea-8178-d52e914bb1d4": {
+          "display_id": 1177,
+          "author": "6Vw9",
+          "content": "Architecture preflight: preferred design is one additive multi-parent MemoryRevision contract. Existing linear revisions retain their byte-identical v1 digest and primary parent_digest; conflict resolutions add a canonical sorted additional-parent set, use a domain-separated v2 digest, and set version=max(all parents)+1. SQLite schema v7 persists the set; ancestry/head application, portable packages, encrypted team replication, and replay consume the same graph. memory_conflicts will expose every bounded active/tombstone branch as untrusted cited evidence, and memory_update will accept exactly one of expected_record_digest or a complete expected_head_digests set. Team resolution gets an explicit maintainer/owner Resolve grant. Rejected alternative: encode other heads only in lesson correction metadata and special-case head deletion; that would make the revision DAG, offline convergence, portable export, and generic replication falsely single-parent.",
+          "created_at": "2026-08-22T14:13:44.911413499Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAA6QYQWZH7s0zWPS8dqi204mx3uxXTL4ZWYFpy8HI5Z7jjqVG4YL13X3rOBhe7VCmI40tQauXuK9p+JDZc39pBQ=="
         }
       }
     },
@@ -32347,11 +32356,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 922,
       "timestamp": "2026-08-22T14:10:13.409516480Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 923,
+      "timestamp": "2026-08-22T14:13:44.913979147Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T14:10:13.409516480Z",
+    "timestamp": "2026-08-22T14:13:44.913979147Z",
     "agent_id": "6Vw9",
-    "agent_seq": 922
+    "agent_seq": 923
   }
 }
