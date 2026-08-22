@@ -12482,12 +12482,13 @@
       "display_id": 1084,
       "title": "Fix reversed Crosslink dependency arguments in tool adapter",
       "description": "OpenClaudia's typed Crosslink block/unblock adapter passes (blocker, blocked) to crosslink::Database::{add,remove}_dependency, but the library contract is (target, blocker). The command then reports the intended direction even though the stored dependency is reversed. Correct the call order and add a real database regression that proves blocker/readiness behavior.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "66ad6d37-42af-4133-830d-fdf7d4cb67ac",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T06:34:40.318459982Z",
-      "updated_at": "2026-08-22T08:48:13.981191390Z",
+      "updated_at": "2026-08-22T08:48:27.270767296Z",
+      "closed_at": "2026-08-22T08:48:27.270762295Z",
       "labels": [
         "defect"
       ],
@@ -31940,11 +31941,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 886,
       "timestamp": "2026-08-22T08:48:22.358871495Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 887,
+      "timestamp": "2026-08-22T08:48:27.270767296Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:48:22.358871495Z",
+    "timestamp": "2026-08-22T08:48:27.270767296Z",
     "agent_id": "6Vw9",
-    "agent_seq": 886
+    "agent_seq": 887
   }
 }
