@@ -1,6 +1,6 @@
 {
   "next_display_id": 1082,
-  "next_comment_id": 1129,
+  "next_comment_id": 1130,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -12183,11 +12183,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T16:01:36.931436163Z",
-      "updated_at": "2026-08-22T02:56:43.075645826Z",
+      "updated_at": "2026-08-22T02:56:47.124618960Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "cb1df4ff-382a-4688-93f6-33d4575843ec": {
+          "display_id": 1129,
+          "author": "6Vw9",
+          "content": "Design and implement S-105 as explicit tool-call retrieval over typed repository-specific technical lessons. Add bounded task context, policy evaluation against no-memory/lexical baselines, strict artifact and independent-review validation, privacy/error/resource semantics, and promote no mechanism without measured held-out benefit. Remote embeddings remain excluded unless an approved private transport and artifact-bound model demonstrate benefit.",
+          "created_at": "2026-08-22T02:56:47.122153537Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOgXjQw5fQZW5HiUxfWcu44cRhJsGfaCNaGr3XP/RuHvRkpwhyVd13ccR5IQVqftiPjIi8NUJeQjsnvmMq6dCDw=="
+        },
         "d8863e88-b9b8-4d3b-a142-548a7fe18468": {
           "display_id": 1128,
           "author": "6Vw9",
@@ -31350,10 +31359,15 @@
       "agent_id": "6Vw9",
       "agent_seq": 843,
       "timestamp": "2026-08-22T02:56:43.075645826Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 843,
+      "timestamp": "2026-08-22T02:56:47.124618960Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T02:56:43.075645826Z",
+    "timestamp": "2026-08-22T02:56:47.124618960Z",
     "agent_id": "6Vw9",
     "agent_seq": 843
   }
