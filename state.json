@@ -1,6 +1,6 @@
 {
   "next_display_id": 1090,
-  "next_comment_id": 1162,
+  "next_comment_id": 1163,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9118,7 +9118,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:53:08.818081581Z",
-      "updated_at": "2026-08-22T09:18:29.339429924Z",
+      "updated_at": "2026-08-22T09:29:56.693763576Z",
       "labels": [
         "remediation"
       ],
@@ -9140,6 +9140,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqd0uVndnftdq5Feb8UNAIABqOTbzan+z8eQu8KRsN+Z9yJDmBzOIKqHJX1+iKyrJCr2u4Y6N2Gh3FakArKO3Ag=="
+        },
+        "8c2f84fa-8775-4114-9522-991099ea22f8": {
+          "display_id": 1162,
+          "author": "6Vw9",
+          "content": "S-055 architecture: replace the legacy REPL-only prose and last-error heuristic with one bounded consumer at the canonical post-authorization typed tool-result boundary. Only an allowlisted exact verification failure, same task/run successful file mutations, and the exact same verification invocation succeeding may create a private ObservedOnce review-due technical-lesson candidate. Tool/result/workspace/task generations are digest-bound; unrelated success and prose are ineligible; recurrence writes a causal correction. CLI, TUI, ACP, and subagents inherit the same path, with memory_learning_status as a read-only bounded diagnostic.",
+          "created_at": "2026-08-22T09:29:56.683842094Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALCGV/6B8TPP+9ZSlht/C3dYTfceBQQ0nR0oKeX54QhYwDZyZgtT0R/GB0o717xJE2tJakXSpFkU2jE6N4LGpCQ=="
         },
         "a3c84baa-f1be-412c-acb1-fac811f600fb": {
           "display_id": 1161,
@@ -32080,11 +32089,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 900,
       "timestamp": "2026-08-22T09:18:29.339429924Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 901,
+      "timestamp": "2026-08-22T09:29:56.693763576Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T09:18:29.339429924Z",
+    "timestamp": "2026-08-22T09:29:56.693763576Z",
     "agent_id": "6Vw9",
-    "agent_seq": 900
+    "agent_seq": 901
   }
 }
