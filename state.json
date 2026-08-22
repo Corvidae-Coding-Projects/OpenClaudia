@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1101,
+  "next_display_id": 1102,
   "next_comment_id": 1253,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -913,6 +913,7 @@
     "e7630c27-7e6e-4157-bbc9-231b1d51ce32": 259,
     "e7714245-93b6-4412-ac26-17d21d06c481": 776,
     "e7a14f5a-1282-4a75-a792-699c42744928": 146,
+    "e7ae99d8-2e12-4340-a382-8243e6d61ea3": 1101,
     "e7eb22d0-91ee-4661-ab75-6e45c813079b": 96,
     "e804c6f1-0400-42b9-bdea-96e79257ffe1": 916,
     "e80d4c39-9917-4e5b-89f2-2411ad9abaad": 732,
@@ -25664,6 +25665,18 @@
         "qa"
       ]
     },
+    "e7ae99d8-2e12-4340-a382-8243e6d61ea3": {
+      "uuid": "e7ae99d8-2e12-4340-a382-8243e6d61ea3",
+      "display_id": 1101,
+      "title": "Exclude Crosslink runtime state from verification artifact snapshots",
+      "description": "The ProjectSourceTreeV3 freshness snapshot traverses ignored .crosslink runtime state, including issues.db and local keys. Crosslink hooks can mutate issues.db during a quality-gate snapshot, causing nondeterministic InvalidEvidenceProvenance failures; reading local control-plane secrets/state also lies outside source verification. Explicitly exclude ignored Crosslink runtime paths while retaining tracked hook-config.json and bundled rules, add adversarial tests, and preserve fail-closed detection for source mutations.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T23:44:49.419688674Z",
+      "updated_at": "2026-08-22T23:44:49.419688674Z"
+    },
     "e7eb22d0-91ee-4661-ab75-6e45c813079b": {
       "uuid": "e7eb22d0-91ee-4661-ab75-6e45c813079b",
       "display_id": 96,
@@ -33820,11 +33833,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1043,
       "timestamp": "2026-08-22T23:36:24.558239349Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1044,
+      "timestamp": "2026-08-22T23:44:49.419688674Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T23:36:24.558239349Z",
+    "timestamp": "2026-08-22T23:44:49.419688674Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1043
+    "agent_seq": 1044
   }
 }
