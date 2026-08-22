@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1169,
+  "next_comment_id": 1170,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9119,7 +9119,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:53:08.818081581Z",
-      "updated_at": "2026-08-22T13:12:07.326656978Z",
+      "updated_at": "2026-08-22T13:57:46.223721236Z",
       "labels": [
         "remediation"
       ],
@@ -9141,6 +9141,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5LiWp0+3JbFTTUCEXeG2LUvhXyRtfPSTE37aSRk5w3nQqIK/QKc+aV9OgBM4wN3gRFVMus/Jf6Za5ycf9cxhBw=="
+        },
+        "53e8fff7-722e-41d9-ba6c-05ee2e08ca22": {
+          "display_id": 1169,
+          "author": "6Vw9",
+          "content": "Pre-commit skeptical review tightened S-055 beyond green tests: reject lone shell background operators; expose pending/run/learned capacity pressure as degraded health; and fail closed when more than 16 mutations make the causal edit set incomplete, so no partial candidate can be persisted. Focused causal E2E now passes 13/13. The full native suite and Windows GNU check passed before these final bounded-state repairs and will be rerun against the exact final diff.",
+          "created_at": "2026-08-22T13:57:46.221259986Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAuS/JMf8MyrOjR39LWxw4T08eAacmXPxU9KVHdPfgMTnDVX/8HV+qYh/lukruGfpj18uKW8vyh3LrgcAXth6SBg=="
         },
         "54b183e7-12d8-4889-b4ad-445b32c2c666": {
           "display_id": 1159,
@@ -32217,11 +32226,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 911,
       "timestamp": "2026-08-22T13:22:54.032401193Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 912,
+      "timestamp": "2026-08-22T13:57:46.223721236Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T13:22:54.032401193Z",
+    "timestamp": "2026-08-22T13:57:46.223721236Z",
     "agent_id": "6Vw9",
-    "agent_seq": 911
+    "agent_seq": 912
   }
 }
