@@ -1,6 +1,6 @@
 {
   "next_display_id": 1097,
-  "next_comment_id": 1220,
+  "next_comment_id": 1221,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3283,7 +3283,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T19:10:00.528199762Z",
-      "updated_at": "2026-08-22T19:10:21.275497238Z",
+      "updated_at": "2026-08-22T19:56:32.132365370Z",
       "labels": [
         "remediation"
       ],
@@ -3296,6 +3296,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA0v71ETktrAv6EudAtCMiOcyb7MOmX2JglNPSKxoE5kH9EWIL5+T0daEA/n9dU1DK3rRv4ii8EnhwzNFT5HoMAQ=="
+        },
+        "e38c6de6-1ebf-4bef-9ae7-58356bce620a": {
+          "display_id": 1220,
+          "author": "6Vw9",
+          "content": "[action] S-064 production wiring implemented across deterministic MCP catalog, fail-closed policy/schema validation, canonical async dispatch, TUI publication/follow-up, and explicit non-advertisement by frontends without owned loops; focused/native/strict Clippy gates green, fuzz matrix and prior-head PR runners still in progress; uncommitted 21-file diff under review",
+          "created_at": "2026-08-22T19:56:32.129788418Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAG3joMfYvc0kIoCY/it/Pb4eozvavmy8ppEpQoNpiGis0n8qVUqCcW369aoGM/bAk3lbvrDWOg34aGCNscF1EAw=="
         }
       }
     },
@@ -33217,11 +33226,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 995,
       "timestamp": "2026-08-22T19:10:21.275497238Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 996,
+      "timestamp": "2026-08-22T19:56:32.132365370Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T19:10:21.275497238Z",
+    "timestamp": "2026-08-22T19:56:32.132365370Z",
     "agent_id": "6Vw9",
-    "agent_seq": 995
+    "agent_seq": 996
   }
 }
