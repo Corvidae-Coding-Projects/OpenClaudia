@@ -2603,23 +2603,9 @@ fn reopen_subagent_memory(
     let Some(memory) = memory_db else {
         return Ok(None);
     };
-    let expected_workspace = memory
-        .workspace_id()
-        .cloned()
-        .ok_or_else(|| "Subagent technical memory is not workspace-bound".to_string())?;
-    let expected_store = memory
-        .store_id()
-        .map_err(|error| format!("Cannot inspect the parent technical-memory store: {error}"))?;
-    let reopened = crate::memory::MemoryDb::open(memory.path())
+    let reopened = memory
+        .reopen_for_subagent()
         .map_err(|error| format!("Cannot reopen technical memory for the subagent: {error}"))?;
-    if reopened.workspace_id() != Some(&expected_workspace)
-        || reopened.store_id().ok().as_ref() != Some(&expected_store)
-    {
-        return Err(
-            "The subagent technical-memory store changed identity while it was reopened"
-                .to_string(),
-        );
-    }
     Ok(Some(Arc::new(reopened)))
 }
 
@@ -3755,6 +3741,44 @@ mod tests {
         let unbound_path = host.path().join("unbound.db");
         let unbound = crate::memory::MemoryDb::open(&unbound_path).expect("unbound store");
         assert!(reopen_subagent_memory(Some(&unbound)).is_err());
+    }
+
+    #[test]
+    fn subagent_reopen_retains_the_exact_authenticated_team_replica() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let principal: crate::team_memory::PrincipalId = "owner".parse().expect("principal");
+        let authority = crate::team_memory::TeamAuthorityStore::bootstrap(
+            host.path(),
+            workspace.path(),
+            principal,
+            31_536_000,
+        )
+        .expect("team authority");
+        let memory = crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("workspace memory");
+        crate::team_memory::activate_team_memory(
+            &memory,
+            host.path(),
+            workspace.path(),
+            authority.team_id().clone(),
+        )
+        .expect("activate team memory");
+        let parent_status = memory
+            .team_replica()
+            .expect("parent team replica")
+            .status()
+            .expect("parent status");
+
+        let reopened = reopen_subagent_memory(Some(&memory))
+            .expect("reopen memory")
+            .expect("subagent memory");
+        let child_status = reopened
+            .team_replica()
+            .expect("subagent team replica")
+            .status()
+            .expect("subagent status");
+        assert_eq!(child_status, parent_status);
     }
 
     #[test]

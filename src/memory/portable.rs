@@ -546,8 +546,12 @@ impl MemoryDb {
         }
 
         control.check()?;
-        Self::validate_current_technical_lesson_projections(conn, Some(workspace_id))
-            .map_err(PortableMemoryError::store)?;
+        Self::validate_current_technical_lesson_projections(
+            conn,
+            Some(workspace_id),
+            Some(MemoryRecordScope::UserPrivate),
+        )
+        .map_err(PortableMemoryError::store)?;
         control.check()?;
         match Self::technical_memory_source_status_on(conn, workspace_id)
             .map_err(PortableMemoryError::store)?
@@ -640,8 +644,12 @@ fn validate_portable_revision(
     }
     match kind {
         LineageKind::TechnicalLesson => {
-            MemoryDb::validate_technical_lesson_lineage_revision(revision, workspace_id)
-                .map_err(PortableMemoryError::store)?;
+            MemoryDb::validate_technical_lesson_lineage_revision(
+                revision,
+                workspace_id,
+                MemoryRecordScope::UserPrivate,
+            )
+            .map_err(PortableMemoryError::store)?;
         }
         LineageKind::SourceState => {
             if revision.state != MemoryRevisionState::Active

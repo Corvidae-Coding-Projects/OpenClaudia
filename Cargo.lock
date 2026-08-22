@@ -3193,6 +3193,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "openclaudia"
 version = "0.5.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arboard",
  "arborium",
@@ -3210,6 +3211,8 @@ dependencies = [
  "futures",
  "headless_chrome",
  "htmd",
+ "hyper",
+ "hyper-util",
  "indicatif",
  "libc",
  "proptest",
@@ -3218,6 +3221,8 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "rustyline",
  "scraper",
  "serde",
@@ -3229,6 +3234,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "url",

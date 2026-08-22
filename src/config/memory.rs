@@ -5,9 +5,9 @@
 //! store; configuration can never create them. The former shared-directory
 //! proposal is retained only as a rejected migration diagnostic.
 //!
-//! The private causal-replica implementation is retained for S-104, but its
-//! transport and authorization will be driven by signed team identity rather
-//! than a repository-selected location.
+//! The production replica uses signed team identity, encrypted host-owned
+//! state, and a pinned bounded transport rather than a repository-selected
+//! location. The older path-based engine remains compatibility-only.
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -26,8 +26,8 @@ pub struct MemoryConfig {
     /// Host-approved team selected for this repository.
     ///
     /// The identifier is only a selector. Loading it never creates or widens
-    /// membership, and S-104 must authenticate every data operation through
-    /// the corresponding host-owned authority file.
+    /// membership; every data operation is authenticated through the
+    /// corresponding host-owned authority file.
     #[serde(default)]
     pub team_id: Option<TeamId>,
     /// Directory containing a shared team memory database.

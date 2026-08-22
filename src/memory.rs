@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{BufReader, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
@@ -174,7 +174,8 @@ pub struct ArchivalMemory {
 }
 
 /// Metadata for one unresolved concurrent branch of a logical memory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryConflictHead {
     pub version: MemoryVersion,
     pub record_digest: MemoryDigest,
@@ -294,7 +295,35 @@ pub struct MemoryDb {
     conn: Mutex<Connection>,
     path: PathBuf,
     workspace_id: Option<WorkspaceMemoryId>,
+    authority_scope: Option<MemoryRecordScope>,
     approval_workspace_digest: Option<String>,
+    team_replication: OnceLock<TeamReplicationBinding>,
+}
+
+struct TeamReplicationBinding {
+    replica: Arc<crate::team_memory::TeamReplica>,
+    supervisor: Option<Arc<crate::team_memory::TeamReplicationSupervisor>>,
+}
+
+pub(crate) enum TeamSynchronizationRequest {
+    Scheduled,
+    Offline,
+    AlreadyQueued,
+}
+
+impl MemoryDb {
+    fn scope_for_authority_kind(authority_kind: &str) -> Option<MemoryRecordScope> {
+        match authority_kind {
+            "user_private" => Some(MemoryRecordScope::UserPrivate),
+            "team_shared" => Some(MemoryRecordScope::TeamShared),
+            _ => None,
+        }
+    }
+
+    fn technical_authority_scope(&self) -> Result<MemoryRecordScope> {
+        self.authority_scope
+            .context("technical lessons require a typed store authority")
+    }
 }
 
 struct ValidatedTechnicalLessonQuery {
@@ -361,13 +390,15 @@ impl MemoryDb {
 
         // Run schema migrations on the bare connection before wrapping in Mutex
         Self::ensure_schema_on(&conn, existing_version)?;
-        let workspace_id = Self::load_workspace_binding(&conn)?;
+        let (workspace_id, authority_scope) = Self::load_workspace_authority(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
             workspace_id,
+            authority_scope,
             approval_workspace_digest: None,
+            team_replication: OnceLock::new(),
         })
     }
 
@@ -428,9 +459,148 @@ impl MemoryDb {
         Self::validate_private_database_file(&host_home, &database_path)?;
         database.bind_workspace_authority(&workspace_id, "user_private")?;
         database.workspace_id = Some(workspace_id);
+        database.authority_scope = Some(MemoryRecordScope::UserPrivate);
         database.approval_workspace_digest =
             Some(crate::permissions::approval_workspace_digest(&project_dir));
         Ok(database)
+    }
+
+    pub(crate) fn open_ephemeral_team_replica(
+        workspace_id: &WorkspaceMemoryId,
+        store_id: MemoryStoreId,
+    ) -> Result<Self> {
+        let conn = Connection::open_in_memory().context("opening in-memory team replica")?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
+            .context("configuring in-memory team replica")?;
+        Self::ensure_schema_on(&conn, 0)?;
+        anyhow::ensure!(
+            conn.execute(
+                "UPDATE memory_store_metadata SET store_id = ?1 WHERE singleton = 1",
+                params![store_id.to_string()],
+            )? == 1,
+            "team replica physical store identity was not installed"
+        );
+        let mut database = Self {
+            conn: Mutex::new(conn),
+            path: PathBuf::from(":memory:"),
+            workspace_id: None,
+            authority_scope: None,
+            approval_workspace_digest: None,
+            team_replication: OnceLock::new(),
+        };
+        database.bind_workspace_authority(workspace_id, "team_shared")?;
+        database.workspace_id = Some(workspace_id.clone());
+        database.authority_scope = Some(MemoryRecordScope::TeamShared);
+        Ok(database)
+    }
+
+    pub(crate) fn attach_team_replication(
+        &self,
+        replica: Arc<crate::team_memory::TeamReplica>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.authority_scope == Some(MemoryRecordScope::UserPrivate),
+            "team replication can attach only to the user-private production store"
+        );
+        let workspace_id = self
+            .workspace_id
+            .as_ref()
+            .context("team replication requires a workspace-bound private store")?;
+        let status = replica.status().map_err(anyhow::Error::new)?;
+        anyhow::ensure!(
+            &status.workspace_id == workspace_id,
+            "team replica belongs to a different workspace"
+        );
+        let supervisor = status
+            .service_configured
+            .then(|| crate::team_memory::TeamReplicationSupervisor::start(Arc::clone(&replica)))
+            .transpose()
+            .map_err(anyhow::Error::new)?
+            .map(Arc::new);
+        let binding = TeamReplicationBinding {
+            replica,
+            supervisor,
+        };
+        self.team_replication
+            .set(binding)
+            .map_err(|_| anyhow::anyhow!("team replication is already attached"))
+    }
+
+    pub(crate) fn team_replica(&self) -> Option<&crate::team_memory::TeamReplica> {
+        self.team_replication
+            .get()
+            .map(|binding| binding.replica.as_ref())
+    }
+
+    pub(crate) fn request_team_synchronization(&self) -> Result<TeamSynchronizationRequest> {
+        let binding = self
+            .team_replication
+            .get()
+            .context("team memory is not configured")?;
+        let Some(supervisor) = &binding.supervisor else {
+            return Ok(TeamSynchronizationRequest::Offline);
+        };
+        supervisor
+            .request_sync()
+            .map(|scheduled| {
+                if scheduled {
+                    TeamSynchronizationRequest::Scheduled
+                } else {
+                    TeamSynchronizationRequest::AlreadyQueued
+                }
+            })
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Run and observe one bounded synchronization cycle for the attached
+    /// authenticated team replica.
+    ///
+    /// # Errors
+    /// Returns an error when no team/service is configured, authorization or
+    /// identity validation fails, the transport is unavailable, or durable
+    /// replica publication cannot be confirmed.
+    pub fn synchronize_team_now(&self) -> Result<crate::team_memory::TeamSyncReport> {
+        let binding = self
+            .team_replication
+            .get()
+            .context("team memory is not configured")?;
+        binding
+            .supervisor
+            .as_ref()
+            .ok_or(crate::team_memory::TeamReplicationError::Unconfigured)
+            .and_then(|supervisor| supervisor.synchronize_now())
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn reopen_for_subagent(&self) -> Result<Self> {
+        let expected_workspace = self
+            .workspace_id
+            .as_ref()
+            .context("subagent technical memory requires a workspace-bound store")?;
+        let expected_store = self.store_id()?;
+        let expected_scope = self
+            .authority_scope
+            .context("subagent technical memory requires a typed store authority")?;
+        let mut reopened = Self::open(&self.path)?;
+        anyhow::ensure!(
+            reopened.workspace_id.as_ref() == Some(expected_workspace)
+                && reopened.store_id()? == expected_store
+                && reopened.authority_scope == Some(expected_scope),
+            "subagent technical-memory store identity or authority changed while reopening"
+        );
+        reopened
+            .approval_workspace_digest
+            .clone_from(&self.approval_workspace_digest);
+        if let Some(binding) = self.team_replication.get() {
+            reopened
+                .team_replication
+                .set(TeamReplicationBinding {
+                    replica: Arc::clone(&binding.replica),
+                    supervisor: binding.supervisor.as_ref().map(Arc::clone),
+                })
+                .map_err(|_| anyhow::anyhow!("subagent team replication attached twice"))?;
+        }
+        Ok(reopened)
     }
 
     #[cfg(not(unix))]
@@ -1421,24 +1591,32 @@ impl MemoryDb {
             stored_schema_digest == &Self::schema_manifest_digest(conn)?,
             "memory store schema digest does not match its exact object definitions"
         );
-        let workspace_id = match (authority.as_str(), workspace.as_deref()) {
-            ("explicit_unbound", None) => None,
-            ("user_private" | "team_shared", Some(encoded)) => Some(
-                encoded
-                    .parse()
-                    .context("memory store workspace binding is malformed")?,
+        let (workspace_id, authority_scope) = match (authority.as_str(), workspace.as_deref()) {
+            ("explicit_unbound", None) => (None, None),
+            (kind @ ("user_private" | "team_shared"), Some(encoded)) => (
+                Some(
+                    encoded
+                        .parse()
+                        .context("memory store workspace binding is malformed")?,
+                ),
+                Self::scope_for_authority_kind(kind),
             ),
             _ => anyhow::bail!("memory store authority binding is inconsistent"),
         };
-        Self::validate_current_technical_lesson_projections(conn, workspace_id.as_ref())?;
+        Self::validate_current_technical_lesson_projections(
+            conn,
+            workspace_id.as_ref(),
+            authority_scope,
+        )?;
         Ok(())
     }
 
     fn validate_current_technical_lesson_projections(
         conn: &Connection,
         workspace_id: Option<&WorkspaceMemoryId>,
+        authority_scope: Option<MemoryRecordScope>,
     ) -> Result<()> {
-        Self::validate_technical_lesson_revision_history(conn, workspace_id)?;
+        Self::validate_technical_lesson_revision_history(conn, workspace_id, authority_scope)?;
         let rows = Self::memory_search_by_tag_on(
             conn,
             TECHNICAL_LESSON_TAG,
@@ -1453,8 +1631,10 @@ impl MemoryDb {
         }
         let workspace_id = workspace_id
             .context("an unbound memory store cannot contain typed technical lessons")?;
+        let authority_scope = authority_scope
+            .context("an unbound memory store cannot contain typed technical lessons")?;
         for row in &rows {
-            Self::decode_technical_lesson_row(conn, row, workspace_id)?;
+            Self::decode_technical_lesson_row(conn, row, workspace_id, authority_scope)?;
         }
         Ok(())
     }
@@ -1465,6 +1645,7 @@ impl MemoryDb {
     fn validate_technical_lesson_revision_history(
         conn: &Connection,
         workspace_id: Option<&WorkspaceMemoryId>,
+        authority_scope: Option<MemoryRecordScope>,
     ) -> Result<()> {
         let total_revisions: i64 =
             conn.query_row("SELECT COUNT(*) FROM memory_revisions", [], |row| {
@@ -1528,24 +1709,41 @@ impl MemoryDb {
             let revision = Self::revision_from_row(row)?;
             let workspace_id = workspace_id
                 .context("an unbound memory store cannot contain typed technical lessons")?;
-            Self::validate_technical_lesson_lineage_revision(&revision, workspace_id)?;
+            let authority_scope = authority_scope
+                .context("an unbound memory store cannot contain typed technical lessons")?;
+            Self::validate_technical_lesson_lineage_revision(
+                &revision,
+                workspace_id,
+                authority_scope,
+            )?;
             Self::validate_host_review_audit_on(conn, &revision, workspace_id)?;
         }
         Ok(())
     }
 
-    fn load_workspace_binding(conn: &Connection) -> Result<Option<WorkspaceMemoryId>> {
+    fn load_workspace_authority(
+        conn: &Connection,
+    ) -> Result<(Option<WorkspaceMemoryId>, Option<MemoryRecordScope>)> {
         if !Self::table_exists(conn, "memory_store_contract")? {
-            return Ok(None);
+            return Ok((None, None));
         }
-        let encoded: Option<String> = conn.query_row(
-            "SELECT workspace_id FROM memory_store_contract WHERE singleton = 1",
+        let (authority_kind, encoded): (String, Option<String>) = conn.query_row(
+            "SELECT authority_kind, workspace_id FROM memory_store_contract WHERE singleton = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        encoded
-            .map(|value| value.parse().context("invalid memory workspace binding"))
-            .transpose()
+        match (authority_kind.as_str(), encoded) {
+            ("explicit_unbound", None) => Ok((None, None)),
+            (kind @ ("user_private" | "team_shared"), Some(workspace_id)) => Ok((
+                Some(
+                    workspace_id
+                        .parse()
+                        .context("invalid memory workspace binding")?,
+                ),
+                Self::scope_for_authority_kind(kind),
+            )),
+            _ => anyhow::bail!("memory authority and workspace binding are inconsistent"),
+        }
     }
 
     fn bind_workspace_authority(
@@ -3193,6 +3391,7 @@ impl MemoryDb {
             .workspace_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
+        let authority_scope = self.technical_authority_scope()?;
         let provenance = MemoryProvenance::new(
             source,
             MemoryAttribution::new(
@@ -3200,9 +3399,9 @@ impl MemoryDb {
                 Some(self.store_id()?),
                 Some(workspace_id.to_string()),
             ),
-            MemoryRecordScope::UserPrivate,
+            authority_scope,
         );
-        Self::validate_technical_lesson_provenance(&provenance, &workspace_id)?;
+        Self::validate_technical_lesson_provenance(&provenance, &workspace_id, authority_scope)?;
         let logical_id =
             LogicalMemoryId::for_technical_source(workspace_id.as_str(), &provenance.source_id);
         if let Some(record) = self.existing_idempotent_technical_lesson(
@@ -3274,7 +3473,11 @@ impl MemoryDb {
             .next()
             .context("idempotent technical lesson head disappeared")?;
         revision.validate()?;
-        Self::validate_technical_lesson_provenance(&revision.provenance, workspace_id)?;
+        Self::validate_technical_lesson_provenance(
+            &revision.provenance,
+            workspace_id,
+            self.technical_authority_scope()?,
+        )?;
         if revision.version != MemoryVersion::INITIAL
             || revision.parent_digest.is_some()
             || revision.state != MemoryRevisionState::Active
@@ -3332,9 +3535,11 @@ impl MemoryDb {
             .workspace_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
+        let authority_scope = self.technical_authority_scope()?;
         let query = Self::validate_technical_lesson_query(query)?;
         let mut candidates = self.collect_technical_lesson_candidates(
             &workspace_id,
+            authority_scope,
             &query.terms,
             now_unix_seconds,
         )?;
@@ -3433,12 +3638,14 @@ impl MemoryDb {
     fn collect_technical_lesson_candidates(
         &self,
         workspace_id: &WorkspaceMemoryId,
+        authority_scope: MemoryRecordScope,
         query_terms: &[String],
         now_unix_seconds: i64,
     ) -> Result<TechnicalLessonCandidates> {
         Self::collect_technical_lesson_candidates_on(
             &*self.lock_conn()?,
             workspace_id,
+            authority_scope,
             query_terms,
             now_unix_seconds,
         )
@@ -3447,6 +3654,7 @@ impl MemoryDb {
     fn collect_technical_lesson_candidates_on(
         conn: &Connection,
         workspace_id: &WorkspaceMemoryId,
+        authority_scope: MemoryRecordScope,
         query_terms: &[String],
         now_unix_seconds: i64,
     ) -> Result<TechnicalLessonCandidates> {
@@ -3476,7 +3684,8 @@ impl MemoryDb {
                 break;
             }
             scanned_bytes = next_bytes;
-            let lesson = Self::decode_technical_lesson_row(conn, &row, workspace_id)?;
+            let lesson =
+                Self::decode_technical_lesson_row(conn, &row, workspace_id, authority_scope)?;
             if lesson.is_expired_at(now_unix_seconds) {
                 result.omitted_expired += 1;
                 continue;
@@ -3538,6 +3747,7 @@ impl MemoryDb {
             .workspace_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
+        let authority_scope = self.technical_authority_scope()?;
         let heads = self.revision_heads(logical_id)?;
         if heads.len() > 1 {
             return Err(TechnicalLessonStoreError::UnresolvedConflict.into());
@@ -3556,7 +3766,7 @@ impl MemoryDb {
             ),
             current.provenance.scope,
         );
-        Self::validate_technical_lesson_provenance(&provenance, &workspace_id)?;
+        Self::validate_technical_lesson_provenance(&provenance, &workspace_id, authority_scope)?;
         if current.record_digest != expected_record_digest {
             if let Some(record) =
                 self.existing_idempotent_technical_correction(TechnicalCorrectionReplay {
@@ -3692,6 +3902,7 @@ impl MemoryDb {
             .workspace_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
+        let authority_scope = self.technical_authority_scope()?;
         let heads = self.revision_heads(logical_id)?;
         if heads.len() > 1 {
             return Err(TechnicalLessonStoreError::UnresolvedConflict.into());
@@ -3710,7 +3921,7 @@ impl MemoryDb {
             ),
             current.provenance.scope,
         );
-        Self::validate_technical_lesson_provenance(&provenance, &workspace_id)?;
+        Self::validate_technical_lesson_provenance(&provenance, &workspace_id, authority_scope)?;
         if current.state == MemoryRevisionState::Tombstone
             && current.parent_digest.as_ref() == Some(expected_record_digest)
             && current.provenance.source_id == provenance.source_id
@@ -3751,6 +3962,7 @@ impl MemoryDb {
         conn: &Connection,
         row: &ArchivalMemory,
         workspace_id: &WorkspaceMemoryId,
+        authority_scope: MemoryRecordScope,
     ) -> Result<TechnicalLesson> {
         anyhow::ensure!(
             row.tags.iter().any(|tag| tag == TECHNICAL_LESSON_TAG),
@@ -3765,7 +3977,7 @@ impl MemoryDb {
             .collect::<Result<Vec<_>>>()?;
         anyhow::ensure!(!heads.is_empty(), "technical lesson has no causal head");
         for head in &heads {
-            Self::validate_technical_lesson_lineage_revision(head, workspace_id)?;
+            Self::validate_technical_lesson_lineage_revision(head, workspace_id, authority_scope)?;
             Self::validate_host_review_audit_on(conn, head, workspace_id)?;
         }
 
@@ -3826,8 +4038,8 @@ impl MemoryDb {
             "technical lesson provenance workspace does not match the store"
         );
         anyhow::ensure!(
-            row.provenance.scope == MemoryRecordScope::UserPrivate,
-            "technical lesson is outside the user-private authority"
+            row.provenance.scope == authority_scope,
+            "technical lesson is outside the store authority"
         );
         Ok(lesson)
     }
@@ -3873,7 +4085,8 @@ impl MemoryDb {
             .workspace_id
             .as_ref()
             .context("an unbound memory store cannot contain typed technical lessons")?;
-        Self::validate_technical_lesson_lineage_revision(revision, workspace_id)?;
+        let authority_scope = self.technical_authority_scope()?;
+        Self::validate_technical_lesson_lineage_revision(revision, workspace_id, authority_scope)?;
         if revision.state == MemoryRevisionState::Active {
             let lesson = TechnicalLesson::decode(&revision.content)?;
             anyhow::ensure!(
@@ -3891,13 +4104,18 @@ impl MemoryDb {
     fn validate_technical_lesson_lineage_revision(
         revision: &MemoryRevision,
         workspace_id: &WorkspaceMemoryId,
+        authority_scope: MemoryRecordScope,
     ) -> Result<()> {
         if revision.state == MemoryRevisionState::Active {
-            Self::validate_technical_lesson_revision(revision, workspace_id)?;
+            Self::validate_technical_lesson_revision(revision, workspace_id, authority_scope)?;
             return Ok(());
         }
         revision.validate()?;
-        Self::validate_technical_lesson_provenance(&revision.provenance, workspace_id)?;
+        Self::validate_technical_lesson_provenance(
+            &revision.provenance,
+            workspace_id,
+            authority_scope,
+        )?;
         anyhow::ensure!(
             revision.parent_digest.is_some(),
             "technical lesson tombstone has no causal parent"
@@ -3908,13 +4126,18 @@ impl MemoryDb {
     fn validate_technical_lesson_revision(
         revision: &MemoryRevision,
         workspace_id: &WorkspaceMemoryId,
+        authority_scope: MemoryRecordScope,
     ) -> Result<TechnicalLesson> {
         revision.validate()?;
         anyhow::ensure!(
             revision.state == MemoryRevisionState::Active,
             "a tagged technical lesson revision must be active"
         );
-        Self::validate_technical_lesson_provenance(&revision.provenance, workspace_id)?;
+        Self::validate_technical_lesson_provenance(
+            &revision.provenance,
+            workspace_id,
+            authority_scope,
+        )?;
         let lesson = TechnicalLesson::decode(&revision.content)?;
         anyhow::ensure!(
             &lesson.workspace_id == workspace_id,
@@ -3956,6 +4179,7 @@ impl MemoryDb {
     fn validate_technical_lesson_provenance(
         provenance: &MemoryProvenance,
         workspace_id: &WorkspaceMemoryId,
+        authority_scope: MemoryRecordScope,
     ) -> Result<()> {
         anyhow::ensure!(
             provenance.schema_version == MEMORY_PROVENANCE_SCHEMA_VERSION,
@@ -3981,8 +4205,8 @@ impl MemoryDb {
             "technical lesson provenance workspace does not match the store"
         );
         anyhow::ensure!(
-            provenance.scope == MemoryRecordScope::UserPrivate,
-            "technical lesson provenance is outside the user-private authority"
+            provenance.scope == authority_scope,
+            "technical lesson provenance is outside the store authority"
         );
         anyhow::ensure!(
             provenance.source_kind != MemorySourceKind::LegacyUnattributed,
@@ -5022,6 +5246,23 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let _db = MemoryDb::open(&db_path).unwrap();
         assert!(db_path.exists());
+    }
+
+    #[test]
+    fn subagent_reopen_rejects_an_authority_scope_replacement() {
+        let host = tempdir().expect("host home");
+        let workspace = tempdir().expect("workspace");
+        let db = MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("private workspace memory");
+        db.lock_conn()
+            .expect("memory connection")
+            .execute(
+                "UPDATE memory_store_contract SET authority_kind = 'team_shared' WHERE singleton = 1",
+                [],
+            )
+            .expect("replace persisted authority scope");
+
+        assert!(db.reopen_for_subagent().is_err());
     }
 
     #[test]

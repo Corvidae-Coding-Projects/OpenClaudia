@@ -244,11 +244,14 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
         ),
         "Interactive frontends open one host-owned workspace store and expose typed technical lessons only through explicit tools.",
     ),
-    LifecycleServiceRegistration::classified(
+    LifecycleServiceRegistration::wired(
         LifecycleServiceId::TeamMemory,
-        LifecycleServiceClassification::Unavailable,
-        "Host-owned authenticated authority is reachable through `openclaudia team`, but lesson data remains unavailable until the bounded replication service consumes those grants; legacy path activation fails visibly.",
-        Some("S-104"),
+        LifecyclePath::new(
+            "team_memory::activate_team_memory/openclaudia team configure-service|serve",
+            "canonical scoped memory_* tools and TeamReplicationSupervisor push/pull",
+            "TeamReplicationSupervisor::shutdown/drop and serve_team_memory_tls shutdown",
+        ),
+        "Configured frontends attach a host-owned encrypted replica, consume S-103 grants for exact scoped operations, and own bounded transport shutdown; legacy shared-path activation remains rejected.",
     ),
     LifecycleServiceRegistration::wired(
         LifecycleServiceId::Guardrails,

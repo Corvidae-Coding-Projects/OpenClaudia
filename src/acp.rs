@@ -879,6 +879,17 @@ impl AcpServer {
             crate::memory::MemoryDb::open_for_workspace(host_home, &launch_root)
                 .map_err(|error| format!("opening ACP technical memory failed: {error}"))?,
         );
+        if let Some(team_id) = config.memory.team_id.clone() {
+            crate::team_memory::activate_team_memory(
+                memory_db.as_ref(),
+                host_home,
+                &launch_root,
+                team_id,
+            )
+            .map_err(|error| {
+                format!("activating ACP authenticated team technical memory failed: {error}")
+            })?;
+        }
         let persist_dir = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("openclaudia")
@@ -4103,6 +4114,48 @@ permissions:
         server
             .execute_tool_via_acp(run, "unit-test", call_id, name, &arguments.to_string())
             .await
+    }
+
+    #[tokio::test]
+    async fn acp_startup_activates_the_configured_authenticated_team_replica() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let principal: crate::team_memory::PrincipalId = "owner".parse().expect("principal");
+        let authority = crate::team_memory::TeamAuthorityStore::bootstrap(
+            host.path(),
+            workspace.path(),
+            principal,
+            31_536_000,
+        )
+        .expect("team authority");
+        let mut config = test_config();
+        config.memory.team_id = Some(authority.team_id().clone());
+        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
+        let server = AcpServer::new_with_host_home(
+            config,
+            "local-model".to_string(),
+            None,
+            None,
+            stdout_tx,
+            workspace.path().to_path_buf(),
+            host.path().to_path_buf(),
+        )
+        .expect("ACP startup");
+        let run = Arc::clone(&server.launch_capabilities);
+
+        let listed = execute_acp_memory_tool(
+            &server,
+            &run,
+            "s104-acp-team-list",
+            "memory_list",
+            json!({"scope": "team", "limit": 5}),
+        )
+        .await;
+        assert!(
+            !listed.is_error,
+            "ACP configured team list failed: {}",
+            listed.content
+        );
     }
 
     fn assert_agent_proposal(record: &crate::memory::TechnicalLessonRecord) {

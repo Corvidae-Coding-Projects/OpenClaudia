@@ -42,6 +42,13 @@ impl TechnicalLessonReviewAction {
             Self::Revoke => "revoke",
         }
     }
+
+    const fn result_status(self) -> TechnicalLessonReviewStatus {
+        match self {
+            Self::Review => TechnicalLessonReviewStatus::Reviewed,
+            Self::Revoke => TechnicalLessonReviewStatus::Revoked,
+        }
+    }
 }
 
 /// Truthful review mutation outcome.
@@ -140,8 +147,11 @@ impl MemoryDb {
             let reviewed_revision =
                 Self::load_revision_by_digest(conn, &audit.resulting_record_digest)?
                     .context("host-review audit result revision is unavailable")?;
-            let lesson =
-                Self::validate_technical_lesson_revision(&reviewed_revision, workspace_id)?;
+            let lesson = Self::validate_technical_lesson_revision(
+                &reviewed_revision,
+                workspace_id,
+                MemoryRecordScope::UserPrivate,
+            )?;
             audit.validate_for_revision(
                 &reviewed_revision,
                 &lesson,
@@ -211,7 +221,11 @@ impl MemoryDb {
             current.state == MemoryRevisionState::Active,
             "technical lesson is deleted"
         );
-        let lesson = Self::validate_technical_lesson_revision(&current, workspace_id)?;
+        let lesson = Self::validate_technical_lesson_revision(
+            &current,
+            workspace_id,
+            MemoryRecordScope::UserPrivate,
+        )?;
         Self::validate_host_review_audit_on(conn, &current, workspace_id)?;
 
         match (&lesson.review, request.action) {
@@ -291,7 +305,11 @@ impl MemoryDb {
             action,
             source_digest,
         );
-        Self::validate_technical_lesson_provenance(&provenance, workspace_id)?;
+        Self::validate_technical_lesson_provenance(
+            &provenance,
+            workspace_id,
+            MemoryRecordScope::UserPrivate,
+        )?;
         let revision = current.successor(
             next_lesson.encode()?,
             vec![
@@ -341,10 +359,7 @@ impl MemoryDb {
             )?;
         }
         Ok(TechnicalLessonReviewResult {
-            status: match action {
-                TechnicalLessonReviewAction::Review => TechnicalLessonReviewStatus::Reviewed,
-                TechnicalLessonReviewAction::Revoke => TechnicalLessonReviewStatus::Revoked,
-            },
+            status: action.result_status(),
             logical_id: revision.logical_id,
             previous_record_digest: current.record_digest.clone(),
             record_digest: revision.record_digest,
@@ -368,7 +383,11 @@ impl MemoryDb {
         {
             return Ok(None);
         }
-        let lesson = Self::validate_technical_lesson_revision(current, workspace_id)?;
+        let lesson = Self::validate_technical_lesson_revision(
+            current,
+            workspace_id,
+            MemoryRecordScope::UserPrivate,
+        )?;
         Self::validate_host_review_audit_on(conn, current, workspace_id)?;
         let audit_revision =
             Self::load_review_audit_revision_on(conn, workspace_id, &request.approval.receipt_id)?;

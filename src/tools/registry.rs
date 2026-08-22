@@ -1303,6 +1303,32 @@ fn technical_lesson_draft_schema() -> Value {
     })
 }
 
+fn memory_write_scope_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["user", "team"],
+        "default": "user",
+        "description": "Explicit destination authority. `user` remains host-private; `team` writes only to the authenticated encrypted team replica."
+    })
+}
+
+fn memory_read_scope_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["user", "team", "both"],
+        "default": "user",
+        "description": "Explicit retrieval authority. `both` returns one bounded typed result with each record's original scope and truthful team freshness/conflict state."
+    })
+}
+
+fn technical_lesson_save_schema() -> Value {
+    let mut schema = technical_lesson_draft_schema();
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("scope".to_string(), memory_write_scope_schema());
+    }
+    schema
+}
+
 struct MemorySaveHandler;
 impl ToolHandler for MemorySaveHandler {
     fn name(&self) -> &'static str {
@@ -1322,8 +1348,8 @@ impl ToolHandler for MemorySaveHandler {
             "type": "function",
             "function": {
                 "name": "memory_save",
-                "description": "Save one codebase-specific technical lesson with exact applicability and digest-bound citations. This does not save conversation prose, transcripts, prompts, or arbitrary notes. Saved candidates remain untrusted reference evidence and are retrieved only by explicit memory tool calls.",
-                "parameters": technical_lesson_draft_schema()
+                "description": "Save one codebase-specific technical lesson to an explicit private or authenticated-team scope with exact applicability and digest-bound citations. This does not save conversation prose, transcripts, prompts, or arbitrary notes. Saved candidates remain untrusted reference evidence and are retrieved only by explicit memory tool calls.",
+                "parameters": technical_lesson_save_schema()
             }
         })
     }
@@ -1362,7 +1388,8 @@ impl ToolHandler for MemorySearchHandler {
                     "additionalProperties": false,
                     "properties": {
                         "query": {"type": "string", "minLength": 1, "maxLength": 512},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                        "scope": memory_read_scope_schema()
                     },
                     "required": ["query"]
                 }
@@ -1403,7 +1430,8 @@ impl ToolHandler for MemoryListHandler {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                        "scope": memory_read_scope_schema()
                     }
                 }
             }
@@ -1446,7 +1474,8 @@ impl ToolHandler for MemoryUpdateHandler {
                         "logical_id": {"type": "string", "format": "uuid"},
                         "expected_record_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
                         "correction_reason": {"type": "string", "minLength": 1, "maxLength": MAX_LESSON_CORRECTION_BYTES},
-                        "replacement": technical_lesson_draft_schema()
+                        "replacement": technical_lesson_draft_schema(),
+                        "scope": memory_write_scope_schema()
                     },
                     "required": ["logical_id", "expected_record_digest", "correction_reason", "replacement"]
                 }
@@ -1488,7 +1517,8 @@ impl ToolHandler for MemoryDeleteHandler {
                     "additionalProperties": false,
                     "properties": {
                         "logical_id": {"type": "string", "format": "uuid"},
-                        "expected_record_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+                        "expected_record_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                        "scope": memory_write_scope_schema()
                     },
                     "required": ["logical_id", "expected_record_digest"]
                 }

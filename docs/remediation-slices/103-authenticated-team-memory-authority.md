@@ -86,14 +86,15 @@ Architecture generations: `team-authority-state-v1` and
 - Losing an ordinary principal credential requires fresh owner-approved
   enrollment. Losing the sole authority signing credential has no insecure
   reset path: existing members remain bounded by their signed roles/expiries
-  and must export permitted lessons into a newly bootstrapped team once S-104
-  exists. Offline hosts retain signed state and fail stale/revoked grants after
+  and must migrate permitted lessons through explicit typed reads and writes
+  into a newly bootstrapped team. Offline hosts retain signed state and fail
+  stale/revoked grants after
   importing a newer bundle.
 - The legacy `memory.team_memory_path` input remains parseable only to produce
   a permanent migration error. `TeamMemoryStore::open` rejects it before
-  creating a directory or database. The causal replica engine is retained
-  privately and unit-tested for S-104 adaptation rather than being deleted or
-  exposed as path-based authority.
+  creating a directory or database. S-104 now exposes the causal replica only
+  through authenticated encrypted host-owned storage, never as path-based
+  authority.
 
 ## Adversarial evidence
 
@@ -110,8 +111,8 @@ Architecture generations: `team-authority-state-v1` and
 - `tests/memory_identity_e2e.rs` and
   `tests/team_memory_thinking_e2e.rs` retain direct causal-identity coverage
   while asserting that production path activation is rejected without side
-  effects. Detailed preserved replica behavior remains covered by private unit
-  tests until S-104 wires the authenticated data plane.
+  effects. S-104 separately binds the authenticated encrypted data plane to the
+  public tools, host CLI, startup frontends, and transport tests.
 
 Current focused Rust 1.98.0 evidence (`CARGO_BUILD_JOBS=4`, tests with
 `--test-threads=1`):
@@ -145,7 +146,7 @@ non-slice artifacts is
 The capability registry was deliberately not regenerated or promoted by this
 slice. Its final-state receipts bind the reviewed S-001 corpus; changing that
 artifact requires a new independent corpus review rather than fabricated hash
-updates. S-088 owns artifact-bound VDD. S-104 owns encrypted bounded lesson
-replication and tool/frontend data access. Non-Unix private-memory runtime
+updates. S-088 owns artifact-bound VDD. S-104 implements encrypted bounded
+lesson replication and tool/frontend data access. Non-Unix private-memory runtime
 availability remains dependent on the descriptor-safe platform backend from
 S-036; cross-target compilation is still required here.

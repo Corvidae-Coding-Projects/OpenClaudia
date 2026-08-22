@@ -797,7 +797,11 @@ impl MemoryDb {
                 revision.record_digest
             }
             Some(current) => {
-                Self::validate_technical_lesson_revision(&current, workspace_id)?;
+                Self::validate_technical_lesson_revision(
+                    &current,
+                    workspace_id,
+                    MemoryRecordScope::UserPrivate,
+                )?;
                 let previous = TechnicalLesson::decode(&current.content)?;
                 if previous.draft() == entry.lesson {
                     counts.unchanged += 1;
@@ -876,7 +880,11 @@ impl MemoryDb {
         }
         let current = Self::load_revision_by_digest(conn, &prior.record_digest)?
             .context("technical-memory member head is missing")?;
-        Self::validate_technical_lesson_revision(&current, workspace_id)?;
+        Self::validate_technical_lesson_revision(
+            &current,
+            workspace_id,
+            MemoryRecordScope::UserPrivate,
+        )?;
         let provenance = imported_provenance(
             MemorySourceEvidence::new(
                 MemorySourceKind::Imported,
@@ -1066,7 +1074,11 @@ impl MemoryDb {
         {
             return Err(TechnicalMemorySourceStoreError::CausalConflict.into());
         }
-        Self::validate_technical_lesson_revision(reviewed_revision, workspace_id)?;
+        Self::validate_technical_lesson_revision(
+            reviewed_revision,
+            workspace_id,
+            MemoryRecordScope::UserPrivate,
+        )?;
         Self::validate_host_review_transition_on(conn, reviewed_revision, workspace_id)?;
         member
             .record_digest
@@ -1206,7 +1218,12 @@ impl MemoryDb {
         review_lineage_budget: &mut usize,
     ) -> Result<bool> {
         loop {
-            if Self::validate_technical_lesson_revision(&revision, workspace_id).is_err()
+            if Self::validate_technical_lesson_revision(
+                &revision,
+                workspace_id,
+                MemoryRecordScope::UserPrivate,
+            )
+            .is_err()
                 || revision.logical_id != member.logical_id
             {
                 return Ok(false);

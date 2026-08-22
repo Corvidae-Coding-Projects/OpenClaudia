@@ -70,7 +70,7 @@ fn every_service_has_one_unambiguous_audited_disposition() {
         ),
         (
             LifecycleServiceId::TeamMemory,
-            LifecycleServiceClassification::Unavailable,
+            LifecycleServiceClassification::Wired,
         ),
         (
             LifecycleServiceId::Guardrails,
@@ -167,7 +167,7 @@ fn configured_team_memory_fails_visibly_instead_of_being_ignored() {
     assert!(text.contains("filesystem path is never"));
     assert!(text.contains("authenticated team authority"));
     assert!(text.contains("configure memory.team_id after host enrollment"));
-    assert!(text.contains("replication tracked by S-104"));
+    assert!(text.contains("signed service descriptor"));
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn environment_configured_team_memory_fails_at_the_same_boundary() {
     assert!(text.contains("filesystem path is never"));
     assert!(text.contains("authenticated team authority"));
     assert!(text.contains("configure memory.team_id after host enrollment"));
-    assert!(text.contains("replication tracked by S-104"));
+    assert!(text.contains("signed service descriptor"));
 }
 
 #[test]

@@ -25,6 +25,7 @@ use openclaudia::{
 };
 
 use clap::{builder::PossibleValuesParser, Parser, Subcommand};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -362,6 +363,54 @@ enum TeamCommands {
         #[arg(long)]
         team_id: Option<String>,
     },
+    /// Show the encrypted local team-replica status without lesson content
+    ReplicaStatus {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Emit a fresh short-lived descriptor for an existing team-memory service
+    ServiceDescriptor {
+        #[arg(long)]
+        team_id: Option<String>,
+        /// Externally reachable HTTPS origin encoded into the signed descriptor
+        #[arg(long)]
+        endpoint: String,
+        /// Exact DER-encoded leaf certificate presented by this service
+        #[arg(long)]
+        tls_certificate: PathBuf,
+    },
+    /// Authenticate and pin a signed team-memory service descriptor
+    ConfigureService {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        descriptor: PathBuf,
+        /// Explicitly authorize endpoint/certificate rotation for the same
+        /// pinned service identity
+        #[arg(long)]
+        rotate_transport: bool,
+    },
+    /// Run one observed push/pull cycle against the pinned service
+    Sync {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Serve the bounded authenticated replication protocol over TLS
+    Serve {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Externally reachable HTTPS origin encoded into the signed descriptor
+        #[arg(long)]
+        endpoint: String,
+        /// Exact DER-encoded leaf certificate presented by this service
+        #[arg(long)]
+        tls_certificate: PathBuf,
+        /// Owner-only PKCS#8 DER private key used by this service
+        #[arg(long)]
+        tls_private_key: PathBuf,
+    },
 }
 
 // OpenClaudia is a single-user CLI. A current-thread runtime keeps scheduling
@@ -574,6 +623,46 @@ async fn main() -> anyhow::Result<()> {
                 }
                 TeamCommands::Audit { team_id } => {
                     cli::commands::team::cmd_team_audit(team_id.as_deref())
+                }
+                TeamCommands::ReplicaStatus { team_id } => {
+                    cli::commands::team::cmd_team_replica_status(team_id.as_deref())
+                }
+                TeamCommands::ServiceDescriptor {
+                    team_id,
+                    endpoint,
+                    tls_certificate,
+                } => cli::commands::team::cmd_team_service_descriptor(
+                    team_id.as_deref(),
+                    &endpoint,
+                    &tls_certificate,
+                ),
+                TeamCommands::ConfigureService {
+                    team_id,
+                    descriptor,
+                    rotate_transport,
+                } => cli::commands::team::cmd_team_configure_service(
+                    team_id.as_deref(),
+                    &descriptor,
+                    rotate_transport,
+                ),
+                TeamCommands::Sync { team_id } => {
+                    cli::commands::team::cmd_team_sync(team_id.as_deref())
+                }
+                TeamCommands::Serve {
+                    team_id,
+                    listen,
+                    endpoint,
+                    tls_certificate,
+                    tls_private_key,
+                } => {
+                    cli::commands::team::cmd_team_serve(
+                        team_id.as_deref(),
+                        listen,
+                        &endpoint,
+                        &tls_certificate,
+                        &tls_private_key,
+                    )
+                    .await
                 }
             }
         }
@@ -929,7 +1018,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     // MCP subprocesses/reconnects retain this exact resumed-session
     // capability rather than discovering identity from a worker thread.
     let run_context = app.tool_run_context().map_err(anyhow::Error::msg)?;
-    let memory_db = Some(open_workspace_memory_db(&run_context)?);
+    let memory_db = Some(open_workspace_memory_db(&run_context, config)?);
     app.permission_mgr = Some(std::sync::Arc::new(init_permission_manager(
         config,
         dangerously_skip_permissions,
@@ -1251,8 +1340,9 @@ fn maybe_resume_session(chat_session: &mut Session, resume: bool, session_id: Op
 /// Startup fails closed when the store cannot be validated or opened.
 fn init_memory_with_banner(
     run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    config: &config::AppConfig,
 ) -> anyhow::Result<memory::MemoryDb> {
-    let db = open_workspace_memory_db(run)?;
+    let db = open_workspace_memory_db(run, config)?;
 
     let recent_count = db.get_recent_sessions(10).map_or(0, |s| s.len());
     if recent_count > 0 {
@@ -1280,12 +1370,29 @@ fn init_memory_with_banner(
 
 fn open_workspace_memory_db(
     run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    config: &config::AppConfig,
 ) -> anyhow::Result<memory::MemoryDb> {
     let host_home = run
         .host_home()
         .ok_or_else(|| anyhow::anyhow!("host home is unavailable for private technical memory"))?;
     let db = memory::MemoryDb::open_for_workspace(host_home, run.project_root())
         .context("opening host-owned workspace technical memory")?;
+    if let Some(team_id) = config.memory.team_id.clone() {
+        let status = openclaudia::team_memory::activate_team_memory(
+            &db,
+            host_home,
+            run.project_root(),
+            team_id,
+        )
+        .context("activating authenticated team technical memory")?;
+        tracing::info!(
+            team_id = %status.team_id,
+            freshness = ?status.freshness,
+            queued_mutations = status.queued_mutations,
+            service_configured = status.service_configured,
+            "Authenticated team technical memory ready"
+        );
+    }
     tracing::debug!(
         path = %db.path().display(),
         workspace_id = ?db.workspace_id().map(ToString::to_string),
@@ -2690,6 +2797,61 @@ mod tests {
             .expect("write .openclaudia file");
 
         assert!(memory::MemoryDb::open_for_workspace(host.path(), project.path()).is_err());
+    }
+
+    #[test]
+    fn shared_repl_and_tui_startup_opens_the_configured_authenticated_team_replica() {
+        let host = tempfile::tempdir().expect("host home");
+        let project = tempfile::tempdir().expect("project");
+        let principal: openclaudia::team_memory::PrincipalId = "owner".parse().expect("principal");
+        let authority = openclaudia::team_memory::TeamAuthorityStore::bootstrap(
+            host.path(),
+            project.path(),
+            principal,
+            31_536_000,
+        )
+        .expect("team authority");
+        let mut config = startup_vdd_config();
+        config.memory.team_id = Some(authority.team_id().clone());
+        let run = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            project.path(),
+        )
+        .working_directory(project.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .host_home(Some(host.path().to_path_buf()))
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(true)
+        .secrets(true)
+        .provider("test")
+        .build()
+        .expect("frontend run");
+        let memory = open_workspace_memory_db(&run, &config).expect("frontend memory");
+        let permissions = PermissionManager::unrestricted_for_run(&run);
+        let call = permission_test_call(
+            "memory_list",
+            &serde_json::json!({"scope": "team", "limit": 5}),
+        );
+        let result = openclaudia::services::tool_executor::ToolExecutor::execute(
+            openclaudia::services::tool_executor::ToolExecutorRequest {
+                run_context: &run,
+                tool_call: &call,
+                memory_db: Some(&memory),
+                app_config: Some(&config),
+                task_mgr: None,
+                permission_mgr: &permissions,
+                authorization: None,
+                session_id: Some("s104-frontend-startup"),
+                policy_enforcer: None,
+            },
+        );
+        assert!(!result.is_error(), "team list failed: {}", result.content());
+        let structured = result.structured().expect("typed team result");
+        assert_eq!(structured["scope"], "team");
+        assert_eq!(structured["team_freshness"], "unconfigured");
     }
 
     #[test]

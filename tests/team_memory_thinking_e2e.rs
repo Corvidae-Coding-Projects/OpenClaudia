@@ -1,6 +1,7 @@
 //! End-to-end tests for the production team-memory fail-closed boundary and
 //! user-only compatibility wrapper, plus `thinking` effort helpers. Detailed
-//! causal replica behavior remains unit-covered for S-104 adaptation.
+//! causal compatibility behavior remains unit-covered beside the authenticated
+//! production replica.
 //!
 //! Sprint 59 of the verification effort.
 

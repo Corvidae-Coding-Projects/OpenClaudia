@@ -272,7 +272,8 @@ pub enum MemorySourceKind {
 }
 
 /// Typed source observation from which a memory revision was derived.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemorySourceEvidence {
     /// Evidence category; never an authority level.
     pub kind: MemorySourceKind,

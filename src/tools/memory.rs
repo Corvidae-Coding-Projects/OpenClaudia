@@ -1,9 +1,10 @@
 //! Canonical typed tools for codebase-specific technical lessons.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr as _;
 
+use anyhow::Context as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -11,11 +12,18 @@ use crate::memdir::{EntrypointInspection, EntrypointIssue, EntrypointIssueCode};
 use crate::memory::{
     LogicalMemoryId, MemoryDb, MemoryDigest, MemorySourceEvidence, MemorySourceKind,
     PortableMemoryExportStatus, PortableMemoryImportStatus, TechnicalLessonCorrectionRequest,
-    TechnicalLessonDraft, TechnicalLessonReviewAction, TechnicalLessonReviewRequest,
+    TechnicalLessonDraft, TechnicalLessonQueryResult, TechnicalLessonQueryStatus,
+    TechnicalLessonRecord, TechnicalLessonReviewAction, TechnicalLessonReviewRequest,
     TechnicalLessonStoreError, TechnicalMemorySourceStoreError, TechnicalMemorySourceStoreStatus,
+    MAX_TECHNICAL_QUERY_RESULT_BYTES,
 };
 use crate::permissions::HostApprovalEvidence;
 use crate::persistence::PersistentStorage;
+use crate::team_memory::{
+    MemoryScope, ScopedTechnicalLessonQueryResult, ScopedTechnicalLessonQueryStatus,
+    TeamReplicaFreshness, TeamReplicationError, TeamReplicationFailureClass,
+    TeamTechnicalLessonQueryResult,
+};
 
 use super::{
     ToolFailure, ToolFailureCode, ToolHandlerResult, ToolObservation, ToolRetryability,
@@ -25,12 +33,29 @@ use super::{
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 20;
 
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TeamSyncScheduleStatus {
+    Scheduled,
+    Offline,
+    AlreadyQueued,
+    SupervisorUnavailable,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TeamSyncSchedule {
+    scheduled: bool,
+    status: TeamSyncScheduleStatus,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
     query: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    #[serde(default)]
+    scope: MemoryScope,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +63,17 @@ struct SearchArgs {
 struct ListArgs {
     #[serde(default = "default_search_limit")]
     limit: usize,
+    #[serde(default)]
+    scope: MemoryScope,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveArgs {
+    #[serde(default)]
+    scope: MemoryScope,
+    #[serde(flatten)]
+    draft: TechnicalLessonDraft,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +83,8 @@ struct UpdateArgs {
     expected_record_digest: String,
     correction_reason: String,
     replacement: TechnicalLessonDraft,
+    #[serde(default)]
+    scope: MemoryScope,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +92,8 @@ struct UpdateArgs {
 struct DeleteArgs {
     logical_id: String,
     expected_record_digest: String,
+    #[serde(default)]
+    scope: MemoryScope,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,21 +145,39 @@ pub fn execute_save(
         return unavailable();
     };
     let value = args_value(args);
-    let draft = match serde_json::from_value::<TechnicalLessonDraft>(value.clone()) {
-        Ok(draft) => draft,
+    let parsed = match serde_json::from_value::<SaveArgs>(value.clone()) {
+        Ok(parsed) => parsed,
         Err(error) => return invalid_arguments("memory_save", &error),
     };
     let source = match source_evidence(run, invocation_id, "memory_save", &value) {
         Ok(source) => source,
         Err(error) => return encoding_error("memory_save", &error),
     };
-    match db.save_technical_lesson_candidate(
-        &draft,
-        source,
-        actor_id(run),
-        chrono::Utc::now().timestamp(),
-    ) {
-        Ok(record) => private_structured(
+    let captured_at = chrono::Utc::now().timestamp();
+    let stored = match parsed.scope {
+        MemoryScope::User => db
+            .save_technical_lesson_candidate(&parsed.draft, source, actor_id(run), captured_at)
+            .map(|record| (record, None)),
+        MemoryScope::Team => {
+            let Some(replica) = db.team_replica() else {
+                return team_unavailable();
+            };
+            replica
+                .save_technical_lesson_candidate(&parsed.draft, source, actor_id(run), captured_at)
+                .map(|record| {
+                    let schedule = schedule_team_synchronization(db);
+                    (record, Some(schedule))
+                })
+                .map_err(anyhow::Error::new)
+        }
+        MemoryScope::Both => {
+            return invalid_input(
+                "memory_save requires one explicit write scope: user or team".to_string(),
+            );
+        }
+    };
+    match stored {
+        Ok((record, sync_schedule)) => private_structured(
             format!(
                 "Stored technical lesson {} at version {} as untrusted reference evidence.",
                 record.logical_id, record.version
@@ -128,11 +186,14 @@ pub fn execute_save(
                 "schema_version": 1,
                 "operation": "stored",
                 "authority": "untrusted_reference_evidence",
+                "scope": parsed.scope,
+                "sync_scheduled": sync_schedule.map(|schedule| schedule.scheduled),
+                "sync_status": sync_schedule.map(|schedule| schedule.status),
                 "record": record,
             }),
         ),
         Err(error) if is_conflict_error(&error) => conflict(error.to_string()),
-        Err(error) => store_error("memory_save", &error),
+        Err(error) => scoped_query_error("memory_save", &error),
     }
 }
 
@@ -156,7 +217,9 @@ pub fn execute_search(
             "memory_search limit must be between 1 and {MAX_SEARCH_LIMIT}"
         ));
     }
-    match db.query_technical_lessons(
+    match query_scoped(
+        db,
+        parsed.scope,
         Some(&parsed.query),
         parsed.limit,
         chrono::Utc::now().timestamp(),
@@ -171,7 +234,7 @@ pub fn execute_search(
             ),
             Err(error) => encoding_error("memory_search", &error),
         },
-        Err(error) => store_error("memory_search", &error),
+        Err(error) => scoped_query_error("memory_search", &error),
     }
 }
 
@@ -192,7 +255,13 @@ pub fn execute_list(
             "memory_list limit must be between 1 and {MAX_SEARCH_LIMIT}"
         ));
     }
-    match db.query_technical_lessons(None, parsed.limit, chrono::Utc::now().timestamp()) {
+    match query_scoped(
+        db,
+        parsed.scope,
+        None,
+        parsed.limit,
+        chrono::Utc::now().timestamp(),
+    ) {
         Ok(result) => match serde_json::to_value(&result) {
             Ok(value) => private_structured(
                 format!(
@@ -203,7 +272,7 @@ pub fn execute_list(
             ),
             Err(error) => encoding_error("memory_list", &error),
         },
-        Err(error) => store_error("memory_list", &error),
+        Err(error) => scoped_query_error("memory_list", &error),
     }
 }
 
@@ -233,7 +302,7 @@ pub fn execute_update(
         Ok(source) => source,
         Err(error) => return encoding_error("memory_update", &error),
     };
-    match db.correct_technical_lesson(TechnicalLessonCorrectionRequest {
+    let request = TechnicalLessonCorrectionRequest {
         logical_id,
         expected_record_digest: expected_digest,
         replacement: parsed.replacement,
@@ -241,8 +310,31 @@ pub fn execute_update(
         source,
         author_id: actor_id(run),
         captured_at_unix_seconds: chrono::Utc::now().timestamp(),
-    }) {
-        Ok(record) => private_structured(
+    };
+    let corrected = match parsed.scope {
+        MemoryScope::User => db
+            .correct_technical_lesson(request)
+            .map(|record| (record, None)),
+        MemoryScope::Team => {
+            let Some(replica) = db.team_replica() else {
+                return team_unavailable();
+            };
+            replica
+                .correct_technical_lesson(request)
+                .map(|record| {
+                    let schedule = schedule_team_synchronization(db);
+                    (record, Some(schedule))
+                })
+                .map_err(anyhow::Error::new)
+        }
+        MemoryScope::Both => {
+            return invalid_input(
+                "memory_update requires one explicit write scope: user or team".to_string(),
+            );
+        }
+    };
+    match corrected {
+        Ok((record, sync_schedule)) => private_structured(
             format!(
                 "Corrected technical lesson {} to version {}.",
                 record.logical_id, record.version
@@ -251,11 +343,14 @@ pub fn execute_update(
                 "schema_version": 1,
                 "operation": "corrected",
                 "authority": "untrusted_reference_evidence",
+                "scope": parsed.scope,
+                "sync_scheduled": sync_schedule.map(|schedule| schedule.scheduled),
+                "sync_status": sync_schedule.map(|schedule| schedule.status),
                 "record": record,
             }),
         ),
         Err(error) if is_conflict_error(&error) => conflict(error.to_string()),
-        Err(error) => store_error("memory_update", &error),
+        Err(error) => scoped_query_error("memory_update", &error),
     }
 }
 
@@ -285,18 +380,43 @@ pub fn execute_delete(
         Ok(source) => source,
         Err(error) => return encoding_error("memory_delete", &error),
     };
-    match db.delete_technical_lesson(logical_id, &expected_digest, source, actor_id(run)) {
-        Ok(tombstone_digest) => private_structured(
+    let deleted = match parsed.scope {
+        MemoryScope::User => db
+            .delete_technical_lesson(logical_id, &expected_digest, source, actor_id(run))
+            .map(|digest| (digest, None)),
+        MemoryScope::Team => {
+            let Some(replica) = db.team_replica() else {
+                return team_unavailable();
+            };
+            replica
+                .delete_technical_lesson(logical_id, &expected_digest, source, actor_id(run))
+                .map(|digest| {
+                    let schedule = schedule_team_synchronization(db);
+                    (digest, Some(schedule))
+                })
+                .map_err(anyhow::Error::new)
+        }
+        MemoryScope::Both => {
+            return invalid_input(
+                "memory_delete requires one explicit write scope: user or team".to_string(),
+            );
+        }
+    };
+    match deleted {
+        Ok((tombstone_digest, sync_schedule)) => private_structured(
             format!("Deleted technical lesson {logical_id} with a causal tombstone."),
             json!({
                 "schema_version": 1,
                 "operation": "deleted",
+                "scope": parsed.scope,
+                "sync_scheduled": sync_schedule.map(|schedule| schedule.scheduled),
+                "sync_status": sync_schedule.map(|schedule| schedule.status),
                 "logical_id": logical_id,
                 "tombstone_digest": tombstone_digest,
             }),
         ),
         Err(error) if is_conflict_error(&error) => conflict(error.to_string()),
-        Err(error) => store_error("memory_delete", &error),
+        Err(error) => scoped_query_error("memory_delete", &error),
     }
 }
 
@@ -513,6 +633,420 @@ pub fn execute_import(
         Ok(result) => portable_import_result(&result),
         Err(error) => portable_error("memory_import", &error),
     }
+}
+
+fn query_scoped(
+    db: &MemoryDb,
+    scope: MemoryScope,
+    query: Option<&str>,
+    limit: usize,
+    now_unix_seconds: i64,
+) -> anyhow::Result<ScopedTechnicalLessonQueryResult> {
+    match scope {
+        MemoryScope::User => {
+            let result = db.query_technical_lessons(query, limit, now_unix_seconds)?;
+            Ok(scoped_private_result(scope, result))
+        }
+        MemoryScope::Team => {
+            let replica = db
+                .team_replica()
+                .ok_or(TeamReplicationError::Unconfigured)?;
+            let result = replica
+                .query_technical_lessons(query, limit, now_unix_seconds)
+                .map_err(anyhow::Error::new)?;
+            scoped_team_result(scope, result)
+        }
+        MemoryScope::Both => {
+            let private = db.query_technical_lessons(query, limit, now_unix_seconds)?;
+            let Some(replica) = db.team_replica() else {
+                let mut result = scoped_private_result(scope, private);
+                result.status = ScopedTechnicalLessonQueryStatus::Partial;
+                result.team_freshness = Some(TeamReplicaFreshness::Unconfigured);
+                return Ok(result);
+            };
+            match replica.query_technical_lessons(query, limit, now_unix_seconds) {
+                Ok(team) => merge_scoped_results(private, team, limit),
+                Err(error) => {
+                    tracing::warn!(error = %error, "team side of a combined memory query is unavailable");
+                    let mut result = scoped_private_result(scope, private);
+                    result.status = ScopedTechnicalLessonQueryStatus::Partial;
+                    result.team_freshness = Some(freshness_for_failure(&error));
+                    bound_scoped_query_result(&mut result)?;
+                    Ok(result)
+                }
+            }
+        }
+    }
+}
+
+fn schedule_team_synchronization(db: &MemoryDb) -> TeamSyncSchedule {
+    use crate::memory::TeamSynchronizationRequest;
+
+    match db.request_team_synchronization() {
+        Ok(TeamSynchronizationRequest::Scheduled) => TeamSyncSchedule {
+            scheduled: true,
+            status: TeamSyncScheduleStatus::Scheduled,
+        },
+        Ok(TeamSynchronizationRequest::Offline) => TeamSyncSchedule {
+            scheduled: false,
+            status: TeamSyncScheduleStatus::Offline,
+        },
+        Ok(TeamSynchronizationRequest::AlreadyQueued) => TeamSyncSchedule {
+            scheduled: true,
+            status: TeamSyncScheduleStatus::AlreadyQueued,
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "team mutation is durable but synchronization could not be scheduled");
+            TeamSyncSchedule {
+                scheduled: false,
+                status: TeamSyncScheduleStatus::SupervisorUnavailable,
+            }
+        }
+    }
+}
+
+fn freshness_for_failure(error: &TeamReplicationError) -> TeamReplicaFreshness {
+    match error.failure_class() {
+        TeamReplicationFailureClass::Unconfigured => TeamReplicaFreshness::Unconfigured,
+        TeamReplicationFailureClass::AuthorizationDenied => TeamReplicaFreshness::Unauthorized,
+        TeamReplicationFailureClass::InvalidRequest
+        | TeamReplicationFailureClass::IntegrityFailure => TeamReplicaFreshness::Corrupt,
+        TeamReplicationFailureClass::CapacityExceeded
+        | TeamReplicationFailureClass::ConcurrentUpdate
+        | TeamReplicationFailureClass::Unavailable => TeamReplicaFreshness::Stale,
+    }
+}
+
+fn scoped_private_result(
+    scope: MemoryScope,
+    result: TechnicalLessonQueryResult,
+) -> ScopedTechnicalLessonQueryResult {
+    ScopedTechnicalLessonQueryResult {
+        schema_version: result.schema_version,
+        workspace_id: result.workspace_id,
+        authority: result.authority,
+        scope,
+        status: private_query_status(result.status),
+        query: result.query,
+        records: result.records,
+        private_status: Some(result.status),
+        team_freshness: None,
+        team_conflicts: Vec::new(),
+        team_conflicts_truncated: false,
+        omitted_expired: result.omitted_expired,
+        omitted_conflicted: result.omitted_conflicted,
+        truncated_by_budget: result.truncated_by_budget,
+    }
+}
+
+fn scoped_team_result(
+    scope: MemoryScope,
+    result: TeamTechnicalLessonQueryResult,
+) -> anyhow::Result<ScopedTechnicalLessonQueryResult> {
+    let status = team_query_status(&result);
+    let mut scoped = ScopedTechnicalLessonQueryResult {
+        schema_version: result.result.schema_version,
+        workspace_id: result.result.workspace_id,
+        authority: result.result.authority,
+        scope,
+        status,
+        query: result.result.query,
+        records: result.result.records,
+        private_status: None,
+        team_freshness: Some(result.freshness),
+        team_conflicts: result.conflicts,
+        team_conflicts_truncated: result.conflicts_truncated,
+        omitted_expired: result.result.omitted_expired,
+        omitted_conflicted: result.result.omitted_conflicted,
+        truncated_by_budget: result.result.truncated_by_budget,
+    };
+    // The team result was bounded before wrapping, but the scope/freshness
+    // envelope also counts toward the canonical tool-result budget.
+    bound_scoped_query_result(&mut scoped)?;
+    Ok(scoped)
+}
+
+fn merge_scoped_results(
+    private: TechnicalLessonQueryResult,
+    team: TeamTechnicalLessonQueryResult,
+    limit: usize,
+) -> anyhow::Result<ScopedTechnicalLessonQueryResult> {
+    anyhow::ensure!(
+        private.workspace_id == team.result.workspace_id,
+        "private and team technical-memory workspaces differ"
+    );
+    anyhow::ensure!(
+        private.query == team.result.query,
+        "private and team technical-memory queries differ"
+    );
+
+    let private_status = private.status;
+    let team_status = team_query_status(&team);
+    let team_freshness = team.freshness;
+    let team_conflicts = team.conflicts;
+    let team_conflicts_truncated = team.conflicts_truncated;
+    let (omitted_expired, omitted_conflicted, count_overflow) = merge_omitted_counts(
+        private.omitted_expired,
+        team.result.omitted_expired,
+        private.omitted_conflicted,
+        team.result.omitted_conflicted,
+    );
+    let mut records = private.records;
+    records.extend(team.result.records);
+    let terms = private
+        .query
+        .as_deref()
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    records.sort_by(|left, right| {
+        technical_lesson_score(right, &terms)
+            .cmp(&technical_lesson_score(left, &terms))
+            .then_with(|| {
+                right
+                    .lesson
+                    .captured_at_unix_seconds
+                    .cmp(&left.lesson.captured_at_unix_seconds)
+            })
+            .then_with(|| right.version.cmp(&left.version))
+            .then_with(|| left.logical_id.cmp(&right.logical_id))
+            .then_with(|| memory_scope_rank(left.scope).cmp(&memory_scope_rank(right.scope)))
+    });
+    let mut identities = HashSet::with_capacity(records.len());
+    let cross_scope_alias = records
+        .iter()
+        .any(|record| !identities.insert(record.logical_id));
+    let result_truncated = records.len() > limit;
+    records.truncate(limit);
+
+    let incomplete = count_overflow
+        || result_truncated
+        || private.truncated_by_budget
+        || team.result.truncated_by_budget
+        || team_conflicts_truncated
+        || private_status == TechnicalLessonQueryStatus::Partial
+        || matches!(
+            team_status,
+            ScopedTechnicalLessonQueryStatus::Partial
+                | ScopedTechnicalLessonQueryStatus::Unavailable
+        );
+    let consistency = if cross_scope_alias
+        || !team_conflicts.is_empty()
+        || team_conflicts_truncated
+        || team_status == ScopedTechnicalLessonQueryStatus::Conflicted
+    {
+        MergedQueryConsistency::Conflicted
+    } else {
+        MergedQueryConsistency::Consistent
+    };
+    let completeness = if incomplete {
+        MergedQueryCompleteness::Partial
+    } else {
+        MergedQueryCompleteness::Complete
+    };
+    let status = merged_query_status(&records, consistency, completeness, team_status);
+    let mut result = ScopedTechnicalLessonQueryResult {
+        schema_version: private.schema_version,
+        workspace_id: private.workspace_id,
+        authority: private.authority,
+        scope: MemoryScope::Both,
+        status,
+        query: private.query,
+        records,
+        private_status: Some(private_status),
+        team_freshness: Some(team_freshness),
+        team_conflicts,
+        team_conflicts_truncated,
+        omitted_expired,
+        omitted_conflicted,
+        truncated_by_budget: count_overflow
+            || result_truncated
+            || private.truncated_by_budget
+            || team.result.truncated_by_budget,
+    };
+    bound_scoped_query_result(&mut result)?;
+    Ok(result)
+}
+
+const fn merge_omitted_counts(
+    private_expired: usize,
+    team_expired: usize,
+    private_conflicted: usize,
+    team_conflicted: usize,
+) -> (usize, usize, bool) {
+    let overflow = private_expired.checked_add(team_expired).is_none()
+        || private_conflicted.checked_add(team_conflicted).is_none();
+    (
+        private_expired.saturating_add(team_expired),
+        private_conflicted.saturating_add(team_conflicted),
+        overflow,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergedQueryConsistency {
+    Consistent,
+    Conflicted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergedQueryCompleteness {
+    Complete,
+    Partial,
+}
+
+fn merged_query_status(
+    records: &[TechnicalLessonRecord],
+    consistency: MergedQueryConsistency,
+    completeness: MergedQueryCompleteness,
+    team_status: ScopedTechnicalLessonQueryStatus,
+) -> ScopedTechnicalLessonQueryStatus {
+    if consistency == MergedQueryConsistency::Conflicted {
+        ScopedTechnicalLessonQueryStatus::Conflicted
+    } else if completeness == MergedQueryCompleteness::Partial {
+        ScopedTechnicalLessonQueryStatus::Partial
+    } else if team_status == ScopedTechnicalLessonQueryStatus::Stale {
+        ScopedTechnicalLessonQueryStatus::Stale
+    } else if records.is_empty() {
+        ScopedTechnicalLessonQueryStatus::NoHit
+    } else {
+        ScopedTechnicalLessonQueryStatus::Complete
+    }
+}
+
+const fn private_query_status(
+    status: TechnicalLessonQueryStatus,
+) -> ScopedTechnicalLessonQueryStatus {
+    match status {
+        TechnicalLessonQueryStatus::Complete => ScopedTechnicalLessonQueryStatus::Complete,
+        TechnicalLessonQueryStatus::NoHit => ScopedTechnicalLessonQueryStatus::NoHit,
+        TechnicalLessonQueryStatus::Partial => ScopedTechnicalLessonQueryStatus::Partial,
+    }
+}
+
+fn team_query_status(result: &TeamTechnicalLessonQueryResult) -> ScopedTechnicalLessonQueryStatus {
+    if !result.conflicts.is_empty() || result.conflicts_truncated {
+        return ScopedTechnicalLessonQueryStatus::Conflicted;
+    }
+    if result.result.status == TechnicalLessonQueryStatus::Partial
+        || result.freshness == TeamReplicaFreshness::Partial
+    {
+        return ScopedTechnicalLessonQueryStatus::Partial;
+    }
+    if matches!(
+        result.freshness,
+        TeamReplicaFreshness::Unconfigured
+            | TeamReplicaFreshness::NeverSynchronized
+            | TeamReplicaFreshness::Stale
+    ) {
+        return ScopedTechnicalLessonQueryStatus::Stale;
+    }
+    if matches!(
+        result.freshness,
+        TeamReplicaFreshness::Unauthorized | TeamReplicaFreshness::Corrupt
+    ) {
+        return ScopedTechnicalLessonQueryStatus::Unavailable;
+    }
+    if result.result.records.is_empty() {
+        ScopedTechnicalLessonQueryStatus::NoHit
+    } else {
+        ScopedTechnicalLessonQueryStatus::Complete
+    }
+}
+
+fn technical_lesson_score(record: &TechnicalLessonRecord, terms: &[String]) -> usize {
+    if terms.is_empty() {
+        return 1;
+    }
+    let projection = record.lesson.search_projection().to_lowercase();
+    terms
+        .iter()
+        .filter(|term| projection.contains(term.as_str()))
+        .count()
+}
+
+const fn memory_scope_rank(scope: crate::memory::MemoryRecordScope) -> u8 {
+    match scope {
+        crate::memory::MemoryRecordScope::UserPrivate => 0,
+        crate::memory::MemoryRecordScope::TeamShared => 1,
+        crate::memory::MemoryRecordScope::ProjectEvidence => 2,
+    }
+}
+
+fn bound_scoped_query_result(result: &mut ScopedTechnicalLessonQueryResult) -> anyhow::Result<()> {
+    if encoded_scoped_result_len(result)? <= MAX_TECHNICAL_QUERY_RESULT_BYTES {
+        return Ok(());
+    }
+
+    result.truncated_by_budget = true;
+    let conflicts = std::mem::take(&mut result.team_conflicts);
+    let conflict_count = conflicts.len();
+    result.team_conflicts_truncated |= conflict_count > 0;
+    if result.status != ScopedTechnicalLessonQueryStatus::Conflicted {
+        result.status = ScopedTechnicalLessonQueryStatus::Partial;
+    }
+    let records_only_len = encoded_scoped_result_len(result)?;
+    if records_only_len <= MAX_TECHNICAL_QUERY_RESULT_BYTES {
+        let retained = serialized_scoped_prefix_count(
+            &conflicts,
+            MAX_TECHNICAL_QUERY_RESULT_BYTES - records_only_len,
+        )?;
+        result
+            .team_conflicts
+            .extend(conflicts.into_iter().take(retained));
+        result.team_conflicts_truncated |= retained < conflict_count;
+        anyhow::ensure!(
+            encoded_scoped_result_len(result)? <= MAX_TECHNICAL_QUERY_RESULT_BYTES,
+            "scoped technical-memory result exceeds its byte budget"
+        );
+        return Ok(());
+    }
+
+    let records = std::mem::take(&mut result.records);
+    let metadata_len = encoded_scoped_result_len(result)?;
+    anyhow::ensure!(
+        metadata_len <= MAX_TECHNICAL_QUERY_RESULT_BYTES,
+        "scoped technical-memory metadata exceeds its result byte budget"
+    );
+    let retained =
+        serialized_scoped_prefix_count(&records, MAX_TECHNICAL_QUERY_RESULT_BYTES - metadata_len)?;
+    result.records.extend(records.into_iter().take(retained));
+    anyhow::ensure!(
+        encoded_scoped_result_len(result)? <= MAX_TECHNICAL_QUERY_RESULT_BYTES,
+        "scoped technical-memory result exceeds its byte budget"
+    );
+    Ok(())
+}
+
+fn encoded_scoped_result_len(result: &ScopedTechnicalLessonQueryResult) -> anyhow::Result<usize> {
+    Ok(serde_json::to_vec(result)?.len())
+}
+
+fn serialized_scoped_prefix_count<T: serde::Serialize>(
+    items: &[T],
+    available_bytes: usize,
+) -> anyhow::Result<usize> {
+    let mut used = 0_usize;
+    let mut retained = 0_usize;
+    for item in items {
+        let item_bytes = serde_json::to_vec(item)?.len();
+        let addition = item_bytes
+            .checked_add(usize::from(retained > 0))
+            .context("scoped technical-memory result byte count overflowed")?;
+        let Some(next) = used.checked_add(addition) else {
+            break;
+        };
+        if next > available_bytes {
+            break;
+        }
+        used = next;
+        retained += 1;
+    }
+    Ok(retained)
 }
 
 fn package_storage(
@@ -1021,6 +1555,72 @@ fn unavailable() -> ToolHandlerResult {
             .to_string(),
         ToolRetryability::Never,
     ))
+}
+
+fn team_unavailable() -> ToolHandlerResult {
+    team_error("team_memory", &TeamReplicationError::Unconfigured)
+}
+
+fn scoped_query_error(operation: &str, error: &anyhow::Error) -> ToolHandlerResult {
+    error.downcast_ref::<TeamReplicationError>().map_or_else(
+        || store_error(operation, error),
+        |error| team_error(operation, error),
+    )
+}
+
+fn team_error(operation: &str, error: &TeamReplicationError) -> ToolHandlerResult {
+    let (code, retryability, message, recovery) = match error.failure_class() {
+        TeamReplicationFailureClass::Unconfigured => (
+            ToolFailureCode::Unavailable,
+            ToolRetryability::Never,
+            "Authenticated team memory is not configured for this workspace".to_string(),
+            Some(json!({"action": "configure_team_memory_service"})),
+        ),
+        TeamReplicationFailureClass::AuthorizationDenied => (
+            ToolFailureCode::PermissionDenied,
+            ToolRetryability::Never,
+            "Authenticated team-memory membership does not permit this exact operation".to_string(),
+            Some(json!({"action": "inspect_team_membership"})),
+        ),
+        TeamReplicationFailureClass::CapacityExceeded => (
+            ToolFailureCode::Unavailable,
+            ToolRetryability::AfterBackoff,
+            "Team memory reached a bounded authority, replica, or transport capacity".to_string(),
+            Some(json!({"action": "synchronize_team_memory"})),
+        ),
+        TeamReplicationFailureClass::ConcurrentUpdate => (
+            ToolFailureCode::Conflict,
+            ToolRetryability::Safe,
+            "Team-memory replica state changed concurrently or has unresolved causal heads; no unconfirmed result was returned"
+                .to_string(),
+            Some(json!({"action": "retrieve_current_team_heads_then_retry"})),
+        ),
+        TeamReplicationFailureClass::Unavailable => (
+            ToolFailureCode::External,
+            ToolRetryability::AfterBackoff,
+            "The authenticated team-memory authority, replica, or service is temporarily unavailable"
+                .to_string(),
+            Some(json!({"action": "retry_synchronization"})),
+        ),
+        TeamReplicationFailureClass::InvalidRequest => (
+            ToolFailureCode::InvalidInput,
+            ToolRetryability::Never,
+            "The team-memory request violates the typed technical-lesson or replication contract"
+                .to_string(),
+            None,
+        ),
+        TeamReplicationFailureClass::IntegrityFailure => (
+            ToolFailureCode::External,
+            ToolRetryability::Never,
+            "Team-memory protocol, identity, encryption, or durable state validation failed"
+                .to_string(),
+            Some(json!({"action": "inspect_team_replica_status"})),
+        ),
+    };
+    tracing::warn!(operation, error = %error, "team memory operation failed");
+    let mut failure = ToolFailure::new(code, message, retryability);
+    failure.recovery = recovery;
+    private_error(failure)
 }
 
 fn invalid_arguments(tool: &str, error: &serde_json::Error) -> ToolHandlerResult {

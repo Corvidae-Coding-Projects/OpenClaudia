@@ -14,8 +14,8 @@ Every inventoried lifecycle-service implementation now has one typed,
 unambiguous production disposition. Operational services have concrete owners
 and consumers. Incomplete implementations remain in the repository and are
 classified as unavailable, experimental, or test-only rather than being
-deleted or silently installed. Configuration cannot claim that an unavailable
-team-memory or arbitrary feature-rollout service is active.
+deleted or silently installed. Configuration cannot claim that an arbitrary
+feature-rollout service or a legacy shared-path team store is active.
 
 ## Architecture decision
 
@@ -38,8 +38,10 @@ composition model:
 
 This preserves the intended capabilities while removing only false wiring and
 duplicate authority. In particular, the transport-neutral plugin MCP mirror,
-feature-flag source, background scheduler, team-memory prototype, LSP staging,
-and rate-limit state machine remain present for their owning follow-up slices.
+feature-flag source, background scheduler, LSP staging, and rate-limit state
+machine remain present for their owning follow-up slices. S-103 and S-104 later
+promoted team memory through a separate authenticated, encrypted replica rather
+than converting the rejected shared-path prototype into runtime authority.
 
 ## Audited lifecycle catalog
 
@@ -52,7 +54,7 @@ and rate-limit state machine remain present for their owning follow-up slices.
 | Plugin MCP runtime | Wired | Real `PluginManager` + `McpManager` owners in proxy/TUI / MCP dispatch / `disconnect_all` |
 | Plugin MCP shadow registry | Experimental | Preserved transport-neutral migration mirror; never a runtime authority or secret store; S-063/S-064/S-066 |
 | Project memory | Wired | Host-owned workspace store / five explicit technical-memory tools and role-scoped subagents / frontend or subagent completion then `MemoryDb` drop |
-| Team memory | Unavailable | Stable cross-store identity and replay landed in S-053; production config rejects the shared-path proposal while S-103/S-104 implement authenticated authority and bounded replication |
+| Team memory | Wired | `team_memory::activate_team_memory` or `openclaudia team service-descriptor\|configure-service\|serve` / five canonical scoped memory tools and bounded supervisor push/pull / supervisor RAII shutdown or TLS service shutdown |
 | Guardrails | Wired | `guardrails::configure` / tool, diff, and quality boundaries / last-`Arc` run retirement |
 | Enterprise policy | Wired | `PolicyEnforcer::new` / provider and tool policy consumers / frontend owner drop |
 | Tool executor | Wired | typed `ToolExecutorRequest` / `ToolExecutor::execute` / typed result publication |
@@ -96,11 +98,13 @@ policy. Every ACP session/new, session/load, and prompt generation now uses
 published. The regression test loads a real strict `.env` deny policy and
 proves that the resulting ACP run rejects access.
 
-### Unavailable configuration
+### Configuration failure boundaries
 
 - `memory.team_memory_path`, from YAML or its typed environment name, fails at
-  production config loading with its remaining S-103/S-104 ownership instead of
-  being silently ignored. S-053 completed logical identity and durable replay.
+  production config loading instead of being silently treated as authority.
+  An enrolled host activates team memory with `memory.team_id` and imports an
+  owner-signed, identity-pinned service descriptor with `openclaudia team
+  configure-service`; the service never trusts a repository-shared path.
 - Arbitrary `OPENCLAUDIA_FEATURE_*` variables no longer bypass the finite typed
   environment registry and fail as unknown names.
 - The library/test prototypes remain available so later slices can complete
@@ -187,10 +191,13 @@ The repair cycle was retained as evidence rather than erased:
   suites, ACP guardrail, policy/tool-executor, and lifecycle tests. Operational
   artifact-bound promotion remains intentionally withheld pending S-088.
 - **Configured-but-unconsumed behavior:** process tests prove unknown feature
-  variables and YAML/environment team-memory activation fail visibly.
+  variables and legacy YAML/environment shared-path team-memory activation fail
+  visibly. S-104 process and frontend tests separately bind `memory.team_id` to
+  the authenticated replica and canonical scoped tools.
 - **Preservation over deletion:** incomplete feature flags, background jobs,
-  team memory, shadow MCP, LSP, and rate-limit implementations remain present
-  under explicit classifications and follow-up owners.
+  shadow MCP, LSP, and rate-limit implementations remain present under explicit
+  classifications and follow-up owners. Team memory was subsequently wired by
+  completing its authenticated authority and bounded replication design.
 - **Deterministic tests and traces:** focused trace/privacy/fail-closed/process
   assertions and the complete Rust gate pass.
 
@@ -203,8 +210,9 @@ The repair cycle was retained as evidence rather than erased:
   frontends onto canonical lifecycle routing rather than parallel S-012
   adapters.
 - S-053 completed safe team-memory identity and cross-store replay. S-054 owns
-  the local typed evidence schema/retrieval baseline; S-103/S-104 own
-  authenticated authority and production team activation.
+  the local typed evidence schema/retrieval baseline; S-103/S-104 subsequently
+  completed authenticated authority and production team activation. S-105 owns
+  evaluated technical-memory retrieval quality rather than transport wiring.
   S-061/S-062/S-084 own plugin maintenance and durable job
   scheduling. S-068/S-069 own workspace/generation-safe LSP. S-048/S-050 own
   real provider-transport failure injection. S-014/S-047 own declared rollout

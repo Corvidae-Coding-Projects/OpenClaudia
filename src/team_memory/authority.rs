@@ -2,7 +2,7 @@
 //!
 //! This module deliberately does not move lesson content. It establishes the
 //! identity, membership, role, credential, grant, revocation, and audit
-//! boundary that the bounded replication service in S-104 must consume. A
+//! boundary consumed by the bounded replication service. A
 //! repository may name a [`TeamId`], but neither a repository file nor a
 //! filesystem path can create membership or grant access.
 
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::memory::{MemoryDb, WorkspaceMemoryId};
+use crate::memory::{MemoryDb, MemoryStoreId, WorkspaceMemoryId};
 use crate::persistence::{
     CommitState, FileClass, PersistenceError, PersistentStorage, StorageGeneration,
 };
@@ -263,15 +263,16 @@ impl TeamRole {
         match operation {
             TeamMemoryOperation::List
             | TeamMemoryOperation::Search
+            | TeamMemoryOperation::ReplicatePull
             | TeamMemoryOperation::ManageOwnCredential => true,
-            TeamMemoryOperation::Propose => !matches!(self, Self::Reader),
+            TeamMemoryOperation::Propose | TeamMemoryOperation::ReplicatePush => {
+                !matches!(self, Self::Reader)
+            }
             TeamMemoryOperation::Correct
             | TeamMemoryOperation::Delete
             | TeamMemoryOperation::Review
             | TeamMemoryOperation::Export
-            | TeamMemoryOperation::Import
-            | TeamMemoryOperation::ReplicatePull
-            | TeamMemoryOperation::ReplicatePush => {
+            | TeamMemoryOperation::Import => {
                 matches!(self, Self::Maintainer | Self::Owner)
             }
             TeamMemoryOperation::Admin => matches!(self, Self::Owner),
@@ -655,6 +656,21 @@ impl TeamOperationGrant {
     pub const fn grant_id(&self) -> &TeamGrantId {
         &self.grant_id
     }
+
+    #[must_use]
+    pub const fn principal_id(&self) -> &PrincipalId {
+        &self.principal_id
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> TeamMemoryOperation {
+        self.operation
+    }
+
+    #[must_use]
+    pub const fn request_digest(&self) -> ContentDigest {
+        self.request_digest
+    }
 }
 
 /// Redacted authorization decision emitted only after its audit event is
@@ -863,6 +879,40 @@ fn generate_signing_key() -> Result<SigningKey, TeamAuthorityError> {
     Ok(key)
 }
 
+fn generate_replica_storage_secret() -> Result<SecretString, TeamAuthorityError> {
+    let mut secret = [0_u8; 32];
+    SysRng
+        .try_fill_bytes(&mut secret)
+        .map_err(|_| TeamAuthorityError::RecoveryRequired {
+            reason: "operating-system randomness is unavailable",
+        })?;
+    let encoded = BASE64_STANDARD.encode(secret);
+    secret.zeroize();
+    SecretString::try_from_string(encoded).map_err(Into::into)
+}
+
+fn decode_replica_storage_secret(
+    secret: &SecretString,
+) -> Result<Zeroizing<[u8; 32]>, TeamAuthorityError> {
+    secret.expose(|encoded| {
+        let mut bytes =
+            BASE64_STANDARD
+                .decode(encoded)
+                .map_err(|_| TeamAuthorityError::RecoveryRequired {
+                    reason: "replica encryption credential encoding is corrupt",
+                })?;
+        let key =
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| TeamAuthorityError::RecoveryRequired {
+                    reason: "replica encryption credential length is corrupt",
+                })?;
+        bytes.zeroize();
+        Ok(Zeroizing::new(key))
+    })
+}
+
 fn random_authorization_attempt_digest() -> Result<ContentDigest, TeamAuthorityError> {
     let mut random = [0_u8; 32];
     SysRng
@@ -955,10 +1005,34 @@ enum StoredLocalAuthority {
         principal_secret_key: SecretString,
         #[serde(default)]
         authority_secret_key: Option<SecretString>,
+        #[serde(default)]
+        replica_storage_secret_key: Option<SecretString>,
+        #[serde(default)]
+        replica_identities: ReplicaIdentityAnchors,
         bundle: TeamAuthorityBundle,
         #[serde(default)]
         pending_rotation: Option<PendingCredentialRotation>,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaIdentityAnchors {
+    client: Option<ReplicaIdentityAnchor>,
+    service: Option<ReplicaIdentityAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaIdentityAnchor {
+    replica_id: String,
+    store_id: MemoryStoreId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicaAuthorityRole {
+    Client,
+    Service,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1044,6 +1118,8 @@ enum StoredLocalAuthorityRef<'a> {
         principal_id: &'a PrincipalId,
         principal_secret_key: RawSecret<'a>,
         authority_secret_key: Option<RawSecret<'a>>,
+        replica_storage_secret_key: Option<RawSecret<'a>>,
+        replica_identities: &'a ReplicaIdentityAnchors,
         bundle: &'a TeamAuthorityBundle,
         pending_rotation: Option<PendingCredentialRotationRef<'a>>,
     },
@@ -1074,12 +1150,16 @@ impl StoredAuthorityState {
                 principal_id,
                 principal_secret_key,
                 authority_secret_key,
+                replica_storage_secret_key,
+                replica_identities,
                 bundle,
                 pending_rotation,
             } => StoredLocalAuthorityRef::Active {
                 principal_id,
                 principal_secret_key: RawSecret(principal_secret_key),
                 authority_secret_key: authority_secret_key.as_ref().map(RawSecret),
+                replica_storage_secret_key: replica_storage_secret_key.as_ref().map(RawSecret),
+                replica_identities,
                 bundle,
                 pending_rotation: pending_rotation.as_ref().map(|pending| {
                     PendingCredentialRotationRef {
@@ -1572,6 +1652,8 @@ fn validate_stored_state(
             principal_id,
             principal_secret_key,
             authority_secret_key,
+            replica_storage_secret_key,
+            replica_identities,
             bundle,
             pending_rotation,
         } => {
@@ -1603,6 +1685,7 @@ fn validate_stored_state(
                     });
                 }
             }
+            validate_replica_credentials(replica_storage_secret_key.as_ref(), replica_identities)?;
             if let Some(pending) = pending_rotation {
                 validate_rotation_request(
                     &pending.request,
@@ -1618,6 +1701,40 @@ fn validate_stored_state(
                     });
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_replica_credentials(
+    replica_storage_secret_key: Option<&SecretString>,
+    replica_identities: &ReplicaIdentityAnchors,
+) -> Result<(), TeamAuthorityError> {
+    if replica_storage_secret_key.is_none()
+        && (replica_identities.client.is_some() || replica_identities.service.is_some())
+    {
+        return Err(TeamAuthorityError::RecoveryRequired {
+            reason: "replica identity is pinned but its encryption credential is missing",
+        });
+    }
+    if let Some(secret) = replica_storage_secret_key {
+        let _ = decode_replica_storage_secret(secret)?;
+    }
+    for anchor in [
+        replica_identities.client.as_ref(),
+        replica_identities.service.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let replica_id = &anchor.replica_id;
+        if replica_id.is_empty()
+            || replica_id.len() > 64
+            || replica_id.chars().any(char::is_control)
+        {
+            return Err(TeamAuthorityError::RecoveryRequired {
+                reason: "replica identity anchor is invalid",
+            });
         }
     }
     Ok(())
@@ -1896,6 +2013,8 @@ impl TeamAuthorityStore {
                 principal_id,
                 principal_secret_key: signing_key_to_secret(&principal_key)?,
                 authority_secret_key: Some(signing_key_to_secret(&authority_key)?),
+                replica_storage_secret_key: Some(generate_replica_storage_secret()?),
+                replica_identities: ReplicaIdentityAnchors::default(),
                 bundle,
                 pending_rotation: None,
             },
@@ -1917,6 +2036,131 @@ impl TeamAuthorityStore {
     #[must_use]
     pub const fn workspace_id(&self) -> &WorkspaceMemoryId {
         &self.workspace_id
+    }
+
+    pub(crate) fn replica_storage(&self) -> PersistentStorage {
+        self.storage.clone()
+    }
+
+    /// Return the currently enrolled local principal without exposing any
+    /// credential material.
+    ///
+    /// # Errors
+    /// Returns a typed lifecycle or recovery error for missing, pending, or
+    /// corrupt state.
+    pub fn local_principal_id(&self) -> Result<PrincipalId, TeamAuthorityError> {
+        let (_, state) = self.read_required_state()?;
+        let StoredLocalAuthority::Active { principal_id, .. } = state.local else {
+            return Err(TeamAuthorityError::EnrollmentPending);
+        };
+        Ok(principal_id)
+    }
+
+    pub(crate) fn replica_storage_key(&self) -> Result<Zeroizing<[u8; 32]>, TeamAuthorityError> {
+        let (_, state) = self.read_required_state()?;
+        let StoredLocalAuthority::Active {
+            replica_storage_secret_key,
+            ..
+        } = state.local
+        else {
+            return Err(TeamAuthorityError::EnrollmentPending);
+        };
+        if let Some(secret) = replica_storage_secret_key {
+            return decode_replica_storage_secret(&secret);
+        }
+
+        let generated = generate_replica_storage_secret()?;
+        self.update_state(|state| {
+            let StoredLocalAuthority::Active {
+                replica_storage_secret_key,
+                ..
+            } = &mut state.local
+            else {
+                return Err(TeamAuthorityError::EnrollmentPending);
+            };
+            if replica_storage_secret_key.is_none() {
+                *replica_storage_secret_key = Some(generated.clone());
+            }
+            Ok(())
+        })?;
+        let (_, state) = self.read_required_state()?;
+        let StoredLocalAuthority::Active {
+            replica_storage_secret_key: Some(secret),
+            ..
+        } = state.local
+        else {
+            return Err(TeamAuthorityError::RecoveryRequired {
+                reason: "replica encryption credential was not published",
+            });
+        };
+        decode_replica_storage_secret(&secret)
+    }
+
+    pub(crate) fn replica_identity(
+        &self,
+        role: ReplicaAuthorityRole,
+    ) -> Result<Option<(String, MemoryStoreId)>, TeamAuthorityError> {
+        let (_, state) = self.read_required_state()?;
+        let StoredLocalAuthority::Active {
+            replica_identities, ..
+        } = state.local
+        else {
+            return Err(TeamAuthorityError::EnrollmentPending);
+        };
+        Ok(match role {
+            ReplicaAuthorityRole::Client => replica_identities.client,
+            ReplicaAuthorityRole::Service => replica_identities.service,
+        }
+        .map(|anchor| (anchor.replica_id, anchor.store_id)))
+    }
+
+    pub(crate) fn pin_replica_identity(
+        &self,
+        role: ReplicaAuthorityRole,
+        replica_id: &str,
+        store_id: MemoryStoreId,
+    ) -> Result<(), TeamAuthorityError> {
+        if replica_id.is_empty()
+            || replica_id.len() > 64
+            || replica_id.chars().any(char::is_control)
+        {
+            return Err(TeamAuthorityError::RecoveryRequired {
+                reason: "replica identity anchor is invalid",
+            });
+        }
+        if self
+            .replica_identity(role)?
+            .as_ref()
+            .is_some_and(|(current_id, current_store)| {
+                current_id == replica_id && *current_store == store_id
+            })
+        {
+            return Ok(());
+        }
+        self.update_state(|state| {
+            let StoredLocalAuthority::Active {
+                replica_identities, ..
+            } = &mut state.local
+            else {
+                return Err(TeamAuthorityError::EnrollmentPending);
+            };
+            let anchor = match role {
+                ReplicaAuthorityRole::Client => &mut replica_identities.client,
+                ReplicaAuthorityRole::Service => &mut replica_identities.service,
+            };
+            if anchor.as_ref().is_some_and(|current| {
+                current.replica_id != replica_id || current.store_id != store_id
+            }) {
+                return Err(TeamAuthorityError::RecoveryRequired {
+                    reason: "encrypted team replica identity changed",
+                });
+            }
+            *anchor = Some(ReplicaIdentityAnchor {
+                replica_id: replica_id.to_string(),
+                store_id,
+            });
+            Ok(())
+        })
     }
 
     /// Report lifecycle state without revealing credentials or host paths.
@@ -2032,8 +2276,8 @@ impl TeamAuthorityStore {
     /// Revalidate an already audited permit against the current signed
     /// authority document at the downstream operation boundary.
     ///
-    /// S-104 must call this immediately before reading or changing replicated
-    /// lesson state. A concurrent role, revocation, membership, principal-key,
+    /// The replication boundary calls this immediately before reading or
+    /// changing replicated lesson state. A concurrent role, revocation, membership, principal-key,
     /// or authority-key generation change invalidates the permit.
     ///
     /// # Errors
@@ -2791,6 +3035,7 @@ impl TeamAuthorityStore {
             return Err(TeamAuthorityError::InvalidArtifact);
         }
         validate_authority_bundle(&approval.bundle, &self.team_id, &self.workspace_id)?;
+        let replica_storage_secret_key = generate_replica_storage_secret()?;
         self.update_state(|state| {
             let StoredLocalAuthority::Pending {
                 principal_id,
@@ -2819,6 +3064,8 @@ impl TeamAuthorityStore {
                 principal_id: principal_id.clone(),
                 principal_secret_key: principal_secret_key.clone(),
                 authority_secret_key: None,
+                replica_storage_secret_key: Some(replica_storage_secret_key.clone()),
+                replica_identities: ReplicaIdentityAnchors::default(),
                 bundle: approval.bundle.clone(),
                 pending_rotation: None,
             };
@@ -3240,6 +3487,7 @@ impl TeamAuthorityStore {
                 authority_secret_key,
                 bundle,
                 pending_rotation,
+                ..
             } = &mut state.local
             else {
                 return Err(TeamAuthorityError::EnrollmentPending);
@@ -3311,6 +3559,7 @@ impl TeamAuthorityStore {
                 authority_secret_key,
                 bundle,
                 pending_rotation,
+                ..
             } = &mut state.local
             else {
                 return Err(TeamAuthorityError::EnrollmentPending);

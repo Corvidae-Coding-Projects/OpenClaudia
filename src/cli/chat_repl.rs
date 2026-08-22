@@ -558,7 +558,7 @@ impl ChatRepl {
                 .provider(config.proxy.target.clone())
                 .build()
                 .map_err(anyhow::Error::msg)?;
-        let memory_db = Some(init_memory_with_banner(&run_context)?);
+        let memory_db = Some(init_memory_with_banner(&run_context, &config)?);
         guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
         let permission_mgr =
             init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);

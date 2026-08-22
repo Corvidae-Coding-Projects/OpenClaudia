@@ -9,7 +9,8 @@ use openclaudia::runtime::ContentDigest;
 use openclaudia::team_memory::{
     PrincipalId, TeamAuditDecisionCode, TeamAuthorityError, TeamAuthorityStatus,
     TeamAuthorityStore, TeamAuthorizationDenial, TeamAuthorizationOutcome,
-    TeamEnrollmentInvitation, TeamId, TeamMemoryOperation, TeamOperationGrant, TeamRole,
+    TeamEnrollmentInvitation, TeamId, TeamMemoryOperation, TeamOperationGrant, TeamReplica,
+    TeamRole,
 };
 
 const START: i64 = 1_800_000_000;
@@ -159,6 +160,89 @@ fn enrollment_artifacts_are_public_bounded_and_restart_safe() {
     )
     .expect("reopen member");
     assert_eq!(reopened.status_at(START + 5).unwrap(), status);
+}
+
+#[test]
+fn pre_replication_authority_state_lazily_adds_a_stable_storage_key() {
+    let home = tempfile::tempdir().expect("host home");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let store = TeamAuthorityStore::bootstrap(
+        home.path(),
+        workspace.path(),
+        principal("owner"),
+        31_536_000,
+    )
+    .expect("bootstrap owner");
+    let state_path = home
+        .path()
+        .join(".openclaudia/memory/workspaces")
+        .join(store.workspace_id().path_component())
+        .join(format!("team-authority-{}.json", store.team_id()));
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read credential state"))
+            .expect("credential JSON");
+    let local = legacy["local"]
+        .as_object_mut()
+        .expect("local credential object");
+    local.remove("replica_storage_secret_key");
+    local.remove("replica_identities");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&legacy).expect("legacy state JSON"),
+    )
+    .expect("install pre-replication state");
+
+    let first = TeamReplica::open_client(store.clone()).expect("migrate replica state");
+    let first_id = first.status().expect("first status").replica_id;
+    drop(first);
+    let second = TeamReplica::open_client(store).expect("reopen migrated replica");
+    assert_eq!(second.status().expect("second status").replica_id, first_id);
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state_path).expect("read migrated credential state"))
+            .expect("migrated credential JSON");
+    assert!(migrated["local"]["replica_storage_secret_key"].is_string());
+    assert!(migrated["local"]["replica_identities"]["client"].is_object());
+}
+
+#[test]
+fn pinned_replica_without_its_storage_key_requires_recovery() {
+    let home = tempfile::tempdir().expect("host home");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let store = TeamAuthorityStore::bootstrap(
+        home.path(),
+        workspace.path(),
+        principal("owner"),
+        31_536_000,
+    )
+    .expect("bootstrap owner");
+    let team_id = store.team_id().clone();
+    let workspace_id = store.workspace_id().clone();
+    let replica = TeamReplica::open_client(store).expect("pin client replica");
+    drop(replica);
+    let state_path = home
+        .path()
+        .join(".openclaudia/memory/workspaces")
+        .join(workspace_id.path_component())
+        .join(format!("team-authority-{team_id}.json"));
+    let mut damaged: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read credential state"))
+            .expect("credential JSON");
+    damaged["local"]
+        .as_object_mut()
+        .expect("local credential object")
+        .remove("replica_storage_secret_key");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&damaged).expect("damaged state JSON"),
+    )
+    .expect("install damaged state");
+
+    let reopened = TeamAuthorityStore::open_for_workspace(home.path(), workspace.path(), team_id)
+        .expect("open authority storage capability");
+    let error = reopened
+        .status()
+        .expect_err("pinned replica without encryption key must fail closed on state read");
+    assert!(matches!(error, TeamAuthorityError::RecoveryRequired { .. }));
 }
 
 #[test]

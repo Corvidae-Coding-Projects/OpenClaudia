@@ -5,14 +5,15 @@
 //! cross-store reconciliation. Production [`crate::config::load_config`] still
 //! rejects the legacy shared-path proposal. S-054 supplies host-owned local
 //! storage, schema recovery, and evidence-only retrieval; S-103 supplies
-//! authenticated team authority, while S-104 owns bounded lesson replication.
+//! authenticated team authority, while S-104 supplies bounded lesson
+//! replication.
 //! A shared path alone is never a team authorization model.
 //!
-//! The older path-backed replica engine remains private and test-covered so
-//! S-104 can adapt its causal merge and restart behavior. No production caller
-//! can activate that engine with a path. A repository can select only a typed
-//! team identity; [`TeamAuthorityStore`] then requires host-owned signed
-//! membership before a future replica operation can disclose or mutate data.
+//! The older path-backed replica engine remains private and test-covered for
+//! compatibility. No production caller can activate that engine with a path.
+//! A repository can select only a typed team identity; [`TeamAuthorityStore`]
+//! then requires host-owned signed membership before the encrypted replica can
+//! disclose or mutate data.
 //!
 //! # Scope model
 //!
@@ -20,10 +21,13 @@
 //! participates against:
 //!
 //! * [`MemoryScope::User`] — operate on the per-user store only.
-//! * [`MemoryScope::Team`] — target an authenticated team replica. It returns
-//!   [`TeamMemoryError::TeamUnavailable`] until S-104 supplies that replica.
-//! * [`MemoryScope::Both`] — target private storage plus an authenticated team
-//!   replica. It likewise fails closed while the data plane is unavailable.
+//! * [`MemoryScope::Team`] — target an activated authenticated team replica.
+//! * [`MemoryScope::Both`] — read a bounded result spanning private storage and
+//!   the authenticated team replica while retaining each record's authority.
+//!   Canonical technical-lesson mutations require one explicit destination so
+//!   a private lesson cannot be copied into team scope accidentally. The
+//!   private compatibility engine still gives legacy archival operations their
+//!   existing durable `Both` transaction.
 //!
 //! # Merge semantics
 //!
@@ -31,7 +35,7 @@
 //! descendant supersedes its ancestor. Concurrent branches remain explicit
 //! conflict heads and neither branch is deleted. Equal prose with different
 //! logical IDs remains distinct. Core sections retain their stable section key
-//! and user overlay precedence for the S-104 replication implementation.
+//! and user overlay precedence for the compatibility implementation.
 //!
 //! # Tombstones
 //!
@@ -43,6 +47,8 @@
 //! A `Both` deletion is a replicated immutable tombstone revision.
 
 pub mod authority;
+pub mod replication;
+pub mod transport;
 
 pub use authority::{
     PrincipalId, TeamAuditDecisionCode, TeamAuditReceipt, TeamAuthorityBundle, TeamAuthorityError,
@@ -52,6 +58,42 @@ pub use authority::{
     TeamOperationPermit, TeamOwnerRecovery, TeamPublicKey, TeamRole,
     MAX_TEAM_AUTHORITY_ARTIFACT_BYTES,
 };
+pub(crate) use replication::TeamReplicationFailureClass;
+pub use replication::{
+    ScopedTechnicalLessonQueryResult, ScopedTechnicalLessonQueryStatus, TeamLessonConflict,
+    TeamReplica, TeamReplicaFreshness, TeamReplicaId, TeamReplicaStatus, TeamReplicationError,
+    TeamServiceDescriptor, TeamSyncReport, TeamTechnicalLessonQueryResult,
+    MAX_TEAM_REPLICATION_BATCH, MAX_TEAM_REPLICATION_CERTIFICATE_BYTES,
+    MAX_TEAM_REPLICATION_MESSAGE_BYTES, MAX_TEAM_REPLICA_INBOX, MAX_TEAM_REPLICA_OUTBOX,
+    MAX_TEAM_REPLICA_REVISIONS, TEAM_REPLICATION_SCHEMA_VERSION,
+};
+pub use transport::{
+    serve_team_memory_tls, TeamMemoryTlsServer, TeamReplicationSupervisor,
+    MAX_TEAM_REPLICATION_PRIVATE_KEY_BYTES,
+};
+
+/// Activate the authenticated encrypted team replica selected by production
+/// configuration and attach its supervised transport owner to the private
+/// technical-memory service.
+///
+/// # Errors
+/// Returns a typed authority/replica error for unenrolled, expired, revoked,
+/// corrupt, cross-workspace, or unsupported host state.
+pub fn activate_team_memory(
+    private_memory: &MemoryDb,
+    host_home: &Path,
+    project_dir: &Path,
+    team_id: TeamId,
+) -> Result<TeamReplicaStatus> {
+    let authority = TeamAuthorityStore::open_for_workspace(host_home, project_dir, team_id)?;
+    if !matches!(authority.status()?, TeamAuthorityStatus::Active { .. }) {
+        return Err(TeamAuthorityError::MembershipInvalid.into());
+    }
+    let replica = Arc::new(TeamReplica::open_client(authority)?);
+    let status = replica.status()?;
+    private_memory.attach_team_replication(replica)?;
+    Ok(status)
+}
 
 use crate::config::MemoryConfig;
 use crate::memory::{
@@ -77,16 +119,17 @@ const MAX_REPLICATION_REVISION_BYTES: usize = 1_048_576;
 ///
 /// See module documentation for the read/write semantics of each
 /// variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryScope {
     /// Per-user store only.
+    #[default]
     User,
-    /// Team replica only. Production operations remain unavailable until
-    /// S-104 binds the replica through [`TeamAuthorityStore`].
+    /// Activated authenticated team replica only.
     Team,
-    /// Both stores. Reads causally merge by logical identity; writes target
-    /// both stores through a durable idempotent operation.
+    /// Both stores. Canonical technical-lesson reads retain source authority;
+    /// legacy archival writes use the compatibility engine's durable
+    /// idempotent cross-store operation.
     Both,
 }
 
@@ -96,7 +139,7 @@ pub enum TeamMemoryError {
     /// A scoped operation requested a team replica that is unavailable.
     #[error("team memory not configured")]
     TeamUnavailable,
-    /// A shared path cannot establish authenticated membership. The S-104
+    /// A shared path cannot establish authenticated membership. The encrypted
     /// replication service consumes S-103 permits instead of opening it.
     #[error("team-memory paths are not authorization; use an authenticated team identity")]
     UnauthenticatedPath,
@@ -135,7 +178,7 @@ impl VersionBoundTombstone {
 /// replica engine, mediated through a [`MemoryScope`] selector.
 ///
 /// Construct via [`TeamMemoryStore::open`]. A path-configured team replica is
-/// rejected; S-104 will bind typed replica operations to S-103 permits.
+/// rejected; production typed replica operations use S-103 permits.
 /// Clone-friendly via internal [`Arc`]s.
 pub struct TeamMemoryStore {
     user: Arc<MemoryDb>,
@@ -150,7 +193,7 @@ pub struct TeamMemoryStore {
 impl TeamMemoryStore {
     /// Open a user-only compatibility wrapper. A configured
     /// [`MemoryConfig::team_memory_path`] is rejected because possession of a
-    /// path cannot create authenticated team authority. S-104 will construct
+    /// path cannot create authenticated team authority. Production constructs
     /// bounded typed replicas through operation permits issued by
     /// [`authority::TeamAuthorityStore`].
     ///

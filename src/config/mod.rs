@@ -84,8 +84,8 @@ pub struct AppConfig {
     pub guardrails: GuardrailsConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
-    /// Memory subsystem configuration (per-user + optional shared team store).
-    /// See crosslink #604 for the team-memory parity work.
+    /// Memory subsystem configuration (host-owned private store plus an
+    /// optional authenticated, encrypted team replica).
     #[serde(default)]
     pub memory: MemoryConfig,
     /// Web-fetch tool configuration, including the preapproved-domain
@@ -278,10 +278,10 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
 
     // The pre-S-103 shared-path proposal is permanently rejected. A repository
     // may select a strict team ID, but membership and credentials are resolved
-    // only from the host-owned authority store. S-104 owns data replication.
+    // only from the host-owned authority store and signed service descriptor.
     if config.memory.team_memory_path.is_some() {
         return Err(ConfigError::Message(
-            "memory.team_memory_path is unsupported: a filesystem path is never authenticated team authority; configure memory.team_id after host enrollment (replication tracked by S-104)"
+            "memory.team_memory_path is unsupported: a filesystem path is never authenticated team authority; configure memory.team_id after host enrollment and import a signed service descriptor with `openclaudia team configure-service`"
                 .to_string(),
         ));
     }
