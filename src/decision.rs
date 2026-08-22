@@ -1,6 +1,6 @@
 //! Typed agent decisions and validation against the reality ledger.
 
-use crate::evidence::{authoritative_evidence, Denial};
+use crate::evidence::{evidence_for_requirement, Denial, EvidenceRequirement};
 use crate::final_gate::{validate_final_answer, FinalGateReport};
 use crate::ledger::{ObsId, ObservationKind, RealityLedger};
 use serde::{Deserialize, Serialize};
@@ -33,9 +33,37 @@ pub enum AgentDecision {
         argv: Vec<String>,
     },
     Final {
-        summary: String,
+        claims: Vec<FinalClaim>,
+    },
+}
+
+/// A final response is a set of typed claims. Supported claims cite exact
+/// receipts; claims without proof must declare that state instead of being
+/// promoted through free-form summary prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "claim_type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FinalClaim {
+    FileChange {
+        path: String,
         evidence: Vec<ObsId>,
-        verification: Vec<ObsId>,
+    },
+    CommandResult {
+        argv: Vec<String>,
+        exit_code: i32,
+        evidence: Vec<ObsId>,
+    },
+    Verification {
+        check: String,
+        passed: bool,
+        evidence: Vec<ObsId>,
+    },
+    Unsupported {
+        statement: String,
+        reason: String,
+    },
+    Unresolved {
+        statement: String,
+        reason: String,
     },
 }
 
@@ -47,16 +75,17 @@ pub enum DecisionValidation {
     Final(FinalGateReport),
 }
 
-/// Validate a model decision against authoritative ledger evidence.
+/// Validate a model decision against claim-specific, runtime-issued receipts.
 ///
 /// # Errors
 ///
 /// Returns [`Denial`] when the decision lacks required evidence, cites stale
-/// or non-authoritative observations, has an empty reason/patch, or makes a
+/// or inapplicable observations, has an empty reason/patch, or makes a
 /// final-answer claim that is not backed by ledger verification.
 pub fn validate_decision(
     decision: &AgentDecision,
     ledger: &RealityLedger,
+    run: &crate::tools::ToolRunContext,
 ) -> Result<DecisionValidation, Denial> {
     match decision {
         AgentDecision::Inspect { reason, .. } => {
@@ -77,26 +106,35 @@ pub fn validate_decision(
                 return Err(Denial::new("empty patch"));
             }
 
-            let observations = authoritative_evidence(evidence, ledger, "edit requires evidence")?;
-            if !observations
-                .iter()
-                .any(|obs| matches!(obs.kind, ObservationKind::FileRead { .. }))
-            {
-                return Err(Denial::new("edit requires prior file observation"));
+            let patch_paths = patch_paths_requiring_file_read(patch);
+            if patch_paths.is_empty() {
+                return Err(Denial::new("edit patch requires a concrete file target"));
             }
-
-            for patch_path in patch_paths_requiring_file_read(patch) {
-                let has_matching_read = observations.iter().any(|obs| match &obs.kind {
-                    ObservationKind::FileRead { path, .. } => {
-                        observed_path_matches_patch_path(path, &patch_path)
-                    }
-                    _ => false,
-                });
-                if !has_matching_read {
+            for patch_path in patch_paths {
+                let matching_ids = evidence
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        ledger.get(*id).is_some_and(|obs| match &obs.kind {
+                            ObservationKind::FileRead { path, .. } => {
+                                observed_path_matches_patch_path(path, &patch_path)
+                            }
+                            _ => false,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if matching_ids.is_empty() {
                     return Err(Denial::new(format!(
                         "edit patch requires fresh file observation: {patch_path}"
                     )));
                 }
+                evidence_for_requirement(
+                    &matching_ids,
+                    ledger,
+                    run,
+                    "edit requires evidence",
+                    &EvidenceRequirement::FileRead { path: &patch_path },
+                )?;
             }
 
             Ok(DecisionValidation::Edit {
@@ -114,17 +152,20 @@ pub fn validate_decision(
             if argv.is_empty() {
                 return Err(Denial::new("command argv cannot be empty"));
             }
-            authoritative_evidence(evidence, ledger, "command requires evidence")?;
+            evidence_for_requirement(
+                evidence,
+                ledger,
+                run,
+                "command requires evidence",
+                &EvidenceRequirement::TaskIntent,
+            )?;
             Ok(DecisionValidation::RunCommand {
                 evidence: evidence.clone(),
             })
         }
-        AgentDecision::Final {
-            summary,
-            evidence,
-            verification,
-        } => validate_final_answer(summary, evidence, verification, ledger)
-            .map(DecisionValidation::Final),
+        AgentDecision::Final { claims } => {
+            validate_final_answer(claims, ledger, run).map(DecisionValidation::Final)
+        }
     }
 }
 

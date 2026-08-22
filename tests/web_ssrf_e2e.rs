@@ -26,7 +26,13 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::web::fetch_url;
+mod support;
+
+use openclaudia::web::FetchResult;
+
+async fn fetch_url(url: &str) -> Result<FetchResult, String> {
+    openclaudia::web::fetch_url(url, std::sync::Arc::clone(support::shared_run_context())).await
+}
 
 /// Adversarial URLs that the SSRF guard MUST refuse at the URL
 /// parsing / IP-validation layer. We grep the error message for

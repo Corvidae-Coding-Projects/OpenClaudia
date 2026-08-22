@@ -1,25 +1,17 @@
-//! Service registry — organized analytics, feature flags, and other
-//! cross-cutting concerns that would otherwise scatter across the
-//! codebase.
+//! Lifecycle-service composition and audited reachability.
 //!
-//! Port of Claude Code's `services/` layer (analytics / `GrowthBook` /
-//! LSP manager / remote settings). Rather than one giant registry
-//! struct, each service is defined by its own trait with a default
-//! no-op impl. [`ServiceRegistry`] holds one `Arc<dyn Trait>` per
-//! service, so adding a new service is:
-//!
-//! 1. Define the trait + its `Noop` impl in a submodule.
-//! 2. Add an `Arc<dyn NewTrait>` field to `ServiceRegistry`.
-//! 3. Expose an accessor.
-//!
-//! The registry defaults to "no-op everywhere" — nothing changes on
-//! the hot path until a user (CLI / SDK caller / test) installs a
-//! real implementation.
+//! [`ServiceRegistry`] is intentionally not a global service locator. Rust
+//! dependencies with different authority and lifetime requirements remain
+//! explicit at their call sites. The registry owns the one genuinely injected
+//! cross-frontend service (analytics) and exposes the audited lifecycle catalog
+//! for every other service-shaped implementation. There is no `Default` or
+//! production no-op constructor: absence is represented explicitly.
 
 pub mod analytics;
 pub mod auto_compactor;
 pub mod background;
 pub mod feature_flags;
+pub mod lifecycle;
 pub mod lsp_diagnostics;
 pub mod lsp_pool;
 pub mod mcp_registry;
@@ -34,6 +26,10 @@ pub use background::{
     PluginAutoupdateJob, PluginDelistingJob,
 };
 pub use feature_flags::{FeatureFlagSource, StaticFlags};
+pub use lifecycle::{
+    lifecycle_service_catalog, validate_lifecycle_service_catalog, LifecyclePath,
+    LifecycleServiceClassification, LifecycleServiceId, LifecycleServiceRegistration,
+};
 pub use lsp_diagnostics::{
     DefaultDiagnosticInjector, Diagnostic, DiagnosticInjector, DiagnosticRegistry,
     DiagnosticSeverity, NoopDiagnosticInjector,
@@ -47,136 +43,65 @@ pub use policy::{
 pub use rate_limit_mock::{MockRateLimit, RateLimitMock};
 pub use tool_executor::{ToolExecutor, ToolExecutorRequest};
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-/// Central service registry. Clone-cheap (`Arc` fields) so it can be
-/// passed down the call tree without worrying about lifetime plumbing.
+/// Explicit analytics composition used by interactive production frontends.
+///
+/// Other services remain typed dependencies at their real owners and are
+/// described by [`lifecycle_service_catalog`]. This avoids hiding run authority,
+/// cancellation, or shutdown behind a heterogeneous global locator.
 #[derive(Clone)]
 pub struct ServiceRegistry {
-    analytics: Arc<dyn AnalyticsSink>,
-    flags: Arc<dyn FeatureFlagSource>,
-    /// Plugin-declared MCP servers wired on plugin load (CC parity with
-    /// `mcpPluginIntegration.ts`, crosslink #654). Mutated under
-    /// [`PluginMcpRegistry`]'s internal `RwLock`; cloning the `Arc` keeps
-    /// every observer on the same view.
-    mcp_servers: Arc<RwLock<PluginMcpRegistry>>,
+    analytics: Option<Arc<dyn AnalyticsSink>>,
 }
 
 impl ServiceRegistry {
-    /// All services wired to their no-op default. Safe to use in
-    /// tests and headless invocations where analytics emission or
-    /// feature-flag resolution isn't desired.
+    /// Compose an interactive frontend with an explicit analytics sink.
     #[must_use]
-    pub fn noop() -> Self {
+    pub fn interactive(analytics: Arc<dyn AnalyticsSink>) -> Self {
         Self {
-            analytics: Arc::new(NoopAnalytics),
-            flags: Arc::new(StaticFlags::default()),
-            mcp_servers: Arc::new(RwLock::new(PluginMcpRegistry::default())),
+            analytics: Some(analytics),
         }
     }
 
-    /// Register every MCP server declared by the given plugins (CC
-    /// parity with `mcpPluginIntegration.ts`, crosslink #654).
+    /// Compose a frontend that deliberately emits no analytics.
     ///
-    /// Iterates each [`crate::plugins::Plugin`] passed in and copies its
-    /// `mcp_configs` map into the registry under the plugin's `id` as
-    /// the namespace. Subsequent calls with the same plugin id replace
-    /// the prior set so reload-and-re-wire works in-place. Lock
-    /// poisoning is recovered (`PoisonError::into_inner`) so a panicked
-    /// reader cannot brick the registry for the rest of the process.
-    pub fn wire_plugin_mcp_servers<'p, I>(&self, plugins: I)
-    where
-        I: IntoIterator<Item = &'p crate::plugins::Plugin>,
-    {
-        let mut guard = match self.mcp_servers.write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for plugin in plugins {
-            let registrations: Vec<McpRegistration> = plugin
-                .mcp_configs
-                .iter()
-                .map(|(name, cfg)| McpRegistration {
-                    plugin_id: plugin.id.clone(),
-                    server_name: name.clone(),
-                    spec: McpServerSpec::from_plugin_config(cfg),
-                })
-                .collect();
-            guard.replace_plugin(&plugin.id, registrations);
-        }
-    }
-
-    /// Iterate every currently registered (plugin, server) pair. Useful
-    /// for `/mcp list` and the doctor command.
+    /// This is an explicit disabled state, not a fallback for failed service
+    /// construction.
     #[must_use]
-    pub fn plugin_mcp_registrations(&self) -> Vec<McpRegistration> {
-        match self.mcp_servers.read() {
-            Ok(g) => g.all(),
-            Err(poisoned) => poisoned.into_inner().all(),
-        }
+    pub const fn analytics_disabled() -> Self {
+        Self { analytics: None }
     }
 
-    /// Swap the analytics sink. Consuming builder style so test code
-    /// can chain `noop().with_analytics(recording)` fluently.
+    /// Whether analytics was deliberately composed for this frontend.
     #[must_use]
-    pub fn with_analytics(mut self, sink: Arc<dyn AnalyticsSink>) -> Self {
-        self.analytics = sink;
-        self
+    pub const fn analytics_is_enabled(&self) -> bool {
+        self.analytics.is_some()
     }
 
-    /// Swap the feature-flag source.
+    /// Borrow the explicitly configured analytics sink.
     #[must_use]
-    pub fn with_flags(mut self, flags: Arc<dyn FeatureFlagSource>) -> Self {
-        self.flags = flags;
-        self
+    pub fn analytics(&self) -> Option<&dyn AnalyticsSink> {
+        self.analytics.as_deref()
     }
 
-    /// Borrow the analytics sink as a trait reference.
+    /// Clone the explicitly configured analytics sink.
+    #[must_use]
+    pub fn analytics_arc(&self) -> Option<Arc<dyn AnalyticsSink>> {
+        self.analytics.as_ref().map(Arc::clone)
+    }
+
+    /// Bind the configured analytics sink to one canonical state store.
     ///
-    /// Returns `&dyn AnalyticsSink` rather than `&Arc<dyn AnalyticsSink>`
-    /// so callers don't depend on the registry's smart-pointer choice
-    /// (crosslink #952). Replacing `Arc<dyn _>` with `Box<dyn _>` or a
-    /// `&'static dyn _` singleton would now leave every call site
-    /// unchanged. Callers that genuinely need a shared, long-lived
-    /// handle should use [`Self::analytics_arc`].
+    /// Returning `None` preserves the registry's explicit disabled state;
+    /// callers must decide whether that state is valid for their frontend.
     #[must_use]
-    pub fn analytics(&self) -> &dyn AnalyticsSink {
-        &*self.analytics
-    }
-
-    /// Borrow the feature-flag source as a trait reference.
-    ///
-    /// See [`Self::analytics`] — same reasoning. The Arc-flavoured
-    /// accessor is [`Self::flags_arc`].
-    #[must_use]
-    pub fn flags(&self) -> &dyn FeatureFlagSource {
-        &*self.flags
-    }
-
-    /// Explicit shared-ownership accessor for the analytics sink.
-    ///
-    /// Returns the underlying `Arc<dyn AnalyticsSink>` so a caller can
-    /// keep the sink alive past the registry's borrow lifetime
-    /// (e.g. to install it into a background task). This is the
-    /// "I really do need the Arc" escape hatch — preferring
-    /// [`Self::analytics`] keeps every other call site decoupled from
-    /// the smart-pointer choice.
-    #[must_use]
-    pub fn analytics_arc(&self) -> Arc<dyn AnalyticsSink> {
-        Arc::clone(&self.analytics)
-    }
-
-    /// Explicit shared-ownership accessor for the feature-flag source.
-    /// See [`Self::analytics_arc`] for the motivation.
-    #[must_use]
-    pub fn flags_arc(&self) -> Arc<dyn FeatureFlagSource> {
-        Arc::clone(&self.flags)
-    }
-}
-
-impl Default for ServiceRegistry {
-    fn default() -> Self {
-        Self::noop()
+    pub fn analytics_subscriber(
+        &self,
+        state: crate::state::StateStore,
+    ) -> Option<analytics::StateAnalyticsSubscriber> {
+        self.analytics_arc()
+            .map(|sink| analytics::StateAnalyticsSubscriber::new(state, sink))
     }
 }
 
@@ -186,8 +111,14 @@ impl std::fmt::Debug for ServiceRegistry {
         // trying to traverse the sinks. Keeps the struct usable in
         // `#[derive(Debug)]` contexts that transitively need it.
         f.debug_struct("ServiceRegistry")
-            .field("analytics", &"<sink>")
-            .field("flags", &"<source>")
+            .field(
+                "analytics",
+                &if self.analytics.is_some() {
+                    "configured"
+                } else {
+                    "disabled"
+                },
+            )
             .finish()
     }
 }
@@ -210,39 +141,45 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_is_noop_everywhere() {
-        let reg = ServiceRegistry::default();
-        // No-op: calling record doesn't panic and has no observable
-        // side effect. The assertion here is that we can call every
-        // accessor without downcast or unwrap.
-        reg.analytics().record(AnalyticsEvent::SessionStart {
-            session_id: "s".to_string(),
-        });
-        assert!(!reg.flags().is_enabled("any_flag"));
+    fn disabled_registry_cannot_fabricate_an_analytics_sink() {
+        let registry = ServiceRegistry::analytics_disabled();
+        assert!(!registry.analytics_is_enabled());
+        assert!(registry.analytics().is_none());
+        assert!(registry.analytics_arc().is_none());
+        assert!(registry
+            .analytics_subscriber(crate::state::StateStore::new(
+                crate::state::SessionState::default(),
+            ))
+            .is_none());
     }
 
     #[test]
-    fn with_analytics_swaps_sink() {
+    fn interactive_registry_constructs_and_routes_the_lifecycle_subscriber() {
         let recording = Arc::new(RecordingAnalytics {
             events: Mutex::new(Vec::new()),
         });
-        let reg = ServiceRegistry::noop().with_analytics(recording.clone());
-        reg.analytics().record(AnalyticsEvent::ToolUsed {
-            tool: "bash".to_string(),
-            success: true,
-        });
-        let events = recording.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        matches!(events[0], AnalyticsEvent::ToolUsed { .. });
+        let reg = ServiceRegistry::interactive(recording.clone());
+        let mut subscriber = reg
+            .analytics_subscriber(crate::state::StateStore::new(
+                crate::state::SessionState::default(),
+            ))
+            .expect("interactive subscriber");
+        subscriber.finish();
+        let events = recording.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], AnalyticsEvent::SessionStart { .. }));
+        assert!(matches!(events[1], AnalyticsEvent::SessionEnd { .. }));
     }
 
     #[test]
-    fn with_flags_swaps_source() {
-        let mut flags = StaticFlags::default();
-        flags.set("fast_path", true);
-        let reg = ServiceRegistry::noop().with_flags(Arc::new(flags));
-        assert!(reg.flags().is_enabled("fast_path"));
-        assert!(!reg.flags().is_enabled("slow_path"));
+    fn lifecycle_catalog_is_complete_and_wired_paths_are_total() {
+        validate_lifecycle_service_catalog().expect("bundled lifecycle catalog");
+        for registration in lifecycle_service_catalog() {
+            assert_eq!(
+                registration.classification() == LifecycleServiceClassification::Wired,
+                registration.path().is_some()
+            );
+        }
     }
 
     #[test]
@@ -253,16 +190,21 @@ mod tests {
         let recording = Arc::new(RecordingAnalytics {
             events: Mutex::new(Vec::new()),
         });
-        let reg = ServiceRegistry::noop().with_analytics(recording.clone());
+        let reg = ServiceRegistry::interactive(recording.clone());
         let clone = reg.clone();
 
-        reg.analytics().record(AnalyticsEvent::SessionStart {
-            session_id: "a".to_string(),
-        });
-        clone.analytics().record(AnalyticsEvent::SessionEnd {
-            session_id: "a".to_string(),
-            messages: 10,
-        });
+        reg.analytics()
+            .expect("interactive sink")
+            .record(AnalyticsEvent::SessionStart {
+                session_id: "a".to_string(),
+            });
+        clone
+            .analytics()
+            .expect("interactive sink")
+            .record(AnalyticsEvent::SessionEnd {
+                session_id: "a".to_string(),
+                messages: 10,
+            });
 
         assert_eq!(recording.events.lock().unwrap().len(), 2);
     }

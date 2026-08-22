@@ -13,20 +13,13 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch_lsp(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("lsp", args, &mut ctx)
-        .expect("lsp must be registered")
+    support::dispatch_tool("lsp", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -35,6 +28,15 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
         m.insert((*k).to_string(), v.clone());
     }
     m
+}
+
+fn assert_file_path_classification_denial(message: &str) {
+    assert!(message.contains("Host safety"), "got {message:?}");
+    assert!(message.contains("file_path"), "got {message:?}");
+    assert!(
+        message.contains("malformed arguments") || message.contains("Missing"),
+        "got {message:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -56,7 +58,7 @@ fn file_path_arg_as_number_returns_validation_error() {
     let args = args_with(&[("file_path", json!(42))]);
     let (msg, is_err) = dispatch_lsp(&args);
     assert!(is_err);
-    assert_eq!(msg, "Invalid 'file_path' argument: expected string");
+    assert_file_path_classification_denial(&msg);
 }
 
 #[test]
@@ -64,7 +66,7 @@ fn file_path_arg_as_array_returns_validation_error() {
     let args = args_with(&[("file_path", json!(["a", "b"]))]);
     let (msg, is_err) = dispatch_lsp(&args);
     assert!(is_err);
-    assert_eq!(msg, "Invalid 'file_path' argument: expected string");
+    assert_file_path_classification_denial(&msg);
 }
 
 #[test]
@@ -72,7 +74,7 @@ fn file_path_arg_as_null_returns_validation_error() {
     let args = args_with(&[("file_path", Value::Null)]);
     let (msg, is_err) = dispatch_lsp(&args);
     assert!(is_err);
-    assert_eq!(msg, "Invalid 'file_path' argument: expected string");
+    assert_file_path_classification_denial(&msg);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -109,12 +111,11 @@ fn file_with_no_extension_yields_no_language_server_message() {
 }
 
 #[test]
-fn empty_string_file_path_yields_no_language_server() {
-    // Empty extension after rsplit('.') → no match.
+fn empty_string_file_path_is_rejected_before_language_server_selection() {
     let args = args_with(&[("file_path", json!("")), ("action", json!("hover"))]);
     let (msg, is_err) = dispatch_lsp(&args);
     assert!(is_err);
-    assert!(msg.contains("No language server known"));
+    assert_file_path_classification_denial(&msg);
 }
 
 #[test]

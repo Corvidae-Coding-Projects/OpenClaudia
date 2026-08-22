@@ -72,7 +72,7 @@ pub struct TurnMetrics {
     pub estimated_input_tokens: usize,
     /// Actual usage reported by the provider (if available)
     pub actual_usage: Option<TokenUsage>,
-    /// Tokens consumed by injected context (rules, hooks, session, MCP tools)
+    /// Tokens consumed by injected context (hooks, session, MCP tools, plugins)
     pub injected_context_tokens: usize,
     /// Tokens consumed by system prompt
     pub system_prompt_tokens: usize,
@@ -301,7 +301,14 @@ pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "ask_user_question",
     "task",
     "agent_output",
+    "task_get",
+    "task_list",
     "todo_read",
+    "memory_search",
+    "memory_list",
+    "memory_learning_status",
+    "memory_conflicts",
+    "memory_source_status",
     "crosslink",
     "bash_output",
 ];
@@ -718,7 +725,7 @@ mod plan_mode_tests {
         );
         assert!(
             !is_tool_allowed_in_plan_mode("memory_save", &state.plan_realpath, &no_args),
-            "newly added tool not yet in allowlist must be refused (#341)"
+            "technical-memory mutation must be refused in plan mode (#341)"
         );
     }
 

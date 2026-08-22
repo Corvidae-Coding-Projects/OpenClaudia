@@ -54,7 +54,10 @@ const SKIP_DIRS: &[&str] = &[
 ///
 /// Returns `(stdout, is_error)`. Errors include: missing pattern, invalid
 /// pattern (uncompilable as regex), invalid `path` (jail violation).
-pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_glob(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let pattern = match args.arg_str_strict("pattern") {
         Ok(p) => p,
         Err(e) => return e.into_tool_error(),
@@ -64,7 +67,7 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
         Ok(path) => path,
         Err(e) => return e.into_tool_error(),
     };
-    let root = match resolve_path(raw_path) {
+    let root = match resolve_path(run, raw_path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };
@@ -84,8 +87,15 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
     let mut matches: Vec<String> = Vec::new();
     let mut visited: usize = 0;
     let mut truncated = false;
+    let mut resource_batch = match crate::guardrails::begin_path_resource_batch(run) {
+        Ok(batch) => batch,
+        Err(error) => return (format!("Blocked by blast radius guardrails: {error}"), true),
+    };
+    if let Err(error) = resource_batch.check_scope(run, &root) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
 
-    let directory = match secure_fs::open_directory(&root) {
+    let directory = match secure_fs::open_directory(run, &root) {
         Ok(directory) => directory,
         Err(error) => {
             return (
@@ -97,7 +107,9 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
             );
         }
     };
-    walk(
+    if let Err(error) = walk(
+        run,
+        &root,
         &directory,
         Path::new(""),
         &regex,
@@ -105,7 +117,10 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
         &mut matches,
         &mut visited,
         &mut truncated,
-    );
+        &mut resource_batch,
+    ) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
 
     matches.sort();
 
@@ -123,10 +138,14 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
     } else {
         format!("{header}\n{body}")
     };
+    resource_batch.commit();
     (out, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
+    run: &crate::tools::ToolRunContext,
+    root: &Path,
     dir: &secure_fs::SecureDirectory,
     relative_dir: &Path,
     regex: &Regex,
@@ -134,9 +153,10 @@ fn walk(
     matches: &mut Vec<String>,
     visited: &mut usize,
     truncated: &mut bool,
-) {
+    resource_batch: &mut crate::guardrails::PathResourceBatch,
+) -> Result<(), String> {
     if matches.len() >= MAX_RESULTS || *visited >= MAX_WALK_ENTRIES {
-        return;
+        return Ok(());
     }
     let entries = match dir.entries() {
         Ok(e) => e,
@@ -146,7 +166,7 @@ fn walk(
                 error = %e,
                 "glob: skipping unreadable directory",
             );
-            return;
+            return Ok(());
         }
     };
     let mut subdirs: Vec<(secure_fs::SecureDirectory, PathBuf)> = Vec::new();
@@ -158,9 +178,10 @@ fn walk(
                 "glob: visited-entry cap reached; results may be incomplete",
             );
             *truncated = true;
-            return;
+            return Ok(());
         }
         let path = relative_dir.join(&entry.name);
+        let absolute = root.join(&path);
         if entry.kind == secure_fs::SecureFileType::Directory {
             let name = entry.name;
             let name_str = name.to_string_lossy();
@@ -171,6 +192,7 @@ fn walk(
             {
                 continue;
             }
+            resource_batch.check_scope(run, &absolute)?;
             match dir.open_child_directory(&name) {
                 Ok(child) => subdirs.push((child, path)),
                 Err(error) => {
@@ -184,23 +206,33 @@ fn walk(
         } else if entry.kind == secure_fs::SecureFileType::Regular {
             let rel_str = path.to_string_lossy();
             if regex.is_match(&rel_str) {
+                resource_batch.reserve_file(run, &absolute)?;
                 matches.push(path.display().to_string());
                 if matches.len() >= MAX_RESULTS {
                     *truncated = true;
-                    return;
+                    return Ok(());
                 }
             }
         }
     }
     for (sub, relative) in subdirs {
         walk(
-            &sub, &relative, regex, false, // descend with default hidden-skip behaviour
-            matches, visited, truncated,
-        );
+            run,
+            root,
+            &sub,
+            &relative,
+            regex,
+            false, // descend with default hidden-skip behaviour
+            matches,
+            visited,
+            truncated,
+            resource_batch,
+        )?;
         if matches.len() >= MAX_RESULTS || *visited >= MAX_WALK_ENTRIES {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 /// Translate a glob pattern into an anchored regex.
@@ -260,6 +292,10 @@ mod tests {
     use std::io::Write as _;
     use tempfile::TempDir;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     fn write_file(dir: &Path, rel: &str, body: &str) {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() {
@@ -284,7 +320,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
         assert!(!err, "got error: {out}");
         assert!(out.contains("lib.rs"), "lib.rs missing in: {out}");
         assert!(out.contains("main.rs"), "main.rs missing in: {out}");
@@ -306,7 +342,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
         assert!(!err, "got error: {out}");
         assert!(out.contains("a.rs"), "deep .rs missing in: {out}");
         assert!(!out.contains("b.txt"), "non-rs leaked into matches: {out}");
@@ -316,7 +352,7 @@ mod tests {
     #[test]
     fn glob_missing_pattern_errors() {
         let args = HashMap::new();
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
         assert!(err, "missing pattern must be an error: {out}");
         assert!(out.contains("pattern"), "error must name the arg: {out}");
     }
@@ -326,7 +362,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("pattern".to_string(), json!(42));
 
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
 
         assert!(err, "non-string pattern must be an error: {out}");
         assert_eq!(out, "Invalid 'pattern' argument: expected string");
@@ -338,7 +374,7 @@ mod tests {
         args.insert("pattern".to_string(), json!("*.rs"));
         args.insert("path".to_string(), json!(42));
 
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
 
         assert!(err, "non-string path must be an error: {out}");
         assert!(
@@ -365,7 +401,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_glob(&args);
+        let (out, err) = execute_glob(test_run(), &args);
         assert!(!err, "literal-bracket pattern must not error: {out}");
         assert!(
             out.contains("weird[name].txt"),

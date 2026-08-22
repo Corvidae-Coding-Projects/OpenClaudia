@@ -23,26 +23,29 @@
 //!   - `DenialTracker` escalation — consecutive + total denial counters
 //!     cross [`MAX_CONSECUTIVE_DENIALS`] / [`MAX_TOTAL_DENIALS`]
 //!     thresholds and `escalation_state` flips to `ShouldAbort`.
-//!   - Always-allow persistence — `add_always_allow` registers
-//!     a rule that subsequent `check` calls honour.
+//!   - Exact approval persistence — a bounded receipt authorizes only the
+//!     normalized invocation it records.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, SandboxMode};
 use openclaudia::hooks::{HookEngine, HookEvent, HookInput};
 use openclaudia::permissions::{
-    CheckResult, EscalationState, PermissionDecision, PermissionManager, PermissionRule,
-    MAX_CONSECUTIVE_DENIALS, MAX_TOTAL_DENIALS,
+    ApprovalProvenance, AuthorizationResult, CheckResult, EscalationState, PermissionDecision,
+    PermissionManager, PermissionRule, MAX_CONSECUTIVE_DENIALS, MAX_TOTAL_DENIALS,
 };
+use openclaudia::tools::{FunctionCall, ToolCall};
 use serde_json::json;
 use std::time::Instant;
 use tempfile::tempdir;
 
 /// Build a `PermissionManager` with a tempdir-backed persistence path
-/// so `add_always_allow` writes don't leak into the user's real rule
-/// store. `enabled=true` so the manager actually evaluates rules;
+/// so approval writes don't leak into the user's real rule store.
+/// `enabled=true` so the manager actually evaluates rules;
 /// `default_allow=[]` so we never get an unwanted `Allowed` result that
 /// masks a regression.
 fn fresh_manager() -> (PermissionManager, tempfile::TempDir) {
@@ -97,7 +100,7 @@ enum HookSlot {
 async fn command_hook_runs_and_returns_allowed_by_default() {
     let cfg = config_with_command_hook(HookSlot::SessionStart, None, "echo ok", 10);
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let result = engine.run(HookEvent::SessionStart, &input).await;
     assert!(
@@ -133,7 +136,7 @@ async fn full_sandbox_hook_cannot_persist_host_temp_write() {
         sandbox: SandboxMode::FullSandbox,
     });
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let result = engine.run(HookEvent::SessionStart, &input).await;
 
@@ -162,7 +165,8 @@ async fn pretool_hook_deny_decision_flips_allowed_to_false() {
         10,
     );
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::PreToolUse).with_tool("Bash", json!({"command": "ls"}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("Bash", json!({"command": "ls"}));
 
     let result = engine.run(HookEvent::PreToolUse, &input).await;
     assert!(
@@ -194,8 +198,8 @@ async fn pretool_hook_with_non_matching_matcher_does_not_fire() {
         10,
     );
     let engine = HookEngine::new(cfg);
-    let input =
-        HookInput::new(HookEvent::PreToolUse).with_tool("Write", json!({"file_path": "/tmp/x"}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("Write", json!({"file_path": "/tmp/x"}));
 
     let result = engine.run(HookEvent::PreToolUse, &input).await;
     assert!(
@@ -212,7 +216,7 @@ async fn timeout_kills_long_running_hook_within_grace_window() {
     // hook never got to print one).
     let cfg = config_with_command_hook(HookSlot::SessionStart, None, "sleep 60", 1);
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let start = Instant::now();
     let result = engine.run(HookEvent::SessionStart, &input).await;
@@ -244,7 +248,7 @@ async fn timeout_kills_hook_descendants_before_they_can_escape_lifetime() {
     let command = format!("(sleep 2; touch '{}') & sleep 60", marker.to_string_lossy());
     let cfg = config_with_command_hook(HookSlot::SessionStart, None, &command, 1);
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let _ = engine.run(HookEvent::SessionStart, &input).await;
     tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
@@ -260,7 +264,7 @@ async fn hook_output_capture_is_bounded() {
     let command = r#"python3 -c 'print("x" * (2 * 1024 * 1024))'"#;
     let cfg = config_with_command_hook(HookSlot::SessionStart, None, command, 10);
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
 
     let result = engine.run(HookEvent::SessionStart, &input).await;
     let retained = result
@@ -291,7 +295,8 @@ async fn user_prompt_submit_matcher_targets_prompt_not_tool_name() {
 
     // Match: prompt contains "secret"
     let input_match =
-        HookInput::new(HookEvent::UserPromptSubmit).with_prompt("please show me the secret");
+        HookInput::for_run(support::shared_run_context(), HookEvent::UserPromptSubmit)
+            .with_prompt("please show me the secret");
     let r1 = engine.run(HookEvent::UserPromptSubmit, &input_match).await;
     assert!(
         !r1.allowed,
@@ -299,7 +304,9 @@ async fn user_prompt_submit_matcher_targets_prompt_not_tool_name() {
     );
 
     // No match: prompt is innocuous
-    let input_clean = HookInput::new(HookEvent::UserPromptSubmit).with_prompt("hello there");
+    let input_clean =
+        HookInput::for_run(support::shared_run_context(), HookEvent::UserPromptSubmit)
+            .with_prompt("hello there");
     let r2 = engine.run(HookEvent::UserPromptSubmit, &input_clean).await;
     assert!(
         r2.allowed,
@@ -312,7 +319,8 @@ async fn empty_config_is_allowed_by_default() {
     // Engine with no configured hooks for an event returns
     // HookResult::allowed() without spawning anything.
     let engine = HookEngine::new(HooksConfig::default());
-    let input = HookInput::new(HookEvent::PreToolUse).with_tool("Bash", json!({"command": "ls"}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("Bash", json!({"command": "ls"}));
     let result = engine.run(HookEvent::PreToolUse, &input).await;
     assert!(result.allowed);
     assert!(result.outputs.is_empty());
@@ -347,7 +355,7 @@ async fn multiple_hooks_in_same_slot_all_run() {
     });
 
     let engine = HookEngine::new(cfg);
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
     let _ = engine.run(HookEvent::SessionStart, &input).await;
 
     assert!(
@@ -367,11 +375,11 @@ async fn multiple_hooks_in_same_slot_all_run() {
 // Notes on the registry layer:
 // - `check()` keys into `tools::registry()` by the *registered* tool
 //   name, which is lowercase snake_case ("bash", "write_file"). The
-//   registry's PermissionTarget then yields the *canonical* tool
-//   label ("Bash", "Write") that PermissionRule.tool matches against
-//   (case-insensitive, see `rule_matches`).
-// - `PermissionTarget.arg_key` for Bash is `"command"`; for
-//   write_file it is `"path"` (NOT `"file_path"`, per crosslink #782).
+//   registry's mandatory effect spec then yields the *canonical* tool
+//   label ("Bash", "Write") and concrete target that PermissionRule
+//   matches (case-insensitive tool label; see `rule_matches`).
+// - The declared target key for Bash is `"command"`; for write_file it
+//   is `"path"` (NOT `"file_path"`, per crosslink #782).
 // - Glob `*` matches one path segment (no `/`); use `**` to span
 //   path separators.
 
@@ -419,27 +427,25 @@ fn permission_check_explicit_deny_rule_returns_denied() {
 
 #[test]
 fn permission_check_deny_outranks_allow_for_same_tool() {
-    // When both an allow and a deny match, the first matching rule
-    // wins. Session rules are evaluated in insertion order — so for
-    // a security-conservative outcome, the deny must be inserted
-    // BEFORE the allow. This pins the documented evaluation order;
-    // a future change to "deny always wins regardless of order"
-    // would surface here.
+    // A later, narrower deny must revoke an earlier broad allow. This order is
+    // deliberate: the old test inserted the deny first and therefore stayed
+    // green under both first-match and deny-first implementations, so it did
+    // not actually prove the security property its name claimed.
     let (mut mgr, _td) = fresh_manager();
-    mgr.add_session_rule(PermissionRule {
-        tool: "Bash".to_string(),
-        pattern: "rm**".to_string(),
-        decision: PermissionDecision::Deny,
-    });
     mgr.add_session_rule(PermissionRule {
         tool: "Bash".to_string(),
         pattern: "**".to_string(),
         decision: PermissionDecision::Allow,
     });
+    mgr.add_session_rule(PermissionRule {
+        tool: "Bash".to_string(),
+        pattern: "rm**".to_string(),
+        decision: PermissionDecision::Deny,
+    });
     let r = mgr.check("bash", &json!({"command": "rm -rf /"}));
     assert!(
         matches!(r, CheckResult::Denied(_)),
-        "deny inserted first must catch 'rm -rf /'; got {r:?}"
+        "later specific deny must catch 'rm -rf /' despite the earlier broad allow; got {r:?}"
     );
     // Counter-case: a non-rm command falls through deny and hits allow.
     let r2 = mgr.check("bash", &json!({"command": "echo hello"}));
@@ -485,8 +491,8 @@ fn permission_check_unrestricted_still_denies_hard_safety_commands() {
 
 #[test]
 fn permission_check_write_pattern_matches_path_arg() {
-    // For write_file, the registry's PermissionTarget extracts from
-    // the `path` arg (NOT `file_path`) and uses canonical "Write".
+    // For write_file, the mandatory effect declaration extracts from the
+    // `path` arg (NOT `file_path`) and uses canonical "Write".
     // `/etc/**` matches across `/` boundaries.
     let (mut mgr, _td) = fresh_manager();
     mgr.add_session_rule(PermissionRule {
@@ -505,31 +511,33 @@ fn permission_check_write_pattern_matches_path_arg() {
 }
 
 #[test]
-fn always_allow_persists_for_subsequent_checks() {
-    let (mut mgr, _td) = fresh_manager();
-    // Initial state: NeedsPrompt.
+fn persisted_exact_approval_authorizes_a_matching_later_call() {
+    let (mgr, _td) = fresh_manager();
+    let approved = ToolCall {
+        id: "first".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "bash".to_string(),
+            arguments: json!({"command": "git status"}).to_string(),
+        },
+    };
+    let permit = mgr
+        .approve_tool_call_persisted(
+            &approved,
+            Some("session"),
+            ApprovalProvenance::HostAdministrator,
+        )
+        .unwrap();
+    mgr.consume_execution_permit(&permit, &approved, Some("session"))
+        .unwrap();
+
+    let mut repeated = approved;
+    repeated.id = "second".to_string();
     assert!(matches!(
-        mgr.check("bash", &json!({"command": "git status"})),
-        CheckResult::NeedsPrompt { .. }
+        mgr.authorize_tool_call(&repeated, Some("session")),
+        AuthorizationResult::Allowed(_)
     ));
-    // Add an always-allow rule. The pattern must match exactly the
-    // canonical target ("git status") since glob `*` doesn't cross
-    // `/` and we have no slashes here anyway.
-    mgr.add_always_allow("Bash", "git status");
-    // Now: Allowed.
-    assert_eq!(
-        mgr.check("bash", &json!({"command": "git status"})),
-        CheckResult::Allowed,
-        "always-allow must persist for subsequent checks"
-    );
-    // And the rule shows up in persisted_rules.
-    assert!(
-        mgr.persisted_rules()
-            .iter()
-            .any(|r| r.tool.eq_ignore_ascii_case("Bash") && r.pattern == "git status"),
-        "persisted_rules must include the new always-allow rule; got {:?}",
-        mgr.persisted_rules()
-    );
+    assert!(mgr.persisted_rules().is_empty());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -609,25 +617,42 @@ fn record_denial_eventually_reaches_should_abort_via_total() {
 }
 
 #[test]
-fn clear_session_rules_does_not_clear_persisted() {
+fn clearing_compatibility_session_rules_does_not_clear_exact_receipts() {
     let (mut mgr, _td) = fresh_manager();
-    mgr.add_always_allow("Bash", "git status");
+    let approved = ToolCall {
+        id: "persisted".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "bash".to_string(),
+            arguments: json!({"command": "git status"}).to_string(),
+        },
+    };
+    let first = mgr
+        .approve_tool_call_persisted(
+            &approved,
+            Some("session"),
+            ApprovalProvenance::HostAdministrator,
+        )
+        .unwrap();
+    mgr.consume_execution_permit(&first, &approved, Some("session"))
+        .unwrap();
     mgr.add_session_rule(PermissionRule {
         tool: "Bash".to_string(),
         pattern: "ls*".to_string(),
         decision: PermissionDecision::Allow,
     });
     assert_eq!(mgr.session_rules().len(), 1);
-    assert_eq!(mgr.persisted_rules().len(), 1);
+    assert!(mgr.persisted_rules().is_empty());
 
     mgr.clear_session_rules();
     assert!(
         mgr.session_rules().is_empty(),
         "session rules must be cleared"
     );
-    assert_eq!(
-        mgr.persisted_rules().len(),
-        1,
-        "persisted rules must SURVIVE session clear"
-    );
+    let mut repeated = approved;
+    repeated.id = "after-clear".to_string();
+    assert!(matches!(
+        mgr.authorize_tool_call(&repeated, Some("session")),
+        AuthorizationResult::Allowed(_)
+    ));
 }

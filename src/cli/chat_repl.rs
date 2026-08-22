@@ -24,25 +24,26 @@ use crate::cli::display::tool_result::display_tool_result;
 use crate::cli::repl::input::expand_file_references;
 use crate::cli::repl::keybindings::{display_keybindings, execute_key_action, key_event_to_string};
 use crate::cli::repl::permissions::execute_shell_command_with_permission;
-use crate::cli::repl::plan_mode::{check_plan_mode_restriction, process_tool_result_marker};
+use crate::cli::repl::plan_mode::{check_plan_mode_restriction, process_tool_follow_up};
 use crate::cli::repl::session_io::{
     compact_chat_session_with_instructions, estimate_session_tokens, export_chat_session,
     save_session_to_short_term_memory,
 };
 use crate::cli::repl::slash::{
-    handle_activity_command, handle_memory_command, handle_slash_command, PluginActionOutcome,
-    PluginActionRunner, PluginCommandInvocation, SkillInvocation, SlashCommandResult,
+    handle_activity_command, handle_memory_command, handle_slash_command_for_runtime,
+    PluginActionOutcome, PluginActionRunner, PluginCommandInvocation, SkillInvocation,
+    SlashCommandResult,
 };
 use crate::cli::repl::vim::{self, VimState};
 use crate::cli::repl::{load_chat_session, save_chat_session, Session};
 use crate::{
-    build_chat_endpoint_and_headers, build_chat_request_body, build_hook_engine, chdir_to_git_root,
-    check_tool_permission_interactive, check_tool_unrestricted, finalize_chat,
-    init_memory_with_banner, init_permission_manager, init_plugin_manager,
-    init_rustyline_with_history, init_vdd_engine_if_enabled, maybe_auto_compact,
-    maybe_resume_session, parse_initial_behavior_mode, read_multiline_continuation,
-    render_welcome_or_fallback, resolve_chat_auth, resolve_model_name, run_vdd_review, ChatAuth,
-    ChatAuthSelectionMode, ToolPermissionResult,
+    build_chat_endpoint_and_headers, build_hook_engine, chdir_to_git_root,
+    check_tool_permission_interactive, finalize_chat, init_memory_with_banner,
+    init_permission_manager, init_plugin_manager, init_rustyline_with_history,
+    init_vdd_engine_if_enabled, maybe_auto_compact, maybe_resume_session,
+    parse_initial_behavior_mode, read_multiline_continuation, render_welcome_or_fallback,
+    resolve_chat_auth, resolve_model_name, run_vdd_review, ChatAuth, ChatAuthSelectionMode,
+    ToolPermissionResult,
 };
 
 use eventsource_stream::Eventsource;
@@ -54,53 +55,96 @@ use openclaudia::state::EffortLevel;
 use openclaudia::tools::safe_truncate;
 use openclaudia::{
     config, guardrails, memory,
-    permissions::{allowed_tool_specs_to_permission_rules, PermissionManager, PermissionRule},
-    plugins, prompt, proxy, session, tool_intercept, tools, tui, vdd,
+    permissions::{
+        allowed_tool_specs_to_permission_rules, ExecutionPermit, PermissionManager, PermissionRule,
+    },
+    plugins, prompt, proxy, session, tools, tui, vdd,
 };
 use rustyline::error::ReadlineError;
 
-fn execute_tool_with_memory_after_permission(
-    tool_call: &tools::ToolCall,
-    memory_db: Option<&memory::MemoryDb>,
-    permission_mgr: &PermissionManager,
-    permission_already_checked: bool,
-    session_id: &str,
-    policy_enforcer: Option<&openclaudia::services::policy::PolicyEnforcer>,
-) -> tools::ToolResult {
-    openclaudia::services::tool_executor::ToolExecutor::execute(
-        openclaudia::services::tool_executor::ToolExecutorRequest {
-            tool_call,
-            memory_db,
-            app_config: None,
-            task_mgr: None,
-            permission_mgr: Some(permission_mgr),
-            permission_already_checked,
-            session_id: Some(session_id),
-            policy_enforcer,
-        },
-    )
+struct CliToolExecution<'a> {
+    run_context: &'a std::sync::Arc<tools::ToolRunContext>,
+    tool_call: &'a tools::ToolCall,
+    memory_db: Option<&'a memory::MemoryDb>,
+    app_config: &'a config::AppConfig,
+    task_manager: &'a std::sync::Mutex<session::TaskManager>,
+    permission_mgr: &'a PermissionManager,
+    authorization: Option<ExecutionPermit>,
+    session_id: &'a str,
+    policy_enforcer: Option<&'a openclaudia::services::policy::PolicyEnforcer>,
+}
+
+fn execute_tool_with_memory_after_permission(request: CliToolExecution<'_>) -> tools::ToolResult {
+    let CliToolExecution {
+        run_context,
+        tool_call,
+        memory_db,
+        app_config,
+        task_manager,
+        permission_mgr,
+        authorization,
+        session_id,
+        policy_enforcer,
+    } = request;
+    let execute = |task_mgr: Option<&mut session::TaskManager>| {
+        openclaudia::services::tool_executor::ToolExecutor::execute(
+            openclaudia::services::tool_executor::ToolExecutorRequest {
+                run_context,
+                tool_call,
+                memory_db,
+                app_config: Some(app_config),
+                task_mgr,
+                permission_mgr,
+                authorization,
+                session_id: Some(session_id),
+                policy_enforcer,
+            },
+        )
+    };
+    if tools::uses_canonical_task_graph(&tool_call.function.name) {
+        let mut task_manager = task_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execute(Some(&mut task_manager))
+    } else {
+        execute(None)
+    }
 }
 
 fn observe_cli_model_visible_tool_result(
+    run: &tools::ToolRunContext,
     session_id: &str,
     tool_call: &tools::ToolCall,
     tool_call_id: &str,
     content: &str,
     is_error: bool,
 ) {
-    let result = tools::ToolResult {
-        tool_call_id: tool_call_id.to_string(),
-        content: content.to_string(),
-        is_error,
-    };
-    openclaudia::grounded_loop::observe_tool_result_for_session(
-        session_id,
+    let mut bound_call = tool_call.clone();
+    bound_call.id = tool_call_id.to_string();
+    let result = tools::ToolResult::bind(
+        &bound_call,
         &tool_call.function.name,
-        &result,
+        tools::ToolHandlerResult::legacy(content.to_string(), is_error),
+    );
+    openclaudia::grounded_loop::observe_tool_result_for_session(run, session_id, &result);
+}
+
+fn push_observed_cli_typed_tool_result_message(
+    run: &tools::ToolRunContext,
+    session: &mut Session,
+    _tool_call: &tools::ToolCall,
+    result: &tools::ToolResult,
+) {
+    openclaudia::grounded_loop::observe_tool_result_for_session(run, &session.id(), result);
+    push_chat_session_message_and_persist(
+        session,
+        result.openai_message(),
+        "typed CLI tool result",
     );
 }
 
 fn push_observed_cli_tool_result_message(
+    run: &tools::ToolRunContext,
     session: &mut Session,
     tool_call: &tools::ToolCall,
     tool_call_id: &str,
@@ -108,6 +152,7 @@ fn push_observed_cli_tool_result_message(
     final_is_error: bool,
 ) {
     observe_cli_model_visible_tool_result(
+        run,
         &session.id(),
         tool_call,
         tool_call_id,
@@ -158,24 +203,24 @@ pub struct ChatRepl {
     // ── Configuration captured during setup ──
     config: config::AppConfig,
     coordinator: bool,
-    ext_regex: regex::Regex,
     // Crosslink #433: was `Box<dyn ProviderAdapter>`. Now `&'static dyn …`
     // — `get_adapter` returns a shared static singleton, so the REPL just
     // borrows it for the lifetime of the process. No allocation, no Drop.
     adapter: &'static dyn openclaudia::providers::ProviderAdapter,
     client: reqwest::Client,
     hook_engine: openclaudia::hooks::HookEngine,
-    rules_engine: openclaudia::rules::RulesEngine,
     api_key: Option<openclaudia::providers::ApiKey>,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<openclaudia::secrets::OAuthToken>,
     permission_mgr: PermissionManager,
     policy_enforcer: std::sync::Arc<openclaudia::services::policy::PolicyEnforcer>,
+    run_context: std::sync::Arc<tools::ToolRunContext>,
     vdd_engine: Option<vdd::VddEngine>,
     history_path: std::path::PathBuf,
     // ── Per-session mutable state ──
     model: String,
     rl: rustyline::DefaultEditor,
     chat_session: Session,
+    service_registry: openclaudia::services::ServiceRegistry,
     analytics_subscriber: openclaudia::services::analytics::StateAnalyticsSubscriber,
     current_task_obs: Option<openclaudia::ledger::ObsId>,
     active_theme: tui::Theme,
@@ -183,11 +228,8 @@ pub struct ChatRepl {
     vim_state: VimState,
     audit_logger: openclaudia::session::AuditLogger,
     memory_db: Option<memory::MemoryDb>,
-    // `auto_learner` borrows `memory_db` so it can't live on the same
-    // struct (self-referential). It is constructed once in `run` and
-    // threaded into any method that needs it via `&mut Option<_>`.
-    permissions: std::collections::HashSet<String>,
-    always_allowed_tools: std::collections::HashSet<String>,
+    task_manager: std::sync::Mutex<session::TaskManager>,
+    permissions: openclaudia::permissions::LocalApprovalCache,
     transient_allowed_tool_rules: Vec<PermissionRule>,
     transient_model_restore: Option<String>,
     transient_effort_override: Option<EffortLevel>,
@@ -212,7 +254,54 @@ enum SlashOutcome {
 #[derive(Clone, Copy)]
 struct TurnTransport<'a> {
     endpoint: &'a str,
-    headers: &'a [(String, String)],
+    headers: &'a openclaudia::secrets::SensitiveHeaders,
+}
+
+fn derive_repl_session_run(
+    parent: &tools::ToolRunContext,
+    session: &Session,
+    configured_provider: &str,
+) -> Result<std::sync::Arc<tools::ToolRunContext>, String> {
+    if canonical_provider_name(&session.provider) != canonical_provider_name(configured_provider) {
+        return Err(format!(
+            "Saved session provider '{}' differs from the active provider '{}'; relaunch with --target {} to resume it",
+            session.provider, configured_provider, session.provider
+        ));
+    }
+    let identity = session.inspect_state(|state| state.identity.clone());
+    let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
+        format!(
+            "Cannot resume project root '{}': {error}",
+            identity.project_root.display()
+        )
+    })?;
+    if project_root != parent.project_root() {
+        return Err(format!(
+            "Session project '{}' differs from the authorized launch project '{}'; launch OpenClaudia from that project to resume it",
+            project_root.display(),
+            parent.project_root().display()
+        ));
+    }
+    parent.derive_frontend_session(
+        identity.session_id,
+        &project_root,
+        &identity.cwd,
+        configured_provider,
+    )
+}
+
+fn fresh_repl_session_in_run(current: &Session, model: &str, provider: &str) -> Session {
+    let behavior_mode = current.behavior_mode();
+    let identity = current.inspect_state(|state| state.identity.clone());
+    let fresh = Session::new_with_behavior_mode(model, provider, behavior_mode);
+    let fresh_id = fresh.inspect_state(|state| state.identity.session_id.clone());
+    fresh.update_state(|state, _| {
+        state.identity = identity;
+        state.identity.session_id = fresh_id;
+        state.identity.parent_session_id = None;
+        state.transcript.transcript_cwd = state.identity.cwd.clone();
+    });
+    fresh
 }
 
 /// Mutable state threaded through the Gemini agentic tool loop.
@@ -237,7 +326,6 @@ struct OpenAiLoopState {
 struct SseFrameCtx<'a> {
     full_content: &'a mut String,
     reasoning_content: &'a mut String,
-    md_renderer: &'a mut tui::StreamingMarkdownRenderer,
     tool_accumulator: &'a mut tools::ToolCallAccumulator,
     anthropic_accumulator: &'a mut tools::AnthropicToolAccumulator,
     stream_usage: &'a mut openclaudia::session::TokenUsage,
@@ -248,7 +336,6 @@ struct SseFrameCtx<'a> {
 
 /// Spinner template — uses indicatif placeholder syntax, not `format!`.
 const SPINNER_TMPL: &str = "{spinner:.cyan} {msg}";
-const EXTENSION_REGEX_PATTERN: &str = r"[\w/\\.-]+\.([a-zA-Z0-9]{1,10})\b";
 
 fn active_provider_for_turn(config: &config::AppConfig) -> Result<&config::ProviderConfig, String> {
     config.active_provider().ok_or_else(|| {
@@ -259,11 +346,6 @@ fn active_provider_for_turn(config: &config::AppConfig) -> Result<&config::Provi
     })
 }
 
-fn compile_extension_regex() -> Result<regex::Regex, String> {
-    regex::Regex::new(EXTENSION_REGEX_PATTERN)
-        .map_err(|err| format!("failed to compile file extension detector regex: {err}"))
-}
-
 fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
     messages
         .iter()
@@ -272,45 +354,49 @@ fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
         .and_then(|message| message.get("content").and_then(|content| content.as_str()))
 }
 
-fn observe_cli_user_task(session_id: &str, content: &str) -> Option<openclaudia::ledger::ObsId> {
-    openclaudia::grounded_loop::observe_session_user_task(session_id, content)
+fn observe_cli_user_task(
+    run: &tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+    model_identity: &str,
+) -> Option<openclaudia::ledger::ObsId> {
+    openclaudia::grounded_loop::observe_session_user_task(run, session_id, content, model_identity)
 }
 
 fn request_messages_with_cli_grounding(
+    run: &tools::ToolRunContext,
     session_id: &str,
     task_obs: Option<openclaudia::ledger::ObsId>,
     session_messages: &[serde_json::Value],
 ) -> Result<Vec<serde_json::Value>, String> {
     openclaudia::grounded_loop::request_messages_with_grounding(
+        run,
         session_id,
         task_obs,
         session_messages,
     )
 }
 
-fn append_gemini_system_instruction_text(request: &mut serde_json::Value, content: &str) {
-    if let Some(parts) = request
-        .get_mut("systemInstruction")
-        .and_then(|instruction| instruction.get_mut("parts"))
-        .and_then(|parts| parts.as_array_mut())
-    {
-        parts.push(serde_json::json!({ "text": content }));
-        return;
-    }
-    request["systemInstruction"] = serde_json::json!({
-        "parts": [{ "text": content }]
-    });
-}
-
 fn cli_grounding_system_content(
+    run: &tools::ToolRunContext,
     session_id: &str,
     task_obs: openclaudia::ledger::ObsId,
 ) -> Option<String> {
-    openclaudia::grounded_loop::session_grounding_system_content(session_id, task_obs)
+    openclaudia::grounded_loop::session_grounding_system_content(run, session_id, task_obs)
 }
 
-fn validate_cli_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
-    openclaudia::grounded_loop::validate_agentic_final_response(session_id, content)
+fn validate_and_render_cli_agentic_final_response(
+    run: &tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+    model_identity: &str,
+) -> Result<String, String> {
+    openclaudia::grounded_loop::validate_and_render_agentic_final_response(
+        run,
+        session_id,
+        content,
+        model_identity,
+    )
 }
 
 fn final_response_requires_grounding(content: &str, cancelled: bool) -> bool {
@@ -318,11 +404,13 @@ fn final_response_requires_grounding(content: &str, cancelled: bool) -> bool {
 }
 
 fn check_provider_request_policy(
+    run: &tools::ToolRunContext,
     policy_enforcer: &openclaudia::services::policy::PolicyEnforcer,
     model: &str,
     messages: &[serde_json::Value],
 ) -> Result<(), String> {
-    let request = openclaudia::pipeline::build_chat_completion_request(model, messages)?;
+    let request =
+        openclaudia::pipeline::build_chat_completion_request_for_run(run, model, messages)?;
     let estimated_input = openclaudia::compaction::estimate_request_tokens(&request);
     openclaudia::services::policy::ProviderRequestPolicy::new(policy_enforcer.policy())
         .check(
@@ -408,17 +496,9 @@ impl ChatRepl {
     /// initialized REPL. Setup failures return an error after printing the
     /// same user-facing diagnostics as the default TUI path, so the process
     /// exits non-zero instead of making automation believe startup succeeded.
+    #[allow(clippy::too_many_lines)] // Session composition is intentionally linear and fail-fast.
     pub async fn new(args: ChatReplArgs) -> anyhow::Result<Self> {
-        use openclaudia::rules::RulesEngine;
-
         chdir_to_git_root();
-        let ext_regex = match compile_extension_regex() {
-            Ok(regex) => regex,
-            Err(err) => {
-                eprintln!("{err}");
-                anyhow::bail!(err);
-            }
-        };
 
         let Some(config) = load_repl_config(
             args.model_override.as_deref(),
@@ -434,8 +514,6 @@ impl ChatRepl {
                 anyhow::bail!(e);
             }
         };
-
-        guardrails::configure(&config.guardrails);
 
         let provider = match active_provider_for_turn(&config) {
             Ok(provider) => provider,
@@ -463,8 +541,6 @@ impl ChatRepl {
         };
         let client = reqwest::Client::new();
         let hook_engine = build_hook_engine(&config);
-        let rules_engine = RulesEngine::new(".openclaudia/rules");
-        let plugin_manager = init_plugin_manager();
         let (rl, history_path) = init_rustyline_with_history()?;
 
         render_welcome_or_fallback(&config.proxy.target, &model);
@@ -476,37 +552,64 @@ impl ChatRepl {
         // A dangerous bypass is a launch-scoped choice. Apply it after resume
         // so a saved session can neither enable nor disable the current CLI's
         // explicit posture.
-        chat_session.set_permission_bypass(args.dangerously_skip_permissions);
-        let analytics_subscriber = openclaudia::services::analytics::StateAnalyticsSubscriber::new(
-            chat_session.state_store(),
-            std::sync::Arc::new(openclaudia::services::analytics::TracingAnalytics),
+        chat_session.set_permission_bypass(
+            args.dangerously_skip_permissions || !config.permissions.enabled,
         );
+        let analytics_sink: std::sync::Arc<dyn openclaudia::services::analytics::AnalyticsSink> =
+            std::sync::Arc::new(openclaudia::services::analytics::TracingAnalytics);
+        let service_registry = openclaudia::services::ServiceRegistry::interactive(
+            std::sync::Arc::clone(&analytics_sink),
+        );
+        let Some(analytics_subscriber) =
+            service_registry.analytics_subscriber(chat_session.state_store())
+        else {
+            anyhow::bail!("interactive REPL service registry has analytics disabled");
+        };
 
         let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id())?;
-        let memory_db: Option<memory::MemoryDb> = init_memory_with_banner();
-        let permission_mgr = init_permission_manager(&config, args.dangerously_skip_permissions);
         let policy_enforcer = std::sync::Arc::new(
             openclaudia::services::policy::PolicyEnforcer::new(config.policy.clone()),
         );
         let vdd_engine: Option<vdd::VddEngine> = init_vdd_engine_if_enabled(&config);
+        let identity = chat_session.inspect_state(|state| state.identity.clone());
+        let run_context =
+            tools::ToolRunContext::builder(identity.session_id, identity.project_root)
+                .working_directory(identity.cwd)
+                .host_startup_grants()
+                .workspace_access(tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(true)
+                .secrets(true)
+                .provider(config.proxy.target.clone())
+                .build()
+                .map_err(anyhow::Error::msg)?;
+        let memory_db = Some(init_memory_with_banner(&run_context, &config)?);
+        let task_manager = std::sync::Mutex::new(
+            session::TaskManager::open_for_run(&run_context).map_err(anyhow::Error::msg)?,
+        );
+        guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
+        let permission_mgr =
+            init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);
+        let plugin_manager = init_plugin_manager(run_context.project_root());
+        let permissions = openclaudia::permissions::LocalApprovalCache::for_run(&run_context);
 
         Ok(Self {
             config,
             coordinator: args.coordinator,
-            ext_regex,
             adapter,
             client,
             hook_engine,
-            rules_engine,
             api_key,
             claude_code_token,
             permission_mgr,
             policy_enforcer,
+            run_context,
             vdd_engine,
             history_path,
             model,
             rl,
             chat_session,
+            service_registry,
             analytics_subscriber,
             current_task_obs: None,
             active_theme: tui::Theme::load(),
@@ -514,8 +617,8 @@ impl ChatRepl {
             vim_state: VimState::new(),
             audit_logger,
             memory_db,
-            permissions: std::collections::HashSet::new(),
-            always_allowed_tools: std::collections::HashSet::new(),
+            task_manager,
+            permissions,
             transient_allowed_tool_rules: Vec::new(),
             transient_model_restore: None,
             transient_effort_override: None,
@@ -523,29 +626,17 @@ impl ChatRepl {
         })
     }
 
-    /// Drive the readline loop until the user exits. `auto_learner`
-    /// is owned by `run` (it borrows `self.memory_db` only) and
-    /// threaded into the few methods that need it via parameter; this
-    /// side-steps the self-referential-struct problem without adding
-    /// `unsafe` or changing the upstream `AutoLearner` lifetime.
+    /// Drive the readline loop until the user exits.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        // Split the borrow: take memory_db out so the learner can
-        // hold a stable borrow, then pass `memory_db.as_ref()` to
-        // every site that used to call `memory_db`.
         let memory_db = self.memory_db.take();
-        let mut auto_learner: Option<openclaudia::auto_learn::AutoLearner<'_>> = memory_db
-            .as_ref()
-            .map(openclaudia::auto_learn::AutoLearner::new);
 
         loop {
             let prompt = self.build_prompt_string();
             let readline = self.rl.readline(&prompt);
             match readline {
                 Ok(line) => {
-                    let should_break = self
-                        .process_line(line, memory_db.as_ref(), &mut auto_learner)
-                        .await?
-                        == Some(true);
+                    let should_break =
+                        self.process_line(line, memory_db.as_ref()).await? == Some(true);
                     self.analytics_subscriber.drain_pending();
                     if should_break {
                         break;
@@ -563,15 +654,23 @@ impl ChatRepl {
             }
         }
         finalize_chat(
-            &mut auto_learner,
             &self.chat_session,
             memory_db.as_ref(),
             &mut self.rl,
             &self.history_path,
         );
         self.analytics_subscriber.finish();
-        // Drop the learner before memory_db.
-        drop(auto_learner);
+        debug_assert!(self.service_registry.analytics_is_enabled());
+        let end_input = openclaudia::hooks::HookInput::for_run(
+            &self.run_context,
+            openclaudia::hooks::HookEvent::SessionEnd,
+        )
+        .with_session_id(self.chat_session.id());
+        let _ = self
+            .hook_engine
+            .run(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
+            .await;
+        tools::retire_run(&self.run_context);
         drop(memory_db);
         println!("\nGoodbye!");
         Ok(())
@@ -613,7 +712,6 @@ impl ChatRepl {
         &mut self,
         line: String,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> anyhow::Result<Option<bool>> {
         let mut input = line.trim().to_string();
         let mut editor_message_added = false;
@@ -648,10 +746,13 @@ impl ChatRepl {
                     self.clear_transient_prompt_options();
                     return Ok(Some(false));
                 }
-                if let Some(execution) =
-                    execute_shell_command_with_permission(cmd, &mut self.permissions)
-                {
+                if let Some(execution) = execute_shell_command_with_permission(
+                    &self.run_context,
+                    cmd,
+                    &mut self.permissions,
+                ) {
                     openclaudia::grounded_loop::observe_shell_command_for_session(
+                        &self.run_context,
                         &self.chat_session.id(),
                         &execution.cwd,
                         &execution.command,
@@ -670,20 +771,25 @@ impl ChatRepl {
             }
         }
 
-        if !editor_message_added && !self.prepare_user_message(&input, auto_learner).await {
+        if !editor_message_added && !self.prepare_user_message(&input).await {
             self.clear_transient_prompt_options();
             return Ok(Some(false));
         }
 
         let task_messages = self.chat_session.messages_snapshot();
-        self.current_task_obs = latest_user_message_content(&task_messages)
-            .and_then(|content| observe_cli_user_task(&self.chat_session.id(), content));
+        self.current_task_obs = latest_user_message_content(&task_messages).and_then(|content| {
+            observe_cli_user_task(
+                &self.run_context,
+                &self.chat_session.id(),
+                content,
+                &self.model,
+            )
+        });
 
-        self.inject_rules_from_extensions();
-        let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
-        self.install_system_prompt(&prompt_blocks);
+        let prompt_blocks = self.build_prompt_blocks_for_turn();
         let request_state = self.chat_session.messages_snapshot();
         let request_messages = match request_messages_with_cli_grounding(
+            &self.run_context,
             &self.chat_session.id(),
             self.current_task_obs,
             &request_state,
@@ -696,9 +802,12 @@ impl ChatRepl {
                 return Ok(Some(false));
             }
         };
-        if let Err(err) =
-            check_provider_request_policy(&self.policy_enforcer, &self.model, &request_messages)
-        {
+        if let Err(err) = check_provider_request_policy(
+            &self.run_context,
+            &self.policy_enforcer,
+            &self.model,
+            &request_messages,
+        ) {
             self.clear_transient_prompt_options();
             tracing::warn!(error = %err, "Enterprise policy blocked chat request");
             eprintln!("\n\x1b[31m{err}\x1b[0m");
@@ -708,13 +817,14 @@ impl ChatRepl {
         let effort = self
             .transient_effort_override
             .unwrap_or_else(|| self.chat_session.effort_level());
-        let request_body = match build_chat_request_body(
+        let request_body = match openclaudia::pipeline::build_request_for_run(
+            &self.run_context,
             &self.config.proxy.target,
-            &request_messages,
             &self.model,
-            &prompt_blocks,
+            &request_messages,
             effort.as_str(),
-            self.claude_code_token.as_deref(),
+            self.claude_code_token.as_ref(),
+            Some(&prompt_blocks),
         ) {
             Ok(request_body) => request_body,
             Err(err) => {
@@ -739,7 +849,7 @@ impl ChatRepl {
             provider,
             self.adapter,
             self.api_key.as_ref(),
-            self.claude_code_token.as_deref(),
+            self.claude_code_token.as_ref(),
         );
 
         let transport = TurnTransport {
@@ -747,13 +857,7 @@ impl ChatRepl {
             headers: &headers,
         };
         let exit = self
-            .send_and_process_turn(
-                transport,
-                request_body,
-                &prompt_blocks,
-                memory_db,
-                auto_learner,
-            )
+            .send_and_process_turn(transport, request_body, &prompt_blocks, memory_db)
             .await;
 
         self.clear_transient_prompt_options();
@@ -788,8 +892,29 @@ impl ChatRepl {
         input: &mut String,
         memory_db: Option<&memory::MemoryDb>,
     ) -> SlashOutcome {
+        let doctor_runtime = input.trim().eq_ignore_ascii_case("/doctor").then(|| {
+            let manager = openclaudia::mcp::registered_manager(&self.run_context);
+            let mut snapshot = openclaudia::doctor::DoctorRuntimeSnapshot::from_run_with_mcp(
+                &self.run_context,
+                manager.as_ref(),
+            )
+            .with_composed_provider_transport(&self.client, self.adapter)
+            .with_composed_plugin_manager(&self.plugin_manager);
+            if let Some(store) = memory_db {
+                snapshot = snapshot.with_composed_memory_store(store);
+            }
+            snapshot
+        });
         let result = self.chat_session.update_messages(|messages| {
-            handle_slash_command(input, messages, &self.config.proxy.target, &self.model)
+            handle_slash_command_for_runtime(
+                input,
+                messages,
+                &self.config.proxy.target,
+                &self.model,
+                &self.run_context,
+                &self.config,
+                doctor_runtime.as_ref(),
+            )
         });
         let Some(result) = result else {
             return SlashOutcome::FallThrough;
@@ -801,24 +926,25 @@ impl ChatRepl {
             }
             SlashCommandResult::Clear => {
                 save_session_to_short_term_memory(&self.chat_session, memory_db);
-                let prev_mode = self.chat_session.behavior_mode();
-                self.chat_session
-                    .apply_loaded(&Session::new_with_behavior_mode(
-                        &self.model,
-                        &self.config.proxy.target,
-                        prev_mode,
-                    ));
+                let fresh = fresh_repl_session_in_run(
+                    &self.chat_session,
+                    &self.model,
+                    &self.config.proxy.target,
+                );
+                if let Err(error) = self.apply_session_transition(&fresh) {
+                    eprintln!("Could not start a new session: {error}");
+                }
                 SlashOutcome::Continue
             }
             SlashCommandResult::LoadSession(sid) => {
                 match load_chat_session(&sid) {
-                    Ok(Some(loaded)) => {
-                        self.chat_session.apply_loaded(&loaded);
-                        println!(
+                    Ok(Some(loaded)) => match self.apply_session_transition(&loaded) {
+                        Ok(()) => println!(
                             "Loaded {} messages from previous session.\n",
                             self.chat_session.message_count()
-                        );
-                    }
+                        ),
+                        Err(error) => eprintln!("Failed to activate session {sid}: {error}"),
+                    },
                     Ok(None) => {
                         eprintln!("Session {sid} was not found.");
                     }
@@ -847,6 +973,28 @@ impl ChatRepl {
             }
             other => self.dispatch_slash_rest(input, other, memory_db),
         }
+    }
+
+    fn apply_session_transition(&mut self, loaded: &Session) -> Result<(), String> {
+        let next_run =
+            derive_repl_session_run(&self.run_context, loaded, &self.config.proxy.target)?;
+        let next_audit = openclaudia::session::AuditLogger::new(&loaded.id())
+            .map_err(|error| format!("cannot initialize session audit log: {error}"))?;
+        let permission_bypass = self.chat_session.permission_bypass_enabled();
+        guardrails::configure(&next_run, &self.config.guardrails)?;
+
+        self.clear_transient_prompt_options();
+        tools::retire_run(&self.run_context);
+        self.chat_session.apply_loaded(loaded);
+        self.chat_session.set_permission_bypass(permission_bypass);
+        self.model.clone_from(&loaded.model);
+        self.run_context = next_run;
+        self.permission_mgr =
+            init_permission_manager(&self.config, permission_bypass, &self.run_context);
+        self.audit_logger = next_audit;
+        self.current_task_obs = None;
+        self.permissions = openclaudia::permissions::LocalApprovalCache::for_run(&self.run_context);
+        Ok(())
     }
 
     /// Tail of [`Self::dispatch_slash`] — kept separate so neither
@@ -899,14 +1047,16 @@ impl ChatRepl {
                 self.apply_skill_invocation(input, invocation);
                 SlashOutcome::RewrittenPrompt
             }
-            SlashCommandResult::Plugin(action) => match action.apply(&mut self.plugin_manager) {
-                PluginActionOutcome::Handled => SlashOutcome::Continue,
-                PluginActionOutcome::Prompt(invocation) => {
-                    eprintln!("\x1b[36m⚡ Running plugin command...\x1b[0m");
-                    self.apply_plugin_command_invocation(input, invocation);
-                    SlashOutcome::RewrittenPrompt
+            SlashCommandResult::Plugin(action) => {
+                match action.apply(&mut self.plugin_manager, &self.run_context) {
+                    PluginActionOutcome::Handled => SlashOutcome::Continue,
+                    PluginActionOutcome::Prompt(invocation) => {
+                        eprintln!("\x1b[36m⚡ Running plugin command...\x1b[0m");
+                        self.apply_plugin_command_invocation(input, invocation);
+                        SlashOutcome::RewrittenPrompt
+                    }
                 }
-            },
+            }
             other => self.dispatch_slash_simple(other, memory_db),
         }
     }
@@ -995,7 +1145,14 @@ impl ChatRepl {
                 );
             }
             SlashCommandResult::Keybindings => display_keybindings(&self.config.keybindings),
-            SlashCommandResult::Memory(args) => handle_memory_command(&args, memory_db),
+            SlashCommandResult::Memory(args) => {
+                handle_memory_command(
+                    &args,
+                    memory_db,
+                    &self.run_context,
+                    self.config.memory.automatic_learning_enabled,
+                );
+            }
             SlashCommandResult::Activity(args) => {
                 handle_activity_command(&args, &self.chat_session.id(), memory_db);
             }
@@ -1027,7 +1184,7 @@ impl ChatRepl {
     /// a fresh user message and reset undo state.
     fn handle_editor_input(&mut self, editor_content: String) -> SlashOutcome {
         let expanded = if editor_content.contains('@') {
-            expand_file_references(&editor_content)
+            expand_file_references(&self.run_context, &editor_content)
         } else {
             editor_content
         };
@@ -1220,15 +1377,11 @@ impl ChatRepl {
     /// Push the user message (with `@file` expansion) and run
     /// `UserPromptSubmit` hooks. Returns `false` if a hook blocked the
     /// turn (caller should `continue` the outer loop).
-    async fn prepare_user_message(
-        &mut self,
-        input: &str,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
-    ) -> bool {
+    async fn prepare_user_message(&mut self, input: &str) -> bool {
         use openclaudia::hooks::{HookEvent, HookInput};
 
         let expanded_input = if input.contains('@') {
-            expand_file_references(input)
+            expand_file_references(&self.run_context, input)
         } else {
             input.to_string()
         };
@@ -1241,18 +1394,8 @@ impl ChatRepl {
         self.chat_session.touch();
         self.chat_session.clear_undo_stack();
 
-        if let Some(ref mut learner) = auto_learner {
-            let messages = self.chat_session.messages_snapshot();
-            let prev_assistant = messages
-                .iter()
-                .rev()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-                .map(std::string::ToString::to_string);
-            learner.on_user_message(&expanded_input, prev_assistant.as_deref());
-        }
-
-        let hook_input = HookInput::new(HookEvent::UserPromptSubmit).with_prompt(&expanded_input);
+        let hook_input = HookInput::for_run(&self.run_context, HookEvent::UserPromptSubmit)
+            .with_prompt(&expanded_input);
         let hook_result = self
             .hook_engine
             .run(HookEvent::UserPromptSubmit, &hook_input)
@@ -1269,28 +1412,19 @@ impl ChatRepl {
             return false;
         }
 
-        for output in &hook_result.outputs {
-            if let Some(sys_msg) = &output.system_message {
-                self.chat_session.update_messages(|messages| {
-                    messages.insert(
-                        0,
-                        serde_json::json!({
-                            "role": "system",
-                            "content": sys_msg
-                        }),
-                    );
-                });
-            }
-            if let Some(ctx) = &output.additional_context {
-                // Route through the centralized envelope builder so the
-                // crosslink #502 XML-escape (which neutralizes any
-                // attacker-supplied `</system-reminder>` closing tag)
-                // is applied here too, not just in `ContextInjector`.
-                self.chat_session.push_message(serde_json::json!({
-                    "role": "system",
-                    "content": openclaudia::context::wrap_system_reminder(ctx),
-                }));
-            }
+        let hook_items = openclaudia::context::hook_result_reference_items(
+            &hook_result,
+            "user_prompt_submit",
+            500,
+        );
+        if !hook_items.is_empty() {
+            let projection = openclaudia::context::ContextProjector::project(
+                hook_items,
+                openclaudia::context::ContextBudget::default(),
+            );
+            self.chat_session.update_messages(|messages| {
+                projection.append_reference_to_json_messages(messages);
+            });
         }
         true
     }
@@ -1298,6 +1432,7 @@ impl ChatRepl {
     fn request_messages_with_grounding(&self) -> Result<Vec<serde_json::Value>, String> {
         let session_messages = self.chat_session.messages_snapshot();
         let mut messages = request_messages_with_cli_grounding(
+            &self.run_context,
             &self.chat_session.id(),
             self.current_task_obs,
             &session_messages,
@@ -1323,7 +1458,12 @@ impl ChatRepl {
                 return false;
             }
         };
-        match check_provider_request_policy(&self.policy_enforcer, &self.model, &request_messages) {
+        match check_provider_request_policy(
+            &self.run_context,
+            &self.policy_enforcer,
+            &self.model,
+            &request_messages,
+        ) {
             Ok(()) => true,
             Err(err) => {
                 tracing::warn!(error = %err, context, "Enterprise policy blocked follow-up request");
@@ -1334,8 +1474,9 @@ impl ChatRepl {
     }
 
     fn current_grounding_system_content(&self) -> Option<String> {
-        self.current_task_obs
-            .and_then(|task_obs| cli_grounding_system_content(&self.chat_session.id(), task_obs))
+        self.current_task_obs.and_then(|task_obs| {
+            cli_grounding_system_content(&self.run_context, &self.chat_session.id(), task_obs)
+        })
     }
 
     fn policy_denied_tool_result(&self, tool_call: &tools::ToolCall) -> Option<tools::ToolResult> {
@@ -1347,10 +1488,13 @@ impl ChatRepl {
         tool_policy
             .check_tool(&tool_call.function.name)
             .err()
-            .map(|err| tools::ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!("Blocked by policy: {err}"),
-                is_error: true,
+            .map(|err| {
+                tools::ToolResult::failure(
+                    tool_call,
+                    tools::ToolFailureCode::PolicyDenied,
+                    format!("Blocked by policy: {err}"),
+                    tools::ToolRetryability::Never,
+                )
             })
     }
 
@@ -1360,6 +1504,7 @@ impl ChatRepl {
         tool_args: &serde_json::Value,
     ) -> Option<tools::ToolResult> {
         openclaudia::services::tool_executor::ToolExecutor::run_pre_tool_use(
+            &self.run_context,
             &self.hook_engine,
             Some(&self.chat_session.id()),
             &tool_call.function.name,
@@ -1367,18 +1512,23 @@ impl ChatRepl {
         )
         .await
         .err()
-        .map(|blocked| blocked.into_tool_result(tool_call.id.clone()))
+        .map(|blocked| blocked.into_tool_result(tool_call))
     }
 
-    fn final_response_allowed(&self, content: &str, cancelled: bool) -> bool {
+    fn render_final_response(&self, content: &str, cancelled: bool) -> Option<String> {
         if !final_response_requires_grounding(content, cancelled) {
-            return true;
+            return Some(content.to_string());
         }
-        match validate_cli_agentic_final_response(&self.chat_session.id(), content.trim()) {
-            Ok(()) => true,
+        match validate_and_render_cli_agentic_final_response(
+            &self.run_context,
+            &self.chat_session.id(),
+            content.trim(),
+            &self.model,
+        ) {
+            Ok(rendered) => Some(rendered),
             Err(reason) => {
                 eprintln!("\n\x1b[31mFinal answer failed grounding gate: {reason}\x1b[0m");
-                false
+                None
             }
         }
     }
@@ -1390,169 +1540,28 @@ impl ChatRepl {
         persist_chat_session_update(&mut self.chat_session, "failed turn marker");
     }
 
-    /// Extract file extensions from recent messages and inject combined
-    /// rules content (once per session) at the head of `messages`.
-    fn inject_rules_from_extensions(&self) {
-        let messages = self.chat_session.messages_snapshot();
-        let extensions: Vec<String> = messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-            .flat_map(|text| {
-                self.ext_regex
-                    .captures_iter(text)
-                    .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_lowercase()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        if extensions.is_empty() {
-            return;
-        }
-        let rules_content = self.rules_engine.get_combined_rules(
-            &extensions
-                .iter()
-                .map(std::string::String::as_str)
-                .collect::<Vec<_>>(),
-        );
-        if !rules_content.is_empty()
-            && !messages.iter().any(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("## Rules"))
-            })
-        {
-            self.chat_session.update_messages(|messages| {
-                messages.insert(
-                    0,
-                    serde_json::json!({
-                        "role": "system",
-                        "content": rules_content
-                    }),
-                );
-            });
-        }
-    }
-
-    /// Build Claudia's split system-prompt blocks for this turn
-    /// (coordinator + file-knowledge injections live here).
-    fn build_prompt_blocks_for_turn(
-        &self,
-        memory_db: Option<&memory::MemoryDb>,
-    ) -> prompt::SystemPromptBlocks {
-        let messages = self.chat_session.messages_snapshot();
-        let hook_instructions: Option<String> = messages
-            .iter()
-            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-            .filter(|c| !c.contains("Persona: Claudia"))
-            .map(std::string::ToString::to_string)
-            .reduce(|acc, s| format!("{acc}\n\n{s}"));
-
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
+    /// Build Claudia's typed, bounded prompt context for this turn.
+    fn build_prompt_blocks_for_turn(&self) -> prompt::SystemPromptBlocks {
         let behavior_mode = self.chat_session.behavior_mode();
-        let mut prompt_blocks = prompt::build_system_prompt_blocks(
-            &behavior_mode,
-            hook_instructions.as_deref(),
-            None,
-            memory_db,
-            Some(&cwd),
-        );
+        let mut additional_items = Vec::new();
 
         if self.coordinator {
-            prompt_blocks.stable_prefix = format!(
-                "{}\n\n{}",
+            additional_items.push(openclaudia::context::ContextItem::host_instruction(
+                "repl.coordinator_policy",
+                openclaudia::context::HostInstructionSource::CoordinatorPolicy,
+                "host:coordinator-role",
                 openclaudia::subagent::AgentType::Coordinator.system_prompt(),
-                prompt_blocks.stable_prefix
-            );
+                openclaudia::context::ContextFreshness::Static,
+                5,
+            ));
         }
 
-        if let Some(db) = memory_db {
-            let mut injected_files: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for msg in messages.iter().rev().take(10) {
-                if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
-                    if role == "tool" || role == "assistant" {
-                        if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
-                            for tc in tool_calls {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("");
-                                if matches!(name, "read_file" | "edit_file" | "write_file") {
-                                    if let Some(args_str) = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("arguments"))
-                                        .and_then(|a| a.as_str())
-                                    {
-                                        if let Ok(args) =
-                                            serde_json::from_str::<serde_json::Value>(args_str)
-                                        {
-                                            if let Some(path) = args
-                                                .get("path")
-                                                .or_else(|| args.get("file_path"))
-                                                .and_then(|p| p.as_str())
-                                            {
-                                                injected_files.insert(path.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let mut file_knowledge_parts = Vec::new();
-            for file_path in injected_files.iter().take(3) {
-                if let Ok(knowledge) = db.format_file_knowledge(file_path) {
-                    if !knowledge.is_empty() {
-                        file_knowledge_parts.push(knowledge);
-                    }
-                }
-            }
-            if !file_knowledge_parts.is_empty() {
-                if !prompt_blocks.dynamic_suffix.is_empty() {
-                    prompt_blocks.dynamic_suffix.push_str("\n\n");
-                }
-                prompt_blocks.dynamic_suffix.push_str("## File Knowledge\n");
-                prompt_blocks
-                    .dynamic_suffix
-                    .push_str(&file_knowledge_parts.join("\n"));
-            }
-        }
-        prompt_blocks
-    }
-
-    /// Replace (or insert) the combined Claudia system prompt at the
-    /// front of `messages` so non-Anthropic providers see it directly.
-    fn install_system_prompt(&self, prompt_blocks: &prompt::SystemPromptBlocks) {
-        let combined = prompt_blocks.to_combined();
-        self.chat_session.update_messages(|messages| {
-            if let Some(pos) = messages.iter().position(|message| {
-                message
-                    .get("content")
-                    .and_then(|content| content.as_str())
-                    .is_some_and(|content| content.contains("Persona: Claudia"))
-            }) {
-                messages[pos] = serde_json::json!({
-                    "role": "system",
-                    "content": combined
-                });
-            } else {
-                messages.insert(
-                    0,
-                    serde_json::json!({
-                        "role": "system",
-                        "content": combined
-                    }),
-                );
-            }
-        });
+        prompt::build_prompt_context_with_items_for_run(
+            &behavior_mode,
+            &self.run_context,
+            additional_items,
+            openclaudia::context::ContextBudget::default(),
+        )
     }
 
     /// Send the initial turn request and dispatch the response to the
@@ -1564,7 +1573,6 @@ impl ChatRepl {
         request_body: serde_json::Value,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> bool {
         use indicatif::{ProgressBar, ProgressStyle};
         let spinner = ProgressBar::new_spinner();
@@ -1576,37 +1584,34 @@ impl ChatRepl {
         spinner.set_message("Connecting...");
         spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        let mut req = self.client.post(transport.endpoint).json(&request_body);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
+        let req = match transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(&request_body))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                spinner.finish_and_clear();
+                eprintln!("\nProvider header error: {error}\n");
+                self.record_failed_turn(&format!("provider header error: {error}"));
+                return false;
+            }
+        };
 
         match req.send().await {
             Ok(response) => {
                 spinner.finish_and_clear();
                 if !response.status().is_success() {
-                    self.handle_failed_response(response).await;
+                    self.handle_failed_response(response, transport.headers)
+                        .await;
                     return false;
                 }
                 if self.config.proxy.target == "google" {
-                    self.process_google_response(
-                        response,
-                        &request_body,
-                        transport,
-                        memory_db,
-                        auto_learner,
-                    )
-                    .await;
+                    self.process_google_response(response, &request_body, transport, memory_db)
+                        .await;
                     false
                 } else {
-                    self.process_streaming_response(
-                        response,
-                        transport,
-                        prompt_blocks,
-                        memory_db,
-                        auto_learner,
-                    )
-                    .await
+                    self.process_streaming_response(response, transport, prompt_blocks, memory_db)
+                        .await
                 }
             }
             Err(e) => {
@@ -1620,7 +1625,11 @@ impl ChatRepl {
 
     /// Read body of a non-2xx response, print user-friendly error, and
     /// record a failed-turn marker.
-    async fn handle_failed_response(&mut self, response: reqwest::Response) {
+    async fn handle_failed_response(
+        &mut self,
+        response: reqwest::Response,
+        headers: &openclaudia::secrets::SensitiveHeaders,
+    ) {
         let status = response.status();
         let content_type = response
             .headers()
@@ -1628,15 +1637,18 @@ impl ChatRepl {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = response.text().await.unwrap_or_default();
+        let body = openclaudia::secrets::read_bounded_diagnostic_body(response)
+            .await
+            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
         if content_type.contains("text/html") {
             eprintln!("\nError {status}: (HTML response — check your provider configuration)\n");
             self.record_failed_turn(&format!(
                 "HTTP {status}: HTML response; check provider configuration"
             ));
         } else {
-            eprintln!("\nError {status}: {body}\n");
-            self.record_failed_turn(&format!("HTTP {status}: {body}"));
+            let diagnostic = headers.sanitize_diagnostic(&body);
+            eprintln!("\nError {status}: {diagnostic}\n");
+            self.record_failed_turn(&format!("HTTP {status}: {diagnostic}"));
         }
     }
 
@@ -1648,11 +1660,10 @@ impl ChatRepl {
         request_body: &serde_json::Value,
         transport: TurnTransport<'_>,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         println!();
-        let body = response.text().await.unwrap_or_default();
-        let Some(gemini_json) = self.parse_gemini_initial_body(&body) else {
+        let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
+        let Some(gemini_json) = self.parse_gemini_initial_body(&body, transport.headers) else {
             return;
         };
 
@@ -1660,8 +1671,9 @@ impl ChatRepl {
             match Self::emit_gemini_initial_text_and_calls(&gemini_json) {
                 Ok(parsed) => parsed,
                 Err(e) => {
-                    eprintln!("\nInvalid Gemini response: {e}");
-                    self.record_failed_turn(&format!("invalid Gemini response: {e}"));
+                    let diagnostic = transport.headers.sanitize_diagnostic(&e);
+                    eprintln!("\nInvalid Gemini response: {diagnostic}");
+                    self.record_failed_turn(&format!("invalid Gemini response: {diagnostic}"));
                     return;
                 }
             };
@@ -1692,7 +1704,7 @@ impl ChatRepl {
             tool_calls,
             contents,
         };
-        self.run_gemini_tool_loop(&mut state, request_body, transport, memory_db, auto_learner)
+        self.run_gemini_tool_loop(&mut state, request_body, transport, memory_db)
             .await;
 
         self.finalize_gemini_response(&state.full_content, input_tokens, output_tokens)
@@ -1701,30 +1713,31 @@ impl ChatRepl {
 
     /// Parse the Gemini HTTP body to JSON, or print an error and record
     /// a failed-turn marker on failure.
-    fn parse_gemini_initial_body(&mut self, body: &str) -> Option<serde_json::Value> {
+    fn parse_gemini_initial_body(
+        &mut self,
+        body: &str,
+        headers: &openclaudia::secrets::SensitiveHeaders,
+    ) -> Option<serde_json::Value> {
         match serde_json::from_str::<serde_json::Value>(body) {
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("\nFailed to parse Gemini response: {e}");
-                eprintln!("Raw body: {}", &body[..body.len().min(500)]);
+                eprintln!("Response body: {}", headers.sanitize_diagnostic(body));
                 self.record_failed_turn(&format!("failed to parse Gemini response: {e}"));
                 None
             }
         }
     }
 
-    /// Print the initial Gemini text (if any) and return the assembled
-    /// `(full_content, tool_calls)` pair for the tool loop.
+    /// Return the assembled Gemini `(full_content, tool_calls)` pair.
+    /// Terminal text stays buffered until the final evidence gate runs.
     fn emit_gemini_initial_text_and_calls(
         gemini_json: &serde_json::Value,
     ) -> Result<(String, Vec<tools::ToolCall>), String> {
-        use std::io::Write;
         let mut full_content = String::new();
         let text = gemini_extract_text(gemini_json)?;
         let tool_calls = gemini_extract_tool_calls(gemini_json)?;
         if !text.is_empty() {
-            print!("{text}");
-            std::io::stdout().flush().ok();
             full_content.push_str(&text);
         }
         Ok((full_content, tool_calls))
@@ -1738,21 +1751,18 @@ impl ChatRepl {
         request_body: &serde_json::Value,
         transport: TurnTransport<'_>,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
-        use std::io::Write;
         let max_iterations = self.config.session.max_turns;
         let mut iteration: u32 = 0;
         while !state.tool_calls.is_empty() && (max_iterations == 0 || iteration < max_iterations) {
             iteration += 1;
-            guardrails::reset_turn();
             self.gemini_record_model_turn(
                 &state.full_content,
                 &state.tool_calls,
                 &mut state.contents,
             );
             let function_responses = self
-                .gemini_execute_tools(&state.tool_calls, memory_db, auto_learner)
+                .gemini_execute_tools(&state.tool_calls, memory_db)
                 .await;
             state.contents.push(serde_json::json!({
                 "role": "user",
@@ -1771,11 +1781,6 @@ impl ChatRepl {
                 .await
             {
                 Some((next_text, next_calls)) => {
-                    if !next_text.is_empty() {
-                        println!();
-                        print!("{next_text}");
-                        std::io::stdout().flush().ok();
-                    }
                     state.full_content = next_text;
                     state.tool_calls = next_calls;
                 }
@@ -1807,26 +1812,31 @@ impl ChatRepl {
         input_tokens: u64,
         output_tokens: u64,
     ) {
-        if !full_content.trim().is_empty() {
-            if !self.final_response_allowed(full_content.trim(), false) {
+        let rendered_content = if full_content.trim().is_empty() {
+            String::new()
+        } else {
+            let Some(rendered) = self.render_final_response(full_content.trim(), false) else {
                 return;
-            }
+            };
+            println!("{rendered}");
             push_chat_session_message_and_persist(
                 &mut self.chat_session,
                 serde_json::json!({
                     "role": "assistant",
-                    "content": full_content.trim()
+                    "content": rendered
                 }),
                 "gemini final assistant response",
             );
-        }
+            rendered
+        };
 
         if let Some(ref engine) = self.vdd_engine {
             let original = self.chat_session.messages_snapshot();
             let mut messages = original.clone();
             run_vdd_review(
                 engine,
-                full_content,
+                &self.run_context,
+                &rendered_content,
                 &mut messages,
                 &self.config.proxy.target,
                 self.api_key.as_ref(),
@@ -1838,7 +1848,7 @@ impl ChatRepl {
             }
         }
 
-        let tokens = estimate_session_tokens(&self.chat_session) + full_content.len() / 4;
+        let tokens = estimate_session_tokens(&self.chat_session) + rendered_content.len() / 4;
         // `draw_status_bar` accepts `Option<f64>` and elides the cost
         // segment when None; an unknown model therefore renders as a
         // blank cost rather than $0.00.
@@ -1846,7 +1856,7 @@ impl ChatRepl {
             &self.model,
             &openclaudia::session::TokenUsage {
                 input_tokens: input_tokens.max(tokens as u64),
-                output_tokens: output_tokens.max(full_content.len() as u64 / 4),
+                output_tokens: output_tokens.max(rendered_content.len() as u64 / 4),
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
@@ -1924,7 +1934,6 @@ impl ChatRepl {
         &mut self,
         gemini_tool_calls: &[tools::ToolCall],
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> Vec<serde_json::Value> {
         let mut function_responses: Vec<serde_json::Value> = Vec::new();
         for tool_call in gemini_tool_calls {
@@ -1932,20 +1941,14 @@ impl ChatRepl {
                 function_responses.push(blocked);
                 continue;
             }
-            let permission_already_checked =
-                match self.gemini_permission_error_response(tool_call).await {
-                    Ok(checked) => checked,
-                    Err(blocked) => {
-                        function_responses.push(blocked);
-                        continue;
-                    }
-                };
-            let result = self.gemini_run_single_tool(
-                tool_call,
-                memory_db,
-                auto_learner,
-                permission_already_checked,
-            );
+            let authorization = match self.gemini_permission_error_response(tool_call).await {
+                Ok(authorization) => authorization,
+                Err(blocked) => {
+                    function_responses.push(blocked);
+                    continue;
+                }
+            };
+            let result = self.gemini_run_single_tool(tool_call, memory_db, authorization);
             function_responses.push(self.gemini_record_tool_outcome(tool_call, &result).await);
         }
         function_responses
@@ -1968,6 +1971,7 @@ impl ChatRepl {
             tool_call.function.name
         );
         push_observed_cli_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
             &tool_call.id,
@@ -1987,11 +1991,12 @@ impl ChatRepl {
     async fn gemini_permission_error_response(
         &mut self,
         tool_call: &tools::ToolCall,
-    ) -> Result<bool, serde_json::Value> {
+    ) -> Result<Option<ExecutionPermit>, serde_json::Value> {
         let tool_args_val = match parse_tool_args(&tool_call.function) {
             Ok(args) => args,
             Err(msg) => {
                 push_observed_cli_tool_result_message(
+                    &self.run_context,
                     &mut self.chat_session,
                     tool_call,
                     &tool_call.id,
@@ -2005,40 +2010,34 @@ impl ChatRepl {
             .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
             .await
         {
-            push_observed_cli_tool_result_message(
+            push_observed_cli_typed_tool_result_message(
+                &self.run_context,
                 &mut self.chat_session,
                 tool_call,
-                &result.tool_call_id,
-                &result.content,
-                true,
+                &result,
             );
-            return Err(gemini_tool_error_response(tool_call, &result.content));
+            return Err(gemini_tool_error_response(tool_call, result.content()));
         }
         if let Some(result) = self.policy_denied_tool_result(tool_call) {
-            push_observed_cli_tool_result_message(
+            push_observed_cli_typed_tool_result_message(
+                &self.run_context,
                 &mut self.chat_session,
                 tool_call,
-                &result.tool_call_id,
-                &result.content,
-                true,
+                &result,
             );
-            return Err(gemini_tool_error_response(tool_call, &result.content));
+            return Err(gemini_tool_error_response(tool_call, result.content()));
         }
-        let result = if self.chat_session.permission_bypass_enabled() {
-            check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
-        } else {
-            check_tool_permission_interactive(
-                &tool_call.function.name,
-                &tool_args_val,
-                &mut self.always_allowed_tools,
-                Some(&self.permission_mgr),
-                &self.transient_allowed_tool_rules,
-            )
-        };
+        let result = check_tool_permission_interactive(
+            tool_call,
+            &self.chat_session.id(),
+            &self.permission_mgr,
+            &self.transient_allowed_tool_rules,
+        );
         match result {
-            ToolPermissionResult::Allowed { checked } => Ok(checked),
+            ToolPermissionResult::Allowed { authorization } => Ok(authorization),
             ToolPermissionResult::Denied(msg) => {
                 push_observed_cli_tool_result_message(
+                    &self.run_context,
                     &mut self.chat_session,
                     tool_call,
                     &tool_call.id,
@@ -2050,14 +2049,13 @@ impl ChatRepl {
         }
     }
 
-    /// Dispatch the tool, observe it for auto-learning, and return the
-    /// raw `ToolResult` for downstream recording.
+    /// Dispatch the tool through the canonical executor and return the raw
+    /// `ToolResult` for downstream recording.
     fn gemini_run_single_tool(
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
-        permission_already_checked: bool,
+        authorization: Option<ExecutionPermit>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
         if let Err(e) = self.audit_logger.log_security(
@@ -2074,16 +2072,17 @@ impl ChatRepl {
             tracing::error!("Security audit failed for tool_call: {e}");
         }
 
-        let result = execute_tool_with_memory_after_permission(
+        execute_tool_with_memory_after_permission(CliToolExecution {
+            run_context: &self.run_context,
             tool_call,
             memory_db,
-            &self.permission_mgr,
-            permission_already_checked,
-            &self.chat_session.id(),
-            Some(self.policy_enforcer.as_ref()),
-        );
-        Self::auto_learn_observe(auto_learner, tool_call, &result);
-        result
+            app_config: &self.config,
+            task_manager: &self.task_manager,
+            permission_mgr: &self.permission_mgr,
+            authorization,
+            session_id: &self.chat_session.id(),
+            policy_enforcer: Some(self.policy_enforcer.as_ref()),
+        })
     }
 
     /// Render the tool result, push it onto the session as a `tool`
@@ -2093,61 +2092,54 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         result: &tools::ToolResult,
     ) -> serde_json::Value {
-        let (final_content, was_marker) = process_tool_result_marker(
+        let final_result = process_tool_follow_up(
+            &self.run_context,
             &self.chat_session,
-            &tool_call.function.name,
-            &result.content,
+            &self.task_manager,
+            result,
         );
-        let final_is_error = if was_marker { false } else { result.is_error };
+        let final_content = final_result.content();
+        let final_is_error = final_result.is_error();
         let tool_input = parse_tool_args(&tool_call.function).unwrap_or_else(
             |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.run_context,
             &self.hook_engine,
             !final_is_error,
             &tool_call.function.name,
             tool_input,
-            &final_content,
+            final_content,
             Some(&self.chat_session.id()),
         )
         .await;
-        display_tool_result(&tool_call.function.name, &final_content, final_is_error);
-        push_observed_cli_tool_result_message(
+        display_tool_result(&final_result);
+        push_observed_cli_typed_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
-            &result.tool_call_id,
-            &final_content,
-            final_is_error,
+            &final_result,
         );
 
-        let response_content = if final_is_error {
-            serde_json::json!({"error": final_content})
-        } else {
-            serde_json::json!({"result": final_content})
-        };
         let response = serde_json::json!({
             "functionResponse": {
+                "id": final_result.tool_call_id(),
                 "name": tool_call.function.name,
-                "response": response_content
+                "response": final_result.model_payload()
             }
         });
-
-        let result_content = if final_is_error {
-            format!("[ERROR] {final_content}")
-        } else {
-            final_content
-        };
-        push_chat_session_message_and_persist(
-            &mut self.chat_session,
-            serde_json::json!({
-                "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "content": result_content,
-                "is_error": final_is_error
-            }),
-            "gemini tool result",
-        );
         response
+    }
+
+    fn gemini_followup_functions(&self) -> Result<Vec<serde_json::Value>, String> {
+        let catalog_messages = self.request_messages_with_grounding()?;
+        let openai_tools =
+            tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
+                .definitions_value();
+        let tools_vec = openai_tools
+            .as_array()
+            .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?;
+        convert_tools_to_gemini_functions(tools_vec).map_err(|error| error.to_string())
     }
 
     /// Send the next Gemini turn with tool results. Returns the new
@@ -2158,42 +2150,57 @@ impl ChatRepl {
         request_body: &serde_json::Value,
         transport: TurnTransport<'_>,
     ) -> Option<(String, Vec<tools::ToolCall>)> {
-        let openai_tools = tools::get_all_tool_definitions(true);
-        let functions = match openai_tools
-            .as_array()
-            .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())
-            .and_then(|tools_vec| {
-                convert_tools_to_gemini_functions(tools_vec).map_err(|e| e.to_string())
-            }) {
+        let functions = match self.gemini_followup_functions() {
             Ok(functions) => functions,
             Err(error) => {
                 tracing::error!(
                     error = %error,
-                    "failed to convert built-in tools to Gemini function declarations"
+                    "failed to build progressive Gemini follow-up tools"
                 );
                 return None;
             }
         };
 
+        let mut grounded_contents = gemini_contents.to_vec();
+        if let Some(grounding) = self.current_grounding_system_content() {
+            let projection = openclaudia::context::ContextProjector::project(
+                vec![openclaudia::context::ContextItem::reference(
+                    "reality.grounding",
+                    openclaudia::context::ReferenceSource::Reality,
+                    "reality-ledger:current-task",
+                    grounding,
+                    openclaudia::context::ContextFreshness::Turn,
+                    800,
+                )],
+                openclaudia::context::ContextBudget::default(),
+            );
+            grounded_contents.push(serde_json::json!({
+                "role": "user",
+                "parts": [{"text": projection.reference}]
+            }));
+        }
         let mut followup_req = serde_json::json!({
-            "contents": gemini_contents,
+            "contents": grounded_contents,
             "generationConfig": {"maxOutputTokens": 4096},
             "tools": [{"functionDeclarations": functions}]
         });
         if let Some(sys) = request_body.get("systemInstruction") {
             followup_req["systemInstruction"] = sys.clone();
         }
-        if let Some(grounding) = self.current_grounding_system_content() {
-            append_gemini_system_instruction_text(&mut followup_req, &grounding);
-        }
 
-        let mut req = self.client.post(transport.endpoint).json(&followup_req);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
+        let req = match transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(&followup_req))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("\nProvider header error: {error}");
+                return None;
+            }
+        };
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                let resp_body = resp.text().await.unwrap_or_default();
+                let resp_body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
                 let Ok(resp_json) = serde_json::from_str::<serde_json::Value>(&resp_body) else {
                     eprintln!("\nFailed to parse Gemini follow-up response");
                     return None;
@@ -2201,14 +2208,20 @@ impl ChatRepl {
                 let text = match gemini_extract_text(&resp_json) {
                     Ok(text) => text,
                     Err(e) => {
-                        eprintln!("\nInvalid Gemini follow-up response: {e}");
+                        eprintln!(
+                            "\nInvalid Gemini follow-up response: {}",
+                            transport.headers.sanitize_diagnostic(&e)
+                        );
                         return None;
                     }
                 };
                 let calls = match gemini_extract_tool_calls(&resp_json) {
                     Ok(calls) => calls,
                     Err(e) => {
-                        eprintln!("\nInvalid Gemini follow-up tool call response: {e}");
+                        eprintln!(
+                            "\nInvalid Gemini follow-up tool call response: {}",
+                            transport.headers.sanitize_diagnostic(&e)
+                        );
                         return None;
                     }
                 };
@@ -2216,8 +2229,11 @@ impl ChatRepl {
             }
             Ok(resp) => {
                 let status = resp.status();
-                let err_body = resp.text().await.unwrap_or_default();
-                eprintln!("\nGemini follow-up failed: {status} {err_body}");
+                let err_body = openclaudia::secrets::read_bounded_diagnostic_body(resp)
+                    .await
+                    .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+                let diagnostic = transport.headers.sanitize_diagnostic(&err_body);
+                eprintln!("\nGemini follow-up failed: {status} {diagnostic}");
                 None
             }
             Err(e) => {
@@ -2235,7 +2251,6 @@ impl ChatRepl {
         transport: TurnTransport<'_>,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> bool {
         println!();
         let mut tool_accumulator = tools::ToolCallAccumulator::new();
@@ -2281,7 +2296,6 @@ impl ChatRepl {
                 transport,
                 prompt_blocks,
                 memory_db,
-                auto_learner,
             )
             .await;
             return false;
@@ -2295,8 +2309,8 @@ impl ChatRepl {
                 cancelled,
             },
             transport,
+            prompt_blocks,
             memory_db,
-            auto_learner,
         )
         .await;
 
@@ -2359,9 +2373,8 @@ impl ChatRepl {
         );
     }
 
-    /// Pick between the structured Anthropic `tool_use` loop and the
-    /// XML-intercept fallback, then run VDD review and emit the trailing
-    /// newline. Returns nothing — callers always continue the REPL.
+    /// Run Anthropic's native `tool_use` loop, then VDD review and the
+    /// trailing newline. Ordinary assistant text is never scanned for calls.
     async fn dispatch_anthropic_tool_path(
         &mut self,
         anthropic_accumulator: &mut tools::AnthropicToolAccumulator,
@@ -2369,23 +2382,16 @@ impl ChatRepl {
         transport: TurnTransport<'_>,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
-        let handled_structured = anthropic_accumulator.has_tool_use();
-        let final_content = if handled_structured {
-            self.run_anthropic_structured_tool_loop(
+        let final_content = self
+            .run_anthropic_structured_tool_loop(
                 anthropic_accumulator,
                 full_content,
                 transport,
                 prompt_blocks,
                 memory_db,
-                auto_learner,
             )
-            .await
-        } else {
-            self.run_xml_intercept_tool_loop(full_content, transport, prompt_blocks, memory_db)
-                .await
-        };
+            .await;
         if let Some(ref engine) = self.vdd_engine {
             if final_content.trim().is_empty() {
                 println!();
@@ -2395,6 +2401,7 @@ impl ChatRepl {
             let mut messages = original.clone();
             run_vdd_review(
                 engine,
+                &self.run_context,
                 &final_content,
                 &mut messages,
                 &self.config.proxy.target,
@@ -2412,8 +2419,8 @@ impl ChatRepl {
         println!();
     }
 
-    /// Consume the initial SSE stream, push deltas into the markdown
-    /// renderer + accumulators, and return the assembled state.
+    /// Consume the initial SSE stream into bounded accumulators and return the
+    /// assembled state. Terminal text stays buffered until final validation.
     async fn consume_initial_stream(
         &self,
         response: reqwest::Response,
@@ -2432,7 +2439,6 @@ impl ChatRepl {
         let mut in_thinking_block = false;
         let mut thinking_start_time: Option<std::time::Instant> = None;
         let mut reasoning_started = false;
-        let mut md_state = tui::StreamingMarkdownRenderer::new().into_state();
         let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
 
         loop {
@@ -2452,9 +2458,7 @@ impl ChatRepl {
                     break;
                 }
             };
-            let mut md_renderer = tui::StreamingMarkdownRenderer::from_state(md_state);
             if sse.data == "[DONE]" {
-                md_state = md_renderer.into_state();
                 break;
             }
 
@@ -2462,7 +2466,6 @@ impl ChatRepl {
                 let mut ctx = SseFrameCtx {
                     full_content: &mut full_content,
                     reasoning_content: &mut reasoning_content,
-                    md_renderer: &mut md_renderer,
                     tool_accumulator,
                     anthropic_accumulator,
                     stream_usage,
@@ -2472,15 +2475,10 @@ impl ChatRepl {
                 };
                 Self::route_sse_frame(&json, &mut ctx);
             }
-            md_state = md_renderer.into_state();
         }
         if reasoning_started {
             let elapsed = thinking_start_time.map_or(0.0, |t| t.elapsed().as_secs_f64());
             tui::print_thinking_end(elapsed);
-        }
-        {
-            let mut md_renderer = tui::StreamingMarkdownRenderer::from_state(md_state);
-            md_renderer.flush();
         }
         InitialStreamResult {
             full_content,
@@ -2565,7 +2563,6 @@ impl ChatRepl {
                     *ctx.reasoning_started = false;
                     *ctx.thinking_start_time = None;
                 }
-                ctx.md_renderer.push(&text);
                 ctx.full_content.push_str(&text);
             }
             openclaudia::pipeline::SseAction::Thinking(text) => {
@@ -2608,7 +2605,6 @@ impl ChatRepl {
         transport: TurnTransport<'_>,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> String {
         let max_proxy_iterations = self.config.session.max_turns;
         let mut proxy_iteration: u32 = 0;
@@ -2635,7 +2631,6 @@ impl ChatRepl {
                 break;
             }
             proxy_iteration += 1;
-            guardrails::reset_turn();
 
             let Some(tool_calls) =
                 self.collect_anthropic_iteration(&*anthropic_accumulator, &mut executed_tool_sigs)
@@ -2643,13 +2638,8 @@ impl ChatRepl {
                 break;
             };
 
-            self.dispatch_anthropic_tool_batch(
-                &tool_calls,
-                anthropic_accumulator,
-                memory_db,
-                auto_learner,
-            )
-            .await;
+            self.dispatch_anthropic_tool_batch(&tool_calls, anthropic_accumulator, memory_db)
+                .await;
 
             let followup_req = match self.build_anthropic_followup(prompt_blocks) {
                 Ok(req) => req,
@@ -2677,17 +2667,19 @@ impl ChatRepl {
         }
 
         if !full_content.trim().is_empty() {
-            if !self.final_response_allowed(full_content.trim(), false) {
+            let Some(rendered) = self.render_final_response(full_content.trim(), false) else {
                 return String::new();
-            }
+            };
+            println!("{rendered}");
             push_chat_session_message_and_persist(
                 &mut self.chat_session,
                 serde_json::json!({
                     "role": "assistant",
-                    "content": full_content.trim()
+                    "content": rendered
                 }),
                 "anthropic final assistant response",
             );
+            full_content = rendered;
         }
         full_content
     }
@@ -2732,11 +2724,9 @@ impl ChatRepl {
         tool_calls: &[tools::ToolCall],
         anthropic_accumulator: &mut tools::AnthropicToolAccumulator,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         for tool_call in tool_calls {
-            self.execute_anthropic_tool(tool_call, memory_db, auto_learner)
-                .await;
+            self.execute_anthropic_tool(tool_call, memory_db).await;
         }
         self.run_quality_gates_and_inject();
         anthropic_accumulator.clear();
@@ -2754,28 +2744,23 @@ impl ChatRepl {
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         if self.push_plan_mode_block_if_any(tool_call) {
             return;
         }
-        let Some(permission_already_checked) = self.push_permission_or_proceed(tool_call).await
-        else {
+        let Some(authorization) = self.push_permission_or_proceed(tool_call).await else {
             return;
         };
-        let result = self.run_tool_with_audit(
-            tool_call,
-            memory_db,
-            auto_learner,
-            permission_already_checked,
-        );
+        let result = self.run_tool_with_audit(tool_call, memory_db, authorization);
 
-        let (final_content, was_marker) = process_tool_result_marker(
+        let final_result = process_tool_follow_up(
+            &self.run_context,
             &self.chat_session,
-            &tool_call.function.name,
-            &result.content,
+            &self.task_manager,
+            &result,
         );
-        let final_is_error = if was_marker { false } else { result.is_error };
+        let final_content = final_result.content();
+        let final_is_error = final_result.is_error();
 
         if let Err(e) = self.audit_logger.log_security(
             "tool_result",
@@ -2792,21 +2777,21 @@ impl ChatRepl {
             |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.run_context,
             &self.hook_engine,
             !final_is_error,
             &tool_call.function.name,
             tool_input,
-            &final_content,
+            final_content,
             Some(&self.chat_session.id()),
         )
         .await;
-        display_tool_result(&tool_call.function.name, &final_content, final_is_error);
-        push_observed_cli_tool_result_message(
+        display_tool_result(&final_result);
+        push_observed_cli_typed_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
-            &result.tool_call_id,
-            &final_content,
-            final_is_error,
+            &final_result,
         );
     }
 
@@ -2825,6 +2810,7 @@ impl ChatRepl {
             tool_call.function.name
         );
         push_observed_cli_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
             &tool_call.id,
@@ -2835,13 +2821,17 @@ impl ChatRepl {
     }
 
     /// Run the interactive permission check. On `Denied` push the error
-    /// tool message and return `None`. On `Allowed` return whether the
-    /// lower-level permission gate has already been checked.
-    async fn push_permission_or_proceed(&mut self, tool_call: &tools::ToolCall) -> Option<bool> {
+    /// tool message and return `None`. On `Allowed`, return the exact one-use
+    /// execution permit (or `None` for the explicit unrestricted path).
+    async fn push_permission_or_proceed(
+        &mut self,
+        tool_call: &tools::ToolCall,
+    ) -> Option<Option<ExecutionPermit>> {
         let tool_args_val = match parse_tool_args(&tool_call.function) {
             Ok(args) => args,
             Err(msg) => {
                 push_observed_cli_tool_result_message(
+                    &self.run_context,
                     &mut self.chat_session,
                     tool_call,
                     &tool_call.id,
@@ -2855,39 +2845,33 @@ impl ChatRepl {
             .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
             .await
         {
-            push_observed_cli_tool_result_message(
+            push_observed_cli_typed_tool_result_message(
+                &self.run_context,
                 &mut self.chat_session,
                 tool_call,
-                &result.tool_call_id,
-                &result.content,
-                true,
+                &result,
             );
             return None;
         }
         if let Some(result) = self.policy_denied_tool_result(tool_call) {
-            push_observed_cli_tool_result_message(
+            push_observed_cli_typed_tool_result_message(
+                &self.run_context,
                 &mut self.chat_session,
                 tool_call,
-                &result.tool_call_id,
-                &result.content,
-                true,
+                &result,
             );
             return None;
         }
-        let result = if self.chat_session.permission_bypass_enabled() {
-            check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
-        } else {
-            check_tool_permission_interactive(
-                &tool_call.function.name,
-                &tool_args_val,
-                &mut self.always_allowed_tools,
-                Some(&self.permission_mgr),
-                &self.transient_allowed_tool_rules,
-            )
-        };
+        let result = check_tool_permission_interactive(
+            tool_call,
+            &self.chat_session.id(),
+            &self.permission_mgr,
+            &self.transient_allowed_tool_rules,
+        );
         match result {
             ToolPermissionResult::Denied(msg) => {
                 push_observed_cli_tool_result_message(
+                    &self.run_context,
                     &mut self.chat_session,
                     tool_call,
                     &tool_call.id,
@@ -2896,19 +2880,17 @@ impl ChatRepl {
                 );
                 None
             }
-            ToolPermissionResult::Allowed { checked } => Some(checked),
+            ToolPermissionResult::Allowed { authorization } => Some(authorization),
         }
     }
 
-    /// Emit the running banner + `tool_call` audit event, dispatch via
-    /// `execute_tool_with_memory`, and observe the result for the
-    /// auto-learner. Shared by both the Anthropic and `OpenAI` paths.
+    /// Emit the running banner + `tool_call` audit event and dispatch via the
+    /// canonical executor. Shared by both the Anthropic and `OpenAI` paths.
     fn run_tool_with_audit(
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
-        permission_already_checked: bool,
+        authorization: Option<ExecutionPermit>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
         if let Err(e) = self.audit_logger.log_security(
@@ -2924,16 +2906,17 @@ impl ChatRepl {
             // session itself is not corrupted by an audit-write failure).
             tracing::error!("Security audit failed for tool_call: {e}");
         }
-        let result = execute_tool_with_memory_after_permission(
+        execute_tool_with_memory_after_permission(CliToolExecution {
+            run_context: &self.run_context,
             tool_call,
             memory_db,
-            &self.permission_mgr,
-            permission_already_checked,
-            &self.chat_session.id(),
-            Some(self.policy_enforcer.as_ref()),
-        );
-        Self::auto_learn_observe(auto_learner, tool_call, &result);
-        result
+            app_config: &self.config,
+            task_manager: &self.task_manager,
+            permission_mgr: &self.permission_mgr,
+            authorization,
+            session_id: &self.chat_session.id(),
+            policy_enforcer: Some(self.policy_enforcer.as_ref()),
+        })
     }
 
     /// Build the next Anthropic follow-up request body reusing the
@@ -2942,10 +2925,13 @@ impl ChatRepl {
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let request_messages = self.request_messages_with_grounding()?;
+        let catalog_messages = self.request_messages_with_grounding()?;
+        let request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
         let anthropic_messages =
             convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
-        let openai_tools = tools::get_all_tool_definitions(true);
+        let openai_tools =
+            tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
+                .definitions_value();
         let anthropic_tools = convert_tool_definitions_to_anthropic_checked(&openai_tools)
             .map_err(|e| e.to_string())?;
 
@@ -2958,7 +2944,7 @@ impl ChatRepl {
         });
         followup_req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
         if self.claude_code_token.is_some() {
-            openclaudia::claude_credentials::inject_system_prompt(&mut followup_req);
+            openclaudia::claude_credentials::inject_oauth_prefix_only(&mut followup_req);
         }
         Ok(followup_req)
     }
@@ -2974,17 +2960,21 @@ impl ChatRepl {
         full_content: &mut String,
     ) -> bool {
         use futures::StreamExt;
-        use std::io::Write;
 
-        let mut req = self.client.post(transport.endpoint).json(&followup_req);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
+        let req = match transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(&followup_req))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("\nProvider header error: {error}");
+                return false;
+            }
+        };
         match req.send().await {
             Ok(response) if response.status().is_success() => {
                 let mut stream = response.bytes_stream().eventsource();
                 let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
-                println!();
                 loop {
                     let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
                         Ok(Some(Ok(sse))) => sse,
@@ -3003,8 +2993,6 @@ impl ChatRepl {
                     }
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse.data) {
                         if let Some(text) = anthropic_accumulator.process_event(&json) {
-                            print!("{text}");
-                            std::io::stdout().flush().ok();
                             full_content.push_str(&text);
                         }
                     }
@@ -3022,289 +3010,6 @@ impl ChatRepl {
         }
     }
 
-    /// Text-based XML tool interception fallback for Anthropic.
-    async fn run_xml_intercept_tool_loop(
-        &mut self,
-        mut full_content: String,
-        transport: TurnTransport<'_>,
-        prompt_blocks: &prompt::SystemPromptBlocks,
-        memory_db: Option<&memory::MemoryDb>,
-    ) -> String {
-        let mut tool_interceptor = tool_intercept::ToolInterceptor::new();
-        tool_interceptor.push(&full_content);
-
-        let max_proxy_iterations = self.config.session.max_turns;
-        let mut proxy_iteration: u32 = 0;
-        let mut executed_tool_signatures: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        while tool_interceptor.has_complete_block()
-            && (max_proxy_iterations == 0 || proxy_iteration < max_proxy_iterations)
-        {
-            proxy_iteration += 1;
-            let (all_tools, text_parts) = tool_interceptor.extract_all_tool_calls();
-            if all_tools.is_empty() {
-                break;
-            }
-
-            if Self::xml_loop_should_break_on_duplicates(
-                &all_tools,
-                &mut executed_tool_signatures,
-                proxy_iteration,
-            ) {
-                break;
-            }
-
-            self.push_xml_assistant_text(&text_parts);
-            let surviving_tools = self.filter_xml_plan_blocked_tools(all_tools);
-            self.send_xml_tool_results(&surviving_tools, memory_db);
-
-            let followup_req = match self.build_xml_followup_request(prompt_blocks) {
-                Ok(req) => req,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to build XML follow-up request");
-                    eprintln!("\n\x1b[31mRequest build error: {e}\x1b[0m");
-                    break;
-                }
-            };
-            if !self.followup_request_policy_allows("anthropic XML follow-up") {
-                break;
-            }
-            let next = self.send_xml_followup_stream(followup_req, transport).await;
-            match next {
-                Some(content) => {
-                    tool_interceptor.clear();
-                    tool_interceptor.push(&content);
-                    full_content = content;
-                }
-                None => break,
-            }
-        }
-
-        if max_proxy_iterations > 0
-            && proxy_iteration >= max_proxy_iterations
-            && tool_interceptor.has_complete_block()
-        {
-            // #601 — structured `error_max_turns` for the XML-intercept path.
-            let _ = emit_max_turns_event(
-                &self.chat_session.id(),
-                "anthropic_xml_intercept",
-                max_proxy_iterations,
-                proxy_iteration,
-            );
-            eprintln!(
-                "\n\x1b[33m⚠ Reached max_turns limit ({max_proxy_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
-            );
-        }
-        if !full_content.trim().is_empty() && !tool_interceptor.has_pending_tool_calls() {
-            if !self.final_response_allowed(full_content.trim(), false) {
-                return String::new();
-            }
-            push_chat_session_message_and_persist(
-                &mut self.chat_session,
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": full_content.trim()
-                }),
-                "anthropic XML final assistant response",
-            );
-        }
-        full_content
-    }
-
-    /// Insert each tool's signature; return `true` when every signature
-    /// was already present AND this isn't the first iteration (so the
-    /// loop should break on duplicates).
-    fn xml_loop_should_break_on_duplicates(
-        all_tools: &[tool_intercept::InterceptedToolCall],
-        executed_tool_signatures: &mut std::collections::HashSet<String>,
-        proxy_iteration: u32,
-    ) -> bool {
-        let mut all_duplicates = true;
-        for tool in all_tools {
-            let params_str: String = tool
-                .parameters
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sig = format!("{}:{}", tool.name, params_str);
-            if executed_tool_signatures.insert(sig) {
-                all_duplicates = false;
-            }
-        }
-        if all_duplicates && proxy_iteration > 1 {
-            eprintln!("\n\x1b[33m⚠ Detected duplicate tool calls - breaking loop\x1b[0m");
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Push any pre-tool prose extracted by the interceptor as a single
-    /// assistant message (skip if empty).
-    fn push_xml_assistant_text(&mut self, text_parts: &[String]) {
-        let combined_text = text_parts.join("\n\n");
-        if !combined_text.is_empty() {
-            push_chat_session_message_and_persist(
-                &mut self.chat_session,
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": combined_text
-                }),
-                "anthropic XML assistant text",
-            );
-        }
-    }
-
-    /// Strip out tools blocked by plan mode (and push the user-visible
-    /// error message for each), returning the survivors.
-    fn filter_xml_plan_blocked_tools(
-        &mut self,
-        all_tools: Vec<tool_intercept::InterceptedToolCall>,
-    ) -> Vec<tool_intercept::InterceptedToolCall> {
-        all_tools
-            .into_iter()
-            .filter(|tool| {
-                let args_json = serde_json::to_string(
-                    &tool
-                        .parameters
-                        .iter()
-                        .collect::<std::collections::HashMap<_, _>>(),
-                )
-                .unwrap_or_default();
-                if let Some(block_msg) =
-                    check_plan_mode_restriction(&self.chat_session, &tool.name, &args_json)
-                {
-                    println!("\n\x1b[33m⚠ Blocked in plan mode: {}\x1b[0m", tool.name);
-                    push_chat_session_message_and_persist(
-                        &mut self.chat_session,
-                        serde_json::json!({
-                            "role": "user",
-                            "content": format!("[ERROR] {}", block_msg)
-                        }),
-                        "anthropic XML plan-mode block",
-                    );
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect()
-    }
-
-    /// Execute the surviving XML tools, append the formatted XML
-    /// results as a user message, and print the "sending N results"
-    /// banner.
-    fn send_xml_tool_results(
-        &mut self,
-        all_tools: &[tool_intercept::InterceptedToolCall],
-        memory_db: Option<&memory::MemoryDb>,
-    ) {
-        let results = tool_intercept::execute_intercepted_tools_for_session(
-            all_tools,
-            memory_db,
-            Some(&self.permission_mgr),
-            Some(&self.chat_session.id()),
-            Some(self.policy_enforcer.as_ref()),
-        );
-        let results_xml = tool_intercept::format_execution_results_xml(&results);
-        push_chat_session_message_and_persist(
-            &mut self.chat_session,
-            serde_json::json!({
-                "role": "user",
-                "content": results_xml
-            }),
-            "anthropic XML tool results",
-        );
-        println!(
-            "\n\x1b[90m(Sending {} tool result{} to Claude...)\x1b[0m",
-            results.len(),
-            if results.len() == 1 { "" } else { "s" }
-        );
-    }
-
-    fn build_xml_followup_request(
-        &self,
-        prompt_blocks: &prompt::SystemPromptBlocks,
-    ) -> Result<serde_json::Value, String> {
-        let request_messages = self.request_messages_with_grounding()?;
-        let anthropic_messages =
-            convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
-        let mut followup_req = serde_json::json!({
-            "model": self.model,
-            "messages": anthropic_messages,
-            "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
-            "stream": true
-        });
-        followup_req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
-        if self.claude_code_token.is_some() {
-            openclaudia::claude_credentials::inject_system_prompt(&mut followup_req);
-        }
-        Ok(followup_req)
-    }
-
-    async fn send_xml_followup_stream(
-        &self,
-        followup_req: serde_json::Value,
-        transport: TurnTransport<'_>,
-    ) -> Option<String> {
-        use futures::StreamExt;
-        use std::io::Write;
-
-        let mut req = self.client.post(transport.endpoint).json(&followup_req);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
-        match req.send().await {
-            Ok(response) if response.status().is_success() => {
-                let mut stream = response.bytes_stream().eventsource();
-                let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
-                let mut followup_content = String::new();
-                loop {
-                    let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
-                        Ok(Some(Ok(sse))) => sse,
-                        Ok(Some(Err(e))) => {
-                            eprintln!("\nStream error: {e}");
-                            break;
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-                            Self::handle_stream_timeout(&followup_content);
-                            break;
-                        }
-                    };
-                    if sse.data == "[DONE]" {
-                        break;
-                    }
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse.data) {
-                        if json.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
-                        {
-                            if let Some(text) = json
-                                .get("delta")
-                                .and_then(|d| d.get("text"))
-                                .and_then(|t| t.as_str())
-                            {
-                                print!("{text}");
-                                std::io::stdout().flush().ok();
-                                followup_content.push_str(text);
-                            }
-                        }
-                    }
-                }
-                Some(followup_content)
-            }
-            Ok(response) => {
-                eprintln!("\nFollow-up request failed: {}", response.status());
-                None
-            }
-            Err(e) => {
-                eprintln!("\nFollow-up request error: {e}");
-                None
-            }
-        }
-    }
-
     /// OpenAI-compatible agentic loop. Save the final response state to
     /// the session at the end.
     async fn run_openai_tool_loop(
@@ -3312,8 +3017,8 @@ impl ChatRepl {
         tool_accumulator: &mut tools::ToolCallAccumulator,
         mut state: OpenAiLoopState,
         transport: TurnTransport<'_>,
+        prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         let max_iterations = self.config.session.max_turns;
         let mut iteration: u32 = 0;
@@ -3325,7 +3030,6 @@ impl ChatRepl {
             && (max_iterations == 0 || iteration < max_iterations)
         {
             iteration += 1;
-            guardrails::reset_turn();
             let tool_calls = tool_accumulator.finalize();
 
             if iteration > 1
@@ -3346,11 +3050,11 @@ impl ChatRepl {
                 &state.current_content,
                 &state.current_reasoning_content,
             );
-            self.dispatch_openai_tool_batch(&tool_calls, tool_accumulator, memory_db, auto_learner)
+            self.dispatch_openai_tool_batch(&tool_calls, tool_accumulator, memory_db)
                 .await;
 
             println!("\n\x1b[90mContinuing with tool results...\x1b[0m\n");
-            let request_body = match self.build_openai_followup_request() {
+            let request_body = match self.build_openai_followup_request(prompt_blocks) {
                 Ok(req) => req,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build OpenAI follow-up request");
@@ -3424,11 +3128,9 @@ impl ChatRepl {
         tool_calls: &[tools::ToolCall],
         tool_accumulator: &mut tools::ToolCallAccumulator,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         for tool_call in tool_calls {
-            self.execute_openai_tool(tool_call, memory_db, auto_learner)
-                .await;
+            self.execute_openai_tool(tool_call, memory_db).await;
         }
         self.run_quality_gates_and_inject();
         tool_accumulator.clear();
@@ -3448,12 +3150,18 @@ impl ChatRepl {
         if (!current_content.is_empty() || !reasoning_content.is_empty())
             && !tool_accumulator.has_tool_calls()
         {
-            if !self.final_response_allowed(current_content.trim(), cancelled) {
+            if cancelled {
+                self.record_failed_turn("provider response was cancelled before final validation");
                 return false;
             }
+            let Some(rendered) = self.render_final_response(current_content.trim(), cancelled)
+            else {
+                return false;
+            };
+            println!("{rendered}");
             let mut message = serde_json::json!({
                 "role": "assistant",
-                "content": current_content
+                "content": rendered
             });
             attach_reasoning_content(&mut message, reasoning_content);
             push_chat_session_message_and_persist(
@@ -3489,6 +3197,7 @@ impl ChatRepl {
         let mut messages = original.clone();
         run_vdd_review(
             engine,
+            &self.run_context,
             current_content,
             &mut messages,
             &self.config.proxy.target,
@@ -3503,17 +3212,18 @@ impl ChatRepl {
 
     /// Build the OpenAI-compatible follow-up request body (handles both
     /// the Anthropic direct branch and the generic `OpenAI` shape).
-    fn build_openai_followup_request(&self) -> Result<serde_json::Value, String> {
-        let request_messages = self.request_messages_with_grounding()?;
+    fn build_openai_followup_request(
+        &self,
+        prompt_blocks: &prompt::SystemPromptBlocks,
+    ) -> Result<serde_json::Value, String> {
+        let catalog_messages = self.request_messages_with_grounding()?;
+        let request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
+        let openai_tools =
+            tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
+                .definitions_value();
         if self.config.proxy.target.eq_ignore_ascii_case("anthropic") {
-            let system_msg = request_messages
-                .iter()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-                .map(String::from);
             let anthropic_messages = convert_messages_to_anthropic_checked(&request_messages)
                 .map_err(|e| e.to_string())?;
-            let openai_tools = tools::get_all_tool_definitions(true);
             let anthropic_tools = convert_tool_definitions_to_anthropic_checked(&openai_tools)
                 .map_err(|e| e.to_string())?;
             let mut req = serde_json::json!({
@@ -3523,13 +3233,7 @@ impl ChatRepl {
                 "stream": true,
                 "tools": anthropic_tools
             });
-            if let Some(sys) = system_msg {
-                req["system"] = serde_json::json!([{
-                    "type": "text",
-                    "text": sys,
-                    "cache_control": {"type": "ephemeral"}
-                }]);
-            }
+            req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
             Ok(req)
         } else {
             Ok(serde_json::json!({
@@ -3537,7 +3241,7 @@ impl ChatRepl {
                 "messages": request_messages,
                 "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
                 "stream": true,
-                "tools": tools::get_all_tool_definitions(true)
+                "tools": openai_tools
             }))
         }
     }
@@ -3553,12 +3257,13 @@ impl ChatRepl {
         current_reasoning_content: &mut String,
     ) {
         use futures::StreamExt;
-        use std::io::Write;
 
-        let mut req = self.client.post(transport.endpoint).json(&request_body);
-        for (key, value) in transport.headers {
-            req = req.header(key, value);
-        }
+        let Ok(req) = transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(&request_body))
+        else {
+            return;
+        };
         let Ok(response) = req.send().await else {
             return;
         };
@@ -3602,8 +3307,6 @@ impl ChatRepl {
                             reasoning_started = false;
                             thinking_start_time = None;
                         }
-                        print!("{text}");
-                        std::io::stdout().flush().ok();
                         current_content.push_str(&text);
                     }
                     openclaudia::pipeline::SseAction::Thinking(text) => {
@@ -3644,7 +3347,6 @@ impl ChatRepl {
                 thinking_start_time.map_or(0.0, |started| started.elapsed().as_secs_f64());
             tui::print_thinking_end(elapsed);
         }
-        println!();
     }
 
     /// Execute a single tool call from the OpenAI-style loop (matches
@@ -3653,28 +3355,23 @@ impl ChatRepl {
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         if self.push_plan_mode_block_if_any(tool_call) {
             return;
         }
-        let Some(permission_already_checked) = self.push_permission_or_proceed(tool_call).await
-        else {
+        let Some(authorization) = self.push_permission_or_proceed(tool_call).await else {
             return;
         };
-        let result = self.run_openai_tool_unaudited(
-            tool_call,
-            memory_db,
-            auto_learner,
-            permission_already_checked,
-        );
+        let result = self.run_openai_tool_unaudited(tool_call, memory_db, authorization);
 
-        let (final_content, was_marker) = process_tool_result_marker(
+        let final_result = process_tool_follow_up(
+            &self.run_context,
             &self.chat_session,
-            &tool_call.function.name,
-            &result.content,
+            &self.task_manager,
+            &result,
         );
-        let final_is_error = if was_marker { false } else { result.is_error };
+        let final_content = final_result.content();
+        let final_is_error = final_result.is_error();
 
         Self::log_openai_activity(
             memory_db,
@@ -3686,45 +3383,44 @@ impl ChatRepl {
             |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.run_context,
             &self.hook_engine,
             !final_is_error,
             &tool_call.function.name,
             tool_input,
-            &final_content,
+            final_content,
             Some(&self.chat_session.id()),
         )
         .await;
-        display_tool_result(&tool_call.function.name, &final_content, final_is_error);
-        push_observed_cli_tool_result_message(
+        display_tool_result(&final_result);
+        push_observed_cli_typed_tool_result_message(
+            &self.run_context,
             &mut self.chat_session,
             tool_call,
-            &result.tool_call_id,
-            &final_content,
-            final_is_error,
+            &final_result,
         );
     }
 
-    /// `OpenAI`-loop variant of `run_tool_with_audit` — same dispatch and
-    /// auto-learner observation, but no audit logger calls (the `OpenAI`
-    /// loop emits its own audit shape upstream).
+    /// `OpenAI`-loop variant of `run_tool_with_audit` without duplicate audit
+    /// logger calls (the `OpenAI` loop emits its own audit shape upstream).
     fn run_openai_tool_unaudited(
         &self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
-        permission_already_checked: bool,
+        authorization: Option<ExecutionPermit>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
-        let result = execute_tool_with_memory_after_permission(
+        execute_tool_with_memory_after_permission(CliToolExecution {
+            run_context: &self.run_context,
             tool_call,
             memory_db,
-            &self.permission_mgr,
-            permission_already_checked,
-            &self.chat_session.id(),
-            Some(self.policy_enforcer.as_ref()),
-        );
-        Self::auto_learn_observe(auto_learner, tool_call, &result);
-        result
+            app_config: &self.config,
+            task_manager: &self.task_manager,
+            permission_mgr: &self.permission_mgr,
+            authorization,
+            session_id: &self.chat_session.id(),
+            policy_enforcer: Some(self.policy_enforcer.as_ref()),
+        })
     }
 
     /// Persist a memory-DB activity row for one `OpenAI` tool execution.
@@ -3744,6 +3440,7 @@ impl ChatRepl {
                     args.get("path")
                         .or_else(|| args.get("file_path"))
                         .or_else(|| args.get("command"))
+                        .or_else(|| args.get("operation"))
                         .and_then(|v| v.as_str())
                         .unwrap_or(&tool_call.function.name)
                         .to_string()
@@ -3760,31 +3457,36 @@ impl ChatRepl {
     /// Run quality gates after a tool batch and inject any failures
     /// back into the session as system messages.
     fn run_quality_gates_and_inject(&mut self) {
-        let qg_results = guardrails::run_quality_gates();
+        let qg_results = guardrails::run_quality_gates(&self.run_context, &self.model);
         self.record_quality_gate_verifications(&qg_results);
         let mut injected_failure = false;
         for qg in &qg_results {
-            if qg.passed {
-                tracing::debug!(name = %qg.name, "Quality gate passed");
+            if qg.passed() {
+                tracing::debug!(name = %qg.name(), "Quality gate passed");
                 continue;
             }
-            let severity = if qg.required { "FAILED" } else { "warning" };
+            let severity = if qg.required() { "FAILED" } else { "warning" };
             eprintln!(
                 "\x1b[33m⚠ Quality gate '{}' {} (exit {})\x1b[0m",
-                qg.name, severity, qg.exit_code
+                qg.name(),
+                severity,
+                qg.exit_code()
             );
-            if !qg.stderr.is_empty() {
-                let preview: String = qg.stderr.lines().take(3).collect::<Vec<_>>().join("\n");
+            if !qg.stderr().is_empty() {
+                let preview: String = qg.stderr().lines().take(3).collect::<Vec<_>>().join("\n");
                 eprintln!("  {preview}");
             }
             self.chat_session.push_message(serde_json::json!({
                 "role": "system",
                 "content": format!(
                     "[Quality Gate '{}' {}] exit code {}\nstdout: {}\nstderr: {}",
-                    qg.name, severity, qg.exit_code,
-                    if qg.stdout.len() > 500 { safe_truncate(&qg.stdout, 500) } else { &qg.stdout },
-                    if qg.stderr.len() > 500 { safe_truncate(&qg.stderr, 500) } else { &qg.stderr }
-                )
+                    qg.name(), severity, qg.exit_code(),
+                    if qg.stdout().len() > 500 { safe_truncate(qg.stdout(), 500) } else { qg.stdout() },
+                    if qg.stderr().len() > 500 { safe_truncate(qg.stderr(), 500) } else { qg.stderr() }
+                ),
+                "metadata": {
+                    "openclaudia_context_source": "reality"
+                }
             }));
             injected_failure = true;
         }
@@ -3811,31 +3513,17 @@ impl ChatRepl {
                 }
             };
         for gate in qg_results {
-            if let Err(err) =
-                openclaudia::grounded_loop::append_quality_gate_observations(&mut ledger, gate)
-            {
+            if let Err(err) = openclaudia::grounded_loop::append_quality_gate_observations(
+                &self.run_context,
+                &mut ledger,
+                gate,
+            ) {
                 tracing::warn!(
                     session_id = %self.chat_session.id(),
-                    gate = %gate.name,
+                    gate = %gate.name(),
                     error = %err,
                     "failed to append CLI quality-gate observations to reality ledger"
                 );
-            }
-        }
-    }
-
-    fn auto_learn_observe(
-        auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
-        tool_call: &tools::ToolCall,
-        result: &tools::ToolResult,
-    ) {
-        if let Some(ref mut learner) = auto_learner {
-            let args: serde_json::Value =
-                serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
-            if result.is_error {
-                learner.on_tool_failure(&tool_call.function.name, &args, &result.content);
-            } else {
-                learner.on_tool_success(&tool_call.function.name, &args, &result.content);
             }
         }
     }
@@ -3882,6 +3570,12 @@ impl ChatRepl {
             }
             _ => false,
         }
+    }
+}
+
+impl Drop for ChatRepl {
+    fn drop(&mut self) {
+        tools::retire_run(&self.run_context);
     }
 }
 
@@ -4160,18 +3854,13 @@ fn openai_activity_type(tool_call: &tools::ToolCall) -> &'static str {
         "bash" => "bash_command",
         "crosslink" => serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
             .map_or("crosslink", |args| {
-                args.get("command")
+                args.get("operation")
                     .and_then(|v| v.as_str())
-                    .map_or("crosslink", |cmd| {
-                        if cmd.starts_with("create") {
-                            "issue_created"
-                        } else if cmd.starts_with("close") {
-                            "issue_closed"
-                        } else if cmd.starts_with("comment") {
-                            "issue_comment"
-                        } else {
-                            "crosslink"
-                        }
+                    .map_or("crosslink", |operation| match operation {
+                        "create" | "subissue" => "issue_created",
+                        "close" => "issue_closed",
+                        "comment" => "issue_comment",
+                        _ => "crosslink",
                     })
             }),
         // SAFETY: tool-call names are static-ish strings; we don't get to choose them
@@ -4201,6 +3890,108 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_run() -> &'static Arc<openclaudia::tools::ToolRunContext> {
+        static RUN: std::sync::OnceLock<Arc<openclaudia::tools::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            openclaudia::tools::ToolRunContext::builder(
+                openclaudia::state::SessionId::new(),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("chat-repl-test")
+            .build()
+            .expect("explicit chat REPL test run")
+        })
+    }
+
+    fn isolated_test_run() -> Arc<openclaudia::tools::ToolRunContext> {
+        openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("chat-repl-isolated-test")
+        .build()
+        .expect("isolated chat REPL test run")
+    }
+
+    fn test_session_at(root: &std::path::Path, provider: &str) -> Session {
+        let session = Session::new("test-model", provider);
+        session.update_state(|state, _| {
+            state.identity.original_cwd = root.to_path_buf();
+            state.identity.cwd = root.to_path_buf();
+            state.identity.project_root = root.to_path_buf();
+            state.identity.session_project_dir = root.to_path_buf();
+            state.transcript.transcript_cwd = root.to_path_buf();
+        });
+        session
+    }
+
+    #[test]
+    fn repl_session_derivation_preserves_authority_and_rejects_foreign_state() {
+        let root = tempfile::tempdir().expect("REPL transition root");
+        let foreign = tempfile::tempdir().expect("foreign REPL transition root");
+        let parent = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            root.path(),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("anthropic")
+        .build()
+        .expect("parent REPL run");
+        let loaded = test_session_at(root.path(), "anthropic");
+
+        let derived = derive_repl_session_run(&parent, &loaded, "anthropic")
+            .expect("same-project session must derive");
+        assert_eq!(derived.session_id(), loaded.id());
+        assert_eq!(derived.project_root(), parent.project_root());
+        assert_ne!(derived.run_id(), parent.run_id());
+
+        let foreign_session = test_session_at(foreign.path(), "anthropic");
+        let foreign_error = derive_repl_session_run(&parent, &foreign_session, "anthropic")
+            .expect_err("foreign project must not widen launch authority");
+        assert!(foreign_error.contains("differs from the authorized launch project"));
+
+        let provider_error = derive_repl_session_run(&parent, &loaded, "openai")
+            .expect_err("foreign provider must not retain a mismatched transport");
+        assert!(provider_error.contains("differs from the active provider"));
+    }
+
+    #[test]
+    fn fresh_repl_session_keeps_the_run_workspace_without_reusing_identity() {
+        let root = tempfile::tempdir().expect("fresh REPL root");
+        let current = test_session_at(root.path(), "anthropic");
+        let current_id = current.id();
+        let fresh = fresh_repl_session_in_run(&current, "next-model", "anthropic");
+
+        assert_ne!(fresh.id(), current_id);
+        let identity = fresh.inspect_state(|state| state.identity.clone());
+        assert_eq!(identity.project_root, root.path());
+        assert_eq!(identity.cwd, root.path());
+        assert_eq!(identity.original_cwd, root.path());
+        assert_eq!(fresh.model, "next-model");
+        assert_eq!(fresh.provider, "anthropic");
+    }
 
     struct EnvGuard {
         key: &'static str,
@@ -4269,6 +4060,74 @@ providers: {}
     }
 
     #[test]
+    fn cli_executor_propagates_automatic_learning_policy() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("CLI learning workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        let run = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            workspace.path(),
+        )
+        .working_directory(workspace.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("chat-repl-learning-test")
+        .build()
+        .expect("CLI learning run");
+        let memory = memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("CLI workspace memory");
+        let config: config::AppConfig = serde_yaml::from_str(
+            r"
+proxy:
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+memory:
+  automatic_learning_enabled: true
+",
+        )
+        .expect("CLI learning config");
+        let tasks =
+            std::sync::Mutex::new(session::TaskManager::for_run(&run).expect("CLI task manager"));
+        let permissions = PermissionManager::unrestricted_for_run(&run);
+        let call = tools::ToolCall {
+            id: "cli-learning-write".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/cli_learning.rs",
+                    "content": "pub const CLI_POLICY_PROPAGATED: bool = true;\n"
+                })
+                .to_string(),
+            },
+        };
+
+        let result = execute_tool_with_memory_after_permission(CliToolExecution {
+            run_context: &run,
+            tool_call: &call,
+            memory_db: Some(&memory),
+            app_config: &config,
+            task_manager: &tasks,
+            permission_mgr: &permissions,
+            authorization: None,
+            session_id: "cli-learning-policy",
+            policy_enforcer: None,
+        });
+        assert!(!result.is_error(), "CLI write failed: {}", result.content());
+        assert!(result.observations().iter().any(|observation| {
+            observation.kind == "technical_learning_capture" && !observation.authoritative
+        }));
+        openclaudia::tools::retire_run(&run);
+    }
+
+    #[test]
     fn parse_tool_args_rejects_malformed_or_non_object_json() {
         let malformed = tools::FunctionCall {
             name: "bash".to_string(),
@@ -4318,38 +4177,24 @@ providers: {}
     }
 
     #[test]
-    fn cli_plain_final_records_allow_decision() {
-        let mut ledger = openclaudia::ledger::RealityLedger::new();
+    fn cli_plain_final_is_denied_and_records_policy_decision() {
+        let session_id = format!("cli-plain-final-{}", uuid::Uuid::new_v4());
+        let path = openclaudia::ledger::project_session_ledger_path(&session_id)
+            .expect("safe test session");
         let content = "Verified with cargo test.";
 
-        openclaudia::grounded_loop::validate_final_against_ledger(&mut ledger, content)
-            .expect("plain assistant text should render");
+        let err = validate_and_render_cli_agentic_final_response(
+            test_run(),
+            &session_id,
+            content,
+            "test-model",
+        )
+        .expect_err("plain assistant text must not bypass the claim gate");
 
-        assert!(ledger
-            .observations_chronological()
-            .iter()
-            .any(|obs| matches!(
-                &obs.kind,
-                openclaudia::ledger::ObservationKind::PolicyDecision { allowed: true, .. }
-            )));
-    }
+        assert_eq!(err, "final answer must use the typed final claim envelope");
 
-    #[test]
-    fn cli_structured_final_gate_rejects_missing_verification() {
-        let mut ledger = openclaudia::ledger::RealityLedger::new();
-        let task = ledger.observe_user_task("Audit CLI loop.").expect("task");
-        let content = serde_json::json!({
-            "kind": "final",
-            "summary": "Verified with cargo test.",
-            "evidence": [task],
-            "verification": [],
-        })
-        .to_string();
-
-        let err = openclaudia::grounded_loop::validate_final_against_ledger(&mut ledger, &content)
-            .expect_err("structured final without verification must be denied");
-
-        assert_eq!(err, "final answer requires verification observation");
+        let ledger = openclaudia::ledger::RealityLedger::open_project_session(&session_id)
+            .expect("reopen CLI ledger");
         assert!(ledger
             .observations_chronological()
             .iter()
@@ -4357,23 +4202,104 @@ providers: {}
                 &obs.kind,
                 openclaudia::ledger::ObservationKind::PolicyDecision { allowed: false, .. }
             )));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_structured_final_gate_rejects_missing_verification() {
+        let session_id = format!("cli-ungrounded-final-{}", uuid::Uuid::new_v4());
+        let path = openclaudia::ledger::project_session_ledger_path(&session_id)
+            .expect("safe test session");
+        let content = serde_json::json!({
+            "kind": "final",
+            "claims": [{
+                "claim_type": "file_change",
+                "path": "src/cli/chat_repl.rs",
+                "evidence": []
+            }]
+        })
+        .to_string();
+
+        let err = validate_and_render_cli_agentic_final_response(
+            test_run(),
+            &session_id,
+            &content,
+            "test-model",
+        )
+        .expect_err("supported runtime claim without verification must be denied");
+
+        assert_eq!(
+            err,
+            "supported runtime claims require a trusted verification claim"
+        );
+        let ledger = openclaudia::ledger::RealityLedger::open_project_session(&session_id)
+            .expect("reopen CLI ledger");
+        assert!(ledger
+            .observations_chronological()
+            .iter()
+            .any(|obs| matches!(
+                &obs.kind,
+                openclaudia::ledger::ObservationKind::PolicyDecision { allowed: false, .. }
+            )));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_structured_final_renders_typed_uncertainty_not_raw_json() {
+        let session_id = format!("cli-typed-final-{}", uuid::Uuid::new_v4());
+        let path = openclaudia::ledger::project_session_ledger_path(&session_id)
+            .expect("safe test session");
+        let content = serde_json::json!({
+            "kind": "final",
+            "claims": [{
+                "claim_type": "unsupported",
+                "statement": "The remote deployment is healthy.",
+                "reason": "No deployment receipt is available."
+            }]
+        })
+        .to_string();
+
+        let rendered = validate_and_render_cli_agentic_final_response(
+            test_run(),
+            &session_id,
+            &content,
+            "test-model",
+        )
+        .expect("typed uncertainty should pass");
+
+        assert_eq!(
+            rendered,
+            "Unsupported claim \"The remote deployment is healthy.\"; reason \"No deployment receipt is available.\"."
+        );
+        assert!(!rendered.contains("claim_type"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn cli_quality_gate_result_records_command_and_verification_observations() {
+        let run = isolated_test_run();
         let mut ledger = openclaudia::ledger::RealityLedger::new();
-        let gate = guardrails::QualityCheckResult {
-            name: "fmt".to_string(),
-            command: "cargo fmt --check".to_string(),
-            passed: false,
-            exit_code: 1,
-            stdout: "format drift".to_string(),
-            stderr: "run cargo fmt".to_string(),
-            required: true,
+        let config = openclaudia::config::GuardrailsConfig {
+            quality_gates: Some(openclaudia::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![openclaudia::config::QualityCheck {
+                    name: "deliberate-failure".to_string(),
+                    command: "sh -c 'printf format-drift; exit 1'".to_string(),
+                    required: true,
+                }],
+                ..openclaudia::config::QualityGatesConfig::default()
+            }),
+            ..openclaudia::config::GuardrailsConfig::default()
         };
+        guardrails::configure(&run, &config).expect("configure quality gate");
+        let gate = guardrails::run_quality_gates(&run, "test-model")
+            .into_iter()
+            .next()
+            .expect("configured quality gate result");
 
-        let ids = openclaudia::grounded_loop::append_quality_gate_observations(&mut ledger, &gate)
-            .expect("quality gate should ledger command and verification");
+        let ids =
+            openclaudia::grounded_loop::append_quality_gate_observations(&run, &mut ledger, &gate)
+                .expect("quality gate should ledger command and verification");
 
         let command_obs = ledger
             .get(ids.command)
@@ -4387,9 +4313,9 @@ providers: {}
         assert_eq!(
             argv,
             &vec![
-                "cargo".to_string(),
-                "fmt".to_string(),
-                "--check".to_string()
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf format-drift; exit 1".to_string()
             ]
         );
         assert_eq!(*exit_code, 1);
@@ -4406,11 +4332,22 @@ providers: {}
             panic!("expected verification observation");
         };
         assert!(!passed);
-        assert_eq!(command.as_deref(), Some("cargo fmt --check"));
-        assert!(findings.iter().any(|finding| finding.contains("fmt")));
+        assert_eq!(
+            command.as_deref(),
+            Some("sh -c 'printf format-drift; exit 1'")
+        );
         assert!(findings
             .iter()
-            .any(|finding| finding.contains("run cargo fmt")));
+            .any(|finding| finding.contains("deliberate-failure")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("format-drift")));
+        assert_eq!(
+            obs.provenance.trust,
+            openclaudia::ledger::EvidenceTrust::TrustedVerifier
+        );
+        assert!(obs.provenance.is_bound_to(&run));
+        assert!(obs.provenance.verification_method.is_some());
     }
 
     fn chat_session_with_turns(turns: usize) -> Session {
@@ -4737,6 +4674,7 @@ providers: {}
         };
 
         push_observed_cli_tool_result_message(
+            test_run(),
             &mut session,
             &tool_call,
             &tool_call.id,
@@ -4763,7 +4701,20 @@ providers: {}
                 .cloned()
         }
         .expect("tool result observation");
-        assert_eq!(observation.authority, openclaudia::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            openclaudia::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(test_run()));
+        assert_eq!(
+            observation
+                .provenance
+                .tool_call
+                .as_ref()
+                .expect("tool-call provenance")
+                .call_id,
+            "call_denied"
+        );
         let openclaudia::ledger::ObservationKind::ToolResult { tool, result } = &observation.kind
         else {
             panic!("expected tool result observation");
@@ -4783,18 +4734,5 @@ providers: {}
     fn rustyline_editor_mode_construction_is_fallible_not_panicking() {
         let _ = new_rustyline_editor(rustyline::EditMode::Emacs);
         let _ = new_rustyline_editor(rustyline::EditMode::Vi);
-    }
-
-    #[test]
-    fn extension_regex_construction_is_fallible_not_panicking() {
-        let regex = compile_extension_regex()
-            .expect("built-in file extension detector regex should compile");
-
-        let captures: Vec<_> = regex
-            .captures_iter("Review src/main.rs and crates/foo/lib.test.ts")
-            .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-            .collect();
-
-        assert_eq!(captures, ["rs", "ts"]);
     }
 }

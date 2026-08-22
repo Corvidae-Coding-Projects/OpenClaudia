@@ -4,9 +4,11 @@
 //! against real filesystem, processes, and network operations.
 
 use openclaudia::memory::MemoryDb;
+use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
+use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
 use openclaudia::tools::{
     clear_todo_list, execute_tool, get_todo_list, reset_read_tracker, FunctionCall, TodoStatus,
-    ToolCall,
+    ToolCall, ToolResult,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -18,7 +20,7 @@ use tempfile::TempDir;
 static READ_TRACKER_LOCK: Mutex<()> = Mutex::new(());
 
 /// Global lock for tests that depend on the shared `TODO_LIST` state.
-/// Tests that call `clear_todo_list()` must hold this lock to avoid races.
+/// Tests that mutate the shared todo store hold this lock to avoid races.
 static TODO_LIST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Helper to create a `ToolCall` from name and arguments
@@ -31,6 +33,37 @@ fn make_tool_call(name: &str, args: &Value) -> ToolCall {
             arguments: args.to_string(),
         },
     }
+}
+
+/// Execute shell syntax that the host has explicitly approved.
+///
+/// `execute_tool` intentionally uses `PermissionManager::unrestricted()`, whose
+/// established bypass-mode policy rejects compound shell constructs. Tests of
+/// those constructs must prove the Bash implementation remains available
+/// through a real approval path rather than relying on the retired
+/// manager-less dispatch bypass.
+fn execute_tool_with_bash_approval(tool_call: &ToolCall) -> ToolResult {
+    let run = support::shared_run_context();
+    let state = TempDir::new().expect("create permission state directory");
+    let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
+    let permit = manager
+        .approve_tool_call_once(
+            tool_call,
+            Some(run.session_id()),
+            ApprovalProvenance::InteractiveUser,
+        )
+        .expect("host approval must mint an exact one-use permit");
+    ToolExecutor::execute(ToolExecutorRequest {
+        run_context: run,
+        tool_call,
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+        permission_mgr: &manager,
+        authorization: Some(permit),
+        session_id: None,
+        policy_enforcer: None,
+    })
 }
 
 /// Helper to create a temp directory with test files
@@ -83,15 +116,19 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error, "Read should succeed: {}", result.content);
         assert!(
-            result.content.contains("Hello, World!"),
+            !result.is_error(),
+            "Read should succeed: {}",
+            result.content()
+        );
+        assert!(
+            result.content().contains("Hello, World!"),
             "Should contain file content"
         );
         assert!(
-            result.content.contains("Line 2"),
+            result.content().contains("Line 2"),
             "Should contain all lines"
         );
     }
@@ -105,13 +142,13 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(result.is_error, "Read of nonexistent file should fail");
+        assert!(result.is_error(), "Read of nonexistent file should fail");
         // The path-jail (crosslink #269) rejects out-of-root paths before
         // attempting the read, so any of these error phrasings is acceptable:
         // strict-jail rejection, legacy not-found error, or a generic failure.
-        let c = result.content.to_lowercase();
+        let c = result.content().to_lowercase();
         assert!(
             c.contains("not found")
                 || c.contains("no such file")
@@ -120,7 +157,7 @@ mod file_tools {
                 || c.contains("outside the project root")
                 || c.contains("path traversal"),
             "Error should describe a path/file-access failure: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -138,16 +175,16 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Read with offset should succeed: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("Line 2"), "Should contain line 2");
+        assert!(result.content().contains("Line 2"), "Should contain line 2");
         assert!(
-            !result.content.contains("Hello"),
+            !result.content().contains("Hello"),
             "Should not contain line 1"
         );
     }
@@ -165,9 +202,13 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error, "Write should succeed: {}", result.content);
+        assert!(
+            !result.is_error(),
+            "Write should succeed: {}",
+            result.content()
+        );
 
         // Verify the file was actually written
         let content = fs::read_to_string(&file_path).expect("Failed to read written file");
@@ -177,7 +218,7 @@ mod file_tools {
     #[test]
     fn test_write_file_overwrite() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker();
+        reset_read_tracker(support::shared_run_context());
         let dir = setup_test_dir();
         let file_path = dir.path().join("test.txt");
 
@@ -186,11 +227,11 @@ mod file_tools {
         // before the write so the test exercises the realistic
         // read-then-write flow.
         let read_call = make_tool_call("read_file", &json!({"path": file_path.to_string_lossy()}));
-        let read_result = execute_tool(&read_call);
+        let read_result = execute_tool(support::shared_run_context(), &read_call);
         assert!(
-            !read_result.is_error,
+            !read_result.is_error(),
             "read_file precondition failed: {}",
-            read_result.content
+            read_result.content()
         );
 
         let tool_call = make_tool_call(
@@ -201,12 +242,12 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Write overwrite should succeed: {}",
-            result.content
+            result.content()
         );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -216,14 +257,14 @@ mod file_tools {
     #[test]
     fn test_edit_file_replace() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker(); // Clear tracker for clean test state
+        reset_read_tracker(support::shared_run_context()); // Clear this run's tracker state
         let dir = setup_test_dir();
         let file_path = dir.path().join("test.txt");
 
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
@@ -234,9 +275,13 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error, "Edit should succeed: {}", result.content);
+        assert!(
+            !result.is_error(),
+            "Edit should succeed: {}",
+            result.content()
+        );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
         assert!(
@@ -252,14 +297,14 @@ mod file_tools {
     #[test]
     fn test_edit_file_old_string_not_found() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker(); // Clear tracker for clean test state
+        reset_read_tracker(support::shared_run_context()); // Clear this run's tracker state
         let dir = setup_test_dir();
         let file_path = dir.path().join("test.txt");
 
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
@@ -270,15 +315,18 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(result.is_error, "Edit with missing old_string should fail");
         assert!(
-            result.content.to_lowercase().contains("could not find")
-                || result.content.to_lowercase().contains("not found")
-                || result.content.to_lowercase().contains("no match"),
+            result.is_error(),
+            "Edit with missing old_string should fail"
+        );
+        assert!(
+            result.content().to_lowercase().contains("could not find")
+                || result.content().to_lowercase().contains("not found")
+                || result.content().to_lowercase().contains("no match"),
             "Error should mention string not found: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -294,14 +342,17 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "list_files should succeed: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("test.txt"), "Should find test.txt");
+        assert!(
+            result.content().contains("test.txt"),
+            "Should find test.txt"
+        );
     }
 
     #[test]
@@ -316,11 +367,11 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should succeed but with no matches
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "list_files should succeed even with no matches"
         );
     }
@@ -343,15 +394,15 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Read should handle Unicode: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("世界"), "Should contain Chinese");
-        assert!(result.content.contains("🦀"), "Should contain emoji");
+        assert!(result.content().contains("世界"), "Should contain Chinese");
+        assert!(result.content().contains("🦀"), "Should contain emoji");
     }
 
     #[test]
@@ -368,12 +419,12 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Write should handle Unicode: {}",
-            result.content
+            result.content()
         );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -393,12 +444,12 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Read empty file should succeed: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -422,15 +473,15 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Read large file should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Line 0"),
+            result.content().contains("Line 0"),
             "Should contain first line"
         );
     }
@@ -456,11 +507,11 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error, "Read with offset/limit should succeed");
+        assert!(!result.is_error(), "Read with offset/limit should succeed");
         assert!(
-            result.content.contains("Line 500") || result.content.contains("Line 501"),
+            result.content().contains("Line 500") || result.content().contains("Line 501"),
             "Should contain content from offset"
         );
     }
@@ -468,7 +519,7 @@ mod file_tools {
     #[test]
     fn test_edit_file_multiline() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker(); // Clear tracker for clean test state
+        reset_read_tracker(support::shared_run_context()); // Clear this run's tracker state
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("multiline.txt");
 
@@ -478,7 +529,7 @@ mod file_tools {
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
@@ -489,12 +540,12 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Multiline edit should succeed: {}",
-            result.content
+            result.content()
         );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -507,7 +558,7 @@ mod file_tools {
     #[test]
     fn test_edit_file_special_characters() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker(); // Clear tracker for clean test state
+        reset_read_tracker(support::shared_run_context()); // Clear this run's tracker state
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("special.txt");
 
@@ -517,7 +568,7 @@ mod file_tools {
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
@@ -528,12 +579,12 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Edit with special chars should succeed: {}",
-            result.content
+            result.content()
         );
 
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -552,15 +603,18 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Recursive list should succeed: {}",
-            result.content
+            result.content()
         );
         // Should find both test.txt and subdir/nested.txt
-        assert!(result.content.contains("test.txt"), "Should find test.txt");
+        assert!(
+            result.content().contains("test.txt"),
+            "Should find test.txt"
+        );
     }
 
     #[test]
@@ -576,13 +630,13 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // write_file should create parent directories automatically
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "write_file should create parent dirs, got error: {}",
-            result.content
+            result.content()
         );
         let content = fs::read_to_string(&file_path).expect("Failed to read written file");
         assert_eq!(content, "Content in nested dir");
@@ -604,22 +658,22 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Must produce a non-empty response (either content or error message)
         assert!(
-            !result.content.is_empty(),
+            !result.content().is_empty(),
             "Binary file read should produce output (content or error), got empty"
         );
         // If it succeeded, it should have returned some representation of the bytes
         // If it errored, it should mention binary
-        if result.is_error {
+        if result.is_error() {
             assert!(
-                result.content.to_lowercase().contains("binary")
-                    || result.content.to_lowercase().contains("utf")
-                    || result.content.to_lowercase().contains("invalid"),
+                result.content().to_lowercase().contains("binary")
+                    || result.content().to_lowercase().contains("utf")
+                    || result.content().to_lowercase().contains("invalid"),
                 "Binary error should explain the issue, got: {}",
-                result.content
+                result.content()
             );
         }
     }
@@ -629,7 +683,7 @@ mod file_tools {
     #[test]
     fn test_edit_file_without_prior_read() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker();
+        reset_read_tracker(support::shared_run_context());
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("unread.txt");
         fs::write(&file_path, "original content").expect("Failed to write");
@@ -644,18 +698,18 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            result.is_error,
+            result.is_error(),
             "Edit without prior read should fail, got: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.to_lowercase().contains("read")
-                || result.content.to_lowercase().contains("must"),
+            result.content().to_lowercase().contains("read")
+                || result.content().to_lowercase().contains("must"),
             "Error should mention the read requirement, got: {}",
-            result.content
+            result.content()
         );
 
         // Verify file is unchanged
@@ -678,12 +732,12 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Writing empty content should succeed: {}",
-            result.content
+            result.content()
         );
         let content = fs::read_to_string(&file_path).expect("Failed to read");
         assert_eq!(content, "", "File should be empty");
@@ -694,7 +748,7 @@ mod file_tools {
     #[test]
     fn test_edit_file_identical_old_new() {
         let _lock = READ_TRACKER_LOCK.lock().unwrap();
-        reset_read_tracker();
+        reset_read_tracker(support::shared_run_context());
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
         let file_path = dir.path().join("identical.txt");
         fs::write(&file_path, "some content here").expect("Failed to write");
@@ -702,7 +756,7 @@ mod file_tools {
         // Read first
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(&read_call);
+        let _ = execute_tool(support::shared_run_context(), &read_call);
 
         // Edit with same old and new string
         let tool_call = make_tool_call(
@@ -714,7 +768,7 @@ mod file_tools {
             }),
         );
 
-        let _result = execute_tool(&tool_call);
+        let _result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should either succeed (no-op) or warn — but file must be unchanged
         let content = fs::read_to_string(&file_path).expect("Failed to read");
@@ -735,11 +789,11 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // On Windows this path won't exist; on any OS this should fail or return safely
         assert!(
-            result.is_error || !result.content.contains("root:"),
+            result.is_error() || !result.content().contains("root:"),
             "Path traversal should not expose sensitive files"
         );
     }
@@ -760,13 +814,13 @@ mod file_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should fail gracefully — most filesystems reject names > 255 chars
         assert!(
-            result.is_error,
+            result.is_error(),
             "Very long filename should fail, got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -789,11 +843,15 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error, "Bash should succeed: {}", result.content);
         assert!(
-            result.content.contains("Hello from bash"),
+            !result.is_error(),
+            "Bash should succeed: {}",
+            result.content()
+        );
+        assert!(
+            result.content().contains("Hello from bash"),
             "Should contain echo output"
         );
     }
@@ -807,13 +865,13 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        // A non-zero exit must be flagged as an error
+        // The process started, so a non-zero exit is a typed partial outcome:
+        // the generic Bash executor cannot prove that no effect occurred.
         assert!(
-            result.is_error,
-            "Non-zero exit code should set is_error=true, got content: {}",
-            result.content
+            result.is_partial(),
+            "Non-zero exit after process start must preserve a partial receipt, got: {result:?}"
         );
     }
 
@@ -826,15 +884,15 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should indicate command not found (either error or in content)
         assert!(
-            result.is_error
-                || result.content.to_lowercase().contains("not found")
-                || result.content.to_lowercase().contains("not recognized"),
+            result.is_error()
+                || result.content().to_lowercase().contains("not found")
+                || result.content().to_lowercase().contains("not recognized"),
             "Should indicate command not found: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -863,15 +921,15 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Bash cd should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("marker.txt"),
+            result.content().contains("marker.txt"),
             "Should list files in target dir"
         );
     }
@@ -886,14 +944,14 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should either error with timeout or produce some output
         assert!(
-            result.is_error
-                || result.content.contains("timeout")
-                || result.content.contains("timed out")
-                || !result.content.is_empty(),
+            result.is_error()
+                || result.content().contains("timeout")
+                || result.content().contains("timed out")
+                || !result.content().is_empty(),
             "Timeout test should produce output or error, got empty result"
         );
     }
@@ -908,15 +966,15 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Background bash should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("shell_") || result.content.contains("background"),
+            result.content().contains("shell_") || result.content().contains("background"),
             "Should return shell ID for background process"
         );
     }
@@ -931,28 +989,28 @@ mod bash_tools {
                 "run_in_background": true
             }),
         );
-        let bg_result = execute_tool(&bg_call);
-        assert!(!bg_result.is_error, "Background start should succeed");
+        let bg_result = execute_tool(support::shared_run_context(), &bg_call);
+        assert!(!bg_result.is_error(), "Background start should succeed");
 
         // Small delay for process to start
         thread::sleep(Duration::from_millis(100));
 
         // Now list shells (no shell_id = list all)
         let list_call = make_tool_call("bash_output", &json!({}));
-        let list_result = execute_tool(&list_call);
+        let list_result = execute_tool(support::shared_run_context(), &list_call);
 
         assert!(
-            !list_result.is_error,
+            !list_result.is_error(),
             "bash_output list should succeed: {}",
-            list_result.content
+            list_result.content()
         );
         // Should list at least one shell
         assert!(
-            list_result.content.contains("shell_")
-                || list_result.content.contains("Background shells")
-                || list_result.content.contains("ping"),
+            list_result.content().contains("shell_")
+                || list_result.content().contains("Background shells")
+                || list_result.content().contains("ping"),
             "Should list running shells: {}",
-            list_result.content
+            list_result.content()
         );
     }
 
@@ -966,10 +1024,10 @@ mod bash_tools {
                 "run_in_background": true
             }),
         );
-        let bg_result = execute_tool(&bg_call);
+        let bg_result = execute_tool_with_bash_approval(&bg_call);
 
         // Extract shell ID from result - look for pattern like "shell_abc123"
-        let shell_id = extract_shell_id(&bg_result.content);
+        let shell_id = extract_shell_id(bg_result.content());
 
         // Wait for some output
         thread::sleep(Duration::from_millis(500));
@@ -981,13 +1039,13 @@ mod bash_tools {
                 "shell_id": shell_id
             }),
         );
-        let output_result = execute_tool(&output_call);
+        let output_result = execute_tool(support::shared_run_context(), &output_call);
 
         // Should have some output (might be empty if command finished quickly)
         assert!(
-            !output_result.is_error,
+            !output_result.is_error(),
             "bash_output should succeed: {}",
-            output_result.content
+            output_result.content()
         );
     }
 
@@ -1001,10 +1059,10 @@ mod bash_tools {
                 "run_in_background": true
             }),
         );
-        let bg_result = execute_tool(&bg_call);
+        let bg_result = execute_tool(support::shared_run_context(), &bg_call);
 
         // Extract shell ID
-        let shell_id = extract_shell_id(&bg_result.content);
+        let shell_id = extract_shell_id(bg_result.content());
 
         thread::sleep(Duration::from_millis(100));
 
@@ -1015,19 +1073,19 @@ mod bash_tools {
                 "shell_id": shell_id
             }),
         );
-        let kill_result = execute_tool(&kill_call);
+        let kill_result = execute_tool(support::shared_run_context(), &kill_call);
 
         assert!(
-            !kill_result.is_error,
+            !kill_result.is_error(),
             "kill_shell should succeed: {}",
-            kill_result.content
+            kill_result.content()
         );
         assert!(
-            kill_result.content.to_lowercase().contains("kill")
-                || kill_result.content.to_lowercase().contains("terminated")
-                || kill_result.content.to_lowercase().contains("stopped"),
+            kill_result.content().to_lowercase().contains("kill")
+                || kill_result.content().to_lowercase().contains("terminated")
+                || kill_result.content().to_lowercase().contains("stopped"),
             "Should confirm shell was killed: {}",
-            kill_result.content
+            kill_result.content()
         );
     }
 
@@ -1042,16 +1100,16 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Multiline command should succeed: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("line1"), "Should contain line1");
-        assert!(result.content.contains("line2"), "Should contain line2");
-        assert!(result.content.contains("line3"), "Should contain line3");
+        assert!(result.content().contains("line1"), "Should contain line1");
+        assert!(result.content().contains("line2"), "Should contain line2");
+        assert!(result.content().contains("line3"), "Should contain line3");
     }
 
     #[test]
@@ -1063,15 +1121,15 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Pipe command should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("HELLO WORLD"),
+            result.content().contains("HELLO WORLD"),
             "Should contain uppercase output"
         );
     }
@@ -1085,15 +1143,15 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Variable expansion should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("test123"),
+            result.content().contains("test123"),
             "Should contain variable value"
         );
     }
@@ -1107,13 +1165,13 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         // Stderr output must appear in result content regardless of is_error
         assert!(
-            result.content.contains("stderr test"),
+            result.content().contains("stderr test"),
             "Should capture stderr output in content, got: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1126,19 +1184,19 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool_with_bash_approval(&tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Quoted strings should work: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("double quotes"),
+            result.content().contains("double quotes"),
             "Should have double quotes content"
         );
         assert!(
-            result.content.contains("single quotes"),
+            result.content().contains("single quotes"),
             "Should have single quotes content"
         );
     }
@@ -1152,13 +1210,13 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&kill_call);
+        let result = execute_tool(support::shared_run_context(), &kill_call);
 
         // Should fail or indicate shell not found
         assert!(
-            result.is_error || result.content.to_lowercase().contains("not found"),
+            result.is_error() || result.content().to_lowercase().contains("not found"),
             "Should indicate shell not found: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1171,13 +1229,13 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&output_call);
+        let result = execute_tool(support::shared_run_context(), &output_call);
 
         // Should fail or indicate shell not found
         assert!(
-            result.is_error || result.content.to_lowercase().contains("not found"),
+            result.is_error() || result.content().to_lowercase().contains("not found"),
             "Should indicate shell not found: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1192,16 +1250,16 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Empty command should either error or produce a safe no-op result — not crash
         assert!(
-            result.is_error
-                || result.content.is_empty()
-                || result.content.to_lowercase().contains("no output")
-                || result.content.to_lowercase().contains("empty"),
+            result.is_error()
+                || result.content().is_empty()
+                || result.content().to_lowercase().contains("no output")
+                || result.content().to_lowercase().contains("empty"),
             "Empty command should fail gracefully or produce no-op output, got: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1216,17 +1274,17 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Quoted special chars should not be interpreted: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("hello; world & test | more"),
+            result.content().contains("hello; world & test | more"),
             "Should print literal special chars, got: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1242,23 +1300,23 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "Large output command should succeed: {}",
-            result.content
+            result.content()
         );
         // Should contain at least some of the output
         assert!(
-            result.content.contains('1'),
+            result.content().contains('1'),
             "Should contain start of output"
         );
         // Content should be non-trivially sized
         assert!(
-            result.content.len() > 100,
+            result.content().len() > 100,
             "Large output should produce substantial content, got {} bytes",
-            result.content.len()
+            result.content().len()
         );
     }
 }
@@ -1298,14 +1356,14 @@ mod web_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(result.is_error, "loopback web_fetch must be rejected");
+        assert!(result.is_error(), "loopback web_fetch must be rejected");
         assert!(
-            result.content.contains("reserved/internal")
-                || result.content.contains("metadata endpoint"),
+            result.content().contains("reserved/internal")
+                || result.content().contains("metadata endpoint"),
             "SSRF rejection should explain the blocked target: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1319,21 +1377,21 @@ mod web_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "live web_fetch smoke failed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            !result.content.is_empty(),
+            !result.content().is_empty(),
             "web_fetch should return content"
         );
         assert!(
-            result.content.contains("URL: https://example.com/"),
+            result.content().contains("URL: https://example.com/"),
             "web_fetch raw output should include the fetched URL: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -1347,13 +1405,13 @@ mod web_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(result.is_error, "Invalid URL should fail");
+        assert!(result.is_error(), "Invalid URL should fail");
     }
 
-    // DuckDuckGo/Bing search uses the browser feature (enabled by default)
-    // and does not require a search API key.
+    // DuckDuckGo/Bing search uses the explicit browser feature and does not
+    // require a search API key.
     #[cfg(feature = "browser")]
     #[test]
     #[ignore = "requires network access; run with `cargo test -- --ignored`"]
@@ -1365,10 +1423,10 @@ mod web_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        if !result.is_error {
-            assert!(result.content.contains("http"), "Should contain URLs");
+        if !result.is_error() {
+            assert!(result.content().contains("http"), "Should contain URLs");
         }
     }
 }
@@ -1379,7 +1437,6 @@ mod web_tools {
 
 mod auto_learn_integration {
     use super::*;
-    use openclaudia::auto_learn::AutoLearner;
 
     fn setup_memory_db() -> (TempDir, MemoryDb) {
         let dir = TempDir::new_in(".").expect("Failed to create temp dir");
@@ -1464,46 +1521,6 @@ mod auto_learn_integration {
         let prefs = db.get_all_preferences().unwrap();
         assert_eq!(prefs.len(), 1);
         assert_eq!(prefs[0].category, "style");
-    }
-
-    #[test]
-    fn test_auto_learner_tool_failure_records_error() {
-        let (_dir, db) = setup_memory_db();
-        let mut learner = AutoLearner::new(&db);
-
-        let args = json!({"command": "cargo build"});
-        learner.on_tool_failure(
-            "bash",
-            &args,
-            "error[E0308]: mismatched types\n  --> src/main.rs:42:5",
-        );
-
-        let errors = db.get_error_patterns_for_file("src/main.rs").unwrap();
-        assert_eq!(errors.len(), 1);
-    }
-
-    #[test]
-    fn test_auto_learner_session_end_records_relationships() {
-        let (_dir, db) = setup_memory_db();
-        let mut learner = AutoLearner::new(&db);
-
-        // Use absolute paths to avoid canonicalization mismatches
-        // (normalize_path canonicalizes real files but keeps fictitious ones as-is)
-        let abs_a = std::fs::canonicalize("src/main.rs").map_or_else(
-            |_| "/tmp/test_a.rs".to_string(),
-            |p| p.to_string_lossy().to_string(),
-        );
-        let abs_b = "/tmp/nonexistent_test_b.rs".to_string();
-
-        let args_a = json!({"path": &abs_a});
-        let args_b = json!({"path": &abs_b});
-        learner.on_tool_success("edit_file", &args_a, "ok");
-        learner.on_tool_success("edit_file", &args_b, "ok");
-
-        learner.on_session_end();
-
-        let related = db.get_related_files(&abs_a).unwrap();
-        assert_eq!(related.len(), 1);
     }
 
     #[test]
@@ -1608,8 +1625,7 @@ mod tool_definitions {
     }
 
     #[test]
-    fn test_get_all_tool_definitions_no_memory_tools() {
-        // Memory tools were removed in favor of auto-learning
+    fn typed_technical_memory_tools_replace_the_absent_legacy_surface() {
         let tools = get_all_tool_definitions(false);
         let tool_names: Vec<&str> = tools
             .as_array()
@@ -1618,10 +1634,26 @@ mod tool_definitions {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
 
-        assert!(
-            !tool_names.iter().any(|n| n.contains("memory")),
-            "Memory tools should not be present (replaced by auto-learning)"
-        );
+        for expected in [
+            "memory_save",
+            "memory_search",
+            "memory_list",
+            "memory_learning_status",
+            "memory_conflicts",
+            "memory_update",
+            "memory_delete",
+            "memory_review",
+            "memory_export",
+            "memory_import",
+            "memory_source_status",
+            "memory_source_refresh",
+        ] {
+            assert!(
+                tool_names.contains(&expected),
+                "canonical technical-memory tool {expected} must be registered"
+            );
+        }
+        assert!(!tool_names.contains(&"core_memory_update"));
     }
 
     #[test]
@@ -1699,11 +1731,12 @@ mod todo_tools {
     #[test]
     fn test_todo_write_basic() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Fix the bug",
@@ -1719,38 +1752,39 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "todo_write should succeed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("2 total"),
+            result.content().contains("2 total"),
             "Should report 2 todos: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("1 in progress"),
+            result.content().contains("1 in progress"),
             "Should have 1 in progress: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Writing tests"),
+            result.content().contains("Writing tests"),
             "Should show current task: {}",
-            result.content
+            result.content()
         );
     }
 
     #[test]
     fn test_todo_write_with_completed() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Setup project",
@@ -1771,29 +1805,30 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.contains("2 completed"),
+            result.content().contains("2 completed"),
             "Should have 2 completed: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("1 pending"),
+            result.content().contains("1 pending"),
             "Should have 1 pending: {}",
-            result.content
+            result.content()
         );
     }
 
     #[test]
-    fn test_todo_write_multiple_in_progress_warning() {
+    fn test_todo_write_multiple_in_progress_is_atomic_error() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Task 1",
@@ -1809,26 +1844,27 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(result.is_error(), "Must reject: {}", result.content());
         assert!(
-            result.content.to_lowercase().contains("warning")
-                || result.content.contains("2 tasks marked as in_progress"),
-            "Should warn about multiple in_progress: {}",
-            result.content
+            result.content().contains("multiple in-progress"),
+            "Should name the canonical actor-lane invariant: {}",
+            result.content()
         );
+        assert!(get_todo_list(support::shared_run_context().session_id()).is_empty());
     }
 
     #[test]
     fn test_todo_write_missing_field() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // Missing activeForm
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Task",
@@ -1838,28 +1874,29 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            result.is_error,
+            result.is_error(),
             "Should fail with missing field: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("activeForm"),
+            result.content().contains("activeForm"),
             "Should mention missing activeForm: {}",
-            result.content
+            result.content()
         );
     }
 
     #[test]
     fn test_todo_write_invalid_status() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Task",
@@ -1870,50 +1907,51 @@ mod todo_tools {
             }),
         );
 
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         assert!(
-            result.is_error,
+            result.is_error(),
             "Should fail with invalid status: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("invalid")
-                || result.content.contains("pending")
-                || result.content.contains("in_progress")
-                || result.content.contains("completed"),
+            result.content().contains("invalid")
+                || result.content().contains("pending")
+                || result.content().contains("in_progress")
+                || result.content().contains("completed"),
             "Should mention valid statuses: {}",
-            result.content
+            result.content()
         );
     }
 
     #[test]
     fn test_todo_read_empty() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         let tool_call = make_tool_call("todo_read", &json!({}));
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.to_lowercase().contains("no todos")
-                || result.content.contains("empty")
-                || result.content.is_empty(),
+            result.content().to_lowercase().contains("no todos")
+                || result.content().contains("empty")
+                || result.content().is_empty(),
             "Should indicate empty list: {}",
-            result.content
+            result.content()
         );
     }
 
     #[test]
     fn test_todo_read_after_write() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // Write some todos
         let write_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Research API",
@@ -1933,49 +1971,50 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write_call);
+        let _ = execute_tool(support::shared_run_context(), &write_call);
 
         // Read them back
         let read_call = make_tool_call("todo_read", &json!({}));
-        let result = execute_tool(&read_call);
+        let result = execute_tool(support::shared_run_context(), &read_call);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.contains("Research API"),
+            result.content().contains("Research API"),
             "Should contain first task: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Implement endpoint"),
+            result.content().contains("Implement endpoint"),
             "Should contain second task: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Write documentation"),
+            result.content().contains("Write documentation"),
             "Should contain third task: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("[x]") || result.content.contains("completed"),
+            result.content().contains("[x]") || result.content().contains("completed"),
             "Should show completed status: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("[>]") || result.content.contains("in_progress"),
+            result.content().contains("[>]") || result.content().contains("in_progress"),
             "Should show in_progress status: {}",
-            result.content
+            result.content()
         );
     }
 
     #[test]
     fn test_todo_list_persistence() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // Write todos
         let write_call = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Persistent task",
@@ -1985,10 +2024,10 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write_call);
+        let _ = execute_tool(support::shared_run_context(), &write_call);
 
         // Get the list directly using helper function
-        let todos = get_todo_list();
+        let todos = get_todo_list(support::shared_run_context().session_id());
 
         assert_eq!(todos.len(), 1, "Should have 1 todo");
         assert_eq!(todos[0].content, "Persistent task");
@@ -1999,12 +2038,13 @@ mod todo_tools {
     #[test]
     fn test_todo_write_replaces_list() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // First write
         let write1 = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Old task 1",
@@ -2019,12 +2059,13 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write1);
+        let _ = execute_tool(support::shared_run_context(), &write1);
 
         // Second write (should replace, not append)
         let write2 = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 1,
                 "todos": [
                     {
                         "content": "New task",
@@ -2034,9 +2075,9 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write2);
+        let _ = execute_tool(support::shared_run_context(), &write2);
 
-        let todos = get_todo_list();
+        let todos = get_todo_list(support::shared_run_context().session_id());
         assert_eq!(todos.len(), 1, "Should have replaced list with 1 todo");
         assert_eq!(todos[0].content, "New task");
     }
@@ -2044,12 +2085,13 @@ mod todo_tools {
     #[test]
     fn test_todo_write_empty_list() {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
-        clear_todo_list();
+        clear_todo_list(support::shared_run_context().session_id());
 
         // First add some todos
         let write1 = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 0,
                 "todos": [
                     {
                         "content": "Task",
@@ -2059,25 +2101,26 @@ mod todo_tools {
                 ]
             }),
         );
-        let _ = execute_tool(&write1);
+        let _ = execute_tool(support::shared_run_context(), &write1);
 
         // Then clear by writing empty list
         let write_empty = make_tool_call(
             "todo_write",
             &json!({
+                "expected_generation": 1,
                 "todos": []
             }),
         );
-        let result = execute_tool(&write_empty);
+        let result = execute_tool(support::shared_run_context(), &write_empty);
 
-        assert!(!result.is_error, "Should succeed: {}", result.content);
+        assert!(!result.is_error(), "Should succeed: {}", result.content());
         assert!(
-            result.content.contains("0 total"),
+            result.content().contains("0 total"),
             "Should report 0 todos: {}",
-            result.content
+            result.content()
         );
 
-        let todos = get_todo_list();
+        let todos = get_todo_list(support::shared_run_context().session_id());
         assert!(todos.is_empty(), "List should be empty");
     }
 }
@@ -2093,20 +2136,20 @@ mod subagent_tools {
     fn test_task_tool_missing_args() {
         // Missing all required arguments
         let tool_call = make_tool_call("task", &json!({}));
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should fail because subagent tools require config context
         assert!(
-            result.is_error,
+            result.is_error(),
             "task without config should fail: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("config")
-                || result.content.contains("description")
-                || result.content.contains("require"),
+            result.content().contains("config")
+                || result.content().contains("description")
+                || result.content().contains("require"),
             "Should mention configuration requirement: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -2114,27 +2157,27 @@ mod subagent_tools {
     fn test_agent_output_no_agents() {
         // When no agent_id is provided, should list agents (empty list)
         let tool_call = make_tool_call("agent_output", &json!({}));
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Must produce a meaningful response — either error about config or empty list message
         assert!(
-            !result.content.is_empty(),
+            !result.content().is_empty(),
             "agent_output should produce output, got empty"
         );
-        if result.is_error {
+        if result.is_error() {
             assert!(
-                result.content.to_lowercase().contains("config")
-                    || result.content.to_lowercase().contains("require"),
+                result.content().to_lowercase().contains("config")
+                    || result.content().to_lowercase().contains("require"),
                 "Error should mention config requirement: {}",
-                result.content
+                result.content()
             );
         } else {
             assert!(
-                result.content.to_lowercase().contains("no")
-                    || result.content.to_lowercase().contains("agent")
-                    || result.content.to_lowercase().contains("empty"),
+                result.content().to_lowercase().contains("no")
+                    || result.content().to_lowercase().contains("agent")
+                    || result.content().to_lowercase().contains("empty"),
                 "Should mention no agents: {}",
-                result.content
+                result.content()
             );
         }
     }
@@ -2147,15 +2190,15 @@ mod subagent_tools {
                 "agent_id": "nonexistent_agent_12345"
             }),
         );
-        let result = execute_tool(&tool_call);
+        let result = execute_tool(support::shared_run_context(), &tool_call);
 
         // Should fail because agent doesn't exist or config is missing
         assert!(
-            result.is_error
-                || result.content.to_lowercase().contains("not found")
-                || result.content.to_lowercase().contains("config"),
+            result.is_error()
+                || result.content().to_lowercase().contains("not found")
+                || result.content().to_lowercase().contains("config"),
             "Should indicate agent not found or config missing: {}",
-            result.content
+            result.content()
         );
     }
 
@@ -2912,7 +2955,14 @@ mod token_tracking {
 
         // compact_with_hint with None behaves like compact
         let result = compactor
-            .compact_with_hint(&mut request, None, None, None, None)
+            .compact_with_hint(
+                &mut request,
+                None,
+                crate::support::shared_run_context(),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -3265,38 +3315,44 @@ mod vdd_tests {
     // Session Manager VDD Context Integration
     // ========================================================================
 
-    #[test]
-    fn test_session_manager_vdd_context_store_and_take() {
-        let dir = TempDir::new().unwrap();
-        let mut manager = SessionManager::new(dir.path().to_path_buf());
-
-        // Initially no VDD context
-        assert!(manager.take_vdd_context().is_none());
-
-        // Store advisory findings context
-        let context = "<vdd-advisory>\nSQLi found in db.rs:45\n</vdd-advisory>".to_string();
-        manager.store_vdd_context(context.clone());
-
-        // Take it once
-        let taken = manager.take_vdd_context();
-        assert!(taken.is_some());
-        assert_eq!(taken.unwrap(), context);
-
-        // Second take returns None (consumed)
-        assert!(manager.take_vdd_context().is_none());
+    fn vdd_item(content: &str) -> openclaudia::context::ContextItem {
+        openclaudia::context::ContextItem::reference(
+            "vdd.integration",
+            openclaudia::context::ReferenceSource::Vdd,
+            "vdd:integration-test",
+            content,
+            openclaudia::context::ContextFreshness::Turn,
+            700,
+        )
     }
 
     #[test]
-    fn test_session_manager_vdd_context_overwrite() {
+    fn test_session_manager_vdd_observation_store_and_take() {
         let dir = TempDir::new().unwrap();
         let mut manager = SessionManager::new(dir.path().to_path_buf());
 
-        manager.store_vdd_context("first finding".to_string());
-        manager.store_vdd_context("second finding".to_string());
+        assert!(manager.take_vdd_observation().is_none());
 
-        // Should get the latest one
-        let taken = manager.take_vdd_context();
-        assert_eq!(taken.unwrap(), "second finding");
+        let context = "<vdd-advisory>\nSQLi found in db.rs:45\n</vdd-advisory>".to_string();
+        manager.store_vdd_observation(vdd_item(&context));
+
+        let taken = manager.take_vdd_observation();
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().content(), context);
+
+        assert!(manager.take_vdd_observation().is_none());
+    }
+
+    #[test]
+    fn test_session_manager_vdd_observation_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let mut manager = SessionManager::new(dir.path().to_path_buf());
+
+        manager.store_vdd_observation(vdd_item("first finding"));
+        manager.store_vdd_observation(vdd_item("second finding"));
+
+        let taken = manager.take_vdd_observation();
+        assert_eq!(taken.unwrap().content(), "second finding");
     }
 
     // ========================================================================
@@ -3327,7 +3383,10 @@ mod vdd_tests {
         // VDD hooks with empty config should be no-ops
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async {
-            let input = openclaudia::hooks::HookInput::new(HookEvent::VddConflict);
+            let input = openclaudia::hooks::HookInput::for_run(
+                crate::support::shared_run_context(),
+                HookEvent::VddConflict,
+            );
             engine.run(HookEvent::VddConflict, &input).await
         });
 
@@ -3550,21 +3609,28 @@ mod gated_dispatch_460 {
             },
         };
         let (mgr, _tmp) = deny_bash_mgr();
-        match execute_tool_gated(&tc, None, None, None, Some(&mgr)) {
+        match execute_tool_gated(
+            crate::support::shared_run_context(),
+            &tc,
+            None,
+            None,
+            None,
+            &mgr,
+        ) {
             ExecutionOutcome::Result(r) => {
                 assert!(
-                    r.is_error,
+                    r.is_error(),
                     "denial path must mark result as error, got: {r:?}"
                 );
                 assert!(
-                    r.content.to_lowercase().contains("denied"),
+                    r.content().to_lowercase().contains("denied"),
                     "expected 'denied' in content, got: {}",
-                    r.content
+                    r.content()
                 );
                 assert!(
-                    !r.content.contains("SIDE_EFFECT_THAT_SHOULD_NOT_PRINT"),
+                    !r.content().contains("SIDE_EFFECT_THAT_SHOULD_NOT_PRINT"),
                     "tool body ran despite rule denial — gate BYPASSED. content: {}",
-                    r.content
+                    r.content()
                 );
             }
             ExecutionOutcome::NeedsPrompt { tool, target, .. } => {
@@ -3573,3 +3639,4 @@ mod gated_dispatch_460 {
         }
     }
 }
+mod support;

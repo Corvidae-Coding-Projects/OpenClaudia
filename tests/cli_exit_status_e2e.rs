@@ -44,6 +44,7 @@ const CONFIG_ENV_VARS: &[&str] = &[
     "API_KEY",
     "CLAUDE_CONFIG_HOME_DIR",
     "CLAUDE_CONFIG_DIR",
+    "OPENCLAUDIA_HOOK_APPROVALS_PATH",
 ];
 
 fn assert_missing_config_is_failure(args: &[&str]) {
@@ -75,7 +76,9 @@ fn assert_missing_config_is_failure(args: &[&str]) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("No configuration found") || combined.contains("no configuration found"),
+        combined.contains("No configuration found")
+            || combined.contains("no configuration found")
+            || combined.contains("No configuration source exists"),
         "missing-config failure should explain the problem; got {combined:?}"
     );
 }
@@ -159,6 +162,93 @@ fn isolated_command(cwd: &tempfile::TempDir, home: &tempfile::TempDir) -> Comman
     command
 }
 
+fn snapshot_tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn payload(metadata: &fs::Metadata, contents: &[u8]) -> Vec<u8> {
+        let modified = metadata
+            .modified()
+            .expect("snapshot modification time")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("snapshot time after epoch")
+            .as_nanos();
+        let mut payload = Vec::with_capacity(25 + contents.len());
+        payload.extend_from_slice(&modified.to_le_bytes());
+        payload.extend_from_slice(&metadata.len().to_le_bytes());
+        payload.push(u8::from(metadata.permissions().readonly()));
+        payload.extend_from_slice(contents);
+        payload
+    }
+
+    fn visit(
+        base: &std::path::Path,
+        current: &std::path::Path,
+        entries: &mut Vec<(String, Vec<u8>)>,
+    ) {
+        if !current.exists() {
+            return;
+        }
+        let mut children = fs::read_dir(current)
+            .expect("snapshot directory must be readable")
+            .map(|entry| entry.expect("snapshot entry must be readable"))
+            .collect::<Vec<_>>();
+        children.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in children {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(base)
+                .expect("snapshot path remains beneath root")
+                .to_string_lossy()
+                .into_owned();
+            let file_type = entry.file_type().expect("snapshot file type");
+            let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+            if file_type.is_dir() {
+                entries.push((format!("directory:{relative}"), payload(&metadata, &[])));
+                visit(base, &path, entries);
+            } else if file_type.is_symlink() {
+                let target = fs::read_link(&path).expect("snapshot symlink target");
+                entries.push((
+                    format!("symlink:{relative}"),
+                    payload(&metadata, target.to_string_lossy().as_bytes()),
+                ));
+            } else {
+                entries.push((
+                    format!("file:{relative}"),
+                    payload(&metadata, &fs::read(&path).expect("snapshot file contents")),
+                ));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+fn approve_first_repository_hook_proposal(cwd: &tempfile::TempDir, home: &tempfile::TempDir) {
+    let status = isolated_command(cwd, home)
+        .args(["hooks", "status"])
+        .output()
+        .expect("hook proposal status must run");
+    assert!(
+        status.status.success(),
+        "hook proposal status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8(status.stdout).expect("hook status must be UTF-8");
+    let digest = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Proposal digest: "))
+        .expect("hook status must display a proposal digest");
+    let approval = isolated_command(cwd, home)
+        .args(["hooks", "approve", digest])
+        .output()
+        .expect("hook proposal approval must run");
+    assert!(
+        approval.status.success(),
+        "hook proposal approval failed: {}",
+        String::from_utf8_lossy(&approval.stderr)
+    );
+}
+
 fn run_auth_with_stdin(input: &str) -> Output {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
@@ -228,115 +318,6 @@ fn legacy_repl_login_reads_status_without_nesting_a_runtime() {
         !combined.contains("panicked") && !combined.contains("Cannot start a runtime"),
         "/login must not attempt to nest a Tokio runtime; got {combined:?}"
     );
-}
-
-fn readme_cli_command_invocations() -> Vec<String> {
-    let readme = include_str!("../README.md");
-    let section = readme
-        .split("## CLI Commands")
-        .nth(1)
-        .expect("README must have CLI Commands section")
-        .split("## Slash Commands")
-        .next()
-        .expect("README CLI section must end before slash commands");
-    let block = section
-        .split("```bash")
-        .nth(1)
-        .expect("README CLI section must include bash command block")
-        .split("```")
-        .next()
-        .expect("README CLI command block must close");
-
-    block
-        .lines()
-        .filter_map(|line| {
-            let invocation = line.split('#').next().unwrap_or_default().trim();
-            (!invocation.is_empty()).then(|| invocation.to_string())
-        })
-        .collect()
-}
-
-fn binary_capability_matrix_rows() -> Vec<(String, String, Vec<String>)> {
-    let matrix = include_str!("../docs/binary-capability-matrix.md");
-    matrix
-        .lines()
-        .filter(|line| line.starts_with("| `openclaudia"))
-        .map(|line| {
-            let cells = line
-                .trim_matches('|')
-                .split('|')
-                .map(str::trim)
-                .collect::<Vec<_>>();
-            assert_eq!(cells.len(), 7, "matrix row must have 7 cells: {line}");
-            let invocation = cells[0].trim_matches('`').to_string();
-            let entrypoint = cells[1].to_string();
-            let statuses = cells[2..6]
-                .iter()
-                .map(|cell| (*cell).to_string())
-                .collect::<Vec<_>>();
-            (invocation, entrypoint, statuses)
-        })
-        .collect()
-}
-
-#[test]
-fn binary_capability_matrix_covers_readme_cli_commands() {
-    let readme_commands = readme_cli_command_invocations();
-    let matrix_rows = binary_capability_matrix_rows();
-    let matrix_commands = matrix_rows
-        .iter()
-        .map(|(invocation, _, _)| invocation.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let readme_command_set = readme_commands
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::HashSet<_>>();
-
-    for command in &readme_commands {
-        assert!(
-            matrix_commands.contains(command.as_str()),
-            "docs/binary-capability-matrix.md must cover README command `{command}`"
-        );
-    }
-    for command in &matrix_commands {
-        assert!(
-            readme_command_set.contains(command),
-            "capability matrix contains stale command `{command}` not present in README"
-        );
-    }
-
-    for (invocation, _entrypoint, statuses) in &matrix_rows {
-        for status in statuses {
-            assert!(
-                status.starts_with("works:")
-                    || status.starts_with("unsupported:")
-                    || status == "not_applicable",
-                "matrix status for `{invocation}` must be works/unsupported/not_applicable, got `{status}`"
-            );
-        }
-    }
-
-    let entrypoints = matrix_rows
-        .iter()
-        .map(|(_, entrypoint, _)| entrypoint.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    for expected in [
-        "default_tui",
-        "legacy_repl",
-        "print",
-        "init",
-        "auth",
-        "proxy",
-        "acp",
-        "loop",
-        "config",
-        "doctor",
-    ] {
-        assert!(
-            entrypoints.contains(expected),
-            "capability matrix must include entrypoint `{expected}`"
-        );
-    }
 }
 
 #[test]
@@ -536,14 +517,17 @@ hooks:
   stop:
     - hooks:
         - type: command
-          shell: true
           timeout: 2
-          command: |
-            printf '%s' '{{"decision":"deny","reason":"stop hook requested shutdown"}}'
+          command: python3 .openclaudia/stop-hook.py
 "#,
         ),
     )
     .expect("config file");
+    fs::write(
+        config_dir.join("stop-hook.py"),
+        "import json\nprint(json.dumps({'decision': 'deny', 'reason': 'stop hook requested shutdown'}))\n",
+    )
+    .expect("stop hook script");
 }
 
 fn write_openai_provider_config(cwd: &tempfile::TempDir) {
@@ -587,6 +571,65 @@ providers:
 "#,
     )
     .expect("config file");
+}
+
+fn write_doctor_adversarial_fixture(cwd: &tempfile::TempDir, home: &tempfile::TempDir) {
+    let config_dir = cwd.path().join(".openclaudia");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    fs::write(
+        config_dir.join("config.yaml"),
+        r"proxy:
+  target: openai
+providers:
+  openai:
+    base_url: https://example.com/doctor-origin-canary/v1
+    api_key: doctor-api-key-canary
+    headers:
+      X-Doctor-Canary: doctor-custom-header-canary
+",
+    )
+    .expect("config file");
+
+    let claude_dir = home.path().join(".claude");
+    fs::create_dir_all(&claude_dir).expect("Claude credential dir");
+    fs::write(
+        claude_dir.join(".credentials.json"),
+        b"{foreign-credential-canary",
+    )
+    .expect("foreign credential canary");
+    let plugin_dir = home.path().join(".openclaudia/plugins");
+    fs::create_dir_all(&plugin_dir).expect("plugin tracker dir");
+    fs::write(plugin_dir.join("installed.json"), b"{corrupt-plugin-canary")
+        .expect("corrupt plugin tracker canary");
+    let migration_dir = home.path().join(".local/share/openclaudia/chat_sessions");
+    fs::create_dir_all(&migration_dir).expect("migration state dir");
+    fs::write(
+        migration_dir.join("malformed-session.json"),
+        b"{migration-canary",
+    )
+    .expect("malformed migration canary");
+}
+
+fn assert_doctor_canaries_redacted(output: &Output) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in [
+        "doctor-api-key-canary",
+        "doctor-custom-header-canary",
+        "foreign-credential-canary",
+        "corrupt-plugin-canary",
+        "migration-canary",
+        "doctor-origin-canary",
+        "malformed-session.json",
+    ] {
+        assert!(
+            !combined.contains(secret),
+            "doctor output disclosed canary {secret:?}: {combined:?}"
+        );
+    }
 }
 
 fn write_anthropic_provider_config(cwd: &tempfile::TempDir) {
@@ -890,10 +933,6 @@ fn spawn_doctor_network_probe_detector() -> (
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
 
     let handle = thread::spawn(move || loop {
-        if stop_rx.try_recv().is_ok() {
-            return Ok(());
-        }
-
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream
@@ -917,13 +956,16 @@ fn spawn_doctor_network_probe_detector() -> (
                     request_head.push_str(&line);
                 }
 
-                let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let response = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/redirect-canary\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 let _ = stream.write_all(response.as_bytes());
                 return Err(format!(
-                    "doctor opened a network connection despite failed auth: {request_head:?}"
+                    "doctor opened a network connection without a safe active probe: {request_head:?}"
                 ));
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop_rx.try_recv().is_ok() {
+                    return Ok(());
+                }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(err) => return Err(format!("doctor network probe accept failed: {err}")),
@@ -1305,6 +1347,7 @@ fn loop_stop_hook_denial_shuts_down_unlimited_loop_after_first_iteration() {
     let home = tempfile::tempdir().expect("home tempdir");
     let (server, base_url) = spawn_local_chat_server_rejecting_auth();
     write_local_provider_config_with_stop_hook(&cwd, &base_url);
+    approve_first_repository_hook_proposal(&cwd, &home);
     let proxy_port = unused_loopback_port();
     let proxy_port_arg = proxy_port.to_string();
 
@@ -1971,43 +2014,17 @@ fn legacy_repl_without_config_exits_nonzero() {
 }
 
 #[test]
-fn doctor_does_not_create_session_state() {
+fn doctor_default_is_offline_non_mutating_redacted_and_typed() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
-    let config_dir = cwd.path().join(".openclaudia");
-    fs::create_dir_all(&config_dir).expect("config dir");
-    fs::write(
-        config_dir.join("config.yaml"),
-        "proxy:\n  target: missing-provider\n",
-    )
-    .expect("config file");
+    write_doctor_adversarial_fixture(&cwd, &home);
 
-    let output = isolated_command(&cwd, &home)
-        .arg("doctor")
-        .output()
-        .expect("openclaudia doctor must run");
-
-    assert!(
-        !output.status.success(),
-        "doctor should fail when active provider is missing; stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !config_dir.join("session").exists(),
-        "doctor must not create session state while diagnosing failures"
-    );
-}
-
-#[test]
-fn doctor_skips_endpoint_probe_when_active_provider_auth_fails() {
-    let cwd = tempfile::tempdir().expect("cwd tempdir");
-    let home = tempfile::tempdir().expect("home tempdir");
     let (probe, proxy_url, stop_probe) = spawn_doctor_network_probe_detector();
-    write_openai_provider_config(&cwd);
+    let cwd_before = snapshot_tree(cwd.path());
+    let home_before = snapshot_tree(home.path());
 
     let output = isolated_command(&cwd, &home)
-        .arg("doctor")
+        .args(["doctor", "--json"])
         .env("HTTPS_PROXY", &proxy_url)
         .env("HTTP_PROXY", &proxy_url)
         .env_remove("NO_PROXY")
@@ -2018,39 +2035,139 @@ fn doctor_skips_endpoint_probe_when_active_provider_auth_fails() {
     let probe_result = probe.join().expect("doctor probe thread should join");
 
     assert!(
+        !output.status.success(),
+        "standalone doctor must report degraded when no live composition is present; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
         probe_result.is_ok(),
-        "doctor must not open network connections after auth failed: {:?}",
+        "default doctor must not contact the network: {:?}",
         probe_result.err()
     );
-    assert!(
-        !output.status.success(),
-        "doctor should fail when active provider auth is missing; stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("Active provider auth... FAILED") && combined.contains("OPENAI_API_KEY"),
-        "doctor auth failure should identify the missing provider credential; got {combined:?}"
+    assert_eq!(snapshot_tree(cwd.path()), cwd_before);
+    assert_eq!(snapshot_tree(home.path()), home_before);
+
+    let report: openclaudia::doctor::DoctorReport = serde_json::from_slice(&output.stdout)
+        .expect("doctor stdout must be one typed JSON report");
+    report.validate().expect("doctor report must validate");
+    assert_eq!(
+        report.aggregate(),
+        openclaudia::doctor::DoctorAggregate::Degraded
     );
     assert!(
-        combined.contains("Endpoint reachability for openai... SKIPPED (auth failed)"),
-        "doctor should explicitly skip reachability when auth failed; got {combined:?}"
+        report.receipts().iter().all(|receipt| {
+            receipt.observed_effects().iter().all(|effect| {
+                matches!(
+                    effect,
+                    openclaudia::doctor::DoctorEffect::FilesystemRead
+                        | openclaudia::doctor::DoctorEffect::CredentialRead
+                )
+            })
+        }),
+        "default doctor receipt claimed an active or mutating observed effect"
+    );
+    assert_doctor_canaries_redacted(&output);
+    let active = report
+        .receipts()
+        .iter()
+        .find(|receipt| receipt.check_id() == "provider.reachability")
+        .expect("active provider receipt");
+    assert_eq!(
+        active.outcome(),
+        openclaudia::doctor::DoctorOutcome::Skipped
+    );
+    assert_eq!(active.code(), "provider.reachability.not_granted");
+    let migration = report
+        .receipts()
+        .iter()
+        .find(|receipt| receipt.check_id() == "startup.migration_gate")
+        .expect("migration receipt");
+    assert_eq!(
+        migration.outcome(),
+        openclaudia::doctor::DoctorOutcome::Skipped
     );
 }
 
 #[test]
-fn doctor_mixed_case_remote_provider_names_specific_env_var() {
+fn doctor_active_probe_accepts_only_exact_grant_and_remains_offline_without_broker() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    write_openai_provider_config_with_api_key(&cwd);
+
+    let rejected_cwd_before = snapshot_tree(cwd.path());
+    let rejected_home_before = snapshot_tree(home.path());
+    let rejected = isolated_command(&cwd, &home)
+        .args([
+            "doctor",
+            "--json",
+            "--allow-active",
+            "provider.reachability-canary-secret",
+        ])
+        .output()
+        .expect("openclaudia doctor must reject unknown grant");
+    assert!(!rejected.status.success());
+    let rejected_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(rejected.stdout.is_empty());
+    assert!(rejected_text.contains("unknown active diagnostic grant"));
+    assert!(!rejected_text.contains("canary-secret"));
+    assert_eq!(snapshot_tree(cwd.path()), rejected_cwd_before);
+    assert_eq!(snapshot_tree(home.path()), rejected_home_before);
+
+    let (probe, proxy_url, stop_probe) = spawn_doctor_network_probe_detector();
+    let cwd_before = snapshot_tree(cwd.path());
+    let home_before = snapshot_tree(home.path());
+    let output = isolated_command(&cwd, &home)
+        .args([
+            "doctor",
+            "--json",
+            "--allow-active",
+            "provider.reachability",
+        ])
+        .env("HTTPS_PROXY", &proxy_url)
+        .env("HTTP_PROXY", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .expect("openclaudia doctor must run with exact grant");
+    let _ = stop_probe.send(());
+    let probe_result = probe.join().expect("doctor probe thread should join");
+
+    assert!(!output.status.success());
+    assert!(
+        probe_result.is_ok(),
+        "unsafe active network effect occurred"
+    );
+    assert_eq!(snapshot_tree(cwd.path()), cwd_before);
+    assert_eq!(snapshot_tree(home.path()), home_before);
+    let report: openclaudia::doctor::DoctorReport =
+        serde_json::from_slice(&output.stdout).expect("typed doctor report");
+    report.validate().expect("valid doctor report");
+    let active = report
+        .receipts()
+        .iter()
+        .find(|receipt| receipt.check_id() == "provider.reachability")
+        .expect("active provider receipt");
+    assert_eq!(
+        active.outcome(),
+        openclaudia::doctor::DoctorOutcome::Skipped
+    );
+    assert_eq!(active.code(), "provider.reachability.broker_unavailable");
+    assert!(active.observed_effects().is_empty());
+}
+
+#[test]
+fn doctor_mixed_case_remote_provider_returns_stable_redacted_receipt() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     write_openai_provider_config_with_target(&cwd, "OpenAI");
 
     let output = isolated_command(&cwd, &home)
-        .arg("doctor")
+        .args(["doctor", "--json"])
         .output()
         .expect("openclaudia doctor must run");
 
@@ -2060,15 +2177,15 @@ fn doctor_mixed_case_remote_provider_names_specific_env_var() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("OPENAI_API_KEY") && !combined.contains("set API_KEY"),
-        "mixed-case OpenAI doctor auth should keep the OpenAI env-var hint; got {combined:?}"
-    );
+    let report: openclaudia::doctor::DoctorReport =
+        serde_json::from_slice(&output.stdout).expect("typed doctor report");
+    let provider = report
+        .receipts()
+        .iter()
+        .find(|receipt| receipt.check_id() == "provider.configuration")
+        .expect("provider receipt");
+    assert_eq!(provider.outcome(), openclaudia::doctor::DoctorOutcome::Fail);
+    assert_eq!(provider.code(), "provider.configuration.credential_missing");
 }
 
 #[test]
@@ -2648,7 +2765,9 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
 #[test]
 fn architecture_cli_overview_lists_all_binary_subcommands() {
     let architecture = include_str!("../ARCHITECTURE.md");
-    for command in ["init", "auth", "start", "acp", "config", "doctor", "loop"] {
+    for command in [
+        "init", "auth", "start", "acp", "config", "doctor", "hooks", "team", "loop",
+    ] {
         assert!(
             architecture.contains(command),
             "ARCHITECTURE.md high-level CLI overview must mention `{command}`"
@@ -2656,7 +2775,7 @@ fn architecture_cli_overview_lists_all_binary_subcommands() {
     }
     assert!(
         architecture.contains("Subcommands: init, auth, start,")
-            && architecture.contains("acp, config, doctor, loop"),
+            && architecture.contains("acp, config, doctor, hooks, team, loop"),
         "ARCHITECTURE.md must keep the command inventory in the high-level overview"
     );
 }
@@ -2703,17 +2822,16 @@ fn init_refuses_overwrite_unless_force_and_creates_documented_tree() {
     );
 
     let config_dir = cwd.path().join(".openclaudia");
-    for path in [
-        "config.yaml",
-        "hooks/session-start.py",
-        "rules/global.md",
-        "plugins",
-    ] {
+    for path in ["config.yaml", "hooks/session-start.py", "plugins"] {
         assert!(
             config_dir.join(path).exists(),
             "init should create documented path .openclaudia/{path}"
         );
     }
+    assert!(
+        !config_dir.join("rules").exists(),
+        "init must not recreate the removed repository rule-injector path"
+    );
 
     fs::write(config_dir.join("config.yaml"), "sentinel: true\n").expect("replace config");
     let output = isolated_command(&cwd, &home)

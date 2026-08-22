@@ -48,18 +48,14 @@ fn scheme_less_url_upgraded_to_https() {
     // PINS DOC: example.com/hook → https://example.com/hook
     let r = strict();
     let outcome = r.validate_url("example.com/hook").expect("ok");
-    assert!(
-        outcome.starts_with("https://"),
-        "scheme-less MUST upgrade to https; got {outcome:?}"
-    );
+    assert!(outcome.matches("https://example.com/hook"));
 }
 
 #[test]
 fn scheme_less_url_preserves_path_after_upgrade() {
     let r = strict();
     let outcome = r.validate_url("api.example.com/v1/x").expect("ok");
-    assert!(outcome.contains("api.example.com"));
-    assert!(outcome.contains("/v1/x"));
+    assert!(outcome.matches("https://api.example.com/v1/x"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -111,15 +107,13 @@ fn explicit_http_url_with_path_rejected_in_strict_mode() {
 }
 
 #[test]
-fn http_insecure_error_carries_raw_url_for_diagnostics() {
+fn http_insecure_error_does_not_carry_raw_url_for_diagnostics() {
     let r = strict();
-    let err = r.validate_url("http://marker-217.com/").unwrap_err();
-    match err {
-        WebhookError::InsecureScheme { url } => {
-            assert_eq!(url, "http://marker-217.com/");
-        }
-        other => panic!("expected InsecureScheme; got {other:?}"),
-    }
+    let sentinel = "http://marker-217.com/hook?token=webhook-secret-sentinel";
+    let err = r.validate_url(sentinel).unwrap_err();
+    assert!(matches!(err, WebhookError::InsecureScheme { .. }));
+    assert!(!format!("{err:?}").contains("webhook-secret-sentinel"));
+    assert!(!err.to_string().contains("webhook-secret-sentinel"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -172,16 +166,11 @@ fn javascript_scheme_rejected() {
 }
 
 #[test]
-fn invalid_scheme_error_carries_lowercase_scheme() {
+fn invalid_scheme_error_does_not_carry_untrusted_scheme() {
     let r = strict();
     let err = r.validate_url("FTP://example.com/").unwrap_err();
-    match err {
-        WebhookError::InvalidScheme { scheme } => {
-            // PINS DOC: scheme is lowercased in the error.
-            assert_eq!(scheme, "ftp");
-        }
-        other => panic!("expected InvalidScheme; got {other:?}"),
-    }
+    assert!(matches!(err, WebhookError::InvalidScheme { .. }));
+    assert!(!format!("{err:?}").contains("ftp"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

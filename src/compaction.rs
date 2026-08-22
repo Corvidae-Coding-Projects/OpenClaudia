@@ -1002,9 +1002,10 @@ impl ContextCompactor {
         &self,
         request: &mut ChatCompletionRequest,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
     ) -> Result<CompactionResult, CompactionError> {
-        self.compact_with_hint(request, hook_engine, session_id, None, None)
+        self.compact_with_hint(request, hook_engine, run_context, session_id, None, None)
             .await
     }
 
@@ -1029,6 +1030,7 @@ impl ContextCompactor {
         &self,
         request: &mut ChatCompletionRequest,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         actual_input_tokens: Option<usize>,
         memory_db: Option<Arc<MemoryDb>>,
@@ -1054,7 +1056,7 @@ impl ContextCompactor {
 
         // Run PreCompact hooks if engine provided
         if let Some(engine) = hook_engine {
-            let mut hook_input = HookInput::new(HookEvent::PreCompact)
+            let mut hook_input = HookInput::for_run(run_context, HookEvent::PreCompact)
                 .with_extra("current_tokens", serde_json::json!(analysis.current_tokens))
                 .with_extra("max_tokens", serde_json::json!(analysis.max_tokens));
 
@@ -1157,7 +1159,7 @@ impl ContextCompactor {
             saved = analysis.current_tokens.saturating_sub(new_tokens),
             "Context compacted"
         );
-        record_compaction_summary_observation(session_id, &summary);
+        record_compaction_summary_observation(run_context, session_id, &summary);
 
         Ok(CompactionResult {
             compacted: true,
@@ -1344,6 +1346,7 @@ impl ContextCompactor {
         request: &mut ChatCompletionRequest,
         target_tokens: usize,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<CompactionResult, CompactionError> {
@@ -1402,8 +1405,15 @@ impl ContextCompactor {
         // just driven by the trimmed analysis. We inline only what is
         // needed because `compact_with_hint` re-runs `analyze_with_hint`
         // internally and would discard our truncation.
-        self.apply_analysis(request, &analysis, hook_engine, session_id, memory_db)
-            .await
+        self.apply_analysis(
+            request,
+            &analysis,
+            hook_engine,
+            run_context,
+            session_id,
+            memory_db,
+        )
+        .await
     }
 
     /// Shared "apply a prepared `CompactionAnalysis` to a request" path used
@@ -1418,11 +1428,12 @@ impl ContextCompactor {
         request: &mut ChatCompletionRequest,
         analysis: &CompactionAnalysis,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<CompactionResult, CompactionError> {
         if let Some(engine) = hook_engine {
-            let mut hook_input = HookInput::new(HookEvent::PreCompact)
+            let mut hook_input = HookInput::for_run(run_context, HookEvent::PreCompact)
                 .with_extra("current_tokens", serde_json::json!(analysis.current_tokens))
                 .with_extra("max_tokens", serde_json::json!(analysis.max_tokens))
                 .with_extra("partial", serde_json::json!(true));
@@ -1486,7 +1497,7 @@ impl ContextCompactor {
             });
         }
 
-        record_compaction_summary_observation(session_id, &summary);
+        record_compaction_summary_observation(run_context, session_id, &summary);
 
         Ok(CompactionResult {
             compacted: true,
@@ -1522,7 +1533,11 @@ impl ContextCompactor {
     }
 }
 
-fn record_compaction_summary_observation(session_id: Option<&str>, summary: &str) {
+fn record_compaction_summary_observation(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    summary: &str,
+) {
     let Some(session_id) = session_id else {
         return;
     };
@@ -1542,7 +1557,7 @@ fn record_compaction_summary_observation(session_id: Option<&str>, summary: &str
         .into_iter()
         .map(|entry| entry.id)
         .collect::<Vec<_>>();
-    if let Err(err) = append_compaction_summary_observation(&mut ledger, summary, source_obs) {
+    if let Err(err) = append_compaction_summary_observation(run, &mut ledger, summary, source_obs) {
         tracing::warn!(
             session_id,
             error = %err,
@@ -1552,17 +1567,12 @@ fn record_compaction_summary_observation(session_id: Option<&str>, summary: &str
 }
 
 fn append_compaction_summary_observation(
+    run: &crate::tools::ToolRunContext,
     ledger: &mut crate::ledger::RealityLedger,
     summary: &str,
     source_obs: Vec<crate::ledger::ObsId>,
 ) -> Result<crate::ledger::ObsId, crate::ledger::LedgerError> {
-    ledger.append(
-        crate::ledger::Authority::ModelSummary,
-        crate::ledger::ObservationKind::Summary {
-            text: summary.to_string(),
-            source_obs,
-        },
-    )
+    ledger.observe_model_summary(run, summary, source_obs)
 }
 
 /// Archive a slice of messages into [`MemoryDb`] archival memory before they
@@ -1862,6 +1872,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     fn create_test_message(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
@@ -1887,12 +1901,13 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summary_observation_is_model_summary_authority() {
+    fn compaction_summary_observation_is_run_bound_navigation_data() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task("Summarize older context.")
+            .observe_user_task(test_run(), "Summarize older context.", "test-model")
             .expect("task observation");
         let id = append_compaction_summary_observation(
+            test_run(),
             &mut ledger,
             "<context-summary>x</context-summary>",
             vec![task],
@@ -1900,18 +1915,15 @@ mod tests {
         .expect("summary observation");
         let observation = ledger.get(id).expect("observation");
         assert_eq!(
-            observation.authority,
-            crate::ledger::Authority::ModelSummary
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::DerivedSummary
         );
+        assert!(observation.provenance.is_bound_to(test_run()));
         let crate::ledger::ObservationKind::Summary { text, source_obs } = &observation.kind else {
             panic!("expected summary observation");
         };
         assert_eq!(text, "<context-summary>x</context-summary>");
         assert_eq!(source_obs, &vec![task]);
-        assert!(
-            !ledger.is_authoritative(id),
-            "summary observations must not be authoritative evidence"
-        );
     }
 
     #[test]
@@ -1925,10 +1937,11 @@ mod tests {
             let mut ledger = crate::ledger::RealityLedger::open_project_session(session_id)
                 .expect("open project ledger");
             let task = ledger
-                .observe_user_task("Compact older messages.")
+                .observe_user_task(test_run(), "Compact older messages.", "test-model")
                 .expect("task observation");
             let command = ledger
                 .observe_command_run(
+                    test_run(),
                     "/repo",
                     vec!["cargo".to_string(), "check".to_string()],
                     0,
@@ -1940,6 +1953,7 @@ mod tests {
         };
 
         record_compaction_summary_observation(
+            test_run(),
             Some(session_id),
             "<context-summary>prior work</context-summary>",
         );
@@ -1951,15 +1965,15 @@ mod tests {
             .into_iter()
             .find(|obs| matches!(obs.kind, crate::ledger::ObservationKind::Summary { .. }))
             .expect("summary observation");
-        assert_eq!(summary.authority, crate::ledger::Authority::ModelSummary);
+        assert_eq!(
+            summary.provenance.trust,
+            crate::ledger::EvidenceTrust::DerivedSummary
+        );
+        assert!(summary.provenance.is_bound_to(test_run()));
         let crate::ledger::ObservationKind::Summary { source_obs, .. } = &summary.kind else {
             panic!("expected summary observation");
         };
         assert_eq!(source_obs, &vec![task, command]);
-        assert!(
-            !ledger.is_authoritative(summary.id),
-            "compaction summary must remain non-authoritative"
-        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -2136,7 +2150,10 @@ mod tests {
         let mut request = create_test_request(messages);
         let compactor = ContextCompactor::new(CompactionConfig::default());
 
-        let result = compactor.compact(&mut request, None, None).await.unwrap();
+        let result = compactor
+            .compact(&mut request, None, test_run(), None)
+            .await
+            .unwrap();
 
         assert!(!result.compacted);
         assert_eq!(result.messages_summarized, 0);
@@ -2167,7 +2184,10 @@ mod tests {
         };
 
         let compactor = ContextCompactor::new(config);
-        let result = compactor.compact(&mut request, None, None).await.unwrap();
+        let result = compactor
+            .compact(&mut request, None, test_run(), None)
+            .await
+            .unwrap();
 
         assert!(result.compacted);
         assert!(result.messages_summarized > 0);
@@ -2954,7 +2974,7 @@ mod tests {
         // threshold_tokens_for(10000,0.85)=8500, effective=4404; hint=5000 > 4404
         // But both messages are system → messages_to_summarize is empty → compacted:false.
         let result = compactor
-            .compact_with_hint(&mut request, None, None, Some(5_000), None)
+            .compact_with_hint(&mut request, None, test_run(), None, Some(5_000), None)
             .await
             .unwrap();
 
@@ -3208,7 +3228,10 @@ mod tests {
         // estimate_request_tokens([]) = 0 + 0 + 100 = 100 (overhead only)
         // threshold_tokens = 8_500, effective_threshold = 4_404
         // 100 < 4_404 → needs_compaction: false → early return
-        let result = compactor.compact(&mut request, None, None).await.unwrap();
+        let result = compactor
+            .compact(&mut request, None, test_run(), None)
+            .await
+            .unwrap();
         assert!(
             !result.compacted,
             "empty messages must return compacted:false"
@@ -3255,7 +3278,7 @@ mod tests {
 
         let original_msgs = request.messages.clone();
         let result = compactor
-            .compact_with_hint(&mut request, None, None, Some(9_000), None)
+            .compact_with_hint(&mut request, None, test_run(), None, Some(9_000), None)
             .await
             .expect("all-preserved must not error");
         assert!(
@@ -3288,7 +3311,7 @@ mod tests {
 
         // With hint above effective_threshold, but no summarizable messages.
         let result = compactor
-            .compact_with_hint(&mut request, None, None, Some(5_000), None)
+            .compact_with_hint(&mut request, None, test_run(), None, Some(5_000), None)
             .await
             .unwrap();
         assert!(
@@ -3741,7 +3764,7 @@ mod tests {
 
         let compactor = ContextCompactor::for_model_with_overrides("gpt-4", &overrides);
         let result = compactor
-            .compact(&mut request, None, None)
+            .compact(&mut request, None, test_run(), None)
             .await
             .expect("compaction should succeed on oversized request");
 

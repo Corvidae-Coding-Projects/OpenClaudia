@@ -31,37 +31,45 @@ const WAIT_BACKOFF_MS: &[u64] = &[1, 2, 5, 10, 25, 50, 100];
 const MAX_CAPTURE_BYTES_PER_STREAM: usize = 10 * 1024 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[output truncated at 10 MiB]\n";
 
-static ACTIVE_SANDBOX_PROCESSES: LazyLock<Mutex<HashMap<String, HashSet<u32>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static CANCELLED_SANDBOX_SESSIONS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+struct ActiveRunProcesses {
+    session_id: String,
+    cancellation: crate::runtime::CancellationHandle,
+    pids: HashSet<u32>,
+}
 
+static ACTIVE_SANDBOX_PROCESSES: LazyLock<Mutex<HashMap<String, ActiveRunProcesses>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 pub struct ActiveSandboxProcess {
     owner: String,
     pid: u32,
 }
 
 impl ActiveSandboxProcess {
-    pub(crate) fn register(pid: u32) -> Self {
-        let owner = crate::tools::todo::current_session_key();
+    pub(crate) fn register(run: &crate::tools::security::ToolRunContext, pid: u32) -> Self {
+        let owner = run.run_id().to_string();
         let mut active = ACTIVE_SANDBOX_PROCESSES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.entry(owner.clone()).or_default().insert(pid);
+        active
+            .entry(owner.clone())
+            .or_insert_with(|| ActiveRunProcesses {
+                session_id: run.session_id().to_string(),
+                cancellation: run.runtime().cancellation(),
+                pids: HashSet::new(),
+            })
+            .pids
+            .insert(pid);
         tracing::debug!(
             target: "openclaudia::sandbox",
             event = "sandbox_process_started",
-            session_id = owner,
+            run_id = owner,
+            session_id = run.session_id(),
             pid,
             "Registered cancellable sandbox process"
         );
         drop(active);
-        let cancelled = CANCELLED_SANDBOX_SESSIONS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&owner);
-        if cancelled {
-            crate::tools::bash::terminate_process_tree(pid);
+        if run.runtime().cancellation().is_cancelled() {
+            crate::tools::bash::terminate_sandbox_process_tree(pid);
         }
         Self { owner, pid }
     }
@@ -73,48 +81,76 @@ impl Drop for ActiveSandboxProcess {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(processes) = active.get_mut(&self.owner) {
-            processes.remove(&self.pid);
-            if processes.is_empty() {
+            processes.pids.remove(&self.pid);
+            if processes.pids.is_empty() {
                 active.remove(&self.owner);
             }
         }
     }
 }
 
-/// Terminate every synchronous sandbox process currently owned by a session.
-pub fn cancel_session_sandbox_processes(session_id: &str) -> usize {
-    CANCELLED_SANDBOX_SESSIONS
+fn cancel_sandbox_process_owner(
+    owner_run: &str,
+    reason: Option<crate::runtime::CancellationReason>,
+) -> usize {
+    let (pids, cancellation) = ACTIVE_SANDBOX_PROCESSES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(session_id.to_string());
-    let pids: Vec<u32> = ACTIVE_SANDBOX_PROCESSES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(session_id)
-        .map(|pids| pids.iter().copied().collect())
-        .unwrap_or_default();
+        .get(owner_run)
+        .map_or_else(
+            || (Vec::new(), None),
+            |processes| {
+                (
+                    processes.pids.iter().copied().collect(),
+                    Some(processes.cancellation.clone()),
+                )
+            },
+        );
+    if let (Some(cancellation), Some(reason)) = (cancellation, reason) {
+        let _receipt = cancellation.cancel(reason);
+    }
     for pid in &pids {
-        crate::tools::bash::terminate_process_tree(*pid);
+        crate::tools::bash::terminate_sandbox_process_tree(*pid);
     }
     if !pids.is_empty() {
         tracing::info!(
             target: "openclaudia::sandbox",
             event = "sandbox_processes_cancelled",
-            session_id,
+            owner_run,
             count = pids.len(),
-            "Terminated session sandbox processes"
+            "Terminated run sandbox processes"
         );
     }
     pids.len()
 }
 
-/// Start a new cancellation generation for a session. ACP calls this exactly
-/// once when accepting a fresh prompt, before any of its tool workers spawn.
-pub fn clear_session_process_cancellation(session_id: &str) {
-    CANCELLED_SANDBOX_SESSIONS
+/// Terminate synchronous sandbox processes owned by this exact run generation.
+pub fn cancel_run_sandbox_processes(run: &crate::tools::security::ToolRunContext) -> usize {
+    let _receipt = run
+        .runtime()
+        .cancellation()
+        .cancel(crate::runtime::CancellationReason::User);
+    cancel_sandbox_process_owner(&run.run_id().to_string(), None)
+}
+
+/// Trusted session teardown across all still-active run generations.
+pub fn cancel_session_sandbox_processes(session_id: &str) -> usize {
+    let owners: Vec<String> = ACTIVE_SANDBOX_PROCESSES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(session_id);
+        .iter()
+        .filter(|(_, processes)| processes.session_id == session_id)
+        .map(|(owner, _)| owner.clone())
+        .collect();
+    owners
+        .iter()
+        .map(|owner| {
+            cancel_sandbox_process_owner(
+                owner,
+                Some(crate::runtime::CancellationReason::ParentTerminated),
+            )
+        })
+        .sum()
 }
 
 /// ACP runs as a dedicated process. On transport EOF, terminate any remaining
@@ -127,7 +163,10 @@ pub fn cancel_all_sandbox_processes() {
         .cloned()
         .collect();
     for owner in owners {
-        cancel_session_sandbox_processes(&owner);
+        cancel_sandbox_process_owner(
+            &owner,
+            Some(crate::runtime::CancellationReason::FrontendDisconnected),
+        );
     }
 }
 
@@ -217,6 +256,7 @@ pub fn run_with_timeout_with_input(
 /// Returns the same structured [`CommandError`] variants as
 /// [`run_sandboxed_with_timeout`].
 pub fn run_sandboxed_with_timeout_with_input(
+    run: &crate::tools::security::ToolRunContext,
     program: &(impl AsRef<OsStr> + ?Sized),
     args: &[impl AsRef<OsStr>],
     project_root: &Path,
@@ -224,6 +264,7 @@ pub fn run_sandboxed_with_timeout_with_input(
     stdin_input: &[u8],
 ) -> Result<Output, CommandError> {
     run_sandboxed_with_timeout_inner(
+        run,
         crate::tools::SandboxProfile::DocumentParser,
         program,
         args,
@@ -237,6 +278,7 @@ pub fn run_sandboxed_with_timeout_with_input(
 /// Run a process under a named sandbox profile with explicit environment
 /// grants and no stdin payload.
 pub fn run_sandboxed_with_timeout_with_env(
+    run: &crate::tools::security::ToolRunContext,
     profile: crate::tools::SandboxProfile,
     program: &(impl AsRef<OsStr> + ?Sized),
     args: &[impl AsRef<OsStr>],
@@ -244,10 +286,21 @@ pub fn run_sandboxed_with_timeout_with_env(
     timeout: Duration,
     env: &HashMap<String, String>,
 ) -> Result<Output, CommandError> {
-    run_sandboxed_with_timeout_inner(profile, program, args, project_root, timeout, env, None)
+    run_sandboxed_with_timeout_inner(
+        run,
+        profile,
+        program,
+        args,
+        project_root,
+        timeout,
+        env,
+        None,
+    )
 }
 
+#[allow(clippy::too_many_arguments)] // Internal adapter keeps public process entry points explicit.
 fn run_sandboxed_with_timeout_inner(
+    run: &crate::tools::security::ToolRunContext,
     profile: crate::tools::SandboxProfile,
     program: &(impl AsRef<OsStr> + ?Sized),
     args: &[impl AsRef<OsStr>],
@@ -259,6 +312,7 @@ fn run_sandboxed_with_timeout_inner(
     let program_str = program.as_ref().to_string_lossy().into_owned();
     let sandbox_args: Vec<OsString> = args.iter().map(|arg| arg.as_ref().to_os_string()).collect();
     let mut cmd = crate::tools::sandboxed_process_command(
+        run,
         profile,
         program.as_ref(),
         &sandbox_args,
@@ -269,7 +323,13 @@ fn run_sandboxed_with_timeout_inner(
         source,
     })?;
     cmd.envs(env);
-    run_prepared_with_timeout(cmd, program_str, timeout, stdin_input, true)
+    run_prepared_with_timeout(
+        ProcessExecution::Sandboxed(run),
+        cmd,
+        program_str,
+        timeout,
+        stdin_input,
+    )
 }
 
 #[cfg(test)]
@@ -287,26 +347,61 @@ fn run_test_host_with_timeout_inner(
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
-    run_prepared_with_timeout(command, program_str, timeout, stdin_input, false)
+    run_prepared_with_timeout(
+        ProcessExecution::TestHost,
+        command,
+        program_str,
+        timeout,
+        stdin_input,
+    )
 }
 
 /// Execute an already sandboxed command with bounded capture and a wall-clock
 /// deadline.
 pub fn run_prepared_sandboxed_with_timeout(
+    run: &crate::tools::security::ToolRunContext,
     command: Command,
     program_label: &str,
     timeout: Duration,
 ) -> Result<Output, CommandError> {
-    run_prepared_with_timeout(command, program_label.to_string(), timeout, None, true)
+    run_prepared_with_timeout(
+        ProcessExecution::Sandboxed(run),
+        command,
+        program_label.to_string(),
+        timeout,
+        None,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ProcessExecution<'a> {
+    Sandboxed(&'a crate::tools::security::ToolRunContext),
+    #[cfg(test)]
+    TestHost,
 }
 
 fn run_prepared_with_timeout(
+    execution: ProcessExecution<'_>,
     mut cmd: Command,
     program_str: String,
     timeout: Duration,
     stdin_input: Option<&[u8]>,
-    terminate_tree: bool,
 ) -> Result<Output, CommandError> {
+    let (tracked_run, terminate_tree) = match execution {
+        ProcessExecution::Sandboxed(run) => (Some(run), true),
+        #[cfg(test)]
+        ProcessExecution::TestHost => (None, false),
+    };
+    #[cfg(unix)]
+    if terminate_tree {
+        use std::os::unix::process::CommandExt as _;
+
+        // `terminate_process_tree` signals `-pid` so the spawned wrapper must
+        // lead its own process group.  Foreground callers historically omitted
+        // this even though the teardown helper documented the requirement,
+        // leaving cancellation dependent on racy `/proc` descendant scans.
+        cmd.process_group(0);
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin_input.is_some() {
         cmd.stdin(Stdio::piped());
@@ -316,7 +411,7 @@ fn run_prepared_with_timeout(
         source: e.to_string(),
     })?;
     let pid = child.id();
-    let _active_process = terminate_tree.then(|| ActiveSandboxProcess::register(pid));
+    let _active_process = tracked_run.map(|run| ActiveSandboxProcess::register(run, pid));
     let stdout_reader = child.stdout.take().map(spawn_bounded_reader);
     let stderr_reader = child.stderr.take().map(spawn_bounded_reader);
 

@@ -28,18 +28,18 @@ const MAX_SUBAGENT_TURNS: usize = 50;
 /// Maximum tokens for subagent responses
 const SUBAGENT_MAX_TOKENS: u32 = 8192;
 
-/// Absolute, PATH-independent location of `git` for subagent worktree isolation.
-static GIT_BIN: LazyLock<Result<PathBuf, String>> =
-    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
-
-fn git_bin() -> Result<&'static Path, String> {
-    match &*GIT_BIN {
-        Ok(path) => Ok(path.as_path()),
-        Err(msg) => Err(msg.clone()),
-    }
+/// Resolve `git` through the immutable executable search path captured for the
+/// exact parent or child run that owns the worktree operation.
+fn git_bin(run: &crate::tools::ToolRunContext) -> Result<PathBuf, String> {
+    run.resolve_executable("git")
+        .map_err(|error| error.to_string())
 }
 
-fn sandboxed_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+fn sandboxed_git(
+    run: &crate::tools::ToolRunContext,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     let mut hardened = vec![
         "-c",
         "core.hooksPath=/dev/null",
@@ -63,8 +63,9 @@ fn sandboxed_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, Stri
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
     ]);
     crate::tools::run_sandboxed_with_timeout_with_env(
+        run,
         crate::tools::SandboxProfile::GitWorktree,
-        git_bin()?,
+        &git_bin(run)?,
         &hardened,
         cwd,
         Duration::from_secs(30),
@@ -221,15 +222,43 @@ impl AgentType {
                     "edit_file",
                     "list_files",
                     "web_fetch",
+                    "memory_search",
+                    "memory_list",
+                    "memory_learning_status",
+                    "memory_conflicts",
+                    "memory_save",
+                    "memory_update",
+                    "memory_delete",
+                    "memory_source_status",
+                    "memory_source_refresh",
                 ];
                 add_browser_search_tool(tools)
             }
             Self::Explore => {
-                let tools = vec!["bash", "read_file", "list_files", "web_fetch"];
+                let tools = vec![
+                    "bash",
+                    "read_file",
+                    "list_files",
+                    "web_fetch",
+                    "memory_search",
+                    "memory_list",
+                    "memory_learning_status",
+                    "memory_conflicts",
+                    "memory_source_status",
+                ];
                 add_browser_search_tool(tools)
             }
             Self::Plan | Self::Guide => {
-                let tools = vec!["read_file", "list_files", "web_fetch"];
+                let tools = vec![
+                    "read_file",
+                    "list_files",
+                    "web_fetch",
+                    "memory_search",
+                    "memory_list",
+                    "memory_learning_status",
+                    "memory_conflicts",
+                    "memory_source_status",
+                ];
                 add_browser_search_tool(tools)
             }
             Self::Coordinator => {
@@ -245,6 +274,11 @@ impl AgentType {
                     "read_file",
                     "list_files",
                     "web_fetch",
+                    "memory_search",
+                    "memory_list",
+                    "memory_learning_status",
+                    "memory_conflicts",
+                    "memory_source_status",
                 ];
                 add_browser_search_tool(tools)
             }
@@ -261,17 +295,15 @@ impl AgentType {
     }
 }
 
-fn add_browser_search_tool(tools: Vec<&'static str>) -> Vec<&'static str> {
-    #[cfg(feature = "browser")]
-    {
-        let mut tools = tools;
-        tools.push("web_search");
-        tools
-    }
-    #[cfg(not(feature = "browser"))]
-    {
-        tools
-    }
+#[cfg(feature = "browser")]
+fn add_browser_search_tool(mut tools: Vec<&'static str>) -> Vec<&'static str> {
+    tools.push("web_search");
+    tools
+}
+
+#[cfg(not(feature = "browser"))]
+const fn add_browser_search_tool(tools: Vec<&'static str>) -> Vec<&'static str> {
+    tools
 }
 
 // === System Prompts for Agent Types ===
@@ -388,6 +420,8 @@ pub const FINISHED_AGENT_TTL_SECS: u64 = 60 * 60;
 pub struct BackgroundAgent {
     /// Unique agent ID
     pub id: String,
+    /// Exact parent run generation allowed to observe or cancel this agent.
+    owner_run: crate::runtime::RunId,
     /// Agent type
     pub agent_type: AgentType,
     /// Task description
@@ -411,6 +445,10 @@ pub struct BackgroundAgent {
     /// Serializes terminal-state transitions (`finish`, `fail`, `stop`) so an
     /// external cancellation cannot be overwritten by a late model response.
     terminal_lock: Mutex<()>,
+    /// Stable canonical task-graph node for this delegation, once admission
+    /// has reached the durable graph. The background registry remains a live
+    /// process handle; it is never a second planning truth.
+    canonical_task_id: Mutex<Option<String>>,
 }
 
 /// Manager for background agents
@@ -446,10 +484,24 @@ impl BackgroundAgentManager {
     ///
     /// Also opportunistically sweeps expired finished agents
     /// (see [`Self::gc`]) so the map cannot grow unbounded across a session.
-    pub fn register(&self, agent_type: AgentType, task: &str) -> String {
-        let id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
-        self.register_with_id(agent_type, task, &id);
-        id
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry is unavailable or no unique agent
+    /// identifier can be allocated after the bounded retry budget.
+    pub fn register(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        agent_type: AgentType,
+        task: &str,
+    ) -> Result<String, String> {
+        for _ in 0..16 {
+            let id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
+            if self.register_with_id(owner, agent_type, task, &id)? {
+                return Ok(id);
+            }
+        }
+        Err("Could not allocate a unique background agent id".to_string())
     }
 
     /// Register (or reattach to) a background agent under a caller-chosen id.
@@ -469,19 +521,41 @@ impl BackgroundAgentManager {
     /// Returns `true` iff a new entry was inserted (i.e. the id was
     /// fresh). Callers can ignore the return value when they only need
     /// "ensure tracked".
-    pub fn register_with_id(&self, agent_type: AgentType, task: &str, id: &str) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry is unavailable, `id` is invalid,
+    /// or the same identifier is already owned by a different run.
+    pub fn register_with_id(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        agent_type: AgentType,
+        task: &str,
+        id: &str,
+    ) -> Result<bool, String> {
         // Sweep before insert so the cost of growth is amortized against
         // the spawn that causes it (crosslink #422).
         self.gc();
 
         let Some(mut agents) = self.agents_guard("register_with_id") else {
-            return false;
+            return Err("Background agent registry is unavailable".to_string());
         };
-        if agents.contains_key(id) {
-            return false;
+        if let Some(existing) = agents.get(id) {
+            if existing.owner_run == owner.run_id() {
+                return Ok(false);
+            }
+            tracing::warn!(
+                target: "openclaudia::subagent",
+                event = "cross_run_agent_resume_denied",
+                caller_run = %owner.run_id(),
+                agent_id = id,
+                "Denied background-agent id reuse outside the owning run"
+            );
+            return Err(format!("Agent '{id}' not found"));
         }
         let agent = Arc::new(BackgroundAgent {
             id: id.to_string(),
+            owner_run: owner.run_id(),
             agent_type,
             task: task.to_string(),
             finished: AtomicBool::new(false),
@@ -491,35 +565,91 @@ impl BackgroundAgentManager {
             finished_at: Mutex::new(None),
             abort_handle: Mutex::new(None),
             terminal_lock: Mutex::new(()),
+            canonical_task_id: Mutex::new(None),
         });
         agents.insert(id.to_string(), agent);
-        true
+        Ok(true)
     }
 
-    /// Get an agent by ID
-    pub fn get(&self, id: &str) -> Option<Arc<BackgroundAgent>> {
+    /// Trusted lifecycle lookup by globally unique id.
+    fn get(&self, id: &str) -> Option<Arc<BackgroundAgent>> {
         let agents = self.agents_guard("get")?;
         agents.get(id).cloned()
     }
 
+    /// Resolve an agent only for its exact parent run generation.
+    pub fn get_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+    ) -> Option<Arc<BackgroundAgent>> {
+        let agent = self.get(id)?;
+        (agent.owner_run == owner.run_id()).then_some(agent)
+    }
+
+    fn bind_canonical_task(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+        task_id: &str,
+    ) -> Result<(), String> {
+        let agent = self
+            .get_for_run(owner, id)
+            .ok_or_else(|| format!("Agent '{id}' not found"))?;
+        let Some(mut slot) = agent_field_guard(
+            &agent.canonical_task_id,
+            "bind_canonical_task",
+            id,
+            "canonical_task_id",
+        ) else {
+            return Err(format!("Agent '{id}' canonical task lock poisoned"));
+        };
+        match slot.as_deref() {
+            None => {
+                *slot = Some(task_id.to_string());
+                Ok(())
+            }
+            Some(existing) if existing == task_id => Ok(()),
+            Some(_) => Err(format!(
+                "Agent '{id}' is already bound to a different canonical task"
+            )),
+        }
+    }
+
+    fn canonical_task_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+    ) -> Option<String> {
+        let agent = self.get_for_run(owner, id)?;
+        agent_field_guard(
+            &agent.canonical_task_id,
+            "canonical_task_for_run",
+            id,
+            "canonical_task_id",
+        )
+        .and_then(|slot| slot.clone())
+    }
+
     /// Mark an agent as finished with a result
-    pub fn finish(&self, id: &str, result: String) {
-        self.mark_terminal(id, Some(result), None, "finish");
+    pub fn finish(&self, owner: &crate::tools::ToolRunContext, id: &str, result: String) {
+        self.mark_terminal(owner, id, Some(result), None, "finish");
     }
 
     /// Mark an agent as failed with an error
-    pub fn fail(&self, id: &str, error: String) {
-        self.mark_terminal(id, None, Some(error), "fail");
+    pub fn fail(&self, owner: &crate::tools::ToolRunContext, id: &str, error: String) {
+        self.mark_terminal(owner, id, None, Some(error), "fail");
     }
 
     fn mark_terminal(
         &self,
+        owner: &crate::tools::ToolRunContext,
         id: &str,
         result: Option<String>,
         error: Option<String>,
         operation: &'static str,
     ) -> bool {
-        if let Some(agent) = self.get(id) {
+        if let Some(agent) = self.get_for_run(owner, id) {
             let Ok(_terminal) = agent.terminal_lock.lock() else {
                 tracing::error!(
                     operation,
@@ -564,11 +694,12 @@ impl BackgroundAgentManager {
     /// lock is poisoned.
     pub fn attach_abort_handle(
         &self,
+        owner: &crate::tools::ToolRunContext,
         id: &str,
         abort_handle: tokio::task::AbortHandle,
     ) -> Result<(), String> {
         let agent = self
-            .get(id)
+            .get_for_run(owner, id)
             .ok_or_else(|| format!("Agent '{id}' not found"))?;
         if agent.finished.load(Ordering::SeqCst) {
             abort_handle.abort();
@@ -592,9 +723,14 @@ impl BackgroundAgentManager {
     ///
     /// Returns an error if the agent id is unknown or required agent metadata
     /// locks are poisoned.
-    pub fn stop(&self, id: &str, reason: &str) -> Result<String, String> {
+    pub fn stop(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+        reason: &str,
+    ) -> Result<String, String> {
         let agent = self
-            .get(id)
+            .get_for_run(owner, id)
             .ok_or_else(|| format!("Agent '{id}' not found"))?;
         let turns = agent.turns.load(Ordering::SeqCst);
         let task = agent.task.clone();
@@ -627,15 +763,15 @@ impl BackgroundAgentManager {
         if let Some(handle) = abort_handle {
             handle.abort();
         }
-        let shell_cleanup = crate::tools::BACKGROUND_SHELLS.kill_for_agent(id);
+        let shell_cleanup = crate::tools::BACKGROUND_SHELLS.kill_for_process_owner(owner, id);
         Ok(format!(
             "Agent '{id}' stopped after {turns} turns.\nTask: {task}\nReason: {reason}\n{shell_cleanup}"
         ))
     }
 
     /// Increment turn counter for an agent
-    pub fn increment_turns(&self, id: &str) -> u64 {
-        self.get(id)
+    pub fn increment_turns(&self, owner: &crate::tools::ToolRunContext, id: &str) -> u64 {
+        self.get_for_run(owner, id)
             .map_or(0, |agent| agent.turns.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
@@ -643,13 +779,17 @@ impl BackgroundAgentManager {
     ///
     /// Sweeps expired finished agents first (see [`Self::gc`]) so callers
     /// — including the TUI agent list — never observe leaked stale entries.
-    pub fn list(&self) -> Vec<(String, AgentType, String, bool)> {
+    pub fn list_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+    ) -> Vec<(String, AgentType, String, bool)> {
         self.gc();
         let Some(agents) = self.agents_guard("list") else {
             return Vec::new();
         };
         agents
             .iter()
+            .filter(|(_, agent)| agent.owner_run == owner.run_id())
             .map(|(id, agent)| {
                 (
                     id.clone(),
@@ -661,10 +801,20 @@ impl BackgroundAgentManager {
             .collect()
     }
 
-    /// Remove an agent unconditionally
-    pub fn remove(&self, id: &str) -> Option<Arc<BackgroundAgent>> {
-        let mut agents = self.agents_guard("remove")?;
-        agents.remove(id)
+    pub fn remove_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+    ) -> Option<Arc<BackgroundAgent>> {
+        let mut agents = self.agents_guard("remove_for_run")?;
+        if agents
+            .get(id)
+            .is_some_and(|agent| agent.owner_run == owner.run_id())
+        {
+            agents.remove(id)
+        } else {
+            None
+        }
     }
 
     /// Garbage-collect finished agents older than [`FINISHED_AGENT_TTL_SECS`].
@@ -699,16 +849,54 @@ impl BackgroundAgentManager {
         before.saturating_sub(agents.len())
     }
 
-    /// Public hook for shutdown paths (e.g. `tui.rs`) that want to drop
-    /// every finished agent up-front rather than wait for TTL expiry.
+    /// Drop finished agents owned by one exact run generation rather than
+    /// allowing one frontend to clean up another run's lifecycle state.
     /// Returns the number of agents removed.
-    pub fn cleanup_finished(&self) -> usize {
-        let Some(mut agents) = self.agents_guard("cleanup_finished") else {
+    pub fn cleanup_finished_for_run(&self, owner: &crate::tools::ToolRunContext) -> usize {
+        let Some(mut agents) = self.agents_guard("cleanup_finished_for_run") else {
             return 0;
         };
         let before = agents.len();
-        agents.retain(|_, agent| !agent.finished.load(Ordering::SeqCst));
+        agents.retain(|_, agent| {
+            agent.owner_run != owner.run_id() || !agent.finished.load(Ordering::SeqCst)
+        });
         before.saturating_sub(agents.len())
+    }
+
+    /// Abort and remove every background agent owned by one retiring run.
+    pub(crate) fn stop_all_for_run(&self, owner: &crate::tools::ToolRunContext) -> usize {
+        let agent_ids = self
+            .list_for_run(owner)
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect::<Vec<_>>();
+        let mut stopped = 0;
+        for agent_id in agent_ids {
+            let canonical_task = self.canonical_task_for_run(owner, &agent_id);
+            if self
+                .stop(owner, &agent_id, "owning frontend run retired")
+                .is_ok()
+            {
+                stopped += 1;
+                if let Some(task_id) = canonical_task {
+                    if let Err(error) = transition_canonical_delegation(
+                        owner,
+                        &task_id,
+                        &agent_id,
+                        crate::session::TaskUpdateStatus::Canceled,
+                    ) {
+                        tracing::error!(
+                            agent_id,
+                            %task_id,
+                            %error,
+                            "Could not cancel canonical delegation task during run retirement"
+                        );
+                    }
+                }
+            }
+            let _ = self.remove_for_run(owner, &agent_id);
+        }
+        stopped
     }
 }
 
@@ -726,6 +914,7 @@ pub static BACKGROUND_AGENTS: LazyLock<BackgroundAgentManager> =
 
 /// Stored transcript for a completed agent, enabling resume
 pub(crate) struct StoredTranscript {
+    owner_run: crate::runtime::RunId,
     messages: Vec<Value>,
     agent_type: AgentType,
     created_at: Instant,
@@ -944,7 +1133,12 @@ pub(crate) fn spawn_transcript_sweeper() -> bool {
 /// by retaining the most recent messages; warns when truncation occurs.
 /// Also ensures the background sweeper has been spawned so TTL
 /// eviction does not depend on insert traffic.
-fn store_transcript(agent_id: &str, mut messages: Vec<Value>, agent_type: AgentType) {
+fn store_transcript(
+    owner: &crate::tools::ToolRunContext,
+    agent_id: &str,
+    mut messages: Vec<Value>,
+    agent_type: AgentType,
+) {
     // Make sure the background TTL sweep is running. Idempotent.
     let _ = spawn_transcript_sweeper();
 
@@ -968,6 +1162,7 @@ fn store_transcript(agent_id: &str, mut messages: Vec<Value>, agent_type: AgentT
         store.insert(
             agent_id.to_string(),
             StoredTranscript {
+                owner_run: owner.run_id(),
                 messages,
                 agent_type,
                 created_at: Instant::now(),
@@ -982,7 +1177,10 @@ fn store_transcript(agent_id: &str, mut messages: Vec<Value>, agent_type: AgentT
 /// — the background sweep (see [`spawn_transcript_sweeper`]) handles
 /// that. Per-call eviction is also unnecessary because every read
 /// path verifies the entry's own age in O(1).
-fn load_transcript(agent_id: &str) -> Option<(Vec<Value>, AgentType)> {
+fn load_transcript(
+    owner: &crate::tools::ToolRunContext,
+    agent_id: &str,
+) -> Option<(Vec<Value>, AgentType)> {
     // Tighten lock scope: read out what we need, then release before
     // the rest of the function body. The clippy
     // `significant_drop_tightening` lint flags holding a `MutexGuard`
@@ -990,6 +1188,7 @@ fn load_transcript(agent_id: &str) -> Option<(Vec<Value>, AgentType)> {
     let snapshot = transcript_store_guard("load_transcript").and_then(|store| {
         store
             .get(agent_id)
+            .filter(|entry| entry.owner_run == owner.run_id())
             .map(|entry| (entry.messages.clone(), entry.agent_type, entry.created_at))
     });
     let (messages, agent_type, created_at) = snapshot?;
@@ -1038,14 +1237,15 @@ impl WorktreeIsolation {
     ///
     /// Returns `Err` if git is not available, the current directory is not
     /// a git repository, or the worktree/branch creation fails.
-    pub fn create(agent_id: &str) -> Result<Self, String> {
+    pub fn create(run: &crate::tools::ToolRunContext, agent_id: &str) -> Result<Self, String> {
         validate_worktree_agent_id(agent_id)?;
+        run.require(crate::tools::ToolResource::WorkspaceWrite)
+            .map_err(|error| error.to_string())?;
         let branch_name = format!("agent/{agent_id}");
 
         // Find the git root
-        let security = crate::tools::security::current_context()?;
-        let cwd = security.working_directory();
-        let git_root = sandboxed_git(cwd, &["rev-parse", "--show-toplevel"])
+        let cwd = run.working_directory();
+        let git_root = sandboxed_git(run, cwd, &["rev-parse", "--show-toplevel"])
             .map_err(|e| format!("git not available: {e}"))?;
 
         if !git_root.status.success() {
@@ -1065,8 +1265,12 @@ impl WorktreeIsolation {
         let worktree_arg = worktree_path
             .to_str()
             .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
-        let result = sandboxed_git(cwd, &["worktree", "add", worktree_arg, "-b", &branch_name])
-            .map_err(|e| format!("Failed to create worktree: {e}"))?;
+        let result = sandboxed_git(
+            run,
+            cwd,
+            &["worktree", "add", worktree_arg, "-b", &branch_name],
+        )
+        .map_err(|e| format!("Failed to create worktree: {e}"))?;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -1081,17 +1285,18 @@ impl WorktreeIsolation {
 
     /// Check if the worktree has uncommitted changes
     #[must_use]
-    pub fn has_changes(&self) -> bool {
-        let result = crate::tools::security::current_context().and_then(|security| {
-            let worktree = self
-                .worktree_path
-                .to_str()
-                .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
-            sandboxed_git(
-                security.working_directory(),
-                &["-C", worktree, "diff", "--stat"],
-            )
-        });
+    pub fn has_changes(&self, run: &crate::tools::ToolRunContext) -> bool {
+        let result = self
+            .worktree_path
+            .to_str()
+            .ok_or_else(|| "worktree path must be valid UTF-8".to_string())
+            .and_then(|worktree| {
+                sandboxed_git(
+                    run,
+                    run.working_directory(),
+                    &["-C", worktree, "diff", "--stat"],
+                )
+            });
 
         match result {
             Ok(output) => !output.stdout.is_empty(),
@@ -1105,8 +1310,8 @@ impl WorktreeIsolation {
     ///
     /// Returns `Err` if the worktree has uncommitted changes or if the
     /// git worktree remove command fails.
-    pub fn cleanup(&self) -> Result<(), String> {
-        if self.has_changes() {
+    pub fn cleanup(&self, run: &crate::tools::ToolRunContext) -> Result<(), String> {
+        if self.has_changes(run) {
             return Err(format!(
                 "Worktree has changes \u{2014} keeping at {} on branch {}",
                 self.worktree_path.display(),
@@ -1114,13 +1319,13 @@ impl WorktreeIsolation {
             ));
         }
 
-        let security = crate::tools::security::current_context()?;
         let worktree = self
             .worktree_path
             .to_str()
             .ok_or_else(|| "worktree path must be valid UTF-8".to_string())?;
         let result = sandboxed_git(
-            security.working_directory(),
+            run,
+            run.working_directory(),
             &["worktree", "remove", worktree, "--force"],
         )
         .map_err(|e| format!("Failed to remove worktree: {e}"))?;
@@ -1132,7 +1337,8 @@ impl WorktreeIsolation {
 
         // Also delete the branch
         let _ = sandboxed_git(
-            security.working_directory(),
+            run,
+            run.working_directory(),
             &["branch", "-D", &self.branch_name],
         );
 
@@ -1168,6 +1374,8 @@ pub fn get_task_tool_definition() -> Value {
                 "properties": {
                     "description": {
                         "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::task_graph::MAX_TASK_SUBJECT_BYTES,
                         "description": "A short (3-5 word) description of the task"
                     },
                     "prompt": {
@@ -1291,32 +1499,226 @@ pub struct SubagentResult {
     pub worktree: Option<WorktreeIsolation>,
 }
 
+/// Owns the durable lifecycle record for one admitted child run. Any return,
+/// cancellation, or panic that does not explicitly commit a terminal state
+/// falls back to `failed` on drop. The graph write is synchronous and bounded;
+/// errors are logged because `Drop` cannot safely convert an already-unwinding
+/// control path into a second panic.
+struct DelegationTaskGuard {
+    manager: crate::session::TaskManager,
+    task_id: String,
+    task_revision: u64,
+    agent_id: String,
+    armed: bool,
+}
+
+impl DelegationTaskGuard {
+    fn begin(
+        parent_run: &crate::tools::ToolRunContext,
+        agent_id: &str,
+        subject: &str,
+    ) -> Result<Self, String> {
+        let manager = crate::session::TaskManager::open_for_run(parent_run)?;
+        Self::begin_with_manager(parent_run, manager, agent_id, subject)
+    }
+
+    fn begin_with_manager(
+        parent_run: &crate::tools::ToolRunContext,
+        mut manager: crate::session::TaskManager,
+        agent_id: &str,
+        subject: &str,
+    ) -> Result<Self, String> {
+        manager.refresh()?;
+        let budget = crate::task_graph::TaskBudgetSpec {
+            max_turns: Some(MAX_SUBAGENT_TURNS as u64),
+            max_tokens: Some(
+                u64::from(SUBAGENT_MAX_TOKENS)
+                    .checked_mul(MAX_SUBAGENT_TURNS as u64)
+                    .ok_or_else(|| "subagent task token budget overflowed".to_string())?,
+            ),
+            max_elapsed_millis: None,
+            max_cost_microusd: None,
+            max_child_runs: None,
+            max_concurrent_calls: None,
+        };
+        let existing = manager
+            .list_tasks()
+            .iter()
+            .find(|task| {
+                matches!(
+                    &task.source,
+                    crate::task_graph::TaskSource::Delegation { agent_id: existing }
+                        if existing == agent_id
+                )
+            })
+            .map(|task| task.id.clone());
+        let (task_id, task_revision) = if let Some(task_id) = existing {
+            let revision = manager
+                .update_delegation_task(
+                    &task_id,
+                    agent_id,
+                    None,
+                    crate::session::TaskUpdateStatus::InProgress,
+                    Some(budget),
+                )?
+                .revision;
+            (task_id, revision)
+        } else {
+            let generation = manager.generation();
+            let task = manager.create_task_from_input(crate::task_graph::CreateTask {
+                expected_generation: generation,
+                subject: subject.to_string(),
+                description: String::new(),
+                active_form: Some(format!("Running delegated agent {agent_id}")),
+                status: crate::task_graph::CanonicalTaskStatus::InProgress,
+                priority: crate::task_graph::TaskPriority::Medium,
+                source: crate::task_graph::TaskSource::Delegation {
+                    agent_id: agent_id.to_string(),
+                },
+                budget: Some(budget),
+            })?;
+            (task.id.clone(), task.revision)
+        };
+        if let Err(binding_error) =
+            BACKGROUND_AGENTS.bind_canonical_task(parent_run, agent_id, &task_id)
+        {
+            let settlement = manager.update_delegation_task(
+                &task_id,
+                agent_id,
+                Some(task_revision),
+                crate::session::TaskUpdateStatus::Failed,
+                None,
+            );
+            return Err(match settlement {
+                Ok(_) => binding_error,
+                Err(settlement_error) => format!(
+                    "{binding_error}; canonical delegation settlement also failed: {settlement_error}"
+                ),
+            });
+        }
+        Ok(Self {
+            manager,
+            task_id,
+            task_revision,
+            agent_id: agent_id.to_string(),
+            armed: true,
+        })
+    }
+
+    fn transition(&mut self, status: crate::session::TaskUpdateStatus) -> Result<(), String> {
+        self.manager.update_delegation_task(
+            &self.task_id,
+            &self.agent_id,
+            Some(self.task_revision),
+            status,
+            None,
+        )?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn finish(mut self, status: crate::session::TaskUpdateStatus) -> Result<(), String> {
+        self.transition(status)
+    }
+}
+
+impl Drop for DelegationTaskGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.manager.refresh().is_ok()
+            && self.manager.get_task(&self.task_id).is_some_and(|task| {
+                matches!(
+                    task.status,
+                    crate::session::TaskStatus::Completed
+                        | crate::session::TaskStatus::Failed
+                        | crate::session::TaskStatus::Canceled
+                )
+            })
+        {
+            self.armed = false;
+            return;
+        }
+        if let Err(error) = self.transition(crate::session::TaskUpdateStatus::Failed) {
+            tracing::error!(
+                task_id = %self.task_id,
+                %error,
+                "Could not close canonical delegation task after child termination"
+            );
+        }
+    }
+}
+
+fn transition_canonical_delegation(
+    owner: &crate::tools::ToolRunContext,
+    task_id: &str,
+    agent_id: &str,
+    status: crate::session::TaskUpdateStatus,
+) -> Result<(), String> {
+    let mut manager = crate::session::TaskManager::open_for_run(owner)?;
+    manager.update_delegation_task(task_id, agent_id, None, status, None)?;
+    Ok(())
+}
+
 /// Run a subagent synchronously, returning the final result
 #[allow(clippy::too_many_lines)]
 pub async fn run_subagent(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
 ) -> SubagentResult {
-    run_subagent_inner(config, app_config, client, None).await
+    run_subagent_inner(parent_run, config, app_config, client, None, None, None).await
+}
+
+async fn run_subagent_with_effect_receipt(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    config: &SubagentConfig,
+    app_config: &AppConfig,
+    client: &Client,
+    memory_db: Option<Arc<crate::memory::MemoryDb>>,
+) -> (SubagentResult, bool) {
+    let effect_started = AtomicBool::new(false);
+    let result = run_subagent_inner(
+        parent_run,
+        config,
+        app_config,
+        client,
+        memory_db,
+        None,
+        Some(&effect_started),
+    )
+    .await;
+    (result, effect_started.load(Ordering::SeqCst))
 }
 
 fn validate_and_render_subagent_final_response(
+    run: &crate::tools::ToolRunContext,
     agent_id: &str,
     final_output: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
     if final_output.trim().is_empty() {
         return Ok(String::new());
     }
-    crate::grounded_loop::validate_and_render_agentic_final_response(agent_id, final_output)
+    crate::grounded_loop::validate_and_render_agentic_final_response(
+        run,
+        agent_id,
+        final_output,
+        model_identity,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_subagent_inner(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
+    memory_db: Option<Arc<crate::memory::MemoryDb>>,
     preallocated_agent_id: Option<&str>,
+    effect_receipt: Option<&AtomicBool>,
 ) -> SubagentResult {
     // Handle resume: reuse the *original* agent_id and load transcript.
     //
@@ -1333,23 +1735,44 @@ async fn run_subagent_inner(
     // (e.g. a previous turn of the same resume chain), `register_with_id`
     // is a no-op and preserves the existing turn counter / state.
     let (agent_id, mut messages) = if let Some(preallocated_id) = preallocated_agent_id {
-        BACKGROUND_AGENTS.register_with_id(config.agent_type, &config.task, preallocated_id);
-        let system_prompt = config.agent_type.system_prompt();
-        let msgs = vec![
-            json!({
-                "role": "system",
-                "content": system_prompt
-            }),
-            json!({
-                "role": "user",
-                "content": format!("Task: {}\n\n{}", config.task, config.prompt)
-            }),
-        ];
+        if let Err(error) = BACKGROUND_AGENTS.register_with_id(
+            parent_run,
+            config.agent_type,
+            &config.task,
+            preallocated_id,
+        ) {
+            return SubagentResult {
+                agent_id: preallocated_id.to_string(),
+                success: false,
+                output: error,
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree: None,
+            };
+        }
+        let msgs = vec![json!({
+            "role": "user",
+            "content": format!("Task: {}\n\n{}", config.task, config.prompt)
+        })];
         (preallocated_id.to_string(), msgs)
     } else if let Some(ref resume_id) = config.resume_agent_id {
-        match load_transcript(resume_id) {
+        match load_transcript(parent_run, resume_id) {
             Some((prev_messages, _prev_type)) => {
-                BACKGROUND_AGENTS.register_with_id(config.agent_type, &config.task, resume_id);
+                if let Err(error) = BACKGROUND_AGENTS.register_with_id(
+                    parent_run,
+                    config.agent_type,
+                    &config.task,
+                    resume_id,
+                ) {
+                    return SubagentResult {
+                        agent_id: resume_id.clone(),
+                        success: false,
+                        output: error,
+                        turns_used: 0,
+                        is_background: config.run_in_background,
+                        worktree: None,
+                    };
+                }
                 let mut msgs = prev_messages;
                 // Append the new prompt as a continuation
                 msgs.push(json!({
@@ -1370,39 +1793,48 @@ async fn run_subagent_inner(
             }
         }
     } else {
-        let id = BACKGROUND_AGENTS.register(config.agent_type, &config.task);
-        let system_prompt = config.agent_type.system_prompt();
-        let msgs = vec![
-            json!({
-                "role": "system",
-                "content": system_prompt
-            }),
-            json!({
-                "role": "user",
-                "content": format!("Task: {}\n\n{}", config.task, config.prompt)
-            }),
-        ];
+        let id = match BACKGROUND_AGENTS.register(parent_run, config.agent_type, &config.task) {
+            Ok(id) => id,
+            Err(error) => {
+                return SubagentResult {
+                    agent_id: String::new(),
+                    success: false,
+                    output: error,
+                    turns_used: 0,
+                    is_background: config.run_in_background,
+                    worktree: None,
+                }
+            }
+        };
+        let msgs = vec![json!({
+            "role": "user",
+            "content": format!("Task: {}\n\n{}", config.task, config.prompt)
+        })];
         (id, msgs)
     };
-    let task_obs = crate::grounded_loop::observe_session_user_task(
-        &agent_id,
-        &format!("Subagent task: {}\n\n{}", config.task, config.prompt),
-    );
+    if let Some(receipt) = effect_receipt {
+        receipt.store(true, Ordering::SeqCst);
+    }
+    let task_content = format!("Subagent task: {}\n\n{}", config.task, config.prompt);
+    let delegation = match DelegationTaskGuard::begin(parent_run, &agent_id, &config.task) {
+        Ok(delegation) => delegation,
+        Err(error) => {
+            BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot create canonical delegation task: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree: None,
+            };
+        }
+    };
 
     // Set up worktree isolation if requested
     let worktree = if config.isolation.as_deref() == Some("worktree") {
-        match WorktreeIsolation::create(&agent_id) {
-            Ok(wt) => {
-                // Set working directory for tool execution by injecting context
-                messages.push(json!({
-                    "role": "system",
-                    "content": format!(
-                        "You are running in an isolated git worktree at: {}\nBranch: {}\nAll file operations should use paths relative to or within this directory.",
-                        wt.worktree_path.display(), wt.branch_name
-                    )
-                }));
-                Some(wt)
-            }
+        match WorktreeIsolation::create(parent_run, &agent_id) {
+            Ok(wt) => Some(wt),
             Err(e) => {
                 return SubagentResult {
                     agent_id,
@@ -1418,7 +1850,167 @@ async fn run_subagent_inner(
         None
     };
 
-    let allowed_tools = config.agent_type.allowed_tools();
+    let child_root = worktree.as_ref().map_or_else(
+        || parent_run.project_root().to_path_buf(),
+        |isolation| isolation.worktree_path.clone(),
+    );
+    let child_cwd = worktree.as_ref().map_or_else(
+        || parent_run.working_directory().to_path_buf(),
+        |isolation| isolation.worktree_path.clone(),
+    );
+    let session_id = match crate::state::SessionId::from_raw(parent_run.session_id()) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot bind subagent session capabilities: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree,
+            };
+        }
+    };
+    let workspace_access = if config.agent_type == AgentType::GeneralPurpose {
+        crate::tools::WorkspaceAccess::ReadWrite
+    } else {
+        crate::tools::WorkspaceAccess::ReadOnly
+    };
+    let is_parent_intrinsic_root = |root: &&PathBuf| {
+        root.as_path() == parent_run.project_root()
+            || root.as_path() == parent_run.private_temp_root()
+    };
+    let mut child_read_only_roots: Vec<PathBuf> = parent_run
+        .read_only_roots()
+        .iter()
+        .filter(|root| !is_parent_intrinsic_root(root))
+        .cloned()
+        .collect();
+    let mut child_read_write_roots = Vec::new();
+    if workspace_access == crate::tools::WorkspaceAccess::ReadWrite {
+        child_read_write_roots.extend(
+            parent_run
+                .read_write_roots()
+                .iter()
+                .filter(|root| !is_parent_intrinsic_root(root))
+                .cloned(),
+        );
+    } else {
+        child_read_only_roots.extend(
+            parent_run
+                .read_write_roots()
+                .iter()
+                .filter(|root| !is_parent_intrinsic_root(root))
+                .cloned(),
+        );
+    }
+    let subagent_run = match crate::tools::ToolRunContext::builder(session_id, child_root)
+        .working_directory(child_cwd)
+        .read_only_roots(child_read_only_roots)
+        .read_write_roots(child_read_write_roots)
+        .project_secret_masks(parent_run.project_secret_masks().to_vec())
+        .protected_environment_grants(parent_run.environment_grants().clone())
+        .protected_mcp_environment_grants(parent_run.mcp_environment_grants().clone())
+        .executable_search_path(parent_run.executable_search_path())
+        .host_home(parent_run.host_home().map(Path::to_path_buf))
+        .workspace_access(workspace_access)
+        .process(parent_run.grants_resource(crate::tools::ToolResource::Process))
+        .network(parent_run.grants_resource(crate::tools::ToolResource::Network))
+        .secrets(parent_run.grants_resource(crate::tools::ToolResource::Secrets))
+        .process_owner(&agent_id)
+        .actor_role(crate::runtime::ActorRole::Worker)
+        .provider(app_config.proxy.target.clone())
+        .build()
+    {
+        Ok(run) => run,
+        Err(error) => {
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot create subagent run capabilities: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree,
+            };
+        }
+    };
+    let model = config
+        .model_override
+        .clone()
+        .or_else(|| config.agent_type.preferred_model().map(String::from))
+        .unwrap_or_else(|| {
+            app_config
+                .providers
+                .get(&app_config.proxy.target)
+                .and_then(|p| p.model.clone())
+                .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+        });
+    if let Err(error) = crate::guardrails::configure(&subagent_run, &app_config.guardrails) {
+        return SubagentResult {
+            agent_id,
+            success: false,
+            output: format!("Cannot bind subagent guardrails: {error}"),
+            turns_used: 0,
+            is_background: config.run_in_background,
+            worktree,
+        };
+    }
+    let mut task_manager = match crate::session::TaskManager::open_for_run(&subagent_run) {
+        Ok(manager) => manager,
+        Err(error) => {
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot open canonical subagent task graph: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree,
+            };
+        }
+    };
+    let task_obs = crate::grounded_loop::observe_session_user_task(
+        &subagent_run,
+        &agent_id,
+        &task_content,
+        &model,
+    );
+
+    let mut subagent_context = vec![crate::context::ContextItem::host_instruction(
+        "subagent.role_policy",
+        crate::context::HostInstructionSource::AgentRole,
+        format!("compiled:agent-role:{:?}", config.agent_type),
+        config.agent_type.system_prompt(),
+        crate::context::ContextFreshness::Static,
+        10,
+    )];
+    if let Some(worktree) = &worktree {
+        subagent_context.push(crate::context::ContextItem::host_instruction(
+            "subagent.worktree_policy",
+            crate::context::HostInstructionSource::RuntimePolicy,
+            "host:worktree-isolation",
+            "All file operations for this isolated run must remain within the host-provided worktree in reference context.",
+            crate::context::ContextFreshness::Session,
+            20,
+        ));
+        subagent_context.push(crate::context::ContextItem::reference(
+            "subagent.worktree_identity",
+            crate::context::ReferenceSource::Project,
+            "host-observation:worktree-isolation",
+            format!(
+                "Isolated worktree: {}\nBranch: {}",
+                worktree.worktree_path.display(),
+                worktree.branch_name
+            ),
+            crate::context::ContextFreshness::Session,
+            30,
+        ));
+    }
+    let subagent_prompt_blocks = crate::prompt::SystemPromptBlocks::from_items(
+        subagent_context,
+        crate::context::ContextBudget::default(),
+    );
+
+    let allowed_tools = available_subagent_tools(config.agent_type, memory_db.is_some());
 
     // Filter tool definitions to only allowed tools
     let all_tools = crate::tools::get_tool_definitions();
@@ -1437,19 +2029,6 @@ async fn run_subagent_inner(
         })
         .unwrap_or_default();
     let filtered_tools = add_subagent_typed_decision_contracts(filtered_tools);
-
-    // Determine the model to use
-    let model = config
-        .model_override
-        .clone()
-        .or_else(|| config.agent_type.preferred_model().map(String::from))
-        .unwrap_or_else(|| {
-            app_config
-                .providers
-                .get(&app_config.proxy.target)
-                .and_then(|p| p.model.clone())
-                .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
-        });
 
     // Get provider config. `api_key` is `Option<ApiKey>`: an unconfigured
     // provider yields `None` and `make_api_call` omits the auth header —
@@ -1475,25 +2054,32 @@ async fn run_subagent_inner(
     // Library-layer permission gate — consulted by every
     // `execute_tool_with_memory` call inside this subagent's tool loop.
     // Closes crosslink #505 for the subagent path.
-    let permission_mgr = crate::permissions::PermissionManager::new(
-        std::path::PathBuf::from(".openclaudia/permissions.json"),
-        true,
+    let permission_mgr = crate::permissions::PermissionManager::trusted_for_run(
+        &subagent_run,
+        app_config.permissions.enabled,
         app_config.permissions.default_allow.clone(),
+        app_config.web_fetch.preapproved_domains.clone(),
     );
     let policy_enforcer = crate::services::policy::PolicyEnforcer::new(app_config.policy.clone());
 
     loop {
-        turns = BACKGROUND_AGENTS.increment_turns(&agent_id);
-        if let Some(agent) = BACKGROUND_AGENTS.get(&agent_id) {
+        turns = BACKGROUND_AGENTS.increment_turns(parent_run, &agent_id);
+        if let Some(agent) = BACKGROUND_AGENTS.get_for_run(parent_run, &agent_id) {
             if agent.finished.load(Ordering::SeqCst) {
                 let error = agent_field_guard(&agent.error, "run_subagent", &agent_id, "error")
                     .and_then(|e| e.clone())
                     .unwrap_or_else(|| "Agent stopped before the next turn".to_string());
-                store_transcript(&agent_id, messages, config.agent_type);
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                let output = match delegation.finish(crate::session::TaskUpdateStatus::Canceled) {
+                    Ok(()) => error,
+                    Err(tracking_error) => format!(
+                        "{error}; canonical cancellation could not be committed: {tracking_error}"
+                    ),
+                };
                 return SubagentResult {
                     agent_id,
                     success: false,
-                    output: error,
+                    output,
                     turns_used: turns,
                     is_background: config.run_in_background,
                     worktree: worktree.clone(),
@@ -1503,11 +2089,12 @@ async fn run_subagent_inner(
 
         if turns > MAX_SUBAGENT_TURNS as u64 {
             BACKGROUND_AGENTS.fail(
+                parent_run,
                 &agent_id,
                 format!("Agent exceeded maximum turns ({MAX_SUBAGENT_TURNS})"),
             );
             // Store transcript even on failure for potential resume
-            store_transcript(&agent_id, messages, config.agent_type);
+            store_transcript(parent_run, &agent_id, messages, config.agent_type);
             return SubagentResult {
                 agent_id,
                 success: false,
@@ -1522,12 +2109,15 @@ async fn run_subagent_inner(
         // it helps the provider navigate the current ledger, but it is
         // not persisted into the resumable transcript.
         let request_messages = match crate::grounded_loop::request_messages_with_grounding(
-            &agent_id, task_obs, &messages,
+            &subagent_run,
+            &agent_id,
+            task_obs,
+            &messages,
         ) {
             Ok(messages) => messages,
             Err(e) => {
-                BACKGROUND_AGENTS.fail(&agent_id, e.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1538,17 +2128,38 @@ async fn run_subagent_inner(
                 };
             }
         };
+        let prepared_request_messages =
+            subagent_prompt_blocks.prepare_json_messages(&request_messages);
+        let progressive_tools = match subagent_run.tool_catalog().snapshot(
+            &subagent_run,
+            &request_messages,
+            &filtered_tools,
+        ) {
+            Ok(snapshot) => snapshot.definitions,
+            Err(e) => {
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                return SubagentResult {
+                    agent_id,
+                    success: false,
+                    output: format!("Tool catalog error: {e}"),
+                    turns_used: turns,
+                    is_background: config.run_in_background,
+                    worktree: worktree.clone(),
+                };
+            }
+        };
         let request_body = json!({
             "model": model,
-            "messages": request_messages,
-            "tools": filtered_tools,
+            "messages": prepared_request_messages,
+            "tools": progressive_tools,
             "max_tokens": SUBAGENT_MAX_TOKENS
         });
         let typed_request = match build_chat_completion_request(&request_body) {
             Ok(request) => request,
             Err(e) => {
-                BACKGROUND_AGENTS.fail(&agent_id, e.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1561,8 +2172,8 @@ async fn run_subagent_inner(
         };
         if let Err(e) = check_provider_request_policy(app_config, &typed_request) {
             let message = format!("Blocked by policy: {e}");
-            BACKGROUND_AGENTS.fail(&agent_id, message.clone());
-            store_transcript(&agent_id, messages, config.agent_type);
+            BACKGROUND_AGENTS.fail(parent_run, &agent_id, message.clone());
+            store_transcript(parent_run, &agent_id, messages, config.agent_type);
             return SubagentResult {
                 agent_id,
                 success: false,
@@ -1588,8 +2199,8 @@ async fn run_subagent_inner(
         {
             Ok(r) => r,
             Err(e) => {
-                BACKGROUND_AGENTS.fail(&agent_id, e.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1605,8 +2216,8 @@ async fn run_subagent_inner(
         let assistant_message = match parse_response(&response) {
             Ok(msg) => msg,
             Err(e) => {
-                BACKGROUND_AGENTS.fail(&agent_id, e.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
+                store_transcript(parent_run, &agent_id, messages, config.agent_type);
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -1646,13 +2257,18 @@ async fn run_subagent_inner(
             .unwrap_or_default();
 
         if tool_calls.is_empty() {
-            match validate_and_render_subagent_final_response(&agent_id, &final_output) {
+            match validate_and_render_subagent_final_response(
+                &subagent_run,
+                &agent_id,
+                &final_output,
+                &model,
+            ) {
                 Ok(rendered) => {
                     final_output = rendered;
                 }
                 Err(reason) => {
-                    BACKGROUND_AGENTS.fail(&agent_id, reason.clone());
-                    store_transcript(&agent_id, messages, config.agent_type);
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, reason.clone());
+                    store_transcript(parent_run, &agent_id, messages, config.agent_type);
                     return SubagentResult {
                         agent_id,
                         success: false,
@@ -1702,17 +2318,20 @@ async fn run_subagent_inner(
                 continue;
             }
 
-            if let Err(content) = validate_subagent_tool_decision_for_session(&agent_id, &tc) {
-                let result = crate::tools::ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: format!("Error: {content}"),
-                    is_error: true,
-                };
-                observe_subagent_tool_result(&agent_id, &tc.function.name, &result);
+            if let Err(content) =
+                validate_subagent_tool_decision_for_session(&subagent_run, &agent_id, &tc)
+            {
+                let result = crate::tools::ToolResult::failure(
+                    &tc,
+                    crate::tools::ToolFailureCode::PolicyDenied,
+                    format!("Error: {content}"),
+                    crate::tools::ToolRetryability::Never,
+                );
+                observe_subagent_tool_result(&subagent_run, &agent_id, &result);
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": result.content
+                    "content": result.content()
                 }));
                 continue;
             }
@@ -1725,41 +2344,56 @@ async fn run_subagent_inner(
             // list lives in its own bucket. Claude Code uses the
             // `agentId ?? sessionId` fallback; here agent_id is always
             // present. Closes crosslink #518 for subagents.
-            let result = crate::services::tool_executor::ToolExecutor::execute(
-                crate::services::tool_executor::ToolExecutorRequest {
-                    tool_call: &executable_tc,
-                    memory_db: None,
-                    app_config: None,
-                    task_mgr: None,
-                    permission_mgr: Some(&permission_mgr),
-                    permission_already_checked: false,
-                    session_id: Some(&agent_id),
-                    policy_enforcer: Some(&policy_enforcer),
-                },
-            );
-            observe_subagent_tool_result(&agent_id, &executable_tc.function.name, &result);
+            let result = execute_subagent_local_tool(&mut SubagentToolExecution {
+                run: &subagent_run,
+                tool_call: &executable_tc,
+                memory_db: memory_db.as_deref(),
+                app_config,
+                task_manager: &mut task_manager,
+                permission_manager: &permission_mgr,
+                agent_id: &agent_id,
+                policy_enforcer: &policy_enforcer,
+            });
+            observe_subagent_tool_result(&subagent_run, &agent_id, &result);
 
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": executable_tc.id,
-                "content": result.content
+                "content": result.content()
             }));
         }
     }
 
-    // Mark as finished and store transcript for future resume
-    BACKGROUND_AGENTS.finish(&agent_id, final_output.clone());
-    store_transcript(&agent_id, messages, config.agent_type);
+    // Store the transcript and settle owned resources before publishing the
+    // terminal graph state. The caller cannot observe success until the
+    // canonical delegation node commits `completed`.
+    store_transcript(parent_run, &agent_id, messages, config.agent_type);
 
     // Handle worktree cleanup: remove if no changes, keep if changes exist
     let final_worktree = worktree.and_then(|wt| {
-        if wt.has_changes() {
+        if wt.has_changes(parent_run) {
             Some(wt) // Keep -- return path and branch to caller
         } else {
-            let _ = wt.cleanup(); // No changes, clean up silently
+            let _ = wt.cleanup(parent_run); // No changes, clean up silently
             None
         }
     });
+
+    if let Err(error) = delegation.finish(crate::session::TaskUpdateStatus::Completed) {
+        let message = format!(
+            "Subagent returned a result, but canonical delegation completion could not be committed: {error}"
+        );
+        BACKGROUND_AGENTS.fail(parent_run, &agent_id, message.clone());
+        return SubagentResult {
+            agent_id,
+            success: false,
+            output: message,
+            turns_used: turns,
+            is_background: config.run_in_background,
+            worktree: final_worktree,
+        };
+    }
+    BACKGROUND_AGENTS.finish(parent_run, &agent_id, final_output.clone());
 
     SubagentResult {
         agent_id,
@@ -1951,6 +2585,7 @@ fn subagent_typed_decision_schema(tool_name: &str) -> Value {
 }
 
 fn validate_subagent_tool_decision_for_session(
+    run: &crate::tools::ToolRunContext,
     agent_id: &str,
     tool_call: &ToolCall,
 ) -> Result<(), String> {
@@ -1963,9 +2598,15 @@ fn validate_subagent_tool_decision_for_session(
         &tool_call.function.name,
         &tool_call.function.arguments,
     )?;
-    match validate_subagent_tool_decision_against_ledger(&tool_call.function.name, &args, &ledger) {
+    match validate_subagent_tool_decision_against_ledger(
+        run,
+        &tool_call.function.name,
+        &args,
+        &ledger,
+    ) {
         Ok(()) => {
             crate::grounded_loop::observe_policy_decision_for_session(
+                run,
                 agent_id,
                 true,
                 &format!(
@@ -1976,13 +2617,14 @@ fn validate_subagent_tool_decision_for_session(
             Ok(())
         }
         Err(err) => {
-            crate::grounded_loop::observe_policy_decision_for_session(agent_id, false, &err);
+            crate::grounded_loop::observe_policy_decision_for_session(run, agent_id, false, &err);
             Err(err)
         }
     }
 }
 
 fn validate_subagent_tool_decision_against_ledger(
+    run: &crate::tools::ToolRunContext,
     tool_name: &str,
     args: &Value,
     ledger: &crate::ledger::RealityLedger,
@@ -1996,7 +2638,7 @@ fn validate_subagent_tool_decision_against_ledger(
     let decision = serde_json::from_value::<crate::decision::AgentDecision>(decision_value.clone())
         .map_err(|err| format!("Invalid typed decision for tool '{tool_name}': {err}"))?;
     validate_subagent_tool_decision_shape(tool_name, args, &decision)?;
-    crate::decision::validate_decision(&decision, ledger)
+    crate::decision::validate_decision(&decision, ledger, run)
         .map(|_| ())
         .map_err(|denial| {
             format!(
@@ -2128,20 +2770,16 @@ async fn make_api_call(
     // ensure a content-type header is set in all cases so providers
     // without an explicit content-type contribution still receive
     // valid JSON.
-    let mut headers: Vec<(String, String)> =
-        api_key.map(|k| adapter.get_headers(k)).unwrap_or_default();
-    if !headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-    {
-        headers.push(("content-type".to_string(), "application/json".to_string()));
+    let mut headers = api_key
+        .map(|key| adapter.get_headers(key))
+        .unwrap_or_default();
+    if !headers.contains_name("content-type") {
+        headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
     }
 
-    let mut req = client.post(&endpoint);
-    for (key, value) in headers {
-        req = req.header(&key, &value);
-    }
-    req = req.json(&body);
+    let req = headers
+        .apply(client.post(&endpoint).json(&body))
+        .map_err(|error| format!("invalid provider headers: {error}"))?;
 
     let response = req
         .send()
@@ -2150,11 +2788,13 @@ async fn make_api_call(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response
-            .text()
+        let text = crate::secrets::read_bounded_diagnostic_body(response)
             .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("API error ({status}): {text}"));
+            .unwrap_or_else(|_| zeroize::Zeroizing::new("Unknown error".to_string()));
+        return Err(format!(
+            "API error ({status}): {}",
+            headers.sanitize_diagnostic(&text)
+        ));
     }
 
     let json: Value = response
@@ -2240,40 +2880,110 @@ fn parse_subagent_tool_call(tool_call: &Value, index: usize) -> Result<ToolCall,
 }
 
 fn observe_subagent_tool_result(
+    run: &crate::tools::ToolRunContext,
     agent_id: &str,
-    tool_name: &str,
     result: &crate::tools::ToolResult,
 ) {
-    crate::grounded_loop::observe_tool_result_for_session(agent_id, tool_name, result);
+    crate::grounded_loop::observe_tool_result_for_session(run, agent_id, result);
+}
+
+struct SubagentToolExecution<'a> {
+    run: &'a Arc<crate::tools::ToolRunContext>,
+    tool_call: &'a crate::tools::ToolCall,
+    memory_db: Option<&'a crate::memory::MemoryDb>,
+    app_config: &'a AppConfig,
+    task_manager: &'a mut crate::session::TaskManager,
+    permission_manager: &'a crate::permissions::PermissionManager,
+    agent_id: &'a str,
+    policy_enforcer: &'a crate::services::policy::PolicyEnforcer,
+}
+
+fn execute_subagent_local_tool(
+    request: &mut SubagentToolExecution<'_>,
+) -> crate::tools::ToolResult {
+    crate::services::tool_executor::ToolExecutor::execute(
+        crate::services::tool_executor::ToolExecutorRequest {
+            run_context: request.run,
+            tool_call: request.tool_call,
+            memory_db: request.memory_db,
+            app_config: Some(request.app_config),
+            task_mgr: Some(&mut *request.task_manager),
+            permission_mgr: request.permission_manager,
+            authorization: None,
+            session_id: Some(request.agent_id),
+            policy_enforcer: Some(request.policy_enforcer),
+        },
+    )
 }
 
 // === Tool Execution ===
 
-/// Execute the Task tool
+fn available_subagent_tools(
+    agent_type: AgentType,
+    technical_memory_available: bool,
+) -> Vec<&'static str> {
+    let mut tools = agent_type.allowed_tools();
+    if !technical_memory_available {
+        tools.retain(|name| !name.starts_with("memory_"));
+    }
+    tools
+}
+
+fn reopen_subagent_memory(
+    memory_db: Option<&crate::memory::MemoryDb>,
+) -> Result<Option<Arc<crate::memory::MemoryDb>>, String> {
+    let Some(memory) = memory_db else {
+        return Ok(None);
+    };
+    let reopened = memory
+        .reopen_for_subagent()
+        .map_err(|error| format!("Cannot reopen technical memory for the subagent: {error}"))?;
+    Ok(Some(Arc::new(reopened)))
+}
+
+fn no_task_effect((content, is_error): (String, bool)) -> (String, bool, bool) {
+    (content, is_error, false)
+}
+
+/// Execute the Task tool and retain whether registration made a real effect.
 #[allow(clippy::too_many_lines)]
-pub fn execute_task_tool<S: BuildHasher>(
+fn execute_task_tool_with_receipt<S: BuildHasher>(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
     args: &HashMap<String, Value, S>,
     app_config: &AppConfig,
-) -> (String, bool) {
+    memory_db: Option<&crate::memory::MemoryDb>,
+) -> (String, bool, bool) {
     let description = match args.arg_str_strict("description") {
         Ok(description) => description,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
+    if description.trim().is_empty()
+        || description.len() > crate::task_graph::MAX_TASK_SUBJECT_BYTES
+        || description.contains('\0')
+    {
+        return no_task_effect((
+            format!(
+                "Invalid 'description' argument: must be non-empty, NUL-free, and at most {} bytes",
+                crate::task_graph::MAX_TASK_SUBJECT_BYTES
+            ),
+            true,
+        ));
+    }
 
     let prompt = match args.arg_str_strict("prompt") {
         Ok(prompt) => prompt,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     // Handle resume: if resume ID is provided, load previous transcript
     let resume_id = match args.arg_str_opt_strict("resume") {
         Ok(resume) => resume.map(String::from),
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let subagent_type_str = match args.arg_str_strict("subagent_type") {
         Ok(subagent_type) => subagent_type,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let Some(agent_type) = AgentType::parse_task_type(subagent_type_str) else {
@@ -2283,23 +2993,24 @@ pub fn execute_task_tool<S: BuildHasher>(
                 "Unsupported task subagent_type '{subagent_type_str}'. Valid types: {valid_types}"
             ),
             true,
+            false,
         );
     };
 
     let run_in_background = match args.arg_bool_or_strict("run_in_background", false) {
         Ok(value) => value,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     // Resolve model: map friendly names to actual model IDs
     let model_override = match args.arg_str_opt_strict("model") {
         Ok(model) => model.map(|m| resolve_model_name(m, &app_config.proxy.target)),
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let isolation = match args.arg_str_opt_strict("isolation") {
         Ok(isolation) => isolation.map(String::from),
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let config = SubagentConfig {
@@ -2310,6 +3021,11 @@ pub fn execute_task_tool<S: BuildHasher>(
         model_override,
         resume_agent_id: resume_id,
         isolation,
+    };
+
+    let subagent_memory = match reopen_subagent_memory(memory_db) {
+        Ok(memory) => memory,
+        Err(error) => return (error, true, false),
     };
 
     // Create HTTP client
@@ -2325,18 +3041,25 @@ pub fn execute_task_tool<S: BuildHasher>(
         //   (b) the spawned task's call to `run_subagent` reattaches to
         //       that tracking entry rather than minting a new id.
         // For fresh spawns we mint a new id as before.
-        let agent_id = config.resume_agent_id.as_ref().map_or_else(
-            || BACKGROUND_AGENTS.register(agent_type, description),
-            |rid| {
-                BACKGROUND_AGENTS.register_with_id(agent_type, description, rid);
-                rid.clone()
-            },
-        );
+        let agent_id = if let Some(resume_id) = config.resume_agent_id.as_ref() {
+            match BACKGROUND_AGENTS.register_with_id(parent_run, agent_type, description, resume_id)
+            {
+                Ok(_) => resume_id.clone(),
+                Err(error) => return (error, true, false),
+            }
+        } else {
+            match BACKGROUND_AGENTS.register(parent_run, agent_type, description) {
+                Ok(id) => id,
+                Err(error) => return (error, true, false),
+            }
+        };
 
         // Spawn the background task
         let config_bg = config;
         let app_config_bg = app_config.clone();
         let client_bg = client;
+        let parent_run_bg = Arc::clone(parent_run);
+        let memory_db_bg = subagent_memory;
         let agent_id_bg = agent_id.clone();
         let preallocated_agent_id_bg = config_bg
             .resume_agent_id
@@ -2346,29 +3069,34 @@ pub fn execute_task_tool<S: BuildHasher>(
         // Use tokio runtime to spawn the background task
         let Ok(handle) = Handle::try_current() else {
             BACKGROUND_AGENTS.fail(
+                parent_run,
                 &agent_id,
                 "Background task requires an active tokio runtime".to_string(),
             );
             return (
                 "Background task requires an active tokio runtime".to_string(),
                 true,
+                true,
             );
         };
         let join_handle = handle.spawn(async move {
             let result = run_subagent_inner(
+                &parent_run_bg,
                 &config_bg,
                 &app_config_bg,
                 &client_bg,
+                memory_db_bg,
                 preallocated_agent_id_bg.as_deref(),
+                None,
             )
             .await;
 
             if !result.success {
-                BACKGROUND_AGENTS.fail(&agent_id_bg, result.output);
+                BACKGROUND_AGENTS.fail(&parent_run_bg, &agent_id_bg, result.output);
             }
         });
         if let Err(err) =
-            BACKGROUND_AGENTS.attach_abort_handle(&agent_id, join_handle.abort_handle())
+            BACKGROUND_AGENTS.attach_abort_handle(parent_run, &agent_id, join_handle.abort_handle())
         {
             tracing::warn!(
                 agent_id,
@@ -2381,11 +3109,53 @@ pub fn execute_task_tool<S: BuildHasher>(
             "Background agent started with ID: {agent_id}\nTask: {description}\nType: {agent_type:?}\n\nUse agent_output with this agent_id to retrieve results."
         );
 
-        (message, false)
+        (message, false, true)
     } else {
         // Run synchronously via defensive runtime dispatch (#719).
-        dispatch_subagent_sync(&config, app_config, &client)
+        dispatch_subagent_sync(parent_run, &config, app_config, &client, subagent_memory)
     }
+}
+
+fn bind_subagent_legacy_result(
+    content: String,
+    is_error: bool,
+    effect_observed: bool,
+) -> crate::tools::ToolHandlerResult {
+    if !is_error {
+        return crate::tools::ToolHandlerResult::success_text(content);
+    }
+    let failure = crate::tools::ToolFailure::new(
+        crate::tools::ToolFailureCode::External,
+        content.clone(),
+        crate::tools::ToolRetryability::Unknown,
+    );
+    if effect_observed {
+        crate::tools::ToolHandlerResult::partial_text(content, vec![failure])
+    } else {
+        crate::tools::ToolHandlerResult::error(failure)
+    }
+}
+
+/// Legacy task-tool projection retained for direct compatibility tests.
+pub fn execute_task_tool<S: BuildHasher>(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    args: &HashMap<String, Value, S>,
+    app_config: &AppConfig,
+) -> (String, bool) {
+    let (content, is_error, _) = execute_task_tool_with_receipt(parent_run, args, app_config, None);
+    (content, is_error)
+}
+
+/// Canonical task-tool adapter retaining an explicit causal effect receipt.
+pub fn execute_task_tool_typed<S: BuildHasher>(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    args: &HashMap<String, Value, S>,
+    app_config: &AppConfig,
+    memory_db: Option<&crate::memory::MemoryDb>,
+) -> crate::tools::ToolHandlerResult {
+    let (content, is_error, effect_started) =
+        execute_task_tool_with_receipt(parent_run, args, app_config, memory_db);
+    bind_subagent_legacy_result(content, is_error, effect_started)
 }
 
 /// Synchronous-call-from-tool-dispatch path for `run_subagent`.
@@ -2406,14 +3176,18 @@ pub fn execute_task_tool<S: BuildHasher>(
 ///     `block_in_place` (panics) and cannot `block_on` (deadlocks the
 ///     single worker). The caller must dispatch through the async path.
 fn dispatch_subagent_sync(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
     config: &SubagentConfig,
     app_config: &AppConfig,
     client: &Client,
-) -> (String, bool) {
-    let result = match Handle::try_current() {
+    memory_db: Option<Arc<crate::memory::MemoryDb>>,
+) -> (String, bool, bool) {
+    let (result, effect_started) = match Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
-                handle.block_on(run_subagent(config, app_config, client))
+                handle.block_on(run_subagent_with_effect_receipt(
+                    parent_run, config, app_config, client, memory_db,
+                ))
             }),
             _ => {
                 return (
@@ -2422,13 +3196,16 @@ fn dispatch_subagent_sync(
                      a multi_thread runtime or from the async tool dispatcher."
                         .to_string(),
                     true,
+                    false,
                 );
             }
         },
         Err(_) => match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(run_subagent(config, app_config, client)),
+            Ok(rt) => rt.block_on(run_subagent_with_effect_receipt(
+                parent_run, config, app_config, client, memory_db,
+            )),
             Err(e) => {
-                return (format!("Failed to create runtime: {e}"), true);
+                return (format!("Failed to create runtime: {e}"), true, false);
             }
         },
     };
@@ -2446,23 +3223,29 @@ fn dispatch_subagent_sync(
                 wt.branch_name
             );
         }
-        (message, false)
+        (message, false, effect_started)
     } else {
-        (format!("Agent failed: {}", result.output), true)
+        (
+            format!("Agent failed: {}", result.output),
+            true,
+            effect_started,
+        )
     }
 }
 
-/// Execute the `AgentOutput` tool
-pub fn execute_agent_output_tool<S: BuildHasher>(
+/// Execute the `AgentOutput` tool and retain whether a finished entry was
+/// consumed from the exact-run manager.
+fn execute_agent_output_tool_with_receipt<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
     args: &HashMap<String, Value, S>,
-) -> (String, bool) {
+) -> (String, bool, bool) {
     let agent_id = match args.arg_str_opt_strict("agent_id") {
         Ok(Some(agent_id)) => agent_id,
         Ok(None) => {
             // List all agents if no ID provided
-            let agents = BACKGROUND_AGENTS.list();
+            let agents = BACKGROUND_AGENTS.list_for_run(owner);
             if agents.is_empty() {
-                return ("No background agents running.".to_string(), false);
+                return ("No background agents running.".to_string(), false, false);
             }
             let mut result = format!("Background agents ({}):\n", agents.len());
             for (id, agent_type, task, finished) in agents {
@@ -2474,18 +3257,18 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
                 };
                 let _ = writeln!(result, "  {id} [{agent_type:?}] [{status}]: {task_preview}");
             }
-            return (result, false);
+            return (result, false, false);
         }
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
     let block = match args.arg_bool_or_strict("block", false) {
         Ok(value) => value,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => return no_task_effect(err.into_tool_error()),
     };
 
-    let Some(agent) = BACKGROUND_AGENTS.get(agent_id) else {
-        return (format!("Agent '{agent_id}' not found"), true);
+    let Some(agent) = BACKGROUND_AGENTS.get_for_run(owner, agent_id) else {
+        return (format!("Agent '{agent_id}' not found"), true, false);
     };
 
     if block && !agent.finished.load(Ordering::SeqCst) {
@@ -2546,9 +3329,9 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
         // Drop the local `Arc` clone first so `remove` returns the last
         // strong reference and the heap allocation can actually be freed.
         drop(agent);
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(owner, agent_id);
 
-        error.map_or_else(
+        let (content, is_error) = error.map_or_else(
             || {
                 result.map_or_else(
                     || {
@@ -2571,7 +3354,8 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
                     true,
                 )
             },
-        )
+        );
+        (content, is_error, true)
     } else {
         (
             format!(
@@ -2579,24 +3363,92 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
                 agent.task
             ),
             false,
+            false,
         )
     }
 }
 
-/// Execute the `TaskStop` tool.
-pub fn execute_task_stop_tool<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
+/// Legacy output projection retained for compatibility tests.
+pub fn execute_agent_output_tool<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    let (content, is_error, _) = execute_agent_output_tool_with_receipt(owner, args);
+    (content, is_error)
+}
+
+/// Canonical output adapter.
+///
+/// Consuming a finished failed agent removes its manager entry; preserve that
+/// mutation as partial rather than releasing the enclosing effect reservation
+/// merely because the agent itself failed.
+pub fn execute_agent_output_tool_typed<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> crate::tools::ToolHandlerResult {
+    let (content, is_error, effect_started) = execute_agent_output_tool_with_receipt(owner, args);
+    bind_subagent_legacy_result(content, is_error, effect_started)
+}
+
+fn execute_task_stop_tool_with_receipt<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool, bool) {
     let agent_id = match args.arg_str_strict("agent_id") {
         Ok(agent_id) => agent_id,
-        Err(err) => return err.into_tool_error(),
+        Err(err) => {
+            let (message, is_error) = err.into_tool_error();
+            return (message, is_error, false);
+        }
     };
     let reason = match args.arg_str_opt_strict("reason") {
         Ok(reason) => reason.unwrap_or("stopped by task_stop"),
-        Err(err) => return err.into_tool_error(),
+        Err(err) => {
+            let (message, is_error) = err.into_tool_error();
+            return (message, is_error, false);
+        }
     };
+    let canonical_task = BACKGROUND_AGENTS.canonical_task_for_run(owner, agent_id);
+    let message = match BACKGROUND_AGENTS.stop(owner, agent_id, reason) {
+        Ok(message) => message,
+        Err(error) => return (error, true, false),
+    };
+    if let Some(task_id) = canonical_task {
+        if let Err(error) = transition_canonical_delegation(
+            owner,
+            &task_id,
+            agent_id,
+            crate::session::TaskUpdateStatus::Canceled,
+        ) {
+            return (
+                format!(
+                    "{message}\nAgent stopped, but canonical delegation cancellation failed: {error}"
+                ),
+                true,
+                true,
+            );
+        }
+    }
+    (message, false, true)
+}
 
-    BACKGROUND_AGENTS
-        .stop(agent_id, reason)
-        .map_or_else(|err| (err, true), |msg| (msg, false))
+/// Execute the `TaskStop` tool through its legacy tuple projection.
+pub fn execute_task_stop_tool<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    let (content, is_error, _) = execute_task_stop_tool_with_receipt(owner, args);
+    (content, is_error)
+}
+
+/// Canonical stop adapter that preserves an already-observed cancellation as
+/// a partial outcome if durable task-graph reconciliation then fails.
+pub fn execute_task_stop_tool_typed<S: BuildHasher>(
+    owner: &crate::tools::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> crate::tools::ToolHandlerResult {
+    let (content, is_error, effect_started) = execute_task_stop_tool_with_receipt(owner, args);
+    bind_subagent_legacy_result(content, is_error, effect_started)
 }
 
 #[cfg(test)]
@@ -2606,9 +3458,239 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    fn test_run() -> &'static Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
+    fn isolated_test_run(provider: &str) -> Arc<crate::tools::ToolRunContext> {
+        crate::tools::ToolRunContext::builder(
+            crate::state::SessionId::new(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider(provider)
+        .build()
+        .expect("explicit isolated subagent test run")
+    }
+
+    /// Keeps older lifecycle-focused tests compact while exercising the new
+    /// exact-run API. Cross-run behavior is covered independently below and
+    /// in `background_agent_manager_e2e`.
+    struct TestBackgroundAgentManager {
+        inner: BackgroundAgentManager,
+        owner: Arc<crate::tools::ToolRunContext>,
+    }
+
+    impl TestBackgroundAgentManager {
+        fn new() -> Self {
+            Self {
+                inner: BackgroundAgentManager::new(),
+                owner: Arc::clone(test_run()),
+            }
+        }
+
+        fn register(&self, agent_type: AgentType, task: &str) -> String {
+            self.inner
+                .register(&self.owner, agent_type, task)
+                .expect("test agent registration")
+        }
+
+        fn register_with_id(&self, agent_type: AgentType, task: &str, id: &str) -> bool {
+            self.inner
+                .register_with_id(&self.owner, agent_type, task, id)
+                .expect("test agent registration with id")
+        }
+
+        fn get(&self, id: &str) -> Option<Arc<BackgroundAgent>> {
+            self.inner.get_for_run(&self.owner, id)
+        }
+
+        fn increment_turns(&self, id: &str) -> u64 {
+            self.inner.increment_turns(&self.owner, id)
+        }
+
+        fn finish(&self, id: &str, result: String) {
+            self.inner.finish(&self.owner, id, result);
+        }
+
+        fn fail(&self, id: &str, error: String) {
+            self.inner.fail(&self.owner, id, error);
+        }
+
+        fn attach_abort_handle(
+            &self,
+            id: &str,
+            abort_handle: tokio::task::AbortHandle,
+        ) -> Result<(), String> {
+            self.inner
+                .attach_abort_handle(&self.owner, id, abort_handle)
+        }
+
+        fn stop(&self, id: &str, reason: &str) -> Result<String, String> {
+            self.inner.stop(&self.owner, id, reason)
+        }
+
+        fn gc(&self) -> usize {
+            self.inner.gc()
+        }
+
+        fn cleanup_finished(&self) -> usize {
+            self.inner.cleanup_finished_for_run(&self.owner)
+        }
+    }
+
+    #[test]
+    fn canonical_delegation_guard_commits_success_drop_failure_and_stable_resume() {
+        let root = tempfile::tempdir().expect("delegation graph root");
+        let owner = isolated_test_run("delegation-graph-test");
+        let graph_id = "delegation-lifecycle";
+        let target = std::path::PathBuf::from("tasks.json");
+        let open_manager = || {
+            crate::session::TaskManager::open(
+                root.path(),
+                target.clone(),
+                graph_id,
+                crate::task_graph::TaskActor::from_run(&owner),
+            )
+            .expect("open task manager")
+        };
+        let agent_id = BACKGROUND_AGENTS
+            .register(&owner, AgentType::Plan, "delegated lifecycle")
+            .expect("register agent");
+
+        let guard = DelegationTaskGuard::begin_with_manager(
+            &owner,
+            open_manager(),
+            &agent_id,
+            "delegated lifecycle",
+        )
+        .expect("begin delegation");
+        let stable_task_id = guard.task_id.clone();
+        assert_eq!(
+            guard
+                .manager
+                .get_task(&stable_task_id)
+                .expect("running task")
+                .status,
+            crate::session::TaskStatus::InProgress
+        );
+        guard
+            .finish(crate::session::TaskUpdateStatus::Completed)
+            .expect("complete delegation");
+        let completed = open_manager();
+        let completed_task = completed.get_task(&stable_task_id).expect("completed task");
+        assert_eq!(completed_task.status, crate::session::TaskStatus::Completed);
+        assert!(completed_task.terminal_at.is_some());
+
+        let resumed = DelegationTaskGuard::begin_with_manager(
+            &owner,
+            open_manager(),
+            &agent_id,
+            "delegated lifecycle revised",
+        )
+        .expect("resume delegation");
+        assert_eq!(resumed.task_id, stable_task_id);
+        let mut external_stop = open_manager();
+        external_stop
+            .update_delegation_task(
+                &stable_task_id,
+                &agent_id,
+                None,
+                crate::session::TaskUpdateStatus::Canceled,
+                None,
+            )
+            .expect("external cancellation");
+        let stale_completion = resumed
+            .finish(crate::session::TaskUpdateStatus::Completed)
+            .expect_err("late completion must not overwrite cancellation");
+        assert!(stale_completion.contains("stale"), "{stale_completion}");
+        assert_eq!(
+            open_manager()
+                .get_task(&stable_task_id)
+                .expect("canceled task")
+                .status,
+            crate::session::TaskStatus::Canceled
+        );
+
+        let dropped = DelegationTaskGuard::begin_with_manager(
+            &owner,
+            open_manager(),
+            &agent_id,
+            "delegated lifecycle final attempt",
+        )
+        .expect("resume after cancellation");
+        assert_eq!(dropped.task_id, stable_task_id);
+        drop(dropped);
+        let failed = open_manager();
+        assert_eq!(
+            failed
+                .get_task(&stable_task_id)
+                .expect("failed task")
+                .status,
+            crate::session::TaskStatus::Failed
+        );
+        assert_eq!(
+            BACKGROUND_AGENTS.canonical_task_for_run(&owner, &agent_id),
+            Some(stable_task_id)
+        );
+        let _ = BACKGROUND_AGENTS.remove_for_run(&owner, &agent_id);
+    }
+
+    #[test]
+    fn delegation_binding_failure_settles_created_task_as_failed() {
+        let root = tempfile::tempdir().expect("delegation graph root");
+        let owner = isolated_test_run("delegation-binding-failure");
+        let target = std::path::PathBuf::from("tasks.json");
+        let open_manager = || {
+            crate::session::TaskManager::open(
+                root.path(),
+                target.clone(),
+                "delegation-binding-failure",
+                crate::task_graph::TaskActor::from_run(&owner),
+            )
+            .expect("open task manager")
+        };
+        let agent_id = BACKGROUND_AGENTS
+            .register(&owner, AgentType::Plan, "delegated lifecycle")
+            .expect("register agent");
+        BACKGROUND_AGENTS
+            .bind_canonical_task(&owner, &agent_id, "preexisting-conflict")
+            .expect("prebind conflicting task");
+
+        let error = DelegationTaskGuard::begin_with_manager(
+            &owner,
+            open_manager(),
+            &agent_id,
+            "delegated lifecycle",
+        )
+        .err()
+        .expect("conflicting binding must fail");
+        assert!(error.contains("different canonical task"), "{error}");
+        let manager = open_manager();
+        let task = manager
+            .list_tasks()
+            .iter()
+            .find(|task| {
+                matches!(
+                    &task.source,
+                    crate::task_graph::TaskSource::Delegation { agent_id: source }
+                        if source == &agent_id
+                )
+            })
+            .expect("settled delegation task");
+        assert_eq!(task.status, crate::session::TaskStatus::Failed);
+        let _ = BACKGROUND_AGENTS.remove_for_run(&owner, &agent_id);
+    }
+
     #[test]
     fn worktree_git_helpers_use_resolved_binary_path() {
-        let git = git_bin().expect("subagent tests require git on PATH");
+        let git = git_bin(test_run()).expect("subagent tests require git on the run-bound PATH");
         assert!(
             git.is_absolute(),
             "git_bin must resolve git to an absolute path, got {}",
@@ -2637,13 +3719,21 @@ mod tests {
         let agent_id = "subagent-tool-result-ledger-test";
         let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
         let _guard = crate::ledger::install_active_ledger_for_session(agent_id, ledger.clone());
-        let result = crate::tools::ToolResult {
-            tool_call_id: "call_1".to_string(),
-            content: "model-visible tool output".to_string(),
-            is_error: false,
+        let tool_call = crate::tools::ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "list_files".to_string(),
+                arguments: "{}".to_string(),
+            },
         };
+        let result = crate::tools::ToolResult::bind(
+            &tool_call,
+            &tool_call.function.name,
+            crate::tools::ToolHandlerResult::success_text("model-visible tool output"),
+        );
 
-        observe_subagent_tool_result(agent_id, "list_files", &result);
+        observe_subagent_tool_result(test_run(), agent_id, &result);
 
         let observations = {
             let ledger = ledger.lock().expect("ledger lock");
@@ -2778,7 +3868,7 @@ mod tests {
                 base_url,
                 api_key: None,
                 model: Some("gpt-5.5".to_string()),
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -2786,12 +3876,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_no_tool_plain_final_is_allowed() {
-        let agent_id = "subagent-no-tool-final-allowed";
+    async fn subagent_provider_failure_redacts_seeded_api_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SECRET: &str = "s025-subagent-api-key-e1f85c";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "message": format!("provider echoed {SECRET}"),
+                    "api_key": SECRET,
+                }
+            })))
+            .mount(&server)
+            .await;
+        let key = crate::providers::ApiKey::try_from_string(SECRET.to_string()).expect("API key");
+        let request = serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let error = make_api_call(
+            &reqwest::Client::new(),
+            "openai",
+            &server.uri(),
+            Some(&key),
+            &request,
+        )
+        .await
+        .expect_err("provider failure must surface as an error");
+
+        assert!(!error.contains(SECRET), "subagent leaked API key: {error}");
+        assert!(error.contains(crate::secrets::REDACTED_SECRET), "{error}");
+        assert!(error.len() <= crate::secrets::MAX_DIAGNOSTIC_BYTES + 64);
+    }
+
+    #[tokio::test]
+    async fn subagent_binds_guardrails_before_any_provider_turn() {
+        let mut app_config = issue719_app_config();
+        app_config.guardrails.blast_radius = Some(crate::config::BlastRadiusConfig {
+            enabled: true,
+            mode: crate::config::GuardrailMode::Strict,
+            allowed_paths: vec!["src/../forbidden/**".to_string()],
+            ..crate::config::BlastRadiusConfig::default()
+        });
+        let config = SubagentConfig {
+            agent_type: AgentType::GeneralPurpose,
+            task: "Must fail before provider dispatch".to_string(),
+            prompt: "No request should leave the process".to_string(),
+            run_in_background: false,
+            model_override: None,
+            resume_agent_id: None,
+            isolation: None,
+        };
+
+        let result = run_subagent(test_run(), &config, &app_config, &Client::new()).await;
+
+        assert!(!result.success);
+        assert_eq!(result.turns_used, 0);
+        assert!(
+            result.output.contains("Cannot bind subagent guardrails"),
+            "unexpected child-startup failure: {}",
+            result.output
+        );
+        assert!(result.output.contains("parent traversal"));
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &result.agent_id);
+    }
+
+    #[test]
+    fn task_tool_receipt_distinguishes_validation_error_from_started_failure() {
+        let empty = HashMap::<String, Value>::new();
+        let validation = execute_task_tool_typed(test_run(), &empty, &issue719_app_config(), None);
+        assert!(matches!(
+            validation.outcome,
+            crate::tools::ToolOutcome::Error { .. }
+        ));
+
+        let marker = "s-021-invalid-child-guardrail-receipt";
+        let mut app_config = issue719_app_config();
+        app_config.guardrails.blast_radius = Some(crate::config::BlastRadiusConfig {
+            enabled: true,
+            mode: crate::config::GuardrailMode::Strict,
+            allowed_paths: vec!["src/../forbidden/**".to_string()],
+            ..crate::config::BlastRadiusConfig::default()
+        });
+        let args = HashMap::from([
+            ("description".to_string(), json!(marker)),
+            ("prompt".to_string(), json!("fail before provider dispatch")),
+            ("subagent_type".to_string(), json!("explore")),
+        ]);
+
+        let started = execute_task_tool_typed(test_run(), &args, &app_config, None);
+
+        assert!(
+            matches!(&started.outcome, crate::tools::ToolOutcome::Partial { .. }),
+            "registered child failure must retain a partial receipt: {}",
+            started.content()
+        );
+        assert!(started
+            .content()
+            .contains("Cannot bind subagent guardrails"));
+        for (id, _, task, _) in BACKGROUND_AGENTS.list_for_run(test_run()) {
+            if task == marker {
+                let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &id);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_output_failed_consumption_is_typed_partial() {
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Explore, "s-021-failed-output")
+            .expect("register failed output fixture");
+        BACKGROUND_AGENTS.fail(test_run(), &id, "provider failed".to_string());
+        let args = HashMap::from([("agent_id".to_string(), json!(id))]);
+
+        let result = execute_agent_output_tool_typed(test_run(), &args);
+
+        assert!(
+            matches!(&result.outcome, crate::tools::ToolOutcome::Partial { .. }),
+            "failed output removal is a real effect"
+        );
+        assert!(result.content().contains("provider failed"));
+    }
+
+    #[tokio::test]
+    async fn subagent_no_tool_plain_final_is_denied() {
+        let agent_id = "subagent-no-tool-final-denied";
         let ledger_path =
             crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
         let _ = std::fs::remove_file(&ledger_path);
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
 
         let final_content = "Verified with cargo check.";
         let (server, base_url) = spawn_openai_no_tool_final_server(final_content);
@@ -2807,7 +4024,16 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = run_subagent_inner(&config, &app_config, &client, Some(agent_id)).await;
+        let result = run_subagent_inner(
+            test_run(),
+            &config,
+            &app_config,
+            &client,
+            None,
+            Some(agent_id),
+            None,
+        )
+        .await;
         let server_result = server.join().expect("mock provider thread joined");
 
         assert!(
@@ -2815,24 +4041,26 @@ mod tests {
             "mock provider failed: {:?}",
             server_result.err()
         );
+        assert!(!result.success, "plain no-tool final must fail");
         assert!(
-            result.success,
-            "plain no-tool final should pass; output={}",
+            result
+                .output
+                .contains("final answer must use the typed final claim envelope"),
+            "unexpected grounding denial: {}",
             result.output
         );
-        assert_eq!(result.output, final_content);
 
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
         let _ = std::fs::remove_file(ledger_path);
     }
 
     #[tokio::test]
-    async fn subagent_no_tool_conversational_final_is_allowed() {
-        let agent_id = "subagent-no-tool-greeting-final-allowed";
+    async fn subagent_no_tool_conversational_final_is_denied() {
+        let agent_id = "subagent-no-tool-greeting-final-denied";
         let ledger_path =
             crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
         let _ = std::fs::remove_file(&ledger_path);
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
 
         let (server, base_url) = spawn_openai_no_tool_final_server("Good morning!");
         let app_config = local_subagent_app_config(base_url);
@@ -2847,7 +4075,16 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = run_subagent_inner(&config, &app_config, &client, Some(agent_id)).await;
+        let result = run_subagent_inner(
+            test_run(),
+            &config,
+            &app_config,
+            &client,
+            None,
+            Some(agent_id),
+            None,
+        )
+        .await;
         let server_result = server.join().expect("mock provider thread joined");
 
         assert!(
@@ -2855,14 +4092,16 @@ mod tests {
             "mock provider failed: {:?}",
             server_result.err()
         );
+        assert!(!result.success, "plain conversational final must fail");
         assert!(
-            result.success,
-            "plain no-tool final should pass; output={}",
+            result
+                .output
+                .contains("final answer must use the typed final claim envelope"),
+            "unexpected grounding denial: {}",
             result.output
         );
-        assert_eq!(result.output, "Good morning!");
 
-        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), agent_id);
         let _ = std::fs::remove_file(ledger_path);
     }
 
@@ -2968,6 +4207,214 @@ mod tests {
                 .as_str(),
             Some("agent_output")
         );
+    }
+
+    #[test]
+    fn subagent_memory_tools_are_service_gated_and_role_scoped() {
+        for agent_type in AgentType::ALL {
+            assert!(available_subagent_tools(*agent_type, false)
+                .iter()
+                .all(|name| !name.starts_with("memory_")));
+        }
+
+        let general = available_subagent_tools(AgentType::GeneralPurpose, true);
+        for name in [
+            "memory_search",
+            "memory_list",
+            "memory_learning_status",
+            "memory_conflicts",
+            "memory_save",
+            "memory_update",
+            "memory_delete",
+            "memory_source_status",
+            "memory_source_refresh",
+        ] {
+            assert!(general.contains(&name), "general agent is missing {name}");
+        }
+        let plan = available_subagent_tools(AgentType::Plan, true);
+        assert!(!general.contains(&"memory_review"));
+        assert!(!general.contains(&"memory_export"));
+        assert!(!general.contains(&"memory_import"));
+        assert!(plan.contains(&"memory_search"));
+        assert!(plan.contains(&"memory_list"));
+        assert!(plan.contains(&"memory_learning_status"));
+        assert!(plan.contains(&"memory_conflicts"));
+        assert!(plan.contains(&"memory_source_status"));
+        assert!(!plan.contains(&"memory_save"));
+        assert!(!plan.contains(&"memory_update"));
+        assert!(!plan.contains(&"memory_delete"));
+        assert!(!plan.contains(&"memory_source_refresh"));
+        for agent_type in AgentType::ALL {
+            assert!(
+                !available_subagent_tools(*agent_type, true).contains(&"memory_review"),
+                "subagent role {agent_type:?} has no direct host approval channel"
+            );
+            assert!(
+                !available_subagent_tools(*agent_type, true).contains(&"memory_export")
+                    && !available_subagent_tools(*agent_type, true).contains(&"memory_import"),
+                "subagent role {agent_type:?} has no direct host approval channel"
+            );
+        }
+    }
+
+    #[test]
+    fn every_subagent_role_publishes_its_entire_host_allowlist() {
+        let root = tempfile::tempdir().expect("subagent catalog root");
+        let all_tools = crate::tools::get_tool_definitions();
+        let all_tools = all_tools.as_array().expect("tool definitions array");
+
+        for agent_type in AgentType::ALL {
+            let run = crate::tools::security::test_run_context_for(root.path());
+            let allowed = available_subagent_tools(*agent_type, true);
+            let filtered = all_tools
+                .iter()
+                .filter(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| allowed.contains(&name))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let filtered = add_subagent_typed_decision_contracts(filtered);
+            let snapshot = run
+                .tool_catalog()
+                .snapshot(&run, &[], &filtered)
+                .unwrap_or_else(|error| panic!("{} catalog failed: {error}", agent_type.name()));
+            assert!(
+                snapshot.full_catalog_fallback,
+                "{} has no tool_search bootstrap, so its bounded host allowlist must publish whole",
+                agent_type.name()
+            );
+            assert_eq!(snapshot.definitions.len(), filtered.len());
+        }
+    }
+
+    #[test]
+    fn subagent_executor_propagates_automatic_learning_policy() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("subagent learning workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), workspace.path())
+                .working_directory(workspace.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .provider("subagent-learning-test")
+                .build()
+                .expect("subagent learning run");
+        let memory = crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("subagent workspace memory");
+        let config: AppConfig = serde_yaml::from_str(
+            r"
+proxy:
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+memory:
+  automatic_learning_enabled: true
+",
+        )
+        .expect("subagent learning config");
+        let mut tasks = crate::session::TaskManager::for_run(&run).expect("subagent task manager");
+        let permissions = crate::permissions::PermissionManager::unrestricted_for_run(&run);
+        let policy = crate::services::policy::PolicyEnforcer::new(
+            crate::services::policy::EnterprisePolicy::default(),
+        );
+        let call = crate::tools::ToolCall {
+            id: "subagent-learning-write".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/subagent_learning.rs",
+                    "content": "pub const SUBAGENT_POLICY_PROPAGATED: bool = true;\n"
+                })
+                .to_string(),
+            },
+        };
+
+        let result = execute_subagent_local_tool(&mut SubagentToolExecution {
+            run: &run,
+            tool_call: &call,
+            memory_db: Some(&memory),
+            app_config: &config,
+            task_manager: &mut tasks,
+            permission_manager: &permissions,
+            agent_id: "subagent-learning-policy",
+            policy_enforcer: &policy,
+        });
+        assert!(
+            !result.is_error(),
+            "subagent write failed: {}",
+            result.content()
+        );
+        assert!(result.observations().iter().any(|observation| {
+            observation.kind == "technical_learning_capture" && !observation.authoritative
+        }));
+        crate::tools::retire_run(&run);
+    }
+
+    #[test]
+    fn subagent_reopens_only_the_exact_workspace_bound_memory_store() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let memory = crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("workspace memory");
+        let expected_store = memory.store_id().expect("store id");
+        let expected_workspace = memory.workspace_id().expect("workspace id").clone();
+        let reopened = reopen_subagent_memory(Some(&memory))
+            .expect("reopen memory")
+            .expect("memory service");
+        assert_eq!(reopened.store_id().expect("reopened store"), expected_store);
+        assert_eq!(reopened.workspace_id(), Some(&expected_workspace));
+
+        let unbound_path = host.path().join("unbound.db");
+        let unbound = crate::memory::MemoryDb::open(&unbound_path).expect("unbound store");
+        assert!(reopen_subagent_memory(Some(&unbound)).is_err());
+    }
+
+    #[test]
+    fn subagent_reopen_retains_the_exact_authenticated_team_replica() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let principal: crate::team_memory::PrincipalId = "owner".parse().expect("principal");
+        let authority = crate::team_memory::TeamAuthorityStore::bootstrap(
+            host.path(),
+            workspace.path(),
+            principal,
+            31_536_000,
+        )
+        .expect("team authority");
+        let memory = crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+            .expect("workspace memory");
+        crate::team_memory::activate_team_memory(
+            &memory,
+            host.path(),
+            workspace.path(),
+            authority.team_id().clone(),
+        )
+        .expect("activate team memory");
+        let parent_status = memory
+            .team_replica()
+            .expect("parent team replica")
+            .status()
+            .expect("parent status");
+
+        let reopened = reopen_subagent_memory(Some(&memory))
+            .expect("reopen memory")
+            .expect("subagent memory");
+        let child_status = reopened
+            .team_replica()
+            .expect("subagent team replica")
+            .status()
+            .expect("subagent status");
+        assert_eq!(child_status, parent_status);
     }
 
     #[test]
@@ -3119,8 +4566,9 @@ mod tests {
         let ledger = crate::ledger::RealityLedger::new();
         let args = json!({"command": "cargo test"});
 
-        let err = validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
-            .expect_err("missing decision must be rejected");
+        let err =
+            validate_subagent_tool_decision_against_ledger(test_run(), "bash", &args, &ledger)
+                .expect_err("missing decision must be rejected");
 
         assert!(
             err.contains("requires arguments.decision"),
@@ -3132,7 +4580,7 @@ mod tests {
     fn subagent_tool_decision_accepts_grounded_command_decision() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task("Run the focused test command")
+            .observe_user_task(test_run(), "Run the focused test command", "test-model")
             .expect("task observation");
         let args = json!({
             "command": "cargo test --lib subagent_tool_decision",
@@ -3144,7 +4592,7 @@ mod tests {
             }
         });
 
-        validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
+        validate_subagent_tool_decision_against_ledger(test_run(), "bash", &args, &ledger)
             .expect("grounded command decision must be accepted");
     }
 
@@ -3152,7 +4600,7 @@ mod tests {
     fn subagent_tool_decision_rejects_mismatched_command_argv() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let task = ledger
-            .observe_user_task("Run tests")
+            .observe_user_task(test_run(), "Run tests", "test-model")
             .expect("task observation");
         let args = json!({
             "command": "cargo test",
@@ -3164,8 +4612,9 @@ mod tests {
             }
         });
 
-        let err = validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
-            .expect_err("mismatched argv must be rejected");
+        let err =
+            validate_subagent_tool_decision_against_ledger(test_run(), "bash", &args, &ledger)
+                .expect_err("mismatched argv must be rejected");
 
         assert!(err.contains("argv must match"), "unexpected error: {err}");
     }
@@ -3174,7 +4623,7 @@ mod tests {
     fn subagent_tool_decision_accepts_grounded_edit_decision() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let read = ledger
-            .observe_file_read("src/lib.rs", "old\n", 1, 1, "old")
+            .observe_file_read(test_run(), "src/lib.rs", "old\n", 1, 1, "old")
             .expect("file observation");
         let args = json!({
             "path": "src/lib.rs",
@@ -3188,7 +4637,7 @@ mod tests {
             }
         });
 
-        validate_subagent_tool_decision_against_ledger("edit_file", &args, &ledger)
+        validate_subagent_tool_decision_against_ledger(test_run(), "edit_file", &args, &ledger)
             .expect("grounded edit decision must be accepted");
     }
 
@@ -3196,7 +4645,7 @@ mod tests {
     fn subagent_tool_decision_rejects_edit_patch_for_different_path() {
         let mut ledger = crate::ledger::RealityLedger::new();
         let read = ledger
-            .observe_file_read("src/lib.rs", "old\n", 1, 1, "old")
+            .observe_file_read(test_run(), "src/lib.rs", "old\n", 1, 1, "old")
             .expect("file observation");
         let args = json!({
             "path": "src/lib.rs",
@@ -3210,8 +4659,9 @@ mod tests {
             }
         });
 
-        let err = validate_subagent_tool_decision_against_ledger("edit_file", &args, &ledger)
-            .expect_err("path mismatch must be rejected");
+        let err =
+            validate_subagent_tool_decision_against_ledger(test_run(), "edit_file", &args, &ledger)
+                .expect_err("path mismatch must be rejected");
 
         assert!(err.contains("tool path"), "unexpected error: {err}");
     }
@@ -3244,7 +4694,7 @@ mod tests {
 
     #[test]
     fn test_background_agent_manager() {
-        let manager = BackgroundAgentManager::new();
+        let manager = TestBackgroundAgentManager::new();
 
         // Register an agent
         let id = manager.register(AgentType::Explore, "Test task");
@@ -3488,7 +4938,7 @@ mod tests {
     /// opaque 8-char UUID prefix — format differs, behavior is pinned as-is.
     #[test]
     fn spec1_run_in_background_registers_agent_returns_id() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let id = mgr.register(AgentType::Explore, "scan codebase for dead code");
         assert_eq!(id.len(), 8, "OC uses 8-char UUID prefix (safe_truncate)");
 
@@ -3503,7 +4953,7 @@ mod tests {
     /// the `agent_id`, task description, and a hint to use `agent_output`.
     #[test]
     fn spec1_background_message_format() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let id = mgr.register(AgentType::Plan, "design the auth layer");
 
         // Simulate the format string from execute_task_tool (line ~1333).
@@ -3522,7 +4972,7 @@ mod tests {
     /// has no result. `is_error` is `false` for a background spawn.
     #[test]
     fn spec1_is_error_false_and_not_finished_at_spawn() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let id = mgr.register(AgentType::GeneralPurpose, "refactor module");
         let agent = mgr.get(&id).expect("must exist after register");
 
@@ -3541,7 +4991,7 @@ mod tests {
             ("run_in_background".to_string(), json!("true")),
         ]);
 
-        let (msg, is_err) = execute_task_tool(&args, &app_config);
+        let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
 
         assert!(is_err, "non-boolean run_in_background must error: {msg}");
         assert!(
@@ -3572,7 +5022,7 @@ mod tests {
             ]);
             args.insert(field.to_string(), json!(42));
 
-            let (msg, is_err) = execute_task_tool(&args, &app_config);
+            let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
 
             assert!(is_err, "{field} must reject non-string values: {msg}");
             assert!(msg.contains(expected), "unexpected error: {msg}");
@@ -3595,7 +5045,7 @@ mod tests {
             ]);
             args.insert(field.to_string(), json!(42));
 
-            let (msg, is_err) = execute_task_tool(&args, &app_config);
+            let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
 
             assert!(is_err, "{field} must reject non-string values: {msg}");
             assert!(msg.contains(expected), "unexpected error: {msg}");
@@ -3609,7 +5059,7 @@ mod tests {
             ("block".to_string(), json!("true")),
         ]);
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
 
         assert!(is_err, "non-boolean block must error: {msg}");
         assert!(
@@ -3622,7 +5072,7 @@ mod tests {
     fn agent_output_rejects_non_string_agent_id_when_present() {
         let args = HashMap::from([("agent_id".to_string(), json!(42))]);
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
 
         assert!(is_err, "non-string agent_id must error: {msg}");
         assert!(
@@ -3638,7 +5088,7 @@ mod tests {
     /// `success=false` with the "No transcript found" message.
     #[test]
     fn spec2_resume_miss_returns_not_found_error() {
-        let missing = load_transcript("00000000-dead-beef-0000-000000000000");
+        let missing = load_transcript(test_run(), "00000000-dead-beef-0000-000000000000");
         assert!(
             missing.is_none(),
             "unknown agent_id must return None from transcript store"
@@ -3655,13 +5105,34 @@ mod tests {
             json!({"role": "assistant", "content": "Done."}),
         ];
         let fake_id = format!("tt-{}", Uuid::new_v4());
-        store_transcript(&fake_id, msgs.clone(), AgentType::Explore);
+        store_transcript(test_run(), &fake_id, msgs.clone(), AgentType::Explore);
 
-        let loaded = load_transcript(&fake_id).expect("stored transcript must be loadable");
+        let loaded =
+            load_transcript(test_run(), &fake_id).expect("stored transcript must be loadable");
         assert_eq!(loaded.0.len(), msgs.len());
         assert_eq!(loaded.1, AgentType::Explore);
         assert_eq!(loaded.0[0]["role"].as_str(), Some("system"));
         assert_eq!(loaded.0[2]["content"].as_str(), Some("Done."));
+    }
+
+    #[test]
+    fn transcript_resume_is_bound_to_exact_owner_run() {
+        let owner = isolated_test_run("transcript-owner");
+        let foreign = isolated_test_run("transcript-foreign");
+        let id = format!("s019-transcript-{}", Uuid::new_v4());
+        let messages = vec![json!({"role": "assistant", "content": "owner-only"})];
+
+        store_transcript(&owner, &id, messages.clone(), AgentType::Explore);
+
+        assert!(
+            load_transcript(&foreign, &id).is_none(),
+            "foreign run must observe the transcript as absent"
+        );
+        assert_eq!(
+            load_transcript(&owner, &id),
+            Some((messages, AgentType::Explore)),
+            "foreign lookup must not consume or alter the owner's transcript"
+        );
     }
 
     // ── Crosslink #582: subagent resume reuses original agent_id ──
@@ -3681,12 +5152,13 @@ mod tests {
     fn fix582_task_dispatch_with_resume_id_reuses_id() {
         let original_id = format!("582-reuse-{}", Uuid::new_v4());
         store_transcript(
+            test_run(),
             &original_id,
             vec![json!({"role": "user", "content": "Original turn"})],
             AgentType::Plan,
         );
         assert!(
-            load_transcript(&original_id).is_some(),
+            load_transcript(test_run(), &original_id).is_some(),
             "precondition: transcript must exist"
         );
 
@@ -3695,9 +5167,15 @@ mod tests {
         // code path that now must keep the original id.
         let resume_id_opt: Option<String> = Some(original_id.clone());
         let agent_id = resume_id_opt.as_ref().map_or_else(
-            || BACKGROUND_AGENTS.register(AgentType::Plan, "resume task"),
+            || {
+                BACKGROUND_AGENTS
+                    .register(test_run(), AgentType::Plan, "resume task")
+                    .expect("register fresh test agent")
+            },
             |rid| {
-                BACKGROUND_AGENTS.register_with_id(AgentType::Plan, "resume task", rid);
+                BACKGROUND_AGENTS
+                    .register_with_id(test_run(), AgentType::Plan, "resume task", rid)
+                    .expect("reattach test agent");
                 rid.clone()
             },
         );
@@ -3707,11 +5185,13 @@ mod tests {
             "#582: resume must reuse the original id, not mint a new one"
         );
         assert!(
-            BACKGROUND_AGENTS.get(&agent_id).is_some(),
+            BACKGROUND_AGENTS
+                .get_for_run(test_run(), &agent_id)
+                .is_some(),
             "tracking entry must exist under the reused id"
         );
         assert!(
-            load_transcript(&original_id).is_some(),
+            load_transcript(test_run(), &original_id).is_some(),
             "TRANSCRIPT_STORE entry under the original id must still be reachable"
         );
     }
@@ -3723,16 +5203,24 @@ mod tests {
     fn fix582_task_dispatch_without_resume_generates_fresh_id() {
         let resume_id_opt: Option<String> = None;
         let agent_id = resume_id_opt.as_ref().map_or_else(
-            || BACKGROUND_AGENTS.register(AgentType::Plan, "fresh task"),
+            || {
+                BACKGROUND_AGENTS
+                    .register(test_run(), AgentType::Plan, "fresh task")
+                    .expect("register fresh test agent")
+            },
             |rid| {
-                BACKGROUND_AGENTS.register_with_id(AgentType::Plan, "fresh task", rid);
+                BACKGROUND_AGENTS
+                    .register_with_id(test_run(), AgentType::Plan, "fresh task", rid)
+                    .expect("reattach test agent");
                 rid.clone()
             },
         );
 
         assert_eq!(agent_id.len(), 8, "fresh ids are 8-char UUID prefixes");
         assert!(
-            BACKGROUND_AGENTS.get(&agent_id).is_some(),
+            BACKGROUND_AGENTS
+                .get_for_run(test_run(), &agent_id)
+                .is_some(),
             "fresh-spawn tracking entry must exist"
         );
     }
@@ -3747,11 +5235,11 @@ mod tests {
     fn fix582_resume_unknown_id_errors_does_not_silently_create() {
         let unknown_id = format!("582-unknown-{}", Uuid::new_v4());
         // Precondition: nothing in the store under this id.
-        assert!(load_transcript(&unknown_id).is_none());
+        assert!(load_transcript(test_run(), &unknown_id).is_none());
 
         // Mirror run_subagent's resume branch decision: `load_transcript`
         // returns None → error path produces "No transcript found".
-        let load_result = load_transcript(&unknown_id);
+        let load_result = load_transcript(test_run(), &unknown_id);
         assert!(
             load_result.is_none(),
             "unknown id must miss the transcript store"
@@ -3767,7 +5255,7 @@ mod tests {
 
         // And we deliberately did NOT create a transcript under the id.
         assert!(
-            load_transcript(&unknown_id).is_none(),
+            load_transcript(test_run(), &unknown_id).is_none(),
             "resume miss must not silently materialize a transcript"
         );
     }
@@ -3787,13 +5275,16 @@ mod tests {
             json!({"role": "user", "content": "first prompt"}),
             json!({"role": "assistant", "content": "first reply"}),
         ];
-        store_transcript(&chain_id, turn1.clone(), AgentType::Explore);
+        store_transcript(test_run(), &chain_id, turn1.clone(), AgentType::Explore);
 
         // First resume dispatch: register_with_id is a no-op on the
         // tracking side because we already registered, but the resume
         // path's load+append+re-store cycle must round-trip on the same key.
-        BACKGROUND_AGENTS.register_with_id(AgentType::Explore, "chain task", &chain_id);
-        let (loaded1, t1) = load_transcript(&chain_id).expect("turn-1 transcript must be loadable");
+        BACKGROUND_AGENTS
+            .register_with_id(test_run(), AgentType::Explore, "chain task", &chain_id)
+            .expect("register chain agent");
+        let (loaded1, t1) =
+            load_transcript(test_run(), &chain_id).expect("turn-1 transcript must be loadable");
         assert_eq!(loaded1.len(), turn1.len());
         assert_eq!(t1, AgentType::Explore);
 
@@ -3802,13 +5293,15 @@ mod tests {
         let mut turn2 = loaded1;
         turn2.push(json!({"role": "user", "content": "Continuing from where you left off.\n\nsecond prompt"}));
         turn2.push(json!({"role": "assistant", "content": "second reply"}));
-        store_transcript(&chain_id, turn2.clone(), AgentType::Explore);
+        store_transcript(test_run(), &chain_id, turn2.clone(), AgentType::Explore);
 
         // Second resume dispatch: must see the *combined* history under
         // the same id — proof of transcript / prompt-cache continuity.
-        BACKGROUND_AGENTS.register_with_id(AgentType::Explore, "chain task", &chain_id);
-        let (loaded2, _) =
-            load_transcript(&chain_id).expect("turn-2 transcript must still be at same key");
+        BACKGROUND_AGENTS
+            .register_with_id(test_run(), AgentType::Explore, "chain task", &chain_id)
+            .expect("reattach chain agent");
+        let (loaded2, _) = load_transcript(test_run(), &chain_id)
+            .expect("turn-2 transcript must still be at same key");
         assert_eq!(
             loaded2.len(),
             turn1.len() + 2,
@@ -3822,7 +5315,9 @@ mod tests {
 
         // And only one tracking entry exists under chain_id (no
         // duplicates from the multiple register_with_id calls).
-        assert!(BACKGROUND_AGENTS.get(&chain_id).is_some());
+        assert!(BACKGROUND_AGENTS
+            .get_for_run(test_run(), &chain_id)
+            .is_some());
     }
 
     /// #582 — `register_with_id` is idempotent: a second call with the
@@ -3830,7 +5325,7 @@ mod tests {
     /// `finished` / `turns` / `result`).
     #[test]
     fn fix582_register_with_id_is_idempotent() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let id = format!("582-idem-{}", Uuid::new_v4());
 
         let inserted_first = mgr.register_with_id(AgentType::Plan, "task v1", &id);
@@ -3878,7 +5373,7 @@ mod tests {
             .build()
             .expect("runtime must build");
         rt.block_on(async {
-            let mgr = BackgroundAgentManager::new();
+            let mgr = TestBackgroundAgentManager::new();
             let id = mgr.register(AgentType::GeneralPurpose, "long running task");
             let join = tokio::spawn(async {
                 tokio::time::sleep(std::time::Duration::from_mins(1)).await;
@@ -3935,12 +5430,14 @@ mod tests {
 
     #[test]
     fn spec5_execute_task_stop_tool_marks_agent_failed() {
-        let id = BACKGROUND_AGENTS.register(AgentType::Plan, "stoppable task");
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Plan, "stoppable task")
+            .expect("register stoppable test agent");
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!(id));
         args.insert("reason".to_string(), json!("user cancelled"));
 
-        let (msg, is_err) = execute_task_stop_tool(&args);
+        let (msg, is_err) = execute_task_stop_tool(test_run(), &args);
 
         assert!(!is_err, "task_stop must succeed for running agent: {msg}");
         assert!(
@@ -3948,21 +5445,21 @@ mod tests {
             "reason must be surfaced: {msg}"
         );
         let agent = BACKGROUND_AGENTS
-            .get(&id)
+            .get_for_run(test_run(), &id)
             .expect("stopped agent remains tracked");
         assert!(agent.finished.load(Ordering::SeqCst));
         assert_eq!(
             agent.error.lock().unwrap().as_deref(),
             Some("user cancelled")
         );
-        let _ = BACKGROUND_AGENTS.remove(&id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &id);
     }
 
     #[test]
     fn task_stop_rejects_non_string_agent_id() {
         let args = HashMap::from([("agent_id".to_string(), json!(42))]);
 
-        let (msg, is_err) = execute_task_stop_tool(&args);
+        let (msg, is_err) = execute_task_stop_tool(test_run(), &args);
 
         assert!(is_err, "non-string agent_id must error: {msg}");
         assert!(
@@ -3973,20 +5470,22 @@ mod tests {
 
     #[test]
     fn task_stop_rejects_non_string_reason() {
-        let id = BACKGROUND_AGENTS.register(AgentType::Plan, "reason type check");
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Plan, "reason type check")
+            .expect("register reason test agent");
         let args = HashMap::from([
             ("agent_id".to_string(), json!(id)),
             ("reason".to_string(), json!(42)),
         ]);
 
-        let (msg, is_err) = execute_task_stop_tool(&args);
+        let (msg, is_err) = execute_task_stop_tool(test_run(), &args);
 
         assert!(is_err, "non-string reason must error: {msg}");
         assert!(
             msg.contains("Invalid 'reason' argument: expected string"),
             "unexpected error: {msg}"
         );
-        let _ = BACKGROUND_AGENTS.remove(&id);
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &id);
     }
 
     #[test]
@@ -4005,7 +5504,7 @@ mod tests {
             args.insert("subagent_type".to_string(), json!("general-purpose"));
             args.insert("run_in_background".to_string(), json!(true));
 
-            let (msg, is_err) = execute_task_tool(&args, &app_config);
+            let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
             assert!(!is_err, "background task should start: {msg}");
             let agent_id = msg
                 .lines()
@@ -4016,7 +5515,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 loop {
                     if BACKGROUND_AGENTS
-                        .get(&agent_id)
+                        .get_for_run(test_run(), &agent_id)
                         .is_some_and(|agent| agent.finished.load(Ordering::SeqCst))
                     {
                         break;
@@ -4028,7 +5527,7 @@ mod tests {
             .expect("returned agent id must reach a terminal state");
 
             let agent = BACKGROUND_AGENTS
-                .get(&agent_id)
+                .get_for_run(test_run(), &agent_id)
                 .expect("returned id must remain the tracked agent");
             assert!(
                 agent.finished.load(Ordering::SeqCst),
@@ -4038,7 +5537,7 @@ mod tests {
                 agent.error.lock().unwrap().is_some(),
                 "invalid test provider should fail the returned id, not a hidden id"
             );
-            let _ = BACKGROUND_AGENTS.remove(&agent_id);
+            let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &agent_id);
         });
     }
 
@@ -4051,7 +5550,7 @@ mod tests {
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!("00000000-not-registered"));
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
         assert!(is_err, "unknown agent_id must be an error");
         assert!(
             msg.contains("not found"),
@@ -4059,17 +5558,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_output_and_task_stop_reject_foreign_run_ids() {
+        let owner = isolated_test_run("agent-lifecycle-owner");
+        let foreign = isolated_test_run("agent-lifecycle-foreign");
+
+        let finished_id = BACKGROUND_AGENTS
+            .register(&owner, AgentType::Explore, "owner output")
+            .expect("register output agent");
+        BACKGROUND_AGENTS.finish(&owner, &finished_id, "owner-only output".to_string());
+        let output_args = HashMap::from([("agent_id".to_string(), json!(finished_id))]);
+
+        let (foreign_output, foreign_output_error) =
+            execute_agent_output_tool(&foreign, &output_args);
+        assert!(foreign_output_error);
+        assert!(foreign_output.contains("not found"));
+        assert!(BACKGROUND_AGENTS
+            .get_for_run(&owner, &finished_id)
+            .is_some());
+
+        let (owner_output, owner_output_error) = execute_agent_output_tool(&owner, &output_args);
+        assert!(!owner_output_error);
+        assert!(owner_output.contains("owner-only output"));
+
+        let running_id = BACKGROUND_AGENTS
+            .register(&owner, AgentType::Plan, "owner cancellation")
+            .expect("register stoppable agent");
+        let stop_args = HashMap::from([("agent_id".to_string(), json!(running_id))]);
+        let (foreign_stop, foreign_stop_error) = execute_task_stop_tool(&foreign, &stop_args);
+        assert!(foreign_stop_error);
+        assert!(foreign_stop.contains("not found"));
+        assert!(BACKGROUND_AGENTS
+            .get_for_run(&owner, &running_id)
+            .is_some_and(|agent| !agent.finished.load(Ordering::SeqCst)));
+
+        let (owner_stop, owner_stop_error) = execute_task_stop_tool(&owner, &stop_args);
+        assert!(!owner_stop_error, "owner stop failed: {owner_stop}");
+        assert!(owner_stop.contains("stopped"));
+        let _ = BACKGROUND_AGENTS.remove_for_run(&owner, &running_id);
+    }
+
     /// Spec #527 §1 — `agent_output` for a finished agent returns the output text
     /// and `is_error = false`.
     #[test]
     fn spec1_agent_output_finished_agent_returns_result() {
-        let id = BACKGROUND_AGENTS.register(AgentType::Explore, "search task");
-        BACKGROUND_AGENTS.finish(&id, "Found 3 matches.".to_string());
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Explore, "search task")
+            .expect("register successful output test agent");
+        BACKGROUND_AGENTS.finish(test_run(), &id, "Found 3 matches.".to_string());
 
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!(id));
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
         assert!(!is_err, "finished agent must not be an error: {msg}");
         assert!(
             msg.contains("Found 3 matches."),
@@ -4082,13 +5623,15 @@ mod tests {
     /// and the error text.
     #[test]
     fn spec1_agent_output_failed_agent_returns_error() {
-        let id = BACKGROUND_AGENTS.register(AgentType::Plan, "failing task");
-        BACKGROUND_AGENTS.fail(&id, "tool denied".to_string());
+        let id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Plan, "failing task")
+            .expect("register failing output test agent");
+        BACKGROUND_AGENTS.fail(test_run(), &id, "tool denied".to_string());
 
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!(id));
 
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
         assert!(is_err, "failed agent must return is_error=true");
         assert!(msg.contains("tool denied"), "must include error: {msg}");
     }
@@ -4100,7 +5643,7 @@ mod tests {
     /// without sleeping in the test.
     #[test]
     fn issue422_gc_removes_finished_agents_past_ttl() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let stale_id = mgr.register(AgentType::Explore, "stale finished task");
         mgr.finish(&stale_id, "output".to_string());
 
@@ -4126,7 +5669,7 @@ mod tests {
     /// aggressive and drops live work.
     #[test]
     fn issue422_gc_keeps_in_progress_and_recently_finished_agents() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
 
         let running_id = mgr.register(AgentType::Plan, "still running");
         let recent_id = mgr.register(AgentType::Explore, "recently finished");
@@ -4161,39 +5704,43 @@ mod tests {
     #[test]
     fn issue422_agent_output_returns_result_then_removes_finished_entry() {
         // Success path: result text is returned, then the entry vanishes.
-        let ok_id = BACKGROUND_AGENTS.register(AgentType::Explore, "consume-on-read ok");
-        BACKGROUND_AGENTS.finish(&ok_id, "the answer is 42".to_string());
+        let ok_id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Explore, "consume-on-read ok")
+            .expect("register consume-on-read success agent");
+        BACKGROUND_AGENTS.finish(test_run(), &ok_id, "the answer is 42".to_string());
         assert!(
-            BACKGROUND_AGENTS.get(&ok_id).is_some(),
+            BACKGROUND_AGENTS.get_for_run(test_run(), &ok_id).is_some(),
             "agent must exist before retrieval"
         );
 
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert("agent_id".to_string(), json!(ok_id));
-        let (msg, is_err) = execute_agent_output_tool(&args);
+        let (msg, is_err) = execute_agent_output_tool(test_run(), &args);
         assert!(!is_err, "finished agent must not be an error: {msg}");
         assert!(
             msg.contains("the answer is 42"),
             "result must be returned to caller BEFORE removal: {msg}"
         );
         assert!(
-            BACKGROUND_AGENTS.get(&ok_id).is_none(),
+            BACKGROUND_AGENTS.get_for_run(test_run(), &ok_id).is_none(),
             "finished agent must be removed from the manager after agent_output reads it"
         );
 
         // Failure path: error text is returned, then the entry vanishes.
-        let err_id = BACKGROUND_AGENTS.register(AgentType::Plan, "consume-on-read fail");
-        BACKGROUND_AGENTS.fail(&err_id, "synthetic failure".to_string());
+        let err_id = BACKGROUND_AGENTS
+            .register(test_run(), AgentType::Plan, "consume-on-read fail")
+            .expect("register consume-on-read failure agent");
+        BACKGROUND_AGENTS.fail(test_run(), &err_id, "synthetic failure".to_string());
         let mut args2: HashMap<String, Value> = HashMap::new();
         args2.insert("agent_id".to_string(), json!(err_id));
-        let (msg2, is_err2) = execute_agent_output_tool(&args2);
+        let (msg2, is_err2) = execute_agent_output_tool(test_run(), &args2);
         assert!(is_err2, "failed agent must return is_error=true");
         assert!(
             msg2.contains("synthetic failure"),
             "error text must be returned BEFORE removal: {msg2}"
         );
         assert!(
-            BACKGROUND_AGENTS.get(&err_id).is_none(),
+            BACKGROUND_AGENTS.get_for_run(test_run(), &err_id).is_none(),
             "failed agent must be removed from the manager after agent_output reads it"
         );
     }
@@ -4203,7 +5750,7 @@ mod tests {
     /// preserves any still-running ones.
     #[test]
     fn issue422_cleanup_finished_drops_finished_keeps_running() {
-        let mgr = BackgroundAgentManager::new();
+        let mgr = TestBackgroundAgentManager::new();
         let done_a = mgr.register(AgentType::Explore, "done a");
         let done_b = mgr.register(AgentType::Plan, "done b");
         let live = mgr.register(AgentType::GeneralPurpose, "still working");
@@ -4260,7 +5807,7 @@ mod tests {
                     crate::providers::ApiKey::try_from_string("test-key".to_string()).unwrap(),
                 ),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -4304,7 +5851,7 @@ mod tests {
         let mut args = issue719_args();
         args.insert("subagent_type".to_string(), json!("coordinator"));
 
-        let (msg, is_err) = execute_task_tool(&args, &app_config);
+        let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
         assert!(is_err, "coordinator must not be task-spawnable: {msg}");
         assert!(
             msg.contains("Unsupported task subagent_type 'coordinator'"),
@@ -4332,7 +5879,7 @@ mod tests {
             // shape that used to panic via `block_in_place`.
             let app_config = issue719_app_config();
             let args = issue719_args();
-            execute_task_tool(&args, &app_config)
+            execute_task_tool(test_run(), &args, &app_config)
         });
 
         assert!(
@@ -4364,7 +5911,7 @@ mod tests {
         let (msg, is_err) = rt.block_on(async {
             let app_config = issue719_app_config();
             let args = issue719_args();
-            execute_task_tool(&args, &app_config)
+            execute_task_tool(test_run(), &args, &app_config)
         });
 
         assert!(
@@ -4391,7 +5938,7 @@ mod tests {
         // hitting the `Runtime::new()` fallback.
         let app_config = issue719_app_config();
         let args = issue719_args();
-        let (msg, is_err) = execute_task_tool(&args, &app_config);
+        let (msg, is_err) = execute_task_tool(test_run(), &args, &app_config);
 
         assert!(
             is_err,
@@ -4437,6 +5984,7 @@ mod tests {
             store.insert(
                 id,
                 StoredTranscript {
+                    owner_run: test_run().run_id(),
                     messages: vec![json!({"role": "user", "content": "x"})],
                     agent_type: AgentType::Explore,
                     // Stagger timestamps so #0 is unambiguously oldest.
@@ -4476,6 +6024,7 @@ mod tests {
             store.insert(
                 format!("agent-{i:03}"),
                 StoredTranscript {
+                    owner_run: test_run().run_id(),
                     messages: vec![json!({"role": "user", "content": "x"})],
                     agent_type: AgentType::Explore,
                     created_at: base + Duration::from_micros(i_u64),
@@ -4494,6 +6043,7 @@ mod tests {
         store.insert(
             "agent-new".to_string(),
             StoredTranscript {
+                owner_run: test_run().run_id(),
                 messages: vec![json!({"role": "assistant", "content": "new"})],
                 agent_type: AgentType::Plan,
                 created_at: base
@@ -4534,9 +6084,10 @@ mod tests {
             .map(|i| json!({"role": "user", "content": format!("msg {i}")}))
             .collect();
 
-        store_transcript(&id, big, AgentType::Plan);
+        store_transcript(test_run(), &id, big, AgentType::Plan);
 
-        let loaded = load_transcript(&id).expect("just-stored transcript must be loadable");
+        let loaded =
+            load_transcript(test_run(), &id).expect("just-stored transcript must be loadable");
         assert_eq!(
             loaded.0.len(),
             MAX_MESSAGES_PER_TRANSCRIPT,
@@ -4584,6 +6135,7 @@ mod tests {
         store.insert(
             "stale-a".to_string(),
             StoredTranscript {
+                owner_run: test_run().run_id(),
                 messages: vec![],
                 agent_type: AgentType::Explore,
                 created_at: past,
@@ -4592,6 +6144,7 @@ mod tests {
         store.insert(
             "stale-b".to_string(),
             StoredTranscript {
+                owner_run: test_run().run_id(),
                 messages: vec![],
                 agent_type: AgentType::Plan,
                 // Slightly older still; ordering breakup needs unique keys.
@@ -4603,6 +6156,7 @@ mod tests {
         store.insert(
             "fresh".to_string(),
             StoredTranscript {
+                owner_run: test_run().run_id(),
                 messages: vec![],
                 agent_type: AgentType::GeneralPurpose,
                 created_at: now,

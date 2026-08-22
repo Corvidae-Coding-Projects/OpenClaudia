@@ -135,50 +135,18 @@ fn every_adapter_reports_a_name_and_endpoint() {
 // ───────────────────────────────────────────────────────────────────────────
 
 /// CRLF injection: a hostile key value containing `\r\n` MUST NOT split
-/// into two HTTP header lines. The adapters do not directly write to the
-/// HTTP wire — but `get_headers` returns the header values that reqwest
-/// will, and reqwest panics on illegal values. We assert here that no
-/// adapter passes a CRLF-laden value through to its output, so the panic
-/// is reachable as a clear error rather than silent corruption.
+/// into two HTTP header lines. The credential constructor must reject it
+/// before any adapter or request builder can receive the value.
 #[test]
 fn header_values_never_contain_crlf() {
     // Hostile key with a CRLF + injected header attempt.
     let evil_raw = "sk-real\r\nX-Injected: malicious";
-    // Use try_from_string so this test exercises the canonical constructor
-    // path; if a future version rejects CRLF at construction (it currently
-    // does not), the assert below will simply pass via early-out.
-    let Ok(evil) = ApiKey::try_from_string(evil_raw.to_string()) else {
-        // Construction rejected the CRLF — the strongest possible defence.
-        // The header_values_never_contain_crlf invariant is upheld
-        // trivially because no adapter ever sees an evil key.
-        return;
-    };
-    for (name, adapter) in all_adapters() {
-        let headers = adapter.get_headers(&evil);
-        for (k, v) in &headers {
-            assert!(
-                !k.contains('\r') && !k.contains('\n'),
-                "{name}: header name {k:?} contains CRLF"
-            );
-            // Adapters that put the raw key into the value are expected
-            // to forward it verbatim. The contract is that the HTTP
-            // layer rejects it — here we just verify the redaction
-            // guarantee holds: the key must not appear in any header
-            // when API key was redacted. We can't enforce "no CRLF"
-            // because the adapter has no obligation to sanitise.
-            // What we CAN enforce: the Debug output of the headers
-            // collection must not reproduce the raw secret.
-            let dbg = format!("{:?}", (k, v));
-            // Only fail if the EXACT secret marker leaked. We use a
-            // distinctive token so this test doesn't fire on the
-            // benign "sk-" prefix that some providers use as a
-            // header-name prefix.
-            assert!(
-                !dbg.contains("X-Injected: malicious"),
-                "{name}: header debug output leaks the injected payload: {dbg}"
-            );
-        }
-    }
+    // Exercise the canonical constructor rather than relying on reqwest's
+    // later header validation.
+    assert!(
+        ApiKey::try_from_string(evil_raw.to_string()).is_err(),
+        "the typed credential boundary must reject CRLF before any adapter sees it"
+    );
 }
 
 /// `ApiKey::Display` and `ApiKey::Debug` must both redact. The proxy
@@ -848,10 +816,10 @@ async fn anthropic_round_trip_with_wiremock() {
     );
     let api_key = ApiKey::try_from_string("sk-test".to_string()).expect("api key construct");
     let client = reqwest::Client::new();
-    let mut req_builder = client.post(&url).json(&body);
-    for (k, v) in adapter.get_headers(&api_key) {
-        req_builder = req_builder.header(k, v);
-    }
+    let req_builder = adapter
+        .get_headers(&api_key)
+        .apply(client.post(&url).json(&body))
+        .expect("headers");
     let resp = req_builder.send().await.expect("post");
     assert!(
         resp.status().is_success(),
@@ -894,10 +862,10 @@ async fn openai_round_trip_with_wiremock() {
     );
     let api_key = ApiKey::try_from_string("sk-test".to_string()).expect("key");
     let client = reqwest::Client::new();
-    let mut req_builder = client.post(&url).json(&body);
-    for (k, v) in adapter.get_headers(&api_key) {
-        req_builder = req_builder.header(k, v);
-    }
+    let req_builder = adapter
+        .get_headers(&api_key)
+        .apply(client.post(&url).json(&body))
+        .expect("headers");
     let resp = req_builder.send().await.expect("post");
     assert!(resp.status().is_success());
     let value: Value = resp.json().await.expect("json");
@@ -936,10 +904,10 @@ async fn google_round_trip_with_wiremock() {
     );
     let api_key = ApiKey::try_from_string("ya29.test".to_string()).expect("key");
     let client = reqwest::Client::new();
-    let mut req_builder = client.post(&url).json(&body);
-    for (k, v) in adapter.get_headers(&api_key) {
-        req_builder = req_builder.header(k, v);
-    }
+    let req_builder = adapter
+        .get_headers(&api_key)
+        .apply(client.post(&url).json(&body))
+        .expect("headers");
     let resp = req_builder.send().await.expect("post");
     assert!(resp.status().is_success());
     let value: Value = resp.json().await.expect("json");

@@ -1,10 +1,10 @@
-//! A redacting newtype for provider API keys.
+//! A zeroizing, redacting capability for provider API keys.
 //!
 //! The sole purpose of [`ApiKey`] is to make it *structurally impossible* for
 //! a raw secret to land in log output. Every place that formats an `ApiKey`
 //! with `{:?}` or `{}` sees the redacted form. Call sites that need the raw
-//! value (HTTP header construction) must reach for [`ApiKey::as_str`]
-//! explicitly — an audit point that is easy to grep for.
+//! value must pass through the sensitive-header transport boundary. The raw
+//! bytes are never returned as a public `&str`.
 //!
 //! The validation performed by [`ApiKey::try_from_string`] (empty / control
 //! char / non-ASCII rejection) closes the CRLF-injection vector into the
@@ -18,12 +18,13 @@
 //!
 //! * [`Copy`]: keys should never be silently duplicated.
 //! * [`std::hash::Hash`]: secrets are never valid keys in a `HashMap`/`HashSet`.
-//! * `Deref<Target = str>` or `AsRef<str>`: callers must opt-in to raw
-//!   access via [`ApiKey::as_str`]. The name is the audit trail.
+//! * `Deref<Target = str>`, `AsRef<str>`, or a public raw accessor.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use thiserror::Error;
+
+use crate::secrets::{SecretString, SecretValueError};
 
 /// Errors that can occur when constructing an [`ApiKey`] from a raw string.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -58,6 +59,10 @@ pub enum ApiKeyError {
         /// The cap that was exceeded.
         max: usize,
     },
+
+    /// A generic redacted serialization was incorrectly reused as input.
+    #[error("redaction marker cannot be used as an API key")]
+    RedactionMarker,
 }
 
 /// Upper bound on the byte length of an accepted API key.
@@ -67,34 +72,16 @@ pub enum ApiKeyError {
 /// key enough room while refusing 8 KiB attack payloads. See crosslink #452.
 pub const MAX_API_KEY_LEN: usize = 512;
 
-/// A provider API key whose `Debug` and `Display` impls redact the middle of
-/// the value.
+/// A provider API key whose bytes share one zeroizing allocation and whose
+/// `Debug`, `Display`, and generic serialization are fully redacted.
 ///
 /// Construct via [`ApiKey::try_from_string`] (or `serde::Deserialize`, which
-/// delegates to it). Retrieve the raw value for HTTP calls via
-/// [`ApiKey::as_str`].
+/// delegates to it). Provider adapters can clone its opaque secret capability
+/// into [`crate::secrets::SensitiveHeaders`]; no public raw accessor exists.
 #[derive(Clone, PartialEq, Eq)]
-pub struct ApiKey(String);
+pub struct ApiKey(SecretString);
 
 impl ApiKey {
-    /// Borrow the raw key value for genuine cases that need it unredacted
-    /// (notably round-trip persistence — see [`Self::expose_raw_for_serialization`]
-    /// for the audit point used by `Serialize`).
-    ///
-    /// This is **unsafe** in the sense of "easy to misuse, not memory-unsafe":
-    /// the return value MUST NOT be logged, traced, printed, or surfaced in
-    /// error messages. The function name is deliberately verbose so that every
-    /// call site shows up under `git grep expose_raw`.
-    ///
-    /// # Safety
-    /// The caller asserts that the returned `&str` will not escape into any
-    /// log, error, or otherwise human-readable sink. The compiler cannot prove
-    /// this; reviewers must.
-    #[must_use]
-    pub unsafe fn expose_raw_for_serialization(&self) -> &str {
-        &self.0
-    }
-
     /// Attempt to construct an [`ApiKey`] from a raw string.
     ///
     /// # Errors
@@ -104,55 +91,56 @@ impl ApiKey {
     /// [`ApiKeyError::ControlChar`] for input containing any ASCII control
     /// character (covers `\r`, `\n`, `\0`, tabs, …).
     pub fn try_from_string(raw: String) -> Result<Self, ApiKeyError> {
-        if raw.trim().is_empty() {
+        let secret = SecretString::try_from_string(raw).map_err(|error| match error {
+            SecretValueError::TooLong { actual, .. } => ApiKeyError::TooLong {
+                actual,
+                max: MAX_API_KEY_LEN,
+            },
+            SecretValueError::ContainsNul => ApiKeyError::ControlChar { codepoint: 0 },
+            SecretValueError::RedactionMarker => ApiKeyError::RedactionMarker,
+        })?;
+        if secret.expose(|raw| raw.trim().is_empty()) {
             return Err(ApiKeyError::Empty);
         }
-        if raw.len() > MAX_API_KEY_LEN {
+        if secret.len() > MAX_API_KEY_LEN {
             return Err(ApiKeyError::TooLong {
-                actual: raw.len(),
+                actual: secret.len(),
                 max: MAX_API_KEY_LEN,
             });
         }
-        if !raw.is_ascii() {
+        if secret.expose(|raw| !raw.is_ascii()) {
             return Err(ApiKeyError::NonAscii);
         }
-        for c in raw.chars() {
-            if c.is_ascii_control() {
-                return Err(ApiKeyError::ControlChar {
-                    codepoint: c as u32,
-                });
-            }
+        if let Some(codepoint) = secret.expose(|raw| {
+            raw.chars()
+                .find(char::is_ascii_control)
+                .map(|character| character as u32)
+        }) {
+            return Err(ApiKeyError::ControlChar { codepoint });
         }
-        Ok(Self(raw))
+        Ok(Self(secret))
     }
 
-    /// Borrow the raw key value for use in HTTP header construction.
-    ///
-    /// This is the ONE audit point for unredacted access — every other path
-    /// (Debug, Display, Serialize) redacts.
+    /// Compare a candidate without returning the key bytes.
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn matches(&self, candidate: &str) -> bool {
+        self.0.matches(candidate)
+    }
+
+    pub(crate) fn secret(&self) -> SecretString {
+        self.0.clone()
+    }
+
+    pub(crate) fn expose<R>(&self, operation: impl FnOnce(&str) -> R) -> R {
+        self.0.expose(operation)
     }
 }
 
-/// Produce a log-safe fingerprint of an API key.
+/// Produce the stable fully-redacted representation of an API key.
 #[must_use]
 pub fn redact_api_key(raw: &str) -> String {
-    let len = raw.len();
-    if len < 10 {
-        return "<redacted>".to_string();
-    }
-    let head: String = raw.chars().take(4).collect();
-    let tail: String = raw
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}…{tail}")
+    let _ = raw;
+    REDACTED_PLACEHOLDER.to_string()
 }
 
 /// Validate that an API-key string is structurally safe to hand to an HTTP
@@ -173,18 +161,21 @@ pub fn validate_api_key(raw: &str) -> Result<(), String> {
         Err(ApiKeyError::TooLong { actual, max }) => Err(format!(
             "API key is {actual} bytes, exceeding the {max}-byte cap"
         )),
+        Err(ApiKeyError::RedactionMarker) => {
+            Err("redaction marker cannot be used as an API key".to_string())
+        }
     }
 }
 
 impl fmt::Debug for ApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ApiKey({})", redact_api_key(&self.0))
+        f.write_str("ApiKey([REDACTED])")
     }
 }
 
 impl fmt::Display for ApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&redact_api_key(&self.0))
+        f.write_str(REDACTED_PLACEHOLDER)
     }
 }
 
@@ -193,10 +184,8 @@ impl Serialize for ApiKey {
     /// lands in JSON / YAML / debug dumps via `serde_json::to_string`,
     /// `tracing` field formatters, or any other `Serialize`-driven sink.
     ///
-    /// Genuine round-trip persistence (rare; the only legitimate site is
-    /// the proxy's own config rewriter) must reach for
-    /// [`ApiKey::expose_raw_for_serialization`] explicitly so call sites
-    /// are greppable. See crosslink #944.
+    /// Generic persistence is deliberately lossy. Deserialization rejects the
+    /// marker, preventing it from becoming a live credential.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(REDACTED_PLACEHOLDER)
     }
@@ -230,11 +219,7 @@ mod tests {
             "leaked middle: {debug}"
         );
         assert!(!debug.contains("api03-SECRET"), "leaked middle: {debug}");
-        assert!(debug.contains("sk-a"), "missing head fingerprint: {debug}");
-        assert!(
-            debug.contains("TAIL") || debug.contains("…"),
-            "no redaction marker: {debug}"
-        );
+        assert_eq!(debug, "ApiKey([REDACTED])");
     }
 
     #[test]
@@ -247,7 +232,7 @@ mod tests {
             "leaked middle: {shown}"
         );
         assert!(!shown.contains("VALUE_HERE"), "leaked middle: {shown}");
-        assert!(shown.contains('…'), "no ellipsis: {shown}");
+        assert_eq!(shown, REDACTED_PLACEHOLDER);
     }
 
     #[test]
@@ -296,28 +281,15 @@ mod tests {
             "Serialize must not leak the raw key: {json}"
         );
         assert_eq!(json, format!("\"{REDACTED_PLACEHOLDER}\""));
-        // Deserializing the redacted placeholder back yields *that string*
-        // (which still passes validation), NOT the original key — by design,
-        // since reversing redaction would defeat the purpose.
-        let back: ApiKey = serde_json::from_str(&json).expect("deserialize placeholder");
-        assert_ne!(back, key, "round-trip must not recover the original key");
-        // SAFETY: test-only inspection of the raw value to prove the
-        // redaction placeholder was the actual round-trip value.
-        unsafe {
-            assert_eq!(back.expose_raw_for_serialization(), REDACTED_PLACEHOLDER);
-        }
+        assert!(serde_json::from_str::<ApiKey>(&json).is_err());
     }
 
     #[test]
-    fn expose_raw_returns_unredacted_value() {
+    fn candidate_comparison_does_not_return_raw_value() {
         let raw = "sk-ant-api03-EXPOSE-TEST";
         let key = ApiKey::try_from_string(raw.to_string()).expect("valid key");
-        // SAFETY: test asserts the unsafe accessor returns the same bytes
-        // that the safe `as_str` returns — no logging or persistence happens.
-        unsafe {
-            assert_eq!(key.expose_raw_for_serialization(), raw);
-        }
-        assert_eq!(key.as_str(), raw);
+        assert!(key.matches(raw));
+        assert!(!key.matches("different"));
     }
 
     #[test]
@@ -343,10 +315,12 @@ mod tests {
     }
 
     #[test]
-    fn as_str_returns_raw() {
+    fn shared_clone_compares_equal_without_copy_api() {
         let raw = "sk-ant-api03-XXXXXXXXXX";
         let key = ApiKey::try_from_string(raw.to_string()).expect("valid key");
-        assert_eq!(key.as_str(), raw);
+        let clone = key.clone();
+        assert_eq!(key, clone);
+        assert!(clone.matches(raw));
     }
 
     #[test]
@@ -354,7 +328,7 @@ mod tests {
         let key = ApiKey::try_from_string("sk-short1".to_string()).expect("valid key");
         let debug = format!("{key:?}");
         assert!(
-            debug.contains("<redacted>"),
+            debug.contains(REDACTED_PLACEHOLDER),
             "short key not fully redacted: {debug}"
         );
         assert!(!debug.contains("sk-short1"));

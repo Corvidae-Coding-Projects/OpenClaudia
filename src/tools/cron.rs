@@ -208,30 +208,16 @@ impl ScheduleStore {
     }
 }
 
-/// Resolve the schedules path to an absolute location.
+/// Resolve the schedules path against the exact immutable run directory.
 ///
-/// Crosslink #877: the prior implementation returned a bare relative
-/// `PathBuf::from(SCHEDULES_FILE)`, so every cron operation resolved
-/// against whatever the process cwd happened to be at call time. When
-/// the worktree adapter mutated cwd between operations, schedule
-/// load/save silently targeted different files. We now anchor the
-/// path against `std::env::current_dir()` once, producing an absolute
-/// path the caller can rely on for the duration of one tool call.
-///
-/// If `current_dir` itself fails (deleted cwd, FUSE EIO, …) we fall
-/// back to the original relative path rather than panic — surfacing
-/// a `warn!` so the operator can see what happened.
-fn schedules_path() -> PathBuf {
-    match crate::tools::security::current_context() {
-        Ok(context) => context.working_directory().join(SCHEDULES_FILE),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "schedules_path: session context unavailable; using an invalid fail-closed path"
-            );
-            PathBuf::from("/__openclaudia_unavailable__/schedules.json")
-        }
-    }
+/// Crosslink #877 previously resolved a bare relative path against mutable
+/// process CWD. S-019 makes the run capability the sole workspace anchor and
+/// returns a typed denial before any path is materialized when writes are not
+/// granted.
+fn schedules_path(run: &crate::tools::security::ToolRunContext) -> Result<PathBuf, String> {
+    run.require(crate::tools::security::ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    Ok(run.working_directory().join(SCHEDULES_FILE))
 }
 
 /// One cron field's display name and accepted value range.
@@ -345,14 +331,20 @@ fn validate_cron_atom(atom: &str, spec: &CronField) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a cron expression (basic check for 5-field format).
+/// Validate one five-field cron expression without reading or mutating schedule
+/// state.
 ///
-/// Crosslink #901: the field parser now treats `*`, single values,
-/// ranges, steps, and range+step as composable atoms, applied to each
-/// comma-separated piece. Previously `0-30/5 * * * *` and `1,3-5,8 * * * *`
-/// were both rejected because the comma branch parsed each piece as a
-/// flat integer.
-fn validate_cron(expr: &str) -> Result<(), String> {
+/// This is the canonical validation seam used by both `cron_create` and the
+/// hermetic fuzz harness. Keeping it separate from persistence ensures that
+/// arbitrary validation input cannot create or replace a schedule.
+/// Each field treats `*`, single values, ranges, steps, and range-plus-step as
+/// composable atoms within comma-separated lists.
+///
+/// # Errors
+///
+/// Returns a diagnostic when the expression has the wrong number of fields or
+/// a field violates its numeric, range, list, or step grammar.
+pub fn validate_cron_expression(expr: &str) -> Result<(), String> {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != FIELDS.len() {
         return Err(format!(
@@ -425,8 +417,14 @@ fn optional_one_based_index_arg<S: BuildHasher>(
 }
 
 #[must_use]
-pub fn execute_cron_create<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
-    execute_cron_create_at(args, &schedules_path())
+pub fn execute_cron_create<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    match schedules_path(run) {
+        Ok(path) => execute_cron_create_at(args, &path),
+        Err(error) => (error, true),
+    }
 }
 
 /// Path-explicit variant of [`execute_cron_create`].
@@ -466,7 +464,7 @@ fn execute_cron_create_at<S: BuildHasher>(
         Err(e) => return e.into_tool_error(),
     };
 
-    if let Err(e) = validate_cron(&cron_expression) {
+    if let Err(e) = validate_cron_expression(&cron_expression) {
         return (format!("Invalid cron expression: {e}"), true);
     }
 
@@ -555,8 +553,14 @@ fn execute_cron_create_at<S: BuildHasher>(
 }
 
 #[must_use]
-pub fn execute_cron_delete<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
-    execute_cron_delete_at(args, &schedules_path())
+pub fn execute_cron_delete<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    match schedules_path(run) {
+        Ok(path) => execute_cron_delete_at(args, &path),
+        Err(error) => (error, true),
+    }
 }
 
 /// Path-explicit variant of [`execute_cron_delete`] — see
@@ -642,8 +646,14 @@ fn execute_cron_delete_at<S: BuildHasher>(
 }
 
 #[must_use]
-pub fn execute_cron_list<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
-    execute_cron_list_at(args, &schedules_path())
+pub fn execute_cron_list<S: BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> (String, bool) {
+    match schedules_path(run) {
+        Ok(path) => execute_cron_list_at(args, &path),
+        Err(error) => (error, true),
+    }
 }
 
 /// Path-explicit variant of [`execute_cron_list`] — see
@@ -693,6 +703,10 @@ fn execute_cron_list_at<S: BuildHasher>(
 mod tests {
     use super::*;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     // crosslink #984: tests no longer mutate the process cwd — they
     // thread an explicit `schedules.json` path through the `*_at`
     // helpers in this module. The previous `cwd_lock()` shim is gone
@@ -700,18 +714,18 @@ mod tests {
 
     #[test]
     fn test_validate_cron_valid() {
-        assert!(validate_cron("0 * * * *").is_ok());
-        assert!(validate_cron("*/5 * * * *").is_ok());
-        assert!(validate_cron("0 9 * * 1-5").is_ok());
-        assert!(validate_cron("30 8 1,15 * *").is_ok());
+        assert!(validate_cron_expression("0 * * * *").is_ok());
+        assert!(validate_cron_expression("*/5 * * * *").is_ok());
+        assert!(validate_cron_expression("0 9 * * 1-5").is_ok());
+        assert!(validate_cron_expression("30 8 1,15 * *").is_ok());
     }
 
     #[test]
     fn test_validate_cron_invalid() {
-        assert!(validate_cron("* *").is_err());
-        assert!(validate_cron("60 * * * *").is_err());
-        assert!(validate_cron("* 25 * * *").is_err());
-        assert!(validate_cron("* * * * 8").is_err());
+        assert!(validate_cron_expression("* *").is_err());
+        assert!(validate_cron_expression("60 * * * *").is_err());
+        assert!(validate_cron_expression("* 25 * * *").is_err());
+        assert!(validate_cron_expression("* * * * 8").is_err());
     }
 
     #[test]
@@ -728,7 +742,7 @@ mod tests {
             Value::String("* * * * *".to_string()),
         );
         args.insert("prompt".to_string(), Value::String("test".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("Missing 'name'"));
     }
@@ -739,7 +753,7 @@ mod tests {
         args.insert("name".to_string(), Value::String("test".to_string()));
         args.insert("schedule".to_string(), Value::String("bad".to_string()));
         args.insert("prompt".to_string(), Value::String("test".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(msg.contains("Invalid cron"));
     }
@@ -778,7 +792,7 @@ mod tests {
             Value::String("0 * * * *".to_string()),
         );
         args.insert("prompt".to_string(), Value::String("ping".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Missing 'name'"),
@@ -792,7 +806,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("name".to_string(), Value::String("myjob".to_string()));
         args.insert("prompt".to_string(), Value::String("ping".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Missing 'schedule'"),
@@ -809,7 +823,7 @@ mod tests {
             "schedule".to_string(),
             Value::String("0 * * * *".to_string()),
         );
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Missing 'prompt'"),
@@ -1074,7 +1088,7 @@ mod tests {
             Value::String("0 0 * *".to_string()), // only 4 fields
         );
         args.insert("prompt".to_string(), Value::String("test".to_string()));
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create(test_run(), &args);
         assert!(is_err);
         assert!(
             msg.contains("Invalid cron"),
@@ -1086,7 +1100,7 @@ mod tests {
     #[test]
     fn validate_cron_rejects_step_zero() {
         assert!(
-            validate_cron("*/0 * * * *").is_err(),
+            validate_cron_expression("*/0 * * * *").is_err(),
             "step=0 must be invalid"
         );
     }
@@ -1094,30 +1108,30 @@ mod tests {
     /// Contract: out-of-range minute (60) is rejected.
     #[test]
     fn validate_cron_rejects_minute_60() {
-        assert!(validate_cron("60 * * * *").is_err());
+        assert!(validate_cron_expression("60 * * * *").is_err());
     }
 
     /// Contract: out-of-range weekday (7) is rejected.
     #[test]
     fn validate_cron_rejects_weekday_7() {
-        assert!(validate_cron("* * * * 7").is_err());
+        assert!(validate_cron_expression("* * * * 7").is_err());
     }
 
     /// Contract: comma-separated list within valid range is accepted.
     #[test]
     fn validate_cron_accepts_comma_list() {
-        assert!(validate_cron("0,30 9 * * 1,5").is_ok());
+        assert!(validate_cron_expression("0,30 9 * * 1,5").is_ok());
     }
 
     /// Crosslink #901: step+range like `0-30/5` is now accepted.
     #[test]
     fn validate_cron_accepts_step_range() {
         assert!(
-            validate_cron("0-30/5 * * * *").is_ok(),
+            validate_cron_expression("0-30/5 * * * *").is_ok(),
             "step+range 0-30/5 must be accepted"
         );
         assert!(
-            validate_cron("*/15 0-12/2 * * *").is_ok(),
+            validate_cron_expression("*/15 0-12/2 * * *").is_ok(),
             "step over a range must be accepted in any field"
         );
     }
@@ -1126,7 +1140,7 @@ mod tests {
     #[test]
     fn validate_cron_accepts_mixed_comma_with_range() {
         assert!(
-            validate_cron("1,3-5,8 * * * *").is_ok(),
+            validate_cron_expression("1,3-5,8 * * * *").is_ok(),
             "comma-separated list containing a range must be accepted"
         );
     }
@@ -1135,7 +1149,7 @@ mod tests {
     #[test]
     fn validate_cron_rejects_reversed_range() {
         assert!(
-            validate_cron("30-10 * * * *").is_err(),
+            validate_cron_expression("30-10 * * * *").is_err(),
             "reversed range must be rejected"
         );
     }

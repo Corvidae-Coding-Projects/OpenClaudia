@@ -17,13 +17,14 @@
 //!    the consumer to know about the inner type — enough to distinguish the
 //!    common cases (missing, permission denied) in a render or retry path.
 //!
-//! Helpers [`read_file`], [`write_file`], [`write_file_atomic`], [`read_json`],
-//! [`read_yaml`], [`write_json_pretty`], [`write_json_pretty_atomic`], and
-//! [`create_dir_all`] are provided for the ergonomically common case where
-//! callers want the typed error for free without writing the `.map_err(...)`
-//! themselves.
+//! Helpers [`read_file`], [`write_file`], [`read_json`], [`read_yaml`],
+//! [`write_json_pretty`], and [`create_dir_all`] are provided for the
+//! ergonomically common case where callers want the typed error for free
+//! without writing the `.map_err(...)` themselves. The legacy-named
+//! [`write_json_pretty_atomic`] adapter is restricted to session documents and
+//! delegates to [`crate::persistence`]; new stores should use that capability
+//! directly so class, expected generation, and commit receipt remain visible.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -71,6 +72,28 @@ pub enum FileError {
     /// parent, wrong owner, etc.) before any I/O was attempted.
     #[error("invalid file state on {}: {reason}", path.display())]
     Invalid { path: PathBuf, reason: String },
+
+    /// Descriptor-safe persistence rejected or failed an operation before
+    /// publication.
+    #[error("persistence error on {}: {source}", path.display())]
+    Persistence {
+        path: PathBuf,
+        #[source]
+        source: Box<crate::persistence::PersistenceError>,
+    },
+
+    /// Replacement bytes are visible, but directory durability remains
+    /// uncertain. The receipt gives callers the exact generation needed for
+    /// reconciliation rather than collapsing this into an ordinary I/O error.
+    #[error(
+        "persistence publication on {} has uncertain directory durability at generation {}",
+        path.display(),
+        receipt.generation()
+    )]
+    DurabilityUncertain {
+        path: PathBuf,
+        receipt: Box<crate::persistence::CommitReceipt>,
+    },
 }
 
 impl FileError {
@@ -96,7 +119,9 @@ impl FileError {
             | Self::Json { path, .. }
             | Self::Yaml { path, .. }
             | Self::Utf8 { path, .. }
-            | Self::Invalid { path, .. } => path.as_path(),
+            | Self::Invalid { path, .. }
+            | Self::Persistence { path, .. }
+            | Self::DurabilityUncertain { path, .. } => path.as_path(),
         }
     }
 }
@@ -144,76 +169,12 @@ pub fn write_file(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<
     std::fs::write(path, contents).map_err(FileError::with_path(path))
 }
 
-/// Atomically and durably replace `path` with `contents`.
-///
-/// Bytes are written to a unique sibling file, flushed with `fsync`, and then
-/// renamed over the destination. Readers therefore observe either the old
-/// complete file or the new complete file, never a partial write. The sibling
-/// is removed on every recoverable failure.
-///
-/// # Errors
-/// Returns [`FileError::Io`] when the parent directory cannot be created or a
-/// staging-file write, sync, rename, or parent-directory sync fails.
-pub fn write_file_atomic(
-    path: impl AsRef<Path>,
-    contents: impl AsRef<[u8]>,
-) -> Result<(), FileError> {
-    let path = path.as_ref();
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(FileError::with_path(parent))?;
-    }
-
-    let file_name = path.file_name().map_or_else(
-        || "file".to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let tmp_path = path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-
-    let write_result = (|| -> Result<(), FileError> {
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp_path)
-            .map_err(FileError::with_path(&tmp_path))?;
-        file.write_all(contents.as_ref())
-            .map_err(FileError::with_path(&tmp_path))?;
-        file.sync_all().map_err(FileError::with_path(&tmp_path))?;
-        replace_file_atomic(&tmp_path, path).map_err(FileError::with_path(path))?;
-
-        #[cfg(unix)]
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(FileError::with_path(parent))?;
-        }
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    write_result
-}
-
 /// Atomically publish `tmp` at `path`, replacing an existing file.
 ///
-/// `std::fs::rename` replaces on Unix but not on Windows, so every durable
-/// writer shares this platform-specific boundary.
+/// This low-level crate-internal compatibility primitive reports only the
+/// rename result. It does not validate path authority, synchronize either
+/// descriptor, or make a durability claim. New persistent stores must use
+/// [`crate::persistence`] instead.
 #[cfg(unix)]
 pub(crate) fn replace_file_atomic(tmp: &Path, path: &Path) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
@@ -296,18 +257,64 @@ pub fn write_json_pretty<T: serde::Serialize>(
     write_file(path, json)
 }
 
-/// Serialize `value` as pretty JSON and atomically replace `path`.
+/// Serialize one session document as pretty JSON and commit it through the
+/// descriptor-safe persistence capability.
+///
+/// This compatibility adapter exists for the pre-S-037 session frontends. It
+/// opens the already-existing parent as the explicit storage root, observes an
+/// exact generation, then commits with [`crate::persistence::FileClass::Session`].
+/// It never turns a post-rename directory-sync failure into an ordinary I/O
+/// error: [`FileError::DurabilityUncertain`] retains the typed receipt.
 ///
 /// # Errors
-/// Returns [`FileError::Json`] on serialization failure or
-/// [`FileError::Io`] on an underlying filesystem failure.
+/// Returns [`FileError::Json`] on serialization failure,
+/// [`FileError::Persistence`] on validation/conflict/pre-publication failure,
+/// or [`FileError::DurabilityUncertain`] when publication is visible but its
+/// directory sync could not be proven.
 pub fn write_json_pretty_atomic<T: serde::Serialize>(
     path: impl AsRef<Path>,
     value: &T,
 ) -> Result<(), FileError> {
+    use crate::persistence::{CommitState, FileClass, PersistentStorage};
+
     let path = path.as_ref();
-    let json = serde_json::to_string_pretty(value).map_err(FileError::json_with_path(path))?;
-    write_file_atomic(path, json)
+    let json = serde_json::to_vec_pretty(value).map_err(FileError::json_with_path(path))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| FileError::Invalid {
+            path: path.to_path_buf(),
+            reason: "descriptor-safe persistence requires an explicit parent directory".to_string(),
+        })?;
+    let target = path.file_name().ok_or_else(|| FileError::Invalid {
+        path: path.to_path_buf(),
+        reason: "descriptor-safe persistence requires a file-name target".to_string(),
+    })?;
+    let storage = PersistentStorage::open(parent).map_err(|source| FileError::Persistence {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
+    let expected = storage
+        .read(target, FileClass::Session)
+        .map_err(|source| FileError::Persistence {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })?
+        .generation();
+    let receipt = storage
+        .commit(target, FileClass::Session, expected, json)
+        .map_err(|source| FileError::Persistence {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+    if receipt.state() == CommitState::PublishedDurabilityUncertain {
+        Err(FileError::DurabilityUncertain {
+            path: path.to_path_buf(),
+            receipt: Box::new(receipt),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -405,44 +412,40 @@ mod tests {
         assert_eq!(err.path(), p.as_path());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn atomic_write_replaces_complete_file_without_staging_debris() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("session.json");
-        std::fs::write(&path, b"old complete bytes").unwrap();
+    fn session_json_adapter_uses_private_descriptor_safe_commit() {
+        use std::os::unix::fs::PermissionsExt as _;
 
-        write_file_atomic(&path, b"new complete bytes").expect("atomic replacement");
+        let directory = tempfile::tempdir().expect("session root");
+        let path = directory.path().join("session.json");
+        write_json_pretty_atomic(&path, &serde_json::json!({"generation": 1}))
+            .expect("descriptor-safe JSON commit");
 
-        assert_eq!(std::fs::read(&path).unwrap(), b"new complete bytes");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn atomic_write_cleans_staging_file_when_rename_fails() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("session.json");
-        std::fs::create_dir(&path).unwrap();
-
-        write_file_atomic(&path, b"new bytes").expect_err("cannot replace a directory");
-
-        let entries = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(entries, vec![path.file_name().unwrap()]);
-        assert!(path.is_dir(), "failed replacement must preserve the target");
+        let value: serde_json::Value = read_json(&path).expect("read session JSON");
+        assert_eq!(value["generation"], 1);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("session metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn atomic_write_publishes_owner_only_permissions() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn session_json_adapter_rejects_symlinked_parent_without_outside_write() {
+        let holder = tempfile::tempdir().expect("holder");
+        let outside = tempfile::tempdir().expect("outside");
+        let linked_parent = holder.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), &linked_parent).expect("parent symlink");
+        let path = linked_parent.join("session.json");
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("session.json");
-        write_file_atomic(&path, b"secret").unwrap();
-
-        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let error = write_json_pretty_atomic(&path, &serde_json::json!({"redirect": true}))
+            .expect_err("symlinked parent must be rejected");
+        assert!(matches!(error, FileError::Persistence { .. }));
+        assert!(!outside.path().join("session.json").exists());
     }
 }

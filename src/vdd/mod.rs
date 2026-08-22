@@ -40,6 +40,7 @@ mod triage;
 pub use engine::{BuilderProvider, VddEngine};
 pub use error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
 pub use finding::{Finding, FindingStatus, Severity};
+pub use helpers::findings_context_observation;
 pub use review::{AdversaryReview, VddIteration, VddSession};
 pub use static_analysis::StaticAnalysisResult;
 pub use transport::VddProviderAuth;
@@ -49,8 +50,3 @@ pub use transport::VddProviderAuth;
 /// surfacing the internal `RawFinding` / `AdversaryResponse` types
 /// that the parser uses internally.
 pub use triage::{parse_findings, parse_findings_detailed, ParseErrorKind, ParseFindingsOutcome};
-
-/// Advisory-formatting helper re-exported for the same test suite.
-/// Pure function over `Finding` + `StaticAnalysisResult` — no
-/// hidden state, no async surface.
-pub use helpers::format_findings_for_injection;

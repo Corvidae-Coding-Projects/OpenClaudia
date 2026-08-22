@@ -12,9 +12,12 @@
 
 mod cli;
 
+use anyhow::Context as _;
 use openclaudia::{
     config, guardrails, memory,
-    permissions::{CheckResult, PermissionManager, PermissionRule},
+    permissions::{
+        ApprovalProvenance, AuthorizationResult, ExecutionPermit, PermissionManager, PermissionRule,
+    },
     plugins, prompt,
     proxy::normalize_base_url,
     tools::safe_truncate,
@@ -22,6 +25,7 @@ use openclaudia::{
 };
 
 use clap::{builder::PossibleValuesParser, Parser, Subcommand};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -170,8 +174,28 @@ enum Commands {
     /// Show current configuration
     Config,
 
-    /// Check configuration and connectivity
-    Doctor,
+    /// Emit evidence-safe configuration and runtime diagnostics
+    Doctor {
+        /// Emit the typed receipt envelope as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Grant one exact active diagnostic check (repeatable)
+        #[arg(long = "allow-active", value_name = "CHECK_ID")]
+        allow_active: Vec<String>,
+    },
+
+    /// Review, approve, or revoke repository hook imports
+    Hooks {
+        #[command(subcommand)]
+        command: Option<HookCommands>,
+    },
+
+    /// Manage host-owned authenticated team-memory authority
+    Team {
+        #[command(subcommand)]
+        command: TeamCommands,
+    },
 
     /// Start ACP server on stdin/stdout for agent interoperability (acpx)
     Acp {
@@ -214,9 +238,183 @@ enum Commands {
     },
 }
 
-// OpenClaudia is a single-user CLI; a current-thread runtime is sufficient
-// and keeps all futures on one thread, which is required by the `onig`-backed
-// StreamingMarkdownRenderer (holds `*mut` raw pointers that are not Send).
+#[derive(Subcommand)]
+enum HookCommands {
+    /// Show inert and approved repository hook proposals
+    Status,
+    /// Approve the exact proposal digest shown by `hooks status`
+    Approve {
+        /// Full `sha256:...` proposal digest
+        proposal_digest: String,
+    },
+    /// Revoke an exact approved proposal digest
+    Revoke {
+        /// Full `sha256:...` proposal digest
+        proposal_digest: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TeamCommands {
+    /// Create a new team with this principal as its first owner
+    Create {
+        #[arg(long)]
+        principal_id: String,
+        #[arg(long, default_value_t = 31_536_000)]
+        membership_ttl_seconds: i64,
+    },
+    /// Show local enrollment and authority status
+    Status {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Emit a signed public enrollment invitation
+    Invite {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long, default_value_t = 3_600)]
+        ttl_seconds: i64,
+    },
+    /// Create a host-private credential and public proof-of-possession request
+    BeginEnrollment {
+        #[arg(long)]
+        invitation: PathBuf,
+        #[arg(long)]
+        principal_id: String,
+    },
+    /// Approve an enrollment request and emit a signed public approval
+    ApproveEnrollment {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        invitation: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        role: String,
+        #[arg(long, default_value_t = 31_536_000)]
+        membership_ttl_seconds: i64,
+    },
+    /// Accept a signed enrollment approval on the requesting host
+    AcceptEnrollment {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        approval: PathBuf,
+    },
+    /// Change one member's role
+    SetRole {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        principal_id: String,
+        #[arg(long)]
+        role: String,
+    },
+    /// Revoke one member immediately
+    Revoke {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        principal_id: String,
+    },
+    /// Renew one active membership
+    Renew {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        principal_id: String,
+        #[arg(long, default_value_t = 31_536_000)]
+        membership_ttl_seconds: i64,
+    },
+    /// Recover an expired local owner using this host's authority credential
+    RecoverExpiredOwner {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long, default_value_t = 31_536_000)]
+        membership_ttl_seconds: i64,
+    },
+    /// Rotate the team authority key and emit the successor public bundle
+    RotateAuthority {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Begin rotation of this host principal's credential
+    BeginCredentialRotation {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Approve a principal credential-rotation request
+    ApproveCredentialRotation {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Apply a newer signed public authority bundle
+    ApplyAuthority {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        bundle: PathBuf,
+    },
+    /// Print bounded redacted local authorization receipts
+    Audit {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Show the encrypted local team-replica status without lesson content
+    ReplicaStatus {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Emit a fresh short-lived descriptor for an existing team-memory service
+    ServiceDescriptor {
+        #[arg(long)]
+        team_id: Option<String>,
+        /// Externally reachable HTTPS origin encoded into the signed descriptor
+        #[arg(long)]
+        endpoint: String,
+        /// Exact DER-encoded leaf certificate presented by this service
+        #[arg(long)]
+        tls_certificate: PathBuf,
+    },
+    /// Authenticate and pin a signed team-memory service descriptor
+    ConfigureService {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        descriptor: PathBuf,
+        /// Explicitly authorize endpoint/certificate rotation for the same
+        /// pinned service identity
+        #[arg(long)]
+        rotate_transport: bool,
+    },
+    /// Run one observed push/pull cycle against the pinned service
+    Sync {
+        #[arg(long)]
+        team_id: Option<String>,
+    },
+    /// Serve the bounded authenticated replication protocol over TLS
+    Serve {
+        #[arg(long)]
+        team_id: Option<String>,
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Externally reachable HTTPS origin encoded into the signed descriptor
+        #[arg(long)]
+        endpoint: String,
+        /// Exact DER-encoded leaf certificate presented by this service
+        #[arg(long)]
+        tls_certificate: PathBuf,
+        /// Owner-only PKCS#8 DER private key used by this service
+        #[arg(long)]
+        tls_private_key: PathBuf,
+    },
+}
+
+// OpenClaudia is a single-user CLI. A current-thread runtime keeps scheduling
+// deterministic and avoids allocating an idle worker pool for interactive use.
 #[tokio::main(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -255,11 +453,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Run on-disk schema migrations before any subsystem touches the
-    // stores they manage. Failures never abort startup — the runner
-    // logs each and continues.
-    let _ =
-        openclaudia::migrations::run_all(&openclaudia::migrations::MigrationContext::from_env());
+    // A writable frontend may start only after every required persistent
+    // store reaches a known, current state. Evidence-safe doctor is the sole
+    // exception: it must not acquire a migration lock, repair data, or publish
+    // a marker merely to report that runtime migration evidence is unavailable.
+    if command_requires_writable_startup(cli.command.as_ref()) {
+        openclaudia::migrations::run_startup()
+            .into_writable()
+            .map_err(anyhow::Error::new)?;
+    }
 
     let agent_capable_surface = cli.print.is_some()
         || matches!(
@@ -288,7 +490,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None if cli.tui_mode => {
             // Legacy rustyline REPL (--tui-mode is now the escape hatch name, kept for compat)
-            cmd_chat(
+            Box::pin(cmd_chat(
                 cli.model,
                 cli.target,
                 cli.resume,
@@ -296,7 +498,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.coordinator,
                 cli.dangerously_skip_permissions,
                 cli.mode,
-            )
+            ))
             .await
         }
         None => {
@@ -328,7 +530,142 @@ async fn main() -> anyhow::Result<()> {
             cli::commands::start::cmd_start(port, host, target.or(cli.target)).await
         }
         Some(Commands::Config) => cli::commands::config_cmd::cmd_config(),
-        Some(Commands::Doctor) => cli::commands::doctor::cmd_doctor().await,
+        Some(Commands::Doctor { json, allow_active }) => {
+            cli::commands::doctor::cmd_doctor(json, &allow_active)
+        }
+        Some(Commands::Hooks { command }) => match command.unwrap_or(HookCommands::Status) {
+            HookCommands::Status => {
+                cli::commands::hooks::cmd_hooks_status();
+                Ok(())
+            }
+            HookCommands::Approve { proposal_digest } => {
+                cli::commands::hooks::cmd_hooks_approve(&proposal_digest)
+            }
+            HookCommands::Revoke { proposal_digest } => {
+                cli::commands::hooks::cmd_hooks_revoke(&proposal_digest)
+            }
+        },
+        Some(Commands::Team { command }) => {
+            chdir_to_git_root();
+            match command {
+                TeamCommands::Create {
+                    principal_id,
+                    membership_ttl_seconds,
+                } => cli::commands::team::cmd_team_create(&principal_id, membership_ttl_seconds),
+                TeamCommands::Status { team_id } => {
+                    cli::commands::team::cmd_team_status(team_id.as_deref())
+                }
+                TeamCommands::Invite {
+                    team_id,
+                    ttl_seconds,
+                } => cli::commands::team::cmd_team_invite(team_id.as_deref(), ttl_seconds),
+                TeamCommands::BeginEnrollment {
+                    invitation,
+                    principal_id,
+                } => cli::commands::team::cmd_team_begin_enrollment(&invitation, &principal_id),
+                TeamCommands::ApproveEnrollment {
+                    team_id,
+                    invitation,
+                    request,
+                    role,
+                    membership_ttl_seconds,
+                } => cli::commands::team::cmd_team_approve_enrollment(
+                    team_id.as_deref(),
+                    &invitation,
+                    &request,
+                    &role,
+                    membership_ttl_seconds,
+                ),
+                TeamCommands::AcceptEnrollment { team_id, approval } => {
+                    cli::commands::team::cmd_team_accept_enrollment(team_id.as_deref(), &approval)
+                }
+                TeamCommands::SetRole {
+                    team_id,
+                    principal_id,
+                    role,
+                } => {
+                    cli::commands::team::cmd_team_set_role(team_id.as_deref(), &principal_id, &role)
+                }
+                TeamCommands::Revoke {
+                    team_id,
+                    principal_id,
+                } => cli::commands::team::cmd_team_revoke(team_id.as_deref(), &principal_id),
+                TeamCommands::Renew {
+                    team_id,
+                    principal_id,
+                    membership_ttl_seconds,
+                } => cli::commands::team::cmd_team_renew(
+                    team_id.as_deref(),
+                    &principal_id,
+                    membership_ttl_seconds,
+                ),
+                TeamCommands::RecoverExpiredOwner {
+                    team_id,
+                    membership_ttl_seconds,
+                } => cli::commands::team::cmd_team_recover_expired_owner(
+                    team_id.as_deref(),
+                    membership_ttl_seconds,
+                ),
+                TeamCommands::RotateAuthority { team_id } => {
+                    cli::commands::team::cmd_team_rotate_authority(team_id.as_deref())
+                }
+                TeamCommands::BeginCredentialRotation { team_id } => {
+                    cli::commands::team::cmd_team_begin_credential_rotation(team_id.as_deref())
+                }
+                TeamCommands::ApproveCredentialRotation { team_id, request } => {
+                    cli::commands::team::cmd_team_approve_credential_rotation(
+                        team_id.as_deref(),
+                        &request,
+                    )
+                }
+                TeamCommands::ApplyAuthority { team_id, bundle } => {
+                    cli::commands::team::cmd_team_apply_authority(team_id.as_deref(), &bundle)
+                }
+                TeamCommands::Audit { team_id } => {
+                    cli::commands::team::cmd_team_audit(team_id.as_deref())
+                }
+                TeamCommands::ReplicaStatus { team_id } => {
+                    cli::commands::team::cmd_team_replica_status(team_id.as_deref())
+                }
+                TeamCommands::ServiceDescriptor {
+                    team_id,
+                    endpoint,
+                    tls_certificate,
+                } => cli::commands::team::cmd_team_service_descriptor(
+                    team_id.as_deref(),
+                    &endpoint,
+                    &tls_certificate,
+                ),
+                TeamCommands::ConfigureService {
+                    team_id,
+                    descriptor,
+                    rotate_transport,
+                } => cli::commands::team::cmd_team_configure_service(
+                    team_id.as_deref(),
+                    &descriptor,
+                    rotate_transport,
+                ),
+                TeamCommands::Sync { team_id } => {
+                    cli::commands::team::cmd_team_sync(team_id.as_deref())
+                }
+                TeamCommands::Serve {
+                    team_id,
+                    listen,
+                    endpoint,
+                    tls_certificate,
+                    tls_private_key,
+                } => {
+                    cli::commands::team::cmd_team_serve(
+                        team_id.as_deref(),
+                        listen,
+                        &endpoint,
+                        &tls_certificate,
+                        &tls_private_key,
+                    )
+                    .await
+                }
+            }
+        }
         Some(Commands::Loop {
             max_iterations,
             port,
@@ -410,10 +747,16 @@ const fn subcommand_name(command: &Commands) -> &'static str {
         Commands::Auth { .. } => "auth",
         Commands::Start { .. } => "start",
         Commands::Config => "config",
-        Commands::Doctor => "doctor",
+        Commands::Doctor { .. } => "doctor",
+        Commands::Hooks { .. } => "hooks",
+        Commands::Team { .. } => "team",
         Commands::Acp { .. } => "acp",
         Commands::Loop { .. } => "loop",
     }
+}
+
+const fn command_requires_writable_startup(command: Option<&Commands>) -> bool {
+    !matches!(command, Some(Commands::Doctor { .. }))
 }
 
 /// Full-screen TUI mode (default when no subcommand).
@@ -552,11 +895,7 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
     // error here, instead of being silently mapped to `OpenAIAdapter` and
     // producing 4xx responses from the upstream that the user can't
     // attribute to a config typo.
-    let provider_headers = provider
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect::<Vec<_>>();
+    let provider_headers = provider.headers.clone();
     let (endpoint, headers) = if let Some(auth) = codex_responses_auth.as_ref() {
         let endpoint = openclaudia::pipeline::resolve_endpoint_for_wire(
             wire_api,
@@ -565,8 +904,8 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
             openclaudia::codex_credentials::CODEX_CHATGPT_BASE_URL,
             None,
         )?;
-        let mut headers = auth.headers();
-        headers.extend(provider_headers);
+        let mut headers = auth.headers()?;
+        headers.extend(&provider_headers);
         (endpoint, headers)
     } else {
         let endpoint = openclaudia::pipeline::resolve_endpoint_for_wire(
@@ -574,24 +913,24 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
             &config.proxy.target,
             &model,
             &provider.base_url,
-            claude_code_token.as_deref(),
+            claude_code_token.as_ref(),
         )?;
         let headers = openclaudia::pipeline::resolve_headers(
             &config.proxy.target,
             api_key.as_ref(),
-            claude_code_token.as_deref(),
+            claude_code_token.as_ref(),
             &provider_headers,
         )?;
         (endpoint, headers)
     };
 
-    guardrails::configure(&config.guardrails);
     tui_launch(TuiLaunchOptions {
         config: &config,
         model: &model,
         endpoint,
         headers,
         wire_api,
+        codex_responses_backend: codex_responses_auth.is_some(),
         claude_code_token,
         builder_vdd_auth,
         vdd_adversary_auth,
@@ -603,16 +942,17 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
     .await
 }
 
-/// Build TUI system resources (memory, prompt, hooks, rules) and launch the app.
+/// Build TUI system resources (memory, prompt, hooks) and launch the app.
 ///
 /// Extracted from `cmd_tui` to keep that function under the line limit.
 struct TuiLaunchOptions<'a> {
     config: &'a config::AppConfig,
     model: &'a str,
     endpoint: String,
-    headers: Vec<(String, String)>,
+    headers: openclaudia::secrets::SensitiveHeaders,
     wire_api: openclaudia::pipeline::WireApi,
-    claude_code_token: Option<String>,
+    codex_responses_backend: bool,
+    claude_code_token: Option<openclaudia::secrets::OAuthToken>,
     builder_vdd_auth: openclaudia::vdd::VddProviderAuth,
     vdd_adversary_auth: Option<openclaudia::vdd::VddProviderAuth>,
     behavior_mode: &'a openclaudia::modes::BehaviorMode,
@@ -622,8 +962,7 @@ struct TuiLaunchOptions<'a> {
 }
 
 async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
-    use openclaudia::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
-    use openclaudia::rules::RulesEngine;
+    use openclaudia::hooks::{load_effective_hooks, HookEngine};
 
     let TuiLaunchOptions {
         config,
@@ -631,6 +970,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         endpoint,
         headers,
         wire_api,
+        codex_responses_backend,
         claude_code_token,
         builder_vdd_auth,
         vdd_adversary_auth,
@@ -640,73 +980,77 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         dangerously_skip_permissions,
     } = options;
 
-    let cwd_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let memory_db: Option<memory::MemoryDb> = open_project_memory_db(&cwd_path);
-
-    let cwd = cwd_path.to_string_lossy().to_string();
-    let tui_prompt_blocks = prompt::build_system_prompt_blocks(
-        behavior_mode,
-        None,
-        None,
-        memory_db.as_ref(),
-        Some(&cwd),
-    );
-    let system_prompt = tui_prompt_blocks.to_combined();
-
-    let claude_hooks = load_claude_code_hooks();
-    let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
+    let merged_hooks = load_effective_hooks(config.hooks.clone());
     let hook_engine = std::sync::Arc::new(HookEngine::new(merged_hooks));
-
-    // Install a process-wide MCP manager so `list_mcp_resources` /
-    // `read_mcp_resource` can dispatch into real servers instead of
-    // returning the "not wired" stub. Plugin-discovered servers are
-    // connected best-effort — failures are logged by
-    // `connect_mcp_servers` and do not block TUI startup.
-    let plugin_manager = std::sync::Arc::new(init_plugin_manager());
-    let mcp_manager =
-        std::sync::Arc::new(tokio::sync::RwLock::new(openclaudia::mcp::McpManager::new()));
-    openclaudia::proxy::connect_mcp_servers(&mcp_manager, &plugin_manager).await;
-    let _ = openclaudia::mcp::install_manager(mcp_manager);
-
-    let rules_engine = RulesEngine::new(".openclaudia/rules");
-    let rules_content = {
-        let extensions: Vec<&str> = vec!["rs", "py", "ts", "js", "go", "java", "rb", "md"];
-        let content = rules_engine.get_combined_rules(&extensions);
-        if content.is_empty() {
-            None
-        } else {
-            Some(content)
-        }
-    };
 
     let policy_enforcer = std::sync::Arc::new(openclaudia::services::policy::PolicyEnforcer::new(
         config.policy.clone(),
     ));
     let mut app = tui::app::App::new_with_policy(model, &config.proxy.target, policy_enforcer);
-    app.set_api_config(
-        endpoint,
-        headers,
-        wire_api,
-        system_prompt,
-        Some(tui_prompt_blocks),
-        claude_code_token,
-    );
     app.hook_engine = Some(hook_engine);
-    app.memory_db = memory_db.map(std::sync::Arc::new);
-    app.permission_mgr = Some(std::sync::Arc::new(init_permission_manager(
-        config,
-        dangerously_skip_permissions,
-    )));
     app.vdd_engine =
         init_vdd_engine_if_enabled_with_auth(config, vdd_adversary_auth).map(std::sync::Arc::new);
     app.vdd_builder_auth = builder_vdd_auth;
     app.app_config = Some(std::sync::Arc::new(config.clone()));
-    app.rules_content = rules_content;
     app.apply_startup_resume(resume, session_id);
-    app.set_permission_bypass(dangerously_skip_permissions);
-    app.set_analytics_sink(std::sync::Arc::new(
-        openclaudia::services::analytics::TracingAnalytics,
+    app.bind_durable_task_graph().map_err(anyhow::Error::msg)?;
+    let endpoint = if app.model == model {
+        endpoint
+    } else {
+        let provider = config.active_provider().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot rebuild resumed TUI endpoint for missing provider '{}'",
+                config.proxy.target
+            )
+        })?;
+        let base_url = if codex_responses_backend {
+            openclaudia::codex_credentials::CODEX_CHATGPT_BASE_URL
+        } else {
+            &provider.base_url
+        };
+        openclaudia::pipeline::resolve_endpoint_for_wire(
+            wire_api,
+            &config.proxy.target,
+            &app.model,
+            base_url,
+            claude_code_token.as_ref(),
+        )?
+    };
+    // MCP subprocesses/reconnects retain this exact resumed-session
+    // capability rather than discovering identity from a worker thread.
+    let run_context = app.tool_run_context().map_err(anyhow::Error::msg)?;
+    let memory_db = Some(open_workspace_memory_db(&run_context, config)?);
+    app.permission_mgr = Some(std::sync::Arc::new(init_permission_manager(
+        config,
+        dangerously_skip_permissions,
+        &run_context,
+    )));
+    let tui_prompt_blocks = prompt::build_prompt_context_for_run(behavior_mode, &run_context);
+    app.set_api_config(
+        endpoint,
+        headers,
+        wire_api,
+        Some(tui_prompt_blocks),
+        claude_code_token,
+    );
+    app.memory_db = memory_db.map(std::sync::Arc::new);
+    guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
+    let plugin_manager = std::sync::Arc::new(init_plugin_manager(run_context.project_root()));
+    let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+        openclaudia::mcp::McpManager::new_with_permissions(
+            std::sync::Arc::clone(&run_context),
+            config.permissions.clone(),
+        ),
     ));
+    let trusted_mcp_servers =
+        openclaudia::proxy::connect_mcp_servers(&mcp_manager, &plugin_manager).await;
+    let _ = openclaudia::mcp::install_manager(&run_context, &mcp_manager);
+    app.set_mcp_runtime(plugin_manager, mcp_manager, trusted_mcp_servers);
+    app.set_permission_bypass(dangerously_skip_permissions || !config.permissions.enabled);
+    app.set_service_registry(openclaudia::services::ServiceRegistry::interactive(
+        std::sync::Arc::new(openclaudia::services::analytics::TracingAnalytics),
+    ))
+    .map_err(anyhow::Error::msg)?;
     app.run()
         .await
         .map_err(|e| anyhow::anyhow!("TUI error: {e}"))
@@ -715,36 +1059,11 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
 /// Result of an interactive permission prompt for a tool call.
 enum ToolPermissionResult {
     /// User allowed execution (or tool doesn't need permission).
-    Allowed { checked: bool },
+    Allowed {
+        authorization: Option<ExecutionPermit>,
+    },
     /// User denied execution.
     Denied(String),
-}
-
-/// Returns `true` for tools that require an explicit permission decision before execution.
-///
-/// Read-only / informational tools (e.g. `read_file`, `grep`) return `false`
-/// and are always executed without prompting. Write / destructive tools (`bash`,
-/// `write_file`, `edit_file`) and network fetches that are not preapproved return `true`.
-fn tool_needs_permission(tool_name: &str) -> bool {
-    !matches!(
-        tool_name,
-        "read_file"
-            | "grounding_context"
-            | "list_files"
-            | "grep"
-            | "glob"
-            | "web_search"
-            | "ask_user_question"
-            | "task_create"
-            | "task_update"
-            | "task_get"
-            | "task_list"
-            | "enter_plan_mode"
-            | "exit_plan_mode"
-            | "lsp"
-            | "memory_search"
-            | "core_memory_get"
-    )
 }
 
 /// Build a human-readable description of a tool call for the permission prompt.
@@ -783,46 +1102,58 @@ fn tool_call_description(tool_name: &str, tool_args: &serde_json::Value) -> Stri
 /// (`bash`, `write_file`, `edit_file`, etc.) prompt the user unless the tool has been
 /// marked "always allow" for this session via a previous `a` response.
 ///
-/// Use [`check_tool_unrestricted`] instead when running in headless/non-interactive mode
-/// where all tool calls must be auto-approved (e.g. `--dangerously-skip-permissions`).
-///
 /// # Fix #284
 ///
 /// This function replaces the old `check_tool_permission_interactive(skip_permissions: bool, …)`
 /// boolean-flag anti-pattern. The two distinct behaviors are now two distinct functions.
 ///
 /// Returns `Allowed` to proceed, or `Denied(message)` to send back to the model.
+fn parse_interactive_permission_arguments(
+    tool_call: &openclaudia::tools::ToolCall,
+) -> Result<serde_json::Value, String> {
+    let tool_name = &tool_call.function.name;
+    match serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments) {
+        Ok(value @ serde_json::Value::Object(_)) => Ok(value),
+        Ok(_) => Err(format!(
+            "Permission denied: invalid non-object arguments for tool '{tool_name}'"
+        )),
+        Err(error) => Err(format!(
+            "Permission denied: invalid arguments for tool '{tool_name}': {error}"
+        )),
+    }
+}
+
 fn check_tool_permission_interactive(
-    tool_name: &str,
-    tool_args: &serde_json::Value,
-    always_allowed: &mut std::collections::HashSet<String>,
-    permission_mgr: Option<&PermissionManager>,
+    tool_call: &openclaudia::tools::ToolCall,
+    session_id: &str,
+    permission_mgr: &PermissionManager,
     transient_allow_rules: &[PermissionRule],
 ) -> ToolPermissionResult {
     use std::io::Write as _;
 
-    if !tool_needs_permission(tool_name) {
-        return ToolPermissionResult::Allowed { checked: false };
-    }
+    let tool_name = &tool_call.function.name;
+    let tool_args = match parse_interactive_permission_arguments(tool_call) {
+        Ok(arguments) => arguments,
+        Err(reason) => return ToolPermissionResult::Denied(reason),
+    };
 
-    if let Some(mgr) = permission_mgr {
-        match mgr.check_with_transient_allow_rules(tool_name, tool_args, transient_allow_rules) {
-            CheckResult::Allowed => return ToolPermissionResult::Allowed { checked: true },
-            CheckResult::Denied(reason) => {
-                return ToolPermissionResult::Denied(format!("Permission denied: {reason}"));
-            }
-            CheckResult::NeedsPrompt { .. } => {}
+    match permission_mgr.authorize_tool_call_with_transient_rules(
+        tool_call,
+        Some(session_id),
+        transient_allow_rules,
+    ) {
+        AuthorizationResult::Allowed(permit) => {
+            return ToolPermissionResult::Allowed {
+                authorization: Some(permit),
+            };
         }
+        AuthorizationResult::Denied(reason) => {
+            return ToolPermissionResult::Denied(format!("Permission denied: {reason}"));
+        }
+        AuthorizationResult::NeedsPrompt { .. } => {}
     }
 
-    // Check session-level "always allow" cache after hard-safety/config rules.
-    if always_allowed.contains(tool_name) {
-        return ToolPermissionResult::Allowed {
-            checked: permission_mgr.is_some(),
-        };
-    }
-
-    let description = tool_call_description(tool_name, tool_args);
+    let description = tool_call_description(tool_name, &tool_args);
 
     eprint!("\x1b[33m⚠ {description}\x1b[0m [y/n/a(lways)] ");
     std::io::stderr().flush().ok();
@@ -837,45 +1168,45 @@ fn check_tool_permission_interactive(
     let response = input.trim().to_lowercase();
 
     match response.as_str() {
-        "y" | "yes" | "" => ToolPermissionResult::Allowed {
-            checked: permission_mgr.is_some(),
-        },
+        "y" | "yes" | "" => permission_mgr
+            .approve_tool_call_once(
+                tool_call,
+                Some(session_id),
+                ApprovalProvenance::InteractiveUser,
+            )
+            .map_or_else(
+                |reason| {
+                    ToolPermissionResult::Denied(format!(
+                        "Permission approval could not be issued: {reason}"
+                    ))
+                },
+                |permit| ToolPermissionResult::Allowed {
+                    authorization: Some(permit),
+                },
+            ),
         "a" | "always" => {
-            always_allowed.insert(tool_name.to_string());
-            eprintln!(
-                "\x1b[32m✓ Will auto-allow '{tool_name}' for the rest of this session.\x1b[0m"
-            );
-            ToolPermissionResult::Allowed {
-                checked: permission_mgr.is_some(),
+            match permission_mgr.approve_tool_call_for_session(
+                tool_call,
+                session_id,
+                ApprovalProvenance::InteractiveUser,
+            ) {
+                Ok(permit) => {
+                    eprintln!(
+                        "\x1b[32m✓ Will auto-allow this exact '{tool_name}' invocation for the bounded session receipt.\x1b[0m"
+                    );
+                    ToolPermissionResult::Allowed {
+                        authorization: Some(permit),
+                    }
+                }
+                Err(reason) => ToolPermissionResult::Denied(format!(
+                    "Permission approval could not be issued: {reason}"
+                )),
             }
         }
         _ => ToolPermissionResult::Denied(format!(
             "Permission denied by user for tool '{tool_name}'"
         )),
     }
-}
-
-/// Bypass permission checks and auto-approve all tool calls.
-///
-/// This is the explicit bypass path used when `--dangerously-skip-permissions` is set.
-/// Unlike [`check_tool_permission_interactive`], this function never prompts the user and
-/// always returns `Allowed`.
-///
-/// # Fix #284
-///
-/// Replaces the old `skip_permissions: bool` boolean-flag parameter on
-/// `check_tool_permission_interactive`. The caller's intent is now expressed by calling
-/// this function, not by passing a bool.
-///
-/// # Safety
-///
-/// Calling this function grants unrestricted tool execution. Only call it when the
-/// user has explicitly opted in via `--dangerously-skip-permissions`.
-const fn check_tool_unrestricted(
-    _tool_name: &str,
-    _tool_args: &serde_json::Value,
-) -> ToolPermissionResult {
-    ToolPermissionResult::Allowed { checked: false }
 }
 
 /// Interactive chat mode (default command)
@@ -926,12 +1257,11 @@ fn maybe_auto_compact(chat_session: &mut Session, model: &str) {
     }
 }
 
-/// Build a hook engine from config + Claude Code settings.json.
+/// Build a hook engine from host config plus explicitly approved imports.
 ///
 /// Extracted from `cmd_chat` per crosslink #262.
 fn build_hook_engine(config: &config::AppConfig) -> openclaudia::hooks::HookEngine {
-    let claude_hooks = openclaudia::hooks::load_claude_code_hooks();
-    let merged_hooks = openclaudia::hooks::merge_hooks_config(config.hooks.clone(), claude_hooks);
+    let merged_hooks = openclaudia::hooks::load_effective_hooks(config.hooks.clone());
     openclaudia::hooks::HookEngine::new(merged_hooks)
 }
 
@@ -956,6 +1286,7 @@ fn render_welcome_or_fallback(target: &str, model: &str) {
 fn init_permission_manager(
     config: &config::AppConfig,
     dangerously_skip_permissions: bool,
+    run: &openclaudia::tools::ToolRunContext,
 ) -> PermissionManager {
     // `--dangerously-skip-permissions` is the documented bypass. Lift it all
     // the way to the lower-level gate by constructing a permission manager
@@ -965,11 +1296,11 @@ fn init_permission_manager(
     // `execute_tool_with_*` path kept producing `PERMISSION_PROMPT` results
     // that the model could not satisfy in a non-interactive run.
     if dangerously_skip_permissions {
-        return PermissionManager::unrestricted();
+        return PermissionManager::unrestricted_for_run(run);
     }
-    PermissionManager::new_with_web_fetch_preapproved(
-        std::path::PathBuf::from(".openclaudia/permissions.json"),
-        true,
+    PermissionManager::trusted_for_run(
+        run,
+        config.permissions.enabled,
         config.permissions.default_allow.clone(),
         config.web_fetch.preapproved_domains.clone(),
     )
@@ -1008,55 +1339,54 @@ fn maybe_resume_session(chat_session: &mut Session, resume: bool, session_id: Op
     }
 }
 
-/// Open the project-scoped memory database and print one-line status
-/// banners for recent-session count and auto-learning stats.
-///
-/// Returns `None` if the database cannot be opened — the caller then
-/// runs without memory (a `tracing::warn`! is logged, but the session
-/// still starts). Extracted from `cmd_chat` per crosslink #262.
-fn init_memory_with_banner() -> Option<memory::MemoryDb> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let db = open_project_memory_db(&cwd)?;
+/// Open the exact workspace's host-owned technical-memory service and report
+/// the non-authoritative archival/session counts retained for compatibility.
+/// Startup fails closed when the store cannot be validated or opened.
+fn init_memory_with_banner(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    config: &config::AppConfig,
+) -> anyhow::Result<memory::MemoryDb> {
+    let db = open_workspace_memory_db(run, config)?;
 
     let recent_count = db.get_recent_sessions(10).map_or(0, |s| s.len());
     if recent_count > 0 {
         println!("\x1b[90m📝 {recent_count} recent session(s) loaded from memory\x1b[0m");
     }
 
-    if let Ok(stats) = db.auto_learn_stats() {
-        let total = stats.coding_patterns
-            + stats.error_patterns
-            + stats.learned_preferences
-            + stats.file_relationships;
-        if total > 0 {
-            println!(
-                "\x1b[90m🧠 Auto-learned: {} patterns, {} error fixes, {} preferences, {} file relationships\x1b[0m",
-                stats.coding_patterns,
-                stats.errors_resolved,
-                stats.learned_preferences,
-                stats.file_relationships
-            );
-        }
-    }
-
-    Some(db)
+    Ok(db)
 }
 
-fn open_project_memory_db(project_dir: &Path) -> Option<memory::MemoryDb> {
-    match memory::MemoryDb::open_for_project(project_dir) {
-        Ok(db) => {
-            tracing::debug!("Memory database: {}", db.path().display());
-            Some(db)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %project_dir.display(),
-                "Failed to initialize memory database"
-            );
-            None
-        }
+fn open_workspace_memory_db(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    config: &config::AppConfig,
+) -> anyhow::Result<memory::MemoryDb> {
+    let host_home = run
+        .host_home()
+        .ok_or_else(|| anyhow::anyhow!("host home is unavailable for private technical memory"))?;
+    let db = memory::MemoryDb::open_for_workspace(host_home, run.project_root())
+        .context("opening host-owned workspace technical memory")?;
+    if let Some(team_id) = config.memory.team_id.clone() {
+        let status = openclaudia::team_memory::activate_team_memory(
+            &db,
+            host_home,
+            run.project_root(),
+            team_id,
+        )
+        .context("activating authenticated team technical memory")?;
+        tracing::info!(
+            team_id = %status.team_id,
+            freshness = ?status.freshness,
+            queued_mutations = status.queued_mutations,
+            service_configured = status.service_configured,
+            "Authenticated team technical memory ready"
+        );
     }
+    tracing::debug!(
+        path = %db.path().display(),
+        workspace_id = ?db.workspace_id().map(ToString::to_string),
+        "Technical memory database ready"
+    );
+    Ok(db)
 }
 
 /// Build the VDD engine if VDD is enabled in config, printing a status
@@ -1100,17 +1430,11 @@ fn init_vdd_engine_if_enabled_with_auth(
 /// `warn!` but do not propagate, because the CLI is already about to
 /// exit. Extracted from `cmd_chat` per crosslink #262.
 fn finalize_chat(
-    auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner>,
     chat_session: &Session,
     memory_db: Option<&memory::MemoryDb>,
     rl: &mut rustyline::DefaultEditor,
     history_path: &std::path::Path,
 ) {
-    // Finalize auto-learning (compute file relationships, etc.).
-    if let Some(learner) = auto_learner.as_mut() {
-        learner.on_session_end();
-    }
-
     // Autosave to short-term memory so a future resume can pick up.
     save_session_to_short_term_memory(chat_session, memory_db);
 
@@ -1128,19 +1452,19 @@ fn finalize_chat(
 /// Wraps `PluginManager::new()` + `.discover()` + the "N plugin(s)
 /// loaded" print + per-error `tracing::warn!`. Returns the manager
 /// for the caller to use. Extracted from `cmd_chat` per crosslink #262.
-fn init_plugin_manager() -> plugins::PluginManager {
+fn init_plugin_manager(project_root: &std::path::Path) -> plugins::PluginManager {
     // crosslink #893: try_new surfaces "no home directory" as an explicit
     // error. Production code logs it loudly and falls back to the
     // project-only manager so the operator sees the misconfiguration
     // rather than discovering it via missing plugins.
-    let mut plugin_manager = match plugins::PluginManager::try_new() {
+    let mut plugin_manager = match plugins::PluginManager::try_new_for_project(project_root) {
         Ok(pm) => pm,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "PluginManager: falling back to project-only search (no user home)"
             );
-            plugins::PluginManager::new()
+            plugins::PluginManager::new_for_project(project_root)
         }
     };
     let plugin_errors = plugin_manager.discover();
@@ -1248,7 +1572,7 @@ struct ChatAuth {
     api_key: Option<openclaudia::providers::ApiKey>,
     /// Claude Code OAuth Bearer token, when auth came from the
     /// `~/.claude/.credentials.json` store.
-    claude_code_token: Option<String>,
+    claude_code_token: Option<openclaudia::secrets::OAuthToken>,
     /// Codex ChatGPT/PAT bearer auth. This must be sent to the Codex
     /// Responses backend, not `OpenAI` Chat Completions.
     codex_responses_auth: Option<openclaudia::codex_credentials::CodexResponsesAuth>,
@@ -1585,11 +1909,9 @@ fn collect_current_target_startup_auth_candidate(
 fn collect_openai_startup_auth_candidates(
     _config: &config::AppConfig,
     candidates: &mut Vec<TuiStartupAuthCandidate>,
-) -> anyhow::Result<()> {
+) {
     match openclaudia::codex_credentials::load_codex_auth() {
         Ok(Some(openclaudia::codex_credentials::CodexAuthMaterial::ApiKey { api_key, source })) => {
-            let api_key = openclaudia::providers::ApiKey::try_from_string(api_key)
-                .map_err(|e| anyhow::anyhow!("Codex OpenAI API key is invalid: {e}"))?;
             candidates.push(TuiStartupAuthCandidate::OpenAi(
                 OpenAiAuthCandidate::ApiKey {
                     api_key,
@@ -1615,8 +1937,6 @@ fn collect_openai_startup_auth_candidates(
         Ok(None) => {}
         Err(e) => eprintln!("Ignoring unusable Codex auth: {e}"),
     }
-
-    Ok(())
 }
 
 fn canonical_startup_provider(provider: &str) -> &str {
@@ -1746,7 +2066,7 @@ fn push_manual_api_key_candidate(
 fn collect_tui_startup_vdd_auth_candidates(
     config: &config::AppConfig,
     chat_target: &str,
-) -> anyhow::Result<Vec<TuiStartupAuthCandidate>> {
+) -> Vec<TuiStartupAuthCandidate> {
     let mut candidates = Vec::new();
 
     let preferred = config.vdd.adversary.provider.trim();
@@ -1770,17 +2090,15 @@ fn collect_tui_startup_vdd_auth_candidates(
     }
 
     if !same_startup_provider("openai", chat_target) {
-        collect_openai_startup_auth_candidates(config, &mut candidates)?;
+        collect_openai_startup_auth_candidates(config, &mut candidates);
     }
 
     push_manual_api_key_candidate(config, &mut candidates, Some(chat_target));
 
-    Ok(candidates)
+    candidates
 }
 
-fn collect_tui_startup_auth_candidates(
-    config: &config::AppConfig,
-) -> anyhow::Result<Vec<TuiStartupAuthCandidate>> {
+fn collect_tui_startup_auth_candidates(config: &config::AppConfig) -> Vec<TuiStartupAuthCandidate> {
     let mut candidates = Vec::new();
 
     if let Some(candidate) = collect_current_target_startup_auth_candidate(config) {
@@ -1796,11 +2114,11 @@ fn collect_tui_startup_auth_candidates(
         );
     }
 
-    collect_openai_startup_auth_candidates(config, &mut candidates)?;
+    collect_openai_startup_auth_candidates(config, &mut candidates);
 
     push_manual_api_key_candidate(config, &mut candidates, None);
 
-    Ok(candidates)
+    candidates
 }
 
 fn prompt_tui_startup_auth_choice(candidates: &[TuiStartupAuthCandidate]) -> anyhow::Result<usize> {
@@ -1908,7 +2226,7 @@ async fn select_tui_startup_auth(
         return Ok(None);
     }
 
-    let mut candidates = collect_tui_startup_auth_candidates(config)?;
+    let mut candidates = collect_tui_startup_auth_candidates(config);
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -1918,7 +2236,7 @@ async fn select_tui_startup_auth(
     let chat = candidates.remove(selected).into_selection().await?;
     eprintln!("✓ Starting with {label}");
 
-    let mut vdd_candidates = collect_tui_startup_vdd_auth_candidates(config, &chat.target)?;
+    let mut vdd_candidates = collect_tui_startup_vdd_auth_candidates(config, &chat.target);
     let vdd = match prompt_tui_startup_vdd_auth_choice(
         &vdd_candidates,
         &chat.target,
@@ -1979,8 +2297,6 @@ fn resolve_openai_chat_auth(
 
     match openclaudia::codex_credentials::load_codex_auth() {
         Ok(Some(openclaudia::codex_credentials::CodexAuthMaterial::ApiKey { api_key, source })) => {
-            let api_key = openclaudia::providers::ApiKey::try_from_string(api_key)
-                .map_err(|e| anyhow::anyhow!("Codex OpenAI API key is invalid: {e}"))?;
             candidates.push(OpenAiAuthCandidate::ApiKey {
                 api_key,
                 label: format!("OpenAI API key via {}", source.display_name()),
@@ -2112,6 +2428,7 @@ async fn resolve_chat_auth(
 /// guard and the `vdd_engine.is_some()` check before calling.
 async fn run_vdd_review(
     engine: &vdd::VddEngine,
+    run_context: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
     content: &str,
     messages: &mut Vec<serde_json::Value>,
     target: &str,
@@ -2125,7 +2442,10 @@ async fn run_vdd_review(
         .unwrap_or("");
 
     let builder = vdd::BuilderProvider::new(target, api_key);
-    match engine.review_text(content, user_task, builder).await {
+    match engine
+        .review_text(run_context, content, user_task, builder)
+        .await
+    {
         Ok(result) => {
             if result.findings.is_empty() {
                 println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");
@@ -2151,14 +2471,12 @@ async fn run_vdd_review(
                         status_icon, finding.severity, finding.description
                     );
                 }
-                if !result.context_injection.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": format!(
-                            "<vdd-review>\n{}\n</vdd-review>",
-                            result.context_injection
-                        )
-                    }));
+                if let Some(observation) = result.context_observation {
+                    let projection = openclaudia::context::ContextProjector::project(
+                        vec![observation],
+                        openclaudia::context::ContextBudget::default(),
+                    );
+                    projection.append_reference_to_json_messages(messages);
                 }
             }
         }
@@ -2171,16 +2489,16 @@ async fn run_vdd_review(
 
 /// Build a per-turn chat request body for the configured target provider.
 ///
-/// Kept as a private wrapper for the legacy REPL module; the actual request
-/// construction lives in [`openclaudia::pipeline::build_request`] so REPL and
-/// TUI provider behavior cannot drift.
+/// Test-only full-catalog compatibility baseline. Production frontends use the
+/// run-aware progressive builders directly.
+#[cfg(test)]
 fn build_chat_request_body(
     target: &str,
     messages: &[serde_json::Value],
     model: &str,
     prompt_blocks: &openclaudia::prompt::SystemPromptBlocks,
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
 ) -> Result<serde_json::Value, String> {
     openclaudia::pipeline::build_request(
         target,
@@ -2204,8 +2522,8 @@ fn build_chat_endpoint_and_headers(
     provider: &config::ProviderConfig,
     adapter: &dyn openclaudia::providers::ProviderAdapter,
     api_key: Option<&openclaudia::providers::ApiKey>,
-    claude_code_token: Option<&str>,
-) -> (String, Vec<(String, String)>) {
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
+) -> (String, openclaudia::secrets::SensitiveHeaders) {
     let _ = target; // used only for documentation clarity; routing is on claude_code_token
     let endpoint = if claude_code_token.is_some() {
         openclaudia::claude_credentials::get_oauth_endpoint(model)
@@ -2217,12 +2535,16 @@ fn build_chat_endpoint_and_headers(
         )
     };
 
-    let mut headers: Vec<(String, String)> = claude_code_token.map_or_else(
-        || api_key.map_or_else(Vec::new, |key| adapter.get_headers(key)),
+    let mut headers = claude_code_token.map_or_else(
+        || {
+            api_key.map_or_else(openclaudia::secrets::SensitiveHeaders::new, |key| {
+                adapter.get_headers(key)
+            })
+        },
         openclaudia::claude_credentials::get_oauth_headers,
     );
     // Merge in any custom headers from provider config
-    headers.extend(provider.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+    headers.extend(&provider.headers);
     (endpoint, headers)
 }
 
@@ -2250,7 +2572,7 @@ async fn cmd_chat(
         mode_arg,
     })
     .await?;
-    repl.run().await
+    Box::pin(repl.run()).await
 }
 
 // ============================================================================
@@ -2264,6 +2586,88 @@ async fn cmd_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn permission_test_call(
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> openclaudia::tools::ToolCall {
+        openclaudia::tools::ToolCall {
+            id: "permission-test-call".to_string(),
+            call_type: "function".to_string(),
+            function: openclaudia::tools::FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn permission_manager_with_deny(
+        canonical_tool: &str,
+        pattern: &str,
+    ) -> (PermissionManager, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        mgr.add_session_rule(PermissionRule {
+            tool: canonical_tool.to_string(),
+            pattern: pattern.to_string(),
+            decision: openclaudia::permissions::PermissionDecision::Deny,
+        });
+        (mgr, dir)
+    }
+
+    #[test]
+    fn interactive_permission_path_does_not_bypass_read_denials() {
+        let (mgr, _dir) = permission_manager_with_deny("Read", "/etc/**");
+        let call = permission_test_call("read_file", &serde_json::json!({"path": "/etc/shadow"}));
+        let result = check_tool_permission_interactive(&call, "session", &mgr, &[]);
+        assert!(
+            matches!(result, ToolPermissionResult::Denied(_)),
+            "the CLI frontend must not skip an explicit deny merely because the call is read-only"
+        );
+    }
+
+    #[test]
+    fn interactive_permission_path_does_not_bypass_effectful_tool_denials() {
+        // `lsp` was in this frontend's former hard-coded safe list even though
+        // it starts and mutates a long-lived language-server process.
+        let (mgr, _dir) = permission_manager_with_deny("Lsp", "**");
+        let call = permission_test_call(
+            "lsp",
+            &serde_json::json!({"action": "hover", "file_path": "src/main.rs"}),
+        );
+        let result = check_tool_permission_interactive(&call, "session", &mgr, &[]);
+        assert!(
+            matches!(result, ToolPermissionResult::Denied(_)),
+            "the CLI frontend must consult catalog policy for effectful tools"
+        );
+    }
+
+    #[test]
+    fn interactive_permission_path_denies_unknown_tool_without_prompting() {
+        let call = permission_test_call("unknown_from_model", &serde_json::json!({}));
+        let manager = PermissionManager::unrestricted();
+        let result = check_tool_permission_interactive(&call, "session", &manager, &[]);
+        assert!(matches!(result, ToolPermissionResult::Denied(_)));
+    }
+
+    #[test]
+    fn interactive_prompt_bypass_is_derived_from_the_manager_and_keeps_host_safety() {
+        let manager = PermissionManager::unrestricted();
+        let safe = permission_test_call("bash", &serde_json::json!({"command": "git status"}));
+        assert!(matches!(
+            check_tool_permission_interactive(&safe, "session", &manager, &[]),
+            ToolPermissionResult::Allowed {
+                authorization: Some(_)
+            }
+        ));
+
+        let catastrophic =
+            permission_test_call("bash", &serde_json::json!({"command": "rm -rf /"}));
+        assert!(matches!(
+            check_tool_permission_interactive(&catastrophic, "session", &manager, &[]),
+            ToolPermissionResult::Denied(reason) if reason.contains("Host safety")
+        ));
+    }
 
     fn tui_options(
         model_override: Option<&str>,
@@ -2292,7 +2696,7 @@ mod tests {
             api_key: key,
             base_url: base_url.to_string(),
             model: None,
-            headers: std::collections::HashMap::new(),
+            headers: openclaudia::secrets::SensitiveHeaders::new(),
             thinking: config::ThinkingConfig::default(),
         }
     }
@@ -2368,12 +2772,68 @@ mod tests {
     }
 
     #[test]
-    fn open_project_memory_db_returns_none_when_openclaudia_path_is_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join(".openclaudia"), b"not a directory")
+    fn host_owned_memory_open_fails_when_state_path_is_a_file() {
+        let host = tempfile::tempdir().expect("host home");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(host.path().join(".openclaudia"), b"not a directory")
             .expect("write .openclaudia file");
 
-        assert!(open_project_memory_db(dir.path()).is_none());
+        assert!(memory::MemoryDb::open_for_workspace(host.path(), project.path()).is_err());
+    }
+
+    #[test]
+    fn shared_repl_and_tui_startup_opens_the_configured_authenticated_team_replica() {
+        let host = tempfile::tempdir().expect("host home");
+        let project = tempfile::tempdir().expect("project");
+        let principal: openclaudia::team_memory::PrincipalId = "owner".parse().expect("principal");
+        let authority = openclaudia::team_memory::TeamAuthorityStore::bootstrap(
+            host.path(),
+            project.path(),
+            principal,
+            31_536_000,
+        )
+        .expect("team authority");
+        let mut config = startup_vdd_config();
+        config.memory.team_id = Some(authority.team_id().clone());
+        let run = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            project.path(),
+        )
+        .working_directory(project.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .host_home(Some(host.path().to_path_buf()))
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(true)
+        .secrets(true)
+        .provider("test")
+        .build()
+        .expect("frontend run");
+        let memory = open_workspace_memory_db(&run, &config).expect("frontend memory");
+        let permissions = PermissionManager::unrestricted_for_run(&run);
+        let call = permission_test_call(
+            "memory_list",
+            &serde_json::json!({"scope": "team", "limit": 5}),
+        );
+        let result = openclaudia::services::tool_executor::ToolExecutor::execute(
+            openclaudia::services::tool_executor::ToolExecutorRequest {
+                run_context: &run,
+                tool_call: &call,
+                memory_db: Some(&memory),
+                app_config: Some(&config),
+                task_mgr: None,
+                permission_mgr: &permissions,
+                authorization: None,
+                session_id: Some("s104-frontend-startup"),
+                policy_enforcer: None,
+            },
+        );
+        assert!(!result.is_error(), "team list failed: {}", result.content());
+        let structured = result.structured().expect("typed team result");
+        assert_eq!(structured["scope"], "team");
+        assert_eq!(structured["team_freshness"], "unconfigured");
     }
 
     #[test]
@@ -2435,6 +2895,18 @@ mod tests {
     }
 
     #[test]
+    fn only_doctor_bypasses_writable_startup_migrations() {
+        assert!(!command_requires_writable_startup(Some(
+            &Commands::Doctor {
+                json: true,
+                allow_active: Vec::new(),
+            }
+        )));
+        assert!(command_requires_writable_startup(Some(&Commands::Config)));
+        assert!(command_requires_writable_startup(None));
+    }
+
+    #[test]
     fn full_screen_tui_prompts_for_startup_auth_without_overrides() {
         assert!(should_prompt_tui_startup_auth(&tui_options(None, None)));
         assert!(!should_prompt_tui_startup_auth(&tui_options(
@@ -2485,8 +2957,7 @@ mod tests {
     #[test]
     fn vdd_startup_candidates_exclude_selected_chat_provider() {
         let config = startup_vdd_config();
-        let candidates =
-            collect_tui_startup_vdd_auth_candidates(&config, "anthropic").expect("candidates");
+        let candidates = collect_tui_startup_vdd_auth_candidates(&config, "anthropic");
 
         assert!(
             candidates.iter().any(|candidate| candidate
@@ -2505,7 +2976,7 @@ mod tests {
     #[test]
     fn startup_candidates_include_configured_provider_api_keys() {
         let config = startup_vdd_config();
-        let candidates = collect_tui_startup_auth_candidates(&config).expect("candidates");
+        let candidates = collect_tui_startup_auth_candidates(&config);
 
         assert!(
             candidates.iter().any(|candidate| candidate
@@ -2619,10 +3090,17 @@ mod tests {
         }
 
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let prompt_blocks = openclaudia::prompt::SystemPromptBlocks {
-            stable_prefix: "stable".to_string(),
-            dynamic_suffix: String::new(),
-        };
+        let prompt_blocks = openclaudia::prompt::SystemPromptBlocks::from_items(
+            vec![openclaudia::context::ContextItem::host_instruction(
+                "test.stable",
+                openclaudia::context::HostInstructionSource::CorePolicy,
+                "compiled:test",
+                "stable",
+                openclaudia::context::ContextFreshness::Static,
+                1,
+            )],
+            openclaudia::context::ContextBudget::default(),
+        );
 
         let anthropic = build_chat_request_body(
             "anthropic",
@@ -2764,7 +3242,7 @@ mod tests {
     }
 
     #[test]
-    fn repl_session_document_round_trips_through_tui_without_state_loss() {
+    fn repl_session_document_round_trips_through_tui_with_non_authority_state_intact() {
         let repl_session = Session::new_with_behavior_mode(
             "gpt-5.5",
             "openai",
@@ -2834,9 +3312,18 @@ mod tests {
         assert!(state.ui.plan_mode.needs_exit_attachment);
         assert!(state.ui.plan_mode.needs_auto_exit_attachment);
         assert!(state.ui.lsp_recommendation_shown_this_session);
-        assert!(state.permissions.bypass_mode);
-        assert!(state.permissions.trust_accepted);
-        assert!(state.permissions.persistence_disabled);
+        assert!(
+            !state.permissions.bypass_mode,
+            "conversation documents must not restore permission bypass authority"
+        );
+        assert!(
+            !state.permissions.trust_accepted,
+            "conversation documents must not restore trust authority"
+        );
+        assert!(
+            !state.permissions.persistence_disabled,
+            "conversation documents must not restore invocation-local persistence policy"
+        );
         assert_eq!(state.transcript.watermark, 17);
         assert_eq!(
             state.transcript.transcript_cwd,

@@ -12,22 +12,16 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::session::TaskManager;
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+mod support;
 
 const NO_SESSION_MARKER: &str = "Task management not available (no session)";
 
 fn dispatch_without_session(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
+    support::dispatch_tool_with_tasks(name, args, None)
 }
 
 fn dispatch_with_session(
@@ -35,21 +29,36 @@ fn dispatch_with_session(
     args: &HashMap<String, Value>,
     tm: &mut TaskManager,
 ) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: Some(tm),
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
+    support::dispatch_tool_with_tasks(name, args, Some(tm))
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
     let mut m = HashMap::new();
     for (k, v) in entries {
         m.insert((*k).to_string(), v.clone());
+    }
+    if m.contains_key("subject") && m.contains_key("description") {
+        m.insert("expected_generation".to_string(), json!(0));
+    }
+    if m.contains_key("task_id")
+        && [
+            "status",
+            "subject",
+            "description",
+            "active_form",
+            "add_blocks",
+            "add_blocked_by",
+            "remove_blocks",
+            "remove_blocked_by",
+            "priority",
+            "budget",
+            "clear_budget",
+        ]
+        .iter()
+        .any(|field| m.contains_key(*field))
+    {
+        m.insert("expected_generation".to_string(), json!(1));
+        m.insert("expected_task_revision".to_string(), json!(1));
     }
     m
 }
@@ -181,6 +190,103 @@ fn task_create_active_form_as_number_errors_with_session() {
     assert!(msg.contains("Invalid 'active_form' argument: expected string"));
 }
 
+#[test]
+fn task_create_priority_and_budget_round_trip_through_real_dispatch() {
+    let mut tm = TaskManager::new();
+    let args = args_with(&[
+        ("subject", json!("bounded critical task")),
+        ("description", json!("desc")),
+        ("priority", json!("critical")),
+        ("budget", json!({"max_turns": 5, "max_tokens": 1000})),
+    ]);
+    let (msg, is_err) = dispatch_with_session("task_create", &args, &mut tm);
+    assert!(!is_err, "{msg}");
+    let task = tm.get_task("task-1").expect("created task");
+    assert_eq!(
+        task.priority,
+        openclaudia::task_graph::TaskPriority::Critical
+    );
+    let budget = task.budget.as_ref().expect("bounded planning request");
+    assert_eq!(budget.max_turns, Some(5));
+    assert_eq!(budget.max_tokens, Some(1000));
+}
+
+#[test]
+fn invalid_priority_and_empty_budget_are_atomic_dispatch_failures() {
+    let mut tm = TaskManager::new();
+    for extra in [("priority", json!("urgent")), ("budget", json!({}))] {
+        let args = args_with(&[
+            ("subject", json!("must not exist")),
+            ("description", json!("desc")),
+            extra,
+        ]);
+        let before = serde_json::to_vec(tm.graph()).expect("before graph");
+        let (msg, is_err) = dispatch_with_session("task_create", &args, &mut tm);
+        assert!(is_err, "invalid input unexpectedly succeeded: {msg}");
+        assert_eq!(serde_json::to_vec(tm.graph()).expect("after graph"), before);
+    }
+}
+
+#[test]
+fn oversized_task_fields_and_edge_batches_are_atomic_dispatch_failures() {
+    let mut manager = TaskManager::new();
+    for (field, value) in [
+        (
+            "subject",
+            "s".repeat(openclaudia::task_graph::MAX_TASK_SUBJECT_BYTES + 1),
+        ),
+        (
+            "description",
+            "d".repeat(openclaudia::task_graph::MAX_TASK_DESCRIPTION_BYTES + 1),
+        ),
+        (
+            "active_form",
+            "a".repeat(openclaudia::task_graph::MAX_TASK_ACTIVE_FORM_BYTES + 1),
+        ),
+    ] {
+        let mut args = HashMap::from([
+            ("expected_generation".to_string(), json!(0)),
+            ("subject".to_string(), json!("bounded task")),
+            ("description".to_string(), json!("bounded description")),
+        ]);
+        args.insert(field.to_string(), json!(value));
+        let before = serde_json::to_vec(manager.graph()).expect("before field rejection");
+        let (message, is_error) = dispatch_with_session("task_create", &args, &mut manager);
+        assert!(is_error, "{field} unexpectedly succeeded: {message}");
+        assert!(message.contains("exceeds"), "{field}: {message}");
+        assert_eq!(
+            serde_json::to_vec(manager.graph()).expect("after field rejection"),
+            before,
+            "{field} changed the graph"
+        );
+    }
+
+    let (message, is_error) = dispatch_with_session(
+        "task_create",
+        &args_with(&[
+            ("subject", json!("edge owner")),
+            ("description", json!("desc")),
+        ]),
+        &mut manager,
+    );
+    assert!(!is_error, "{message}");
+    let edge_ids = (0..=openclaudia::task_graph::MAX_TASK_EDGES)
+        .map(|index| format!("task-{index}"))
+        .collect::<Vec<_>>();
+    let update = args_with(&[
+        ("task_id", json!("task-1")),
+        ("add_blocks", json!(edge_ids)),
+    ]);
+    let before = serde_json::to_vec(manager.graph()).expect("before edge rejection");
+    let (message, is_error) = dispatch_with_session("task_update", &update, &mut manager);
+    assert!(is_error, "oversized edge batch succeeded: {message}");
+    assert!(message.contains("exceeds"), "{message}");
+    assert_eq!(
+        serde_json::to_vec(manager.graph()).expect("after edge rejection"),
+        before
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section C — task_list with session
 // ───────────────────────────────────────────────────────────────────────────
@@ -210,6 +316,55 @@ fn task_list_after_create_shows_created_task() {
         l_msg.contains("unique_task_subject_marker_151"),
         "task_list MUST show created task subject; got {l_msg:?}"
     );
+}
+
+#[test]
+fn task_list_ready_only_uses_priority_order_and_rejects_cursor_mix() {
+    let mut tm = TaskManager::new();
+    for (generation, subject, priority) in [(0, "medium", "medium"), (1, "critical", "critical")] {
+        let args = HashMap::from([
+            ("expected_generation".to_string(), json!(generation)),
+            ("subject".to_string(), json!(subject)),
+            ("description".to_string(), json!("desc")),
+            ("priority".to_string(), json!(priority)),
+        ]);
+        let (msg, is_err) = dispatch_with_session("task_create", &args, &mut tm);
+        assert!(!is_err, "{msg}");
+    }
+    let (ready, is_err) = dispatch_with_session(
+        "task_list",
+        &HashMap::from([("ready_only".to_string(), json!(true))]),
+        &mut tm,
+    );
+    assert!(!is_err, "{ready}");
+    assert!(
+        ready.find("critical").expect("critical") < ready.find("medium").expect("medium"),
+        "{ready}"
+    );
+
+    let (message, is_err) = dispatch_with_session(
+        "task_list",
+        &HashMap::from([
+            ("ready_only".to_string(), json!(true)),
+            ("cursor".to_string(), json!("v1:2:1")),
+        ]),
+        &mut tm,
+    );
+    assert!(is_err);
+    assert!(message.contains("cannot be used"), "{message}");
+}
+
+#[test]
+fn task_list_rejects_oversized_cursor() {
+    let mut manager = TaskManager::new();
+    let cursor = "x".repeat(openclaudia::task_graph::MAX_PAGE_CURSOR_BYTES + 1);
+    let (message, is_error) = dispatch_with_session(
+        "task_list",
+        &HashMap::from([("cursor".to_string(), json!(cursor))]),
+        &mut manager,
+    );
+    assert!(is_error);
+    assert!(message.contains("cursor is invalid"), "{message}");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -244,7 +399,9 @@ fn task_get_non_string_task_id_arg_errors() {
     let (msg, is_err) = dispatch_with_session("task_get", &args, &mut tm);
     assert!(is_err);
     assert_ne!(msg, NO_SESSION_MARKER);
-    assert!(msg.contains("Invalid 'task_id' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'task_id'"));
 }
 
 #[test]
@@ -285,7 +442,9 @@ fn task_update_non_string_task_id_errors() {
     let (msg, is_err) = dispatch_with_session("task_update", &args, &mut tm);
     assert!(is_err);
     assert_ne!(msg, NO_SESSION_MARKER);
-    assert!(msg.contains("Invalid 'task_id' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'task_id'"));
 }
 
 #[test]

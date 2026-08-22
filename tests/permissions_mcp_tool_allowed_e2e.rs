@@ -1,7 +1,6 @@
 //! End-to-end tests for `config::PermissionsConfig::mcp_tool_allowed` —
-//! per-server MCP allowlist semantics including the
-//! "absent server means allow all" default (#619) and
-//! the empty-allowlist-denies-all special case.
+//! fail-closed per-server MCP allowlist semantics, including absent-server,
+//! empty-list, and exact identity handling.
 //!
 //! Sprint 176 of the verification effort. Sprint 49 had
 //! `validate()` coverage but `mcp_tool_allowed` was
@@ -19,6 +18,7 @@ const fn cfg_with_mcp(mcp: HashMap<String, Vec<String>>) -> PermissionsConfig {
         enabled: true,
         default_allow: Vec::new(),
         mcp,
+        project_proposal: None,
     }
 }
 
@@ -27,29 +27,26 @@ const fn cfg_with_mcp(mcp: HashMap<String, Vec<String>>) -> PermissionsConfig {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn default_permissions_allow_any_mcp_server_and_tool() {
-    // PINS DEFAULT: empty mcp map → every server is unrestricted.
+fn default_permissions_deny_every_unconfigured_mcp_server_and_tool() {
     let cfg = PermissionsConfig::default();
-    assert!(cfg.mcp_tool_allowed("any-server", "any-tool"));
-    assert!(cfg.mcp_tool_allowed("github", "create_issue"));
-    assert!(cfg.mcp_tool_allowed("filesystem", "read_file"));
+    assert!(!cfg.mcp_tool_allowed("any-server", "any-tool"));
+    assert!(!cfg.mcp_tool_allowed("github", "create_issue"));
+    assert!(!cfg.mcp_tool_allowed("filesystem", "read_file"));
 }
 
 #[test]
-fn server_absent_from_allowlist_yields_unrestricted() {
-    // PINS DOC: a server not present in `mcp` map → all
-    // its tools allowed (is_none_or branch).
+fn server_absent_from_allowlist_is_denied() {
     let cfg = cfg_with_mcp(HashMap::from([(
         "configured-server".to_string(),
         vec!["only-tool".to_string()],
     )]));
     assert!(
-        cfg.mcp_tool_allowed("unconfigured-server", "whatever"),
-        "absent server MUST allow all"
+        !cfg.mcp_tool_allowed("unconfigured-server", "whatever"),
+        "absent server must fail closed"
     );
     assert!(
-        cfg.mcp_tool_allowed("unconfigured-server", "another"),
-        "absent server allows even another tool"
+        !cfg.mcp_tool_allowed("unconfigured-server", "another"),
+        "every tool on an absent server must fail closed"
     );
 }
 
@@ -127,10 +124,9 @@ fn server_name_match_is_case_sensitive() {
         "github".to_string(),
         vec!["create_issue".to_string()],
     )]));
-    // "GitHub" is NOT in the map → server-absent branch → allowed.
     assert!(
-        cfg.mcp_tool_allowed("GitHub", "create_issue"),
-        "different-case server name treated as absent (allowed)"
+        !cfg.mcp_tool_allowed("GitHub", "create_issue"),
+        "different-case server name is an absent identity and must be denied"
     );
 }
 
@@ -152,12 +148,12 @@ fn two_servers_have_independent_allowlists() {
 }
 
 #[test]
-fn one_server_locked_down_other_unrestricted() {
+fn one_server_locked_down_other_unconfigured() {
     let cfg = cfg_with_mcp(HashMap::from([("locked".to_string(), Vec::new())]));
     // "locked" denies all.
     assert!(!cfg.mcp_tool_allowed("locked", "x"));
-    // Other server: not in map → unrestricted.
-    assert!(cfg.mcp_tool_allowed("unrestricted", "x"));
+    // Other server: not in map → denied.
+    assert!(!cfg.mcp_tool_allowed("unconfigured", "x"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -181,21 +177,21 @@ mcp:
     assert!(!cfg.mcp_tool_allowed("github", "delete_repo"));
     // filesystem with [] denies all.
     assert!(!cfg.mcp_tool_allowed("filesystem", "read_file"));
-    // Unknown server: unrestricted.
-    assert!(cfg.mcp_tool_allowed("other", "any-tool"));
+    // Unknown server: denied.
+    assert!(!cfg.mcp_tool_allowed("other", "any-tool"));
 }
 
 #[test]
-fn yaml_without_mcp_block_yields_unrestricted_for_every_server() {
+fn yaml_without_mcp_block_denies_every_server() {
     let yaml = "enabled: true\ndefault_allow: []";
     let cfg: PermissionsConfig = serde_yaml::from_str(yaml).expect("ok");
-    assert!(cfg.mcp_tool_allowed("any-server", "any-tool"));
+    assert!(!cfg.mcp_tool_allowed("any-server", "any-tool"));
 }
 
 #[test]
-fn empty_yaml_yields_default_unrestricted_mcp() {
+fn empty_yaml_yields_default_fail_closed_mcp() {
     let cfg: PermissionsConfig = serde_yaml::from_str("{}").expect("ok");
-    assert!(cfg.mcp_tool_allowed("any-server", "any-tool"));
+    assert!(!cfg.mcp_tool_allowed("any-server", "any-tool"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -226,7 +222,7 @@ fn default_mcp_is_empty_map() {
     let cfg = PermissionsConfig::default();
     assert!(
         cfg.mcp.is_empty(),
-        "PINS DEFAULT: no per-server MCP restrictions"
+        "PINS DEFAULT: no MCP dynamic capabilities are configured"
     );
 }
 
@@ -235,16 +231,15 @@ fn default_mcp_is_empty_map() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn empty_server_name_with_no_allowlist_is_unrestricted() {
+fn empty_server_name_with_no_allowlist_is_denied() {
     let cfg = PermissionsConfig::default();
-    // Empty server name not in map → absent → allowed.
-    assert!(cfg.mcp_tool_allowed("", "some-tool"));
+    assert!(!cfg.mcp_tool_allowed("", "some-tool"));
 }
 
 #[test]
-fn empty_tool_name_against_unrestricted_server_allowed() {
+fn empty_tool_name_against_unconfigured_server_is_denied() {
     let cfg = PermissionsConfig::default();
-    assert!(cfg.mcp_tool_allowed("server", ""));
+    assert!(!cfg.mcp_tool_allowed("server", ""));
 }
 
 #[test]

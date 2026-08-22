@@ -11,7 +11,10 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+use openclaudia::runtime::{Actor, ActorId, ActorRole, RunId};
 use openclaudia::session::{Task, TaskManager, TaskStatus, TaskUpdateParams, TaskUpdateStatus};
+use openclaudia::task_graph::{TaskActor, TaskPriority};
+use std::path::PathBuf;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -19,12 +22,13 @@ use openclaudia::session::{Task, TaskManager, TaskStatus, TaskUpdateParams, Task
 
 fn add(mgr: &mut TaskManager, subject: &str) -> String {
     mgr.create_task(subject.to_string(), String::new(), None)
+        .expect("valid task fixture must be created")
         .id
         .clone()
 }
 
 fn status_of(mgr: &TaskManager, id: &str) -> Option<TaskStatus> {
-    mgr.get_task(id).map(|t| t.status.clone())
+    mgr.get_task(id).map(|task| task.status)
 }
 
 fn update_status<'m>(
@@ -58,6 +62,14 @@ fn parse_accepts_every_documented_status_string() {
     assert_eq!(
         TaskUpdateStatus::parse("completed"),
         Some(TaskUpdateStatus::Completed)
+    );
+    assert_eq!(
+        TaskUpdateStatus::parse("failed"),
+        Some(TaskUpdateStatus::Failed)
+    );
+    assert_eq!(
+        TaskUpdateStatus::parse("canceled"),
+        Some(TaskUpdateStatus::Canceled)
     );
     assert_eq!(
         TaskUpdateStatus::parse("deleted"),
@@ -108,6 +120,8 @@ fn create_task_starts_with_no_dependencies() {
     let task = mgr.get_task(&id).unwrap();
     assert!(task.blocks.is_empty());
     assert!(task.blocked_by.is_empty());
+    assert_eq!(task.priority, TaskPriority::Medium);
+    assert!(task.terminal_at.is_none());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -325,12 +339,144 @@ fn empty_update_params_leaves_task_unchanged() {
     let mut mgr = TaskManager::new();
     let id = add(&mut mgr, "stable");
     let before = mgr.get_task(&id).unwrap().clone();
+    let graph_before = serde_json::to_vec(mgr.graph()).expect("serialize graph before");
+    let generation_before = mgr.generation();
     mgr.update_task(&id, TaskUpdateParams::default())
         .expect("noop update");
     let after = mgr.get_task(&id).unwrap();
-    assert_eq!(before.subject, after.subject);
-    assert_eq!(before.description, after.description);
-    assert_eq!(before.status, after.status);
+    assert_eq!(&before, after);
+    assert_eq!(mgr.generation(), generation_before);
+    assert_eq!(
+        serde_json::to_vec(mgr.graph()).expect("serialize graph after"),
+        graph_before
+    );
+}
+
+#[test]
+fn persistent_semantic_noop_does_not_republish_storage() {
+    let root = tempfile::tempdir().expect("persistent task root");
+    let target = PathBuf::from("tasks.json");
+    let actor = TaskActor::new(
+        Actor {
+            id: ActorId::new(),
+            role: ActorRole::Planner,
+        },
+        RunId::new(),
+    );
+    let mut manager = TaskManager::open(root.path(), target.clone(), "persistent-noop", actor)
+        .expect("persistent task manager");
+    let task_id = add(&mut manager, "stable persisted task");
+    let before_graph = serde_json::to_vec(manager.graph()).expect("graph before no-op");
+    let before_file = std::fs::read(root.path().join(&target)).expect("file before no-op");
+
+    manager
+        .update_task(&task_id, TaskUpdateParams::default())
+        .expect("semantic no-op");
+
+    assert_eq!(
+        serde_json::to_vec(manager.graph()).expect("graph after no-op"),
+        before_graph
+    );
+    assert_eq!(
+        std::fs::read(root.path().join(target)).expect("file after no-op"),
+        before_file
+    );
+    let receipt = manager.last_receipt().expect("no-op receipt");
+    assert!(receipt.graph.affected.is_empty());
+    assert!(receipt.persistence.is_none());
+}
+
+#[test]
+fn durable_reopen_uses_stable_session_lane_not_rotating_run_identity() {
+    let root = tempfile::tempdir().expect("persistent task root");
+    let target = PathBuf::from("resume-tasks.json");
+    let actor_for = |session_id: &str| {
+        TaskActor::with_session(
+            Actor {
+                id: ActorId::new(),
+                role: ActorRole::Planner,
+            },
+            RunId::new(),
+            session_id,
+        )
+    };
+    let mut first = TaskManager::open(
+        root.path(),
+        target.clone(),
+        "durable-resume",
+        actor_for("stable-session"),
+    )
+    .expect("first manager");
+    let task_id = add(&mut first, "resume me");
+    update_status(&mut first, &task_id, TaskUpdateStatus::InProgress)
+        .expect("first run starts task");
+    drop(first);
+
+    let mut resumed = TaskManager::open(
+        root.path(),
+        target.clone(),
+        "durable-resume",
+        actor_for("stable-session"),
+    )
+    .expect("resumed manager");
+    update_status(&mut resumed, &task_id, TaskUpdateStatus::Completed)
+        .expect("resumed run completes same session task");
+    assert_eq!(status_of(&resumed, &task_id), Some(TaskStatus::Completed));
+    drop(resumed);
+
+    let mut foreign = TaskManager::open(
+        root.path(),
+        target,
+        "durable-resume",
+        actor_for("foreign-session"),
+    )
+    .expect("foreign manager can inspect bounded data");
+    let before = std::fs::read(root.path().join("resume-tasks.json")).expect("before rejection");
+    let error = update_status(&mut foreign, &task_id, TaskUpdateStatus::Pending)
+        .expect_err("foreign session must not mutate task");
+    assert!(error.contains("another session lane"), "{error}");
+    assert_eq!(
+        std::fs::read(root.path().join("resume-tasks.json")).expect("after rejection"),
+        before
+    );
+}
+
+#[test]
+fn failed_and_canceled_are_terminal_and_returning_to_pending_clears_terminal_time() {
+    let mut mgr = TaskManager::new();
+    let failed = add(&mut mgr, "failed");
+    update_status(&mut mgr, &failed, TaskUpdateStatus::Failed).expect("fail task");
+    assert!(mgr.get_task(&failed).unwrap().terminal_at.is_some());
+    update_status(&mut mgr, &failed, TaskUpdateStatus::Pending).expect("retry task");
+    assert!(mgr.get_task(&failed).unwrap().terminal_at.is_none());
+
+    let canceled = add(&mut mgr, "canceled");
+    update_status(&mut mgr, &canceled, TaskUpdateStatus::Canceled).expect("cancel task");
+    assert!(mgr.get_task(&canceled).unwrap().terminal_at.is_some());
+}
+
+#[test]
+fn priority_update_changes_deterministic_ready_order() {
+    let mut mgr = TaskManager::new();
+    let medium = add(&mut mgr, "medium");
+    let critical = add(&mut mgr, "critical");
+    mgr.update_task(
+        &critical,
+        TaskUpdateParams {
+            priority: Some(TaskPriority::Critical),
+            ..TaskUpdateParams::default()
+        },
+    )
+    .expect("set critical priority");
+    let ready = mgr.ready_tasks(10).expect("ready tasks");
+    assert_eq!(
+        ready
+            .tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![critical.as_str(), medium.as_str()]
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -343,6 +489,8 @@ fn task_status_display_matches_serde_snake_case() {
         (TaskStatus::Pending, "pending"),
         (TaskStatus::InProgress, "in_progress"),
         (TaskStatus::Completed, "completed"),
+        (TaskStatus::Failed, "failed"),
+        (TaskStatus::Canceled, "canceled"),
     ];
     for (status, expected) in cases {
         assert_eq!(format!("{status}"), *expected);
@@ -368,11 +516,7 @@ fn task_serde_round_trip_preserves_all_fields() {
 
     let json = serde_json::to_string(&task).expect("serialize");
     let back: Task = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back.id, task.id);
-    assert_eq!(back.subject, task.subject);
-    assert_eq!(back.description, task.description);
-    assert_eq!(back.active_form, task.active_form);
-    assert_eq!(back.status, task.status);
+    assert_eq!(back, task);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

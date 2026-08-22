@@ -1,0 +1,376 @@
+{
+  "schema_version": 1,
+  "corpus_id": "openclaudia-technical-memory-heldout-v1",
+  "split": "held_out",
+  "generator_id": "s105-corpus-builder",
+  "repository_revision_id": "12f5444119df1067351c876bf01f534f55b41ee4",
+  "repository_revision_digest": "sha256:90575780cc78c06e6d81d030ac93016803874f7808985c0bbe029fb94b47bbdd",
+  "evaluation_now_unix_seconds": 100,
+  "lessons": [
+    {
+      "id": "held-cache-stale",
+      "draft": {
+        "title": "Provider cache review deadline",
+        "kind": "compatibility",
+        "observation": "A provider capability cache becomes stale at its review deadline.",
+        "guidance": "Surface stale state and refresh from authenticated metadata.",
+        "applicability": {"paths": ["src/providers/model_catalog.rs"], "components": ["provider-catalog"], "tags": ["verify"]},
+        "citations": [{"kind": "source_file", "locator": "src/providers/model_catalog.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:0558349bae548233710fd6ff89ecbdca5ad2078880499482325167f46398c3ae"}],
+        "confidence": "reproduced",
+        "sensitivity": "internal",
+        "retention": {"policy": "review_after", "unix_seconds": 70}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 20,
+      "due_for_review": true,
+      "state": "available"
+    },
+    {
+      "id": "held-diverse-duplicate",
+      "draft": {
+        "title": "Migration recovery evidence",
+        "kind": "testing",
+        "observation": "A second runner lesson repeats the same fail-closed trace.",
+        "guidance": "After one runner trace is selected, prefer an independent startup-gate check.",
+        "applicability": {"paths": ["src/migrations/mod.rs"], "components": ["startup-migrations"], "tags": ["testing"]},
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:d70230a137c6cd67e37be47911a4c56d30a7459f548d7313422e8ceb26049e6c"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 55,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-diverse-independent",
+      "draft": {
+        "title": "Migration recovery evidence",
+        "kind": "testing",
+        "observation": "The binary startup gate independently blocks agent surfaces on a fail-closed state.",
+        "guidance": "Retain startup-gate coverage alongside the runner trace.",
+        "applicability": {"paths": ["src/main.rs"], "components": ["startup-gate"], "tags": ["verify"]},
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:d70230a137c6cd67e37be47911a4c56d30a7459f548d7313422e8ceb26049e6c"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 50,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-diverse-primary",
+      "draft": {
+        "title": "Migration recovery evidence",
+        "kind": "testing",
+        "observation": "The runner emits a typed trace for every fail-closed path.",
+        "guidance": "Keep the primary runner trace in the selected technical set.",
+        "applicability": {"paths": ["src/migrations/mod.rs"], "components": ["startup-migrations"], "tags": ["testing"]},
+        "citations": [{"kind": "source_file", "locator": "src/migrations/mod.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:71a8f4f2edf115d463b6f29daa4751e2c5a2e534711990a21d2b40599c5fc42d"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 60,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-expired-membership",
+      "draft": {
+        "title": "Expired membership generation",
+        "kind": "security",
+        "observation": "A team authority observation past its retention boundary cannot establish current membership.",
+        "guidance": "Surface a partial result when expired authority evidence is omitted.",
+        "applicability": {"paths": ["src/team_memory/authority.rs"], "components": ["team-authority"], "tags": ["verify"]},
+        "citations": [{"kind": "source_file", "locator": "src/team_memory/authority.rs", "source_version": "worktree:s108", "digest": "sha256:b2b4713cf81c88860846def28ca5b6ed9660675d21399c1de5dab92af565db5c"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "confidential",
+        "retention": {"policy": "expire_after", "unix_seconds": 30}
+      },
+      "scope": "team_shared",
+      "captured_at_unix_seconds": 10,
+      "due_for_review": false,
+      "state": "expired"
+    },
+    {
+      "id": "held-field-body",
+      "draft": {
+        "title": "Build note",
+        "kind": "build",
+        "observation": "A toolchain pin appears in a remediation document.",
+        "guidance": "Do not prefer a prose mention over the repository configuration.",
+        "applicability": {"paths": ["docs/remediation-slices/002-repository-artifact-dependency-policy.md"], "components": ["documentation"], "tags": ["docs"]},
+        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/002-repository-artifact-dependency-policy.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:64ba5bacfdfe549b12c16a879fd03ca95d8da55707b472e00f24afb55bf8fda2"}],
+        "confidence": "observed_once",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 70,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-field-title",
+      "draft": {
+        "title": "Toolchain pin receipt",
+        "kind": "build",
+        "observation": "The repository toolchain file is the authoritative compiler selection.",
+        "guidance": "Use the exact pinned toolchain for build and verification commands.",
+        "applicability": {"paths": ["rust-toolchain.toml"], "components": ["build-system"], "tags": ["build"]},
+        "citations": [{"kind": "configuration", "locator": "rust-toolchain.toml", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:495c69d1db93f25f53e3d0d2d40d812313366cc368de317871c2ace6c6ffafa4"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 60,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-freshness-current",
+      "draft": {
+        "title": "OAuth callback binding",
+        "kind": "security",
+        "observation": "The current contract binds state and redirect authority before token exchange.",
+        "guidance": "Use the current authenticated contract when changing flow code.",
+        "applicability": {"paths": ["src/oauth.rs"], "components": ["oauth"], "tags": ["verify"]},
+        "citations": [{"kind": "source_file", "locator": "src/oauth.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:4ebe3395bdbb1c962f948cf8086baa434ece1cb8fab314c60bea7ed0b12b91f7"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "confidential",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 40,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-freshness-stale",
+      "draft": {
+        "title": "OAuth callback binding",
+        "kind": "security",
+        "observation": "The audit-era contract predates the current callback implementation.",
+        "guidance": "Revalidate the older contract before using it as technical evidence.",
+        "applicability": {"paths": ["src/oauth.rs"], "components": ["oauth"], "tags": ["verify"]},
+        "citations": [{"kind": "documentation", "locator": "docs/full-codebase-audit-2026-08-16.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:67c11719308878460870202b1d8ad6541b9f0cce88ff1a601169f476f27e3a02"}],
+        "confidence": "observed_once",
+        "sensitivity": "confidential",
+        "retention": {"policy": "review_after", "unix_seconds": 70}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 50,
+      "due_for_review": true,
+      "state": "available"
+    },
+    {
+      "id": "held-migration-doctor",
+      "draft": {
+        "title": "Migration lock restriction",
+        "kind": "operational",
+        "observation": "Doctor diagnostics must not acquire a migration lock or repair persistent state.",
+        "guidance": "Keep health inspection read-only and separate from the migration runner.",
+        "applicability": {"paths": ["src/main.rs"], "components": ["doctor"], "tags": ["doctor", "lock", "migration"]},
+        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s064", "digest": "sha256:ae0fe24999ad3ca165fa2acd41935adcfeab89aa32b20955af9299b23aa6ef1e"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 25,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-migration-lock",
+      "draft": {
+        "title": "Startup migration lock",
+        "kind": "operational",
+        "observation": "A startup migration lock must cover complete preflight and publication.",
+        "guidance": "Acquire the bounded global migration lock before inspecting artifacts.",
+        "applicability": {"paths": ["src/migrations/mod.rs"], "symbols": ["MigrationRunner::run_all"], "components": ["startup-migrations"], "tags": ["operate"]},
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:d70230a137c6cd67e37be47911a4c56d30a7459f548d7313422e8ceb26049e6c"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 11,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-rust-doc-note",
+      "draft": {
+        "title": "Documentation toolchain note",
+        "kind": "build",
+        "observation": "The Rust toolchain appears in an old documentation example.",
+        "guidance": "Use the repository toolchain file rather than a prose example.",
+        "applicability": {"paths": ["docs/remediation-slices/002-repository-artifact-dependency-policy.md"], "components": ["documentation"], "tags": ["docs"]},
+        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/002-repository-artifact-dependency-policy.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:64ba5bacfdfe549b12c16a879fd03ca95d8da55707b472e00f24afb55bf8fda2"}],
+        "confidence": "observed_once",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 35,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "held-schema-conflict",
+      "draft": {
+        "title": "Schema migration causal conflict",
+        "kind": "architecture",
+        "observation": "Concurrent schema ownership claims cannot be selected implicitly.",
+        "guidance": "Return conflict metadata and require typed resolution.",
+        "applicability": {"paths": ["src/session/mod.rs"], "components": ["session-schema"], "tags": ["conflict"]},
+        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/038-session-schema-migration-and-ownership.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:0fde32e71faf941b770529d142f4e12bd6bd9596a12e0f1153ccc56a24bb5440"}],
+        "confidence": "reproduced",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "team_shared",
+      "captured_at_unix_seconds": 18,
+      "due_for_review": false,
+      "state": "conflicted"
+    },
+    {
+      "id": "held-toolchain-config",
+      "draft": {
+        "title": "Pinned Rust toolchain",
+        "kind": "build",
+        "observation": "The build uses the exact Rust version in rust-toolchain.toml.",
+        "guidance": "Run Cargo with the repository-pinned Rust toolchain.",
+        "applicability": {"paths": ["rust-toolchain.toml"], "components": ["build-system"], "tags": ["build"]},
+        "citations": [{"kind": "configuration", "locator": "rust-toolchain.toml", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:495c69d1db93f25f53e3d0d2d40d812313366cc368de317871c2ace6c6ffafa4"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 15,
+      "due_for_review": false,
+      "state": "available"
+    }
+  ],
+  "cases": [
+    {
+      "id": "held-build-toolchain-task",
+      "query": "Rust toolchain",
+      "context": {"stage": "verify", "paths": ["rust-toolchain.toml"], "components": ["build-system"]},
+      "limit": 1,
+      "candidate_ids": ["held-rust-doc-note", "held-toolchain-config"],
+      "expected_relevant_ids": ["held-toolchain-config"],
+      "forbidden_ids": ["held-rust-doc-note"],
+      "expected_top_id": "held-toolchain-config",
+      "expected_state": "complete"
+    },
+    {
+      "id": "held-conflicted-schema",
+      "query": "schema conflict",
+      "context": {"stage": "analyze", "paths": ["src/session/mod.rs"], "components": ["session-schema"]},
+      "limit": 5,
+      "candidate_ids": ["held-schema-conflict"],
+      "expected_relevant_ids": [],
+      "forbidden_ids": ["held-schema-conflict"],
+      "expected_top_id": null,
+      "expected_state": "conflicted"
+    },
+    {
+      "id": "held-diversity-ablation",
+      "query": "migration recovery evidence",
+      "context": {"stage": "verify", "paths": ["src/main.rs", "src/migrations/mod.rs"], "components": ["startup-gate", "startup-migrations"]},
+      "limit": 2,
+      "candidate_ids": ["held-diverse-duplicate", "held-diverse-independent", "held-diverse-primary"],
+      "expected_relevant_ids": ["held-diverse-independent", "held-diverse-primary"],
+      "forbidden_ids": ["held-diverse-duplicate"],
+      "expected_top_id": "held-diverse-primary",
+      "expected_state": "partial"
+    },
+    {
+      "id": "held-expired-membership-is-partial",
+      "query": "expired membership generation",
+      "context": {"stage": "verify", "paths": ["src/team_memory/authority.rs"], "components": ["team-authority"]},
+      "limit": 5,
+      "candidate_ids": ["held-expired-membership"],
+      "expected_relevant_ids": [],
+      "forbidden_ids": ["held-expired-membership"],
+      "expected_top_id": null,
+      "expected_state": "partial"
+    },
+    {
+      "id": "held-field-weight-ablation",
+      "query": "toolchain pin",
+      "context": {"paths": ["docs/remediation-slices/002-repository-artifact-dependency-policy.md", "rust-toolchain.toml"], "components": ["build-system", "documentation"]},
+      "limit": 1,
+      "candidate_ids": ["held-field-body", "held-field-title"],
+      "expected_relevant_ids": ["held-field-title"],
+      "forbidden_ids": ["held-field-body"],
+      "expected_top_id": "held-field-title",
+      "expected_state": "partial"
+    },
+    {
+      "id": "held-freshness-ablation",
+      "query": "OAuth callback binding",
+      "context": {"stage": "verify", "paths": ["src/oauth.rs"], "components": ["oauth"]},
+      "limit": 1,
+      "candidate_ids": ["held-freshness-current", "held-freshness-stale"],
+      "expected_relevant_ids": ["held-freshness-current"],
+      "forbidden_ids": ["held-freshness-stale"],
+      "expected_top_id": "held-freshness-current",
+      "expected_state": "partial"
+    },
+    {
+      "id": "held-migration-lock-task",
+      "query": "migration lock",
+      "context": {"stage": "operate", "paths": ["src/migrations/mod.rs"], "components": ["startup-migrations"]},
+      "limit": 1,
+      "candidate_ids": ["held-migration-doctor", "held-migration-lock"],
+      "expected_relevant_ids": ["held-migration-lock"],
+      "forbidden_ids": ["held-migration-doctor"],
+      "expected_top_id": "held-migration-lock",
+      "expected_state": "complete"
+    },
+    {
+      "id": "held-no-hit-oauth-refresh",
+      "query": "old credential",
+      "context": {"stage": "operate", "paths": ["src/oauth.rs"], "components": ["oauth"]},
+      "limit": 5,
+      "candidate_ids": ["held-rust-doc-note"],
+      "expected_relevant_ids": [],
+      "forbidden_ids": ["held-rust-doc-note"],
+      "expected_top_id": null,
+      "expected_state": "no_hit"
+    },
+    {
+      "id": "held-stale-provider-cache",
+      "query": "cache review deadline",
+      "context": {"stage": "verify", "paths": ["src/providers/model_catalog.rs"], "components": ["provider-catalog"]},
+      "limit": 2,
+      "candidate_ids": ["held-cache-stale"],
+      "expected_relevant_ids": ["held-cache-stale"],
+      "forbidden_ids": [],
+      "expected_top_id": "held-cache-stale",
+      "expected_state": "stale"
+    },
+    {
+      "id": "held-store-error",
+      "query": "memory store corruption",
+      "context": {"stage": "reproduce", "paths": ["src/memory.rs"], "components": ["technical-memory"]},
+      "limit": 5,
+      "injected_failure": "store_error",
+      "candidate_ids": [],
+      "expected_relevant_ids": [],
+      "forbidden_ids": [],
+      "expected_top_id": null,
+      "expected_state": "store_error"
+    }
+  ]
+}

@@ -1,35 +1,52 @@
 //! Memory configuration.
 //!
-//! Per crosslink #604 this carries the optional path to a *team* memory
-//! directory that participates alongside the per-user memory database.
+//! A repository may select one host-approved team identity. Membership,
+//! roles, credentials, and revocation remain in the host-owned authority
+//! store; configuration can never create them. The former shared-directory
+//! proposal is retained only as a rejected migration diagnostic.
 //!
-//! Parity reference: Claude Code's `teamMemPaths.ts` exposes a shared
-//! memory location so multiple users on the same project share core and
-//! archival memories. Resolution order is **User overrides Team** —
-//! reads merge both stores with user entries winning on duplicate IDs,
-//! and writes route to the scope the caller selects. The last-write-wins
-//! rule applies when the same logical key is touched in both stores
-//! (the caller decides scope).
+//! The production replica uses signed team identity, encrypted host-owned
+//! state, and a pinned bounded transport rather than a repository-selected
+//! location. The older path-based engine remains compatibility-only.
 
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::team_memory::TeamId;
+
 /// Memory configuration.
 ///
 /// All fields are optional; defaulting yields per-user-only behaviour
-/// (the team store is simply absent). When `team_memory_path` is set,
-/// memory operations participate against the team store in addition to
-/// the per-user store, governed by the [`MemoryScope`](crate::team_memory::MemoryScope)
-/// passed to each operation.
+/// (the team store is simply absent). Deserialization preserves the proposed
+/// field for migration and library tests, while
+/// [`crate::config::load_config`] rejects a configured path rather than
+/// silently claiming production activation.
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct MemoryConfig {
+    /// Permit the canonical executor to derive review-due technical-lesson
+    /// candidates from exact verification failure/edit/success receipts.
+    ///
+    /// This is deliberately opt-in. Enabling it never permits transcript or
+    /// prompt capture, and learned candidates remain private, cited, untrusted
+    /// reference evidence with bounded review retention.
+    #[serde(default)]
+    pub automatic_learning_enabled: bool,
+    /// Host-approved team selected for this repository.
+    ///
+    /// The identifier is only a selector. Loading it never creates or widens
+    /// membership; every data operation is authenticated through the
+    /// corresponding host-owned authority file.
+    #[serde(default)]
+    pub team_id: Option<TeamId>,
     /// Directory containing a shared team memory database.
     ///
-    /// When `Some`, the path is opened (creating it if missing) alongside
-    /// the per-user memory database. When `None`, all memory ops remain
-    /// scoped to the per-user database. Configurable via either the
-    /// `[memory]` section of `config.yaml` or the `OPENCLAUDIA_MEMORY_TEAM_MEMORY_PATH`
-    /// environment variable.
+    /// When `None`, all production memory operations remain scoped to the
+    /// project database. A `Some` value is permanently rejected by production
+    /// configuration loading because a filesystem path is not authenticated
+    /// authority. The legacy proposal can be expressed via either the
+    /// `[memory]` section of `config.yaml` or the canonical
+    /// `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` environment variable. The exact
+    /// single-underscore spelling remains a deprecated migration alias.
     #[serde(default)]
     pub team_memory_path: Option<PathBuf>,
 }
@@ -41,7 +58,33 @@ mod tests {
     #[test]
     fn default_has_no_team_path() {
         let cfg = MemoryConfig::default();
+        assert!(!cfg.automatic_learning_enabled);
+        assert!(cfg.team_id.is_none());
         assert!(cfg.team_memory_path.is_none());
+    }
+
+    #[test]
+    fn deserialises_strict_team_identity_from_yaml() {
+        let yaml = "team_id: team-0123456789abcdef0123456789abcdef\n";
+        let cfg: MemoryConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+        assert_eq!(
+            cfg.team_id.as_ref().map(TeamId::as_str),
+            Some("team-0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn automatic_learning_requires_explicit_opt_in() {
+        let cfg: MemoryConfig = serde_yaml::from_str("automatic_learning_enabled: true\n")
+            .expect("valid automatic-learning policy");
+        assert!(cfg.automatic_learning_enabled);
+    }
+
+    #[test]
+    fn rejects_path_shaped_team_identity() {
+        let error = serde_yaml::from_str::<MemoryConfig>("team_id: /srv/shared/memory\n")
+            .expect_err("path cannot deserialize as team identity");
+        assert!(error.to_string().contains("invalid team identity"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use reqwest::Client;
 use serde_json::Value;
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 use crate::config::{AppConfig, ProviderConfig, VddConfig};
 use crate::providers::{get_adapter, ApiKey, ProviderAdapter};
@@ -20,7 +21,7 @@ use crate::vdd::helpers::truncate_output;
 #[derive(Clone, PartialEq, Eq)]
 pub enum VddProviderAuth {
     ApiKey(ApiKey),
-    ClaudeCodeToken(String),
+    ClaudeCodeToken(crate::secrets::OAuthToken),
     CodexResponses(crate::codex_credentials::CodexResponsesAuth),
     None,
 }
@@ -46,7 +47,7 @@ impl VddProviderAuth {
     }
 
     #[must_use]
-    pub const fn claude_code_token(token: String) -> Self {
+    pub const fn claude_code_token(token: crate::secrets::OAuthToken) -> Self {
         Self::ClaudeCodeToken(token)
     }
 
@@ -67,8 +68,8 @@ pub async fn forward_request(
     provider: &ProviderConfig,
     endpoint: &str,
     body: &Value,
-    headers: Vec<(String, String)>,
-) -> Result<reqwest::Response, reqwest::Error> {
+    mut headers: crate::secrets::SensitiveHeaders,
+) -> Result<reqwest::Response, String> {
     let base_url = provider
         .base_url
         .trim_end_matches('/')
@@ -86,20 +87,46 @@ pub async fn forward_request(
 
     // Validate the constructed URL before sending the request
     if let Err(e) = reqwest::Url::parse(&url) {
-        warn!("VDD: Invalid provider URL '{}': {}", url, e);
+        warn!("VDD: Invalid provider URL: {e}");
     }
 
-    debug!("VDD: Sending request to {}", url);
+    debug!("VDD: Sending verifier request");
 
-    let mut req = client.post(&url).json(body);
-    for (key, value) in headers {
-        req = req.header(key.as_str(), value.as_str());
-    }
-    for (key, value) in &provider.headers {
-        req = req.header(key.as_str(), value.as_str());
+    headers.extend(&provider.headers);
+    let req = headers
+        .apply(client.post(&url).json(body))
+        .map_err(|error| format!("invalid provider headers: {error}"))?;
+
+    let response = req.send().await.map_err(|error| error.to_string())?;
+    if response.status().is_success() {
+        return Ok(response);
     }
 
-    req.send().await
+    let status = response.status();
+    let body = read_bounded_failure_body(response).await?;
+    Err(format!(
+        "provider returned HTTP {status}: {}",
+        headers.sanitize_diagnostic(&body)
+    ))
+}
+
+async fn read_bounded_failure_body(
+    response: reqwest::Response,
+) -> Result<Zeroizing<String>, String> {
+    use futures::StreamExt as _;
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Zeroizing::new(Vec::new());
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| format!("failed to read provider error body: {error}"))?;
+        let remaining = crate::secrets::MAX_DIAGNOSTIC_INPUT_BYTES.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() > remaining || remaining == 0 {
+            break;
+        }
+    }
+    Ok(Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn chat_messages_as_values(request: &ChatCompletionRequest) -> Result<Vec<Value>, VddError> {
@@ -233,10 +260,12 @@ async fn send_to_codex_responses(
         "{}/responses",
         crate::proxy::normalize_base_url(crate::codex_credentials::CODEX_CHATGPT_BASE_URL)
     );
-    let mut req = client.post(endpoint).json(&body);
-    for (key, value) in auth.headers() {
-        req = req.header(key.as_str(), value.as_str());
-    }
+    let headers = auth
+        .headers()
+        .map_err(|error| VddError::AdversaryRequestFailed(error.to_string()))?;
+    let req = headers
+        .apply(client.post(endpoint).json(&body))
+        .map_err(|error| VddError::AdversaryRequestFailed(error.to_string()))?;
 
     let response = tokio::time::timeout(timeout, req.send())
         .await
@@ -247,19 +276,30 @@ async fn send_to_codex_responses(
         .map_err(|e| VddError::AdversaryRequestFailed(format!("responses request: {e}")))?;
     let status = response.status();
 
-    let raw = tokio::time::timeout(timeout, response.text())
-        .await
-        .map_err(|_| VddError::Timeout {
-            provider: "openai".to_string(),
-            elapsed_secs: timeout_secs,
-        })?
-        .map_err(|e| VddError::AdversaryRequestFailed(format!("responses body: {e}")))?;
     if !status.is_success() {
+        let raw = tokio::time::timeout(timeout, read_bounded_failure_body(response))
+            .await
+            .map_err(|_| VddError::Timeout {
+                provider: "openai".to_string(),
+                elapsed_secs: timeout_secs,
+            })?
+            .map_err(|e| VddError::AdversaryRequestFailed(format!("responses body: {e}")))?;
+        let diagnostic = headers.sanitize_diagnostic(&raw);
         return Err(VddError::AdversaryRequestFailed(format!(
             "responses request failed with HTTP {status}: {}",
-            truncate_output(&raw, 1000)
+            truncate_output(diagnostic.as_str(), 1000)
         )));
     }
+
+    let raw = zeroize::Zeroizing::new(
+        tokio::time::timeout(timeout, response.text())
+            .await
+            .map_err(|_| VddError::Timeout {
+                provider: "openai".to_string(),
+                elapsed_secs: timeout_secs,
+            })?
+            .map_err(|e| VddError::AdversaryRequestFailed(format!("responses body: {e}")))?,
+    );
 
     if raw
         .lines()
@@ -282,7 +322,7 @@ fn adversary_headers_and_endpoint(
     request: &ChatCompletionRequest,
     transformed: &mut Value,
     runtime_auth: Option<&VddProviderAuth>,
-) -> Result<(Vec<(String, String)>, String), VddError> {
+) -> Result<(crate::secrets::SensitiveHeaders, String), VddError> {
     match runtime_auth {
         Some(VddProviderAuth::ApiKey(api_key)) => Ok((
             adapter.get_headers(api_key),
@@ -295,13 +335,16 @@ fn adversary_headers_and_endpoint(
                     config.adversary.provider
                 )));
             }
-            crate::claude_credentials::inject_system_prompt(transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(transformed);
             Ok((
                 crate::claude_credentials::get_oauth_headers(token),
                 crate::claude_credentials::get_oauth_endpoint(&request.model),
             ))
         }
-        Some(VddProviderAuth::None) => Ok((Vec::new(), adapter.chat_endpoint(&request.model))),
+        Some(VddProviderAuth::None) => Ok((
+            crate::secrets::SensitiveHeaders::new(),
+            adapter.chat_endpoint(&request.model),
+        )),
         None => {
             let api_key = config
                 .adversary
@@ -387,7 +430,7 @@ pub async fn send_to_adversary(
         provider: provider_name.clone(),
         elapsed_secs: timeout_secs,
     })?
-    .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
+    .map_err(VddError::AdversaryRequestFailed)?;
 
     // Same timeout wraps the body-read to prevent a slow-drip
     // payload from exceeding the total budget.
@@ -488,13 +531,16 @@ pub async fn send_to_builder(
                     "Claude Code auth can only be used with Anthropic builder, got '{provider_name}'"
                 )));
             }
-            crate::claude_credentials::inject_system_prompt(&mut transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
             (
                 crate::claude_credentials::get_oauth_headers(token),
                 crate::claude_credentials::get_oauth_endpoint(&request.model),
             )
         }
-        Some(VddProviderAuth::None) => (Vec::new(), adapter.chat_endpoint(&request.model)),
+        Some(VddProviderAuth::None) => (
+            crate::secrets::SensitiveHeaders::new(),
+            adapter.chat_endpoint(&request.model),
+        ),
         None => (
             api_key.map(|k| adapter.get_headers(k)).unwrap_or_default(),
             adapter.chat_endpoint(&request.model),
@@ -513,7 +559,7 @@ pub async fn send_to_builder(
         provider: pname.clone(),
         elapsed_secs: timeout_secs,
     })?
-    .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
+    .map_err(VddError::BuilderRevisionFailed)?;
 
     let response_json: Value = tokio::time::timeout(timeout, response.json())
         .await
@@ -582,13 +628,16 @@ pub async fn send_to_builder_for_verification(
                     "Claude Code auth can only be used with Anthropic verifier, got '{provider_name}'"
                 )));
             }
-            crate::claude_credentials::inject_system_prompt(&mut transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
             (
                 crate::claude_credentials::get_oauth_headers(token),
                 crate::claude_credentials::get_oauth_endpoint(&request.model),
             )
         }
-        Some(VddProviderAuth::None) => (Vec::new(), adapter.chat_endpoint(&request.model)),
+        Some(VddProviderAuth::None) => (
+            crate::secrets::SensitiveHeaders::new(),
+            adapter.chat_endpoint(&request.model),
+        ),
         None => (
             api_key.map(|k| adapter.get_headers(k)).unwrap_or_default(),
             adapter.chat_endpoint(&request.model),
@@ -663,7 +712,7 @@ mod tests {
                     crate::providers::ApiKey::try_from_string("test-key".to_string()).unwrap(),
                 ),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -694,6 +743,54 @@ mod tests {
             tool_choice: None,
             extra: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn shared_vdd_transport_redacts_and_bounds_provider_failures() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SECRET: &str = "s025-vdd-header-secret-b921a4";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "message": format!("echo {SECRET}"),
+                    "padding": "x".repeat(crate::secrets::MAX_DIAGNOSTIC_BYTES * 2)
+                }
+            })))
+            .mount(&server)
+            .await;
+        let provider = ProviderConfig {
+            base_url: server.uri(),
+            api_key: None,
+            model: None,
+            headers: crate::secrets::SensitiveHeaders::new(),
+            thinking: ThinkingConfig::default(),
+        };
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_bearer(
+            reqwest::header::AUTHORIZATION,
+            crate::secrets::SecretString::try_from_string(SECRET.to_string()).expect("secret"),
+        );
+
+        let error = forward_request(
+            &Client::new(),
+            &provider,
+            "/v1/chat/completions",
+            &serde_json::json!({}),
+            headers,
+        )
+        .await
+        .expect_err("non-success provider response must fail");
+
+        assert!(
+            !error.contains(SECRET),
+            "VDD leaked provider credential: {error}"
+        );
+        assert!(error.contains(crate::secrets::REDACTED_SECRET), "{error}");
+        assert!(error.len() <= crate::secrets::MAX_DIAGNOSTIC_BYTES + 64);
     }
 
     // ── Crosslink #496: VDD HTTP timeout ──────────────────────────────────

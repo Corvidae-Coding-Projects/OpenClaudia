@@ -4,8 +4,8 @@
 //! tools, and integration with the `crosslink` library for creating issues
 //! from VDD findings (library-backed, no subprocess).
 
+use std::ffi::OsString;
 use std::time::Duration;
-use std::{ffi::OsString, path::Path};
 
 use serde::Serialize;
 
@@ -39,7 +39,12 @@ pub struct StaticAnalysisResult {
 /// config-sourced command (crosslink #277). Pipelines, redirections, and
 /// `&&`/`||` are therefore no longer supported in this entry point; callers
 /// that need them must compose subprocess invocations at the Rust level.
-pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> StaticAnalysisResult {
+#[allow(clippy::too_many_lines)] // Parsing, sandbox admission, bounded execution, and result mapping are atomic.
+pub(crate) async fn run_shell_command(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    command: &str,
+    timeout: Duration,
+) -> StaticAnalysisResult {
     let tokens: Vec<String> = match shlex::split(command) {
         Some(t) if !t.is_empty() => t,
         Some(_) => {
@@ -72,23 +77,24 @@ pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> Stati
             passed: false,
         };
     };
-    let security = match crate::tools::security::current_context() {
-        Ok(security) => security,
+    let cwd = run.working_directory();
+    let args: Vec<OsString> = argv_rest.iter().map(OsString::from).collect();
+    let resolved_program = match run.resolve_executable(program) {
+        Ok(path) => path,
         Err(error) => {
             return StaticAnalysisResult {
                 command: command.to_string(),
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: format!("Cannot resolve static-analysis session context: {error}"),
+                stderr: format!("Static-analysis executable unavailable: {error}"),
                 passed: false,
             };
         }
     };
-    let cwd = security.working_directory();
-    let args: Vec<OsString> = argv_rest.iter().map(OsString::from).collect();
     let sandboxed = match crate::tools::sandboxed_process_command(
+        run,
         crate::tools::SandboxProfile::StaticAnalyzer,
-        Path::new(program).as_os_str(),
+        resolved_program.as_os_str(),
         &args,
         cwd,
     ) {
@@ -104,8 +110,14 @@ pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> Stati
         }
     };
     let program_label = program.clone();
+    let run_for_worker = std::sync::Arc::clone(run);
     let result = tokio::task::spawn_blocking(move || {
-        crate::tools::run_prepared_sandboxed_with_timeout(sandboxed, &program_label, timeout)
+        crate::tools::run_prepared_sandboxed_with_timeout(
+            &run_for_worker,
+            sandboxed,
+            &program_label,
+            timeout,
+        )
     })
     .await;
 
@@ -157,21 +169,20 @@ pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> Stati
 /// removing the shell layer entirely; `title` / `label` / `comment`
 /// are never interpreted by any shell.
 pub(crate) async fn create_crosslink_issue(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
     title: &str,
     label: &str,
     comment: &str,
 ) -> Result<String, VddError> {
+    run.require(crate::tools::ToolResource::WorkspaceWrite)?;
     let title = title.to_string();
     let label = label.to_string();
     // Collapse newlines so the comment renders on one logical line in
     // the crosslink UI — matches the pre-port behaviour.
     let collapsed_comment = comment.replace('\n', " ");
+    let cwd = run.working_directory().to_path_buf();
 
     tokio::task::spawn_blocking(move || -> Result<String, VddError> {
-        let cwd = crate::tools::security::current_context()
-            .map_err(VddError::CrosslinkError)?
-            .working_directory()
-            .to_path_buf();
         let dir = cwd.join(".crosslink");
         std::fs::create_dir_all(&dir)
             .map_err(|e| VddError::CrosslinkError(format!("Failed to create .crosslink/: {e}")))?;
@@ -200,9 +211,13 @@ pub(crate) async fn create_crosslink_issue(
 mod tests {
     use super::*;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     #[tokio::test]
     async fn run_shell_command_rejects_empty_command() {
-        let result = run_shell_command("   ", Duration::from_secs(1)).await;
+        let result = run_shell_command(test_run(), "   ", Duration::from_secs(1)).await;
 
         assert_eq!(result.exit_code, -1);
         assert_eq!(result.stderr, "Empty command");
@@ -211,7 +226,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_shell_command_rejects_unbalanced_quotes() {
-        let result = run_shell_command("echo 'unterminated", Duration::from_secs(1)).await;
+        let result =
+            run_shell_command(test_run(), "echo 'unterminated", Duration::from_secs(1)).await;
 
         assert_eq!(result.exit_code, -1);
         assert!(result.stderr.contains("Could not parse command"));
@@ -241,7 +257,7 @@ print("analyzer_confined=" + str(file_blocked and network_blocked).lower())
             "python3 -c {}",
             shlex::try_quote(&script).expect("quote analyzer probe")
         );
-        let result = run_shell_command(&command, Duration::from_secs(5)).await;
+        let result = run_shell_command(test_run(), &command, Duration::from_secs(5)).await;
         assert!(result.passed, "analyzer probe failed: {}", result.stderr);
         assert!(result.stdout.contains("analyzer_confined=true"));
         assert!(!result.stdout.contains("analyzer-secret"));

@@ -571,6 +571,7 @@ fn task_create_assigns_increasing_ids() {
     let mut mgr = TaskManager::new();
     let a = execute_task_create(
         &args_from(&[
+            ("expected_generation", json!(0)),
             ("subject", json!("first")),
             ("description", json!("first body")),
         ]),
@@ -578,6 +579,7 @@ fn task_create_assigns_increasing_ids() {
     );
     let b = execute_task_create(
         &args_from(&[
+            ("expected_generation", json!(1)),
             ("subject", json!("second")),
             ("description", json!("second body")),
         ]),
@@ -605,6 +607,7 @@ fn task_update_status_round_trips_through_get() {
     let mut mgr = TaskManager::new();
     let (created, _) = execute_task_create(
         &args_from(&[
+            ("expected_generation", json!(0)),
             ("subject", json!("update me")),
             ("description", json!("body")),
         ]),
@@ -623,7 +626,12 @@ fn task_update_status_round_trips_through_get() {
     );
 
     let (upd_msg, is_err) = execute_task_update(
-        &args_from(&[("task_id", json!(id)), ("status", json!("in_progress"))]),
+        &args_from(&[
+            ("task_id", json!(id)),
+            ("expected_generation", json!(1)),
+            ("expected_task_revision", json!(1)),
+            ("status", json!("in_progress")),
+        ]),
         &mut mgr,
     );
     assert!(!is_err, "status update must succeed: {upd_msg}");
@@ -631,7 +639,7 @@ fn task_update_status_round_trips_through_get() {
     // After the update, re-derive the id and look it up. We pass a literal
     // here since the create output is deterministic (task-1 for first call
     // in a fresh manager) — and this also exercises that path.
-    let (got, _) = execute_task_get(&args_from(&[("task_id", json!("task-1"))]), &mgr);
+    let (got, _) = execute_task_get(&args_from(&[("task_id", json!("task-1"))]), &mut mgr);
     assert!(
         got.contains("in_progress") || got.contains("InProgress"),
         "get must report the new status, got: {got}"
@@ -644,13 +652,14 @@ fn task_list_returns_all_created_tasks() {
     for i in 1..=3 {
         execute_task_create(
             &args_from(&[
+                ("expected_generation", json!(i - 1)),
                 ("subject", json!(format!("task {i}"))),
                 ("description", json!(format!("body {i}"))),
             ]),
             &mut mgr,
         );
     }
-    let (listing, is_err) = execute_task_list(&mgr);
+    let (listing, is_err) = execute_task_list(&HashMap::new(), &mut mgr);
     assert!(!is_err, "list must succeed: {listing}");
     for i in 1..=3 {
         let id = format!("task-{i}");
@@ -663,8 +672,8 @@ fn task_list_returns_all_created_tasks() {
 
 #[test]
 fn task_get_unknown_id_returns_error_message() {
-    let mgr = TaskManager::new();
-    let (got, _) = execute_task_get(&args_from(&[("task_id", json!("task-9999"))]), &mgr);
+    let mut mgr = TaskManager::new();
+    let (got, _) = execute_task_get(&args_from(&[("task_id", json!("task-9999"))]), &mut mgr);
     // execute_task_get is documented to return null on not-found (per
     // #588) — verify either the null shape OR an explicit not-found
     // message; what we will NOT tolerate is a panic or a value pretending

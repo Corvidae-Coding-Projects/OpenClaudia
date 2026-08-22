@@ -26,9 +26,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::{
-    execute_tool, source_to_line_array, FunctionCall, SessionIdGuard, ToolCall,
-};
+use openclaudia::tools::{execute_tool, source_to_line_array, FunctionCall, ToolCall};
 use serde_json::{json, Value};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
@@ -60,13 +58,16 @@ fn call(name: &str, args: &Value) -> ToolCall {
 /// Drive `read_file` through the public dispatch so the
 /// `READ_TRACKER` mark is recorded, then return the result tuple.
 fn mark_read(path: &str) -> (String, bool) {
-    let r = execute_tool(&call("read_file", &json!({"path": path})));
-    (r.content, r.is_error)
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call("read_file", &json!({"path": path})),
+    );
+    (r.content().to_string(), r.is_error())
 }
 
 fn notebook_edit(args: &Value) -> (String, bool) {
-    let r = execute_tool(&call("notebook_edit", args));
-    (r.content, r.is_error)
+    let r = execute_tool(support::shared_run_context(), &call("notebook_edit", args));
+    (r.content().to_string(), r.is_error())
 }
 
 /// Build a minimal valid nbformat-v4 notebook with the given cells.
@@ -158,7 +159,6 @@ fn source_to_line_array_preserves_unicode() {
 #[test]
 fn replace_cell_by_id_rewrites_source() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-replace");
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
@@ -200,7 +200,6 @@ fn replace_cell_by_id_rewrites_source() {
 #[test]
 fn insert_cell_grows_notebook_by_one() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-insert");
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
@@ -232,7 +231,6 @@ fn insert_cell_grows_notebook_by_one() {
 #[test]
 fn delete_cell_shrinks_notebook_by_one() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-delete");
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
@@ -275,7 +273,6 @@ fn delete_cell_shrinks_notebook_by_one() {
 #[test]
 fn invalid_edit_mode_is_refused() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-bad-mode");
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
@@ -299,7 +296,6 @@ fn invalid_edit_mode_is_refused() {
 #[test]
 fn invalid_cell_type_on_insert_is_refused() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-bad-celltype");
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
@@ -324,7 +320,6 @@ fn invalid_cell_type_on_insert_is_refused() {
 #[test]
 fn unknown_cell_id_on_replace_is_refused() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-unknown-id");
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
@@ -344,7 +339,6 @@ fn unknown_cell_id_on_replace_is_refused() {
 #[test]
 fn parent_dir_traversal_in_notebook_path_is_refused_before_read_gate() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-traversal");
 
     let (msg, is_err) = notebook_edit(&json!({
         "notebook_path": "/tmp/../etc/passwd",
@@ -367,7 +361,6 @@ fn parent_dir_traversal_in_notebook_path_is_refused_before_read_gate() {
 #[test]
 fn symlink_leaf_notebook_path_is_refused_through_public_dispatch() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-symlink-leaf");
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let target = dir.path().join("target.ipynb");
@@ -415,7 +408,6 @@ fn nbformat_top_level_fields_survive_edit() {
     // unchanged after a cell edit — losing them would invalidate
     // the file as a notebook in Jupyter clients.
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint23-schema");
 
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("nb.ipynb");
@@ -448,3 +440,4 @@ fn nbformat_top_level_fields_survive_edit() {
         "metadata MUST survive edit"
     );
 }
+mod support;

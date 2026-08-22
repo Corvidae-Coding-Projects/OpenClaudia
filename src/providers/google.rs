@@ -20,6 +20,56 @@ fn gemini_tool_call_id(ordinal: usize, function_name: &str) -> String {
     format!("call_{ordinal}_{function_name}")
 }
 
+/// Adapt the JSON Schema keywords used by the canonical registry to Gemini's
+/// `parametersJsonSchema` dialect.
+///
+/// Gemini does not accept JSON Schema's `const` keyword for function
+/// declarations. A one-element `enum` has the same model-facing constraint;
+/// canonical host validation remains authoritative when the call returns.
+fn normalize_gemini_json_schema(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+
+    if let Some(constant) = object.remove("const") {
+        object.insert("enum".to_string(), Value::Array(vec![constant]));
+    }
+
+    for map_key in ["properties", "$defs", "definitions", "patternProperties"] {
+        if let Some(children) = object.get_mut(map_key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                normalize_gemini_json_schema(child);
+            }
+        }
+    }
+
+    for schema_key in [
+        "items",
+        "additionalProperties",
+        "not",
+        "contains",
+        "propertyNames",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(child) = object.get_mut(schema_key) {
+            normalize_gemini_json_schema(child);
+        }
+    }
+
+    for schema_array_key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = object
+            .get_mut(schema_array_key)
+            .and_then(Value::as_array_mut)
+        {
+            for child in children {
+                normalize_gemini_json_schema(child);
+            }
+        }
+    }
+}
+
 /// Convert `OpenAI` tools to Gemini function declarations.
 ///
 /// # Errors
@@ -36,7 +86,7 @@ pub fn convert_tools_to_gemini_functions(tools: &[Value]) -> Result<Vec<Value>, 
             .filter(|value| value.is_object())
             .ok_or_else(|| {
                 ProviderError::RequestFailed(format!(
-                    "Tool at index {index} missing required 'function' object: {tool}"
+                    "Tool at index {index} missing required 'function' object"
                 ))
             })?;
 
@@ -46,7 +96,7 @@ pub fn convert_tools_to_gemini_functions(tools: &[Value]) -> Result<Vec<Value>, 
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
                 ProviderError::RequestFailed(format!(
-                    "Tool at index {index} missing non-empty string 'function.name': {tool}"
+                    "Tool at index {index} missing non-empty string 'function.name'"
                 ))
             })?;
 
@@ -55,25 +105,26 @@ pub fn convert_tools_to_gemini_functions(tools: &[Value]) -> Result<Vec<Value>, 
             Some(value @ Value::String(_)) => value.clone(),
             Some(_) => {
                 return Err(ProviderError::RequestFailed(format!(
-                    "Tool at index {index} has non-string 'function.description': {tool}"
+                    "Tool at index {index} has non-string 'function.description'"
                 )));
             }
         };
 
-        let parameters = match func.get("parameters") {
+        let mut parameters_json_schema = match func.get("parameters") {
             None => json!({}),
             Some(value @ Value::Object(_)) => value.clone(),
             Some(_) => {
                 return Err(ProviderError::RequestFailed(format!(
-                    "Tool at index {index} has non-object 'function.parameters': {tool}"
+                    "Tool at index {index} has non-object 'function.parameters'"
                 )));
             }
         };
+        normalize_gemini_json_schema(&mut parameters_json_schema);
 
         functions.push(json!({
             "name": name,
             "description": description,
-            "parameters": parameters
+            "parametersJsonSchema": parameters_json_schema
         }));
     }
 
@@ -137,7 +188,7 @@ impl GoogleAdapter {
 
     fn convert_content_parts(
         msg_index: usize,
-        role: &str,
+        _role: &str,
         parts: &[ContentPart],
     ) -> Result<Vec<Value>, ProviderError> {
         let mut converted = Vec::with_capacity(parts.len());
@@ -147,7 +198,7 @@ impl GoogleAdapter {
                 "text" => {
                     let text = part.text.as_ref().ok_or_else(|| {
                         ProviderError::RequestFailed(format!(
-                            "Google message at index {msg_index} role '{role}' text part at \
+                            "Google message at index {msg_index} text part at \
                              index {part_index} missing 'text'"
                         ))
                     })?;
@@ -156,16 +207,16 @@ impl GoogleAdapter {
                 "image" | "image_url" => {
                     let image = part.image_url.as_ref().ok_or_else(|| {
                         ProviderError::RequestFailed(format!(
-                            "Google message at index {msg_index} role '{role}' image part at \
+                            "Google message at index {msg_index} image part at \
                              index {part_index} missing 'image_url'"
                         ))
                     })?;
                     converted.push(json!({"inlineData": image}));
                 }
-                other => {
+                _ => {
                     return Err(ProviderError::RequestFailed(format!(
-                        "Unsupported Google content part type '{other}' at message index \
-                         {msg_index}, part index {part_index}"
+                        "Unsupported Google content part type at message index {msg_index}, \
+                         part index {part_index}"
                     )));
                 }
             }
@@ -173,7 +224,7 @@ impl GoogleAdapter {
 
         if converted.is_empty() {
             return Err(ProviderError::RequestFailed(format!(
-                "Google message at index {msg_index} role '{role}' has no content parts"
+                "Google message at index {msg_index} has no content parts"
             )));
         }
 
@@ -261,7 +312,7 @@ impl ProviderAdapter for GoogleAdapter {
             body["tools"] = convert_tools_to_gemini(tools)?;
         }
 
-        debug!(body = %body, "Transformed request for Google");
+        debug!("Transformed request for Google");
         Ok(body)
     }
 
@@ -304,16 +355,17 @@ impl ProviderAdapter for GoogleAdapter {
                 .and_then(Value::as_str)
                 .filter(|message| !message.is_empty())
                 .ok_or_else(|| {
-                    ProviderError::InvalidResponse(format!(
-                        "Gemini API error missing non-empty string 'message': {error}"
-                    ))
+                    ProviderError::InvalidResponse(
+                        "Gemini API error missing non-empty string 'message'".to_string(),
+                    )
                 })?;
             let code = error
                 .get("code")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            let _ = message;
             return Err(ProviderError::InvalidResponse(format!(
-                "Gemini API error ({code}): {message}"
+                "Gemini API returned error code {code}"
             )));
         }
 
@@ -330,9 +382,9 @@ impl ProviderAdapter for GoogleAdapter {
             .and_then(|c| c.get("parts"))
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Gemini candidate missing content.parts array: {candidate}"
-                ))
+                ProviderError::InvalidResponse(
+                    "Gemini candidate missing content.parts array".to_string(),
+                )
             })?;
         let content = extract_gemini_text_content(parts)?;
 
@@ -389,11 +441,14 @@ impl ProviderAdapter for GoogleAdapter {
         ))
     }
 
-    fn get_headers(&self, api_key: &super::ApiKey) -> Vec<(String, String)> {
-        vec![
-            ("x-goog-api-key".to_string(), api_key.as_str().to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
-        ]
+    fn get_headers(&self, api_key: &super::ApiKey) -> crate::secrets::SensitiveHeaders {
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_secret(
+            reqwest::header::HeaderName::from_static("x-goog-api-key"),
+            api_key.secret(),
+        );
+        headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
+        headers
     }
 
     /// Gemini native shape: `candidates[0].content.parts[].text`. Text
@@ -452,9 +507,9 @@ fn extract_gemini_tool_calls(parts: &[Value]) -> Result<Option<Vec<Value>>, Prov
         };
 
         if !func_call.is_object() {
-            return Err(ProviderError::InvalidResponse(format!(
-                "Gemini functionCall must be an object: {func_call}"
-            )));
+            return Err(ProviderError::InvalidResponse(
+                "Gemini functionCall must be an object".to_string(),
+            ));
         }
 
         let name = func_call
@@ -462,15 +517,13 @@ fn extract_gemini_tool_calls(parts: &[Value]) -> Result<Option<Vec<Value>>, Prov
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Gemini functionCall missing non-empty string 'name': {func_call}"
-                ))
+                ProviderError::InvalidResponse(
+                    "Gemini functionCall missing non-empty string 'name'".to_string(),
+                )
             })?;
 
         let args = func_call.get("args").ok_or_else(|| {
-            ProviderError::InvalidResponse(format!(
-                "Gemini functionCall missing object 'args': {func_call}"
-            ))
+            ProviderError::InvalidResponse("Gemini functionCall missing object 'args'".to_string())
         })?;
 
         if !args.is_object() {
@@ -482,7 +535,7 @@ fn extract_gemini_tool_calls(parts: &[Value]) -> Result<Option<Vec<Value>>, Prov
 
         let args = serde_json::to_string(args).map_err(|e| {
             ProviderError::InvalidResponse(format!(
-                "Gemini functionCall has unserializable 'args': {e}; functionCall: {func_call}"
+                "Gemini functionCall has unserializable 'args': {e}"
             ))
         })?;
 
@@ -528,7 +581,7 @@ pub fn extract_gemini_text_content(parts: &[Value]) -> Result<String, ProviderEr
         if let Some(text_value) = part.get("text") {
             let text = text_value.as_str().ok_or_else(|| {
                 ProviderError::InvalidResponse(format!(
-                    "Gemini content part at index {index} has non-string 'text': {part}"
+                    "Gemini content part at index {index} has non-string 'text'"
                 ))
             })?;
             content.push_str(text);
@@ -540,8 +593,7 @@ pub fn extract_gemini_text_content(parts: &[Value]) -> Result<String, ProviderEr
         }
 
         return Err(ProviderError::InvalidResponse(format!(
-            "Gemini content part at index {index} has no supported text or functionCall field: \
-             {part}"
+            "Gemini content part at index {index} has no supported text or functionCall field"
         )));
     }
 
@@ -590,12 +642,64 @@ mod tests {
         assert_eq!(functions.len(), 1);
         assert_eq!(functions[0]["name"], "bash");
         assert_eq!(functions[0]["description"], "run shell");
-        assert_eq!(functions[0]["parameters"]["type"], "object");
+        assert_eq!(functions[0]["parametersJsonSchema"]["type"], "object");
+        assert!(functions[0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn convert_tools_to_gemini_rewrites_nested_const_constraints() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "catalog_generation": {
+                            "type": "string",
+                            "const": "sha256:bound"
+                        },
+                        "policy": {
+                            "oneOf": [
+                                {"const": "private"},
+                                {"const": "team"}
+                            ]
+                        },
+                        "const": {"type": "string"}
+                    }
+                }
+            }
+        })];
+
+        let functions =
+            convert_tools_to_gemini_functions(&tools).expect("valid tool should convert");
+        let schema = &functions[0]["parametersJsonSchema"];
+
+        assert_eq!(
+            schema["properties"]["catalog_generation"]["enum"],
+            json!(["sha256:bound"])
+        );
+        assert_eq!(
+            schema["properties"]["policy"]["oneOf"][0]["enum"],
+            json!(["private"])
+        );
+        assert_eq!(schema["properties"]["const"]["type"], "string");
+        assert!(
+            schema
+                .pointer("/properties/catalog_generation/const")
+                .is_none(),
+            "Gemini schema must not retain unsupported const"
+        );
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]
     fn transform_request_errors_on_tool_missing_function_object() {
-        let request = google_request_with_tools(vec![json!({"type": "function"})]);
+        let request = google_request_with_tools(vec![json!({
+            "type": "function",
+            "credential": "google-tool-secret-sentinel"
+        })]);
         let err = GoogleAdapter::new()
             .transform_request(&request)
             .expect_err("missing function object must fail");
@@ -604,6 +708,7 @@ mod tests {
             ProviderError::RequestFailed(msg) => {
                 assert!(msg.contains("'function' object"), "{msg}");
                 assert!(msg.contains("index 0"), "{msg}");
+                assert!(!msg.contains("google-tool-secret-sentinel"), "{msg}");
             }
             other => panic!("expected RequestFailed, got {other:?}"),
         }
@@ -966,7 +1071,10 @@ mod tests {
             .expect_err("unknown Google content part must fail request conversion");
 
         match err {
-            ProviderError::RequestFailed(msg) => assert!(msg.contains("video_url"), "{msg}"),
+            ProviderError::RequestFailed(msg) => {
+                assert!(msg.contains("content part type"), "{msg}");
+                assert!(!msg.contains("video_url"), "{msg}");
+            }
             other => panic!("expected RequestFailed, got {other:?}"),
         }
     }

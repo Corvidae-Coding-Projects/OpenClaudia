@@ -5,7 +5,9 @@
 
 use crate::config::{AppConfig, ThinkingConfig};
 use crate::memory::MemoryDb;
-use crate::permissions::{PermissionManager, PermissionRule};
+use crate::permissions::{
+    ApprovalProvenance, AuthorizationResult, ExecutionPermit, PermissionManager, PermissionRule,
+};
 use crate::providers::{
     anthropic_rejects_manual_thinking, apply_anthropic_adaptive_thinking,
     convert_messages_to_anthropic_checked, convert_tool_definitions_to_anthropic_checked,
@@ -108,14 +110,31 @@ pub fn build_anthropic_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_anthropic_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_anthropic_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    openai_tools: &Value,
 ) -> Result<Value, String> {
     let anthropic_messages =
         convert_messages_to_anthropic_checked(messages).map_err(|e| e.to_string())?;
-    let openai_tools = tools::get_all_tool_definitions(true);
     let anthropic_tools =
-        convert_tool_definitions_to_anthropic_checked(&openai_tools).map_err(|e| e.to_string())?;
+        convert_tool_definitions_to_anthropic_checked(openai_tools).map_err(|e| e.to_string())?;
 
     let mut req = serde_json::json!({
         "model": model,
@@ -141,7 +160,7 @@ pub fn build_anthropic_request(
     }
 
     if claude_code_token.is_some() {
-        crate::claude_credentials::inject_system_prompt(&mut req);
+        crate::claude_credentials::inject_oauth_prefix_only(&mut req);
     }
 
     // Apply effort level. `high` / `max` switch Anthropic into thinking mode.
@@ -185,12 +204,26 @@ pub fn build_anthropic_request(
 /// `xhigh` tier.
 #[must_use]
 pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str) -> Value {
+    build_openai_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_openai_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    tool_definitions: &Value,
+) -> Value {
     let mut req = serde_json::json!({
         "model": model,
         "messages": messages,
         "max_tokens": crate::DEFAULT_MAX_TOKENS,
         "stream": true,
-        "tools": tools::get_all_tool_definitions(true)
+        "tools": tool_definitions
     });
     match effort_level {
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => {
@@ -372,8 +405,22 @@ pub fn build_openai_responses_request(
     messages: &[Value],
     effort_level: &str,
 ) -> Result<Value, String> {
+    build_openai_responses_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_openai_responses_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    openai_tools: &Value,
+) -> Result<Value, String> {
     let (instructions, input) = responses_input_items(messages)?;
-    let tools = responses_tools_from_openai_tools(&tools::get_all_tool_definitions(true))?;
+    let tools = responses_tools_from_openai_tools(openai_tools)?;
     let mut req = serde_json::json!({
         "model": model,
         "input": input,
@@ -404,6 +451,34 @@ pub fn build_chat_completion_request(
     model: &str,
     messages: &[Value],
 ) -> Result<proxy::ChatCompletionRequest, String> {
+    build_chat_completion_request_with_tools(
+        model,
+        messages,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+/// Build the canonical policy-accounting request with the same progressive
+/// definitions the exact run will publish to the provider.
+///
+/// # Errors
+///
+/// Returns an error if the run-owned catalog cannot be published or a message
+/// cannot be represented as a typed chat-completions message.
+pub fn build_chat_completion_request_for_run(
+    run: &tools::ToolRunContext,
+    model: &str,
+    messages: &[Value],
+) -> Result<proxy::ChatCompletionRequest, String> {
+    let snapshot = tools::get_progressive_tool_definitions(run, messages, true)?;
+    build_chat_completion_request_with_tools(model, messages, &snapshot.definitions_value())
+}
+
+fn build_chat_completion_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    tool_definitions: &Value,
+) -> Result<proxy::ChatCompletionRequest, String> {
     let messages = messages
         .iter()
         .enumerate()
@@ -413,7 +488,7 @@ pub fn build_chat_completion_request(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let tools = tools::get_all_tool_definitions(true)
+    let tools = tool_definitions
         .as_array()
         .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?
         .clone();
@@ -459,8 +534,9 @@ fn build_adapter_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
+    tool_definitions: &Value,
 ) -> Result<Value, String> {
-    let request = build_chat_completion_request(model, messages)?;
+    let request = build_chat_completion_request_with_tools(model, messages, tool_definitions)?;
     let adapter = get_adapter(provider).map_err(|e| e.to_string())?;
     let body = thinking_config_for_pipeline_effort(provider, effort_level).map_or_else(
         || adapter.transform_request(&request),
@@ -476,7 +552,18 @@ fn build_adapter_request(
 /// Returns an error if the built-in tool definitions cannot be represented as
 /// Gemini function declarations.
 pub fn build_google_request(messages: &[Value], effort_level: &str) -> Result<Value, String> {
-    let openai_tools = tools::get_all_tool_definitions(true);
+    build_google_request_with_tools(
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_google_request_with_tools(
+    messages: &[Value],
+    effort_level: &str,
+    openai_tools: &Value,
+) -> Result<Value, String> {
     let tools_vec = openai_tools
         .as_array()
         .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?;
@@ -549,10 +636,38 @@ pub fn build_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
     build_request_for_wire(
+        WireApi::ChatCompletions,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+    )
+}
+
+/// Build a chat-completions request from the exact run-owned progressive tool
+/// catalog rather than the compatibility full-catalog baseline.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication, provider lookup, or provider
+/// request conversion fails.
+pub fn build_request_for_run(
+    run: &tools::ToolRunContext,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_request_for_wire_for_run(
+        run,
         WireApi::ChatCompletions,
         provider,
         model,
@@ -575,8 +690,96 @@ pub fn build_request_for_wire(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_request_for_wire_with_tools(
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+/// Build the provider request from one exact run-owned progressive catalog
+/// snapshot. This is the production path for TUI and legacy frontends.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication, message conversion, provider
+/// lookup, or provider-specific request conversion fails.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_request_for_wire_for_run_with_additional(
+        run,
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &[],
+    )
+}
+
+/// Build a run-owned provider request with already-validated dynamic
+/// definitions. The progressive catalog retains source digests and strips
+/// host-only registration metadata before provider conversion.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication or provider request conversion
+/// rejects a malformed, stale, unavailable, or oversized definition set.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run_with_additional(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    additional: &[Value],
+) -> Result<Value, String> {
+    let snapshot =
+        tools::get_progressive_tool_definitions_with_additional(run, messages, true, additional)?;
+    build_request_for_wire_with_tools(
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &snapshot.definitions_value(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_request_for_wire_with_tools(
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    tool_definitions: &Value,
 ) -> Result<Value, String> {
     // Resolve ultrathink keyword / env override against the base effort
     // so every provider path sees the same effective level (Claude Code
@@ -585,15 +788,35 @@ pub fn build_request_for_wire(
     // effort level, omitting provider effort hints.
     let resolved = crate::thinking::resolve_effort(effort_level, messages);
     let effective = resolved.as_deref().unwrap_or("medium");
+    let prepared_messages = prompt_blocks.map(|context| context.prepare_json_messages(messages));
+    let effective_messages = prepared_messages.as_deref().unwrap_or(messages);
     if wire_api == WireApi::OpenAiResponses {
-        return build_openai_responses_request(model, messages, effective);
+        return build_openai_responses_request_with_tools(
+            model,
+            effective_messages,
+            effective,
+            tool_definitions,
+        );
     }
     match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => {
-            build_anthropic_request(model, messages, effective, claude_code_token, prompt_blocks)
+        "anthropic" => build_anthropic_request_with_tools(
+            model,
+            effective_messages,
+            effective,
+            claude_code_token,
+            prompt_blocks,
+            tool_definitions,
+        ),
+        "google" | "gemini" => {
+            build_google_request_with_tools(effective_messages, effective, tool_definitions)
         }
-        "google" | "gemini" => build_google_request(messages, effective),
-        _ => build_adapter_request(provider, model, messages, effective),
+        _ => build_adapter_request(
+            provider,
+            model,
+            effective_messages,
+            effective,
+            tool_definitions,
+        ),
     }
 }
 
@@ -612,7 +835,7 @@ pub fn resolve_endpoint(
     provider: &str,
     model: &str,
     base_url: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
 ) -> Result<String, crate::providers::ProviderError> {
     resolve_endpoint_for_wire(
         WireApi::ChatCompletions,
@@ -634,7 +857,7 @@ pub fn resolve_endpoint_for_wire(
     provider: &str,
     model: &str,
     base_url: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
 ) -> Result<String, crate::providers::ProviderError> {
     if wire_api == WireApi::OpenAiResponses {
         return Ok(format!("{}/responses", normalize_base_url(base_url)));
@@ -668,18 +891,18 @@ pub fn resolve_endpoint_for_wire(
 pub fn resolve_headers(
     provider: &str,
     api_key: Option<&crate::providers::ApiKey>,
-    claude_code_token: Option<&str>,
-    extra_headers: &[(String, String)],
-) -> Result<Vec<(String, String)>, crate::providers::ProviderError> {
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    extra_headers: &crate::secrets::SensitiveHeaders,
+) -> Result<crate::secrets::SensitiveHeaders, crate::providers::ProviderError> {
     let mut headers = if let Some(token) = claude_code_token {
         crate::claude_credentials::get_oauth_headers(token)
     } else if let Some(key) = api_key {
         let adapter = get_adapter(provider)?;
         adapter.get_headers(key)
     } else {
-        Vec::new()
+        crate::secrets::SensitiveHeaders::new()
     };
-    headers.extend(extra_headers.iter().cloned());
+    headers.extend(extra_headers);
     Ok(headers)
 }
 
@@ -688,11 +911,13 @@ pub fn resolve_headers(
 /// Parameters for [`run_turn`]. Bundled to keep the call-site argument count
 /// within clippy's `too_many_arguments` limit.
 pub struct RunTurnParams<'a> {
+    pub run_context: Arc<tools::ToolRunContext>,
     pub client: &'a reqwest::Client,
     pub endpoint: &'a str,
-    pub headers: &'a [(String, String)],
+    pub headers: &'a crate::secrets::SensitiveHeaders,
     pub request_body: &'a Value,
     pub provider: &'a str,
+    pub model_identity: &'a str,
     pub memory_db: Option<Arc<MemoryDb>>,
     pub app_config: Option<Arc<AppConfig>>,
     pub permission_mgr: Option<Arc<PermissionManager>>,
@@ -858,8 +1083,8 @@ pub fn overload_fallback_for(model: &str) -> &'static str {
 /// per crosslink #595/#596/#597. Each retry emits a structured
 /// `tracing::warn!` (`target="openclaudia::retry"`, `event="api_retry"`)
 /// so log consumers can bucket retry pressure programmatically. The
-/// user-facing `AppEvent::StreamText` retry marker is preserved for
-/// REPL/TUI compatibility.
+/// user-facing retry state is emitted through [`AppEvent::ApiRetry`] so host
+/// status cannot be confused with model-authored stream content.
 ///
 /// When the loop exhausts [`MAX_API_RETRIES`] on a 529 ("service
 /// overloaded") status, the function additionally emits
@@ -869,16 +1094,15 @@ pub fn overload_fallback_for(model: &str) -> &'static str {
 async fn send_with_retry(
     client: &reqwest::Client,
     endpoint: &str,
-    headers: &[(String, String)],
+    headers: &crate::secrets::SensitiveHeaders,
     request_body: &Value,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<reqwest::Response, String> {
     let mut response = None;
     for attempt in 0..=MAX_API_RETRIES {
-        let mut req = client.post(endpoint).json(request_body);
-        for (key, value) in headers {
-            req = req.header(key, value);
-        }
+        let req = headers
+            .apply(client.post(endpoint).json(request_body))
+            .map_err(|error| error.to_string())?;
 
         let resp = match req.send().await {
             Ok(r) => r,
@@ -965,8 +1189,11 @@ async fn send_with_retry(
                     model_hint: hint.to_string(),
                 });
             }
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("API error {status}: {body}"));
+            let body = crate::secrets::read_bounded_diagnostic_body(resp)
+                .await
+                .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+            let diagnostic = headers.sanitize_diagnostic(&body);
+            return Err(format!("API error {status}: {diagnostic}"));
         }
 
         response = Some(resp);
@@ -985,11 +1212,13 @@ async fn send_with_retry(
 /// Returns `Err` if the HTTP request itself fails (network error, etc.).
 pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     let RunTurnParams {
+        run_context,
         client,
         endpoint,
         headers,
         request_body,
         provider,
+        model_identity,
         memory_db,
         app_config,
         permission_mgr,
@@ -1028,6 +1257,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     // For Google, handle non-streaming JSON response
     if provider == "google" {
         return handle_google_response(
+            run_context,
             response,
             memory_db,
             app_config,
@@ -1037,6 +1267,8 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             policy_enforcer.clone(),
             task_mgr.clone(),
             session_id.clone(),
+            model_identity,
+            headers,
             &tx,
         )
         .await;
@@ -1044,8 +1276,11 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
 
     if request_body.get("input").is_some() && request_body.get("messages").is_none() {
         return stream_responses_sse_response(SseStreamParams {
+            run_context,
             response,
+            headers,
             provider,
+            model_identity,
             memory_db,
             app_config,
             permission_mgr,
@@ -1061,8 +1296,11 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
 
     // Stream SSE response (Anthropic / OpenAI format)
     stream_sse_response(SseStreamParams {
+        run_context,
         response,
+        headers,
         provider,
+        model_identity,
         memory_db,
         app_config,
         permission_mgr,
@@ -1262,6 +1500,7 @@ fn extract_google_usage(gemini_json: &Value) -> (u64, u64) {
 /// Handle a non-streaming Google Gemini response.
 #[allow(clippy::too_many_arguments)]
 async fn handle_google_response(
+    run_context: Arc<tools::ToolRunContext>,
     response: reqwest::Response,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -1271,9 +1510,11 @@ async fn handle_google_response(
     policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
+    model_identity: &str,
+    headers: &crate::secrets::SensitiveHeaders,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
-    let body = response.text().await.unwrap_or_default();
+    let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
     let gemini_json: Value =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
 
@@ -1284,17 +1525,26 @@ async fn handle_google_response(
             .and_then(Value::as_str)
             .filter(|message| !message.is_empty())
             .ok_or_else(|| {
-                format!("Gemini API error missing non-empty string 'message': {error}")
+                headers
+                    .sanitize_diagnostic(&format!(
+                        "Gemini API error missing non-empty string 'message': {error}"
+                    ))
+                    .to_string()
             })?;
         let code = error
             .get("code")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        return Err(format!("Gemini API error ({code}): {msg}"));
+        return Err(format!(
+            "Gemini API error ({code}): {}",
+            headers.sanitize_diagnostic(msg)
+        ));
     }
 
-    let parts = google_response_parts(&gemini_json)?;
-    let text = extract_google_text(parts)?;
+    let parts = google_response_parts(&gemini_json)
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+    let text = extract_google_text(parts)
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
 
     // #788: surface Gemini SAFETY / RECITATION / BLOCKLIST blocks via the pure helper.
     let GoogleFinishClassification {
@@ -1302,18 +1552,20 @@ async fn handle_google_response(
         user_error,
     } = classify_google_finish_reason(&gemini_json, text.len());
     if let Some(msg) = user_error {
-        send_event!(tx, AppEvent::ApiError(msg));
+        send_event!(tx, AppEvent::ApiError(headers.sanitize_diagnostic(&msg)));
     }
 
     if !text.is_empty() {
         send_event!(tx, AppEvent::StreamText(text.clone()));
     }
 
-    let tool_calls = extract_google_tool_calls_from_parts(parts)?;
+    let tool_calls = extract_google_tool_calls_from_parts(parts)
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
     let (input_tokens, output_tokens) = extract_google_usage(&gemini_json);
 
     // Execute tool calls if any
     let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+        run_context,
         &tool_calls,
         memory_db,
         app_config,
@@ -1323,6 +1575,7 @@ async fn handle_google_response(
         policy_enforcer,
         task_mgr,
         session_id.as_deref(),
+        model_identity,
         tx,
     )
     .await;
@@ -1424,8 +1677,11 @@ fn handle_sse_timeout(
 /// stages need; the param struct mirrors the established
 /// [`RunTurnParams`] pattern.
 struct SseStreamParams<'a> {
+    run_context: Arc<tools::ToolRunContext>,
     response: reqwest::Response,
+    headers: &'a crate::secrets::SensitiveHeaders,
     provider: &'a str,
+    model_identity: &'a str,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
     permission_mgr: Option<Arc<PermissionManager>>,
@@ -1439,8 +1695,11 @@ struct SseStreamParams<'a> {
 
 async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
+        run_context,
         response,
+        headers: _,
         provider,
+        model_identity,
         memory_db,
         app_config,
         permission_mgr,
@@ -1465,7 +1724,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
-                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}")));
+                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}").into()));
                 break;
             }
             Ok(None) => break,
@@ -1505,7 +1764,9 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
     }
 
     finalize_sse_stream(SseFinalize {
+        run_context,
         provider,
+        model_identity,
         full_content,
         reasoning_content,
         tool_accumulator,
@@ -1571,7 +1832,9 @@ fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<
 /// through). The struct lets the finalize helper take ownership of the
 /// accumulators and the per-turn channels in a single move.
 struct SseFinalize<'a> {
+    run_context: Arc<tools::ToolRunContext>,
     provider: &'a str,
+    model_identity: &'a str,
     full_content: String,
     reasoning_content: String,
     tool_accumulator: ToolCallAccumulator,
@@ -1603,6 +1866,7 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
 
     // Execute tool calls if any
     let (tool_results, has_tools) = execute_tool_calls_for_tui(
+        f.run_context,
         &tool_calls,
         f.memory_db,
         f.app_config,
@@ -1612,6 +1876,7 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
         f.policy_enforcer,
         f.task_mgr,
         f.session_id.as_deref(),
+        f.model_identity,
         f.tx,
     )
     .await;
@@ -1784,12 +2049,12 @@ fn parse_responses_function_call(item: &Value) -> Result<Option<ToolCall>, Strin
         .and_then(Value::as_str)
         .or_else(|| item.get("id").and_then(Value::as_str))
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| format!("Responses function_call missing call_id: {item}"))?;
+        .ok_or_else(|| "Responses function_call missing call_id".to_string())?;
     let name = item
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| format!("Responses function_call missing name: {item}"))?;
+        .ok_or_else(|| "Responses function_call missing name".to_string())?;
     let arguments = item
         .get("arguments")
         .and_then(Value::as_str)
@@ -1880,7 +2145,10 @@ fn dispatch_responses_action(
 
 async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
+        run_context,
         response,
+        headers,
+        model_identity,
         memory_db,
         app_config,
         permission_mgr,
@@ -1904,7 +2172,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
-                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}")));
+                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}").into()));
                 break;
             }
             Ok(None) => break,
@@ -1921,20 +2189,24 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
 
         let json = serde_json::from_str::<Value>(&sse.data)
             .map_err(|err| format!("Failed to parse Responses SSE event: {err}"))?;
+        let action = process_responses_sse_event(&json)
+            .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
         let done = dispatch_responses_action(
-            process_responses_sse_event(&json)?,
+            action,
             &mut full_content,
             &mut reasoning_content,
             &mut tool_calls,
             &mut stream_usage,
             tx,
-        )?;
+        )
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
         if done {
             break;
         }
     }
 
     let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+        run_context,
         &tool_calls,
         memory_db,
         app_config,
@@ -1944,6 +2216,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         policy_enforcer,
         task_mgr,
         session_id.as_deref(),
+        model_identity,
         tx,
     )
     .await;
@@ -1997,31 +2270,15 @@ pub fn merge_reasoning_delta(buffer: &mut String, text: &str) -> String {
     }
 }
 
-/// Tools that are safe to execute without permission (read-only / informational).
-const SAFE_TOOLS: &[&str] = &[
-    "read_file",
-    "grounding_context",
-    "list_files",
-    "grep",
-    "glob",
-    "web_search",
-    "ask_user_question",
-    "todo_read",
-    "task",
-    "agent_output",
-    "task_stop",
-    "enter_plan_mode",
-    "exit_plan_mode",
-    "lsp",
-    "memory_search",
-    "core_memory_get",
-    "crosslink",
-];
-
-/// Check if a tool needs permission before execution.
+/// Check whether a tool's declared ceiling reaches the authorization policy.
+///
+/// This is a catalog helper for UI/tests. Concrete dispatch resolves the
+/// invocation through the mandatory host-safety and permission policies.
+/// Unknown tools return `true`; omission is never interpreted as safe.
 #[must_use]
 pub fn tool_needs_permission(tool_name: &str) -> bool {
-    !SAFE_TOOLS.contains(&tool_name)
+    crate::tools::effect::lookup(tool_name)
+        .is_none_or(|(_, spec)| spec.effect.requires_authorization())
 }
 
 /// Execute tool calls and send progress events to the TUI.
@@ -2033,7 +2290,9 @@ pub fn tool_needs_permission(tool_name: &str) -> bool {
 /// Outcome of a TUI permission check for a single tool call.
 enum PermissionOutcome {
     /// The tool is allowed to proceed.
-    Allowed { checked: bool },
+    Allowed {
+        authorization: Option<ExecutionPermit>,
+    },
     /// The tool was denied; the caller should push `result_json` and `continue`.
     DeniedWithResult(serde_json::Value),
     /// The permission channel is broken; the caller should `break`.
@@ -2060,13 +2319,19 @@ fn permission_denied_with_result(
     }))
 }
 
-fn observe_policy_decision_json(session_id: Option<&str>, allowed: bool, reason: &str) {
+fn observe_policy_decision_json(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    allowed: bool,
+    reason: &str,
+) {
     if let Some(session_id) = session_id {
-        crate::grounded_loop::observe_policy_decision_for_session(session_id, allowed, reason);
+        crate::grounded_loop::observe_policy_decision_for_session(run, session_id, allowed, reason);
     }
 }
 
 fn policy_denied_tool_result(
+    run: &crate::tools::ToolRunContext,
     tool_name: &str,
     tool_call_id: &str,
     error: &PolicyError,
@@ -2074,7 +2339,7 @@ fn policy_denied_tool_result(
     tx: &mpsc::Sender<AppEvent>,
 ) -> Value {
     let reason = error.to_string();
-    observe_policy_decision_json(session_id, false, &reason);
+    observe_policy_decision_json(run, session_id, false, &reason);
     let _ = tx.send(AppEvent::ToolDone {
         name: tool_name.to_string(),
         success: false,
@@ -2088,69 +2353,8 @@ fn policy_denied_tool_result(
     })
 }
 
-fn parse_permission_arguments_for_tui(
-    tool_name: &str,
-    tool_call_id: &str,
-    arguments: &str,
-    tx: &mpsc::Sender<AppEvent>,
-) -> Result<Value, PermissionOutcome> {
-    match serde_json::from_str::<Value>(arguments) {
-        Ok(Value::Object(map)) => Ok(Value::Object(map)),
-        Ok(value) => {
-            let msg = format!(
-                "Invalid tool arguments JSON for '{tool_name}': expected a JSON object, got {}",
-                json_value_type_name(&value)
-            );
-            Err(permission_denied_with_result(
-                tool_name,
-                tool_call_id,
-                &msg,
-                &format!("[ERROR] {msg}"),
-                tx,
-            ))
-        }
-        Err(err) => {
-            let msg = format!("Invalid tool arguments JSON for '{tool_name}': {err}");
-            Err(permission_denied_with_result(
-                tool_name,
-                tool_call_id,
-                &msg,
-                &format!("[ERROR] {msg}"),
-                tx,
-            ))
-        }
-    }
-}
-
-fn permission_manager_outcome_for_tui(
-    tool_name: &str,
-    tool_call_id: &str,
-    arguments: &str,
-    mgr: &PermissionManager,
-    transient_allowed_tool_rules: &[PermissionRule],
-    tx: &mpsc::Sender<AppEvent>,
-) -> Option<PermissionOutcome> {
-    let args = match parse_permission_arguments_for_tui(tool_name, tool_call_id, arguments, tx) {
-        Ok(args) => args,
-        Err(outcome) => return Some(outcome),
-    };
-
-    match mgr.check_with_transient_allow_rules(tool_name, &args, transient_allowed_tool_rules) {
-        crate::permissions::CheckResult::Allowed => {
-            Some(PermissionOutcome::Allowed { checked: true })
-        }
-        crate::permissions::CheckResult::Denied(reason) => Some(permission_denied_with_result(
-            tool_name,
-            tool_call_id,
-            &format!("Permission denied: {reason}"),
-            &format!("[DENIED] Permission denied: {reason}"),
-            tx,
-        )),
-        crate::permissions::CheckResult::NeedsPrompt { .. } => None,
-    }
-}
-
 async fn permission_request_hook_outcome(
+    run_context: &Arc<tools::ToolRunContext>,
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
@@ -2161,12 +2365,13 @@ async fn permission_request_hook_outcome(
     let engine = hook_engine?;
     let tool_input = serde_json::from_str::<Value>(arguments)
         .unwrap_or_else(|_| serde_json::json!({ "raw_arguments": arguments }));
-    let mut input = crate::hooks::HookInput::new(crate::hooks::HookEvent::PermissionRequest)
-        .with_tool(tool_name, tool_input)
-        .with_extra(
-            "tool_call_id",
-            serde_json::Value::String(tool_call_id.to_string()),
-        );
+    let mut input =
+        crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::PermissionRequest)
+            .with_tool(tool_name, tool_input)
+            .with_extra(
+                "tool_call_id",
+                serde_json::Value::String(tool_call_id.to_string()),
+            );
     if let Some(session_id) = session_id {
         input = input.with_session_id(session_id);
     }
@@ -2194,76 +2399,60 @@ async fn permission_request_hook_outcome(
 
 /// Check whether a tool call is permitted in the current session.
 ///
-/// Consults batch/session deny caches first, then the `PermissionManager`
-/// (so hard-safety denials and config auto-allows win), then batch/session
-/// allow caches, then `PermissionRequest` hooks, and finally sends a
-/// `PermissionRequest` event and `.await`s the user's decision via a tokio
-/// `oneshot` if no rule matches.
+/// Consults the canonical permission manager first. Exact reusable approval
+/// records are consumed there; no frontend-local tool-name cache participates.
+/// If no receipt or policy matches, runs `PermissionRequest` hooks and awaits
+/// the user's decision via a Tokio oneshot.
 ///
 /// `async` so the reply wait yields the runtime — under
 /// `flavor = "current_thread"` a synchronous `mpsc::recv` here would
 /// pin the only thread and deadlock the main TUI loop (which is the
 /// one that has to deliver the user's response).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn check_tool_permission(
+    run_context: &Arc<tools::ToolRunContext>,
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
-    always_allowed: &mut std::collections::HashSet<String>,
-    always_denied: &mut std::collections::HashSet<String>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
     transient_allowed_tool_rules: &[PermissionRule],
     hook_engine: Option<&crate::hooks::HookEngine>,
     session_id: Option<&str>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> PermissionOutcome {
-    // Batch-scoped cache (this invocation of execute_tool_calls_for_tui).
-    if always_denied.contains(tool_name) {
-        return permission_denied_with_result(
-            tool_name,
-            tool_call_id,
-            "Denied (always deny for this session)",
-            "[DENIED] User denied permission for this tool.",
-            tx,
-        );
-    }
-    if always_allowed.contains(tool_name) && permission_mgr.is_none() {
-        return PermissionOutcome::Allowed { checked: false };
-    }
-    // Session-scoped cache (crosslink #724 — survives across batches).
-    let mut session_always_allowed = false;
-    if let Some(mgr) = permission_mgr {
-        if mgr.tui_is_always_denied(tool_name) {
+    let tool_call = ToolCall {
+        id: tool_call_id.to_string(),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    };
+
+    match permission_mgr.authorize_tool_call_with_transient_rules(
+        &tool_call,
+        session_id,
+        transient_allowed_tool_rules,
+    ) {
+        AuthorizationResult::Allowed(permit) => {
+            return PermissionOutcome::Allowed {
+                authorization: Some(permit),
+            };
+        }
+        AuthorizationResult::Denied(reason) => {
             return permission_denied_with_result(
                 tool_name,
                 tool_call_id,
-                "Denied (always deny for this session)",
-                "[DENIED] User denied permission for this tool.",
+                &format!("Permission denied: {reason}"),
+                &format!("[DENIED] Permission denied: {reason}"),
                 tx,
             );
         }
-        if mgr.tui_is_always_allowed(tool_name) {
-            session_always_allowed = true;
-        }
-        if let Some(outcome) = permission_manager_outcome_for_tui(
-            tool_name,
-            tool_call_id,
-            arguments,
-            mgr,
-            transient_allowed_tool_rules,
-            tx,
-        ) {
-            return outcome;
-        }
-    }
-
-    if always_allowed.contains(tool_name) || session_always_allowed {
-        return PermissionOutcome::Allowed {
-            checked: permission_mgr.is_some(),
-        };
+        AuthorizationResult::NeedsPrompt { .. } => {}
     }
 
     if let Some(outcome) = permission_request_hook_outcome(
+        run_context,
         tool_name,
         tool_call_id,
         arguments,
@@ -2292,25 +2481,77 @@ async fn check_tool_permission(
     {
         return PermissionOutcome::ChannelBroken;
     }
-    match reply_rx.await {
-        Ok(PermissionResponse::Allow) => PermissionOutcome::Allowed {
-            checked: permission_mgr.is_some(),
-        },
-        Ok(PermissionResponse::AlwaysAllow) => {
-            always_allowed.insert(tool_name.to_string());
-            // Persist for the rest of the session (crosslink #724).
-            if let Some(mgr) = permission_mgr {
-                mgr.tui_remember_always_allowed(tool_name.to_string());
-            }
-            PermissionOutcome::Allowed {
-                checked: permission_mgr.is_some(),
-            }
-        }
+    permission_prompt_response(&reply_rx.await, permission_mgr, session_id, &tool_call, tx)
+}
+
+fn permission_prompt_response(
+    response: &Result<PermissionResponse, tokio::sync::oneshot::error::RecvError>,
+    permission_mgr: &PermissionManager,
+    session_id: Option<&str>,
+    tool_call: &ToolCall,
+    tx: &mpsc::Sender<AppEvent>,
+) -> PermissionOutcome {
+    let tool_name = &tool_call.function.name;
+    let tool_call_id = &tool_call.id;
+    match response {
+        Ok(PermissionResponse::Allow) => permission_mgr
+            .approve_tool_call_once(tool_call, session_id, ApprovalProvenance::InteractiveUser)
+            .map_or_else(
+                |reason| {
+                    permission_denied_with_result(
+                        tool_name,
+                        tool_call_id,
+                        &format!("Permission approval failed: {reason}"),
+                        &format!("[DENIED] Permission approval failed: {reason}"),
+                        tx,
+                    )
+                },
+                |permit| PermissionOutcome::Allowed {
+                    authorization: Some(permit),
+                },
+            ),
+        Ok(PermissionResponse::AlwaysAllow) => session_id.map_or_else(
+            || {
+                permission_denied_with_result(
+                    tool_name,
+                    tool_call_id,
+                    "A scoped reusable approval requires a permission manager and session",
+                    "[DENIED] Scoped reusable approval unavailable.",
+                    tx,
+                )
+            },
+            |session_id| {
+                permission_mgr
+                    .approve_tool_call_for_session(
+                        tool_call,
+                        session_id,
+                        ApprovalProvenance::InteractiveUser,
+                    )
+                    .map_or_else(
+                        |reason| {
+                            permission_denied_with_result(
+                                tool_name,
+                                tool_call_id,
+                                &format!("Permission approval failed: {reason}"),
+                                &format!("[DENIED] Permission approval failed: {reason}"),
+                                tx,
+                            )
+                        },
+                        |permit| PermissionOutcome::Allowed {
+                            authorization: Some(permit),
+                        },
+                    )
+            },
+        ),
         Ok(PermissionResponse::AlwaysDeny) => {
-            always_denied.insert(tool_name.to_string());
-            // Persist for the rest of the session (crosslink #724).
-            if let Some(mgr) = permission_mgr {
-                mgr.tui_remember_always_denied(tool_name.to_string());
+            if let Some(session_id) = session_id {
+                if let Err(error) = permission_mgr.deny_tool_call_for_session(
+                    tool_call,
+                    session_id,
+                    ApprovalProvenance::InteractiveUser,
+                ) {
+                    tracing::warn!(%error, "Could not retain exact session denial");
+                }
             }
             permission_denied_with_result(
                 tool_name,
@@ -2331,11 +2572,12 @@ async fn check_tool_permission(
 }
 
 struct ToolPermissionDispatch {
-    mgr: Option<Arc<PermissionManager>>,
-    already_checked: bool,
+    mgr: Arc<PermissionManager>,
+    authorization: Option<ExecutionPermit>,
 }
 
 struct SingleToolExecution<'a> {
+    run_context: Arc<tools::ToolRunContext>,
     tool_call: &'a ToolCall,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -2347,11 +2589,16 @@ struct SingleToolExecution<'a> {
     tx: &'a mpsc::Sender<AppEvent>,
 }
 
-/// Execute one tool call on a blocking thread, fire `PostToolUse` hooks, and
-/// return the JSON result to append to conversation history.
+const fn tool_result_completed_successfully(result: &tools::ToolResult) -> bool {
+    !result.is_error() && !result.is_partial()
+}
+
+/// Execute one tool call through its canonical sync or async dispatcher, fire
+/// the matching post-tool hook, and retain the typed provider result.
 /// Returns `None` when the event channel is broken (caller should `break`).
-async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
+async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolResult> {
     let SingleToolExecution {
+        run_context,
         tool_call,
         memory_db,
         app_config,
@@ -2363,47 +2610,72 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
         tx,
     } = p;
     let tool_name = &tool_call.function.name;
-    let tool_call_clone = tool_call.clone();
-    let mem_db = memory_db;
-    let app_config_for_blocking = app_config;
     let perm_mgr = permission.mgr;
-    let permission_already_checked_for_blocking = permission.already_checked;
-    let session_for_blocking = session_id.map(str::to_string);
-    let policy_for_blocking = policy_enforcer;
-    let task_mgr_for_blocking = task_mgr;
-    let result = tokio::task::spawn_blocking(move || {
-        // Lock the TaskManager only inside the blocking thread so we
-        // don't hold the mutex across `.await`. Failure-mode parity with
-        // the legacy "no session" branch: poisoned mutex → recover the
-        // inner data rather than panicking, so a single panicking task
-        // tool doesn't take down the entire TUI session.
-        let mut task_guard = task_mgr_for_blocking
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::services::tool_executor::ToolExecutor::execute(
+    let result = if tool_name.starts_with("mcp__") {
+        crate::services::tool_executor::ToolExecutor::execute_mcp(
             crate::services::tool_executor::ToolExecutorRequest {
-                tool_call: &tool_call_clone,
-                memory_db: mem_db.as_deref(),
-                app_config: app_config_for_blocking.as_deref(),
-                task_mgr: Some(&mut *task_guard),
-                permission_mgr: perm_mgr.as_deref(),
-                permission_already_checked: permission_already_checked_for_blocking,
-                session_id: session_for_blocking.as_deref(),
-                policy_enforcer: policy_for_blocking.as_deref(),
+                run_context: &run_context,
+                tool_call,
+                memory_db: memory_db.as_deref(),
+                app_config: app_config.as_deref(),
+                task_mgr: None,
+                permission_mgr: perm_mgr.as_ref(),
+                authorization: permission.authorization,
+                session_id,
+                policy_enforcer: policy_enforcer.as_deref(),
             },
         )
-    })
-    .await
-    .unwrap_or_else(|e| tools::ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content: format!("Tool execution panicked: {e}"),
-        is_error: true,
-    });
+        .await
+    } else {
+        let tool_call_clone = tool_call.clone();
+        let panic_tool_call = tool_call.clone();
+        let session_for_blocking = session_id.map(str::to_string);
+        let run_context_for_blocking = Arc::clone(&run_context);
+        let uses_task_graph = tools::uses_canonical_task_graph(tool_name);
+        tokio::task::spawn_blocking(move || {
+            let execute = |task_mgr: Option<&mut crate::session::TaskManager>| {
+                crate::services::tool_executor::ToolExecutor::execute(
+                    crate::services::tool_executor::ToolExecutorRequest {
+                        run_context: &run_context_for_blocking,
+                        tool_call: &tool_call_clone,
+                        memory_db: memory_db.as_deref(),
+                        app_config: app_config.as_deref(),
+                        task_mgr,
+                        permission_mgr: perm_mgr.as_ref(),
+                        authorization: permission.authorization,
+                        session_id: session_for_blocking.as_deref(),
+                        policy_enforcer: policy_enforcer.as_deref(),
+                    },
+                )
+            };
+            if uses_task_graph {
+                // The lock is acquired on the blocking worker only for handlers
+                // that consume task state. Unrelated file/process/network tools
+                // remain independent of planning persistence.
+                let mut task_guard = task_mgr
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                execute(Some(&mut task_guard))
+            } else {
+                execute(None)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tools::ToolResult::failure(
+                &panic_tool_call,
+                tools::ToolFailureCode::Internal,
+                format!("Tool execution panicked: {e}"),
+                tools::ToolRetryability::Never,
+            )
+        })
+    };
+    let completed_successfully = tool_result_completed_successfully(&result);
     if tx
         .send(AppEvent::ToolDone {
             name: tool_name.clone(),
-            success: !result.is_error,
-            content: result.content.clone(),
+            success: completed_successfully,
+            content: result.content().to_string(),
         })
         .is_err()
     {
@@ -2411,23 +2683,17 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
     }
     if let Some((engine, tool_input)) = hook_context {
         crate::services::tool_executor::ToolExecutor::fire_post_tool(
+            &run_context,
             engine,
-            !result.is_error,
+            completed_successfully,
             tool_name,
             tool_input,
-            &result.content,
+            result.content(),
             session_id,
         )
         .await;
     }
-    let result_content = if result.is_error {
-        format!("[ERROR] {}", result.content)
-    } else {
-        result.content
-    };
-    Some(
-        serde_json::json!({ "role": "tool", "tool_call_id": result.tool_call_id, "content": result_content, "is_error": result.is_error }),
-    )
+    Some(result)
 }
 
 /// Build a human-readable one-line description of what a tool call will do.
@@ -2468,9 +2734,9 @@ fn describe_tool_call(tool_name: &str, args: &Value) -> String {
             .get("url")
             .and_then(|v| v.as_str())
             .map_or_else(|| "Fetching URL".to_string(), |u| format!("Fetching {u}")),
-        "crosslink" => args.get("args").and_then(|v| v.as_str()).map_or_else(
+        "crosslink" => args.get("operation").and_then(|v| v.as_str()).map_or_else(
             || "Running crosslink".to_string(),
-            |a| format!("crosslink {a}"),
+            |operation| format!("crosslink {operation}"),
         ),
         _ => format!("Running {tool_name}"),
     }
@@ -2585,52 +2851,46 @@ pub fn normalize_message_tool_arguments_for_history(messages: &mut [Value]) -> u
     changed
 }
 
-/// Return the effective path that the pipeline should pre-check with
-/// guardrails before read/search tool execution.
-///
-/// Write-like tools intentionally return `None` here because their handlers
-/// already call `guardrails::check_file_access` at the mutation boundary.
-fn guardrail_path_for_tool_call(tool_name: &str, args: &Value) -> Option<String> {
-    let args = args.as_object()?;
-
-    match tool_name {
-        "read_file" => args.get("path").and_then(Value::as_str).map(str::to_string),
-        "list_files" | "glob" | "grep" => Some(
-            args.get("path")
-                .and_then(Value::as_str)
-                .unwrap_or(".")
-                .to_string(),
-        ),
-        _ => None,
-    }
-}
-
-fn guardrail_block_for_tool_call(tool_name: &str, args: &Value) -> Option<String> {
-    let path = guardrail_path_for_tool_call(tool_name, args)?;
-    crate::guardrails::check_file_access(&path).err()
-}
-
-fn emit_failed_quality_gate_events(tx: &mpsc::Sender<AppEvent>, session_id: Option<&str>) {
-    for gate in crate::guardrails::run_quality_gates() {
-        record_quality_gate_verification(session_id, &gate);
-        if gate.passed {
+fn emit_failed_quality_gate_events(
+    run_context: &Arc<tools::ToolRunContext>,
+    tx: &mpsc::Sender<AppEvent>,
+    session_id: Option<&str>,
+    model_identity: &str,
+) {
+    for gate in crate::guardrails::run_quality_gates(run_context, model_identity) {
+        record_quality_gate_verification(run_context, session_id, &gate);
+        if gate.passed() {
             continue;
         }
-        if tx
-            .send(AppEvent::StreamText(format!(
-                "\n⚠ Quality gate '{}': {}\n",
-                gate.name,
-                gate.stdout.lines().next().unwrap_or("failed")
-            )))
-            .is_err()
-        {
+        if tx.send(failed_quality_gate_event(&gate)).is_err() {
             tracing::warn!("TUI channel closed during tool execution");
             break;
         }
     }
 }
 
+fn failed_quality_gate_event(gate: &crate::guardrails::QualityCheckResult) -> AppEvent {
+    let detail = gate
+        .stdout()
+        .lines()
+        .next()
+        .filter(|line| !line.trim().is_empty())
+        .or_else(|| {
+            gate.stderr()
+                .lines()
+                .next()
+                .filter(|line| !line.trim().is_empty())
+        })
+        .unwrap_or("failed");
+    AppEvent::ToolDone {
+        name: format!("quality_gate:{}", gate.name()),
+        success: false,
+        content: format!("Quality gate '{}' failed: {detail}", gate.name()),
+    }
+}
+
 fn record_quality_gate_verification(
+    run: &crate::tools::ToolRunContext,
     session_id: Option<&str>,
     gate: &crate::guardrails::QualityCheckResult,
 ) {
@@ -2642,17 +2902,18 @@ fn record_quality_gate_verification(
         Err(err) => {
             tracing::warn!(
                 session_id,
-                gate = %gate.name,
+                gate = %gate.name(),
                 error = %err,
                 "failed to open session reality ledger for quality-gate verification"
             );
             return;
         }
     };
-    if let Err(err) = crate::grounded_loop::append_quality_gate_observations(&mut ledger, gate) {
+    if let Err(err) = crate::grounded_loop::append_quality_gate_observations(run, &mut ledger, gate)
+    {
         tracing::warn!(
             session_id,
-            gate = %gate.name,
+            gate = %gate.name(),
             error = %err,
             "failed to append quality-gate observations to reality ledger"
         );
@@ -2667,6 +2928,7 @@ fn record_quality_gate_verification(
 /// and a boolean indicating whether there were any tool calls.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_tool_calls_for_tui(
+    run_context: Arc<tools::ToolRunContext>,
     tool_calls: &[ToolCall],
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -2676,14 +2938,38 @@ async fn execute_tool_calls_for_tui(
     policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<&str>,
+    model_identity: &str,
     tx: &mpsc::Sender<AppEvent>,
 ) -> (Vec<Value>, bool) {
     // Session-level "always allow/deny" cache (lives for this agentic loop)
-    let mut always_allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
     if tool_calls.is_empty() {
         return (vec![], false);
     }
+
+    let Some(permission_mgr) = permission_mgr else {
+        let mut results = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            let result = tools::ToolResult::failure(
+                tool_call,
+                tools::ToolFailureCode::PermissionDenied,
+                "Permission denied: the execution frontend has no permission manager".to_string(),
+                tools::ToolRetryability::Never,
+            );
+            if tx
+                .send(AppEvent::ToolDone {
+                    name: tool_call.function.name.clone(),
+                    success: false,
+                    content: result.content().to_string(),
+                })
+                .is_err()
+            {
+                break;
+            }
+            observe_tool_result(&run_context, session_id, &result);
+            results.push(result.openai_message());
+        }
+        return (results, true);
+    };
 
     let mut results = Vec::new();
 
@@ -2694,7 +2980,7 @@ async fn execute_tool_calls_for_tui(
             Ok(args) => args,
             Err(msg) => match malformed_tool_arguments_result(tool_call, &msg, tx) {
                 Ok(result_json) => {
-                    observe_tool_result_json(session_id, tool_name, &result_json);
+                    observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
                     results.push(result_json);
                     continue;
                 }
@@ -2702,43 +2988,31 @@ async fn execute_tool_calls_for_tui(
             },
         };
 
-        // Check read/search blast radius guardrails against the effective
-        // filesystem path, not the raw JSON argument envelope.
-        if let Some(msg) = guardrail_block_for_tool_call(tool_name, &tool_args) {
-            send_event_or_break!(
-                tx,
-                AppEvent::ToolDone {
-                    name: tool_name.clone(),
-                    success: false,
-                    content: format!("Blocked by guardrails: {msg}"),
-                }
-            );
-            let result_json = serde_json::json!({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": format!("[BLOCKED] {msg}"),
-                "is_error": true
-            });
-            observe_tool_result_json(session_id, tool_name, &result_json);
-            results.push(result_json);
-            continue;
-        }
-
         if let Err(err) = crate::services::tool_executor::ToolExecutor::check_policy_before_prompt(
             policy_enforcer.as_deref(),
             session_id,
             tool_name,
         ) {
-            let result_json =
-                policy_denied_tool_result(tool_name, &tool_call.id, &err, session_id, tx);
-            observe_tool_result_json(session_id, tool_name, &result_json);
+            let result_json = policy_denied_tool_result(
+                &run_context,
+                tool_name,
+                &tool_call.id,
+                &err,
+                session_id,
+                tx,
+            );
+            observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
             results.push(result_json);
             continue;
         }
 
         if let Some(engine) = hook_engine.as_deref() {
             if let Err(blocked) = crate::services::tool_executor::ToolExecutor::run_pre_tool_use(
-                engine, session_id, tool_name, &tool_args,
+                &run_context,
+                engine,
+                session_id,
+                tool_name,
+                &tool_args,
             )
             .await
             {
@@ -2756,40 +3030,35 @@ async fn execute_tool_calls_for_tui(
                     "content": format!("[BLOCKED] {}", blocked.content),
                     "is_error": true
                 });
-                observe_tool_result_json(session_id, tool_name, &result_json);
+                observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
                 results.push(result_json);
                 continue;
             }
         }
 
-        // Permission check for write/destructive tools
-        let mut permission_already_checked = false;
-        if tool_needs_permission(tool_name) {
-            match check_tool_permission(
-                tool_name,
-                &tool_call.id,
-                &tool_call.function.arguments,
-                &mut always_allowed,
-                &mut always_denied,
-                permission_mgr.as_deref(),
-                transient_allowed_tool_rules,
-                hook_engine.as_deref(),
-                session_id,
-                tx,
-            )
-            .await
-            {
-                PermissionOutcome::Allowed { checked } => {
-                    permission_already_checked = checked;
-                }
-                PermissionOutcome::DeniedWithResult(result_json) => {
-                    observe_tool_result_json(session_id, tool_name, &result_json);
-                    results.push(result_json);
-                    continue;
-                }
-                PermissionOutcome::ChannelBroken => break,
+        // Every call, including read-only calls, reaches the concrete manager
+        // so explicit denials and host safety remain enforceable.
+        let authorization = match check_tool_permission(
+            &run_context,
+            tool_name,
+            &tool_call.id,
+            &tool_call.function.arguments,
+            permission_mgr.as_ref(),
+            transient_allowed_tool_rules,
+            hook_engine.as_deref(),
+            session_id,
+            tx,
+        )
+        .await
+        {
+            PermissionOutcome::Allowed { authorization } => authorization,
+            PermissionOutcome::DeniedWithResult(result_json) => {
+                observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
+                results.push(result_json);
+                continue;
             }
-        }
+            PermissionOutcome::ChannelBroken => break,
+        };
 
         let args_desc = describe_tool_call(tool_name, &tool_args);
         let hook_context = hook_engine
@@ -2804,12 +3073,13 @@ async fn execute_tool_calls_for_tui(
         );
 
         let tool_result = execute_single_tool(SingleToolExecution {
+            run_context: Arc::clone(&run_context),
             tool_call,
             memory_db: memory_db.clone(),
             app_config: app_config.clone(),
             permission: ToolPermissionDispatch {
-                mgr: permission_mgr.clone(),
-                already_checked: permission_already_checked,
+                mgr: Arc::clone(&permission_mgr),
+                authorization,
             },
             policy_enforcer: policy_enforcer.clone(),
             task_mgr: task_mgr.clone(),
@@ -2820,87 +3090,99 @@ async fn execute_tool_calls_for_tui(
         .await;
         match tool_result {
             None => break, // channel broken
-            Some(mut result_json) => {
-                // ask_user_question bridge — see `intercept_user_question`.
-                // Returns `Err(())` only when the AppEvent channel is dead,
-                // matching the existing break-on-broken-channel semantics.
-                if intercept_user_question(&mut result_json, tx).await.is_err() {
+            Some(mut result) => {
+                if resolve_tui_follow_up(&mut result, tx).await.is_err() {
                     break;
                 }
-                observe_tool_result_json(session_id, tool_name, &result_json);
-                results.push(result_json);
+                observe_tool_result(&run_context, session_id, &result);
+                results.push(result.openai_message());
             }
         }
     }
 
-    emit_failed_quality_gate_events(tx, session_id);
+    emit_failed_quality_gate_events(&run_context, tx, session_id, model_identity);
 
     (results, true)
 }
 
-fn observe_tool_result_json(session_id: Option<&str>, tool_name: &str, result_json: &Value) {
+fn observe_tool_result_json(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    tool_name: &str,
+    result_json: &Value,
+) {
     let Some(session_id) = session_id else {
         return;
     };
-    let result = tools::ToolResult {
-        tool_call_id: result_json
+    let tool_call = ToolCall {
+        id: result_json
             .get("tool_call_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        content: result_json
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        is_error: result_json
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let result = tools::ToolResult::bind(
+        &tool_call,
+        tool_name,
+        tools::ToolHandlerResult::legacy(
+            result_json
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            result_json
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    observe_tool_result(run, Some(session_id), &result);
+}
+
+fn observe_tool_result(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    result: &tools::ToolResult,
+) {
+    let Some(session_id) = session_id else {
+        return;
     };
     crate::services::tool_executor::ToolExecutor::observe_tool_result(
+        run,
         Some(session_id),
-        tool_name,
-        &result,
+        result,
     );
 }
 
-/// Bridge the sync `ask_user_question` tool's `USER_QUESTION_MARKER`
-/// payload onto the full-screen TUI's modal flow.
-///
-/// The sync tool returns a JSON object of shape `{"type":
-/// "user_question", "questions": [...]}` as the tool-result content.
-/// The REPL intercepts that via `process_tool_result_marker` and
-/// blocks on stdin (`handle_user_questions`). Under the full-screen
-/// TUI we route the question set to a modal via `AppEvent::
-/// UserQuestion`, park on a oneshot for the answer JSON, and
-/// rewrite `result_json["content"]` so the model only ever sees
-/// the user's answers — never the raw marker.
-///
-/// Returns `Err(())` only when the `AppEvent` channel is dead
-/// (TUI shut down mid-turn). Tool-result payloads that aren't a
-/// `user_question` marker are returned unchanged and `Ok(())`.
-async fn intercept_user_question(
-    result_json: &mut Value,
+/// Resolve a trusted typed follow-up through the full-screen TUI. Ordinary
+/// tool text is never inspected for control state.
+async fn resolve_tui_follow_up(
+    result: &mut tools::ToolResult,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<(), ()> {
-    let Some(content) = result_json.get("content").and_then(|v| v.as_str()) else {
-        return Ok(());
-    };
-    if !matches!(
-        crate::tools::parse_tool_control_signal(content),
-        Some(crate::tools::ToolControlSignal::UserQuestion)
-    ) {
-        return Ok(());
-    }
-    let Some(questions) = crate::tools::parse_user_questions(content) else {
+    let follow_up = result.follow_up().clone();
+    let tools::ToolFollowUp::UserQuestion { questions, .. } = follow_up else {
+        if result.follow_up().is_pending() {
+            let message = "This typed follow-up is not supported by the full-screen TUI";
+            *result = result
+                .cancel_follow_up(message.to_string(), message.to_string())
+                .expect("pending follow-up can be cancelled");
+        }
         return Ok(());
     };
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if tx
         .send(AppEvent::UserQuestion {
-            questions,
+            questions: questions
+                .iter()
+                .map(tools::ToolQuestion::widget_value)
+                .collect(),
             reply: reply_tx,
         })
         .is_err()
@@ -2914,9 +3196,11 @@ async fn intercept_user_question(
     let answers = reply_rx
         .await
         .unwrap_or_else(|_| "{\"_cancelled\": true}".to_string());
-    if let Some(obj) = result_json.as_object_mut() {
-        obj.insert("content".to_string(), Value::String(answers));
-    }
+    let response =
+        serde_json::from_str(&answers).unwrap_or_else(|_| Value::String(answers.clone()));
+    *result = result
+        .resolve_follow_up(answers, response)
+        .expect("typed user question has one pending follow-up");
     Ok(())
 }
 
@@ -2958,26 +3242,180 @@ pub fn build_assistant_message_with_tools(
 mod tests {
     use super::*;
 
+    fn test_run() -> Arc<tools::ToolRunContext> {
+        Arc::clone(tools::security::test_run_context())
+    }
+
+    #[test]
+    fn partial_tool_outcomes_are_not_reported_as_successful_completion() {
+        let call = tools::ToolCall {
+            id: "partial-hook-fixture".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "mcp__fixture__remote".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let failure = tools::ToolFailure::new(
+            tools::ToolFailureCode::External,
+            "remote outcome unknown".to_string(),
+            tools::ToolRetryability::Unknown,
+        );
+        let partial = tools::ToolResult::bind(
+            &call,
+            "mcp__fixture__remote",
+            tools::ToolHandlerResult::partial_text("uncertain", vec![failure]),
+        );
+        let success = tools::ToolResult::bind(
+            &call,
+            "mcp__fixture__remote",
+            tools::ToolHandlerResult::success_text("done"),
+        );
+
+        assert!(!tool_result_completed_successfully(&partial));
+        assert!(tool_result_completed_successfully(&success));
+    }
+
+    fn typed_test_blocks(prefix: &str, suffix: &str) -> crate::prompt::SystemPromptBlocks {
+        let mut items = Vec::new();
+        if !prefix.is_empty() {
+            items.push(crate::context::ContextItem::host_instruction(
+                "test.stable",
+                crate::context::HostInstructionSource::CorePolicy,
+                "compiled:test",
+                prefix,
+                crate::context::ContextFreshness::Static,
+                1,
+            ));
+        }
+        if !suffix.is_empty() {
+            items.push(crate::context::ContextItem::host_instruction(
+                "test.dynamic",
+                crate::context::HostInstructionSource::RuntimePolicy,
+                "host:test",
+                suffix,
+                crate::context::ContextFreshness::Turn,
+                2,
+            ));
+        }
+        crate::prompt::SystemPromptBlocks::from_items(
+            items,
+            crate::context::ContextBudget::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn tui_pipeline_propagates_automatic_learning_policy() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("TUI learning workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        let run = crate::tools::security::test_run_context_for(workspace.path());
+        let memory = Arc::new(
+            crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+                .expect("TUI workspace memory"),
+        );
+        let config: crate::config::AppConfig = serde_yaml::from_str(
+            r"
+proxy:
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+memory:
+  automatic_learning_enabled: true
+",
+        )
+        .expect("TUI learning config");
+        let permissions = Arc::new(crate::permissions::PermissionManager::unrestricted_for_run(
+            &run,
+        ));
+        let tasks = Arc::new(Mutex::new(
+            crate::session::TaskManager::for_run(&run).expect("TUI task manager"),
+        ));
+        let call = tools::ToolCall {
+            id: "tui-learning-write".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/tui_learning.rs",
+                    "content": "pub const TUI_POLICY_PROPAGATED: bool = true;\n"
+                })
+                .to_string(),
+            },
+        };
+        let (tx, _rx) = mpsc::channel();
+
+        let result = execute_single_tool(SingleToolExecution {
+            run_context: Arc::clone(&run),
+            tool_call: &call,
+            memory_db: Some(memory),
+            app_config: Some(Arc::new(config)),
+            permission: ToolPermissionDispatch {
+                mgr: permissions,
+                authorization: None,
+            },
+            policy_enforcer: None,
+            task_mgr: tasks,
+            session_id: Some("tui-learning-policy"),
+            hook_context: None,
+            tx: &tx,
+        })
+        .await
+        .expect("TUI pipeline result");
+        assert!(!result.is_error(), "TUI write failed: {}", result.content());
+        assert!(result.observations().iter().any(|observation| {
+            observation.kind == "technical_learning_capture" && !observation.authoritative
+        }));
+        crate::tools::retire_run(&run);
+    }
+
     #[test]
     fn quality_gate_records_command_and_failed_gate_findings() {
+        let run = crate::tools::security::test_run_context_for(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )));
         let mut ledger = crate::ledger::RealityLedger::new();
-        let gate = crate::guardrails::QualityCheckResult {
-            name: "unit".to_string(),
-            command: "cargo test --lib".to_string(),
-            passed: false,
-            exit_code: 101,
-            stdout: "running tests".to_string(),
-            stderr: "one failed".to_string(),
-            required: true,
+        let config = crate::config::GuardrailsConfig {
+            quality_gates: Some(crate::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![crate::config::QualityCheck {
+                    name: "unit".to_string(),
+                    command: "sh -c 'printf running-tests; printf one-failed >&2; exit 7'"
+                        .to_string(),
+                    required: true,
+                }],
+                ..crate::config::QualityGatesConfig::default()
+            }),
+            ..crate::config::GuardrailsConfig::default()
         };
+        crate::guardrails::configure(&run, &config).expect("configure gate");
+        let gate = crate::guardrails::run_quality_gates(&run, "test-model")
+            .into_iter()
+            .next()
+            .expect("gate result");
 
-        let ids = crate::grounded_loop::append_quality_gate_observations(&mut ledger, &gate)
+        let event = failed_quality_gate_event(&gate);
+        let AppEvent::ToolDone {
+            name,
+            success,
+            content,
+        } = event
+        else {
+            panic!("failed quality gate must not enter the model-text stream");
+        };
+        assert_eq!(name, "quality_gate:unit");
+        assert!(!success);
+        assert!(content.contains("running-tests"));
+
+        let ids = crate::grounded_loop::append_quality_gate_observations(&run, &mut ledger, &gate)
             .expect("append");
         let command_observation = ledger.get(ids.command).expect("command observation");
         assert_eq!(
-            command_observation.authority,
-            crate::ledger::Authority::Command
+            command_observation.provenance.trust,
+            crate::ledger::EvidenceTrust::RuntimeObserved
         );
+        assert!(command_observation.provenance.is_bound_to(&run));
         let crate::ledger::ObservationKind::CommandRun {
             argv,
             exit_code,
@@ -2990,14 +3428,23 @@ mod tests {
         };
         assert_eq!(
             argv,
-            &vec!["cargo".to_string(), "test".to_string(), "--lib".to_string()]
+            &vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf running-tests; printf one-failed >&2; exit 7".to_string()
+            ]
         );
-        assert_eq!(*exit_code, 101);
-        assert_eq!(stdout, "running tests");
-        assert_eq!(stderr, "one failed");
+        assert_eq!(*exit_code, 7);
+        assert_eq!(stdout, "running-tests");
+        assert_eq!(stderr, "one-failed");
 
         let observation = ledger.get(ids.verification).expect("observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Verifier);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::TrustedVerifier
+        );
+        assert!(observation.provenance.is_bound_to(&run));
+        assert!(observation.provenance.verification_method.is_some());
         let crate::ledger::ObservationKind::Verification {
             passed,
             command,
@@ -3007,70 +3454,15 @@ mod tests {
             panic!("expected verification observation");
         };
         assert!(!passed);
-        assert_eq!(command.as_deref(), Some("cargo test --lib"));
+        assert_eq!(
+            command.as_deref(),
+            Some("sh -c 'printf running-tests; printf one-failed >&2; exit 7'")
+        );
         assert!(findings
             .iter()
             .any(|finding| finding.contains("quality gate 'unit' failed")));
         assert!(findings.iter().any(|finding| finding.contains("stdout:")));
         assert!(findings.iter().any(|finding| finding.contains("stderr:")));
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_uses_actual_read_path() {
-        let args = serde_json::json!({"path":"src/main.rs"});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("read_file", &args),
-            Some("src/main.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_defaults_read_search_paths() {
-        let args = serde_json::json!({});
-
-        for tool_name in ["list_files", "glob", "grep"] {
-            assert_eq!(
-                guardrail_path_for_tool_call(tool_name, &args),
-                Some(".".to_string()),
-                "{tool_name} should precheck its executor's default path"
-            );
-        }
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_matches_optional_path_type_semantics() {
-        let args = serde_json::json!({"path":42});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("list_files", &args),
-            Some(".".to_string())
-        );
-        assert_eq!(guardrail_path_for_tool_call("read_file", &args), None);
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_skips_non_object_arguments() {
-        let args = serde_json::json!([]);
-
-        assert_eq!(guardrail_path_for_tool_call("list_files", &args), None);
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_skips_write_tools_checked_by_handlers() {
-        let write_args = serde_json::json!({"path":"src/main.rs","content":"new"});
-        let edit_args = serde_json::json!({"path":"src/main.rs"});
-        let notebook_args = serde_json::json!({"notebook_path":"nb.ipynb"});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("write_file", &write_args),
-            None
-        );
-        assert_eq!(guardrail_path_for_tool_call("edit_file", &edit_args), None);
-        assert_eq!(
-            guardrail_path_for_tool_call("notebook_edit", &notebook_args),
-            None
-        );
     }
 
     #[test]
@@ -3110,17 +3502,20 @@ mod tests {
         };
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            test_run(),
             &[tool_call],
             None,
             None,
-            None,
+            permission_mgr,
             &[],
             None,
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3207,6 +3602,7 @@ mod tests {
             async move {
                 let tool_calls = vec![tool_call];
                 execute_tool_calls_for_tui(
+                    test_run(),
                     &tool_calls,
                     None,
                     None,
@@ -3216,6 +3612,7 @@ mod tests {
                     None,
                     task_mgr,
                     Some("s"),
+                    "test-model",
                     &tx,
                 )
                 .await
@@ -3265,8 +3662,6 @@ mod tests {
         let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
         let _ledger_guard =
             crate::ledger::install_active_ledger_for_session(session_id, Arc::clone(&ledger));
-        let mgr = Arc::new(PermissionManager::unrestricted());
-        mgr.tui_remember_always_denied("bash".to_string());
         let tool_call = ToolCall {
             id: "call_denied".to_string(),
             call_type: "function".to_string(),
@@ -3275,10 +3670,24 @@ mod tests {
                 arguments: r#"{"command":"cargo test"}"#.to_string(),
             },
         };
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mgr = Arc::new(PermissionManager::new(
+            dir.path().join("permissions.json"),
+            true,
+            Vec::new(),
+        ));
+        mgr.deny_tool_call_for_session(
+            &tool_call,
+            session_id,
+            crate::permissions::ApprovalProvenance::InteractiveUser,
+        )
+        .expect("exact session denial");
         let (tx, _rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let run_context = test_run();
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            Arc::clone(&run_context),
             &[tool_call],
             None,
             None,
@@ -3288,6 +3697,7 @@ mod tests {
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3298,7 +3708,7 @@ mod tests {
         assert!(
             results[0]["content"]
                 .as_str()
-                .is_some_and(|content| content.contains("User denied permission")),
+                .is_some_and(|content| content.contains("exact approval-scope denial")),
             "tool result should carry the denial: {}",
             results[0]
         );
@@ -3312,7 +3722,11 @@ mod tests {
                 .cloned()
         }
         .expect("denied tool result observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run_context));
         let crate::ledger::ObservationKind::ToolResult { tool, result } = &observation.kind else {
             panic!("expected tool result observation");
         };
@@ -3322,7 +3736,7 @@ mod tests {
         assert!(
             result["content"]
                 .as_str()
-                .is_some_and(|content| content.contains("User denied permission")),
+                .is_some_and(|content| content.contains("exact approval-scope denial")),
             "ledgered tool result should carry the denial: {result}"
         );
     }
@@ -3353,6 +3767,7 @@ mod tests {
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            test_run(),
             &[tool_call],
             None,
             None,
@@ -3362,6 +3777,7 @@ mod tests {
             Some(policy_enforcer),
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3449,6 +3865,7 @@ mod tests {
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            test_run(),
             &[tool_call],
             None,
             None,
@@ -3458,6 +3875,7 @@ mod tests {
             None,
             task_mgr,
             Some("tui-prehook-session"),
+            "test-model",
             &tx,
         )
         .await;
@@ -3511,17 +3929,21 @@ mod tests {
         };
         let (tx, _rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
+        let run_context = test_run();
 
         let (results, has_tools) = execute_tool_calls_for_tui(
+            Arc::clone(&run_context),
             &[tool_call],
             None,
             None,
-            None,
+            permission_mgr,
             &[],
             None,
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3539,7 +3961,11 @@ mod tests {
                 .cloned()
         }
         .expect("tool result observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run_context));
         let crate::ledger::ObservationKind::ToolResult { tool, result } = &observation.kind else {
             panic!("expected tool result observation");
         };
@@ -3562,7 +3988,8 @@ mod tests {
             "is_error": false
         });
 
-        observe_tool_result_json(Some(session_id), "ask_user_question", &result_json);
+        let run = test_run();
+        observe_tool_result_json(&run, Some(session_id), "ask_user_question", &result_json);
 
         let observation = {
             let ledger = ledger.lock().expect("ledger lock");
@@ -3579,6 +4006,11 @@ mod tests {
         assert_eq!(tool, "ask_user_question");
         assert_eq!(result["tool_call_id"], "call_question");
         assert_eq!(result["content"], "{\"answer\":\"use the SSD\"}");
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run));
     }
 
     #[test]
@@ -3851,10 +4283,7 @@ mod tests {
     #[test]
     fn test_build_anthropic_request_multi_block() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let blocks = crate::prompt::SystemPromptBlocks {
-            stable_prefix: "identity and tools".to_string(),
-            dynamic_suffix: "hooks and env".to_string(),
-        };
+        let blocks = typed_test_blocks("identity and tools", "hooks and env");
         let req = build_anthropic_request(
             "claude-sonnet-4-6",
             &messages,
@@ -3882,10 +4311,7 @@ mod tests {
     #[test]
     fn test_build_anthropic_request_empty_suffix_single_block() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let blocks = crate::prompt::SystemPromptBlocks {
-            stable_prefix: "everything is static".to_string(),
-            dynamic_suffix: String::new(),
-        };
+        let blocks = typed_test_blocks("everything is static", "");
         let req = build_anthropic_request(
             "claude-sonnet-4-6",
             &messages,
@@ -4457,9 +4883,9 @@ mod tests {
         );
     }
 
-    /// B3 — `tool_needs_permission` classifies read-only tools as safe.
+    /// B3 — `tool_needs_permission` follows mandatory catalog metadata.
     #[test]
-    fn b3_tool_needs_permission_safe_list() {
+    fn b3_tool_needs_permission_uses_effect_catalog() {
         assert!(!tool_needs_permission("read_file"), "read_file is safe");
         assert!(
             !tool_needs_permission("grounding_context"),
@@ -4478,47 +4904,172 @@ mod tests {
         );
     }
 
-    /// crosslink #724 — `check_tool_permission` consults the
-    /// `PermissionManager`'s session-scoped TUI cache and short-circuits to
-    /// `Allowed` without sending a `PermissionRequest` event. This is the
-    /// integration test that proves the cache survives across batches: a
-    /// fresh `execute_tool_calls_for_tui` invocation would see this state.
     #[tokio::test]
-    async fn issue_724_check_tool_permission_uses_session_always_allowed() {
+    async fn tui_permission_manager_applies_explicit_deny_to_read_only_call() {
+        use crate::permissions::{PermissionDecision, PermissionRule};
         use std::sync::mpsc as std_mpsc;
 
-        let mgr = PermissionManager::unrestricted();
-        // Simulate: in a prior batch, the user picked "Always allow" for Bash.
-        mgr.tui_remember_always_allowed("bash".to_string());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        mgr.add_session_rule(PermissionRule {
+            tool: "Read".to_string(),
+            pattern: "/etc/**".to_string(),
+            decision: PermissionDecision::Deny,
+        });
+        let (tx, _rx) = std_mpsc::channel::<AppEvent>();
 
-        // Batch-scoped caches start empty (as they would on every new batch).
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
-            "bash",
-            "call_1",
-            "{\"command\":\"ls\"}",
-            &mut always_allowed,
-            &mut always_denied,
-            Some(&mgr),
+            &test_run(),
+            "read_file",
+            "call_read",
+            r#"{"path":"/etc/shadow"}"#,
+            &mgr,
             &[],
             None,
             None,
             &tx,
         )
         .await;
+        assert!(matches!(outcome, PermissionOutcome::DeniedWithResult(_)));
+    }
+
+    #[tokio::test]
+    async fn tui_unrestricted_manager_denies_unclassified_call_before_prompt() {
+        use std::sync::mpsc as std_mpsc;
+
+        let manager = PermissionManager::unrestricted();
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+
+        let outcome = check_tool_permission(
+            &test_run(),
+            "unknown_from_model",
+            "call_unknown",
+            "{}",
+            &manager,
+            &[],
+            None,
+            None,
+            &tx,
+        )
+        .await;
+
+        assert!(matches!(outcome, PermissionOutcome::DeniedWithResult(_)));
         assert!(
-            matches!(outcome, PermissionOutcome::Allowed { checked: true }),
-            "#724: a prior 'always allow' must short-circuit to Allowed without a prompt"
+            rx.try_iter()
+                .all(|event| !matches!(event, AppEvent::PermissionRequest { .. })),
+            "an unclassified call must not be converted into a user-approvable prompt"
+        );
+    }
+
+    /// crosslink #724 / S-017 — an exact, bounded session approval survives
+    /// across batches without becoming a tool-name-wide bypass.
+    #[tokio::test]
+    async fn issue_724_check_tool_permission_uses_exact_session_approval() {
+        use std::sync::mpsc as std_mpsc;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        let approved = ToolCall {
+            id: "prior_call".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "bash".to_string(),
+                arguments: r#"{"command":"ls"}"#.to_string(),
+            },
+        };
+        let _initial_permit = mgr
+            .approve_tool_call_for_session(
+                &approved,
+                "session-1",
+                crate::permissions::ApprovalProvenance::InteractiveUser,
+            )
+            .expect("exact session approval");
+
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+        let outcome = check_tool_permission(
+            &test_run(),
+            "bash",
+            "call_1",
+            "{\"command\":\"ls\"}",
+            &mgr,
+            &[],
+            None,
+            Some("session-1"),
+            &tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ),
+            "an exact prior approval must return a call-bound permit without a prompt"
         );
         // No PermissionRequest event should have been emitted.
         assert!(
             rx.try_recv().is_err(),
             "#724: no PermissionRequest event must be sent when the session cache allows"
         );
+    }
+
+    #[test]
+    fn durable_memory_prompts_accept_only_the_one_use_choice() {
+        use std::sync::mpsc as std_mpsc;
+
+        let run = test_run();
+        let manager = PermissionManager::unrestricted_for_run(&run);
+        let (tx, _rx) = std_mpsc::channel::<AppEvent>();
+        for (name, arguments) in [
+            (
+                "memory_review",
+                serde_json::json!({
+                    "action": "review",
+                    "logical_id": "00000000-0000-0000-0000-000000000001",
+                    "expected_record_digest": format!("sha256:{}", "0".repeat(64)),
+                }),
+            ),
+            (
+                "memory_export",
+                serde_json::json!({"destination_root": "/tmp/portable-export"}),
+            ),
+            (
+                "memory_import",
+                serde_json::json!({"source_root": "/tmp/portable-import"}),
+            ),
+        ] {
+            let call = ToolCall {
+                id: format!("{name}-call"),
+                call_type: "function".to_string(),
+                function: tools::FunctionCall {
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                },
+            };
+            let allowed = permission_prompt_response(
+                &Ok(PermissionResponse::Allow),
+                &manager,
+                Some("session-durable-memory"),
+                &call,
+                &tx,
+            );
+            assert!(matches!(
+                allowed,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ));
+
+            let reusable = permission_prompt_response(
+                &Ok(PermissionResponse::AlwaysAllow),
+                &manager,
+                Some("session-durable-memory"),
+                &call,
+                &tx,
+            );
+            assert!(matches!(reusable, PermissionOutcome::DeniedWithResult(_)));
+        }
     }
 
     /// #603: `web_fetch` is gated, but a configured preapproved host should
@@ -4535,18 +5086,13 @@ mod tests {
             Vec::new(),
             vec!["docs.python.org".to_string()],
         );
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
-
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "web_fetch",
             "call_web",
             r#"{"url":"https://docs.python.org/3/"}"#,
-            &mut always_allowed,
-            &mut always_denied,
-            Some(&mgr),
+            &mgr,
             &[],
             None,
             None,
@@ -4554,7 +5100,12 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(outcome, PermissionOutcome::Allowed { checked: true }),
+            matches!(
+                outcome,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ),
             "#603: preapproved web_fetch URL must be allowed without a prompt"
         );
         assert!(
@@ -4576,18 +5127,13 @@ mod tests {
             pattern: "git status *".to_string(),
             decision: PermissionDecision::Allow,
         }];
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
-
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_git",
             r#"{"command":"git status --short"}"#,
-            &mut always_allowed,
-            &mut always_denied,
-            Some(&mgr),
+            &mgr,
             &transient,
             None,
             None,
@@ -4596,7 +5142,12 @@ mod tests {
         .await;
 
         assert!(
-            matches!(outcome, PermissionOutcome::Allowed { checked: true }),
+            matches!(
+                outcome,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ),
             "matching transient allowed-tools rule must allow without prompting"
         );
         assert!(
@@ -4621,18 +5172,17 @@ mod tests {
             }],
         });
         let engine = HookEngine::new(hooks);
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let manager =
+            PermissionManager::new(directory.path().join("permissions.json"), true, Vec::new());
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
 
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_hook",
-            r#"{"command":"rm -rf /tmp/openclaudia-hook-test"}"#,
-            &mut always_allowed,
-            &mut always_denied,
-            None,
+            r#"{"command":"printf permission-hook-test"}"#,
+            &manager,
             &[],
             Some(&engine),
             Some("session-1"),
@@ -4683,30 +5233,39 @@ mod tests {
         );
     }
 
-    /// crosslink #724 — symmetric to the above: a session-scoped "always deny"
-    /// short-circuits to `DeniedWithResult` without prompting the user again.
+    /// crosslink #724 / S-017 — an exact session denial short-circuits without
+    /// granting denial authority over other Bash invocations.
     #[tokio::test]
-    async fn issue_724_check_tool_permission_uses_session_always_denied() {
+    async fn issue_724_check_tool_permission_uses_exact_session_denial() {
         use std::sync::mpsc as std_mpsc;
 
-        let mgr = PermissionManager::unrestricted();
-        mgr.tui_remember_always_denied("bash".to_string());
-
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        let denied = ToolCall {
+            id: "prior_call".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "bash".to_string(),
+                arguments: r#"{"command":"cargo test"}"#.to_string(),
+            },
+        };
+        mgr.deny_tool_call_for_session(
+            &denied,
+            "session-1",
+            crate::permissions::ApprovalProvenance::InteractiveUser,
+        )
+        .expect("exact session denial");
 
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_1",
-            "{\"command\":\"rm -rf /\"}",
-            &mut always_allowed,
-            &mut always_denied,
-            Some(&mgr),
+            "{\"command\":\"cargo test\"}",
+            &mgr,
             &[],
             None,
-            None,
+            Some("session-1"),
             &tx,
         )
         .await;

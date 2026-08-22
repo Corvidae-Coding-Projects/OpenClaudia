@@ -101,7 +101,7 @@ pub struct Identity {
     /// during a session (a `bash cd` tool call updates this).
     pub cwd: PathBuf,
     /// Project root (git toplevel or `original_cwd` when not in a
-    /// repo). Used by MEMORY.md discovery and rules/plugins scope.
+    /// repo). Used by project-scoped memory and plugin discovery.
     pub project_root: PathBuf,
     /// Where transcripts / session-memory / subagent metadata all
     /// anchor. Today derives from `cwd`; kept separate so a future
@@ -304,24 +304,22 @@ pub struct ModesState {
 
 // ─── Permissions ────────────────────────────────────────────────────
 
-/// Permission state for this session. The `permission_mgr` itself
-/// lives on `AppHandles`; these flags describe the per-session
-/// decisions layered on top of it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Live permission posture for the current authenticated invocation.
+///
+/// [`crate::state::SessionState`] skips this entire category during serde so a
+/// conversation file can record neither bypass nor mirrored trust authority.
+#[derive(Debug, Clone, Default)]
 pub struct PermissionsState {
     /// `--dangerously-skip-permissions` was set for this session.
     /// Does NOT persist across sessions.
-    #[serde(default)]
     pub bypass_mode: bool,
-    /// The user has accepted the per-project trust prompt. Persists
-    /// across sessions via the existing `permission_mgr` storage;
-    /// mirrored here so callers can read a coherent snapshot.
-    #[serde(default)]
+    /// The current invocation has accepted its project trust prompt.
+    /// This is a process-local mirror only; any durable trust registry lives
+    /// outside conversation/session serialization.
     pub trust_accepted: bool,
     /// When true, no permission decisions made this session get
     /// persisted to the on-disk permissions store. Used by tests
     /// and ephemeral sandboxed sessions.
-    #[serde(default)]
     pub persistence_disabled: bool,
 }
 

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "crosslink-agent-prompt": {
+      "args": [
+        ".crosslink/integrations/mcp/agent-prompt-server.py"
+      ],
+      "command": "python3"
+    },
+    "crosslink-knowledge": {
+      "args": [
+        ".crosslink/integrations/mcp/knowledge-server.py"
+      ],
+      "command": "python3"
+    }
+  }
+}

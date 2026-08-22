@@ -26,13 +26,11 @@
 //!
 //! ## Why a service and not just a fn
 //!
-//! Keeping this in `services::` puts it in the same dispatch graph as
-//! `analytics` / `feature_flags` etc., so future call sites can lift it
-//! out of `ServiceRegistry` instead of constructing one ad-hoc. The
-//! current registry doesn't carry an `AutoCompactor` slot yet (the
-//! compactor needs per-request configuration that `ServiceRegistry`'s
-//! shared-instance model doesn't fit), but the dependency direction is
-//! correct: services depend on compaction, not the other way around.
+//! The proxy constructs this typed owner per request because model-specific
+//! compaction overrides do not fit a shared global registry. Its production
+//! disposition is recorded in `services::lifecycle_service_catalog`; keeping
+//! the dependency explicit avoids hiding request authority in a service
+//! locator.
 
 use std::sync::Arc;
 
@@ -117,6 +115,7 @@ impl AutoCompactor {
         request: &mut ChatCompletionRequest,
         actual_input_tokens: Option<usize>,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<Option<CompactionResult>, CompactionError> {
@@ -128,6 +127,7 @@ impl AutoCompactor {
             .compact_with_hint(
                 request,
                 hook_engine,
+                run_context,
                 session_id,
                 actual_input_tokens,
                 memory_db,
@@ -147,6 +147,7 @@ impl AutoCompactor {
         request: &mut ChatCompletionRequest,
         target_tokens: usize,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<Option<CompactionResult>, CompactionError> {
@@ -155,7 +156,14 @@ impl AutoCompactor {
         }
         let result = self
             .compactor
-            .microcompact(request, target_tokens, hook_engine, session_id, memory_db)
+            .microcompact(
+                request,
+                target_tokens,
+                hook_engine,
+                run_context,
+                session_id,
+                memory_db,
+            )
             .await?;
         Ok(Some(result))
     }
@@ -167,6 +175,10 @@ mod tests {
     use crate::compaction::CompactionConfig;
     use crate::proxy::{ChatMessage, MessageContent};
     use std::collections::HashMap;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     fn small_request() -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -212,7 +224,7 @@ mod tests {
         let ac = AutoCompactor::auto(compactor);
         let mut req = small_request();
         let result = ac
-            .auto_compact(&mut req, None, None, None, None)
+            .auto_compact(&mut req, None, None, test_run(), None, None)
             .await
             .unwrap();
         assert!(result.is_none());

@@ -12,20 +12,14 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
+    support::dispatch_tool(name, args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -95,7 +89,9 @@ fn glob_path_as_number_returns_validation_error() {
     let (msg, is_err) = dispatch("glob", &args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'path' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'path'"),
         "non-string glob path MUST be rejected; got {msg:?}"
     );
 }
@@ -281,7 +277,9 @@ fn grep_path_as_array_returns_validation_error() {
     let (msg, is_err) = dispatch("grep", &args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'path' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'path'"),
         "non-string grep path MUST be rejected; got {msg:?}"
     );
 }

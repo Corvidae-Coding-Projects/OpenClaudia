@@ -1,9 +1,8 @@
 //! End-to-end tests for `tools::registry::registry()` —
 //! global invariants across the full HANDLERS table:
 //! every registered handler has a matching name, every
-//! definition is well-formed, exactly 5 handlers declare
-//! a `permission_target` (Bash/Edit/NotebookEdit/WebFetch/Write),
-//! and the registry has the documented tool count.
+//! definition is well-formed, every handler carries a mandatory effect
+//! declaration, and the registry has the documented tool count.
 //!
 //! Sprint 160 of the verification effort. Sprint 23 / 132
 //! covered the registry dispatch shape; this file pins
@@ -16,8 +15,10 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::{
+    effect::{ToolEffect, ToolTarget},
     get_tool_definitions,
-    registry::{registry, ToolContext},
+    registry::registry,
+    ToolResource,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -39,6 +40,18 @@ fn documented_tool_names() -> Vec<&'static str> {
         "glob",
         "grep",
         "crosslink",
+        "memory_save",
+        "memory_search",
+        "memory_list",
+        "memory_learning_status",
+        "memory_conflicts",
+        "memory_update",
+        "memory_delete",
+        "memory_review",
+        "memory_export",
+        "memory_import",
+        "memory_source_status",
+        "memory_source_refresh",
         "web_fetch",
         "web_search",
         "web_browser",
@@ -112,9 +125,9 @@ fn documented_tool_names_match_emitted_tool_definitions() {
 
 #[test]
 fn registry_documented_tool_count_is_current() {
-    // PINS CATALOG SIZE: 36 with the browser feature, 34 without it.
+    // PINS CATALOG SIZE: 48 with the browser feature, 46 without it.
     // Adding a tool: append a line to HANDLERS and bump this number.
-    let expected = if cfg!(feature = "browser") { 36 } else { 34 };
+    let expected = if cfg!(feature = "browser") { 48 } else { 46 };
     assert_eq!(
         documented_tool_names().len(),
         expected,
@@ -220,105 +233,183 @@ fn every_handler_required_fields_are_in_properties() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn exactly_5_handlers_declare_permission_target() {
-    // AUTHORING DISCOVERY: 5 gated tools. notebook_edit also declares a
-    // permission_target since it overwrites .ipynb on disk; web_fetch declares
-    // a URL target so preapproved documentation hosts can bypass prompts while
-    // arbitrary network reads still ask.
-    // PINS the actual catalog: bash + edit_file + notebook_edit
-    // + web_fetch + write_file. Adding a new gated tool: append here
-    // AND in src/tools/registry.rs's permission_target impl.
+fn every_documented_tool_declares_an_effect() {
+    // S-016 replaces the old "exactly 5 handlers declare permission_target"
+    // pin. That number WAS the defect (F-001): the other twenty-eight
+    // handlers inherited "read-only / safe" from a trait default. The
+    // declaration is now mandatory at compile time, so what remains to pin is
+    // that each declaration is usable by the rule engine.
     let reg = registry();
-    let mut with_target: Vec<&str> = Vec::new();
     for name in documented_tool_names() {
-        let handler = reg.get(name).expect(name);
-        if handler.permission_target().is_some() {
-            with_target.push(name);
-        }
+        let handler = reg
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} must be registered"));
+        handler
+            .effect_spec()
+            .validate(name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
-    with_target.sort_unstable();
-    assert_eq!(
-        with_target,
-        vec![
-            "bash",
-            "edit_file",
-            "notebook_edit",
-            "web_fetch",
-            "write_file"
-        ],
-        "PINS PERMISSION TARGETS: exactly 5 gated tools"
-    );
 }
 
 #[test]
-fn bash_permission_target_canonical_is_bash() {
+fn effectful_tools_outnumber_the_five_that_used_to_be_gated() {
+    // Guards the specific regression shape: if a future change reintroduced a
+    // permissive default, the set of tools requiring authorization would
+    // collapse back toward the original five.
     let reg = registry();
-    let handler = reg.get("bash").expect("bash");
-    let target = handler.permission_target().expect("Some");
-    assert_eq!(target.canonical, "Bash");
-    assert_eq!(target.arg_key, "command");
-}
-
-#[test]
-fn write_file_permission_target_canonical_is_write() {
-    let reg = registry();
-    let handler = reg.get("write_file").expect("write_file");
-    let target = handler.permission_target().expect("Some");
-    assert_eq!(target.canonical, "Write");
-    assert_eq!(target.arg_key, "path");
-}
-
-#[test]
-fn edit_file_permission_target_canonical_is_edit() {
-    let reg = registry();
-    let handler = reg.get("edit_file").expect("edit_file");
-    let target = handler.permission_target().expect("Some");
-    assert_eq!(target.canonical, "Edit");
-    assert_eq!(target.arg_key, "path");
-}
-
-#[test]
-fn notebook_edit_permission_target_uses_notebook_path_arg_key() {
-    // AUTHORING DISCOVERY: notebook_edit also declares a
-    // permission_target — its arg_key is "notebook_path",
-    // not "path", because the notebook tool uses the
-    // distinct notebook_path field name.
-    let reg = registry();
-    let handler = reg.get("notebook_edit").expect("notebook_edit");
-    let target = handler.permission_target().expect("Some");
-    // Canonical capability is documented to share with Edit
-    // (notebook edits ARE file edits semantically).
+    let gated: Vec<&str> = documented_tool_names()
+        .into_iter()
+        .filter(|name| {
+            reg.get(name)
+                .expect("registered")
+                .effect_spec()
+                .effect
+                .requires_authorization()
+        })
+        .collect();
     assert!(
-        target.canonical == "Edit" || target.canonical == "Write",
-        "MUST canonicalize to Edit or Write; got {:?}",
-        target.canonical
+        gated.len() > 5,
+        "only {} tools require authorization ({gated:?}); F-001 was filed because that set \
+         was five while twenty-eight mutating tools sat outside it",
+        gated.len()
     );
+    for expected in [
+        "bash",
+        "edit_file",
+        "write_file",
+        "notebook_edit",
+        "web_fetch",
+    ] {
+        assert!(gated.contains(&expected), "{expected} must still be gated");
+    }
+}
+
+#[test]
+fn bash_effect_is_destructive_on_the_command_argument() {
+    let reg = registry();
+    let spec = reg.get("bash").expect("bash").effect_spec();
+    assert_eq!(spec.canonical, "Bash");
+    assert_eq!(spec.effect, ToolEffect::Destructive);
+    assert_eq!(spec.target, ToolTarget::Arg("command"));
+}
+
+#[test]
+fn write_file_effect_is_workspace_mutation_on_path() {
+    let reg = registry();
+    let spec = reg.get("write_file").expect("write_file").effect_spec();
+    assert_eq!(spec.canonical, "Write");
+    assert_eq!(spec.effect, ToolEffect::WorkspaceMutation);
+    assert_eq!(spec.target, ToolTarget::Arg("path"));
+}
+
+#[test]
+fn edit_file_effect_is_workspace_mutation_on_path() {
+    let reg = registry();
+    let spec = reg.get("edit_file").expect("edit_file").effect_spec();
+    assert_eq!(spec.canonical, "Edit");
+    assert_eq!(spec.effect, ToolEffect::WorkspaceMutation);
+    assert_eq!(spec.target, ToolTarget::Arg("path"));
+}
+
+#[test]
+fn notebook_edit_effect_uses_notebook_path_arg_key() {
+    // notebook_edit shares the Edit capability (notebook edits ARE file
+    // edits) but keys on `notebook_path`, not `path`.
+    let reg = registry();
+    let spec = reg
+        .get("notebook_edit")
+        .expect("notebook_edit")
+        .effect_spec();
+    assert!(
+        spec.canonical == "Edit" || spec.canonical == "Write",
+        "MUST canonicalize to Edit or Write; got {:?}",
+        spec.canonical
+    );
+    assert_eq!(spec.effect, ToolEffect::WorkspaceMutation);
     assert_eq!(
-        target.arg_key, "notebook_path",
+        spec.target,
+        ToolTarget::Arg("notebook_path"),
         "PINS DOC: notebook_edit uses notebook_path key not path"
     );
 }
 
+#[test]
+fn technical_memory_source_tools_declare_exact_effects_and_resources() {
+    let reg = registry();
+    let status = reg
+        .get("memory_source_status")
+        .expect("memory source status");
+    let status_spec = status.effect_spec();
+    assert_eq!(status_spec.canonical, "MemorySourceRead");
+    assert_eq!(status_spec.effect, ToolEffect::ReadOnly);
+    assert_eq!(status_spec.target, ToolTarget::ToolScope);
+    assert_eq!(
+        status.required_resources(&HashMap::new()),
+        [ToolResource::WorkspaceRead, ToolResource::Memory]
+    );
+
+    let refresh = reg
+        .get("memory_source_refresh")
+        .expect("memory source refresh");
+    let refresh_spec = refresh.effect_spec();
+    assert_eq!(refresh_spec.canonical, "MemorySourceRefresh");
+    assert_eq!(refresh_spec.effect, ToolEffect::ExternalMutation);
+    assert_eq!(refresh_spec.target, ToolTarget::ToolScope);
+    assert_eq!(
+        refresh.required_resources(&HashMap::new()),
+        [ToolResource::WorkspaceRead, ToolResource::Memory]
+    );
+}
+
+#[test]
+fn technical_memory_review_declares_exact_effect_and_resource() {
+    let review = registry().get("memory_review").expect("memory review");
+    let spec = review.effect_spec();
+    assert_eq!(spec.canonical, "MemoryReview");
+    assert_eq!(spec.effect, ToolEffect::ExternalMutation);
+    assert_eq!(spec.target, ToolTarget::Arg("logical_id"));
+    assert_eq!(
+        review.required_resources(&HashMap::new()),
+        [ToolResource::WorkspaceRead, ToolResource::Memory]
+    );
+}
+
+#[test]
+fn portable_memory_tools_declare_exact_effects_and_resources() {
+    let export = registry().get("memory_export").expect("memory export");
+    let export_spec = export.effect_spec();
+    assert_eq!(export_spec.canonical, "MemoryExport");
+    assert_eq!(export_spec.effect, ToolEffect::ExternalMutation);
+    assert_eq!(export_spec.target, ToolTarget::Arg("destination_root"));
+    assert_eq!(
+        export.required_resources(&HashMap::new()),
+        [
+            ToolResource::WorkspaceRead,
+            ToolResource::WorkspaceWrite,
+            ToolResource::Memory,
+        ]
+    );
+
+    let import = registry().get("memory_import").expect("memory import");
+    let import_spec = import.effect_spec();
+    assert_eq!(import_spec.canonical, "MemoryImport");
+    assert_eq!(import_spec.effect, ToolEffect::ExternalMutation);
+    assert_eq!(import_spec.target, ToolTarget::Arg("source_root"));
+    assert_eq!(
+        import.required_resources(&HashMap::new()),
+        [ToolResource::WorkspaceRead, ToolResource::Memory]
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — Dispatch invariants
+// Section D — Registration invariants
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn every_documented_tool_dispatches_to_some_result() {
+fn every_documented_tool_is_registered() {
     let reg = registry();
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    let empty_args: HashMap<String, Value> = HashMap::new();
     for name in documented_tool_names() {
-        let outcome = reg.dispatch(name, &empty_args, &mut ctx);
-        assert!(
-            outcome.is_some(),
-            "dispatch({name:?}) MUST return Some(...)"
-        );
+        assert!(reg.get(name).is_some(), "{name:?} MUST be registered");
     }
 }
 

@@ -1,14 +1,13 @@
-//! End-to-end tests for `ServiceRegistry` builder methods +
-//! `analytics_arc` / `flags_arc` shared-handle accessors +
-//! `MemoryConsolidationJob` end-to-end against a real
-//! `MemoryDb` + `PluginAutoupdateJob` outcome shape.
+//! End-to-end tests for explicit analytics composition and preserved background
+//! job mechanics. The lifecycle catalog must keep the jobs unavailable until a
+//! safe scheduler owns them.
 //!
 //! Sprint 77 of the verification effort. Sprint 47 covered
 //! `LspServerManager`, sprint 46 covered `JobScheduler` ticks
 //! plus `MockRateLimit`; this file covers the `ServiceRegistry`
 //! builder API plus the `MemoryConsolidationJob` body that
-//! drives short-term prune plus archival dedup against a
-//! tempdir-backed memory store.
+//! drives short-term pruning plus bounded, non-destructive archival
+//! equivalence review against a tempdir-backed memory store.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
@@ -16,11 +15,13 @@
 
 use openclaudia::memory::MemoryDb;
 use openclaudia::services::{
-    AnalyticsEvent, AnalyticsSink, BackgroundJob, MemoryConsolidationJob, NoopAnalytics,
-    PluginAutoupdateJob, ServiceRegistry, StaticFlags,
+    lifecycle_service_catalog, AnalyticsEvent, AnalyticsSink, BackgroundJob,
+    LifecycleServiceClassification, LifecycleServiceId, MemoryConsolidationJob, NoopAnalytics,
+    PluginAutoupdateJob, PluginDelistingJob, ServiceRegistry,
 };
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
+use tracing_subscriber::fmt::MakeWriter;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -54,41 +55,56 @@ impl AnalyticsSink for RecordingSink {
     }
 }
 
+#[derive(Clone, Default)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().expect("captured trace").clone())
+            .expect("UTF-8 tracing output")
+    }
+}
+
+impl std::io::Write for CapturedWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("captured trace poisoned"))?
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for CapturedWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — ServiceRegistry::noop + Default
+// Section A — explicit ServiceRegistry state
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn noop_registry_returns_noop_analytics_and_static_flags() {
-    let r = ServiceRegistry::noop();
-    // Verify the analytics sink doesn't panic on event recording.
-    r.analytics().record(AnalyticsEvent::SessionStart {
-        session_id: "test".to_string(),
-    });
-    // Verify the flag source returns false for any unknown flag.
-    assert!(!r.flags().is_enabled("any-flag-name"));
+fn analytics_disabled_is_observable_and_has_no_fabricated_sink() {
+    let registry = ServiceRegistry::analytics_disabled();
+    assert!(!registry.analytics_is_enabled());
+    assert!(registry.analytics().is_none());
 }
 
 #[test]
-fn default_registry_matches_noop_registry_shape() {
-    let d = ServiceRegistry::default();
-    // Same behavioral contract: noop analytics + StaticFlags.
-    d.analytics().record(AnalyticsEvent::SessionStart {
-        session_id: "x".to_string(),
-    });
-    assert!(!d.flags().is_enabled("x"));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — Builder methods (with_analytics + with_flags)
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn with_analytics_swaps_the_sink_routed_through_analytics_accessor() {
+fn interactive_registry_routes_through_its_required_sink() {
     let (sink, captured) = RecordingSink::new();
-    let registry = ServiceRegistry::noop().with_analytics(sink);
+    let registry = ServiceRegistry::interactive(sink);
     registry
         .analytics()
+        .expect("interactive sink")
         .record(AnalyticsEvent::PromptSubmitted { prompt_chars: 42 });
     let events = captured.lock().expect("poison").clone();
     assert_eq!(events.len(), 1);
@@ -99,36 +115,10 @@ fn with_analytics_swaps_the_sink_routed_through_analytics_accessor() {
 }
 
 #[test]
-fn with_flags_swaps_the_flag_source() {
-    let flags = StaticFlags::default().with("test-flag", true);
-    let registry = ServiceRegistry::noop().with_flags(Arc::new(flags));
-    assert!(registry.flags().is_enabled("test-flag"));
-    assert!(!registry.flags().is_enabled("other-flag"));
-}
-
-#[test]
-fn builder_methods_chain_in_a_single_expression() {
-    let (sink, captured) = RecordingSink::new();
-    let flags = StaticFlags::default().with("x", true);
-    let registry = ServiceRegistry::noop()
-        .with_analytics(sink)
-        .with_flags(Arc::new(flags));
-    assert!(registry.flags().is_enabled("x"));
-    registry
-        .analytics()
-        .record(AnalyticsEvent::ThinkingEmitted { budget: 1000 });
-    assert_eq!(captured.lock().expect("poison").len(), 1);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section C — analytics_arc + flags_arc shared-ownership accessors
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
 fn analytics_arc_returns_clone_of_underlying_arc() {
-    let registry = ServiceRegistry::noop();
-    let a1 = registry.analytics_arc();
-    let a2 = registry.analytics_arc();
+    let registry = ServiceRegistry::interactive(Arc::new(NoopAnalytics));
+    let a1 = registry.analytics_arc().expect("interactive sink");
+    let a2 = registry.analytics_arc().expect("interactive sink");
     // Both Arcs point at the same sink — clone count went up.
     assert!(
         Arc::strong_count(&a1) >= 2,
@@ -145,20 +135,10 @@ fn analytics_arc_returns_clone_of_underlying_arc() {
 }
 
 #[test]
-fn flags_arc_returns_clone_of_underlying_arc() {
-    let registry = ServiceRegistry::noop();
-    let f1 = registry.flags_arc();
-    let f2 = registry.flags_arc();
-    assert!(Arc::strong_count(&f1) >= 2);
-    assert!(!f1.is_enabled("x"));
-    assert!(!f2.is_enabled("x"));
-}
-
-#[test]
 fn analytics_arc_outlives_the_registry_via_shared_ownership() {
     let arc = {
-        let registry = ServiceRegistry::noop();
-        registry.analytics_arc()
+        let registry = ServiceRegistry::interactive(Arc::new(NoopAnalytics));
+        registry.analytics_arc().expect("interactive sink")
     };
     // Registry has been dropped, but the Arc lives on.
     arc.record(AnalyticsEvent::SessionEnd {
@@ -168,14 +148,21 @@ fn analytics_arc_outlives_the_registry_via_shared_ownership() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — plugin_mcp_registrations (no plugins wired)
+// Section B — unavailable job classification
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn plugin_mcp_registrations_is_empty_when_no_plugins_wired() {
-    let registry = ServiceRegistry::noop();
-    let regs = registry.plugin_mcp_registrations();
-    assert!(regs.is_empty());
+fn background_jobs_are_not_misreported_as_active() {
+    let registration = lifecycle_service_catalog()
+        .iter()
+        .find(|registration| registration.id() == LifecycleServiceId::BackgroundJobs)
+        .expect("background catalog row");
+    assert_eq!(
+        registration.classification(),
+        LifecycleServiceClassification::Unavailable
+    );
+    assert!(registration.path().is_none());
+    assert!(registration.follow_up().is_some());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -184,7 +171,7 @@ fn plugin_mcp_registrations_is_empty_when_no_plugins_wired() {
 
 #[test]
 fn registry_debug_format_does_not_panic() {
-    let registry = ServiceRegistry::noop();
+    let registry = ServiceRegistry::analytics_disabled();
     let debug = format!("{registry:?}");
     // The Debug impl uses type metadata strings (no actual
     // Arc<dyn Trait> Debug); minimum contract is non-panic +
@@ -213,38 +200,65 @@ fn memory_consolidation_on_empty_db_returns_zero_metrics() {
 }
 
 #[test]
-fn memory_consolidation_dedups_identical_archival_entries() {
+fn memory_consolidation_preserves_equal_prose_with_distinct_logical_identity() {
     let (db, _dir) = fresh_db();
-    // Insert 3 archival rows with identical content.
     let content = "duplicate-content";
-    db.memory_save(content, &[]).expect("save 1");
-    db.memory_save(content, &[]).expect("save 2");
-    db.memory_save(content, &[]).expect("save 3");
-    // Also one distinct entry — must NOT be deduped.
-    db.memory_save("unique-content", &[]).expect("save 4");
+    let first_id = db.memory_save(content, &[]).expect("save 1");
+    let second_id = db.memory_save(content, &[]).expect("save 2");
+    let third_id = db.memory_save(content, &[]).expect("save 3");
+    let unique_id = db.memory_save("unique-content", &[]).expect("save 4");
+
+    let before = [first_id, second_id, third_id, unique_id].map(|id| {
+        db.memory_get(id)
+            .expect("read before")
+            .expect("present before")
+    });
+    let mut logical_ids = before
+        .iter()
+        .map(|entry| entry.logical_id)
+        .collect::<Vec<_>>();
+    logical_ids.sort_unstable();
+    logical_ids.dedup();
+    assert_eq!(logical_ids.len(), 4, "equal prose is not logical identity");
 
     let job = MemoryConsolidationJob;
     let outcome = job.run(&db).expect("run OK");
-    assert_eq!(
-        outcome.records_deduped, 2,
-        "3 identical rows → 2 deduped (1 canonical kept); got {}",
-        outcome.records_deduped
-    );
+    assert_eq!(outcome.records_deduped, 0);
+
+    for (id, expected) in [first_id, second_id, third_id, unique_id]
+        .into_iter()
+        .zip(before)
+    {
+        let after = db.memory_get(id).expect("read after").expect("preserved");
+        assert_eq!(after.logical_id, expected.logical_id);
+        assert_eq!(after.record_digest, expected.record_digest);
+        assert_eq!(after.content, expected.content);
+    }
 }
 
 #[test]
-fn memory_consolidation_is_idempotent_on_repeat_runs() {
+fn memory_consolidation_is_idempotently_non_destructive() {
     let (db, _dir) = fresh_db();
-    db.memory_save("dup", &[]).expect("1");
-    db.memory_save("dup", &[]).expect("2");
+    let first_id = db.memory_save("dup", &[]).expect("1");
+    let second_id = db.memory_save("dup", &[]).expect("2");
+    let before = [first_id, second_id].map(|id| {
+        db.memory_get(id)
+            .expect("read before")
+            .expect("present before")
+    });
+    assert_ne!(before[0].logical_id, before[1].logical_id);
+
     let job = MemoryConsolidationJob;
     let first = job.run(&db).expect("first run");
-    assert_eq!(first.records_deduped, 1);
+    assert_eq!(first.records_deduped, 0);
     let second = job.run(&db).expect("second run");
-    assert_eq!(
-        second.records_deduped, 0,
-        "post-dedup nothing left to dedup"
-    );
+    assert_eq!(second.records_deduped, 0);
+
+    for (id, expected) in [first_id, second_id].into_iter().zip(before) {
+        let after = db.memory_get(id).expect("read after").expect("preserved");
+        assert_eq!(after.logical_id, expected.logical_id);
+        assert_eq!(after.record_digest, expected.record_digest);
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -268,17 +282,49 @@ fn plugin_autoupdate_with_empty_plugin_list_returns_zero_metrics() {
 }
 
 #[test]
-fn plugin_autoupdate_with_plugins_does_not_panic() {
+fn plugin_autoupdate_with_plugins_reports_that_no_request_was_made() {
     let (db, _dir) = fresh_db();
     let plugins = vec![
         ("plugin-a".to_string(), Some("1.0.0".to_string())),
         ("plugin-b".to_string(), None),
     ];
     let job = PluginAutoupdateJob::new(plugins);
-    // Phase 1: emits per-plugin trace events; doesn't update
-    // any state. MUST not panic.
-    let outcome = job.run(&db).expect("run");
+    let captured = CapturedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let outcome = tracing::subscriber::with_default(subscriber, || job.run(&db)).expect("run");
     assert_eq!(outcome.job_name, "plugin_autoupdate");
+    assert_eq!(outcome.records_pruned, 0);
+    assert_eq!(outcome.records_deduped, 0);
+    let trace = captured.contents();
+    assert!(trace.contains("plugin update check unavailable"));
+    assert!(trace.contains("no marketplace request was made"));
+    assert!(!trace.contains("polled plugin source"));
+}
+
+#[test]
+fn plugin_delisting_with_plugins_reports_that_no_request_was_made() {
+    let (db, _dir) = fresh_db();
+    let job = PluginDelistingJob::new(vec![("plugin-a".to_string(), "marketplace-a".to_string())]);
+    let captured = CapturedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let outcome = tracing::subscriber::with_default(subscriber, || job.run(&db)).expect("run");
+    assert_eq!(outcome.job_name, "plugin_delisting_check");
+    assert_eq!(outcome.records_pruned, 0);
+    assert_eq!(outcome.records_deduped, 0);
+    let trace = captured.contents();
+    assert!(trace.contains("plugin delisting check unavailable"));
+    assert!(trace.contains("no marketplace request was made"));
+    assert!(!trace.contains("polled marketplace"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

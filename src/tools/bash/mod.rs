@@ -1,27 +1,20 @@
 mod kill;
 mod output;
-pub mod path_constraints;
+mod path_lint;
 pub mod sandbox;
 // `policy` is exposed so the security E2E test suite
 // (`tests/tools_security_e2e.rs`) can drive `validate_command`,
-// `is_safe_for_auto_allow`, `dangerous_shell_construct`, and
-// `is_sensitive_env` against the documented attack catalog
+// `dangerous_shell_construct`, and `is_sensitive_env` against the attack catalog
 // without actually executing the attack payloads. Internal call
 // sites use the same path.
 pub mod policy;
 
+pub use kill::terminate_sandbox_process_tree;
 pub use kill::{execute_kill_shell, execute_kill_shells_for_agent, terminate_process_tree};
-pub use output::execute_bash_output;
-pub use path_constraints::{
-    check_command_against_global, clear_global as clear_global_path_constraints,
-    install_global as install_global_path_constraints, PathConstraints,
-};
-pub use policy::{
-    apply_env_scrub, dangerous_shell_construct, is_safe_for_auto_allow, is_sensitive_env,
-    validate_command,
-};
+pub use output::{bash_output_operations, classify_bash_output, execute_bash_output};
+pub use policy::{apply_env_scrub, dangerous_shell_construct, is_sensitive_env, validate_command};
 
-use crate::tools::args::{into_legacy, ToolArgError, ToolArgs as _, ToolError, ToolOutput};
+use crate::tools::args::{ToolArgError, ToolArgs as _, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -31,7 +24,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use uuid::Uuid;
 
@@ -40,39 +33,10 @@ const MAX_BACKGROUND_SHELLS: usize = 50;
 const LEDGER_COMMAND_OUTPUT_MAX_BYTES: usize = 100_000;
 const BACKGROUND_OUTPUT_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
 const FOREGROUND_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
-const VERIFICATION_COMMAND_NEEDLES: &[&str] = &[
-    "cargo test",
-    "cargo check",
-    "cargo clippy",
-    "cargo fmt",
-    "cargo nextest",
-    "npm test",
-    "npm run test",
-    "pnpm test",
-    "pnpm run test",
-    "yarn test",
-    "yarn run test",
-    "bun test",
-    "pytest",
-    "python -m pytest",
-    "go test",
-    "zig test",
-    "swift test",
-    "mvn test",
-    "gradle test",
-    "make test",
-    "ctest",
-];
 
-static BASH_BIN: LazyLock<Result<PathBuf, String>> = LazyLock::new(|| {
-    which::which("bash").map_err(|e| format!("bash binary not found on PATH: {e}"))
-});
-
-fn bash_bin() -> Result<&'static Path, String> {
-    match &*BASH_BIN {
-        Ok(path) => Ok(path.as_path()),
-        Err(msg) => Err(msg.clone()),
-    }
+fn bash_bin(run: &crate::tools::ToolRunContext) -> Result<PathBuf, String> {
+    run.resolve_executable("bash")
+        .map_err(|error| error.to_string())
 }
 
 fn recover_mutex_lock<'a, T>(
@@ -183,8 +147,12 @@ struct BackgroundShell {
     stdout_buffer: Arc<Mutex<Vec<String>>>,
     stderr_buffer: Arc<Mutex<Vec<String>>>,
     command: String,
-    /// Session or subagent bucket that created this shell.
-    owner: String,
+    /// Exact immutable run generation that created this shell.
+    owner_run: String,
+    /// Stable session identity used only by trusted lifecycle cleanup.
+    owner_session: String,
+    /// Human/model-facing owner label (session or subagent id).
+    owner_label: String,
     /// Liveness signal — true once the wait thread has reaped the child.
     ///
     /// # Fix for crosslink #674
@@ -244,16 +212,23 @@ impl BackgroundShellManager {
     ///
     /// Enforces [`validate_command`] (length cap + denylist) and applies
     /// the env allowlist via [`apply_env_scrub`] before spawn so that only
-    /// a curated set of variables (`PATH`, `HOME`, `USER`, `CARGO_HOME`, ...)
-    /// flows into the child. See crosslink #257 and #730.
+    /// only values explicitly bound to the immutable run capability flow into
+    /// the child. See crosslink #257, #730, and S-019.
     #[allow(clippy::too_many_lines)] // spawn keeps the atomic reserve/spawn/insert sequence together
-    pub(crate) fn spawn(&self, command: &str) -> Result<String, String> {
+    pub(crate) fn spawn(
+        &self,
+        run: &crate::tools::security::ToolRunContext,
+        command: &str,
+    ) -> Result<String, String> {
         validate_command(command)?;
+        run.require(crate::tools::security::ToolResource::Process)
+            .map_err(|error| error.to_string())?;
 
         let shell_id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
-        let owner = super::todo::current_session_key();
-        let security = crate::tools::security::current_context()?;
-        let cwd = security.working_directory().to_path_buf();
+        let owner_run = run.run_id().to_string();
+        let owner_session = run.session_id().to_string();
+        let owner_label = run.process_owner().to_string();
+        let cwd = run.working_directory().to_path_buf();
 
         // ── Crosslink #672 fix: atomic check+reserve ──────────────────────────
         //
@@ -300,17 +275,28 @@ impl BackgroundShellManager {
             ));
         }
 
+        // The canonical dispatch reservation ends when `bash` returns its
+        // shell id, but the child can keep mutating the workspace afterward.
+        // Hold a second run-scoped mutation token until the wait thread reaps
+        // the process so quality gates cannot publish during that interval.
+        let mut background_freshness = crate::evidence_freshness::reserve_mutation(
+            run,
+            crate::tools::effect::ToolEffect::Destructive,
+        )?
+        .ok_or_else(|| "background shell did not receive a mutation reservation".to_string())?;
+
         #[cfg(windows)]
         let child = {
-            let bash = find_git_bash().unwrap_or(bash_bin()?.to_path_buf());
-            let mut cmd = sandbox::sandboxed_bash_command(&bash, command, &cwd)?;
+            let bash = find_git_bash(run).unwrap_or(bash_bin(run)?);
+            let mut cmd = sandbox::sandboxed_bash_command(run, &bash, command, &cwd)?;
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             cmd.spawn()
         };
 
         #[cfg(not(windows))]
         let child = {
-            let mut cmd = sandbox::sandboxed_bash_command(bash_bin()?, command, &cwd)?;
+            let bash = bash_bin(run)?;
+            let mut cmd = sandbox::sandboxed_bash_command(run, &bash, command, &cwd)?;
             cmd.stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0); // Put child in its own process group for clean kill
@@ -384,13 +370,14 @@ impl BackgroundShellManager {
         let stderr_done_for_ledger = Arc::clone(&stderr_done);
         let stdout_ledger_for_wait = Arc::clone(&stdout_ledger_buffer);
         let stderr_ledger_for_wait = Arc::clone(&stderr_ledger_buffer);
-        let owner_for_ledger = owner.clone();
+        let owner_for_ledger = owner_label.clone();
+        let run_for_ledger = crate::ledger::RunBinding::from_run(run);
         let cwd_for_ledger = cwd;
         let command_for_ledger = command.to_string();
         let mut child_for_wait = child;
         let wait_shell_id = shell_id.clone();
-        thread::spawn(move || {
-            if let Ok(status) = child_for_wait.wait() {
+        thread::spawn(move || match child_for_wait.wait() {
+            Ok(status) => {
                 let exit_code = status.code().unwrap_or(-1);
                 *recover_mutex_lock(
                     &exit_status_clone,
@@ -423,6 +410,7 @@ impl BackgroundShellManager {
                 )
                 .clone();
                 record_command_observation_for_session(
+                    &run_for_ledger,
                     &owner_for_ledger,
                     &cwd_for_ledger,
                     &command_for_ledger,
@@ -430,6 +418,25 @@ impl BackgroundShellManager {
                     &stdout,
                     &stderr,
                 );
+                if let Err(error) = background_freshness.commit() {
+                    tracing::error!(
+                        shell_id = wait_shell_id,
+                        %error,
+                        "Failed to advance freshness after background shell completion"
+                    );
+                }
+                crate::ledger::invalidate_verification_receipts_for_binding(
+                    run_for_ledger.run_id,
+                    run_for_ledger.capability_generation,
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    shell_id = wait_shell_id,
+                    %error,
+                    "Background shell wait failed; retaining mutation reservation fail-closed"
+                );
+                std::mem::forget(background_freshness);
             }
         });
 
@@ -437,7 +444,9 @@ impl BackgroundShellManager {
             stdout_buffer,
             stderr_buffer,
             command: command.to_string(),
-            owner,
+            owner_run,
+            owner_session,
+            owner_label,
             finished,
             stdout_done,
             stderr_done,
@@ -455,8 +464,12 @@ impl BackgroundShellManager {
 
     /// Get output from a background shell (returns new output since last call)
     #[allow(clippy::significant_drop_tightening)] // shells lock must be held while accessing shell
-    pub(crate) fn get_output(&self, shell_id: &str) -> Result<(String, bool, Option<i32>), String> {
-        let caller = super::todo::current_session_key();
+    pub(crate) fn get_output(
+        &self,
+        run: &crate::tools::security::ToolRunContext,
+        shell_id: &str,
+    ) -> Result<(String, bool, Option<i32>), String> {
+        let caller = run.run_id().to_string();
         // Crosslink #678: the shells map holds an entry-per-shell HashMap with
         // no cross-field invariant — every recoverable state is fully
         // represented inside an individual BackgroundShell, and HashMap
@@ -469,7 +482,7 @@ impl BackgroundShellManager {
         let shell = shells
             .get(shell_id)
             .ok_or_else(|| format!("Shell '{shell_id}' not found"))?;
-        if shell.owner != caller {
+        if shell.owner_run != caller {
             tracing::warn!(
                 target: "openclaudia::bash",
                 event = "cross_session_shell_access_denied",
@@ -552,16 +565,20 @@ impl BackgroundShellManager {
     /// Sends SIGTERM first, waits for graceful exit, then escalates to SIGKILL
     /// if needed. Only removes the shell from tracking after the process has
     /// been terminated.
-    pub(crate) fn kill(&self, shell_id: &str) -> Result<String, String> {
+    pub(crate) fn kill(
+        &self,
+        run: &crate::tools::security::ToolRunContext,
+        shell_id: &str,
+    ) -> Result<String, String> {
         // Crosslink #678: see get_output for poison-recovery rationale. The
         // log carries shell_id so the audit trail names the specific call
         // that observed poisoning.
         let mut shells = recover_mutex_lock(&self.shells, "kill", "shells", Some(shell_id));
 
-        let caller = super::todo::current_session_key();
+        let caller = run.run_id().to_string();
         if shells
             .get(shell_id)
-            .is_some_and(|shell| shell.owner != caller)
+            .is_some_and(|shell| shell.owner_run != caller)
         {
             tracing::warn!(
                 target: "openclaudia::bash",
@@ -595,17 +612,21 @@ impl BackgroundShellManager {
         }
     }
 
-    /// Kill every background shell owned by a session or subagent id.
-    pub(crate) fn kill_for_agent(&self, agent_id: &str) -> String {
-        let mut shells = recover_mutex_lock(&self.shells, "kill_for_agent", "shells", None);
+    fn kill_matching(
+        &self,
+        operation: &'static str,
+        owner_label: &str,
+        predicate: impl Fn(&BackgroundShell) -> bool,
+    ) -> String {
+        let mut shells = recover_mutex_lock(&self.shells, operation, "shells", None);
         let shell_ids: Vec<String> = shells
             .iter()
-            .filter(|(_, shell)| shell.owner == agent_id)
+            .filter(|(_, shell)| predicate(shell))
             .map(|(id, _)| id.clone())
             .collect();
 
         if shell_ids.is_empty() {
-            return format!("No background shells found for agent '{agent_id}'.");
+            return format!("No background shells found for agent '{owner_label}'.");
         }
 
         let mut removed = Vec::with_capacity(shell_ids.len());
@@ -629,19 +650,51 @@ impl BackgroundShellManager {
         format!(
             "Terminated {} background shell(s) for agent '{}': {}",
             killed_ids.len(),
-            agent_id,
+            owner_label,
             killed_ids.join(", ")
         )
     }
 
+    /// Kill every shell owned by this exact run generation.
+    pub(crate) fn kill_for_run(&self, run: &crate::tools::security::ToolRunContext) -> String {
+        let owner_run = run.run_id().to_string();
+        self.kill_matching("kill_for_run", run.process_owner(), |shell| {
+            shell.owner_run == owner_run
+        })
+    }
+
+    /// Trusted subagent-lifecycle cleanup by stable owner label, constrained to
+    /// the owning session so an identical label in another concurrent session
+    /// cannot terminate its processes.
+    pub(crate) fn kill_for_process_owner(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        owner_label: &str,
+    ) -> String {
+        let owner_session = owner.session_id();
+        self.kill_matching("kill_for_process_owner", owner_label, |shell| {
+            shell.owner_session == owner_session && shell.owner_label == owner_label
+        })
+    }
+
+    /// Trusted session-lifecycle cleanup across run generations.
+    fn kill_for_session(&self, session_id: &str) -> String {
+        self.kill_matching("kill_for_session", session_id, |shell| {
+            shell.owner_session == session_id
+        })
+    }
+
     /// List all background shells
-    pub(crate) fn list(&self) -> Vec<(String, String, bool)> {
-        let caller = super::todo::current_session_key();
+    pub(crate) fn list(
+        &self,
+        run: &crate::tools::security::ToolRunContext,
+    ) -> Vec<(String, String, bool)> {
+        let caller = run.run_id().to_string();
         // Crosslink #678: see get_output for poison-recovery rationale.
         let shells = recover_mutex_lock(&self.shells, "list", "shells", None);
         shells
             .iter()
-            .filter(|(_, shell)| shell.owner == caller)
+            .filter(|(_, shell)| shell.owner_run == caller)
             .map(|(id, shell)| {
                 (
                     id.clone(),
@@ -657,7 +710,7 @@ impl BackgroundShellManager {
 /// cleanup. This bypasses the agent-facing identifier argument, but remains
 /// scoped to the exact immutable session id supplied by `SessionManager`.
 pub fn terminate_session_background_jobs(session_id: &str) {
-    let result = BACKGROUND_SHELLS.kill_for_agent(session_id);
+    let result = BACKGROUND_SHELLS.kill_for_session(session_id);
     tracing::info!(
         target: "openclaudia::bash",
         event = "session_background_jobs_terminated",
@@ -684,7 +737,7 @@ pub static BACKGROUND_SHELLS: std::sync::LazyLock<BackgroundShellManager> =
 
 /// Find Git Bash on Windows
 #[cfg(windows)]
-pub(crate) fn find_git_bash() -> Option<std::path::PathBuf> {
+pub(crate) fn find_git_bash(run: &crate::tools::ToolRunContext) -> Option<std::path::PathBuf> {
     // Common Git Bash locations on Windows
     let paths = [
         r"C:\Program Files\Git\bin\bash.exe",
@@ -700,7 +753,7 @@ pub(crate) fn find_git_bash() -> Option<std::path::PathBuf> {
     }
 
     // Try to find git on PATH and derive the sibling Git Bash path.
-    if let Ok(git_path) = which::which("git") {
+    if let Ok(git_path) = run.resolve_executable("git") {
         // git.exe is usually in cmd/ or bin/, bash is in bin/.
         let git_dir = git_path.parent().and_then(|p| p.parent());
         if let Some(git_root) = git_dir {
@@ -727,11 +780,11 @@ pub(crate) fn find_git_bash() -> Option<std::path::PathBuf> {
 /// A non-zero process exit still counts as a successful tool invocation —
 /// the renderer surfaces the stdout/stderr and the boolean exit-error flag
 /// has historically been encoded into the `(String, bool)` shape's bool.
-/// To preserve byte-identical output for downstream consumers (and the
-/// 80+ pinning tests), we return `Err(ToolError::External(...))` on
-/// non-zero exit so the collapsed tuple stays `(text, true)`. This is
-/// the load-bearing observable: do not "fix" it without updating the
-/// tests that pin the prior behaviour.
+/// To preserve byte-identical legacy output for downstream consumers (and the
+/// pinning tests), a non-zero exit returns
+/// `Err(ToolError::PartialExternal(...))`: its tuple projection remains
+/// `(text, true)`, while canonical dispatch retains the fact that the process
+/// ran and may already have changed state.
 ///
 /// # Errors
 ///
@@ -739,14 +792,22 @@ pub(crate) fn find_git_bash() -> Option<std::path::PathBuf> {
 ///   not a JSON string.
 /// - [`ToolError::InvalidInput`] when [`validate_command`] rejects the
 ///   command (length cap, denylist, structural rule).
+/// - [`ToolError::Unavailable`] when the run has no process capability.
 /// - [`ToolError::External`] when:
 ///   * the spawned process fails to start (no shell, permission denied,
-///     OS resource exhaustion), or
-///   * a non-zero exit status is returned (the message carries the
-///     captured stdout / stderr so the legacy renderer keeps working).
+///     OS resource exhaustion).
+/// - [`ToolError::PartialExternal`] when a started process times out,
+///   cannot be waited, or exits non-zero. The command may already have
+///   changed state, so canonical dispatch must commit its reservation.
 /// - [`ToolError::Other`] when the background shell manager refuses the
 ///   spawn (e.g. cap reached). Preserves the existing message verbatim.
-pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, ToolError> {
+#[allow(clippy::too_many_lines)] // Validation, dispatch, capture, and rendering form one tool result.
+pub fn try_execute_bash(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> Result<ToolOutput, ToolError> {
+    run.require(crate::tools::security::ToolResource::Process)
+        .map_err(|error| ToolError::Unavailable(error.to_string()))?;
     let command = match args.get("command") {
         None => {
             return Err(ToolError::InvalidInput(
@@ -766,32 +827,27 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
         return Err(ToolError::InvalidInput(msg));
     }
 
-    // Crosslink #594: enforce the optional path-allowlist gate. When no
-    // `PathConstraints` have been installed (the default), this is a no-op
-    // — preserving legacy behaviour for callers that have not opted in.
-    // When the proxy startup has populated the constraint set from
-    // `additionalWorkingDirectories`, commands touching paths outside the
-    // allowed roots are refused with a user-facing explanation.
-    if let Err(msg) = check_command_against_global(command) {
-        return Err(ToolError::PermissionDenied(msg));
+    // S-020/F-050: this deliberately shallow lexical scan is telemetry only.
+    // It cannot grant or deny access; immutable capabilities and the OS
+    // sandbox enforce the actual filesystem boundary.
+    let outside_root_tokens = path_lint::outside_run_root_count(run, command);
+    if outside_root_tokens > 0 {
+        tracing::warn!(
+            target: "openclaudia::bash",
+            event = "non_authoritative_path_lint",
+            run_id = %run.run_id(),
+            outside_root_tokens,
+            "Bash text contains literal paths outside declared roots; the lexical lint is non-authoritative and sandbox containment remains decisive"
+        );
     }
 
-    // Diagnostic: log whether the command would qualify for auto-allow under
-    // the CC-parity safety check (`bashCommandIsSafe_DEPRECATED`). This does
-    // NOT gate execution — the permissions layer owns the actual prompt
-    // decision — but exposes a structured signal for the permissions wire-up
-    // (crosslink #589) and for ops-side audit of which commands the model is
-    // running unprompted.
-    if is_safe_for_auto_allow(command) {
+    if let Some(reason) = dangerous_shell_construct(command) {
         tracing::debug!(
-            command = %command,
-            "#589: bash command eligible for safety auto-allow (read-only + no dangerous constructs)"
-        );
-    } else if let Some(reason) = dangerous_shell_construct(command) {
-        tracing::debug!(
-            command = %command,
+            target: "openclaudia::bash",
+            event = "bash_structural_lint",
+            run_id = %run.run_id(),
             reason = reason,
-            "#589: bash command contains dangerous shell construct — auto-allow refused"
+            "Bash text contains a defence-in-depth structural finding; typed policy remains authoritative"
         );
     }
 
@@ -802,7 +858,9 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
 
     if run_in_background {
         // Spawn background shell and return shell_id.
-        let shell_id = BACKGROUND_SHELLS.spawn(command).map_err(ToolError::Other)?;
+        let shell_id = BACKGROUND_SHELLS
+            .spawn(run, command)
+            .map_err(ToolError::Other)?;
         return Ok(ToolOutput::text(format!(
             "Background shell started with ID: {shell_id}\nUse bash_output with this shell_id to retrieve output."
         )));
@@ -811,32 +869,51 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
     // Run synchronously (original behavior).
     // On Windows, use Git Bash explicitly (not WSL bash).
     // On Unix, use system bash.
-    let security = crate::tools::security::current_context().map_err(ToolError::External)?;
-    let cwd = security.working_directory().to_path_buf();
+    let cwd = run.working_directory().to_path_buf();
 
     #[cfg(windows)]
     let output = {
-        let bash =
-            find_git_bash().unwrap_or(bash_bin().map_err(ToolError::External)?.to_path_buf());
-        let cmd =
-            sandbox::sandboxed_bash_command(&bash, command, &cwd).map_err(ToolError::External)?;
-        super::command::run_prepared_sandboxed_with_timeout(cmd, "bash", FOREGROUND_COMMAND_TIMEOUT)
+        let bash = find_git_bash(run).unwrap_or(bash_bin(run).map_err(ToolError::External)?);
+        let cmd = sandbox::sandboxed_bash_command(run, &bash, command, &cwd)
+            .map_err(ToolError::External)?;
+        super::command::run_prepared_sandboxed_with_timeout(
+            run,
+            cmd,
+            "bash",
+            FOREGROUND_COMMAND_TIMEOUT,
+        )
     };
 
     #[cfg(not(windows))]
     let output = {
-        let cmd = sandbox::sandboxed_bash_command(
-            bash_bin().map_err(ToolError::External)?,
-            command,
-            &cwd,
+        let bash = bash_bin(run).map_err(ToolError::External)?;
+        let cmd = sandbox::sandboxed_bash_command(run, &bash, command, &cwd)
+            .map_err(ToolError::External)?;
+        super::command::run_prepared_sandboxed_with_timeout(
+            run,
+            cmd,
+            "bash",
+            FOREGROUND_COMMAND_TIMEOUT,
         )
-        .map_err(ToolError::External)?;
-        super::command::run_prepared_sandboxed_with_timeout(cmd, "bash", FOREGROUND_COMMAND_TIMEOUT)
     };
 
-    let output =
-        output.map_err(|e| ToolError::External(format!("Failed to execute command: {e}")))?;
-    record_active_command_observation(&cwd, command, &output);
+    let output = match output {
+        Ok(output) => output,
+        Err(super::command::CommandError::SpawnFailed { program, source }) => {
+            return Err(ToolError::External(format!(
+                "Failed to execute command: Failed to spawn {program}: {source}"
+            )));
+        }
+        Err(
+            error @ (super::command::CommandError::TimedOut { .. }
+            | super::command::CommandError::WaitFailed { .. }),
+        ) => {
+            return Err(ToolError::PartialExternal(format!(
+                "Failed to execute command after it started: {error}"
+            )));
+        }
+    };
+    record_active_command_observation(run, &cwd, command, &output);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -868,22 +945,35 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
     if output.status.success() {
         Ok(ToolOutput::text(result))
     } else {
-        // Non-zero exit collapses to `(message, true)` via `ToolError::External`
-        // so the legacy tuple shape stays byte-identical to the pre-migration
-        // executor. The message *is* the captured stdout+stderr.
-        Err(ToolError::External(result))
+        // The tuple projection stays `(message, true)`, but canonical dispatch
+        // must retain that the process ran and may have mutated state.
+        Err(ToolError::PartialExternal(result))
     }
 }
 
-fn record_active_command_observation(cwd: &Path, command: &str, output: &std::process::Output) {
-    let session_key = super::todo::current_session_key();
+fn record_active_command_observation(
+    run: &super::security::ToolRunContext,
+    cwd: &Path,
+    command: &str,
+    output: &std::process::Output,
+) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = output.status.code().unwrap_or(-1);
-    record_command_observation_for_session(&session_key, cwd, command, exit_code, &stdout, &stderr);
+    let binding = crate::ledger::RunBinding::from_run(run);
+    record_command_observation_for_session(
+        &binding,
+        run.session_id(),
+        cwd,
+        command,
+        exit_code,
+        &stdout,
+        &stderr,
+    );
 }
 
 pub fn record_command_observation_for_session(
+    run: &crate::ledger::RunBinding,
     session_key: &str,
     cwd: &Path,
     command: &str,
@@ -896,7 +986,7 @@ pub fn record_command_observation_for_session(
             tracing::error!("active reality ledger lock poisoned; recovering inner state");
             err.into_inner()
         });
-        append_command_observation(&mut ledger, cwd, command, exit_code, stdout, stderr);
+        append_command_observation(run, &mut ledger, cwd, command, exit_code, stdout, stderr);
         return;
     }
 
@@ -912,10 +1002,11 @@ pub fn record_command_observation_for_session(
             return;
         }
     };
-    append_command_observation(&mut ledger, cwd, command, exit_code, stdout, stderr);
+    append_command_observation(run, &mut ledger, cwd, command, exit_code, stdout, stderr);
 }
 
 fn append_command_observation(
+    run: &crate::ledger::RunBinding,
     ledger: &mut crate::ledger::RealityLedger,
     cwd: &Path,
     command: &str,
@@ -923,7 +1014,8 @@ fn append_command_observation(
     stdout: &str,
     stderr: &str,
 ) {
-    if let Err(err) = ledger.observe_command_run(
+    if let Err(err) = ledger.observe_command_run_for_binding(
+        run.clone(),
         cwd.to_string_lossy().to_string(),
         vec!["bash".to_string(), "-c".to_string(), command.to_string()],
         exit_code,
@@ -936,63 +1028,6 @@ fn append_command_observation(
             "failed to append bash command observation to reality ledger"
         );
     }
-    let Some(findings) = verification_findings_for_command(command, exit_code, stdout, stderr)
-    else {
-        return;
-    };
-    if let Err(err) = ledger.append(
-        crate::ledger::Authority::Verifier,
-        crate::ledger::ObservationKind::Verification {
-            passed: exit_code == 0,
-            command: Some(command.to_string()),
-            findings,
-        },
-    ) {
-        tracing::warn!(
-            command = %command,
-            error = %err,
-            "failed to append bash verification observation to reality ledger"
-        );
-    }
-}
-
-fn verification_findings_for_command(
-    command: &str,
-    exit_code: i32,
-    stdout: &str,
-    stderr: &str,
-) -> Option<Vec<String>> {
-    if !is_likely_verification_command(command) {
-        return None;
-    }
-
-    let mut findings = vec![format!("verification command exited with code {exit_code}")];
-    if exit_code != 0 {
-        if !stdout.trim().is_empty() {
-            findings.push(format!(
-                "stdout: {}",
-                safe_truncate(stdout, LEDGER_COMMAND_OUTPUT_MAX_BYTES)
-            ));
-        }
-        if !stderr.trim().is_empty() {
-            findings.push(format!(
-                "stderr: {}",
-                safe_truncate(stderr, LEDGER_COMMAND_OUTPUT_MAX_BYTES)
-            ));
-        }
-    }
-    Some(findings)
-}
-
-fn is_likely_verification_command(command: &str) -> bool {
-    let normalized = command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    VERIFICATION_COMMAND_NEEDLES
-        .iter()
-        .any(|needle| normalized.contains(needle))
 }
 
 /// Execute a bash command, returning the legacy `(content, is_error)` tuple.
@@ -1003,13 +1038,18 @@ fn is_likely_verification_command(command: &str) -> bool {
 /// should call [`try_execute_bash`] directly and use the structured error.
 ///
 /// Applies the policy layer: length cap + denylist in [`validate_command`],
-/// and env scrubbing via [`apply_env_scrub`] (allowlist — only `PATH`, `HOME`,
-/// `USER`, `CARGO_HOME`, `RUSTUP_HOME`, LC_*, etc. are inherited; arbitrary
-/// credential-bearing names such as `DATABASE_URL` are dropped along with
-/// `ANTHROPIC_API_KEY`, `AWS_*`, `_TOKEN`/`_SECRET`/`_PASSWORD`).
+/// and env scrubbing via [`apply_env_scrub`] (the ambient environment is
+/// cleared, then only exact values carried by the run capability are added).
 /// See crosslink #257 and #730.
-pub fn execute_bash(args: &HashMap<String, Value>) -> (String, bool) {
-    into_legacy(try_execute_bash(args))
+#[cfg(test)]
+pub fn execute_bash(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
+    match try_execute_bash(run, args) {
+        Ok(output) => output.into(),
+        Err(error) => error.into(),
+    }
 }
 
 /// Process-wide test lock for `BACKGROUND_SHELLS`-touching tests.
@@ -1045,6 +1085,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     // ── Phase 2 pinning tests (crosslink #541) ────────────────────────────────
     // Pins OC's CURRENT BackgroundShellManager and execute_bash contracts
     // per spec crosslink #526 §B1, §B2, §B3.
@@ -1062,9 +1106,11 @@ mod tests {
     }
 
     #[test]
-    fn verification_commands_append_verifier_observation() {
+    fn verification_shaped_shell_text_only_appends_command_observation() {
         let mut ledger = crate::ledger::RealityLedger::new();
+        let binding = crate::ledger::RunBinding::from_run(test_run());
         append_command_observation(
+            &binding,
             &mut ledger,
             Path::new("/tmp/project"),
             "cargo check --all-targets",
@@ -1074,37 +1120,25 @@ mod tests {
         );
 
         let index = ledger.observation_index(8);
-        assert_eq!(index.len(), 2);
-        let verification = index
-            .iter()
-            .filter_map(|entry| ledger.get(entry.id))
-            .find(|obs| {
-                matches!(
-                    obs.kind,
-                    crate::ledger::ObservationKind::Verification { .. }
-                )
-            })
-            .expect("verification observation");
-        assert_eq!(verification.authority, crate::ledger::Authority::Verifier);
-        let crate::ledger::ObservationKind::Verification {
-            passed,
-            command,
-            findings,
-        } = &verification.kind
-        else {
-            panic!("expected verification observation");
-        };
-        assert!(*passed);
-        assert_eq!(command.as_deref(), Some("cargo check --all-targets"));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("exited with code 0")));
+        assert_eq!(index.len(), 1);
+        let command = ledger.get(index[0].id).expect("command observation");
+        assert!(matches!(
+            command.kind,
+            crate::ledger::ObservationKind::CommandRun { .. }
+        ));
+        assert_eq!(
+            command.provenance.trust,
+            crate::ledger::EvidenceTrust::RuntimeObserved
+        );
+        assert!(command.provenance.is_bound_to(test_run()));
     }
 
     #[test]
     fn non_verification_commands_only_append_command_observation() {
         let mut ledger = crate::ledger::RealityLedger::new();
+        let binding = crate::ledger::RunBinding::from_run(test_run());
         append_command_observation(
+            &binding,
             &mut ledger,
             Path::new("/tmp/project"),
             "printf hello",
@@ -1135,14 +1169,14 @@ mod tests {
             "find_git_bash must not shell out to the Windows where command"
         );
         assert!(
-            production.contains("which::which(\"git\")"),
-            "find_git_bash must locate git through the Rust resolver"
+            production.contains("run.resolve_executable(\"git\")"),
+            "find_git_bash must locate git through the run-bound resolver"
         );
     }
 
     #[test]
     fn bash_execution_uses_resolved_binary_path() {
-        let bash = bash_bin().expect("bash tests require bash on PATH");
+        let bash = bash_bin(test_run()).expect("bash tests require bash on the run-bound PATH");
         assert!(
             bash.is_absolute(),
             "bash_bin must resolve bash to an absolute path, got {}",
@@ -1160,8 +1194,8 @@ mod tests {
             "production bash tool code must not invoke bare bash"
         );
         assert!(
-            production.contains("which::which(\"bash\")"),
-            "bash tool must locate bash through the Rust resolver"
+            production.contains("run.resolve_executable(\"bash\")"),
+            "bash tool must locate bash through the run-bound resolver"
         );
     }
 
@@ -1173,14 +1207,14 @@ mod tests {
     fn b1_spawn_returns_8_char_shell_id() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("echo b1_mod_a")
+            .spawn(test_run(), "echo b1_mod_a")
             .expect("b1_spawn_8char: spawn must succeed");
         assert_eq!(
             id.len(),
             8,
             "b1_spawn_8char: shell_id must be 8 chars; got '{id}'"
         );
-        let _ = BACKGROUND_SHELLS.kill(&id);
+        let _ = BACKGROUND_SHELLS.kill(test_run(), &id);
     }
 
     /// B1-mod-b: `execute_bash` with `run_in_background=true` returns `is_error=false`
@@ -1190,7 +1224,7 @@ mod tests {
     #[test]
     fn b1_execute_bash_background_response_format() {
         let _l = bg_lock();
-        let (msg, is_error) = execute_bash(&bg_bash_args("echo b1_mod_b"));
+        let (msg, is_error) = execute_bash(test_run(), &bg_bash_args("echo b1_mod_b"));
         assert!(!is_error, "b1_bg_format: must not be is_error; got: {msg}");
         assert!(
             msg.contains("ID:"),
@@ -1202,17 +1236,63 @@ mod tests {
         );
     }
 
-    /// B1-mod-c: spawned shell appears in `BACKGROUND_SHELLS.list()`.
+    /// B1-mod-c: spawned shell appears in the owning run's list.
     #[test]
     fn b1_spawned_shell_appears_in_list() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("sleep 2")
+            .spawn(test_run(), "sleep 2")
             .expect("b1_list: spawn must succeed");
-        let shells = BACKGROUND_SHELLS.list();
+        let shells = BACKGROUND_SHELLS.list(test_run());
         let found = shells.iter().any(|(listed_id, _, _)| listed_id == &id);
         assert!(found, "b1_list: spawned shell must appear in list; id={id}");
-        let _ = BACKGROUND_SHELLS.kill(&id);
+        let _ = BACKGROUND_SHELLS.kill(test_run(), &id);
+    }
+
+    #[test]
+    fn lifecycle_cleanup_for_same_label_is_scoped_to_owner_session() {
+        let _lock = bg_lock();
+        let root_a = tempfile::tempdir().expect("session A root");
+        let root_b = tempfile::tempdir().expect("session B root");
+        let make_run = |root: &Path| {
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .process_owner("shared-agent-label")
+                .provider("session-cleanup-test")
+                .build()
+                .expect("isolated run")
+        };
+        let run_a = make_run(root_a.path());
+        let run_b = make_run(root_b.path());
+        let shell_a = BACKGROUND_SHELLS
+            .spawn(&run_a, "sleep 30")
+            .expect("spawn session A shell");
+        let shell_b = BACKGROUND_SHELLS
+            .spawn(&run_b, "sleep 30")
+            .unwrap_or_else(|error| {
+                let _ = BACKGROUND_SHELLS.kill(&run_a, &shell_a);
+                panic!("spawn session B shell: {error}");
+            });
+
+        let cleanup = BACKGROUND_SHELLS.kill_for_process_owner(&run_a, "shared-agent-label");
+        let a_is_gone = BACKGROUND_SHELLS.get_output(&run_a, &shell_a).is_err();
+        let b_is_present = BACKGROUND_SHELLS.get_output(&run_b, &shell_b).is_ok();
+        let cleanup_b = BACKGROUND_SHELLS.kill(&run_b, &shell_b);
+
+        assert!(cleanup_b.is_ok(), "session B cleanup failed: {cleanup_b:?}");
+        assert!(cleanup.contains(&shell_a), "{cleanup}");
+        assert!(!cleanup.contains(&shell_b), "{cleanup}");
+        assert!(a_is_gone);
+        assert!(
+            b_is_present,
+            "session A cleanup must not terminate session B's same-label shell"
+        );
     }
 
     /// B1-mod-d: shell limit — when the shell map is at capacity, spawn returns
@@ -1255,7 +1335,7 @@ mod tests {
     #[test]
     fn b2_kill_unknown_id_returns_err() {
         let _l = bg_lock();
-        let result = BACKGROUND_SHELLS.kill("deadbeef");
+        let result = BACKGROUND_SHELLS.kill(test_run(), "deadbeef");
         assert!(result.is_err(), "b2_kill_unknown: must return Err");
         let msg = result.unwrap_err();
         assert!(
@@ -1276,7 +1356,7 @@ mod tests {
     fn b2_kill_running_shell_removes_entry() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("sleep 30")
+            .spawn(test_run(), "sleep 30")
             .expect("b2_kill_running: spawn must succeed");
 
         // Confirm it's tracked
@@ -1290,7 +1370,7 @@ mod tests {
             assert!(contains, "b2_kill_running: must be in map before kill");
         }
 
-        let result = BACKGROUND_SHELLS.kill(&id);
+        let result = BACKGROUND_SHELLS.kill(test_run(), &id);
         assert!(
             result.is_ok(),
             "b2_kill_running: kill must succeed; err={:?}",
@@ -1320,10 +1400,10 @@ mod tests {
     fn b2_kill_success_message_format() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("sleep 30")
+            .spawn(test_run(), "sleep 30")
             .expect("b2_kill_msg: spawn must succeed");
         let msg = BACKGROUND_SHELLS
-            .kill(&id)
+            .kill(test_run(), &id)
             .expect("b2_kill_msg: kill must succeed");
         assert!(
             msg.contains("terminated"),
@@ -1352,14 +1432,14 @@ mod tests {
     fn b2_kill_finished_shell_skips_sigterm_returns_ok() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("echo b2_mod_d_done")
+            .spawn(test_run(), "echo b2_mod_d_done")
             .expect("b2_kill_finished: spawn must succeed");
 
         // Wait for the command to finish
         std::thread::sleep(std::time::Duration::from_millis(400));
 
         // Shell should be finished; kill must still succeed
-        let result = BACKGROUND_SHELLS.kill(&id);
+        let result = BACKGROUND_SHELLS.kill(test_run(), &id);
         assert!(
             result.is_ok(),
             "b2_kill_finished: killing a finished shell must return Ok; got: {:?}",
@@ -1376,7 +1456,7 @@ mod tests {
     #[test]
     fn b3_get_output_unknown_id_returns_err_no_panic() {
         let _l = bg_lock();
-        let result = BACKGROUND_SHELLS.get_output("ffffffff");
+        let result = BACKGROUND_SHELLS.get_output(test_run(), "ffffffff");
         assert!(result.is_err(), "b3_get_output_unknown: must return Err");
         let msg = result.unwrap_err();
         assert!(
@@ -1393,12 +1473,12 @@ mod tests {
     fn b3_get_output_running_shell_is_running_true() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("sleep 5")
+            .spawn(test_run(), "sleep 5")
             .expect("b3_get_output_running: spawn must succeed");
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let result = BACKGROUND_SHELLS.get_output(&id);
+        let result = BACKGROUND_SHELLS.get_output(test_run(), &id);
         assert!(result.is_ok(), "b3_get_output_running: must return Ok");
         let (_output, is_running, _exit_code) = result.unwrap();
         assert!(
@@ -1406,7 +1486,7 @@ mod tests {
             "b3_get_output_running: is_running must be true for a live shell"
         );
         // Clean up
-        let _ = BACKGROUND_SHELLS.kill(&id);
+        let _ = BACKGROUND_SHELLS.kill(test_run(), &id);
     }
 
     /// B3-mod-c: `get_output` for a finished shell returns `is_running=false` and
@@ -1418,12 +1498,12 @@ mod tests {
     fn b3_get_output_finished_shell_is_running_false() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("exit 0")
+            .spawn(test_run(), "exit 0")
             .expect("b3_get_output_finished: spawn must succeed");
 
         std::thread::sleep(std::time::Duration::from_millis(400));
 
-        let result = BACKGROUND_SHELLS.get_output(&id);
+        let result = BACKGROUND_SHELLS.get_output(test_run(), &id);
         assert!(result.is_ok(), "b3_get_output_finished: must return Ok");
         let (_output, is_running, exit_code) = result.unwrap();
         assert!(
@@ -1446,7 +1526,7 @@ mod tests {
     #[test]
     fn b5_execute_bash_missing_command_arg() {
         let args: HashMap<String, Value> = HashMap::new();
-        let (msg, is_error) = execute_bash(&args);
+        let (msg, is_error) = execute_bash(test_run(), &args);
         assert!(is_error, "b5_missing_cmd: must be is_error=true");
         assert!(
             msg.contains("Missing"),
@@ -1458,7 +1538,7 @@ mod tests {
     fn b5_execute_bash_rejects_non_string_command_arg() {
         let mut args = HashMap::new();
         args.insert("command".to_string(), Value::Number(42.into()));
-        let (msg, is_error) = execute_bash(&args);
+        let (msg, is_error) = execute_bash(test_run(), &args);
         assert!(is_error, "non-string command must be rejected: {msg}");
         assert!(
             msg.contains("Invalid 'command' argument: expected string"),
@@ -1472,7 +1552,7 @@ mod tests {
     /// OC source: mod.rs:324-326 — `validate_command` called before spawn.
     #[test]
     fn b5_execute_bash_denylist_command_is_error() {
-        let (msg, is_error) = execute_bash(&bash_args("rm -rf /"));
+        let (msg, is_error) = execute_bash(test_run(), &bash_args("rm -rf /"));
         assert!(is_error, "b5_denylist: must be is_error=true; got: {msg}");
         assert!(
             msg.contains("rejected"),
@@ -1488,7 +1568,7 @@ mod tests {
             Value::String("true".to_string()),
         );
 
-        let (msg, is_error) = execute_bash(&args);
+        let (msg, is_error) = execute_bash(test_run(), &args);
 
         assert!(
             is_error,
@@ -1505,7 +1585,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b5_execute_bash_valid_command_succeeds() {
-        let (msg, is_error) = execute_bash(&bash_args("echo hello_b5_mod_c"));
+        let (msg, is_error) = execute_bash(test_run(), &bash_args("echo hello_b5_mod_c"));
         assert!(!is_error, "b5_valid: must not be is_error; got: {msg}");
         assert!(
             msg.contains("hello_b5_mod_c"),
@@ -1519,7 +1599,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b5_execute_bash_nonzero_exit_is_error() {
-        let (_, is_error) = execute_bash(&bash_args("exit 1"));
+        let (_, is_error) = execute_bash(test_run(), &bash_args("exit 1"));
         assert!(
             is_error,
             "b5_nonzero_exit: non-zero exit must set is_error=true"
@@ -1559,7 +1639,7 @@ mod tests {
     fn fix351_drain_before_finish_marks_retrieved() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("sleep 5")
+            .spawn(test_run(), "sleep 5")
             .expect("fix351-a: spawn must succeed");
 
         // Allow reader threads to start, but the process is still alive.
@@ -1571,7 +1651,7 @@ mod tests {
         );
 
         let (_, is_running, _) = BACKGROUND_SHELLS
-            .get_output(&id)
+            .get_output(test_run(), &id)
             .expect("fix351-a: get_output must succeed");
         assert!(
             is_running,
@@ -1586,7 +1666,7 @@ mod tests {
         );
 
         // Clean up the long-running child.
-        let _ = BACKGROUND_SHELLS.kill(&id);
+        let _ = BACKGROUND_SHELLS.kill(test_run(), &id);
     }
 
     /// `#351-b`: drain-after-finish marks the GC flag.
@@ -1599,7 +1679,7 @@ mod tests {
     fn fix351_drain_after_finish_marks_retrieved() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("echo fix351_b_done")
+            .spawn(test_run(), "echo fix351_b_done")
             .expect("fix351-b: spawn must succeed");
 
         // Let the short-lived process finish and the wait-thread flip
@@ -1607,7 +1687,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(400));
 
         let (_, is_running, _) = BACKGROUND_SHELLS
-            .get_output(&id)
+            .get_output(test_run(), &id)
             .expect("fix351-b: get_output must succeed");
         assert!(
             !is_running,
@@ -1631,7 +1711,7 @@ mod tests {
     fn fix351_never_drained_stays_unretrieved() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
-            .spawn("echo fix351_c_done")
+            .spawn(test_run(), "echo fix351_c_done")
             .expect("fix351-c: spawn must succeed");
 
         // Wait long enough for the wait-thread to set finished=true.
@@ -1639,7 +1719,7 @@ mod tests {
 
         // No `get_output` call on this id — only a list() check to ensure
         // finished is observable without going through the drain path.
-        let listed = BACKGROUND_SHELLS.list();
+        let listed = BACKGROUND_SHELLS.list(test_run());
         let entry = listed
             .iter()
             .find(|(listed_id, _, _)| listed_id == &id)
@@ -1658,7 +1738,7 @@ mod tests {
 
         // Clean up: a single drain marks the flag and makes the slot
         // eligible for the next GC sweep.
-        let _ = BACKGROUND_SHELLS.get_output(&id);
+        let _ = BACKGROUND_SHELLS.get_output(test_run(), &id);
     }
 
     // ── Crosslink #672 — TOCTOU spawn race ────────────────────────────────────
@@ -1715,7 +1795,7 @@ mod tests {
                 bar_c.wait();
                 // Short-lived but non-instant so successful spawns stay in
                 // the map long enough for racers to observe contention.
-                mgr_c.spawn("sleep 2")
+                mgr_c.spawn(test_run(), "sleep 2")
             }));
         }
 
@@ -1729,7 +1809,7 @@ mod tests {
         // Tear down before assertions: kill every successful spawn so we
         // don't leak `sleep` processes on test failure.
         for id in results.iter().flatten() {
-            let _ = mgr.kill(id);
+            let _ = mgr.kill(test_run(), id);
         }
 
         assert!(
@@ -1770,7 +1850,7 @@ mod tests {
             let bar_c = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 bar_c.wait();
-                mgr_c.spawn("sleep 2")
+                mgr_c.spawn(test_run(), "sleep 2")
             }));
         }
         // Let all spawners go and immediately start observing the map.
@@ -1794,7 +1874,7 @@ mod tests {
 
         // Teardown
         for id in results.iter().flatten() {
-            let _ = mgr.kill(id);
+            let _ = mgr.kill(test_run(), id);
         }
 
         assert!(
@@ -1841,7 +1921,7 @@ mod tests {
             } else {
                 format!("echo fix674_{i}")
             };
-            if let Ok(id) = mgr.spawn(&cmd) {
+            if let Ok(id) = mgr.spawn(test_run(), &cmd) {
                 ids.push(id);
             }
         }
@@ -1861,7 +1941,7 @@ mod tests {
             let mut violations: Vec<String> = Vec::new();
             for _ in 0..200 {
                 for id in &ids_poll {
-                    if let Ok((_, is_running, exit_code)) = mgr_poll.get_output(id) {
+                    if let Ok((_, is_running, exit_code)) = mgr_poll.get_output(test_run(), id) {
                         if !is_running && exit_code.is_none() {
                             violations.push(id.clone());
                         }
@@ -1875,7 +1955,7 @@ mod tests {
 
         // Teardown — best-effort
         for id in &ids {
-            let _ = mgr.kill(id);
+            let _ = mgr.kill(test_run(), id);
         }
 
         assert!(
@@ -1900,7 +1980,7 @@ mod tests {
         let mut ids: Vec<(String, i32)> = Vec::with_capacity(N);
         for i in 0..N {
             let exit_code: i32 = i32::try_from(i % 3).expect("0..3 fits in i32");
-            if let Ok(id) = mgr.spawn(&format!("exit {exit_code}")) {
+            if let Ok(id) = mgr.spawn(test_run(), &format!("exit {exit_code}")) {
                 ids.push((id, exit_code));
             }
         }
@@ -1916,7 +1996,7 @@ mod tests {
 
         for (id, expected) in &ids {
             let (_, is_running, exit_code) = mgr
-                .get_output(id)
+                .get_output(test_run(), id)
                 .expect("fix674-b: get_output must succeed");
             assert!(
                 !is_running,

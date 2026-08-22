@@ -38,6 +38,7 @@ pub enum SandboxMode {
 ///     sandbox: full_sandbox
 /// ```
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HookPolicy {
     /// Allowlist of executable base-names (not full paths) that hook
     /// commands may use as their first token.
@@ -55,6 +56,7 @@ pub struct HookPolicy {
 
 /// Hooks configuration
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HooksConfig {
     /// Security policy applied to all command hooks in this config.
     /// Absent → allow every executable name inside the full OS sandbox.
@@ -129,6 +131,7 @@ pub enum HookMatcherTarget {
 
 /// Individual hook entry
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct HookEntry {
     #[serde(default)]
     pub matcher: Option<String>,
@@ -137,7 +140,7 @@ pub struct HookEntry {
 
 /// Hook definition
 #[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum Hook {
     #[serde(rename = "command")]
     Command {

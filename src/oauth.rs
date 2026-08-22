@@ -19,6 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
+use serde::ser::{SerializeMap as _, SerializeStruct as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use tracing::{debug, error, info};
+use zeroize::Zeroizing;
 
 /// Clamp an OAuth `expires_in` value to a plausible window and convert
 /// it to an absolute `DateTime<Utc>`.
@@ -71,79 +73,6 @@ pub(crate) fn clamped_expires_at(expires_in: u64) -> DateTime<Utc> {
     Utc::now() + Duration::seconds(as_i64)
 }
 
-/// Sanitize an OAuth error-response body before surfacing it to the caller.
-///
-/// Anthropic's OAuth endpoint echoes submitted `refresh_token`, `code`,
-/// `client_secret`, and similar credential material inside error bodies.
-/// This helper extracts ONLY the short `error` / `error_description` fields
-/// (the safe OAuth spec fields) and discards everything else. Non-JSON
-/// bodies return the hard-coded string
-/// `"<redacted: body contains sensitive fields>"`.
-/// See crosslink #263.
-pub(crate) fn redact_oauth_error_body(body: &str) -> String {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return "<empty body>".to_string();
-    }
-
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        let error_code = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
-        let error_desc = v
-            .get("error_description")
-            .and_then(|e| e.as_str())
-            .unwrap_or("");
-
-        let desc = if description_looks_safe(error_desc) {
-            error_desc
-        } else {
-            "<redacted>"
-        };
-
-        return match (error_code.is_empty(), desc.is_empty()) {
-            (false, false) => format!("{error_code}: {desc}"),
-            (false, true) => error_code.to_string(),
-            (true, false) => desc.to_string(),
-            (true, true) => "<redacted: body contains sensitive fields>".to_string(),
-        };
-    }
-
-    "<redacted: body contains sensitive fields>".to_string()
-}
-
-/// True when an `error_description` is safe to surface (does not look like
-/// it carries a token, code, or long base64/hex run).
-fn description_looks_safe(desc: &str) -> bool {
-    const FORBIDDEN_NEEDLES: &[&str] = &[
-        "refresh_token",
-        "access_token",
-        "client_secret",
-        "id_token",
-        "bearer ",
-        "code=",
-        "state=",
-    ];
-    if desc.is_empty() {
-        return false;
-    }
-    let lower = desc.to_ascii_lowercase();
-    if FORBIDDEN_NEEDLES.iter().any(|n| lower.contains(n)) {
-        return false;
-    }
-    // Reject any contiguous base64/hex run ≥ 24 chars — likely a token value.
-    let mut run = 0;
-    for c in desc.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+' || c == '/' || c == '=' {
-            run += 1;
-            if run >= 24 {
-                return false;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    true
-}
-
 /// Anthropic's fixed OAuth client identifier
 pub const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
@@ -173,20 +102,26 @@ pub const OAUTH_SCOPES: &str =
 #[derive(Debug, Clone)]
 pub struct PkceParams {
     /// Random verifier string (kept secret, sent during token exchange)
-    pub verifier: String,
+    pub verifier: crate::secrets::SecretString,
     /// SHA256 hash of verifier (sent during authorization)
     pub challenge: String,
     /// Random state for CSRF protection
-    pub state: String,
+    pub state: crate::secrets::SecretString,
 }
 
 impl PkceParams {
     /// Generate new PKCE parameters with cryptographically secure randomness
+    ///
+    /// # Panics
+    /// Panics only if the fixed-size URL-safe random verifier violates the
+    /// internal secret invariant, which would indicate a programming defect.
     #[must_use]
     pub fn generate() -> Self {
-        let verifier = generate_random_string(64);
-        let challenge = compute_s256_challenge(&verifier);
-        let state = generate_random_string(64);
+        let verifier = crate::secrets::SecretString::try_from_string(generate_random_string(64))
+            .expect("generated PKCE verifier must satisfy secret validation");
+        let challenge = verifier.expose(compute_s256_challenge);
+        let state = crate::secrets::SecretString::try_from_string(generate_random_string(64))
+            .expect("generated OAuth state must satisfy secret validation");
 
         Self {
             verifier,
@@ -198,24 +133,26 @@ impl PkceParams {
     /// Build the full authorization URL with all required parameters
     #[must_use]
     pub fn build_auth_url(&self) -> String {
-        let params = [
-            ("code", "true"),
-            ("client_id", ANTHROPIC_CLIENT_ID),
-            ("response_type", "code"),
-            ("redirect_uri", ANTHROPIC_REDIRECT_URI),
-            ("scope", OAUTH_SCOPES),
-            ("code_challenge", &self.challenge),
-            ("code_challenge_method", "S256"),
-            ("state", &self.state),
-        ];
+        self.state.expose(|state| {
+            let params = [
+                ("code", "true"),
+                ("client_id", ANTHROPIC_CLIENT_ID),
+                ("response_type", "code"),
+                ("redirect_uri", ANTHROPIC_REDIRECT_URI),
+                ("scope", OAUTH_SCOPES),
+                ("code_challenge", &self.challenge),
+                ("code_challenge_method", "S256"),
+                ("state", state),
+            ];
 
-        let query = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
+            let query = params
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
 
-        format!("{OAUTH_AUTHORIZE_URL}?{query}")
+            format!("{OAUTH_AUTHORIZE_URL}?{query}")
+        })
     }
 }
 
@@ -240,9 +177,9 @@ fn compute_s256_challenge(verifier: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthCredentials {
     /// Bearer access token for API requests
-    pub access_token: String,
+    pub access_token: crate::secrets::OAuthToken,
     /// Refresh token for obtaining new access tokens
-    pub refresh_token: Option<String>,
+    pub refresh_token: Option<crate::secrets::OAuthToken>,
     /// When the access token expires
     pub expires_at: DateTime<Utc>,
 }
@@ -255,31 +192,40 @@ impl OAuthCredentials {
     }
 }
 
-/// Request body for token endpoint
-#[derive(Debug, Serialize)]
-pub struct TokenExchangeRequest {
-    pub grant_type: String,
-    pub client_id: String,
+/// Borrowed request body for the token endpoint. This exists only long enough
+/// for reqwest to form-encode it into the transport request.
+#[derive(Serialize)]
+struct TokenExchangeRequest<'a> {
+    grant_type: &'static str,
+    client_id: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
+    code: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub redirect_uri: Option<String>,
+    redirect_uri: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code_verifier: Option<String>,
+    code_verifier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
+    refresh_token: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
+    state: Option<&'a str>,
 }
 
 /// Response from token endpoint
 #[derive(Debug, Deserialize)]
 pub struct TokenExchangeResponse {
-    pub access_token: String,
+    pub access_token: crate::secrets::OAuthToken,
     pub token_type: String,
     pub expires_in: u64,
-    pub refresh_token: Option<String>,
+    pub refresh_token: Option<crate::secrets::OAuthToken>,
     pub scope: Option<String>,
+}
+
+fn validate_oauth_token_type(token_type: &str) -> Result<()> {
+    if token_type.eq_ignore_ascii_case("bearer") {
+        Ok(())
+    } else {
+        anyhow::bail!("Unexpected OAuth token type; expected 'Bearer'")
+    }
 }
 
 // ============================================================================
@@ -305,7 +251,7 @@ pub struct OAuthSession {
     /// OAuth credentials
     pub credentials: OAuthCredentials,
     /// Ephemeral API key created from OAuth token (used for actual API calls)
-    pub api_key: Option<String>,
+    pub api_key: Option<crate::providers::ApiKey>,
     /// Authentication mode for API calls
     pub auth_mode: AuthMode,
     /// Scopes that were actually granted by OAuth server
@@ -371,12 +317,117 @@ impl OAuthSession {
     }
 }
 
+/// Borrowed serializer used only by the owner-only OAuth session store.
+///
+/// Runtime `Serialize` implementations stay redacted. This wrapper is the
+/// single explicit persistence boundary where live credential bytes are
+/// written to a `0600` file, and it never creates another owned secret copy.
+struct PersistedOAuthSessionRef<'a>(&'a OAuthSession);
+
+impl Serialize for PersistedOAuthSessionRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let session = self.0;
+        let mut state = serializer.serialize_struct("OAuthSession", 7)?;
+        state.serialize_field("id", &session.id)?;
+        state.serialize_field(
+            "credentials",
+            &PersistedOAuthCredentialsRef(&session.credentials),
+        )?;
+        if let Some(api_key) = &session.api_key {
+            api_key.expose(|raw| state.serialize_field("api_key", raw))?;
+        } else {
+            state.serialize_field("api_key", &Option::<&str>::None)?;
+        }
+        state.serialize_field("auth_mode", &session.auth_mode)?;
+        state.serialize_field("granted_scopes", &session.granted_scopes)?;
+        state.serialize_field("created_at", &session.created_at)?;
+        state.serialize_field("user_id", &session.user_id)?;
+        state.end()
+    }
+}
+
+struct PersistedOAuthCredentialsRef<'a>(&'a OAuthCredentials);
+
+impl Serialize for PersistedOAuthCredentialsRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let credentials = self.0;
+        let mut state = serializer.serialize_struct("OAuthCredentials", 3)?;
+        credentials
+            .access_token
+            .expose(|raw| state.serialize_field("access_token", raw))?;
+        if let Some(refresh_token) = &credentials.refresh_token {
+            refresh_token.expose(|raw| state.serialize_field("refresh_token", raw))?;
+        } else {
+            state.serialize_field("refresh_token", &Option::<&str>::None)?;
+        }
+        state.serialize_field("expires_at", &credentials.expires_at)?;
+        state.end()
+    }
+}
+
+struct PersistedOAuthSessionMap<'a>(&'a HashMap<String, OAuthSession>);
+
+impl Serialize for PersistedOAuthSessionMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (id, session) in self.0 {
+            map.serialize_entry(id, &PersistedOAuthSessionRef(session))?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Deserialize)]
+struct PersistedOAuthCredentials {
+    access_token: crate::secrets::OAuthToken,
+    refresh_token: Option<crate::secrets::OAuthToken>,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct PersistedOAuthSession {
+    id: String,
+    credentials: PersistedOAuthCredentials,
+    api_key: Option<crate::providers::ApiKey>,
+    auth_mode: AuthMode,
+    granted_scopes: Vec<String>,
+    created_at: DateTime<Utc>,
+    user_id: Option<String>,
+}
+
+impl PersistedOAuthSession {
+    fn into_runtime(self) -> OAuthSession {
+        OAuthSession {
+            id: self.id,
+            credentials: OAuthCredentials {
+                access_token: self.credentials.access_token,
+                refresh_token: self.credentials.refresh_token,
+                expires_at: self.credentials.expires_at,
+            },
+            api_key: self.api_key,
+            auth_mode: self.auth_mode,
+            granted_scopes: self.granted_scopes,
+            created_at: self.created_at,
+            user_id: self.user_id,
+        }
+    }
+}
+
 /// Thread-safe storage for OAuth sessions and pending PKCE challenges
 pub struct OAuthStore {
     /// Active sessions keyed by session ID
     sessions: RwLock<HashMap<String, OAuthSession>>,
-    /// Pending PKCE challenges keyed by state parameter
-    pending_challenges: RwLock<HashMap<String, PkceParams>>,
+    /// Pending PKCE challenges retaining the state only in protected storage.
+    pending_challenges: RwLock<Vec<PkceParams>>,
     /// Path for persistent session storage
     persist_path: Option<PathBuf>,
 }
@@ -447,6 +498,7 @@ fn oauth_session_lock_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("json.lock")
 }
 
+#[cfg(unix)]
 fn oauth_session_tmp_path(path: &std::path::Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -460,13 +512,31 @@ fn oauth_session_tmp_path(path: &std::path::Path) -> PathBuf {
 }
 
 fn read_valid_sessions_from_disk(path: &std::path::Path) -> Option<HashMap<String, OAuthSession>> {
+    let file = open_oauth_session_file(path)?;
+    match std::io::read_to_string(file) {
+        Ok(data) => {
+            let data = Zeroizing::new(data);
+            decode_oauth_sessions(&data, path)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("No persisted OAuth sessions found");
+            None
+        }
+        Err(e) => {
+            error!("Failed to load OAuth sessions: {}", e);
+            None
+        }
+    }
+}
+
+fn open_oauth_session_file(path: &std::path::Path) -> Option<fs::File> {
     // Open the session file refusing to follow symlinks (crosslink #814).
     // With O_NOFOLLOW the open itself fails with ELOOP on a symlink, so there
     // is no post-open race window.
     //
     // On non-Unix targets there is no O_NOFOLLOW equivalent here; fall back to
     // the prior open-then-check pattern.
-    let file = {
+    Some({
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -526,38 +596,53 @@ fn read_valid_sessions_from_disk(path: &std::path::Path) -> Option<HashMap<Strin
             }
             f
         }
-    };
+    })
+}
 
-    match std::io::read_to_string(file) {
-        Ok(data) => match serde_json::from_str::<HashMap<String, OAuthSession>>(&data) {
-            Ok(loaded) => Some(
-                loaded
-                    .into_iter()
-                    .filter(|(id, session)| {
-                        if session.credentials.is_expired() {
-                            info!("Removing expired OAuth session: {}", id);
-                            false
-                        } else {
-                            true
-                        }
-                    })
-                    .collect(),
-            ),
-            Err(e) => {
-                error!(
-                    "Failed to parse OAuth sessions from {}: {}",
-                    path.display(),
-                    e
-                );
-                None
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            debug!("No persisted OAuth sessions found");
-            None
-        }
+fn decode_oauth_sessions(
+    data: &str,
+    path: &std::path::Path,
+) -> Option<HashMap<String, OAuthSession>> {
+    let persisted = match serde_json::from_str::<HashMap<String, PersistedOAuthSession>>(data) {
+        Ok(persisted) => persisted,
         Err(e) => {
-            error!("Failed to load OAuth sessions: {}", e);
+            error!(
+                "Failed to parse OAuth sessions from {}: {}",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
+    let loaded = persisted
+        .into_iter()
+        .map(|(storage_id, persisted)| {
+            let session = persisted.into_runtime();
+            if storage_id != session.id {
+                anyhow::bail!("OAuth session map key does not match embedded session id");
+            }
+            Ok((storage_id, session))
+        })
+        .collect::<Result<HashMap<_, _>>>();
+    match loaded {
+        Ok(loaded) => Some(
+            loaded
+                .into_iter()
+                .filter(|(id, session)| {
+                    if session.credentials.is_expired() {
+                        info!("Removing expired OAuth session: {}", id);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect(),
+        ),
+        Err(e) => {
+            error!(
+                "Failed to validate OAuth sessions from {}: {e:#}",
+                path.display()
+            );
             None
         }
     }
@@ -578,7 +663,7 @@ impl OAuthStore {
 
         let store = Self {
             sessions: RwLock::new(HashMap::new()),
-            pending_challenges: RwLock::new(HashMap::new()),
+            pending_challenges: RwLock::new(Vec::new()),
             persist_path: persist_path.clone(),
         };
 
@@ -597,19 +682,25 @@ impl OAuthStore {
     pub(crate) fn with_persist_path(path: PathBuf) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            pending_challenges: RwLock::new(HashMap::new()),
+            pending_challenges: RwLock::new(Vec::new()),
             persist_path: Some(path),
         }
     }
 
     /// Store PKCE challenge for pending authorization
     pub fn store_challenge(&self, pkce: PkceParams) {
-        let state = pkce.state.clone();
         let mut challenges = self
             .pending_challenges
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        challenges.insert(state, pkce);
+        if let Some(existing) = challenges
+            .iter_mut()
+            .find(|candidate| candidate.state == pkce.state)
+        {
+            *existing = pkce;
+        } else {
+            challenges.push(pkce);
+        }
     }
 
     /// Retrieve and remove PKCE challenge by state
@@ -618,7 +709,10 @@ impl OAuthStore {
             .pending_challenges
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        challenges.remove(state)
+        let index = challenges
+            .iter()
+            .position(|candidate| candidate.state.matches(state))?;
+        Some(challenges.swap_remove(index))
     }
 
     /// Store new OAuth session and report persistence failures to the caller.
@@ -700,6 +794,7 @@ impl OAuthStore {
         }
     }
 
+    #[cfg(unix)]
     fn replace_sessions_in_memory(&self, sessions: HashMap<String, OAuthSession>) {
         let mut guard = self
             .sessions
@@ -767,8 +862,8 @@ impl OAuthStore {
         let mut merged_sessions = read_valid_sessions_from_disk(path).unwrap_or_default();
         merged_sessions.extend(local_sessions);
 
-        let json = match serde_json::to_string_pretty(&merged_sessions) {
-            Ok(j) => j,
+        let json = match serde_json::to_string_pretty(&PersistedOAuthSessionMap(&merged_sessions)) {
+            Ok(j) => Zeroizing::new(j),
             Err(e) => {
                 error!("Failed to serialize OAuth sessions: {}", e);
                 return Err(e).context("failed to serialize OAuth sessions");
@@ -862,6 +957,7 @@ impl OAuthStore {
         #[cfg(not(unix))]
         {
             let _ = json; // suppress unused-variable warning on non-unix
+            let _ = merged_sessions;
             error!(
                 "Refusing to persist OAuth sessions on non-Unix target: no portable way to \
                  atomically create the file with owner-only permissions. OAuth sessions will \
@@ -873,8 +969,11 @@ impl OAuthStore {
             );
         }
 
-        self.replace_sessions_in_memory(merged_sessions);
-        Ok(())
+        #[cfg(unix)]
+        {
+            self.replace_sessions_in_memory(merged_sessions);
+            Ok(())
+        }
     }
 }
 
@@ -915,20 +1014,31 @@ impl OAuthClient {
     /// Returns an error if the token exchange HTTP request fails or the response cannot be parsed.
     pub async fn exchange_code(
         &self,
-        code: &str,
+        code: String,
         pkce: &PkceParams,
     ) -> Result<TokenExchangeResponse> {
-        let request = TokenExchangeRequest {
-            grant_type: "authorization_code".to_string(),
-            client_id: ANTHROPIC_CLIENT_ID.to_string(),
-            code: Some(code.to_string()),
-            redirect_uri: Some(ANTHROPIC_REDIRECT_URI.to_string()),
-            code_verifier: Some(pkce.verifier.clone()),
-            refresh_token: None,
-            state: Some(pkce.state.clone()),
-        };
+        let code = crate::secrets::SecretString::try_from_string(code)
+            .context("invalid OAuth authorization code")?;
+        let request = code.expose(|code_raw| {
+            pkce.verifier.expose(|verifier_raw| {
+                pkce.state.expose(|state_raw| {
+                    let form = TokenExchangeRequest {
+                        grant_type: "authorization_code",
+                        client_id: ANTHROPIC_CLIENT_ID,
+                        code: Some(code_raw),
+                        redirect_uri: Some(ANTHROPIC_REDIRECT_URI),
+                        code_verifier: Some(verifier_raw),
+                        refresh_token: None,
+                        state: Some(state_raw),
+                    };
+                    self.token_request(&form)
+                })
+            })
+        });
 
-        let initial_response = self.send_token_request(request).await?;
+        let initial_response = self
+            .send_token_request(request, &[code, pkce.verifier.clone(), pkce.state.clone()])
+            .await?;
 
         // CRITICAL: Immediate token refresh after initial exchange
         // The anthropic-proxy discovered that initial tokens may not be valid for API use
@@ -966,60 +1076,62 @@ impl OAuthClient {
     ///
     /// # Errors
     /// Returns an error if the refresh HTTP request fails or the response cannot be parsed.
-    pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenExchangeResponse> {
-        let request = TokenExchangeRequest {
-            grant_type: "refresh_token".to_string(),
-            client_id: ANTHROPIC_CLIENT_ID.to_string(),
-            code: None,
-            redirect_uri: None,
-            code_verifier: None,
-            refresh_token: Some(refresh_token.to_string()),
-            state: None,
-        };
-
-        self.send_token_request(request).await
+    pub async fn refresh_token(
+        &self,
+        refresh_token: &crate::secrets::OAuthToken,
+    ) -> Result<TokenExchangeResponse> {
+        let request = refresh_token.expose(|refresh_raw| {
+            let form = TokenExchangeRequest {
+                grant_type: "refresh_token",
+                client_id: ANTHROPIC_CLIENT_ID,
+                code: None,
+                redirect_uri: None,
+                code_verifier: None,
+                refresh_token: Some(refresh_raw),
+                state: None,
+            };
+            self.token_request(&form)
+        });
+        self.send_token_request(request, &[refresh_token.secret()])
+            .await
     }
 
-    /// Send token request to Anthropic
+    fn token_request(&self, request: &TokenExchangeRequest<'_>) -> reqwest::RequestBuilder {
+        self.http
+            .post(TOKEN_ENDPOINT)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(request)
+    }
+
+    /// Send a fully materialized token request to Anthropic.
     async fn send_token_request(
         &self,
-        request: TokenExchangeRequest,
+        request: reqwest::RequestBuilder,
+        known_secrets: &[crate::secrets::SecretString],
     ) -> Result<TokenExchangeResponse> {
         debug!("Sending token request to {}", TOKEN_ENDPOINT);
 
-        // CRITICAL: Anthropic's OAuth endpoint requires form-urlencoded, NOT JSON
-        // This is the key difference that makes anthropic-proxy work
-        let response = self
-            .http
-            .post(TOKEN_ENDPOINT)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&request)
+        let response = request
             .send()
             .await
             .context("Failed to send token request")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            // Read the error body to include in the diagnostic log. Propagate
-            // a read error rather than silently defaulting to an empty string,
-            // which would produce a useless "Token exchange failed (N): "
-            // message. The raw body is logged at debug! only (not forwarded to
-            // callers) because it may echo submitted credentials. See #263.
-            let body = response
-                .text()
+            let body = crate::secrets::read_bounded_diagnostic_body(response)
                 .await
                 .context("Failed to read token-exchange error body")?;
-            debug!("token_exchange_failed body (not shipped to caller): {body}");
-            anyhow::bail!(
-                "Token exchange failed ({status}): {}",
-                redact_oauth_error_body(&body)
-            );
+            let safe = crate::secrets::sanitize_diagnostic(&body, known_secrets);
+            debug!(status = %status, body = %safe, "token exchange failed");
+            anyhow::bail!("Token exchange failed ({status}): {safe}");
         }
 
-        let body = response
-            .text()
-            .await
-            .context("Failed to read token response")?;
+        let body = Zeroizing::new(
+            response
+                .text()
+                .await
+                .context("Failed to read token response")?,
+        );
 
         debug!("Token response received");
 
@@ -1027,16 +1139,13 @@ impl OAuthClient {
             serde_json::from_str(&body).context("Failed to parse token response")?;
 
         // Validate token type is Bearer
-        if token_response.token_type.to_lowercase() != "bearer" {
-            anyhow::bail!(
-                "Unexpected token type '{}', expected 'Bearer'",
-                token_response.token_type
-            );
-        }
+        validate_oauth_token_type(&token_response.token_type)?;
 
-        // Log granted scopes (important for debugging permission issues)
-        if let Some(ref scope) = token_response.scope {
-            info!("OAuth granted scopes: {}", scope);
+        // Scope values originate in the provider response. Keep them out of
+        // logs because a compromised endpoint can echo active credentials in
+        // otherwise non-secret fields.
+        if token_response.scope.is_some() {
+            info!("OAuth response included a scope field");
         } else {
             info!("OAuth response did not include scope field");
         }
@@ -1051,42 +1160,42 @@ impl OAuthClient {
     ///
     /// # Errors
     /// Returns an error if the API key creation request fails or the response cannot be parsed.
-    pub async fn create_api_key(&self, access_token: &str) -> Result<String> {
+    pub async fn create_api_key(
+        &self,
+        access_token: &crate::secrets::OAuthToken,
+    ) -> Result<crate::providers::ApiKey> {
         #[derive(Deserialize)]
         struct ApiKeyResponse {
-            raw_key: String,
+            raw_key: crate::providers::ApiKey,
         }
 
         debug!("Creating API key from OAuth token at {}", API_KEY_ENDPOINT);
 
         // Claude Code sends null body with just Authorization header
-        let response = self
-            .http
-            .post(API_KEY_ENDPOINT)
-            .header("Authorization", format!("Bearer {access_token}"))
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_bearer(reqwest::header::AUTHORIZATION, access_token.secret());
+        let response = headers
+            .apply(self.http.post(API_KEY_ENDPOINT))?
             .send()
             .await
             .context("Failed to send API key creation request")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            // Propagate read errors rather than silently producing an empty
-            // diagnostic. Raw body is debug!-only (not forwarded). See #263.
-            let body = response
-                .text()
+            let body = crate::secrets::read_bounded_diagnostic_body(response)
                 .await
                 .context("Failed to read API-key creation error body")?;
-            debug!("api_key_creation_failed body (not shipped to caller): {body}");
-            anyhow::bail!(
-                "API key creation failed ({status}): {}",
-                redact_oauth_error_body(&body)
-            );
+            let safe = headers.sanitize_diagnostic(&body);
+            debug!(status = %status, body = %safe, "API key creation failed");
+            anyhow::bail!("API key creation failed ({status}): {safe}");
         }
 
-        let body = response
-            .text()
-            .await
-            .context("Failed to read API key response")?;
+        let body = Zeroizing::new(
+            response
+                .text()
+                .await
+                .context("Failed to read API key response")?,
+        );
 
         let key_response: ApiKeyResponse =
             serde_json::from_str(&body).context("Failed to parse API key response")?;
@@ -1122,69 +1231,6 @@ pub fn parse_auth_code(input: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- Regression tests for crosslink #263: OAuth error body redaction ---
-
-    #[test]
-    fn redact_drops_refresh_token_in_description() {
-        let body = serde_json::json!({
-            "error": "invalid_grant",
-            "error_description": "refresh_token ey.AbCdEf1234567890XYZ is expired"
-        })
-        .to_string();
-        let sanitized = redact_oauth_error_body(&body);
-        assert!(!sanitized.contains("AbCdEf1234567890XYZ"));
-        assert!(!sanitized.contains("refresh_token"));
-        assert!(sanitized.contains("invalid_grant"));
-    }
-
-    #[test]
-    fn redact_drops_access_token_mention() {
-        let body = serde_json::json!({
-            "error": "invalid_token",
-            "error_description": "access_token sk-ant-oat01-abcdefghijklmnopqrstuvwx is revoked"
-        })
-        .to_string();
-        let sanitized = redact_oauth_error_body(&body);
-        assert!(!sanitized.contains("sk-ant-oat01"));
-        assert!(!sanitized.contains("abcdefghijklmnopqrstuvwx"));
-        assert!(sanitized.contains("invalid_token"));
-    }
-
-    #[test]
-    fn redact_drops_long_base64_run() {
-        let body = serde_json::json!({
-            "error": "server_error",
-            "error_description": "context: AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKK"
-        })
-        .to_string();
-        let sanitized = redact_oauth_error_body(&body);
-        assert!(!sanitized.contains("AAAABBBBCCCCDDDD"));
-    }
-
-    #[test]
-    fn redact_preserves_safe_description() {
-        let body = serde_json::json!({
-            "error": "invalid_scope",
-            "error_description": "scope org:manage is unknown"
-        })
-        .to_string();
-        let sanitized = redact_oauth_error_body(&body);
-        assert_eq!(sanitized, "invalid_scope: scope org:manage is unknown");
-    }
-
-    #[test]
-    fn redact_non_json_body_is_hard_coded() {
-        let s = redact_oauth_error_body("Internal Server Error: stacktrace refresh_token=abcd...");
-        assert!(!s.contains("abcd"));
-        assert_eq!(s, "<redacted: body contains sensitive fields>");
-    }
-
-    #[test]
-    fn redact_empty_body_handled() {
-        assert_eq!(redact_oauth_error_body(""), "<empty body>");
-        assert_eq!(redact_oauth_error_body("   \n\t"), "<empty body>");
-    }
 
     // --- Regression tests for crosslink #480 ---
 
@@ -1238,8 +1284,18 @@ mod tests {
         assert!(!pkce.challenge.is_empty());
         assert!(!pkce.state.is_empty());
 
+        pkce.verifier.expose(|verifier| {
+            assert!(
+                verifier
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_')),
+                "generated verifier must remain URL-safe"
+            );
+        });
+
         // Challenge should be different from verifier
-        assert_ne!(pkce.verifier, pkce.challenge);
+        assert!(!pkce.verifier.matches(&pkce.challenge));
     }
 
     #[test]
@@ -1250,6 +1306,16 @@ mod tests {
 
         // Should be consistent
         assert_eq!(challenge, compute_s256_challenge(verifier));
+    }
+
+    #[test]
+    fn invalid_token_type_diagnostic_does_not_echo_provider_value() {
+        let sentinel = "oauth-token-type-secret-sentinel";
+        let error = validate_oauth_token_type(sentinel)
+            .expect_err("non-bearer token type must be rejected")
+            .to_string();
+        assert!(error.contains("expected 'Bearer'"), "{error}");
+        assert!(!error.contains(sentinel), "{error}");
     }
 
     #[test]
@@ -1284,7 +1350,8 @@ mod tests {
     #[test]
     fn test_token_expiry_check() {
         let creds = OAuthCredentials {
-            access_token: "test".to_string(),
+            access_token: crate::secrets::OAuthToken::try_from_string("test".to_string())
+                .expect("token"),
             refresh_token: None,
             expires_at: Utc::now() + Duration::seconds(100),
         };
@@ -1293,7 +1360,8 @@ mod tests {
         assert!(!creds.is_expired());
 
         let expired_creds = OAuthCredentials {
-            access_token: "test".to_string(),
+            access_token: crate::secrets::OAuthToken::try_from_string("test".to_string())
+                .expect("token"),
             refresh_token: None,
             expires_at: Utc::now() - Duration::seconds(10),
         };
@@ -1317,8 +1385,12 @@ mod tests {
         OAuthSession {
             id: format!("session-{token}"),
             credentials: OAuthCredentials {
-                access_token: token.to_string(),
-                refresh_token: Some(format!("refresh-{token}")),
+                access_token: crate::secrets::OAuthToken::try_from_string(token.to_string())
+                    .expect("token"),
+                refresh_token: Some(
+                    crate::secrets::OAuthToken::try_from_string(format!("refresh-{token}"))
+                        .expect("refresh token"),
+                ),
                 expires_at: Utc::now() + Duration::seconds(3600),
             },
             api_key: None,

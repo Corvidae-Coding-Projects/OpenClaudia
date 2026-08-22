@@ -51,7 +51,10 @@ const SKIP_DIRS: &[&str] = &[
 /// Execute the `grep` tool.
 ///
 /// Returns `(stdout, is_error)`.
-pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_grep(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let pattern = match args.arg_str_strict("pattern") {
         Ok(p) => p.to_string(),
         Err(e) => return e.into_tool_error(),
@@ -61,7 +64,7 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         Ok(path) => path,
         Err(e) => return e.into_tool_error(),
     };
-    let root = match resolve_path(raw_path) {
+    let root = match resolve_path(run, raw_path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };
@@ -86,7 +89,7 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (format!("Invalid regex '{pattern}': {e}"), true),
     };
 
-    let directory = match secure_fs::open_directory(&root) {
+    let directory = match secure_fs::open_directory(run, &root) {
         Ok(directory) => directory,
         Err(error) => {
             return (
@@ -103,7 +106,16 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
     let mut total_matches: usize = 0;
     let mut files_scanned: usize = 0;
     let mut truncated = false;
-    grep_directory(
+    let mut resource_batch = match crate::guardrails::begin_path_resource_batch(run) {
+        Ok(batch) => batch,
+        Err(error) => return (format!("Blocked by blast radius guardrails: {error}"), true),
+    };
+    if let Err(error) = resource_batch.check_scope(run, &root) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
+    if let Err(error) = grep_directory(
+        run,
+        &root,
         &directory,
         Path::new(""),
         &regex,
@@ -113,7 +125,10 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         &mut files_scanned,
         &mut visited,
         &mut truncated,
-    );
+        &mut resource_batch,
+    ) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
 
     let header = if truncated {
         format!(
@@ -128,6 +143,7 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
     } else {
         format!("{header}\n{body}")
     };
+    resource_batch.commit();
     (out, false)
 }
 
@@ -193,6 +209,8 @@ fn grep_one(file: File, regex: &Regex, context: usize) -> std::io::Result<Vec<Hi
 
 #[allow(clippy::too_many_arguments)]
 fn grep_directory(
+    run: &crate::tools::ToolRunContext,
+    root: &Path,
     dir: &secure_fs::SecureDirectory,
     relative_dir: &Path,
     regex: &Regex,
@@ -202,10 +220,11 @@ fn grep_directory(
     files_scanned: &mut usize,
     visited: &mut usize,
     truncated: &mut bool,
-) {
+    resource_batch: &mut crate::guardrails::PathResourceBatch,
+) -> Result<(), String> {
     if *visited >= MAX_WALK_ENTRIES || *total_matches >= MAX_MATCHES {
         *truncated = true;
-        return;
+        return Ok(());
     }
     let entries = match dir.entries() {
         Ok(e) => e,
@@ -215,7 +234,7 @@ fn grep_directory(
                 error = %e,
                 "grep: skipping unreadable dir"
             );
-            return;
+            return Ok(());
         }
     };
     let mut subdirs: Vec<(secure_fs::SecureDirectory, PathBuf)> = Vec::new();
@@ -223,15 +242,17 @@ fn grep_directory(
         *visited += 1;
         if *visited >= MAX_WALK_ENTRIES {
             *truncated = true;
-            return;
+            return Ok(());
         }
         let name = entry.name;
         let name_str = name.to_string_lossy();
         let relative = relative_dir.join(&name);
+        let absolute = root.join(&relative);
         if entry.kind == secure_fs::SecureFileType::Directory {
             if name_str.starts_with('.') || SKIP_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
+            resource_batch.check_scope(run, &absolute)?;
             match dir.open_child_directory(&name) {
                 Ok(child) => subdirs.push((child, relative)),
                 Err(error) => tracing::warn!(
@@ -242,22 +263,26 @@ fn grep_directory(
             }
         } else if entry.kind == secure_fs::SecureFileType::Regular {
             *files_scanned += 1;
+            resource_batch.check_scope(run, &absolute)?;
             match dir.open_child_regular(&name) {
-                Ok(file) => match grep_one(file, regex, context) {
-                    Ok(hits) => append_hits(
-                        &relative.display().to_string(),
-                        hits,
-                        context,
-                        output,
-                        total_matches,
-                        truncated,
-                    ),
-                    Err(error) => tracing::warn!(
-                        file = %relative.display(),
-                        %error,
-                        "grep: confined file read failed"
-                    ),
-                },
+                Ok(file) => {
+                    resource_batch.reserve_file(run, &absolute)?;
+                    match grep_one(file, regex, context) {
+                        Ok(hits) => append_hits(
+                            &relative.display().to_string(),
+                            hits,
+                            context,
+                            output,
+                            total_matches,
+                            truncated,
+                        ),
+                        Err(error) => tracing::warn!(
+                            file = %relative.display(),
+                            %error,
+                            "grep: confined file read failed"
+                        ),
+                    }
+                }
                 Err(error) => tracing::warn!(
                     file = %relative.display(),
                     %error,
@@ -266,12 +291,14 @@ fn grep_directory(
             }
             if *total_matches >= MAX_MATCHES {
                 *truncated = true;
-                return;
+                return Ok(());
             }
         }
     }
     for (sub, relative) in subdirs {
         grep_directory(
+            run,
+            root,
             &sub,
             &relative,
             regex,
@@ -281,11 +308,13 @@ fn grep_directory(
             files_scanned,
             visited,
             truncated,
-        );
+            resource_batch,
+        )?;
         if *truncated {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 fn append_hits(
@@ -326,6 +355,10 @@ mod tests {
     use std::io::Write as _;
     use tempfile::TempDir;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     fn write_file(dir: &Path, rel: &str, body: &str) {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() {
@@ -354,7 +387,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(!err, "got error: {out}");
         assert!(out.contains("a.rs:2:"), "expected a.rs:2: in: {out}");
         assert!(out.contains("hello world"), "match body lost: {out}");
@@ -377,7 +410,7 @@ mod tests {
             json!(dir.path().to_string_lossy().to_string()),
         );
         args.insert("context_lines".to_string(), json!(1));
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(!err, "got error: {out}");
         // Before-context emitted with `-1-` delimiter style
         assert!(out.contains("ctx.txt-1-line one"), "before-ctx: {out}");
@@ -395,7 +428,7 @@ mod tests {
             "path".to_string(),
             json!(dir.path().to_string_lossy().to_string()),
         );
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(err, "expected error, got: {out}");
         assert!(out.contains("Invalid regex"), "msg was: {out}");
     }
@@ -404,7 +437,7 @@ mod tests {
     #[test]
     fn grep_missing_pattern_errors() {
         let args = HashMap::new();
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(err, "missing pattern must be an error: {out}");
         assert!(out.contains("pattern"), "error must name the arg: {out}");
     }
@@ -414,7 +447,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("pattern".to_string(), json!(["hello"]));
 
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
 
         assert!(err, "non-string pattern must be an error: {out}");
         assert_eq!(out, "Invalid 'pattern' argument: expected string");
@@ -426,7 +459,7 @@ mod tests {
         args.insert("pattern".to_string(), json!("hello"));
         args.insert("path".to_string(), json!(["not", "a", "path"]));
 
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
 
         assert!(err, "non-string path must be an error: {out}");
         assert!(
@@ -447,7 +480,7 @@ mod tests {
             json!(dir.path().to_string_lossy().to_string()),
         );
         args.insert("case_insensitive".to_string(), json!(true));
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
         assert!(!err);
         assert!(out.contains("x.txt:1:"), "case-insensitive miss: {out}");
     }
@@ -464,7 +497,7 @@ mod tests {
         );
         args.insert("case_insensitive".to_string(), json!("true"));
 
-        let (out, err) = execute_grep(&args);
+        let (out, err) = execute_grep(test_run(), &args);
 
         assert!(err, "non-boolean case_insensitive must error: {out}");
         assert!(

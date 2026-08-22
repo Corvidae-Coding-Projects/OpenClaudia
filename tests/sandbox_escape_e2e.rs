@@ -7,7 +7,9 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::missing_panics_doc)]
 
-use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
+use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
+use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
+use openclaudia::tools::{FunctionCall, ToolCall};
 use serde_json::json;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixListener;
@@ -31,15 +33,48 @@ fn bash(command: &str) -> openclaudia::tools::ToolResult {
 }
 
 fn bash_unlocked(command: &str) -> openclaudia::tools::ToolResult {
-    execute_tool(&ToolCall {
+    bash_unlocked_for_run(support::shared_run_context(), command)
+}
+
+fn bash_unlocked_for_run(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    command: &str,
+) -> openclaudia::tools::ToolResult {
+    let tool_call = ToolCall {
         id: "sandbox-escape-probe".to_string(),
         call_type: "function".to_string(),
         function: FunctionCall {
             name: "bash".to_string(),
             arguments: json!({"command": command}).to_string(),
         },
+    };
+    // These probes intentionally need compound shell syntax to inspect several
+    // sandbox properties in one process. Exercise that syntax through the
+    // production exact-approval path so this suite tests capability
+    // confinement instead of relying on the retired manager-less bypass.
+    let state = tempfile::TempDir::new().expect("create permission state directory");
+    let manager = PermissionManager::new(state.path().join("permissions.json"), true, Vec::new());
+    let permit = manager
+        .approve_tool_call_once(
+            &tool_call,
+            Some(run.session_id()),
+            ApprovalProvenance::InteractiveUser,
+        )
+        .expect("host approval must mint an exact one-use permit");
+    ToolExecutor::execute(ToolExecutorRequest {
+        run_context: run,
+        tool_call: &tool_call,
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+        permission_mgr: &manager,
+        authorization: Some(permit),
+        session_id: None,
+        policy_enforcer: None,
     })
 }
+
+mod support;
 
 fn project_fixture(prefix: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -50,12 +85,31 @@ fn project_fixture(prefix: &str) -> tempfile::TempDir {
 
 #[test]
 fn host_file_network_and_kernel_trees_are_absent() {
+    let _probe = sandbox_probe_lock();
     let outside = tempfile::tempdir().expect("host sentinel dir");
     let sentinel = outside.path().join("sentinel");
     std::fs::write(&sentinel, "host-secret").expect("host sentinel");
     let quoted = shlex::try_quote(sentinel.to_str().expect("UTF-8 sentinel")).expect("quote");
+
+    // S-020: keep the host path literal. The lexical path scan may report a
+    // diagnostic, but it cannot reject or authorize this command. A successful
+    // probe that observes the path as absent proves the OS sandbox is the
+    // enforcement boundary.
+    let literal_probe = bash_unlocked(&format!(
+        "if test -e {quoted}; then printf host_file_blocked=false; else printf host_file_blocked=true; fi"
+    ));
+    assert!(
+        !literal_probe.is_error(),
+        "literal path must reach the sandbox: {}",
+        literal_probe.content()
+    );
+    assert!(literal_probe.content().contains("host_file_blocked=true"));
+    assert!(!literal_probe.content().contains("host-secret"));
+
     let python = r#"
-import errno, socket
+import errno, os, socket
+kernel_path = os.path.join(os.sep, "sys", "kernel")
+print("sys_blocked=" + str(not os.path.exists(kernel_path)).lower())
 blocked = []
 for family, kind in [(socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET6, socket.SOCK_DGRAM), (socket.AF_UNIX, socket.SOCK_STREAM)]:
     try:
@@ -66,16 +120,10 @@ for family, kind in [(socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET6, soc
 print("network_blocked=" + str(all(blocked)).lower())
 "#;
     let python = shlex::try_quote(python).expect("quote Python");
-    let result = bash(&format!(
-        "if test -e {quoted}; then echo host_file_visible; else echo host_file_blocked; fi; \
-         if test -e /sys/kernel; then echo sys_visible; else echo sys_blocked; fi; \
-         python3 -c {python}"
-    ));
-    assert!(!result.is_error, "probe failed: {}", result.content);
-    assert!(result.content.contains("host_file_blocked"));
-    assert!(result.content.contains("sys_blocked"));
-    assert!(result.content.contains("network_blocked=true"));
-    assert!(!result.content.contains("host-secret"));
+    let result = bash_unlocked(&format!("python3 -c {python}"));
+    assert!(!result.is_error(), "probe failed: {}", result.content());
+    assert!(result.content().contains("sys_blocked=true"));
+    assert!(result.content().contains("network_blocked=true"));
 }
 
 #[test]
@@ -86,9 +134,9 @@ fn project_socket_and_fifo_block_sandbox_startup() {
     let listener = UnixListener::bind(&socket).expect("local Unix listener");
     let socket_result = bash_unlocked("true");
     assert!(
-        socket_result.is_error && socket_result.content.contains("socket, FIFO, or device"),
+        socket_result.is_error() && socket_result.content().contains("socket, FIFO, or device"),
         "project socket was not rejected: {}",
-        socket_result.content
+        socket_result.content()
     );
     drop(listener);
     std::fs::remove_file(&socket).expect("remove socket");
@@ -98,9 +146,9 @@ fn project_socket_and_fifo_block_sandbox_startup() {
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
     let fifo_result = bash_unlocked("true");
     assert!(
-        fifo_result.is_error && fifo_result.content.contains("socket, FIFO, or device"),
+        fifo_result.is_error() && fifo_result.content().contains("socket, FIFO, or device"),
         "project FIFO was not rejected: {}",
-        fifo_result.content
+        fifo_result.content()
     );
 }
 
@@ -118,7 +166,7 @@ fn external_hardlink_alias_is_rejected_but_internal_alias_is_supported() {
     std::fs::hard_link(&sentinel, &alias).expect("same-filesystem hardlink fixture");
     let rejected = bash_unlocked("true");
     assert!(
-        rejected.is_error,
+        rejected.is_error(),
         "external hardlink alias must block startup"
     );
     assert_eq!(
@@ -137,9 +185,9 @@ fn external_hardlink_alias_is_rejected_but_internal_alias_is_supported() {
     );
     let allowed = bash_unlocked(&command);
     assert!(
-        !allowed.is_error,
+        !allowed.is_error(),
         "internal hardlinks should be usable: {}",
-        allowed.content
+        allowed.content()
     );
     assert_eq!(
         std::fs::read_to_string(second).expect("internal alias"),
@@ -156,16 +204,32 @@ fn inherited_host_file_descriptor_is_closed() {
     let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
     assert!(raw >= 0, "open inherited descriptor");
     let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
-    let result = bash_unlocked(&format!(
-        "cat /proc/self/fd/{} 2>/dev/null || echo fd_blocked",
+    // Read the inherited descriptor directly so the sandbox must close it.
+    let python = format!(
+        r#"
+import os
+try:
+    contents = os.read({}, 64)
+except OSError:
+    print("fd_blocked")
+else:
+    print("fd_visible=" + contents.decode(errors="replace"))
+"#,
         inherited.as_raw_fd()
-    ));
-    assert!(
-        !result.content.contains("fd-secret"),
-        "host FD leaked: {}",
-        result.content
     );
-    assert!(result.content.contains("fd_blocked"));
+    let python = shlex::try_quote(&python).expect("quote Python");
+    let result = bash_unlocked(&format!("python3 -c {python}"));
+    assert!(!result.is_error(), "FD probe failed: {}", result.content());
+    assert!(
+        !result.content().contains("fd-secret"),
+        "host FD leaked: {}",
+        result.content()
+    );
+    assert!(
+        result.content().contains("fd_blocked"),
+        "inherited FD was not reported closed: {}",
+        result.content()
+    );
 }
 
 #[test]
@@ -188,8 +252,12 @@ print("seccomp_blocked=" + str(all(checks)).lower())
         "python3 -c {}",
         shlex::try_quote(python).expect("quote Python")
     ));
-    assert!(!result.is_error, "seccomp probe failed: {}", result.content);
-    assert!(result.content.contains("seccomp_blocked=true"));
+    assert!(
+        !result.is_error(),
+        "seccomp probe failed: {}",
+        result.content()
+    );
+    assert!(result.content().contains("seccomp_blocked=true"));
 }
 
 #[test]
@@ -198,15 +266,19 @@ fn effective_rlimits_include_process_memory_cpu_file_and_fd_caps() {
         "printf 'cpu=%s nofile=%s fsize=%s as=%s nproc=%s\\n' \
          \"$(ulimit -t)\" \"$(ulimit -n)\" \"$(ulimit -f)\" \"$(ulimit -v)\" \"$(ulimit -u)\"",
     );
-    assert!(!result.is_error, "rlimit probe failed: {}", result.content);
-    assert!(result.content.contains("cpu=300"));
-    assert!(result.content.contains("nofile=1024"));
     assert!(
-        !result.content.contains("fsize=unlimited"),
-        "file-size limit was not applied: {}",
-        result.content
+        !result.is_error(),
+        "rlimit probe failed: {}",
+        result.content()
     );
-    assert!(result.content.contains("as=4194304"));
+    assert!(result.content().contains("cpu=300"));
+    assert!(result.content().contains("nofile=1024"));
+    assert!(
+        !result.content().contains("fsize=unlimited"),
+        "file-size limit was not applied: {}",
+        result.content()
+    );
+    assert!(result.content().contains("as=4194304"));
 }
 
 #[test]
@@ -235,12 +307,12 @@ print("children=" + str(len(children)))
         shlex::try_quote(python).expect("quote Python")
     ));
     assert!(
-        !result.is_error,
+        !result.is_error(),
         "fork-limit probe failed: {}",
-        result.content
+        result.content()
     );
     let count = result
-        .content
+        .content()
         .split("children=")
         .nth(1)
         .and_then(|tail| tail.lines().next())
@@ -263,30 +335,50 @@ fn git_inspection_works_without_repository_execution_configuration() {
            echo credential_config_visible; else echo git_config_hidden; fi",
     );
     assert!(
-        !result.is_error,
+        !result.is_error(),
         "safe Git inspection failed: {}",
-        result.content
+        result.content()
     );
-    assert!(result.content.contains("git_config_hidden"));
-    assert!(!result.content.contains("credential_config_visible"));
+    assert!(result.content().contains("git_config_hidden"));
+    assert!(!result.content().contains("credential_config_visible"));
 }
 
 #[test]
 fn toolchain_mounts_are_read_only_and_exclude_user_credentials() {
-    let result = bash(
-        "cargo --version >/dev/null && \
+    let _probe = sandbox_probe_lock();
+    let run = support::host_toolchain_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let expected_cargo = run
+        .resolve_executable("cargo")
+        .expect("host-bound test run must resolve Cargo");
+    let result = bash_unlocked_for_run(
+        &run,
+        "cargo_path=\"$(command -v cargo)\" && \
+         test -n \"$cargo_path\" && echo \"cargo_path=$cargo_path\" && \
+         cargo --version >/dev/null && \
          test ! -e \"$HOME/.cargo/credentials\" && \
          test ! -e \"$HOME/.cargo/credentials.toml\" && \
-         if touch \"$HOME/.cargo/bin/openclaudia-write-probe\" 2>/dev/null; then \
-           echo cache_writable; else echo toolchain_confined; fi",
+         cargo_bin=\"${cargo_path%/*}\" && cargo_home=\"${cargo_bin%/bin}\" && \
+         test ! -e \"$cargo_home/credentials\" && \
+         test ! -e \"$cargo_home/credentials.toml\" && \
+         probe=\"$cargo_bin/.openclaudia-write-probe-$$\" && \
+         if touch \"$probe\" 2>/dev/null; then \
+           rm -f \"$probe\"; echo toolchain_writable; \
+         else echo toolchain_confined; fi",
     );
     assert!(
-        !result.is_error,
+        !result.is_error(),
         "read-only Cargo toolchain probe failed: {}",
-        result.content
+        result.content()
     );
-    assert!(result.content.contains("toolchain_confined"));
-    assert!(!result.content.contains("cache_writable"));
+    assert!(
+        result
+            .content()
+            .contains(&format!("cargo_path={}", expected_cargo.display())),
+        "sandbox resolved a different Cargo binary than the run capability: {}",
+        result.content()
+    );
+    assert!(result.content().contains("toolchain_confined"));
+    assert!(!result.content().contains("toolchain_writable"));
 }
 
 #[test]
@@ -321,12 +413,12 @@ fn ambient_ipc_proxy_and_secret_shaped_environment_is_absent() {
          && echo env_leaked || echo env_confined",
     );
     assert!(
-        !result.is_error,
+        !result.is_error(),
         "environment probe failed: {}",
-        result.content
+        result.content()
     );
-    assert!(result.content.contains("env_confined"));
-    assert!(!result.content.contains("secret"));
+    assert!(result.content().contains("env_confined"));
+    assert!(!result.content().contains("secret"));
 }
 
 #[test]
@@ -351,13 +443,13 @@ print("open_files=" + str(len(files)))
         shlex::try_quote(python).expect("quote Python")
     ));
     assert!(
-        !result.is_error,
+        !result.is_error(),
         "resource probe failed: {}",
-        result.content
+        result.content()
     );
-    assert!(result.content.contains("memory_blocked=true"));
+    assert!(result.content().contains("memory_blocked=true"));
     let count = result
-        .content
+        .content()
         .split("open_files=")
         .nth(1)
         .and_then(|tail| tail.lines().next())

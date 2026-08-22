@@ -9,21 +9,17 @@
 //! rather than the leaf modules in isolation.
 //!
 //! Coverage shape:
-//!   - **bash command injection catalog** — hostile strings spanning
+//!   - **bash defence-in-depth catalog** — hostile strings spanning
 //!     command substitution, process substitution, pipe-to-interpreter,
 //!     eval/source/dot, find-exec, tokenization bypass, and environment
-//!     exfiltration. Every one must be caught by `validate_command` or
-//!     `dangerous_shell_construct`. Includes a counter-test of 10 benign
-//!     commands that must NOT be flagged.
-//!   - **path constraints** — install a `PathConstraints` rooted on a
-//!     tempdir, verify the `allows()` predicate accepts paths inside
-//!     and refuses traversal-via-dotdot and absolute paths to
-//!     `/etc/passwd`.
+//!     exfiltration. Every one must be caught by `validate_command` or the
+//!     deny-only `dangerous_shell_construct` diagnostic. Includes a
+//!     counter-test of benign commands that must not be denied.
 //!   - **atomic file write** — 4 concurrent writer threads racing on
 //!     the same target file via `write_file`. The final file must
 //!     exactly equal ONE writer's payload — never a torn splice.
-//!   - **read tracker isolation** — distinct `SessionIdGuard` scopes
-//!     do not share the read-before-write gate, so an `edit_file`
+//!   - **read tracker isolation** — distinct immutable run identities do not
+//!     share the read-before-write gate, so an `edit_file`
 //!     issued under session B fails even if session A read the file
 //!     first.
 
@@ -32,12 +28,10 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::{
-    dangerous_shell_construct, execute_tool, is_safe_for_auto_allow,
-    is_sensitive_env_pub as is_sensitive_env, validate_command, FunctionCall, PathConstraints,
-    SessionIdGuard, ToolCall, MAX_COMMAND_LEN,
+    dangerous_shell_construct, execute_tool, is_sensitive_env_pub as is_sensitive_env,
+    validate_command, FunctionCall, ToolCall, MAX_COMMAND_LEN,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
@@ -106,22 +100,18 @@ const ATTACK_STRINGS: &[&str] = &[
 /// bug surface we're testing, and we don't want the test runner to
 /// hang or scan the entire filesystem if the bug ever returns.
 ///
-/// The contract is two-sided: at least one of `validate_command`
-/// or `dangerous_shell_construct` MUST catch every attack, AND
-/// `is_safe_for_auto_allow` MUST be false for every one (otherwise
-/// the permission layer would silently auto-approve the attack).
+/// The contract here is deliberately one-sided: at least one of
+/// `validate_command` or `dangerous_shell_construct` must catch every attack.
+/// S-020 tests auto-approval separately through typed effect resolution; this
+/// lexical catalog is not permitted to make positive authority claims.
 #[test]
 fn bash_attack_catalog_is_caught_by_policy_gates() {
     let mut leaked = Vec::new();
     for cmd in ATTACK_STRINGS {
         let validated = validate_command(cmd).is_err();
         let danger = dangerous_shell_construct(cmd).is_some();
-        let auto_allowed = is_safe_for_auto_allow(cmd);
         if !validated && !danger {
             leaked.push(format!("PASSED ALL GATES: {cmd:?}"));
-        }
-        if auto_allowed {
-            leaked.push(format!("FALSELY AUTO-ALLOWED: {cmd:?}"));
         }
     }
     assert!(
@@ -199,94 +189,6 @@ fn sensitive_env_keys_classified_correctly() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section B — PathConstraints (re-exported public type)
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn path_constraints_allow_paths_inside_root() {
-    let dir = tempdir().expect("tempdir");
-    let inside = dir.path().join("inside.txt");
-    std::fs::write(&inside, "ok").expect("write");
-    let pc = PathConstraints::new([dir.path().to_path_buf()]);
-    assert!(
-        pc.allows(&inside),
-        "path inside root must be allowed: {inside:?}"
-    );
-}
-
-#[test]
-fn path_constraints_refuse_paths_outside_root() {
-    let dir = tempdir().expect("tempdir");
-    let outside_file = dir
-        .path()
-        .parent()
-        .expect("parent")
-        .join(format!("outside-{}.tmp", std::process::id()));
-    std::fs::write(&outside_file, "evil").expect("write outside");
-    let pc = PathConstraints::new([dir.path().to_path_buf()]);
-    let refused = !pc.allows(&outside_file);
-    // Always clean up the planted file before the assertion so a
-    // failure doesn't leave debris in the parent directory.
-    let _ = std::fs::remove_file(&outside_file);
-    assert!(
-        refused,
-        "path outside root must be refused: {outside_file:?}"
-    );
-}
-
-#[test]
-fn path_constraints_reject_dotdot_traversal() {
-    let dir = tempdir().expect("tempdir");
-    let inside = dir.path().join("inside");
-    std::fs::create_dir(&inside).expect("mkdir");
-    let outside_file = dir
-        .path()
-        .parent()
-        .expect("parent")
-        .join(format!("escape-{}.tmp", std::process::id()));
-    std::fs::write(&outside_file, "evil").expect("write outside");
-
-    let pc = PathConstraints::new([dir.path().to_path_buf()]);
-    // inside/../../escape-PID.tmp resolves OUTSIDE root.
-    let traversal: PathBuf = inside
-        .join("..")
-        .join("..")
-        .join(outside_file.file_name().expect("filename"));
-    let refused = !pc.allows(&traversal);
-    let _ = std::fs::remove_file(&outside_file);
-    assert!(
-        refused,
-        "..-traversal escaping root must be refused: {traversal:?}"
-    );
-}
-
-#[test]
-fn path_constraints_empty_is_unrestricted() {
-    // Empty constraints = no policy active. The proxy installs
-    // constraints only conditionally; absent install means
-    // everything passes. Use an empty iterator since `Default` is
-    // not impl'd on this type.
-    let pc = PathConstraints::new(std::iter::empty::<PathBuf>());
-    assert!(pc.is_empty());
-    assert!(
-        pc.allows(std::path::Path::new("/etc/passwd")),
-        "empty constraints must allow everything (no policy installed)"
-    );
-}
-
-#[test]
-fn path_constraints_check_command_refuses_absolute_outside_root() {
-    let dir = tempdir().expect("tempdir");
-    let pc = PathConstraints::new([dir.path().to_path_buf()]);
-    // `cat /etc/passwd` touches a path outside the tempdir root.
-    let outcome = pc.check_command("cat /etc/passwd");
-    assert!(
-        outcome.is_err(),
-        "command touching /etc/passwd must be refused, got {outcome:?}"
-    );
-}
-
-// ───────────────────────────────────────────────────────────────────────────
 // Section C — file write atomicity under concurrent writers
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -342,71 +244,57 @@ fn concurrent_atomic_writers_never_produce_torn_reads() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — SessionIdGuard read-tracker isolation
+// Section D — exact-run read-tracker isolation
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn session_id_guards_are_stack_scoped_and_restore_on_drop() {
-    // The guard restores the prior session id on Drop, so nested
-    // scopes don't leak. We can't observe the thread-local state
-    // directly from outside the tools crate, but we CAN observe its
-    // effect: an `edit_file` issued AFTER the read-marking guard
-    // drops still sees the same file as "not read in this session"
-    // because each `SessionIdGuard::set` overwrites the slot.
-
+fn exact_run_identity_partitions_read_before_edit_state() {
     let dir = tempfile::tempdir_in(".").expect("tempdir");
     let path = dir.path().join("scoped.txt");
     std::fs::write(&path, "v1").expect("write");
+    let run_a = support::test_run_context(dir.path());
+    let run_b = support::test_run_context(dir.path());
 
-    // Session A: read the file (write-read sequence to mark it).
-    {
-        let _guard_a = SessionIdGuard::set("session-A");
-        let read = execute_tool(&call(
+    let read = execute_tool(
+        &run_a,
+        &call(
             "read_file",
             &json!({"path": path.to_string_lossy().to_string()}),
-        ));
-        assert!(!read.is_error, "session A: read must succeed, got {read:?}");
-    }
+        ),
+    );
+    assert!(!read.is_error(), "run A read must succeed, got {read:?}");
 
-    // Session B: try to edit without reading first. The read-before-
-    // edit gate must refuse because session B never read the file.
-    {
-        let _guard_b = SessionIdGuard::set("session-B");
-        let edit = execute_tool(&call(
+    let edit = execute_tool(
+        &run_b,
+        &call(
             "edit_file",
             &json!({
                 "path": path.to_string_lossy().to_string(),
                 "old_string": "v1",
                 "new_string": "v2",
             }),
-        ));
-        // Either is_error or a message naming the read-before-edit
-        // requirement is acceptable; what we will NOT tolerate is
-        // the edit succeeding (which would mean the gate leaked
-        // across session boundaries).
-        let permitted = edit.is_error
-            || edit.content.to_lowercase().contains("read")
-            || edit.content.to_lowercase().contains("before");
-        assert!(
-            permitted,
-            "session B: edit without prior read must be refused; got {edit:?}"
-        );
-    }
+        ),
+    );
+    assert!(
+        edit.is_error(),
+        "run B edit without its own read must be refused; got {edit:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("unchanged"), "v1");
 
-    // Back in session A (the file was read), the edit must succeed.
-    {
-        let _guard_a = SessionIdGuard::set("session-A");
-        let edit = execute_tool(&call(
+    let edit = execute_tool(
+        &run_a,
+        &call(
             "edit_file",
             &json!({
                 "path": path.to_string_lossy().to_string(),
                 "old_string": "v1",
                 "new_string": "v2",
             }),
-        ));
-        assert!(
-            !edit.is_error,
-            "session A re-entry: edit must succeed (file was read in this session), got {edit:?}"
-        );
-    }
+        ),
+    );
+    assert!(
+        !edit.is_error(),
+        "run A edit must succeed because that exact run read the file: {edit:?}"
+    );
 }
+mod support;

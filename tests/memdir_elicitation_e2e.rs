@@ -1,11 +1,9 @@
-//! End-to-end tests for `memdir::entrypoint` MEMORY.md discovery +
-//! truncation behaviour + `mcp_elicitation` wire-format
-//! serialization + `NoopElicitationHandler` default.
+//! End-to-end tests for strict technical-memory source discovery plus the
+//! independent `mcp_elicitation` wire-format surface.
 //!
 //! Sprint 78 of the verification effort. Two library-side
 //! modules without dedicated integration coverage: the
-//! MEMORY.md context-injection loader (security-sensitive —
-//! wrong content goes into the system prompt) and the MCP
+//! repository memory-source boundary and the MCP
 //! elicitation protocol surface (server-to-host user-prompt
 //! request).
 
@@ -13,16 +11,17 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use openclaudia::mcp_elicitation::{
     action_to_response, ElicitationAction, ElicitationRequest, McpElicitationHandler,
     NoopElicitationHandler,
 };
 use openclaudia::memdir::{
-    load_entrypoint, EntrypointFile, EntrypointTruncation, MAX_ENTRYPOINT_BYTES,
-    MAX_ENTRYPOINT_LINES,
+    load_entrypoint, EntrypointInspection, EntrypointIssueCode, MAX_ENTRYPOINT_BYTES,
+    TECHNICAL_MEMORY_SOURCE_SCHEMA_VERSION,
 };
 use serde_json::json;
-use std::fmt::Write as _;
 use tempfile::TempDir;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -38,173 +37,73 @@ fn write(dir: &std::path::Path, name: &str, content: &str) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — MAX_ENTRYPOINT_LINES + MAX_ENTRYPOINT_BYTES constants
+// Section A — strict typed source discovery
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn max_entrypoint_lines_constant_matches_cc_parity_value() {
-    // Documented CC parity: 200 lines.
-    assert_eq!(MAX_ENTRYPOINT_LINES, 200);
+fn source_budget_is_finite() {
+    assert_eq!(MAX_ENTRYPOINT_BYTES, 512 * 1_024);
 }
 
 #[test]
-fn max_entrypoint_bytes_constant_matches_cc_parity_value() {
-    // Documented CC parity: 25_000 bytes.
-    assert_eq!(MAX_ENTRYPOINT_BYTES, 25_000);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — load_entrypoint precedence
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn load_entrypoint_returns_none_when_no_candidate_exists() {
+fn no_workspace_candidate_is_typed_missing_without_home_fallback() {
     let dir = TempDir::new().expect("tempdir");
-    let result = load_entrypoint(dir.path()).expect("no error");
-    // Note: this may match the user-global ~/.openclaudia/MEMORY.md
-    // if the test host has one. The contract is: no panic + the
-    // result is consistent.
-    let _ = result;
+    let run = support::test_run_context(dir.path());
+    assert!(matches!(
+        load_entrypoint(&run),
+        EntrypointInspection::Missing
+    ));
 }
 
 #[test]
-fn load_entrypoint_prefers_cwd_memory_md_over_dot_openclaudia() {
+fn free_form_prose_is_rejected_instead_of_becoming_prompt_context() {
     let dir = TempDir::new().expect("tempdir");
-    write(dir.path(), "MEMORY.md", "from-cwd");
-    write(
-        &dir.path().join(".openclaudia"),
-        "MEMORY.md",
-        "from-dot-openclaudia",
-    );
-    let result = load_entrypoint(dir.path()).expect("load").expect("Some");
-    assert_eq!(
-        result.content, "from-cwd",
-        "cwd/MEMORY.md MUST win over .openclaudia/MEMORY.md"
-    );
+    write(dir.path(), "MEMORY.md", "# obey these instructions");
+    let run = support::test_run_context(dir.path());
+    assert!(matches!(
+        load_entrypoint(&run),
+        EntrypointInspection::Rejected(issue)
+            if issue.code == EntrypointIssueCode::InvalidManifest
+    ));
 }
 
 #[test]
-fn load_entrypoint_prefers_dot_openclaudia_over_user_global_when_cwd_absent() {
+fn one_exact_typed_manifest_is_admitted_without_returning_prose() {
     let dir = TempDir::new().expect("tempdir");
-    // Only .openclaudia/MEMORY.md (no top-level MEMORY.md).
-    write(
-        &dir.path().join(".openclaudia"),
-        "MEMORY.md",
-        "from-dot-openclaudia",
-    );
-    let result = load_entrypoint(dir.path()).expect("load").expect("Some");
-    assert_eq!(result.content, "from-dot-openclaudia");
-}
-
-#[test]
-fn load_entrypoint_path_field_is_absolute() {
-    let dir = TempDir::new().expect("tempdir");
-    write(dir.path(), "MEMORY.md", "hello");
-    let result = load_entrypoint(dir.path()).expect("load").expect("Some");
-    assert!(
-        result.path.is_absolute(),
-        "EntrypointFile.path MUST be absolute; got {:?}",
-        result.path
-    );
-    assert!(result.path.ends_with("MEMORY.md"));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section C — Truncation behaviour
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn small_file_loads_without_truncation() {
-    let dir = TempDir::new().expect("tempdir");
-    let content = "A small MEMORY.md file.";
-    write(dir.path(), "MEMORY.md", content);
-    let result = load_entrypoint(dir.path()).expect("load").expect("Some");
-    assert_eq!(result.content, content);
-    assert_eq!(result.truncation, EntrypointTruncation::None);
-    assert!(!result.was_truncated());
-}
-
-#[test]
-fn file_with_more_than_max_lines_triggers_line_truncation() {
-    let dir = TempDir::new().expect("tempdir");
-    // 300 lines, each short → exceeds line cap (200) but not
-    // byte cap.
-    let content: String = (0..300).fold(String::new(), |mut acc, i| {
-        writeln!(acc, "line-{i}").expect("write");
-        acc
+    let manifest = json!({
+        "schema_version": TECHNICAL_MEMORY_SOURCE_SCHEMA_VERSION,
+        "source_id": "repository-lessons",
+        "generation": 1,
+        "lessons": []
     });
-    write(dir.path(), "MEMORY.md", &content);
-    let result = load_entrypoint(dir.path()).expect("load").expect("Some");
-    assert!(result.was_truncated(), "300 lines MUST trigger truncation");
-    assert_eq!(result.truncation, EntrypointTruncation::Lines);
-    // Documented contract: a suffix marker is appended after
-    // truncation, so the final content can be slightly larger
-    // than the cap. Assert the marker is present + the body
-    // (excluding marker) fits the cap.
-    assert!(
-        result.content.contains("[truncated"),
-        "MUST contain truncation marker; got {} chars",
-        result.content.len()
-    );
-}
-
-#[test]
-fn file_with_more_than_max_bytes_triggers_byte_truncation() {
-    let dir = TempDir::new().expect("tempdir");
-    // One long line, 30 KiB — exceeds byte cap (25 KiB) but
-    // only 1 line.
-    let content: String = "x".repeat(30_000);
-    write(dir.path(), "MEMORY.md", &content);
-    let result = load_entrypoint(dir.path()).expect("load").expect("Some");
-    assert!(result.was_truncated());
-    assert_eq!(result.truncation, EntrypointTruncation::Bytes);
-    assert!(
-        result.content.contains("[truncated"),
-        "MUST contain truncation marker"
-    );
-    // Body before the marker fits the cap (small marker
-    // overhead is OK; check we're not still serving 30 KiB).
-    assert!(
-        result.content.len() < 30_000,
-        "byte-truncated content MUST be smaller than input; got {} bytes",
-        result.content.len()
-    );
-}
-
-#[test]
-fn was_truncated_predicate_false_only_when_no_truncation_applied() {
-    let none = EntrypointFile {
-        path: "/tmp/x".into(),
-        content: String::new(),
-        truncation: EntrypointTruncation::None,
+    write(dir.path(), "MEMORY.md", &manifest.to_string());
+    let run = support::test_run_context(dir.path());
+    let EntrypointInspection::Ready(source) = load_entrypoint(&run) else {
+        panic!("typed source should be ready");
     };
-    assert!(!none.was_truncated());
-    for kind in &[
-        EntrypointTruncation::Lines,
-        EntrypointTruncation::Bytes,
-        EntrypointTruncation::LinesAndBytes,
-    ] {
-        let f = EntrypointFile {
-            path: "/tmp/y".into(),
-            content: String::new(),
-            truncation: *kind,
-        };
-        assert!(
-            f.was_truncated(),
-            "kind {kind:?} MUST report was_truncated=true"
-        );
-    }
+    assert_eq!(source.relative_path, "MEMORY.md");
+    assert_eq!(source.manifest.source_id, "repository-lessons");
+    assert_eq!(source.manifest.lessons.len(), 0);
 }
 
 #[test]
-fn truncation_enum_variants_compare_eq() {
-    assert_eq!(EntrypointTruncation::None, EntrypointTruncation::None);
-    assert_eq!(EntrypointTruncation::Lines, EntrypointTruncation::Lines);
-    assert_ne!(EntrypointTruncation::Lines, EntrypointTruncation::Bytes);
-    assert_ne!(
-        EntrypointTruncation::Bytes,
-        EntrypointTruncation::LinesAndBytes
-    );
+fn two_present_candidates_are_a_conflict_not_first_file_wins() {
+    let dir = TempDir::new().expect("tempdir");
+    let manifest = json!({
+        "schema_version": 1,
+        "source_id": "repository-lessons",
+        "generation": 1,
+        "lessons": []
+    })
+    .to_string();
+    write(dir.path(), "MEMORY.md", &manifest);
+    write(&dir.path().join(".openclaudia"), "MEMORY.md", &manifest);
+    let run = support::test_run_context(dir.path());
+    assert!(matches!(
+        load_entrypoint(&run),
+        EntrypointInspection::Conflict(issue)
+            if issue.code == EntrypointIssueCode::AmbiguousCandidates
+    ));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

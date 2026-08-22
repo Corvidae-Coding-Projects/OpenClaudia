@@ -16,6 +16,8 @@
 use openclaudia::subagent::{AgentType, SubagentConfig, SubagentResult, WorktreeIsolation};
 use std::path::PathBuf;
 
+mod support;
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — SubagentConfig struct-literal construction
 // ───────────────────────────────────────────────────────────────────────────
@@ -295,28 +297,16 @@ fn worktree_isolation_create_outside_git_repo_or_no_git_errors() {
     // In a non-git tempdir this MUST surface as Err.
     use tempfile::TempDir;
     let dir = TempDir::new().expect("tempdir");
-    let prev = std::env::current_dir().expect("cwd");
-    // Best-effort cwd switch — process-wide; tests using this
-    // must hold the cwd lock if added later.
-    if std::env::set_current_dir(dir.path()).is_ok() {
-        let outcome = WorktreeIsolation::create("test-agent");
-        let _ = std::env::set_current_dir(&prev);
-        // Either git is unavailable on this system OR we're
-        // not in a git repo — both yield Err.
-        if let Err(msg) = outcome {
-            // Documented error messages.
-            assert!(
-                msg.contains("git")
-                    || msg.contains("Git")
-                    || msg.contains("repository")
-                    || msg.contains("worktree"),
-                "error MUST mention git context; got {msg:?}"
-            );
-        }
-        // Else: surprisingly succeeded — TempDir drop cleans up.
-    } else {
-        let _ = std::env::set_current_dir(&prev);
-    }
+    let run = support::test_run_context(dir.path());
+    let outcome = WorktreeIsolation::create(&run, "test-agent");
+    let message = outcome.expect_err("an explicit non-git workspace must fail closed");
+    assert!(
+        message.contains("git")
+            || message.contains("Git")
+            || message.contains("repository")
+            || message.contains("worktree"),
+        "error MUST mention git context; got {message:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

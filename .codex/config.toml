@@ -1,0 +1,11 @@
+[mcp_servers]
+
+[mcp_servers.crosslink-knowledge]
+command = "python3"
+args = [".crosslink/integrations/mcp/knowledge-server.py"]
+required = true
+
+[mcp_servers.crosslink-agent-prompt]
+command = "python3"
+args = [".crosslink/integrations/mcp/agent-prompt-server.py"]
+required = true

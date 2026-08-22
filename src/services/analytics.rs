@@ -1,19 +1,18 @@
 //! Analytics sink — where lifecycle + usage events get recorded.
 //!
 //! Port of Claude Code's `services/analytics/` layer. OC keeps this
-//! minimal: a typed [`AnalyticsEvent`] enum covering the events we
-//! actually emit, and two default impls:
+//! minimal: a typed [`AnalyticsEvent`] enum covering current and reserved event
+//! shapes, and two sink implementations:
 //!
-//! - [`NoopAnalytics`]: discards every event. Used in tests and
-//!   headless invocations where recording would skew results or leak
-//!   user data. This is the `ServiceRegistry` default.
-//! - [`TracingAnalytics`]: forwards each event as a `tracing::info!`
-//!   span. Lets operators turn analytics on via `RUST_LOG` without
-//!   hauling in a full telemetry library.
+//! - [`NoopAnalytics`]: discards every event. Used only when a caller chooses
+//!   it explicitly; `ServiceRegistry` has no silent default.
+//! - [`TracingAnalytics`]: forwards each event as a `tracing::debug!`
+//!   span. The default info filter therefore keeps analytics disabled;
+//!   `--verbose` or an explicit `RUST_LOG=openclaudia::analytics=debug`
+//!   opts into local trace emission without a remote telemetry backend.
 //!
-//! Callers invoke via `ServiceRegistry::analytics().record(...)` —
-//! the sink lives behind an `Arc<dyn AnalyticsSink>` so a test can
-//! substitute a recording impl without changing the call sites.
+//! Interactive frontends inject the sink through `ServiceRegistry`, then the
+//! lifecycle subscriber retains the shared handle.
 
 /// Structured event variants. New fields or new variants land here
 /// so the type system forces every sink to handle them — a stringly-
@@ -56,8 +55,7 @@ pub trait AnalyticsSink: Send + Sync {
     fn record(&self, event: AnalyticsEvent);
 }
 
-/// No-op sink — the `ServiceRegistry` default. Exists so callers can
-/// record unconditionally without a `Some(sink)` check.
+/// Explicit no-op sink for tests or deliberately disabled library composition.
 pub struct NoopAnalytics;
 
 impl AnalyticsSink for NoopAnalytics {
@@ -77,25 +75,27 @@ impl AnalyticsSink for TracingAnalytics {
     fn record(&self, event: AnalyticsEvent) {
         match event {
             AnalyticsEvent::SessionStart { session_id } => {
-                tracing::info!(
+                let session_digest = pseudonymous_session_digest(&session_id);
+                tracing::debug!(
                     target: "openclaudia::analytics",
                     event = "session_start",
-                    session_id = %session_id
+                    session_digest = %session_digest
                 );
             }
             AnalyticsEvent::SessionEnd {
                 session_id,
                 messages,
             } => {
-                tracing::info!(
+                let session_digest = pseudonymous_session_digest(&session_id);
+                tracing::debug!(
                     target: "openclaudia::analytics",
                     event = "session_end",
-                    session_id = %session_id,
+                    session_digest = %session_digest,
                     messages
                 );
             }
             AnalyticsEvent::ToolUsed { tool, success } => {
-                tracing::info!(
+                tracing::debug!(
                     target: "openclaudia::analytics",
                     event = "tool_used",
                     tool = %tool,
@@ -103,7 +103,7 @@ impl AnalyticsSink for TracingAnalytics {
                 );
             }
             AnalyticsEvent::PromptSubmitted { prompt_chars } => {
-                tracing::info!(
+                tracing::debug!(
                     target: "openclaudia::analytics",
                     event = "prompt_submitted",
                     prompt_chars
@@ -113,7 +113,7 @@ impl AnalyticsSink for TracingAnalytics {
                 trigger,
                 tokens_freed,
             } => {
-                tracing::info!(
+                tracing::debug!(
                     target: "openclaudia::analytics",
                     event = "context_compacted",
                     trigger,
@@ -121,7 +121,7 @@ impl AnalyticsSink for TracingAnalytics {
                 );
             }
             AnalyticsEvent::ApiRequest { provider, model } => {
-                tracing::info!(
+                tracing::debug!(
                     target: "openclaudia::analytics",
                     event = "api_request",
                     provider = %provider,
@@ -129,13 +129,26 @@ impl AnalyticsSink for TracingAnalytics {
                 );
             }
             AnalyticsEvent::ThinkingEmitted { budget } => {
-                tracing::info!(
+                tracing::debug!(
                     target: "openclaudia::analytics",
                     event = "thinking_emitted",
                     budget
                 );
             }
         }
+    }
+}
+
+fn pseudonymous_session_digest(session_id: &str) -> crate::runtime::ContentDigest {
+    crate::runtime::ContentDigest::sha256(session_id.as_bytes())
+}
+
+fn record_safely(sink: &dyn AnalyticsSink, event: AnalyticsEvent) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.record(event))).is_err() {
+        tracing::warn!(
+            target: "openclaudia::analytics",
+            "analytics sink panicked; lifecycle processing continued"
+        );
     }
 }
 
@@ -157,7 +170,7 @@ impl StateAnalyticsSubscriber {
     pub fn new(state: StateStore, sink: Arc<dyn AnalyticsSink>) -> Self {
         let subscription = state.subscribe_log_lag();
         let session_id = state.inspect(|snapshot| snapshot.identity.session_id.to_string());
-        sink.record(AnalyticsEvent::SessionStart { session_id });
+        record_safely(sink.as_ref(), AnalyticsEvent::SessionStart { session_id });
         Self {
             state,
             subscription,
@@ -175,13 +188,19 @@ impl StateAnalyticsSubscriber {
                 from_messages,
             } = event
             {
-                self.sink.record(AnalyticsEvent::SessionEnd {
-                    session_id: from.to_string(),
-                    messages: from_messages,
-                });
-                self.sink.record(AnalyticsEvent::SessionStart {
-                    session_id: to.to_string(),
-                });
+                record_safely(
+                    self.sink.as_ref(),
+                    AnalyticsEvent::SessionEnd {
+                        session_id: from.to_string(),
+                        messages: from_messages,
+                    },
+                );
+                record_safely(
+                    self.sink.as_ref(),
+                    AnalyticsEvent::SessionStart {
+                        session_id: to.to_string(),
+                    },
+                );
             }
         }
     }
@@ -198,10 +217,13 @@ impl StateAnalyticsSubscriber {
                 snapshot.conversation.messages.len(),
             )
         });
-        self.sink.record(AnalyticsEvent::SessionEnd {
-            session_id,
-            messages,
-        });
+        record_safely(
+            self.sink.as_ref(),
+            AnalyticsEvent::SessionEnd {
+                session_id,
+                messages,
+            },
+        );
         self.finished = true;
     }
 }
@@ -216,6 +238,35 @@ impl Drop for StateAnalyticsSubscriber {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     struct Recording {
         events: Mutex<Vec<AnalyticsEvent>>,
@@ -409,5 +460,71 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn production_session_identity_is_pseudonymous() {
+        let digest = pseudonymous_session_digest("sensitive-session-id").to_string();
+        assert!(digest.starts_with("sha256:"));
+        assert!(!digest.contains("sensitive-session-id"));
+    }
+
+    #[test]
+    fn production_trace_emits_only_the_pseudonymous_identity_at_debug() {
+        let raw_session_id = "private-session-id-s012";
+        let expected_digest = pseudonymous_session_digest(raw_session_id).to_string();
+        let captured = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            TracingAnalytics.record(AnalyticsEvent::SessionStart {
+                session_id: raw_session_id.to_string(),
+            });
+        });
+
+        let trace = captured.contents();
+        assert!(trace.contains("session_start"));
+        assert!(trace.contains(&expected_digest));
+        assert!(!trace.contains(raw_session_id));
+    }
+
+    #[test]
+    fn default_info_level_does_not_emit_analytics_debug_events() {
+        let captured = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            TracingAnalytics.record(AnalyticsEvent::SessionStart {
+                session_id: "not-emitted".to_string(),
+            });
+        });
+
+        assert!(captured.contents().is_empty());
+    }
+
+    #[test]
+    fn subscriber_contains_a_panicking_sink() {
+        struct Panicking;
+
+        impl AnalyticsSink for Panicking {
+            fn record(&self, _event: AnalyticsEvent) {
+                panic!("fixture sink panic");
+            }
+        }
+
+        let state = StateStore::new(crate::state::SessionState::default());
+        let mut subscriber = StateAnalyticsSubscriber::new(state, Arc::new(Panicking));
+        subscriber.drain_pending();
+        subscriber.finish();
     }
 }

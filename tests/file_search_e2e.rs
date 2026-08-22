@@ -44,18 +44,18 @@ fn call(name: &str, args: &Value) -> ToolCall {
 }
 
 fn list_files(args: &Value) -> (String, bool) {
-    let r = execute_tool(&call("list_files", args));
-    (r.content, r.is_error)
+    let r = execute_tool(support::shared_run_context(), &call("list_files", args));
+    (r.content().to_string(), r.is_error())
 }
 
 fn glob(args: &Value) -> (String, bool) {
-    let r = execute_tool(&call("glob", args));
-    (r.content, r.is_error)
+    let r = execute_tool(support::shared_run_context(), &call("glob", args));
+    (r.content().to_string(), r.is_error())
 }
 
 fn grep(args: &Value) -> (String, bool) {
-    let r = execute_tool(&call("grep", args));
-    (r.content, r.is_error)
+    let r = execute_tool(support::shared_run_context(), &call("grep", args));
+    (r.content().to_string(), r.is_error())
 }
 
 fn touch(path: &Path, content: &str) {
@@ -392,3 +392,4 @@ fn grep_redos_resistant_input_completes_within_deadline() {
          10kB ReDoS-shaped input; took {elapsed:?}"
     );
 }
+mod support;

@@ -1,4 +1,9 @@
 target
-corpus
 artifacts
 coverage
+
+# Keep reviewed seed-* inputs as deterministic regression evidence while
+# ignoring hash-named corpus discoveries produced by local fuzzing.
+corpus/**
+!corpus/**/
+!corpus/**/seed-*

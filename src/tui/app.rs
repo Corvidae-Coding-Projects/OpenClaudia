@@ -54,38 +54,6 @@ fn input_content_width(area_width: u16) -> u16 {
     area_width.saturating_sub(INPUT_PROMPT_WIDTH).max(1)
 }
 
-fn current_exe_command() -> Result<Command, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("failed to resolve current executable: {e}"))?;
-    Ok(Command::new(exe))
-}
-
-fn format_init_command_output(out: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let mut parts = Vec::new();
-    let stdout = stdout.trim();
-    let stderr = stderr.trim();
-    if !stdout.is_empty() {
-        parts.push(stdout);
-    }
-    if !stderr.is_empty() {
-        parts.push(stderr);
-    }
-    let details = parts.join("\n");
-    if out.status.success() {
-        if details.is_empty() {
-            "Initialized OpenClaudia configuration in .openclaudia/".to_string()
-        } else {
-            details
-        }
-    } else if details.is_empty() {
-        format!("Init failed: {}", out.status)
-    } else {
-        format!("Init failed: {details}")
-    }
-}
-
 fn format_review_command_output(out: &Output) -> String {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -178,7 +146,7 @@ fn compile_file_ref_regex(pattern: &str) -> Option<regex::Regex> {
 }
 
 /// Expand @filename references in user input by inlining file contents.
-fn expand_file_refs(input: &str) -> String {
+fn expand_file_refs(run: &crate::tools::ToolRunContext, input: &str) -> String {
     if !input.contains('@') {
         return input.to_string();
     }
@@ -187,9 +155,6 @@ fn expand_file_refs(input: &str) -> String {
     };
     let mut result = input.to_string();
     let mut replacements = Vec::new();
-
-    // Get project root for path traversal validation
-    let cwd = std::env::current_dir().unwrap_or_default();
 
     for cap in file_ref_re.captures_iter(input) {
         let full_match = match cap.get(0) {
@@ -201,57 +166,24 @@ fn expand_file_refs(input: &str) -> String {
             None => continue,
         };
 
-        // Resolve and validate path — reject traversal attempts
-        let resolved = if std::path::Path::new(raw_path).is_absolute() {
-            std::path::PathBuf::from(raw_path)
-        } else {
-            cwd.join(raw_path)
-        };
-
-        // Reject paths with .. components
-        if resolved
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
+        // Use the same immutable capability roots and descriptor-relative
+        // secure open as read_file. No process CWD or pathname-only check can
+        // grant this context-assembly helper additional authority.
+        let (canonical, mut file) = match crate::tools::open_capability_regular_read(run, raw_path)
         {
-            replacements.push((
-                full_match.to_string(),
-                format!("[Path traversal blocked: {raw_path}]"),
-            ));
-            continue;
-        }
-
-        // #818: open-then-read on a single file descriptor.  The previous
-        // canonicalize → read_to_string pair was a TOCTOU window — between
-        // the two syscalls the path could be replaced with a symlink to an
-        // arbitrary file.  We now open the file first (yielding an fd
-        // pinned to one inode), then validate the canonical path of the
-        // already-resolved name, then read from the same fd.  Any post-open
-        // symlink flip is irrelevant — the kernel keeps reading the
-        // originally-opened inode.
-        let Ok(mut file) = std::fs::File::open(&resolved) else {
-            replacements.push((
-                full_match.to_string(),
-                format!("[File not found: {raw_path}]"),
-            ));
-            continue;
+            Ok(opened) => opened,
+            Err(error) => {
+                let label = if error.contains("traversal") {
+                    "Path traversal blocked"
+                } else if error.contains("outside") || error.contains("masked") {
+                    "File outside granted roots"
+                } else {
+                    "Cannot read file"
+                };
+                replacements.push((full_match.to_string(), format!("[{label}: {raw_path}]")));
+                continue;
+            }
         };
-        // Canonicalize for the containment check.  Even if the symlink
-        // chain is swapped between the open() above and this canonicalize,
-        // the file we will actually read is the inode pinned by `file`.
-        let Ok(canonical) = std::fs::canonicalize(&resolved) else {
-            replacements.push((
-                full_match.to_string(),
-                format!("[File not found: {raw_path}]"),
-            ));
-            continue;
-        };
-        if !canonical.starts_with(&cwd) {
-            replacements.push((
-                full_match.to_string(),
-                format!("[File outside project directory: {raw_path}]"),
-            ));
-            continue;
-        }
         let mut content = String::new();
         match std::io::Read::read_to_string(&mut file, &mut content) {
             Ok(_) => {
@@ -495,7 +427,7 @@ fn lookup_tui_slash(text: &str) -> Option<TuiSlashHandler> {
 #[derive(Debug)]
 struct ProviderSwitchAuth {
     api_key: Option<crate::providers::ApiKey>,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<crate::secrets::OAuthToken>,
     codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
 }
 
@@ -540,8 +472,6 @@ async fn resolve_provider_switch_auth(
     if target.eq_ignore_ascii_case("openai") {
         match crate::codex_credentials::load_codex_auth() {
             Ok(Some(crate::codex_credentials::CodexAuthMaterial::ApiKey { api_key, .. })) => {
-                let api_key = crate::providers::ApiKey::try_from_string(api_key)
-                    .map_err(|e| format!("Codex OpenAI API key is invalid: {e}"))?;
                 return Ok(ProviderSwitchAuth {
                     api_key: Some(api_key),
                     claude_code_token: None,
@@ -599,11 +529,7 @@ async fn resolve_provider_switch(
         .model
         .clone()
         .unwrap_or_else(|| crate::providers::default_model_for_target(&target).to_string());
-    let extra_headers: Vec<(String, String)> = provider
-        .headers
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let extra_headers = provider.headers.clone();
     let wire_api = if auth.codex_responses_auth.is_some() {
         crate::pipeline::WireApi::OpenAiResponses
     } else {
@@ -618,8 +544,8 @@ async fn resolve_provider_switch(
             None,
         )
         .map_err(|e| e.to_string())?;
-        let mut headers = codex_auth.headers();
-        headers.extend(extra_headers);
+        let mut headers = codex_auth.headers().map_err(|e| e.to_string())?;
+        headers.extend(&extra_headers);
         (endpoint, headers)
     } else {
         let endpoint = crate::pipeline::resolve_endpoint_for_wire(
@@ -627,13 +553,13 @@ async fn resolve_provider_switch(
             &target,
             &model,
             &provider.base_url,
-            auth.claude_code_token.as_deref(),
+            auth.claude_code_token.as_ref(),
         )
         .map_err(|e| e.to_string())?;
         let headers = crate::pipeline::resolve_headers(
             &target,
             auth.api_key.as_ref(),
-            auth.claude_code_token.as_deref(),
+            auth.claude_code_token.as_ref(),
             &extra_headers,
         )
         .map_err(|e| e.to_string())?;
@@ -759,12 +685,12 @@ pub struct ApiClient {
     /// The provider endpoint URL the proxy will POST to.
     pub endpoint: String,
     /// Wire-level headers carried on every request (auth, anthropic-version, …).
-    pub headers: Vec<(String, String)>,
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Wire protocol carried by the endpoint.
     pub wire_api: crate::pipeline::WireApi,
     /// OAuth bearer used by the claude-code-token flow. `None` when the
     /// raw `ANTHROPIC_API_KEY` path is taken.
-    pub claude_code_token: Option<String>,
+    pub claude_code_token: Option<crate::secrets::OAuthToken>,
     /// Pre-split system-prompt blocks the Anthropic adapter uses to get
     /// cache hits on the long static tail. `None` when no split has been
     /// computed (non-Anthropic providers).
@@ -781,7 +707,7 @@ impl ApiClient {
         Self {
             client: reqwest::Client::new(),
             endpoint: String::new(),
-            headers: Vec::new(),
+            headers: crate::secrets::SensitiveHeaders::new(),
             wire_api: crate::pipeline::WireApi::ChatCompletions,
             claude_code_token: None,
             prompt_blocks: None,
@@ -795,19 +721,78 @@ impl Default for ApiClient {
     }
 }
 
+fn build_startup_session_run_context(
+    session: &Session,
+    provider: &str,
+) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
+    let identity = session.inspect_state(|state| state.identity.clone());
+    crate::tools::ToolRunContext::builder(identity.session_id, identity.project_root)
+        .working_directory(identity.cwd)
+        .host_startup_grants()
+        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(true)
+        .secrets(true)
+        .provider(provider)
+        .build()
+}
+
+fn derive_session_run_context(
+    parent: &crate::tools::ToolRunContext,
+    session: &Session,
+    active_provider: &str,
+) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
+    if !session.provider.eq_ignore_ascii_case(active_provider) {
+        return Err(format!(
+            "Saved session provider '{}' differs from the active provider '{}'; switch providers before resuming it",
+            session.provider, active_provider
+        ));
+    }
+    let identity = session.inspect_state(|state| state.identity.clone());
+    let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
+        format!(
+            "Cannot resume project root '{}': {error}",
+            identity.project_root.display()
+        )
+    })?;
+    if project_root != parent.project_root() {
+        return Err(format!(
+            "Session project '{}' differs from the authorized launch project '{}'; launch OpenClaudia from that project to resume it",
+            project_root.display(),
+            parent.project_root().display()
+        ));
+    }
+    parent.derive_frontend_session(
+        identity.session_id,
+        &project_root,
+        &identity.cwd,
+        active_provider,
+    )
+}
+
+struct TuiMcpRuntime {
+    plugin_manager: std::sync::Arc<crate::plugins::PluginManager>,
+    manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+    trusted_servers: std::collections::HashSet<String>,
+}
+
 /// Main TUI application state.
 pub struct App {
     pub messages: MessageList,
     pub input: TextInput,
     pub model: String,
     pub provider: String,
+    /// Exact immutable host capabilities for this interactive session.
+    run_context: Result<std::sync::Arc<crate::tools::ToolRunContext>, String>,
+    /// MCP composition snapshot rebound when the frontend creates a new exact
+    /// run generation. Trust and plugin discovery are captured at launch.
+    mcp_runtime: Option<TuiMcpRuntime>,
     pub mode: Mode,
     pub should_quit: bool,
     pub is_waiting: bool,
     spinner_frame: usize,
     /// Full assistant text as received from streaming deltas. The visible
-    /// streaming text may be suppressed while a structured final envelope is
-    /// still incomplete.
+    /// Assistant text is buffered until the terminal evidence gate runs.
     streaming_raw_text: String,
     /// Sender for pushing API events into the event loop's channel.
     api_event_tx: Option<std::sync::mpsc::Sender<AppEvent>>,
@@ -820,7 +805,6 @@ pub struct App {
     next_turn_effort_level: Option<EffortLevel>,
     next_turn_model: Option<String>,
     next_turn_allowed_tool_rules: Vec<crate::permissions::PermissionRule>,
-    pub system_prompt: String,
     /// Memory database for auto-learning from tool execution.
     pub memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     /// Loaded app configuration passed to tools that need provider/config state
@@ -844,6 +828,7 @@ pub struct App {
     /// tracing sink after startup resume; tests and headless users remain
     /// silent unless they explicitly provide a sink.
     analytics_subscriber: Option<crate::services::analytics::StateAnalyticsSubscriber>,
+    service_registry: crate::services::ServiceRegistry,
     /// Active permission prompt (if any). Tool execution blocks until resolved.
     pending_permission: Option<PendingPermission>,
     /// Active `ask_user_question` modal (if any). The pipeline's
@@ -861,10 +846,6 @@ pub struct App {
     /// `None` for `task_mgr` and the dispatcher returned
     /// "Task management not available (no session)".
     pub task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
-    /// Rules content injected as system message (loaded once at startup).
-    pub rules_content: Option<String>,
-    /// Whether rules have been injected into session messages.
-    rules_injected: bool,
     /// Active modal overlay (help / log picker / …). At most one at a
     /// time. `None` when the main chat UI has focus. Closing an
     /// overlay goes through its `OverlayAction` return value so the
@@ -881,6 +862,20 @@ pub enum ActiveOverlay {
 }
 
 impl App {
+    /// Clone the exact run capability after startup/resume has selected the
+    /// final session identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the startup/resume capability-construction error when the TUI
+    /// could not bind its selected session to an immutable run.
+    pub fn tool_run_context(&self) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
+        self.run_context
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .map_err(Clone::clone)
+    }
+
     #[must_use]
     pub fn new(model: &str, provider: &str) -> Self {
         Self::new_with_policy(
@@ -901,11 +896,19 @@ impl App {
         let chat_session = Session::new(model, provider);
         let transcript_subscriber =
             crate::transcript::TranscriptStateSubscriber::new(chat_session.state_store());
+        let run_context = build_startup_session_run_context(&chat_session, provider);
+        let task_manager = run_context
+            .as_ref()
+            .ok()
+            .and_then(|run| crate::session::TaskManager::for_run(run).ok())
+            .unwrap_or_default();
         Self {
             messages: MessageList::new(),
             input: TextInput::new(),
             model: model.to_string(),
             provider: provider.to_string(),
+            run_context,
+            mcp_runtime: None,
             mode: Mode::Build,
             should_quit: false,
             is_waiting: false,
@@ -916,7 +919,6 @@ impl App {
             next_turn_effort_level: None,
             next_turn_model: None,
             next_turn_allowed_tool_rules: Vec::new(),
-            system_prompt: String::new(),
             memory_db: None,
             app_config: None,
             permission_mgr: None,
@@ -926,17 +928,27 @@ impl App {
             chat_session,
             transcript_subscriber,
             analytics_subscriber: None,
+            service_registry: crate::services::ServiceRegistry::analytics_disabled(),
             pending_permission: None,
             pending_user_question: None,
             hook_engine: None,
             policy_enforcer,
-            task_mgr: std::sync::Arc::new(
-                std::sync::Mutex::new(crate::session::TaskManager::new()),
-            ),
-            rules_content: None,
-            rules_injected: false,
+            task_mgr: std::sync::Arc::new(std::sync::Mutex::new(task_manager)),
             overlay: None,
         }
+    }
+
+    /// Upgrade the selected startup/resume session to its descriptor-safe
+    /// durable canonical task graph.
+    ///
+    /// # Errors
+    /// Returns an error when the run context or durable graph root cannot be
+    /// opened and validated.
+    pub fn bind_durable_task_graph(&mut self) -> Result<(), String> {
+        let run = self.tool_run_context()?;
+        let manager = crate::session::TaskManager::open_for_run(&run)?;
+        self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(manager));
+        Ok(())
     }
 
     /// Open the help-cheatsheet overlay. Subsequent keystrokes go to
@@ -945,17 +957,75 @@ impl App {
         self.overlay = Some(ActiveOverlay::Help(super::components::HelpOverlay::new()));
     }
 
-    fn apply_loaded_session(&mut self, loaded: &Session) {
+    fn apply_loaded_session(&mut self, loaded: &Session) -> bool {
+        let current_run = match self.run_context.as_ref() {
+            Ok(run) => std::sync::Arc::clone(run),
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Cannot replace a session whose current run is unavailable: {error}"
+                )));
+                return false;
+            }
+        };
+        let next_run = match derive_session_run_context(&current_run, loaded, &self.provider) {
+            Ok(run) => run,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(error));
+                return false;
+            }
+        };
+        let durable_tasks = self
+            .task_mgr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_durable();
+        let next_task_manager = if durable_tasks {
+            crate::session::TaskManager::open_for_run(&next_run)
+        } else {
+            crate::session::TaskManager::for_run(&next_run)
+        };
+        let next_task_manager = match next_task_manager {
+            Ok(manager) => manager,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Cannot bind the loaded session task graph: {error}"
+                )));
+                return false;
+            }
+        };
+        let permission_bypass = self.chat_session.permission_bypass_enabled();
+        if let Some(config) = self.app_config.as_ref() {
+            if let Err(error) = crate::guardrails::configure(&next_run, &config.guardrails) {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Session guardrails configuration is invalid: {error}"
+                )));
+                return false;
+            }
+        }
+
         // Flush the old snapshot before replacement. Subscribers stay attached
         // because `apply_loaded` replaces the shared store in place.
         self.transcript_subscriber.flush_now();
+        crate::tools::retire_run(&current_run);
         self.chat_session.apply_loaded(loaded);
+        self.chat_session.set_permission_bypass(permission_bypass);
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
+        self.run_context = Ok(std::sync::Arc::clone(&next_run));
+        self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(next_task_manager));
+        self.rebind_permission_manager(&next_run);
+        self.refresh_prompt_context_for_run();
+        self.rebind_mcp_runtime(&next_run);
         self.mode = tui_mode_for_agent(loaded.agent_mode());
         self.refresh_app_config_target();
         let _ = self.chat_session.refresh_estimated_tokens();
-        let transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let transcript_cwd = self.run_context.as_ref().map_or_else(
+            |_| {
+                self.chat_session
+                    .inspect_state(|state| state.identity.cwd.clone())
+            },
+            |run| run.working_directory().to_path_buf(),
+        );
         self.chat_session
             .set_transcript_position(transcript_cwd, self.chat_session.message_count());
         // Repaint the transcript.
@@ -985,18 +1055,77 @@ impl App {
             });
         }
         self.drain_state_subscribers();
+        true
     }
 
-    /// Install the lifecycle analytics sink for the active state store.
-    pub fn set_analytics_sink(
+    fn refresh_prompt_context_for_run(&mut self) {
+        if self.api_client.prompt_blocks.is_none() {
+            return;
+        }
+        let Ok(run) = self.run_context.as_ref() else {
+            self.api_client.prompt_blocks = None;
+            return;
+        };
+        self.api_client.prompt_blocks = Some(crate::prompt::build_prompt_context_for_run(
+            &self.chat_session.behavior_mode(),
+            run,
+        ));
+    }
+
+    fn rebind_mcp_runtime(&mut self, run: &std::sync::Arc<crate::tools::ToolRunContext>) {
+        let Some(runtime) = self.mcp_runtime.as_mut() else {
+            return;
+        };
+        let next_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::mcp::McpManager::new_with_permissions(
+                std::sync::Arc::clone(run),
+                self.app_config
+                    .as_ref()
+                    .map_or_else(crate::config::PermissionsConfig::default, |config| {
+                        config.permissions.clone()
+                    }),
+            ),
+        ));
+        let _ = crate::mcp::install_manager(run, &next_manager);
+        let previous_manager = std::mem::replace(&mut runtime.manager, next_manager.clone());
+        let plugin_manager = std::sync::Arc::clone(&runtime.plugin_manager);
+        let trusted_servers = runtime.trusted_servers.clone();
+        let Some(handle) = self.runtime_handle.clone() else {
+            tracing::warn!(
+                "MCP session rebind installed without reconnect because the TUI runtime is unavailable"
+            );
+            return;
+        };
+        drop(handle.spawn(async move {
+            if let Err(error) = previous_manager.write().await.disconnect_all().await {
+                tracing::warn!(%error, "failed to disconnect MCP servers for retired TUI run");
+            }
+            crate::proxy::connect_mcp_servers_with_trust(
+                &next_manager,
+                &plugin_manager,
+                &trusted_servers,
+            )
+            .await;
+        }));
+    }
+
+    /// Install the explicit lifecycle-service composition for this frontend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a caller attempts to install an analytics-disabled
+    /// registry into the interactive TUI.
+    pub fn set_service_registry(
         &mut self,
-        sink: std::sync::Arc<dyn crate::services::analytics::AnalyticsSink>,
-    ) {
-        self.analytics_subscriber =
-            Some(crate::services::analytics::StateAnalyticsSubscriber::new(
-                self.chat_session.state_store(),
-                sink,
-            ));
+        registry: crate::services::ServiceRegistry,
+    ) -> Result<(), &'static str> {
+        let Some(subscriber) = registry.analytics_subscriber(self.chat_session.state_store())
+        else {
+            return Err("interactive TUI service registry has analytics disabled");
+        };
+        self.service_registry = registry;
+        self.analytics_subscriber = Some(subscriber);
+        Ok(())
     }
 
     fn drain_state_subscribers(&mut self) {
@@ -1021,7 +1150,7 @@ impl App {
             )));
             return;
         };
-        self.apply_loaded_session(&loaded);
+        let _ = self.apply_loaded_session(&loaded);
     }
 
     /// Apply top-level `--resume` / `--session-id` startup options.
@@ -1046,14 +1175,34 @@ impl App {
                 .add(DisplayMessage::system("No saved sessions to resume."));
             return;
         };
-        self.apply_loaded_session(&loaded);
+        let _ = self.apply_loaded_session(&loaded);
     }
 
     /// Apply the current process's permission posture after any startup
     /// resume. This prevents a persisted session from carrying a dangerous
     /// bypass choice into a later invocation that omitted the flag.
-    pub fn set_permission_bypass(&self, enabled: bool) {
+    pub fn set_permission_bypass(&mut self, enabled: bool) {
         self.chat_session.set_permission_bypass(enabled);
+        if let Ok(run) = self.run_context.as_ref().map(std::sync::Arc::clone) {
+            self.rebind_permission_manager(&run);
+        }
+    }
+
+    fn rebind_permission_manager(&mut self, run: &crate::tools::ToolRunContext) {
+        let Some(config) = self.app_config.as_ref() else {
+            return;
+        };
+        let manager = if self.chat_session.permission_bypass_enabled() {
+            crate::permissions::PermissionManager::unrestricted_for_run(run)
+        } else {
+            crate::permissions::PermissionManager::trusted_for_run(
+                run,
+                config.permissions.enabled,
+                config.permissions.default_allow.clone(),
+                config.web_fetch.preapproved_domains.clone(),
+            )
+        };
+        self.permission_mgr = Some(std::sync::Arc::new(manager));
     }
 
     /// Open the log-selector (session picker) overlay seeded with
@@ -1085,11 +1234,15 @@ impl App {
         if let (Some(engine), Some(handle)) =
             (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
         {
+            let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
+                return;
+            };
             let engine = engine.clone();
             let session_id = self.chat_session.id();
             handle.spawn(async move {
-                let input = crate::hooks::HookInput::new(crate::hooks::HookEvent::Stop)
-                    .with_session_id(session_id);
+                let input =
+                    crate::hooks::HookInput::for_run(&run_context, crate::hooks::HookEvent::Stop)
+                        .with_session_id(session_id);
                 let _ = engine.run(crate::hooks::HookEvent::Stop, &input).await;
             });
         }
@@ -1101,6 +1254,9 @@ impl App {
         if let (Some(engine), Some(handle)) =
             (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
         {
+            let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
+                return;
+            };
             let engine = engine.clone();
             let session_id = self.chat_session.id();
             let message = message.to_string();
@@ -1111,7 +1267,15 @@ impl App {
                     "level": level.clone(),
                     "session_id": session_id,
                 });
-                let _ = engine.fire_notification(&level, payload).await;
+                let input = crate::hooks::HookInput::for_run(
+                    &run_context,
+                    crate::hooks::HookEvent::Notification,
+                )
+                .with_extra("notification_type", serde_json::Value::String(level))
+                .with_extra("data", payload);
+                let _ = engine
+                    .run(crate::hooks::HookEvent::Notification, &input)
+                    .await;
             });
         }
     }
@@ -1130,18 +1294,31 @@ impl App {
     pub fn set_api_config(
         &mut self,
         endpoint: String,
-        headers: Vec<(String, String)>,
+        headers: crate::secrets::SensitiveHeaders,
         wire_api: crate::pipeline::WireApi,
-        system_prompt: String,
         prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
-        claude_code_token: Option<String>,
+        claude_code_token: Option<crate::secrets::OAuthToken>,
     ) {
         self.api_client.endpoint = endpoint;
         self.api_client.headers = headers;
         self.api_client.wire_api = wire_api;
-        self.system_prompt = system_prompt;
         self.api_client.prompt_blocks = prompt_blocks;
         self.api_client.claude_code_token = claude_code_token;
+    }
+
+    /// Retain the launch-time MCP discovery/trust snapshot so a later session
+    /// transition can create a manager for the new exact run generation.
+    pub fn set_mcp_runtime(
+        &mut self,
+        plugin_manager: std::sync::Arc<crate::plugins::PluginManager>,
+        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>,
+        trusted_servers: std::collections::HashSet<String>,
+    ) {
+        self.mcp_runtime = Some(TuiMcpRuntime {
+            plugin_manager,
+            manager,
+            trusted_servers,
+        });
     }
 
     fn apply_provider_switch(&mut self, switch: ProviderSwitch) {
@@ -1156,22 +1333,61 @@ impl App {
             prompt_blocks,
         } = switch;
 
+        let current_run = match self.run_context.as_ref() {
+            Ok(run) => std::sync::Arc::clone(run),
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Provider switch cannot create a run capability: {error}"
+                )));
+                return;
+            }
+        };
+        let identity = self
+            .chat_session
+            .inspect_state(|state| state.identity.clone());
+        let next_run = match current_run.derive_frontend_session(
+            identity.session_id,
+            &identity.project_root,
+            &identity.cwd,
+            &provider,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Provider switch cannot bind the session run: {error}"
+                )));
+                return;
+            }
+        };
+
+        if let Some(config) = self.app_config.as_ref() {
+            if let Err(error) = crate::guardrails::configure(&next_run, &config.guardrails) {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Provider guardrails configuration is invalid: {error}"
+                )));
+                return;
+            }
+        }
+
+        crate::tools::retire_run(&current_run);
+        self.run_context = Ok(std::sync::Arc::clone(&next_run));
         self.provider = provider;
         self.model = model;
         self.chat_session.provider.clone_from(&self.provider);
         self.chat_session.model.clone_from(&self.model);
         self.chat_session.touch();
         self.refresh_app_config_target();
+        self.rebind_permission_manager(&next_run);
 
-        let system_prompt = self.system_prompt.clone();
         self.set_api_config(
             endpoint,
             headers,
             wire_api,
-            system_prompt,
             prompt_blocks,
             claude_code_token,
         );
+        self.refresh_prompt_context_for_run();
+        self.rebind_mcp_runtime(&next_run);
         self.vdd_builder_auth = vdd_builder_auth;
         self.persist_session();
         self.messages.add(DisplayMessage::system(format!(
@@ -1226,14 +1442,6 @@ impl App {
         let events = EventHandler::new(Duration::from_millis(100));
         // Store a sender clone so spawn_api_turn can push events into the same channel
         self.api_event_tx = Some(events.sender());
-
-        // Inject system prompt as the first message
-        if !self.system_prompt.is_empty() {
-            self.chat_session.push_message(serde_json::json!({
-                "role": "system",
-                "content": self.system_prompt
-            }));
-        }
 
         // No welcome message added to the message list — the welcome
         // box is rendered directly in draw() as a ratatui widget.
@@ -1305,6 +1513,7 @@ impl App {
         if let Some(analytics) = self.analytics_subscriber.as_mut() {
             analytics.finish();
         }
+        debug_assert!(self.service_registry.analytics_is_enabled());
 
         // Fire SessionEnd hooks. Best-effort: the app is already exiting
         // so we can't recover from a failure, and we must not spam the
@@ -1316,12 +1525,25 @@ impl App {
         // within a runtime" panic that surfaced when the TUI was launched
         // via `#[tokio::main(flavor = "current_thread")]`.
         if let Some(engine) = self.hook_engine.as_ref() {
-            let session_id = self.chat_session.id();
-            let input = crate::hooks::HookInput::new(crate::hooks::HookEvent::SessionEnd)
+            if let Ok(run_context) = self.run_context.as_ref() {
+                let session_id = self.chat_session.id();
+                let input = crate::hooks::HookInput::for_run(
+                    run_context,
+                    crate::hooks::HookEvent::SessionEnd,
+                )
                 .with_session_id(session_id);
-            let _ = engine
-                .run(crate::hooks::HookEvent::SessionEnd, &input)
-                .await;
+                let _ = engine
+                    .run(crate::hooks::HookEvent::SessionEnd, &input)
+                    .await;
+            }
+        }
+        if let Some(runtime) = self.mcp_runtime.as_ref() {
+            if let Err(error) = runtime.manager.write().await.disconnect_all().await {
+                tracing::warn!(%error, "failed to disconnect MCP servers during TUI shutdown");
+            }
+        }
+        if let Ok(run_context) = self.run_context.as_ref() {
+            crate::tools::retire_run(run_context);
         }
 
         Ok(())
@@ -1346,6 +1568,10 @@ impl App {
                 self.messages.scroll_to_bottom();
             }
             Ok(AppEvent::ToolStart { name, description }) => {
+                // Any buffered model text belonged to a tool-bearing turn,
+                // not a validated terminal response.
+                self.messages.finish_streaming();
+                self.streaming_raw_text.clear();
                 self.messages.add(DisplayMessage {
                     kind: MessageKind::ToolStart { name },
                     content: description,
@@ -1452,7 +1678,7 @@ impl App {
                 self.handle_overload_fallback(&model_hint);
             }
             Ok(AppEvent::ProviderSwitchReady(switch)) => {
-                self.apply_provider_switch(switch);
+                self.apply_provider_switch(*switch);
             }
             Ok(AppEvent::ProviderSwitchError(msg)) => {
                 self.messages.add(DisplayMessage::error(format!(
@@ -1542,7 +1768,16 @@ impl App {
         } else {
             self.streaming_raw_text.clone()
         };
-        match render_live_final_response_for_display(&self.chat_session.id(), &content) {
+        let Ok(run_context) = self.tool_run_context() else {
+            self.messages.streaming_text.clear();
+            return;
+        };
+        match render_live_final_response_for_display(
+            &run_context,
+            &self.chat_session.id(),
+            &content,
+            &self.model,
+        ) {
             Some(rendered) => self.messages.streaming_text = rendered,
             None => self.messages.streaming_text.clear(),
         }
@@ -1550,18 +1785,11 @@ impl App {
 
     fn append_streaming_for_display(&mut self, text: &str) {
         self.streaming_raw_text.push_str(text);
-        if may_be_structured_final_stream(&self.streaming_raw_text) {
-            if let Ok(Some(summary)) =
-                crate::grounded_loop::structured_final_summary(&self.streaming_raw_text)
-            {
-                self.messages.streaming_text = summary;
-            } else {
-                self.messages.streaming_text.clear();
-            }
-            self.messages.is_streaming = true;
-            return;
-        }
-        self.messages.append_streaming(text);
+        // Terminal-vs-tool-bearing output is unknown during streaming. Buffer
+        // it until ResponseDone can run the evidence gate; ToolStart discards
+        // text from a non-terminal iteration.
+        self.messages.streaming_text.clear();
+        self.messages.is_streaming = true;
     }
 
     /// Render the result of a backgrounded shell call dispatched via
@@ -2368,7 +2596,7 @@ impl App {
 
     /// Table-handler entry point for `/skill` / `/skills` (no-arg list form).
     fn slash_skill_list(&mut self) {
-        let skills = crate::skills::load_skills();
+        let skills = self.session_skills();
         let invocable_skills = skills
             .iter()
             .filter(|skill| skill.user_invocable)
@@ -2395,7 +2623,11 @@ impl App {
         } else {
             text.strip_prefix('/').unwrap_or("")
         };
-        if let Some(skill) = crate::skills::get_user_invocable_skill(skill_name) {
+        if let Some(skill) = self
+            .session_skills()
+            .into_iter()
+            .find(|skill| skill.name == skill_name && skill.user_invocable)
+        {
             self.messages.add(DisplayMessage::system(format!(
                 "Running skill: /{}",
                 skill.name
@@ -2512,7 +2744,7 @@ impl App {
         )));
         handle.spawn(async move {
             let event = match resolve_provider_switch(requested, prompt_blocks).await {
-                Ok(switch) => AppEvent::ProviderSwitchReady(switch),
+                Ok(switch) => AppEvent::ProviderSwitchReady(Box::new(switch)),
                 Err(err) => AppEvent::ProviderSwitchError(err),
             };
             let _ = tx.send(event);
@@ -2569,11 +2801,7 @@ impl App {
 
         let provider = self.provider.clone();
         let current_model = self.model.clone();
-        let extra_headers: Vec<(String, String)> = provider_config
-            .headers
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        let extra_headers = provider_config.headers.clone();
         self.messages.add(DisplayMessage::system(format!(
             "Fetching models for {provider} from the configured /models endpoint..."
         )));
@@ -2712,25 +2940,56 @@ impl App {
 
     /// Handle the `/doctor` slash command (environment diagnostics).
     fn handle_slash_doctor(&mut self) {
-        let checks = [
-            match crate::config::load_config() {
-                Ok(_) => "✓ Config: loaded".to_string(),
-                Err(e) => format!("✗ Config: {e}"),
-            },
-            format!("✓ Provider: {}", self.provider),
-            format!("✓ Model: {}", self.model),
-            format!("✓ Endpoint: {}", self.api_client.endpoint),
-            format!("✓ Skills: {} loaded", crate::skills::load_skills().len()),
-            if self.memory_db.is_some() {
-                "✓ Memory DB: connected".to_string()
-            } else {
-                "✗ Memory DB: not available".to_string()
-            },
-        ];
-        self.messages.add(DisplayMessage::system(format!(
-            "Diagnostics:\n{}",
-            checks.join("\n")
-        )));
+        let mut runtime = self.run_context.as_ref().map_or_else(
+            |_| crate::doctor::DoctorRuntimeSnapshot::live_without_run(),
+            |run| crate::doctor::DoctorRuntimeSnapshot::from_run(run),
+        );
+        if !self.api_client.endpoint.is_empty() {
+            if let Ok(adapter) = crate::providers::get_adapter(&self.provider) {
+                runtime =
+                    runtime.with_composed_provider_transport(&self.api_client.client, adapter);
+            }
+        }
+        if let Some(memory) = self.memory_db.as_deref() {
+            runtime = runtime.with_composed_memory_store(memory);
+        }
+        if let Some(mcp) = self.mcp_runtime.as_ref() {
+            runtime = runtime
+                .with_composed_plugin_manager(mcp.plugin_manager.as_ref())
+                .with_composed_mcp_manager(&mcp.manager);
+        }
+
+        let config_state = self.app_config.as_deref().map_or(
+            crate::doctor::DoctorConfig::Unavailable,
+            crate::doctor::DoctorConfig::Attached,
+        );
+        let report = crate::doctor::diagnose(
+            config_state,
+            &runtime,
+            &crate::doctor::DoctorRequest::default(),
+        );
+        let rendered = if report.validate().is_ok() {
+            report.render_human()
+        } else {
+            "Diagnostics unavailable: typed report validation failed closed.".to_string()
+        };
+        self.messages.add(DisplayMessage::system(rendered));
+    }
+
+    /// Discover skills through this session's immutable project boundary.
+    ///
+    /// A failed run construction deliberately yields no project skills rather
+    /// than falling back to the process current directory.
+    fn session_skills(&self) -> Vec<crate::skills::SkillDefinition> {
+        match self.run_context.as_ref() {
+            Ok(run) => {
+                crate::skills::load_skills_for_project(run.project_root(), run.working_directory())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "skill discovery unavailable without a valid TUI run");
+                Vec::new()
+            }
+        }
     }
 
     /// Handle the `/review` slash command (shows truncated `git diff HEAD`).
@@ -2748,19 +3007,19 @@ impl App {
 
     /// Handle the `/init` slash command (create config if absent).
     fn handle_slash_init(&mut self) {
-        if crate::config::config_file_exists() {
-            self.messages.add(DisplayMessage::system(
-                "Config already exists. Use /doctor to check it.",
-            ));
-        } else {
-            let content = match current_exe_command()
-                .and_then(|mut cmd| cmd.arg("init").output().map_err(|e| e.to_string()))
-            {
-                Ok(out) => format_init_command_output(&out),
-                Err(e) => format!("Init failed: {e}"),
-            };
-            self.messages.add(DisplayMessage::system(content));
-        }
+        let content = match self.run_context.as_deref() {
+            Ok(run) => match crate::tools::initialize_project_for_run(run) {
+                Ok(crate::tools::ProjectInitOutcome::Created) => {
+                    "Initialized OpenClaudia configuration in .openclaudia/".to_string()
+                }
+                Ok(crate::tools::ProjectInitOutcome::AlreadyExists) => {
+                    "Config already exists. Use /doctor to check it.".to_string()
+                }
+                Err(error) => format!("Init failed: {error}"),
+            },
+            Err(error) => format!("Init failed: no valid run capability: {error}"),
+        };
+        self.messages.add(DisplayMessage::system(content));
     }
 
     /// Handle diagnostic/info slash commands. Returns true if handled.
@@ -2832,7 +3091,10 @@ impl App {
 
     /// Send a user message to the API.
     fn send_user_message(&mut self, text: String) {
-        let expanded = expand_file_refs(&text);
+        let expanded = self
+            .run_context
+            .as_ref()
+            .map_or_else(|_| text.clone(), |run| expand_file_refs(run, &text));
 
         self.messages.add(DisplayMessage::user(text));
 
@@ -2841,23 +3103,6 @@ impl App {
             "content": expanded
         }));
 
-        // Inject rules as system message on first turn
-        if !self.rules_injected {
-            if let Some(ref rules) = self.rules_content {
-                self.chat_session.update_messages(|messages| {
-                    messages.insert(
-                        0,
-                        serde_json::json!({
-                            "role": "system",
-                            "content": rules
-                        }),
-                    );
-                });
-            }
-            self.rules_injected = true;
-        }
-
-        crate::guardrails::reset_turn();
         self.is_waiting = true;
         self.spawn_api_turn();
     }
@@ -2948,6 +3193,7 @@ impl App {
     /// If no runtime is bound yet (`self.runtime_handle == None`) the
     /// helper posts an error `ShellDone` (`exit_code` = None, stderr
     /// explaining the missing runtime) and returns `None`.
+    #[allow(clippy::too_many_lines)] // Keep async process lifecycle and its single TUI completion event together.
     fn spawn_shell(
         &self,
         cmd: Vec<&str>,
@@ -2955,10 +3201,39 @@ impl App {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let tx = self.api_event_tx.clone();
         let session_id = self.chat_session.id();
-        let cwd = std::env::current_dir().ok();
         let ledger_target = target.clone();
         // Eagerly own the argv as Strings — the future outlives `&self`.
         let argv: Vec<String> = cmd.into_iter().map(str::to_owned).collect();
+
+        let run_context = match &self.run_context {
+            Ok(run_context) => std::sync::Arc::clone(run_context),
+            Err(error) => {
+                if let Some(tx) = tx {
+                    let _ = tx.send(AppEvent::ShellDone {
+                        target,
+                        stdout: String::new(),
+                        stderr: format!("session process capability unavailable: {error}"),
+                        exit_code: None,
+                    });
+                }
+                return None;
+            }
+        };
+        if let Err(error) = run_context.require(crate::tools::ToolResource::Process) {
+            if let Some(tx) = tx {
+                let _ = tx.send(AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: error.to_string(),
+                    exit_code: None,
+                });
+            }
+            return None;
+        }
+        let cwd = run_context.working_directory().to_path_buf();
+        let environment_grants = run_context.environment_grants().clone();
+        let private_temp = run_context.private_temp_root().to_path_buf();
+        let executable_search_path = run_context.executable_search_path().to_os_string();
 
         let Some(handle) = self.runtime_handle.clone() else {
             // No runtime — surface as a failed ShellDone so the receiver
@@ -2974,6 +3249,32 @@ impl App {
             return None;
         };
 
+        let mutation_effect = match &target {
+            SpawnTarget::Init => Some(crate::tools::effect::ToolEffect::WorkspaceMutation),
+            SpawnTarget::ShellCommand { .. } => Some(crate::tools::effect::ToolEffect::Destructive),
+            SpawnTarget::Diff | SpawnTarget::Review | SpawnTarget::Files | SpawnTarget::Doctor => {
+                None
+            }
+        };
+        let mut freshness_reservation = match mutation_effect {
+            Some(effect) => match crate::evidence_freshness::reserve_mutation(&run_context, effect)
+            {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(AppEvent::ShellDone {
+                            target,
+                            stdout: String::new(),
+                            stderr: format!("cannot reserve shell mutation freshness: {error}"),
+                            exit_code: None,
+                        });
+                    }
+                    return None;
+                }
+            },
+            None => None,
+        };
+
         Some(handle.spawn(async move {
             let Some((exe, rest)) = argv.split_first() else {
                 if let Some(tx) = tx {
@@ -2987,16 +3288,48 @@ impl App {
                 return;
             };
 
-            let result = tokio::process::Command::new(exe).args(rest).output().await;
+            let result = match run_context.resolve_executable(exe) {
+                Ok(executable) => {
+                    let mut command = tokio::process::Command::new(executable);
+                    command
+                        .args(rest)
+                        .current_dir(&cwd)
+                        .kill_on_drop(true)
+                        .env_clear()
+                        .env("HOME", &private_temp)
+                        .env("TMPDIR", &private_temp)
+                        .env("TMP", &private_temp)
+                        .env("TEMP", &private_temp)
+                        .env("PATH", &executable_search_path)
+                        .env("CLAUDE_PROJECT_DIR", &cwd);
+                    environment_grants.apply_tokio(&mut command);
+                    command.output().await
+                }
+                Err(error) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("cannot resolve '{exe}': {error}"),
+                )),
+            };
 
-            if let (SpawnTarget::ShellCommand { displayed }, Some(cwd), Ok(out)) =
-                (&ledger_target, cwd.as_deref(), &result)
-            {
+            if result.is_ok() {
+                if let Some(reservation) = freshness_reservation.as_mut() {
+                    if let Err(error) = reservation.commit() {
+                        tracing::error!(
+                            %error,
+                            "failed to advance freshness after TUI shell completion"
+                        );
+                    }
+                    crate::ledger::invalidate_verification_receipts_for_run(&run_context);
+                }
+            }
+
+            if let (SpawnTarget::ShellCommand { displayed }, Ok(out)) = (&ledger_target, &result) {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 crate::grounded_loop::observe_shell_command_for_session(
+                    &run_context,
                     &session_id,
-                    cwd,
+                    &cwd,
                     displayed,
                     out.status.code().unwrap_or(-1),
                     &stdout,
@@ -3030,6 +3363,7 @@ impl App {
     /// Sends events through the event handler's mpsc channel so the
     /// synchronous TUI event loop can display streaming output.
     fn spawn_api_turn(&mut self) {
+        self.refresh_prompt_context_for_run();
         let Some(ref handle) = self.runtime_handle else {
             // No async runtime — show fallback message
             self.messages.add(DisplayMessage::error(
@@ -3066,6 +3400,21 @@ impl App {
         let wire_api = api.wire_api;
         let hook_engine = self.hook_engine.clone();
         let session_id_for_task = self.chat_session.id();
+        let run_context = match &self.run_context {
+            Ok(run_context) => std::sync::Arc::clone(run_context),
+            Err(error) => {
+                send_or_warn(
+                    &tx,
+                    super::events::AppEvent::ApiError(
+                        format!("Tool execution is unavailable: {error}").into(),
+                    ),
+                    &session_id_for_task,
+                );
+                self.is_waiting = false;
+                self.clear_next_turn_metadata();
+                return;
+            }
+        };
         let memory_db = self.memory_db.clone();
         let app_config = self.app_config.clone();
         let permission_mgr = self.permission_mgr.clone();
@@ -3073,11 +3422,16 @@ impl App {
         let vdd_builder_auth = self.vdd_builder_auth.clone();
         let policy_enforcer = std::sync::Arc::clone(&self.policy_enforcer);
         let task_mgr = self.task_mgr.clone();
+        let mcp_manager = self
+            .mcp_runtime
+            .as_ref()
+            .map(|runtime| std::sync::Arc::clone(&runtime.manager));
         // Clone the canonical state snapshot so the async task can build
         // follow-up requests without holding the state lock across awaits.
         let session_messages = self.chat_session.messages_snapshot();
 
         handle.spawn(run_api_turn_async(ApiTurnParams {
+            run_context,
             session_messages,
             client,
             endpoint,
@@ -3097,6 +3451,7 @@ impl App {
             hook_engine,
             policy_enforcer,
             task_mgr,
+            mcp_manager,
             session_id: session_id_for_task,
             tx,
         }));
@@ -3359,9 +3714,10 @@ impl App {
         } else {
             format!("Welcome back, {username}!")
         };
-        let cwd = std::env::current_dir().map_or_else(
+        let cwd = self.run_context.as_ref().map_or_else(
             |_| ".".to_string(),
-            |p| {
+            |run| {
+                let p = run.working_directory();
                 if let Some(home) = dirs::home_dir() {
                     if let Ok(rel) = p.strip_prefix(&home) {
                         return format!("~/{}", rel.display());
@@ -3412,17 +3768,26 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Ok(run) = self.run_context.as_ref() {
+            crate::tools::retire_run(run);
+        }
+    }
+}
+
 /// Owned call parameters for one spawned API turn.
 struct ApiTurnParams {
+    run_context: std::sync::Arc<crate::tools::ToolRunContext>,
     session_messages: Vec<serde_json::Value>,
     client: reqwest::Client,
     endpoint: String,
-    headers: Vec<(String, String)>,
+    headers: crate::secrets::SensitiveHeaders,
     provider: String,
     model: String,
     effort_level: EffortLevel,
     wire_api: crate::pipeline::WireApi,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<crate::secrets::OAuthToken>,
     prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
@@ -3433,11 +3798,13 @@ struct ApiTurnParams {
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
+    mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     session_id: String,
     tx: std::sync::mpsc::Sender<super::events::AppEvent>,
 }
 
 struct InitialTurnRequest<'a> {
+    run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     session_id: &'a str,
     session_messages: &'a [serde_json::Value],
     policy_enforcer: &'a std::sync::Arc<crate::services::policy::PolicyEnforcer>,
@@ -3445,8 +3812,9 @@ struct InitialTurnRequest<'a> {
     wire_api: crate::pipeline::WireApi,
     provider: &'a str,
     effort_level: EffortLevel,
-    claude_code_token: Option<&'a str>,
+    claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
+    mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
 }
 
@@ -3457,14 +3825,15 @@ struct PreparedInitialTurn {
 
 /// Shared context threaded through the agentic follow-up loop.
 struct AgenticCtx<'a> {
+    run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     client: &'a reqwest::Client,
     endpoint: &'a str,
-    headers: &'a [(String, String)],
+    headers: &'a crate::secrets::SensitiveHeaders,
     provider: &'a str,
     model: &'a str,
     effort_level: &'a str,
     wire_api: crate::pipeline::WireApi,
-    claude_code_token: Option<&'a str>,
+    claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
@@ -3473,6 +3842,7 @@ struct AgenticCtx<'a> {
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
+    mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     session_id: &'a str,
     task_obs: Option<crate::ledger::ObsId>,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
@@ -3495,19 +3865,23 @@ fn latest_assistant_message_content(messages: &[serde_json::Value]) -> Option<&s
 }
 
 fn observe_turn_user_task(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
     messages: &[serde_json::Value],
+    model_identity: &str,
 ) -> Option<crate::ledger::ObsId> {
     let content = latest_user_message_content(messages)?;
-    crate::grounded_loop::observe_session_user_task(session_id, content)
+    crate::grounded_loop::observe_session_user_task(run, session_id, content, model_identity)
 }
 
 fn request_messages_with_grounding(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
     task_obs: Option<crate::ledger::ObsId>,
     session_messages: &[serde_json::Value],
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut messages = crate::grounded_loop::request_messages_with_grounding(
+        run,
         session_id,
         task_obs,
         session_messages,
@@ -3524,78 +3898,74 @@ fn request_messages_with_grounding(
 }
 
 fn validate_and_render_agentic_final_response(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
     content: &str,
+    model_identity: &str,
 ) -> Result<String, String> {
-    crate::grounded_loop::validate_and_render_agentic_final_response(session_id, content)
+    crate::grounded_loop::validate_and_render_agentic_final_response(
+        run,
+        session_id,
+        content,
+        model_identity,
+    )
 }
 
-fn render_final_response_for_history(session_id: &str, content: &str) -> Option<String> {
+fn render_final_response_for_history(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+    model_identity: &str,
+) -> Result<String, String> {
     if content.trim().is_empty() {
-        return Some(String::new());
+        return Ok(String::new());
     }
-    match validate_and_render_agentic_final_response(session_id, content.trim()) {
-        Ok(rendered) => Some(rendered),
+    match validate_and_render_agentic_final_response(
+        run,
+        session_id,
+        content.trim(),
+        model_identity,
+    ) {
+        Ok(rendered) => Ok(rendered),
         Err(reason) => {
             tracing::warn!(
                 session_id,
-                reason,
+                reason = %reason,
                 "final answer rejected by grounding gate"
             );
-            None
+            Err(reason)
         }
     }
 }
 
-fn render_live_final_response_for_display(session_id: &str, content: &str) -> Option<String> {
+fn render_live_final_response_for_display(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    content: &str,
+    model_identity: &str,
+) -> Option<String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Some(String::new());
     }
-    match crate::grounded_loop::structured_final_summary(trimmed) {
-        Ok(Some(summary)) => return Some(summary),
-        Ok(None) => {}
-        Err(reason) => {
-            tracing::warn!(
-                session_id,
-                reason,
-                "structured final answer rejected before display"
-            );
-            return None;
-        }
-    }
-    render_final_response_for_history(session_id, trimmed)
-}
-
-fn may_be_structured_final_stream(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    if trimmed.starts_with('{') {
-        return true;
-    }
-    if let Some(fenced) = trimmed.strip_prefix("```") {
-        let fenced = fenced
-            .strip_prefix("json")
-            .or_else(|| fenced.strip_prefix("JSON"))
-            .unwrap_or(fenced)
-            .trim_start();
-        return fenced.starts_with('{');
-    }
-    false
+    render_final_response_for_history(run, session_id, trimmed, model_identity).ok()
 }
 
 fn check_provider_request_policy_for_messages(
+    run: &crate::tools::ToolRunContext,
     policy_enforcer: &crate::services::policy::PolicyEnforcer,
     model: &str,
     messages: &[serde_json::Value],
     tx: &std::sync::mpsc::Sender<super::events::AppEvent>,
     session_id: &str,
 ) -> bool {
-    let request = match crate::pipeline::build_chat_completion_request(model, messages) {
+    let request = match crate::pipeline::build_chat_completion_request_for_run(run, model, messages)
+    {
         Ok(request) => request,
         Err(e) => {
             send_or_warn(
                 tx,
-                super::events::AppEvent::ApiError(format!("Request build error: {e}")),
+                super::events::AppEvent::ApiError(format!("Request build error: {e}").into()),
                 session_id,
             );
             return false;
@@ -3613,7 +3983,7 @@ fn check_provider_request_policy_for_messages(
         Err(err) => {
             send_or_warn(
                 tx,
-                super::events::AppEvent::ApiError(format!("Blocked by policy: {err}")),
+                super::events::AppEvent::ApiError(format!("Blocked by policy: {err}").into()),
                 session_id,
             );
             false
@@ -3622,9 +3992,10 @@ fn check_provider_request_policy_for_messages(
 }
 
 /// Run the pre-turn `UserPromptSubmit` hook. Returns `false` and sends an
-/// `ApiError` event if the hook denies the request; injects any system
-/// messages from hook outputs and returns `true` on success.
+/// `ApiError` event if the hook denies the request; allowed model-visible
+/// outputs are appended as typed reference data.
 async fn run_preturn_hooks(
+    run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
     engine: &crate::hooks::HookEngine,
     session_messages: &mut Vec<serde_json::Value>,
     tx: &std::sync::mpsc::Sender<super::events::AppEvent>,
@@ -3635,8 +4006,9 @@ async fn run_preturn_hooks(
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string();
-    let hook_input = crate::hooks::HookInput::new(crate::hooks::HookEvent::UserPromptSubmit)
-        .with_prompt(&user_prompt);
+    let hook_input =
+        crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::UserPromptSubmit)
+            .with_prompt(&user_prompt);
     let hook_result = engine
         .run(crate::hooks::HookEvent::UserPromptSubmit, &hook_input)
         .await;
@@ -3645,15 +4017,19 @@ async fn run_preturn_hooks(
             || "Hook blocked the request".to_string(),
             std::string::ToString::to_string,
         );
-        let _ = tx.send(super::events::AppEvent::ApiError(format!(
-            "Blocked by hook: {reason}"
-        )));
+        let _ = tx.send(super::events::AppEvent::ApiError(
+            format!("Blocked by hook: {reason}").into(),
+        ));
         return false;
     }
-    for output in &hook_result.outputs {
-        if let Some(ref sys_msg) = output.system_message {
-            session_messages.push(serde_json::json!({ "role": "system", "content": sys_msg }));
-        }
+    let hook_items =
+        crate::context::hook_result_reference_items(&hook_result, "user_prompt_submit", 500);
+    if !hook_items.is_empty() {
+        let projection = crate::context::ContextProjector::project(
+            hook_items,
+            crate::context::ContextBudget::default(),
+        );
+        projection.append_reference_to_json_messages(session_messages);
     }
     true
 }
@@ -3691,6 +4067,18 @@ fn send_or_warn(
             persist_orphan_messages(session_id, &msgs);
         }
     }
+}
+
+fn send_api_error(
+    tx: &std::sync::mpsc::Sender<super::events::AppEvent>,
+    error: String,
+    session_id: &str,
+) {
+    send_or_warn(
+        tx,
+        super::events::AppEvent::ApiError(error.into()),
+        session_id,
+    );
 }
 
 /// Build the line list for the `ask_user_question` modal overlay.
@@ -3836,7 +4224,7 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         }
         super::events::AppEvent::ResponseDone => "ResponseDone".to_string(),
         super::events::AppEvent::ApiError(e) => {
-            let snippet: String = e.chars().take(80).collect();
+            let snippet: String = e.as_str().chars().take(80).collect();
             format!("ApiError({snippet:?})")
         }
         super::events::AppEvent::ApiRetry {
@@ -3962,14 +4350,13 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
         if iteration > MAX_ITER {
             send_or_warn(
                 ctx.tx,
-                super::events::AppEvent::ApiError(
-                    "Reached maximum tool iterations (25)".to_string(),
-                ),
+                super::events::AppEvent::ApiError("Reached maximum tool iterations (25)".into()),
                 ctx.session_id,
             );
             break;
         }
         let request_messages = match request_messages_with_grounding(
+            ctx.run_context,
             ctx.session_id,
             ctx.task_obs,
             session_messages,
@@ -3977,11 +4364,16 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             Ok(messages) => messages,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to build grounded agentic follow-up request");
-                send_or_warn(ctx.tx, super::events::AppEvent::ApiError(e), ctx.session_id);
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::ApiError(e.into()),
+                    ctx.session_id,
+                );
                 break;
             }
         };
         if !check_provider_request_policy_for_messages(
+            ctx.run_context,
             &ctx.policy_enforcer,
             ctx.model,
             &request_messages,
@@ -3990,28 +4382,38 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
         ) {
             break;
         }
-        let body = match crate::pipeline::build_request_for_wire(
-            ctx.wire_api,
-            ctx.provider,
-            ctx.model,
-            &request_messages,
-            ctx.effort_level,
-            ctx.claude_code_token,
-            ctx.prompt_blocks,
-        ) {
+        let body = match build_request_with_live_mcp(LiveMcpRequest {
+            run: ctx.run_context,
+            wire_api: ctx.wire_api,
+            provider: ctx.provider,
+            model: ctx.model,
+            messages: &request_messages,
+            effort_level: ctx.effort_level,
+            claude_code_token: ctx.claude_code_token,
+            prompt_blocks: ctx.prompt_blocks,
+            mcp_manager: ctx.mcp_manager,
+        })
+        .await
+        {
             Ok(body) => body,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to build agentic follow-up request");
-                send_or_warn(ctx.tx, super::events::AppEvent::ApiError(e), ctx.session_id);
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::ApiError(e.into()),
+                    ctx.session_id,
+                );
                 break;
             }
         };
         match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
+            run_context: std::sync::Arc::clone(ctx.run_context),
             client: ctx.client,
             endpoint: ctx.endpoint,
             headers: ctx.headers,
             request_body: &body,
             provider: ctx.provider,
+            model_identity: ctx.model,
             memory_db: ctx.memory_db.clone(),
             app_config: ctx.app_config.clone(),
             permission_mgr: ctx.permission_mgr.clone(),
@@ -4046,10 +4448,24 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                         .as_deref()
                         .filter(|text| !text.is_empty());
                     if !followup.content.is_empty() || reasoning.is_some() {
-                        let Some(rendered_content) =
-                            render_final_response_for_history(ctx.session_id, &followup.content)
-                        else {
-                            break;
+                        let rendered_content = match render_final_response_for_history(
+                            ctx.run_context,
+                            ctx.session_id,
+                            &followup.content,
+                            ctx.model,
+                        ) {
+                            Ok(rendered) => rendered,
+                            Err(reason) => {
+                                send_or_warn(
+                                    ctx.tx,
+                                    super::events::AppEvent::ApiError(
+                                        format!("Final answer failed grounding gate: {reason}")
+                                            .into(),
+                                    ),
+                                    ctx.session_id,
+                                );
+                                break;
+                            }
                         };
                         let mut message = serde_json::json!({
                             "role": "assistant",
@@ -4066,7 +4482,11 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             }
             Err(e) => {
                 tracing::error!(error = %e, "Agentic follow-up failed");
-                send_or_warn(ctx.tx, super::events::AppEvent::ApiError(e), ctx.session_id);
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::ApiError(e.into()),
+                    ctx.session_id,
+                );
                 // The caller's `SyncMessages` send after the loop will trigger
                 // recovery persistence if the channel is closed — no extra
                 // action needed here for partial-state capture.
@@ -4076,17 +4496,26 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
     }
 }
 
-fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInitialTurn> {
-    let task_obs = observe_turn_user_task(p.session_id, p.session_messages);
-    let request_messages =
-        match request_messages_with_grounding(p.session_id, task_obs, p.session_messages) {
-            Ok(messages) => messages,
-            Err(e) => {
-                send_or_warn(p.tx, super::events::AppEvent::ApiError(e), p.session_id);
-                return None;
-            }
-        };
+async fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInitialTurn> {
+    let task_obs = observe_turn_user_task(p.run_context, p.session_id, p.session_messages, p.model);
+    let request_messages = match request_messages_with_grounding(
+        p.run_context,
+        p.session_id,
+        task_obs,
+        p.session_messages,
+    ) {
+        Ok(messages) => messages,
+        Err(e) => {
+            send_or_warn(
+                p.tx,
+                super::events::AppEvent::ApiError(e.into()),
+                p.session_id,
+            );
+            return None;
+        }
+    };
     if !check_provider_request_policy_for_messages(
+        p.run_context,
         p.policy_enforcer,
         p.model,
         &request_messages,
@@ -4095,123 +4524,171 @@ fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<PreparedInit
     ) {
         return None;
     }
-    match crate::pipeline::build_request_for_wire(
-        p.wire_api,
-        p.provider,
-        p.model,
-        &request_messages,
-        p.effort_level.as_str(),
-        p.claude_code_token,
-        p.prompt_blocks,
-    ) {
+    match build_request_with_live_mcp(LiveMcpRequest {
+        run: p.run_context,
+        wire_api: p.wire_api,
+        provider: p.provider,
+        model: p.model,
+        messages: &request_messages,
+        effort_level: p.effort_level.as_str(),
+        claude_code_token: p.claude_code_token,
+        prompt_blocks: p.prompt_blocks,
+        mcp_manager: p.mcp_manager,
+    })
+    .await
+    {
         Ok(request_body) => Some(PreparedInitialTurn {
             task_obs,
             request_body,
         }),
         Err(e) => {
-            send_or_warn(p.tx, super::events::AppEvent::ApiError(e), p.session_id);
+            send_or_warn(
+                p.tx,
+                super::events::AppEvent::ApiError(e.into()),
+                p.session_id,
+            );
             None
         }
     }
 }
 
+struct LiveMcpRequest<'a> {
+    run: &'a std::sync::Arc<crate::tools::ToolRunContext>,
+    wire_api: crate::pipeline::WireApi,
+    provider: &'a str,
+    model: &'a str,
+    messages: &'a [serde_json::Value],
+    effort_level: &'a str,
+    claude_code_token: Option<&'a crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
+    mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+}
+
+async fn build_request_with_live_mcp(
+    request: LiveMcpRequest<'_>,
+) -> Result<serde_json::Value, String> {
+    let definitions = if let Some(manager) = request.mcp_manager {
+        let manager = manager.read().await;
+        if !manager.matches_run(request.run) {
+            return Err("MCP manager belongs to a different run generation".to_string());
+        }
+        let snapshot = manager.tool_catalog_snapshot().await;
+        drop(manager);
+        tracing::debug!(
+            target: "openclaudia::mcp",
+            event = "mcp_tool_catalog_snapshot",
+            run_id = %request.run.run_id(),
+            capability_generation = %request.run.generation(),
+            mcp_catalog_generation = %snapshot.generation,
+            callable = snapshot.definitions.len(),
+            unavailable = snapshot.unavailable.len(),
+            "Built exact MCP dynamic tool snapshot"
+        );
+        for item in &snapshot.unavailable {
+            tracing::warn!(
+                target: "openclaudia::mcp",
+                server = %item.server,
+                tool = %item.tool,
+                reason = %item.reason,
+                "MCP tool is unavailable in this run generation"
+            );
+        }
+        snapshot.definitions
+    } else {
+        Vec::new()
+    };
+    crate::pipeline::build_request_for_wire_for_run_with_additional(
+        request.run,
+        request.wire_api,
+        request.provider,
+        request.model,
+        request.messages,
+        request.effort_level,
+        request.claude_code_token,
+        request.prompt_blocks,
+        &definitions,
+    )
+}
+
 /// Run a complete API turn: pre-turn hooks, first `run_turn`, and an agentic
 /// follow-up loop when tool calls are present.
-async fn run_api_turn_async(p: ApiTurnParams) {
-    let ApiTurnParams {
-        mut session_messages,
-        client,
-        endpoint,
-        headers,
-        provider,
-        model,
-        effort_level,
-        wire_api,
-        claude_code_token,
-        prompt_blocks,
-        memory_db,
-        app_config,
-        permission_mgr,
-        vdd_engine,
-        vdd_builder_auth,
-        transient_allowed_tool_rules,
-        hook_engine,
-        policy_enforcer,
-        task_mgr,
-        session_id,
-        tx,
-    } = p;
-    if let Some(ref engine) = hook_engine {
-        if !run_preturn_hooks(engine, &mut session_messages, &tx).await {
+async fn run_api_turn_async(mut p: ApiTurnParams) {
+    if let Some(ref engine) = p.hook_engine {
+        if !run_preturn_hooks(&p.run_context, engine, &mut p.session_messages, &p.tx).await {
             return;
         }
     }
-    let initial_request = InitialTurnRequest {
-        session_id: &session_id,
-        session_messages: &session_messages,
-        policy_enforcer: &policy_enforcer,
-        model: &model,
-        wire_api,
-        provider: &provider,
-        effort_level,
-        claude_code_token: claude_code_token.as_deref(),
-        prompt_blocks: prompt_blocks.as_ref(),
-        tx: &tx,
-    };
-    let Some(initial_turn) = build_initial_turn_request(&initial_request) else {
+    let Some(initial_turn) = build_initial_turn_request(&InitialTurnRequest {
+        run_context: &p.run_context,
+        session_id: &p.session_id,
+        session_messages: &p.session_messages,
+        policy_enforcer: &p.policy_enforcer,
+        model: &p.model,
+        wire_api: p.wire_api,
+        provider: &p.provider,
+        effort_level: p.effort_level,
+        claude_code_token: p.claude_code_token.as_ref(),
+        prompt_blocks: p.prompt_blocks.as_ref(),
+        mcp_manager: p.mcp_manager.as_ref(),
+        tx: &p.tx,
+    })
+    .await
+    else {
         return;
     };
     match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
-        client: &client,
-        endpoint: &endpoint,
-        headers: &headers,
+        run_context: std::sync::Arc::clone(&p.run_context),
+        client: &p.client,
+        endpoint: &p.endpoint,
+        headers: &p.headers,
         request_body: &initial_turn.request_body,
-        provider: &provider,
-        memory_db: memory_db.clone(),
-        app_config: app_config.clone(),
-        permission_mgr: permission_mgr.clone(),
-        transient_allowed_tool_rules: &transient_allowed_tool_rules,
-        hook_engine: hook_engine.clone(),
-        policy_enforcer: Some(std::sync::Arc::clone(&policy_enforcer)),
-        task_mgr: task_mgr.clone(),
-        session_id: Some(session_id.clone()),
-        tx: tx.clone(),
+        provider: &p.provider,
+        model_identity: &p.model,
+        memory_db: p.memory_db.clone(),
+        app_config: p.app_config.clone(),
+        permission_mgr: p.permission_mgr.clone(),
+        transient_allowed_tool_rules: &p.transient_allowed_tool_rules,
+        hook_engine: p.hook_engine.clone(),
+        policy_enforcer: Some(std::sync::Arc::clone(&p.policy_enforcer)),
+        task_mgr: p.task_mgr.clone(),
+        session_id: Some(p.session_id.clone()),
+        tx: p.tx.clone(),
     })
     .await
     {
         Ok(turn_result) => {
             handle_turn_result(
                 turn_result,
-                session_messages,
+                p.session_messages,
                 TurnContext {
-                    client: &client,
-                    endpoint: &endpoint,
-                    headers: &headers,
-                    provider: &provider,
-                    model: &model,
-                    effort_level,
-                    wire_api,
-                    claude_code_token: claude_code_token.as_deref(),
-                    prompt_blocks: prompt_blocks.as_ref(),
-                    memory_db,
-                    app_config,
-                    permission_mgr,
-                    vdd_engine,
-                    vdd_builder_auth: &vdd_builder_auth,
-                    transient_allowed_tool_rules: &transient_allowed_tool_rules,
-                    hook_engine,
-                    policy_enforcer,
-                    task_mgr,
-                    session_id: &session_id,
+                    run_context: &p.run_context,
+                    client: &p.client,
+                    endpoint: &p.endpoint,
+                    headers: &p.headers,
+                    provider: &p.provider,
+                    model: &p.model,
+                    effort_level: p.effort_level,
+                    wire_api: p.wire_api,
+                    claude_code_token: p.claude_code_token.as_ref(),
+                    prompt_blocks: p.prompt_blocks.as_ref(),
+                    memory_db: p.memory_db,
+                    app_config: p.app_config,
+                    permission_mgr: p.permission_mgr,
+                    vdd_engine: p.vdd_engine,
+                    vdd_builder_auth: &p.vdd_builder_auth,
+                    transient_allowed_tool_rules: &p.transient_allowed_tool_rules,
+                    hook_engine: p.hook_engine,
+                    policy_enforcer: p.policy_enforcer,
+                    task_mgr: p.task_mgr,
+                    mcp_manager: p.mcp_manager,
+                    session_id: &p.session_id,
                     task_obs: initial_turn.task_obs,
-                    tx: &tx,
+                    tx: &p.tx,
                 },
             )
             .await;
         }
-        Err(e) => {
-            send_or_warn(&tx, super::events::AppEvent::ApiError(e), &session_id);
-        }
+        Err(e) => send_api_error(&p.tx, e, &p.session_id),
     }
 }
 
@@ -4219,14 +4696,15 @@ async fn run_api_turn_async(p: ApiTurnParams) {
 /// struct to keep `run_api_turn_async` under the line-count lint while
 /// preserving the per-iteration data each branch needs.
 struct TurnContext<'a> {
+    run_context: &'a std::sync::Arc<crate::tools::ToolRunContext>,
     client: &'a reqwest::Client,
     endpoint: &'a str,
-    headers: &'a [(String, String)],
+    headers: &'a crate::secrets::SensitiveHeaders,
     provider: &'a str,
     model: &'a str,
     effort_level: EffortLevel,
     wire_api: crate::pipeline::WireApi,
-    claude_code_token: Option<&'a str>,
+    claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
@@ -4237,6 +4715,7 @@ struct TurnContext<'a> {
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
+    mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     session_id: &'a str,
     task_obs: Option<crate::ledger::ObsId>,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
@@ -4249,7 +4728,7 @@ struct TurnContext<'a> {
 /// partial in-flight state is persisted instead of silently dropped.
 async fn handle_turn_result(
     turn_result: crate::pipeline::TurnResult,
-    mut session_messages: Vec<serde_json::Value>,
+    session_messages: Vec<serde_json::Value>,
     ctx: TurnContext<'_>,
 ) {
     tracing::debug!(
@@ -4259,83 +4738,112 @@ async fn handle_turn_result(
         "Turn result"
     );
     if turn_result.needs_followup {
-        let asst = crate::pipeline::build_assistant_message_with_tools(
-            &turn_result.content,
-            turn_result.reasoning_content.as_deref(),
-            &turn_result.tool_calls,
-            ctx.provider,
-        );
-        session_messages.push(asst);
-        session_messages.extend(turn_result.tool_results.iter().cloned());
-        tracing::info!(
-            tool_count = turn_result.tool_calls.len(),
-            result_count = turn_result.tool_results.len(),
-            "Starting agentic follow-up loop"
-        );
-        let agentic = AgenticCtx {
-            client: ctx.client,
-            endpoint: ctx.endpoint,
-            headers: ctx.headers,
-            provider: ctx.provider,
-            model: ctx.model,
-            effort_level: ctx.effort_level.as_str(),
-            wire_api: ctx.wire_api,
-            claude_code_token: ctx.claude_code_token,
-            prompt_blocks: ctx.prompt_blocks,
-            memory_db: ctx.memory_db.clone(),
-            app_config: ctx.app_config.clone(),
-            permission_mgr: ctx.permission_mgr.clone(),
-            transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
-            hook_engine: ctx.hook_engine.clone(),
-            policy_enforcer: std::sync::Arc::clone(&ctx.policy_enforcer),
-            task_mgr: ctx.task_mgr.clone(),
-            session_id: ctx.session_id,
-            task_obs: ctx.task_obs,
-            tx: ctx.tx,
-        };
-        run_agentic_loop(&agentic, &mut session_messages).await;
-        if let Some(content) =
-            latest_assistant_message_content(&session_messages).map(str::to_string)
-        {
-            run_tui_vdd_review(&ctx, &content, &mut session_messages).await;
-        }
-        send_or_warn(
-            ctx.tx,
-            super::events::AppEvent::SyncMessages(session_messages),
-            ctx.session_id,
-        );
-        send_or_warn(
-            ctx.tx,
-            super::events::AppEvent::ResponseDone,
-            ctx.session_id,
-        );
+        handle_followup_turn(turn_result, session_messages, &ctx).await;
     } else if !turn_result.content.is_empty() {
-        let Some(rendered_content) =
-            render_final_response_for_history(ctx.session_id, &turn_result.content)
-        else {
+        handle_direct_turn(turn_result, session_messages, &ctx).await;
+    }
+}
+
+async fn handle_followup_turn(
+    turn_result: crate::pipeline::TurnResult,
+    mut session_messages: Vec<serde_json::Value>,
+    ctx: &TurnContext<'_>,
+) {
+    let assistant = crate::pipeline::build_assistant_message_with_tools(
+        &turn_result.content,
+        turn_result.reasoning_content.as_deref(),
+        &turn_result.tool_calls,
+        ctx.provider,
+    );
+    session_messages.push(assistant);
+    session_messages.extend(turn_result.tool_results.iter().cloned());
+    tracing::info!(
+        tool_count = turn_result.tool_calls.len(),
+        result_count = turn_result.tool_results.len(),
+        "Starting agentic follow-up loop"
+    );
+    let agentic = AgenticCtx {
+        run_context: ctx.run_context,
+        client: ctx.client,
+        endpoint: ctx.endpoint,
+        headers: ctx.headers,
+        provider: ctx.provider,
+        model: ctx.model,
+        effort_level: ctx.effort_level.as_str(),
+        wire_api: ctx.wire_api,
+        claude_code_token: ctx.claude_code_token,
+        prompt_blocks: ctx.prompt_blocks,
+        memory_db: ctx.memory_db.clone(),
+        app_config: ctx.app_config.clone(),
+        permission_mgr: ctx.permission_mgr.clone(),
+        transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
+        hook_engine: ctx.hook_engine.clone(),
+        policy_enforcer: std::sync::Arc::clone(&ctx.policy_enforcer),
+        task_mgr: ctx.task_mgr.clone(),
+        mcp_manager: ctx.mcp_manager.as_ref(),
+        session_id: ctx.session_id,
+        task_obs: ctx.task_obs,
+        tx: ctx.tx,
+    };
+    run_agentic_loop(&agentic, &mut session_messages).await;
+    if let Some(content) = latest_assistant_message_content(&session_messages).map(str::to_string) {
+        run_tui_vdd_review(ctx, &content, &mut session_messages).await;
+    }
+    send_or_warn(
+        ctx.tx,
+        super::events::AppEvent::SyncMessages(session_messages),
+        ctx.session_id,
+    );
+    send_or_warn(
+        ctx.tx,
+        super::events::AppEvent::ResponseDone,
+        ctx.session_id,
+    );
+}
+
+async fn handle_direct_turn(
+    turn_result: crate::pipeline::TurnResult,
+    mut session_messages: Vec<serde_json::Value>,
+    ctx: &TurnContext<'_>,
+) {
+    let rendered_content = match render_final_response_for_history(
+        ctx.run_context,
+        ctx.session_id,
+        &turn_result.content,
+        ctx.model,
+    ) {
+        Ok(rendered) => rendered,
+        Err(reason) => {
+            send_or_warn(
+                ctx.tx,
+                super::events::AppEvent::ApiError(
+                    format!("Final answer failed grounding gate: {reason}").into(),
+                ),
+                ctx.session_id,
+            );
             send_or_warn(
                 ctx.tx,
                 super::events::AppEvent::ResponseDone,
                 ctx.session_id,
             );
             return;
-        };
-        let mut message = serde_json::json!({ "role": "assistant", "content": rendered_content });
-        if let Some(reasoning) = turn_result
-            .reasoning_content
-            .as_deref()
-            .filter(|text| !text.is_empty())
-        {
-            message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
         }
-        session_messages.push(message);
-        run_tui_vdd_review(&ctx, &rendered_content, &mut session_messages).await;
-        send_or_warn(
-            ctx.tx,
-            super::events::AppEvent::SyncMessages(session_messages),
-            ctx.session_id,
-        );
+    };
+    let mut message = serde_json::json!({ "role": "assistant", "content": rendered_content });
+    if let Some(reasoning) = turn_result
+        .reasoning_content
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
     }
+    session_messages.push(message);
+    run_tui_vdd_review(ctx, &rendered_content, &mut session_messages).await;
+    send_or_warn(
+        ctx.tx,
+        super::events::AppEvent::SyncMessages(session_messages),
+        ctx.session_id,
+    );
 }
 
 async fn run_tui_vdd_review(
@@ -4363,7 +4871,10 @@ async fn run_tui_vdd_review(
         .unwrap_or_default()
         .to_string();
     let builder = crate::vdd::BuilderProvider::with_auth(ctx.provider, ctx.vdd_builder_auth);
-    match engine.review_text(content, &user_task, builder).await {
+    match engine
+        .review_text(ctx.run_context, content, &user_task, builder)
+        .await
+    {
         Ok(result) => {
             let genuine_count = result
                 .findings
@@ -4387,11 +4898,12 @@ async fn run_tui_vdd_review(
                 },
                 ctx.session_id,
             );
-            if !result.context_injection.is_empty() {
-                session_messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": format!("<vdd-review>\n{}\n</vdd-review>", result.context_injection),
-                }));
+            if let Some(observation) = result.context_observation {
+                let projection = crate::context::ContextProjector::project(
+                    vec![observation],
+                    crate::context::ContextBudget::default(),
+                );
+                projection.append_reference_to_json_messages(session_messages);
             }
         }
         Err(error) => {
@@ -4435,11 +4947,11 @@ fn parse_prompt_effort_level(effort: &str) -> Option<EffortLevel> {
 mod tests {
     use super::{compile_file_ref_regex, expand_file_refs};
     use super::{
-        current_exe_command, format_api_retry_delay, format_api_retry_message,
-        format_init_command_output, format_review_command_output, format_stream_timeout_message,
-        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, read_tui_session_file,
-        resolve_provider_switch_auth, save_session, ApiClient, App, AppEvent, EffortLevel,
-        MessageKind, ProviderSwitch, SpawnTarget, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
+        format_api_retry_delay, format_api_retry_message, format_review_command_output,
+        format_stream_timeout_message, git_bin, handle_turn_result, list_sessions,
+        lookup_tui_slash, read_tui_session_file, resolve_provider_switch_auth, save_session,
+        ApiClient, App, AppEvent, EffortLevel, MessageKind, ProviderSwitch, SpawnTarget,
+        TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
     };
     use crate::slash_commands::all_tui_commands;
     use crate::state::Session;
@@ -4475,32 +4987,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tui_init_uses_current_executable_path() {
-        let cmd = current_exe_command().expect("current executable must resolve in tests");
-        assert!(
-            std::path::Path::new(cmd.get_program()).is_absolute(),
-            "current executable command must use an absolute path, got {:?}",
-            cmd.get_program()
-        );
-
-        let src = include_str!("app.rs");
-        let cfg_test = src
-            .find("#[cfg(test)]")
-            .expect("test module marker must be present");
-        let production = &src[..cfg_test];
-
-        for (idx, raw_line) in production.lines().enumerate() {
-            let code = raw_line.split("//").next().unwrap_or("");
-            assert!(
-                !code.contains("Command::new(\"openclaudia\")")
-                    && !code.contains("std::process::Command::new(\"openclaudia\")"),
-                "production TUI app code must not invoke bare openclaudia; line {n}: {raw_line}",
-                n = idx + 1,
-            );
-        }
-    }
-
     #[cfg(unix)]
     fn output_with_status(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt as _;
@@ -4510,49 +4996,6 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tui_init_output_uses_stderr_on_success() {
-        let output = output_with_status(
-            0,
-            "",
-            "Initialized OpenClaudia configuration in .openclaudia/\nSet your API key",
-        );
-
-        let rendered = format_init_command_output(&output);
-
-        assert!(rendered.contains("Initialized OpenClaudia configuration"));
-        assert!(rendered.contains("Set your API key"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tui_init_output_reports_nonzero_status() {
-        let output = output_with_status(
-            1,
-            "",
-            "Configuration already exists. Use --force to overwrite.",
-        );
-
-        let rendered = format_init_command_output(&output);
-
-        assert!(rendered.starts_with("Init failed:"));
-        assert!(rendered.contains("Configuration already exists"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tui_init_output_never_renders_blank_on_silent_success() {
-        let output = output_with_status(0, "", "");
-
-        let rendered = format_init_command_output(&output);
-
-        assert_eq!(
-            rendered,
-            "Initialized OpenClaudia configuration in .openclaudia/"
-        );
     }
 
     #[cfg(unix)]
@@ -4747,6 +5190,29 @@ mod tests {
     }
 
     #[test]
+    fn tui_doctor_uses_shared_receipts_without_transport_details() {
+        let mut app = App::new("doctor-model-canary", "local");
+        app.api_client.endpoint = "https://doctor-endpoint-canary.invalid".to_string();
+        app.api_client
+            .headers
+            .insert_literal("x-doctor-secret", "doctor-header-canary".to_string())
+            .expect("test header");
+
+        app.handle_slash_doctor();
+
+        let message = app.messages.messages.last().expect("doctor message");
+        assert!(message.content.contains("evidence.registry"));
+        assert!(message.content.contains("runtime.context"));
+        assert!(message.content.contains("runtime.provider_transport"));
+        assert!(message
+            .content
+            .contains("runtime.provider_transport.composed"));
+        assert!(!message.content.contains("doctor-model-canary"));
+        assert!(!message.content.contains("doctor-endpoint-canary"));
+        assert!(!message.content.contains("doctor-header-canary"));
+    }
+
+    #[test]
     fn app_constructors_do_not_load_config_from_disk() {
         let src = include_str!("app.rs");
         let constructor_start = src
@@ -4925,7 +5391,7 @@ mod tests {
             api_key: None,
             base_url: base_url.to_string(),
             model: None,
-            headers: std::collections::HashMap::new(),
+            headers: crate::secrets::SensitiveHeaders::new(),
             thinking: crate::config::ThinkingConfig::default(),
         }
     }
@@ -4937,32 +5403,45 @@ mod tests {
         path
     }
 
-    fn seed_valid_final_ledger(session_id: &str) -> String {
+    fn seed_valid_final_ledger(session_id: &str) -> (String, Arc<crate::tools::ToolRunContext>) {
+        let run = crate::tools::security::test_run_context_for(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )));
         let mut ledger = crate::ledger::RealityLedger::open_project_session(session_id)
             .expect("open test ledger");
-        let task = ledger
-            .observe_user_task("Audit direct TUI final.")
-            .expect("task");
-        let command = ledger
-            .observe_command_run(
-                "/repo",
-                vec!["cargo".to_string(), "check".to_string()],
-                0,
-                "ok",
-                "",
-            )
-            .expect("command");
-        let verification = ledger
-            .append(
-                crate::ledger::Authority::Verifier,
-                crate::ledger::ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo check".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        format!("Verified direct TUI final using [{task}] [{command}] [{verification}].")
+        let diff = ledger
+            .observe_diff(&run, vec!["src/tui/app.rs".to_string()], "patch")
+            .expect("diff");
+        let config = crate::config::GuardrailsConfig {
+            quality_gates: Some(crate::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![crate::config::QualityCheck {
+                    name: "tui-check".to_string(),
+                    command: "sh -c 'exit 0'".to_string(),
+                    required: true,
+                }],
+                ..crate::config::QualityGatesConfig::default()
+            }),
+            ..crate::config::GuardrailsConfig::default()
+        };
+        crate::guardrails::configure(&run, &config).expect("configure gate");
+        let gate = crate::guardrails::run_quality_gates(&run, "gpt-test")
+            .into_iter()
+            .next()
+            .expect("gate result");
+        let verification =
+            crate::grounded_loop::append_quality_gate_observations(&run, &mut ledger, &gate)
+                .expect("gate receipts")
+                .verification;
+        let content = serde_json::json!({
+            "kind":"final",
+            "claims":[
+                {"claim_type":"file_change", "path":"src/tui/app.rs", "evidence":[diff]},
+                {"claim_type":"verification", "check":"tui-check", "passed":true, "evidence":[verification]}
+            ]
+        })
+        .to_string();
+        (content, run)
     }
 
     fn direct_turn_result(content: String) -> crate::pipeline::TurnResult {
@@ -4978,27 +5457,34 @@ mod tests {
     }
 
     #[test]
-    fn live_structured_final_display_renders_summary_only() {
+    fn live_structured_final_display_validates_before_claim_projection() {
+        let session_id = "tui-live-structured-final-summary";
+        let ledger_path = reset_project_ledger(session_id);
         let content = serde_json::json!({
             "kind": "final",
-            "summary": "Hello - I'm Claudia. What would you like to work on?",
-            "evidence": ["a20e1686-5990-4f06-a09d-226c5e6778ac"],
-            "verification": []
+            "claims": [{
+                "claim_type":"unsupported",
+                "statement":"Hello - I'm Claudia. What would you like to work on?",
+                "reason":"Greeting does not assert an observed runtime fact."
+            }]
         })
         .to_string();
 
         let rendered = super::render_live_final_response_for_display(
-            "tui-live-structured-final-summary",
+            crate::tools::security::test_run_context(),
+            session_id,
             &content,
+            "test-model",
         )
-        .expect("structured final summary should render");
+        .expect("validated structured final should render");
 
         assert_eq!(
             rendered,
-            "Hello - I'm Claudia. What would you like to work on?"
+            "Unsupported claim \"Hello - I'm Claudia. What would you like to work on?\"; reason \"Greeting does not assert an observed runtime fact.\"."
         );
         assert!(!rendered.contains("\"evidence\""));
         assert!(!rendered.contains("\"verification\""));
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     #[test]
@@ -5007,26 +5493,35 @@ mod tests {
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
         let mut app = App::new("gpt-5.5", "openai");
         app.is_waiting = true;
-        app.messages.append_streaming(
+        app.append_streaming_for_display(
             &serde_json::json!({
                 "kind": "final",
-                "summary": "Hello - I'm Claudia.",
-                "evidence": ["a20e1686-5990-4f06-a09d-226c5e6778ac"],
-                "verification": []
+                "claims": [{
+                    "claim_type":"unsupported",
+                    "statement":"Hello - I'm Claudia.",
+                    "reason":"Greeting."
+                }]
             })
             .to_string(),
+        );
+        assert!(
+            app.messages.streaming_text.is_empty(),
+            "unvalidated structured claims must stay hidden while streaming"
         );
 
         app.handle_response_done();
 
         let last = app.messages.messages.last().expect("assistant message");
         assert_eq!(last.kind, MessageKind::Assistant);
-        assert_eq!(last.content, "Hello - I'm Claudia.");
+        assert_eq!(
+            last.content,
+            "Unsupported claim \"Hello - I'm Claudia.\"; reason \"Greeting.\"."
+        );
         assert!(!last.content.contains("\"kind\""));
     }
 
     #[test]
-    fn streamed_structured_final_never_displays_raw_json() {
+    fn streamed_structured_final_stays_hidden_until_response_done() {
         let mut app = App::new("gpt-5.5", "openai");
         app.append_streaming_for_display("{\"kind\"");
 
@@ -5035,11 +5530,26 @@ mod tests {
         assert!(app.streaming_raw_text.contains("\"kind\""));
 
         app.append_streaming_for_display(
-            ":\"final\",\"summary\":\"Hello - I'm Claudia.\",\"evidence\":[\"a20e1686-5990-4f06-a09d-226c5e6778ac\"],\"verification\":[]}",
+            ":\"final\",\"claims\":[{\"claim_type\":\"unsupported\",\"statement\":\"Hello - I'm Claudia.\",\"reason\":\"Greeting.\"}]}",
         );
 
-        assert_eq!(app.messages.streaming_text, "Hello - I'm Claudia.");
-        assert!(!app.messages.streaming_text.contains("\"evidence\""));
+        assert!(app.messages.streaming_text.is_empty());
+        assert!(app.streaming_raw_text.contains("unsupported"));
+    }
+
+    #[test]
+    fn streamed_plain_final_stays_hidden_and_is_removed_at_response_done() {
+        let mut app = App::new("gpt-5.5", "openai");
+        app.is_waiting = true;
+        app.append_streaming_for_display("Verified with cargo test.");
+
+        assert!(app.messages.streaming_text.is_empty());
+        app.handle_response_done();
+
+        assert!(app.messages.messages.iter().all(|message| {
+            message.kind != MessageKind::Assistant
+                || !message.content.contains("Verified with cargo test")
+        }));
     }
 
     #[test]
@@ -5060,12 +5570,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tui_direct_plain_final_syncs_without_grounding_citations() {
+    async fn tui_direct_plain_final_denial_is_surfaced_and_not_persisted() {
         let session_id = "tui-direct-final-plain-text";
         let ledger_path = reset_project_ledger(session_id);
         let (tx, rx) = mpsc::channel();
         let client = reqwest::Client::new();
-        let headers: Vec<(String, String)> = Vec::new();
+        let headers = crate::secrets::SensitiveHeaders::new();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
         let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             crate::services::policy::EnterprisePolicy::default(),
@@ -5075,6 +5585,7 @@ mod tests {
             direct_turn_result("Verified with cargo check.".to_string()),
             vec![serde_json::json!({"role":"user","content":"verify this"})],
             TurnContext {
+                run_context: crate::tools::security::test_run_context(),
                 client: &client,
                 endpoint: "https://example.invalid",
                 headers: &headers,
@@ -5088,6 +5599,7 @@ mod tests {
                 app_config: None,
                 permission_mgr: None,
                 vdd_engine: None,
+                mcp_manager: None,
                 vdd_builder_auth: &crate::vdd::VddProviderAuth::None,
                 transient_allowed_tool_rules: &[],
                 hook_engine: None,
@@ -5111,11 +5623,10 @@ mod tests {
         }
         let _ = std::fs::remove_file(ledger_path);
 
-        assert!(!saw_error, "plain direct final must not be rejected");
-        let messages = synced_messages.expect("plain direct final should sync messages");
-        assert_eq!(
-            messages.last().and_then(|msg| msg.get("content")),
-            Some(&serde_json::json!("Verified with cargo check."))
+        assert!(saw_error, "final gate denial must be surfaced to the user");
+        assert!(
+            synced_messages.is_none(),
+            "plain direct final must not be persisted as an assistant result"
         );
     }
 
@@ -5123,10 +5634,10 @@ mod tests {
     async fn tui_direct_final_accepts_cited_evidence_and_verification() {
         let session_id = "tui-direct-final-accepted";
         let ledger_path = reset_project_ledger(session_id);
-        let content = seed_valid_final_ledger(session_id);
+        let (content, run) = seed_valid_final_ledger(session_id);
         let (tx, rx) = mpsc::channel();
         let client = reqwest::Client::new();
-        let headers: Vec<(String, String)> = Vec::new();
+        let headers = crate::secrets::SensitiveHeaders::new();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
         let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             crate::services::policy::EnterprisePolicy::default(),
@@ -5136,6 +5647,7 @@ mod tests {
             direct_turn_result(content.clone()),
             vec![serde_json::json!({"role":"user","content":"verify this"})],
             TurnContext {
+                run_context: &run,
                 client: &client,
                 endpoint: "https://example.invalid",
                 headers: &headers,
@@ -5149,6 +5661,7 @@ mod tests {
                 app_config: None,
                 permission_mgr: None,
                 vdd_engine: None,
+                mcp_manager: None,
                 vdd_builder_auth: &crate::vdd::VddProviderAuth::None,
                 transient_allowed_tool_rules: &[],
                 hook_engine: None,
@@ -5180,7 +5693,9 @@ mod tests {
         );
         assert_eq!(
             messages.last().and_then(|msg| msg.get("content")),
-            Some(&serde_json::json!(content))
+            Some(&serde_json::json!(
+                "Changed file \"src/tui/app.rs\".\nVerification check \"tui-check\": passed."
+            ))
         );
     }
 
@@ -5218,24 +5733,28 @@ mod tests {
     #[test]
     fn set_api_config_threads_through_api_client() {
         let mut app = App::new("test-model", "anthropic");
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers
+            .insert_literal("x-api-key", "secret".to_string())
+            .expect("test header");
         app.set_api_config(
             "https://example.com/v1".to_string(),
-            vec![("x-api-key".to_string(), "secret".to_string())],
+            headers,
             crate::pipeline::WireApi::OpenAiResponses,
-            "system prompt".to_string(),
             None,
-            Some("oauth-token".to_string()),
+            Some(
+                crate::secrets::OAuthToken::try_from_string("oauth-token".to_string())
+                    .expect("test token"),
+            ),
         );
         assert_eq!(app.api_client.endpoint, "https://example.com/v1");
-        assert_eq!(
-            app.api_client.headers,
-            vec![("x-api-key".to_string(), "secret".to_string())]
-        );
-        assert_eq!(app.system_prompt, "system prompt");
-        assert_eq!(
-            app.api_client.claude_code_token.as_deref(),
-            Some("oauth-token")
-        );
+        assert!(app.api_client.headers.matches_value("x-api-key", "secret"));
+        assert!(app.api_client.prompt_blocks.is_none());
+        assert!(app
+            .api_client
+            .claude_code_token
+            .as_ref()
+            .is_some_and(|token| token.matches("oauth-token")));
         assert_eq!(
             app.api_client.wire_api,
             crate::pipeline::WireApi::OpenAiResponses
@@ -5246,28 +5765,55 @@ mod tests {
     fn apply_provider_switch_updates_metadata_and_transport() {
         let mut app = App::new("old-model", "anthropic");
         let original_session_id = app.chat_session.id();
-        let blocks = crate::prompt::SystemPromptBlocks {
-            stable_prefix: "stable".to_string(),
-            dynamic_suffix: "dynamic".to_string(),
-        };
+        let original_run = app.tool_run_context().expect("original run");
+        let blocks = crate::prompt::SystemPromptBlocks::from_items(
+            vec![
+                crate::context::ContextItem::host_instruction(
+                    "test.stable",
+                    crate::context::HostInstructionSource::CorePolicy,
+                    "compiled:test",
+                    "stable",
+                    crate::context::ContextFreshness::Static,
+                    1,
+                ),
+                crate::context::ContextItem::host_instruction(
+                    "test.dynamic",
+                    crate::context::HostInstructionSource::RuntimePolicy,
+                    "host:test",
+                    "dynamic",
+                    crate::context::ContextFreshness::Turn,
+                    2,
+                ),
+            ],
+            crate::context::ContextBudget::default(),
+        );
+        let mut old_headers = crate::secrets::SensitiveHeaders::new();
+        old_headers
+            .insert_literal("x-api-key", "old-key".to_string())
+            .expect("header");
+        let old_token =
+            crate::secrets::OAuthToken::try_from_string("oauth-token".to_string()).expect("token");
         app.set_api_config(
             "https://old.example/v1/messages".to_string(),
-            vec![("x-api-key".to_string(), "old-key".to_string())],
+            old_headers,
             crate::pipeline::WireApi::ChatCompletions,
-            "system prompt".to_string(),
             Some(blocks.clone()),
-            Some("oauth-token".to_string()),
+            Some(old_token),
         );
 
+        let mut switched_headers = crate::secrets::SensitiveHeaders::new();
+        switched_headers
+            .insert_literal("Authorization", "Bearer kimi-key".to_string())
+            .expect("header");
         app.apply_provider_switch(ProviderSwitch {
             provider: "kimi".to_string(),
             model: "kimi-k2.7-code".to_string(),
             endpoint: "https://api.moonshot.ai/v1/chat/completions".to_string(),
-            headers: vec![("Authorization".to_string(), "Bearer kimi-key".to_string())],
+            headers: switched_headers.clone(),
             wire_api: crate::pipeline::WireApi::ChatCompletions,
             claude_code_token: None,
             vdd_builder_auth: crate::vdd::VddProviderAuth::None,
-            prompt_blocks: Some(blocks.clone()),
+            prompt_blocks: Some(blocks),
         });
 
         assert_eq!(app.provider, "kimi");
@@ -5275,27 +5821,30 @@ mod tests {
         assert_eq!(app.chat_session.id(), original_session_id);
         assert_eq!(app.chat_session.provider, "kimi");
         assert_eq!(app.chat_session.model, "kimi-k2.7-code");
+        let switched_run = app.tool_run_context().expect("switched run");
+        assert_ne!(switched_run.run_id(), original_run.run_id());
+        assert!(original_run.runtime().cancellation().is_cancelled());
+        assert_eq!(switched_run.session_id(), original_session_id);
         assert_eq!(
             app.api_client.endpoint,
             "https://api.moonshot.ai/v1/chat/completions"
         );
-        assert_eq!(
-            app.api_client.headers,
-            vec![("Authorization".to_string(), "Bearer kimi-key".to_string())]
-        );
+        assert_eq!(app.api_client.headers, switched_headers);
         assert!(app.api_client.claude_code_token.is_none());
         assert_eq!(app.vdd_builder_auth, crate::vdd::VddProviderAuth::None);
         assert_eq!(
             app.api_client.wire_api,
             crate::pipeline::WireApi::ChatCompletions
         );
-        assert_eq!(
-            app.api_client
-                .prompt_blocks
-                .as_ref()
-                .map(crate::prompt::SystemPromptBlocks::to_combined),
-            Some(blocks.to_combined())
-        );
+        let rebound_prompt = app
+            .api_client
+            .prompt_blocks
+            .as_ref()
+            .expect("provider switch must rebuild run-scoped prompt context");
+        assert!(rebound_prompt.reference_context().contains(&format!(
+            "Working directory: {}",
+            switched_run.working_directory().display()
+        )));
         assert!(
             app.messages
                 .messages
@@ -5566,6 +6115,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_shell_uses_exact_run_cwd_and_environment() {
+        let root = tempfile::tempdir_in(".").expect("TUI shell root");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::from([(
+                    "S019_TUI_ENV".to_string(),
+                    "exact".to_string(),
+                )]))
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .provider("tui-shell-environment-test")
+                .build()
+                .expect("explicit TUI shell run");
+        let expected_cwd = run.working_directory().to_string_lossy().into_owned();
+        let mut app = App::new("test-model", "test-provider");
+        app.run_context = Ok(run);
+        let rx = wire_app(&mut app);
+        let ungranted = "S019_TUI_UNGRANTED";
+        let command =
+            format!("printf '%s|%s|' \"$S019_TUI_ENV\" \"${{{ungranted}:-missing}}\"; pwd");
+
+        let join = app
+            .spawn_shell(vec!["bash", "-c", &command], SpawnTarget::Diff)
+            .expect("run-bound TUI shell task");
+        join.await.expect("TUI shell task panicked");
+
+        let (_, stdout, stderr, exit_code) =
+            recv_shell_done(&rx, Duration::from_millis(500)).expect("TUI shell result");
+        assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+        assert_eq!(stdout.trim(), format!("exact|missing|{expected_cwd}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_shell_failure_delivers_nonzero_exit() {
         // `bash -c 'exit 7'` exits with code 7. ShellDone must surface
         // exit_code = Some(7) so the renderer picks the ToolErr branch.
@@ -5597,6 +6183,9 @@ mod tests {
     async fn spawn_shell_command_records_ledger_observation() {
         let mut app = App::new("test-model", "test-provider");
         let rx = wire_app(&mut app);
+        let run = Arc::clone(app.run_context.as_ref().expect("TUI run context"));
+        let freshness_before =
+            crate::evidence_freshness::current_stamp(&run).expect("capture freshness before shell");
         let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
         let _guard =
             crate::ledger::install_active_ledger_for_session(app.chat_session.id(), ledger.clone());
@@ -5625,7 +6214,19 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        let freshness_after =
+            crate::evidence_freshness::current_stamp(&run).expect("capture freshness after shell");
+        assert_eq!(
+            freshness_after.workspace_generation,
+            freshness_before.workspace_generation + 1,
+            "arbitrary TUI shell execution must advance workspace freshness"
+        );
         assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].provenance.freshness.as_ref(),
+            Some(&freshness_after),
+            "command receipt must bind the post-execution freshness generation"
+        );
         assert!(observations.iter().any(|obs| {
             matches!(
                 &obs.kind,
@@ -5681,7 +6282,10 @@ mod tests {
         // Fast path: no '@' in input — function returns immediately without
         // touching the regex.  Output must equal the input exactly.
         let input = "hello world, no references here";
-        assert_eq!(expand_file_refs(input), input);
+        assert_eq!(
+            expand_file_refs(crate::tools::security::test_run_context(), input),
+            input
+        );
     }
 
     #[test]
@@ -5712,6 +6316,24 @@ mod tests {
     }
 
     #[test]
+    fn expand_file_refs_cannot_read_a_foreign_run_root() {
+        let owner_root = tempfile::tempdir_in(".").expect("owner root");
+        let foreign_root = tempfile::tempdir_in(".").expect("foreign root");
+        let foreign_file = foreign_root.path().join("secret.txt");
+        std::fs::write(&foreign_file, "S019-TUI-FOREIGN-SECRET").expect("foreign fixture");
+        let run = crate::tools::security::test_run_context_for(owner_root.path());
+        let input = format!("inspect @\"{}\"", foreign_file.display());
+
+        let expanded = expand_file_refs(&run, &input);
+
+        assert!(!expanded.contains("S019-TUI-FOREIGN-SECRET"));
+        assert!(
+            expanded.contains("outside granted roots"),
+            "foreign reference must fail at the run capability boundary: {expanded}"
+        );
+    }
+
+    #[test]
     fn invalid_file_ref_regex_is_skipped() {
         assert!(compile_file_ref_regex("[").is_none());
     }
@@ -5720,24 +6342,26 @@ mod tests {
     fn expand_file_refs_double_at_does_not_panic() {
         // Regression guard for the old `.unwrap()` on cap.get(0): a bare '@@'
         // or '@ @' must not panic regardless of whether the regex matches.
-        let _ = expand_file_refs("@@");
-        let _ = expand_file_refs("@ @");
-        let _ = expand_file_refs("email@example.com and @another");
+        let run = crate::tools::security::test_run_context();
+        let _ = expand_file_refs(run, "@@");
+        let _ = expand_file_refs(run, "@ @");
+        let _ = expand_file_refs(run, "email@example.com and @another");
     }
 
     #[test]
     fn expand_file_refs_unclosed_quote_does_not_panic() {
         // A `@"` with no closing quote must not panic — the regex simply won't
         // match group 1, and the `if let Some` guard skips it cleanly.
-        let _ = expand_file_refs(r#"@"unclosed"#);
-        let _ = expand_file_refs(r#"some text @"no end here and more text"#);
+        let run = crate::tools::security::test_run_context();
+        let _ = expand_file_refs(run, r#"@"unclosed"#);
+        let _ = expand_file_refs(run, r#"some text @"no end here and more text"#);
     }
 
     #[test]
     fn expand_file_refs_many_at_signs_does_not_panic() {
         // Stress: 1 000 '@' characters in a row must not panic or overflow.
         let input = "@".repeat(1_000);
-        let _ = expand_file_refs(&input);
+        let _ = expand_file_refs(crate::tools::security::test_run_context(), &input);
     }
 
     // =========================================================================
@@ -5803,18 +6427,20 @@ mod tests {
 
     #[test]
     fn startup_resume_loads_most_recent_saved_session() {
+        const OLDER_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const NEWER_ID: &str = "22222222-2222-4222-8222-222222222222";
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut older = Session::new("old-model", "old-provider");
-        older.set_id("older-session".to_string());
+        let mut older = Session::new("old-model", "initial-provider");
+        older.set_id(OLDER_ID.to_string());
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
         older.push_message(serde_json::json!({"role": "user", "content": "older"}));
 
-        let mut newer = Session::new("new-model", "new-provider");
-        newer.set_id("newer-session".to_string());
+        let mut newer = Session::new("new-model", "initial-provider");
+        newer.set_id(NEWER_ID.to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
@@ -5828,9 +6454,18 @@ mod tests {
         let mut state_events = app.chat_session.state_store().subscribe_log_lag();
         app.apply_startup_resume(true, None);
 
-        assert_eq!(app.chat_session.id(), "newer-session");
+        assert_eq!(
+            app.chat_session.id(),
+            NEWER_ID,
+            "resume diagnostics: {:?}",
+            app.messages
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(app.model, "new-model");
-        assert_eq!(app.provider, "new-provider");
+        assert_eq!(app.provider, "initial-provider");
         assert_eq!(app.chat_session.messages_snapshot()[0]["content"], "newer");
         assert!(matches!(
             state_events.try_recv(),
@@ -5838,23 +6473,25 @@ mod tests {
                 from,
                 to,
                 from_messages: 0,
-            }) if from.as_str() == initial_id && to.as_str() == "newer-session"
+            }) if from.as_str() == initial_id && to.as_str() == NEWER_ID
         ));
     }
 
     #[test]
     fn startup_session_id_takes_precedence_over_resume() {
+        const OLDER_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const NEWER_ID: &str = "22222222-2222-4222-8222-222222222222";
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut older = Session::new("old-model", "old-provider");
-        older.set_id("older-session".to_string());
+        let mut older = Session::new("old-model", "initial-provider");
+        older.set_id(OLDER_ID.to_string());
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
 
-        let mut newer = Session::new("new-model", "new-provider");
-        newer.set_id("newer-session".to_string());
+        let mut newer = Session::new("new-model", "initial-provider");
+        newer.set_id(NEWER_ID.to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
@@ -5863,10 +6500,31 @@ mod tests {
         save_session(&newer).expect("newer session should save");
 
         let mut app = App::new("initial-model", "initial-provider");
-        app.apply_startup_resume(true, Some("older"));
+        app.apply_startup_resume(true, Some("11111111"));
 
-        assert_eq!(app.chat_session.id(), "older-session");
+        assert_eq!(app.chat_session.id(), OLDER_ID);
         assert_eq!(app.model, "old-model");
+    }
+
+    #[test]
+    fn startup_resume_rejects_a_different_provider_without_rebinding_transport() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
+        let foreign = Session::new("foreign-model", "foreign-provider");
+        let foreign_id = foreign.id();
+        save_session(&foreign).expect("foreign session should save");
+
+        let mut app = App::new("initial-model", "initial-provider");
+        let initial_id = app.chat_session.id();
+        app.apply_startup_resume(false, Some(&foreign_id));
+
+        assert_eq!(app.chat_session.id(), initial_id);
+        assert_eq!(app.provider, "initial-provider");
+        assert!(app
+            .messages
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("differs from the active provider") }));
     }
 
     #[test]

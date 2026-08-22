@@ -12,6 +12,7 @@
 //! - 2: Block the action
 
 pub mod claude_compat;
+pub mod compat_import;
 pub mod merge;
 
 // Re-export everything public from submodules
@@ -19,10 +20,27 @@ pub use claude_compat::{
     load_claude_code_hooks, load_claude_code_hooks_layered, load_claude_settings, ClaudeCodeHook,
     ClaudeCodeHookEntry, ClaudeCodeSettings, LayeredSettings,
 };
+pub use compat_import::{
+    approve_repository_hook_import, approve_repository_hook_import_at,
+    hook_import_approval_store_path, inspect_repository_hook_imports,
+    inspect_repository_hook_imports_at, load_approved_repository_hooks_at,
+    revoke_repository_hook_import, revoke_repository_hook_import_at, HookImportBoundFile,
+    HookImportDiagnostic, HookImportError, HookImportKind, HookImportProposal, HookImportReport,
+    HookImportState,
+};
 pub use merge::merge_hooks_config;
 
+/// Compose explicitly approved compatibility hooks below native host hooks.
+///
+/// Repository sources never activate merely because the files exist. Native
+/// hooks supplied by the host configuration are the final merge layer, so an
+/// imported matcher or policy cannot override them.
+#[must_use]
+pub fn load_effective_hooks(host_hooks: HooksConfig) -> HooksConfig {
+    merge::merge_host_hooks(load_claude_code_hooks(), host_hooks)
+}
+
 use crate::config::{Hook, HookEntry, HookMatcherTarget, HookPolicy, HooksConfig, SandboxMode};
-use crate::tools::is_sensitive_env;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -228,6 +246,10 @@ impl HooksConfig {
 /// Input provided to hooks via stdin
 #[derive(Debug, Clone, Serialize)]
 pub struct HookInput {
+    /// Host capability for command hooks. It is deliberately omitted from the
+    /// serialized hook payload; only the trusted harness may use it.
+    #[serde(skip)]
+    run_context: Arc<crate::tools::ToolRunContext>,
     /// The event type that triggered this hook
     pub event: HookEvent,
     /// Current working directory
@@ -250,13 +272,13 @@ pub struct HookInput {
 }
 
 impl HookInput {
+    /// Construct hook input bound to one exact immutable run capability.
     #[must_use]
-    pub fn new(event: HookEvent) -> Self {
+    pub fn for_run(run: &Arc<crate::tools::ToolRunContext>, event: HookEvent) -> Self {
         Self {
+            run_context: Arc::clone(run),
             event,
-            cwd: crate::tools::security::current_context()
-                .map(|context| context.working_directory().to_string_lossy().to_string())
-                .unwrap_or_default(),
+            cwd: run.working_directory().to_string_lossy().to_string(),
             session_id: None,
             tool_name: None,
             tool_input: None,
@@ -318,8 +340,12 @@ impl HookInput {
     }
 }
 
-fn notification_input(notification_type: &str, data: Value) -> HookInput {
-    HookInput::new(HookEvent::Notification)
+fn notification_input(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    notification_type: &str,
+    data: Value,
+) -> HookInput {
+    HookInput::for_run(run, HookEvent::Notification)
         .with_extra(
             "notification_type",
             Value::String(notification_type.to_string()),
@@ -335,12 +361,15 @@ pub struct HookOutput {
     pub decision: Option<String>,
     /// Reason for the decision
     pub reason: Option<String>,
-    /// System message to inject
+    /// Legacy hook field name. The runtime treats this as reference data;
+    /// hooks cannot create system instructions.
     #[serde(rename = "systemMessage")]
     pub system_message: Option<String>,
-    /// Modified prompt (for `UserPromptSubmit`)
+    /// Legacy prompt suggestion (for `UserPromptSubmit`). The runtime keeps
+    /// the user's original prompt and attaches this as reference data.
     pub prompt: Option<String>,
-    /// Additional context from hook (plain text output or hookSpecificOutput.additionalContext)
+    /// Reference context from hook (plain text output or
+    /// hookSpecificOutput.additionalContext).
     #[serde(rename = "additionalContext")]
     pub additional_context: Option<String>,
     /// Additional data from the hook
@@ -380,26 +409,14 @@ impl HookResult {
             errors: vec![],
         }
     }
-
-    /// Get all system messages from hook outputs
-    #[must_use]
-    pub fn system_messages(&self) -> Vec<&str> {
-        self.outputs
-            .iter()
-            .filter_map(|o| o.system_message.as_deref())
-            .collect()
-    }
-
-    /// Get modified prompt if any hook provided one
-    #[must_use]
-    pub fn modified_prompt(&self) -> Option<&str> {
-        self.outputs.iter().find_map(|o| o.prompt.as_deref())
-    }
 }
 
 /// Errors that can occur during hook execution
 #[derive(Error, Debug, Clone)]
 pub enum HookError {
+    #[error(transparent)]
+    Capability(#[from] crate::tools::ToolCapabilityError),
+
     #[error("Hook timed out after {0} seconds")]
     Timeout(u64),
 
@@ -418,6 +435,41 @@ pub enum HookError {
     /// Allowlist enforcement rejected the command's executable.
     #[error("Hook command denied by allowlist: binary '{binary}' is not in allowed_commands")]
     Denied { binary: String },
+}
+
+/// Maximum matcher source bytes accepted by the production hook engine.
+pub const MAX_HOOK_MATCHER_BYTES: usize = 1024;
+
+/// Compile and evaluate one hook matcher without executing a hook or consulting
+/// ambient hook configuration.
+///
+/// This is the pure matcher boundary shared by normal hook admission and the
+/// hermetic fuzz harness. Event-specific fail-open/fail-closed policy remains
+/// in [`HookEngine`]; callers receive the typed compile/limit error here.
+///
+/// # Errors
+///
+/// Returns [`HookError::InvalidMatcher`] for empty, oversized, or invalid regex
+/// patterns.
+pub fn validate_hook_matcher(pattern: &str, context: &str) -> Result<bool, HookError> {
+    const MAX_REGEX_SIZE: usize = 10 * 1024;
+
+    if pattern.is_empty() {
+        return Err(HookError::InvalidMatcher("Empty pattern".to_string()));
+    }
+    if pattern.len() > MAX_HOOK_MATCHER_BYTES {
+        return Err(HookError::InvalidMatcher(format!(
+            "Pattern too long ({} bytes, max {})",
+            pattern.len(),
+            MAX_HOOK_MATCHER_BYTES
+        )));
+    }
+
+    RegexBuilder::new(pattern)
+        .size_limit(MAX_REGEX_SIZE)
+        .build()
+        .map(|regex| regex.is_match(context))
+        .map_err(|error| HookError::InvalidMatcher(error.to_string()))
 }
 
 /// Callback for executing model hooks via a provider adapter.
@@ -465,6 +517,7 @@ impl HookEngine {
     /// missing session IDs (tests / one-shot invocations).
     pub async fn fire_post_tool(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         success: bool,
         tool_name: &str,
         tool_input: serde_json::Value,
@@ -476,7 +529,7 @@ impl HookEngine {
         } else {
             HookEvent::PostToolUseFailure
         };
-        let mut input = HookInput::new(event).with_tool(tool_name, tool_input);
+        let mut input = HookInput::for_run(run, event).with_tool(tool_name, tool_input);
         if let Some(sid) = session_id {
             input = input.with_session_id(sid);
         }
@@ -584,7 +637,9 @@ impl HookEngine {
         };
         let futures: Vec<_> = hooks_to_run
             .iter()
-            .map(|(hook, timeout_secs)| self.run_hook(hook, &input_json, *timeout_secs))
+            .map(|(hook, timeout_secs)| {
+                self.run_hook(&input.run_context, hook, &input_json, *timeout_secs)
+            })
             .collect();
 
         let results = futures::future::join_all(futures).await;
@@ -723,37 +778,14 @@ impl HookEngine {
         }
     }
 
-    /// Validate regex pattern and check for match
-    /// Maximum pattern length to prevent `ReDoS` via complex expressions.
-    const MAX_PATTERN_LEN: usize = 1024;
-    /// Maximum compiled regex size (bytes) to limit pathological backtracking.
-    const MAX_REGEX_SIZE: usize = 10 * 1024; // 10KB
-
     fn validate_and_match(pattern: &str, context: &str) -> Result<bool, HookError> {
-        if pattern.is_empty() {
-            return Err(HookError::InvalidMatcher("Empty pattern".to_string()));
-        }
-        if pattern.len() > Self::MAX_PATTERN_LEN {
-            return Err(HookError::InvalidMatcher(format!(
-                "Pattern too long ({} chars, max {})",
-                pattern.len(),
-                Self::MAX_PATTERN_LEN
-            )));
-        }
-
-        match RegexBuilder::new(pattern)
-            .size_limit(Self::MAX_REGEX_SIZE)
-            .build()
-        {
-            Ok(re) => Ok(re.is_match(context)),
-            Err(e) => Err(HookError::InvalidMatcher(e.to_string())),
-        }
+        validate_hook_matcher(pattern, context)
     }
 
     /// Parse hook output — matches Claude Code behavior:
     /// - Empty output → default
     /// - Starts with '{' → try JSON parse, fall back to plain text on failure
-    /// - Anything else → treat as plain text (`additionalContext` / system-reminder)
+    /// - Anything else → treat as plain-text reference context
     fn parse_hook_output(stdout: &str) -> HookOutput {
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
@@ -802,8 +834,13 @@ impl HookEngine {
     }
 
     /// Fire a notification event with type and data.
-    pub async fn fire_notification(&self, notification_type: &str, data: Value) -> Vec<HookResult> {
-        let input = notification_input(notification_type, data);
+    pub async fn fire_notification(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        notification_type: &str,
+        data: Value,
+    ) -> Vec<HookResult> {
+        let input = notification_input(run, notification_type, data);
 
         debug!(
             notification_type = %notification_type,
@@ -816,6 +853,7 @@ impl HookEngine {
     /// Run a single hook
     async fn run_hook(
         &self,
+        run: &crate::tools::ToolRunContext,
         hook: &Hook,
         input_json: &str,
         timeout_secs: u64,
@@ -823,6 +861,7 @@ impl HookEngine {
         match hook {
             Hook::Command { command, shell, .. } => {
                 self.run_command_hook(
+                    run,
                     command,
                     *shell,
                     self.config.policy.as_ref(),
@@ -832,10 +871,11 @@ impl HookEngine {
                 .await
             }
             Hook::Prompt { prompt, .. } => {
-                // Prompt hooks just return the prompt as system message
+                // Hook-authored prompts are observations/suggestions. They do
+                // not acquire system authority from the hook transport.
                 Ok((
                     HookOutput {
-                        system_message: Some(prompt.clone()),
+                        additional_context: Some(prompt.clone()),
                         ..Default::default()
                     },
                     0,
@@ -847,6 +887,8 @@ impl HookEngine {
                 provider,
                 ..
             } => {
+                run.require(crate::tools::ToolResource::Network)?;
+                run.require(crate::tools::ToolResource::Secrets)?;
                 self.run_model_hook(prompt, model, provider.as_deref(), timeout_secs)
                     .await
             }
@@ -859,6 +901,7 @@ impl HookEngine {
     /// the ready-to-spawn `Command`. Returns `Err` on tokenisation failure or
     /// allowlist denial.
     fn build_direct_command(
+        run: &crate::tools::ToolRunContext,
         command: &str,
         policy: Option<&HookPolicy>,
     ) -> Result<Command, HookError> {
@@ -903,34 +946,44 @@ impl HookEngine {
             }
         }
 
-        let mut cmd = Command::new(binary_path);
+        let resolved = run
+            .resolve_executable(binary_path)
+            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
+        let mut cmd = Command::new(resolved);
         if tokens.len() > 1 {
             cmd.args(&tokens[1..]);
         }
         Ok(cmd)
     }
 
-    /// Scrub credential env vars and inject `CLAUDE_PROJECT_DIR` into `cmd`.
-    fn apply_hook_env(cmd: &mut Command, project_dir: &std::path::Path) {
-        let sensitive: Vec<String> = std::env::vars()
-            .map(|(k, _)| k)
-            .filter(|k| is_sensitive_env(k))
-            .collect();
-        for key in &sensitive {
-            cmd.env_remove(key);
-        }
-        cmd.env("CLAUDE_PROJECT_DIR", project_dir);
+    /// Replace ambient process state with this run's exact environment grants
+    /// and the one harness-owned project-directory value documented for hooks.
+    fn apply_hook_env(
+        cmd: &mut Command,
+        run: &crate::tools::ToolRunContext,
+        project_dir: &std::path::Path,
+    ) {
+        cmd.env_clear();
+        run.environment_grants().apply_tokio(cmd);
+        cmd.env("HOME", run.private_temp_root())
+            .env("TMPDIR", run.private_temp_root())
+            .env("TMP", run.private_temp_root())
+            .env("TEMP", run.private_temp_root())
+            .env("PATH", run.executable_search_path())
+            .env("CLAUDE_PROJECT_DIR", project_dir);
     }
 
-    fn resolved_hook_shell() -> Result<(PathBuf, &'static str), HookError> {
+    fn resolved_hook_shell(
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(PathBuf, &'static str), HookError> {
         let (shell, shell_arg) = if cfg!(windows) {
             ("cmd", "/C")
         } else {
             ("sh", "-c")
         };
-        let shell_path = which::which(shell).map_err(|e| {
-            HookError::CommandFailed(format!("{shell} binary not found on PATH: {e}"))
-        })?;
+        let shell_path = run
+            .resolve_executable(shell)
+            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
         Ok((shell_path, shell_arg))
     }
 
@@ -1059,6 +1112,7 @@ impl HookEngine {
     /// Credentials are scrubbed in both paths. See [`Self::build_direct_command`].
     async fn run_command_hook(
         &self,
+        run: &crate::tools::ToolRunContext,
         command: &str,
         use_shell: bool,
         policy: Option<&HookPolicy>,
@@ -1068,9 +1122,8 @@ impl HookEngine {
         debug!(command = %command, shell = use_shell, "Running command hook");
 
         // Resolve cwd eagerly — missing cwd is a hard error, not a silent "".
-        let security =
-            crate::tools::security::current_context().map_err(HookError::CommandFailed)?;
-        let project_dir = security.working_directory().to_path_buf();
+        run.require(crate::tools::ToolResource::Process)?;
+        let project_dir = run.working_directory().to_path_buf();
 
         let mut child_cmd = if use_shell {
             warn!(
@@ -1078,23 +1131,26 @@ impl HookEngine {
                 "Hook is running with shell:true — shell injection risk. \
                  Consider converting to a direct-spawn hook."
             );
-            let (shell_path, shell_arg) = Self::resolved_hook_shell()?;
+            let (shell_path, shell_arg) = Self::resolved_hook_shell(run)?;
             let mut cmd = Command::new(shell_path);
             cmd.arg(shell_arg).arg(command);
             cmd
         } else {
-            Self::build_direct_command(command, policy)?
+            Self::build_direct_command(run, command, policy)?
         };
 
-        Self::apply_hook_env(&mut child_cmd, &project_dir);
+        Self::apply_hook_env(&mut child_cmd, run, &project_dir);
         let sandbox_mode = policy.map_or(SandboxMode::FullSandbox, |hook_policy| {
             hook_policy.sandbox.clone()
         });
         if sandbox_mode == SandboxMode::FullSandbox {
-            let sandboxed = crate::tools::sandboxed_hook_command(child_cmd.as_std(), &project_dir)
-                .map_err(|error| {
-                    HookError::CommandFailed(format!("failed to create full hook sandbox: {error}"))
-                })?;
+            let sandboxed =
+                crate::tools::sandboxed_hook_command(run, child_cmd.as_std(), &project_dir)
+                    .map_err(|error| {
+                        HookError::CommandFailed(format!(
+                            "failed to create full hook sandbox: {error}"
+                        ))
+                    })?;
             child_cmd = Command::from(sandboxed);
         } else {
             let trusted = TRUST_UNSANDBOXED_HOOKS
@@ -1122,11 +1178,9 @@ impl HookEngine {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| HookError::CommandFailed(e.to_string()))?;
-        let _process_registration = (sandbox_mode == SandboxMode::FullSandbox).then(|| {
-            child
-                .id()
-                .map(crate::tools::command::ActiveSandboxProcess::register)
-        });
+        let _process_registration = child
+            .id()
+            .map(|pid| crate::tools::command::ActiveSandboxProcess::register(run, pid));
 
         let Some(mut stdin) = child.stdin.take() else {
             Self::terminate_child_after_stdin_failure(&mut child).await;
@@ -1198,7 +1252,7 @@ impl HookEngine {
         match timeout(Duration::from_secs(timeout_secs), future).await {
             Ok(Ok(response)) => Ok((
                 HookOutput {
-                    system_message: Some(response),
+                    additional_context: Some(response),
                     ..Default::default()
                 },
                 0,
@@ -1217,6 +1271,29 @@ mod tests {
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
+    fn test_run_with_environment(
+        grants: std::collections::HashMap<String, String>,
+    ) -> std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::ToolRunContext::builder(
+            crate::state::SessionId::new(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(grants)
+        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("hook-environment-test")
+        .build()
+        .expect("explicit hook test run")
+    }
 
     struct FailingAsyncWrite;
 
@@ -1253,7 +1330,7 @@ mod tests {
 
     #[test]
     fn test_hook_input_builder() {
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_session_id("test-session")
             .with_tool("Write", serde_json::json!({"path": "/tmp/test"}));
 
@@ -1264,7 +1341,7 @@ mod tests {
 
     #[test]
     fn notification_input_sets_expected_extra_fields() {
-        let input = notification_input("status", serde_json::json!({"ok": true}));
+        let input = notification_input(test_run(), "status", serde_json::json!({"ok": true}));
 
         assert_eq!(input.event, HookEvent::Notification);
         assert_eq!(
@@ -1278,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_result_system_messages() {
+    fn test_hook_output_system_message_becomes_typed_reference() {
         let result = HookResult {
             allowed: true,
             outputs: vec![
@@ -1294,20 +1371,73 @@ mod tests {
             errors: vec![],
         };
 
-        let messages = result.system_messages();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], "Message 1");
-        assert_eq!(messages[1], "Message 2");
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| {
+            item.source()
+                == crate::context::ContextSource::Reference(crate::context::ReferenceSource::Hook)
+                && item.authority() == crate::context::ContextAuthority::Reference
+        }));
+        assert_eq!(items[0].content(), "Message 1");
+        assert_eq!(items[1].content(), "Message 2");
     }
 
     #[tokio::test]
     async fn test_empty_hooks_config() {
         let engine = HookEngine::new(HooksConfig::default());
-        let input = HookInput::new(HookEvent::SessionStart);
+        let input = HookInput::for_run(test_run(), HookEvent::SessionStart);
         let result = engine.run(HookEvent::SessionStart, &input).await;
 
         assert!(result.allowed);
         assert!(result.outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_hook_requires_secrets_before_invoking_provider_callback() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .process(false)
+                .network(true)
+                .secrets(false)
+                .provider("model-hook-secret-denial-test")
+                .build()
+                .expect("network-only hook test run");
+        let callback_invoked = std::sync::Arc::new(AtomicBool::new(false));
+        let callback_probe = std::sync::Arc::clone(&callback_invoked);
+        let engine = HookEngine::new(HooksConfig::default()).with_model_callback(Box::new(
+            move |_, _, _| {
+                callback_probe.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok("unexpected provider response".to_string()) })
+            },
+        ));
+        let hook = Hook::Model {
+            prompt: "review this".to_string(),
+            model: "test-model".to_string(),
+            provider: Some("test-provider".to_string()),
+            timeout: 1,
+        };
+
+        let error = engine
+            .run_hook(&run, &hook, "{}", 1)
+            .await
+            .expect_err("missing secret capability must reject the model hook");
+
+        assert!(matches!(
+            error,
+            HookError::Capability(crate::tools::ToolCapabilityError::Unavailable {
+                resource: crate::tools::ToolResource::Secrets,
+                ..
+            })
+        ));
+        assert!(
+            !callback_invoked.load(Ordering::SeqCst),
+            "provider callback must not run before every required capability is authorized"
+        );
     }
 
     #[tokio::test]
@@ -1520,8 +1650,8 @@ mod tests {
 
     #[test]
     fn test_hook_input_with_prompt() {
-        let input =
-            HookInput::new(HookEvent::UserPromptSubmit).with_prompt("How do I fix this bug?");
+        let input = HookInput::for_run(test_run(), HookEvent::UserPromptSubmit)
+            .with_prompt("How do I fix this bug?");
 
         assert_eq!(input.event, HookEvent::UserPromptSubmit);
         assert_eq!(input.prompt, Some("How do I fix this bug?".to_string()));
@@ -1529,7 +1659,7 @@ mod tests {
 
     #[test]
     fn test_hook_input_with_extra() {
-        let input = HookInput::new(HookEvent::PreCompact)
+        let input = HookInput::for_run(test_run(), HookEvent::PreCompact)
             .with_extra("current_tokens", serde_json::json!(50_000))
             .with_extra("max_tokens", serde_json::json!(100_000));
 
@@ -1544,16 +1674,18 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_input_cwd_populated() {
-        let input = HookInput::new(HookEvent::SessionStart);
-
-        // CWD should be populated from env
-        assert!(!input.cwd.is_empty());
+    fn test_hook_input_cwd_comes_from_explicit_run() {
+        let bound = HookInput::for_run(test_run(), HookEvent::SessionStart);
+        assert_eq!(
+            bound.cwd,
+            test_run().working_directory().to_string_lossy(),
+            "bound hook input must expose only its exact run working directory"
+        );
     }
 
     #[test]
     fn test_hook_input_serialization() {
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_session_id("session-123")
             .with_tool("bash", serde_json::json!({"command": "ls"}));
 
@@ -1582,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_result_modified_prompt() {
+    fn test_hook_prompt_suggestion_becomes_typed_reference() {
         let result = HookResult {
             allowed: true,
             outputs: vec![HookOutput {
@@ -1592,17 +1724,23 @@ mod tests {
             errors: vec![],
         };
 
-        assert_eq!(result.modified_prompt(), Some("Modified user prompt"));
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content(), "Modified user prompt");
+        assert_eq!(
+            items[0].authority(),
+            crate::context::ContextAuthority::Reference
+        );
     }
 
     #[test]
-    fn test_hook_result_no_modified_prompt() {
+    fn test_hook_result_without_context_has_no_reference_items() {
         let result = HookResult::allowed();
-        assert_eq!(result.modified_prompt(), None);
+        assert!(crate::context::hook_result_reference_items(&result, "fixture", 10).is_empty());
     }
 
     #[test]
-    fn test_hook_result_multiple_system_messages() {
+    fn test_hook_result_multiple_legacy_system_fields_keep_order_as_references() {
         let result = HookResult {
             allowed: true,
             outputs: vec![
@@ -1619,10 +1757,10 @@ mod tests {
             errors: vec![],
         };
 
-        let messages = result.system_messages();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], "Security warning");
-        assert_eq!(messages[1], "Style guide reminder");
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].content(), "Security warning");
+        assert_eq!(items[1].content(), "Style guide reminder");
     }
 
     // ========================================================================
@@ -1888,7 +2026,7 @@ mod tests {
         });
 
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("Write", serde_json::json!({"path": "/tmp/test"}));
 
         let result = engine.run(HookEvent::PreToolUse, &input).await;
@@ -1896,9 +2034,10 @@ mod tests {
         assert!(result.allowed);
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(
-            result.outputs[0].system_message,
+            result.outputs[0].additional_context,
             Some("Remember to backup".to_string())
         );
+        assert!(result.outputs[0].system_message.is_none());
     }
 
     #[tokio::test]
@@ -1913,7 +2052,7 @@ mod tests {
         });
 
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("Read", serde_json::json!({"path": "/tmp/test"})); // Different tool
 
         let result = engine.run(HookEvent::PreToolUse, &input).await;
@@ -1940,7 +2079,8 @@ mod tests {
         });
 
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PreToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
+            .with_tool("bash", serde_json::json!({}));
 
         let result = engine.run(HookEvent::PreToolUse, &input).await;
 
@@ -1965,7 +2105,7 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PostToolUseFailure)
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUseFailure)
             .with_tool("bash", serde_json::json!({}))
             .with_extra("tool_output", serde_json::json!("boom"));
 
@@ -2002,8 +2142,8 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input =
-            HookInput::new(HookEvent::PostToolUseFailure).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUseFailure)
+            .with_tool("bash", serde_json::json!({}));
 
         let result = engine.run(HookEvent::PostToolUseFailure, &input).await;
         assert_eq!(
@@ -2046,7 +2186,8 @@ mod tests {
             sandbox: SandboxMode::FullSandbox,
         };
         let engine = HookEngine::new(make_command_config("true", false, Some(policy)));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         // `true` succeeds with exit code 0 → hook allowed.
         assert!(result.allowed, "allowlisted binary must be permitted");
@@ -2064,7 +2205,8 @@ mod tests {
         };
         // Attempt to run `true` which is NOT in the allowlist.
         let engine = HookEngine::new(make_command_config("true", false, Some(policy)));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         assert_eq!(
             result.errors.len(),
@@ -2099,7 +2241,8 @@ mod tests {
             false,
             Some(policy),
         ));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         // Should succeed: echo exits 0, allowlist check passes.
         assert!(
@@ -2120,7 +2263,8 @@ mod tests {
             true, // explicit shell: true
             None, // no policy
         ));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         assert!(result.errors.is_empty(), "shell pipeline must succeed");
         assert!(result.allowed);
@@ -2128,7 +2272,8 @@ mod tests {
 
     #[test]
     fn shell_mode_resolves_platform_shell_binary() {
-        let (shell_path, shell_arg) = HookEngine::resolved_hook_shell().expect("platform shell");
+        let (shell_path, shell_arg) =
+            HookEngine::resolved_hook_shell(test_run()).expect("platform shell");
         assert!(
             shell_path.is_absolute(),
             "hook shell must resolve to an absolute path, got {}",
@@ -2146,48 +2291,64 @@ mod tests {
             "hook shell mode must not spawn an unresolved shell binary"
         );
         assert!(
-            production.contains("which::which(shell)"),
-            "hook shell mode must resolve the platform shell through which"
+            production.contains(".resolve_executable(shell)"),
+            "hook shell mode must resolve the platform shell through the run capability"
         );
     }
 
-    /// Env scrub: sensitive vars must not be present in the child's environment.
-    /// We run `printenv ANTHROPIC_API_KEY` and expect an empty/missing output.
-    #[tokio::test]
-    async fn env_scrub_removes_sensitive_vars() {
-        // Set a fake key in the current process env so there's something to scrub.
-        // Safety: single-threaded test context; no other thread reads this var.
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-fake-key-for-test") };
+    /// Environment replacement must remove both ambient inheritance and
+    /// values explicitly attached before the run grants are applied.
+    #[test]
+    fn hook_environment_replacement_clears_prior_values() {
+        let mut command = Command::new("unused-hook-binary");
+        command.env("ANTHROPIC_API_KEY", "must-not-survive");
 
-        let policy = HookPolicy {
-            allowed_commands: Some(std::collections::HashSet::from([
-                "printenv".to_string(),
-                "sh".to_string(),
-            ])),
-            sandbox: SandboxMode::FullSandbox,
-        };
+        HookEngine::apply_hook_env(&mut command, test_run(), test_run().project_root());
+
+        let configured = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert!(!configured.contains_key("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            configured.get("CLAUDE_PROJECT_DIR"),
+            Some(&Some(
+                test_run().project_root().to_string_lossy().into_owned()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_process_receives_only_exact_run_environment_grants() {
+        let run = test_run_with_environment(std::collections::HashMap::from([(
+            "S019_HOOK_ENV".to_string(),
+            "exact".to_string(),
+        )]));
         let engine = HookEngine::new(make_command_config(
-            "printenv ANTHROPIC_API_KEY",
-            false,
-            Some(policy),
+            "[ \"$S019_HOOK_ENV\" = exact ] && [ -z \"${S019_UNGRANTED_ENV+x}\" ]",
+            true,
+            Some(HookPolicy {
+                allowed_commands: None,
+                sandbox: SandboxMode::FullSandbox,
+            }),
         ));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(&run, HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
+
         let result = engine.run(HookEvent::PostToolUse, &input).await;
 
-        // printenv exits 1 when the variable is unset — that's expected.
-        // Crucially, there should be no output containing the fake key.
-        // We inspect hook outputs (stdout) for the key string.
-        for out in &result.outputs {
-            if let Some(ctx) = &out.additional_context {
-                assert!(
-                    !ctx.contains("sk-fake-key-for-test"),
-                    "sensitive var must not appear in hook stdout"
-                );
-            }
-        }
-
-        // Restore env to not leak into other tests.
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        assert!(result.allowed);
+        assert!(
+            result.errors.is_empty(),
+            "exact environment hook failed: {:?}",
+            result.errors
+        );
     }
 
     /// Backwards-compatible mode (no policy): hook runs without error even
@@ -2196,7 +2357,8 @@ mod tests {
     async fn no_policy_allow_all_backwards_compat() {
         // No policy → allow-all mode.
         let engine = HookEngine::new(make_command_config("true", false, None));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         assert!(
             result.errors.is_empty(),
@@ -2292,7 +2454,7 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("bash", serde_json::json!({"command": "cargo test"}));
 
         let result = engine.run(HookEvent::PreToolUse, &input).await;
@@ -2325,7 +2487,8 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
 
         let result = engine.run(HookEvent::PostToolUse, &input).await;
 
@@ -2515,6 +2678,7 @@ mod tests {
         let guard = subscriber::set_default(subscriber);
         engine
             .fire_post_tool(
+                test_run(),
                 true,
                 "bash",
                 serde_json::json!({"command": "ls"}),
@@ -2581,6 +2745,7 @@ mod tests {
         let guard = subscriber::set_default(subscriber);
         engine
             .fire_post_tool(
+                test_run(),
                 true,
                 "bash",
                 serde_json::json!({"command": "true"}),
@@ -2619,10 +2784,24 @@ mod tests {
         let engine = HookEngine::new(config);
 
         engine
-            .fire_post_tool(true, "bash", serde_json::json!({}), "ok", Some("s1"))
+            .fire_post_tool(
+                test_run(),
+                true,
+                "bash",
+                serde_json::json!({}),
+                "ok",
+                Some("s1"),
+            )
             .await;
         engine
-            .fire_post_tool(false, "bash", serde_json::json!({}), "fail", Some("s1"))
+            .fire_post_tool(
+                test_run(),
+                false,
+                "bash",
+                serde_json::json!({}),
+                "fail",
+                Some("s1"),
+            )
             .await;
         // Success assertion: neither call panicked or returned an error
         // that bubbled up — the fire_post_tool helper swallows hook
@@ -2678,19 +2857,19 @@ mod tests {
     fn typed_accessors_return_correct_slot() {
         // match_tool / match_prompt / match_event each look at exactly one
         // slot of HookInput and do not cross-pollinate.
-        let with_tool = HookInput::new(HookEvent::PreToolUse)
+        let with_tool = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("rm", serde_json::json!({"path": "/etc"}));
         assert_eq!(with_tool.match_tool(), Some("rm"));
         assert_eq!(with_tool.match_prompt(), None);
         assert_eq!(with_tool.match_event(), Some("pre_tool_use"));
 
-        let with_prompt =
-            HookInput::new(HookEvent::UserPromptSubmit).with_prompt("I want to rm a file");
+        let with_prompt = HookInput::for_run(test_run(), HookEvent::UserPromptSubmit)
+            .with_prompt("I want to rm a file");
         assert_eq!(with_prompt.match_tool(), None);
         assert_eq!(with_prompt.match_prompt(), Some("I want to rm a file"));
         assert_eq!(with_prompt.match_event(), Some("user_prompt_submit"));
 
-        let bare = HookInput::new(HookEvent::SessionStart);
+        let bare = HookInput::for_run(test_run(), HookEvent::SessionStart);
         assert_eq!(bare.match_tool(), None);
         assert_eq!(bare.match_prompt(), None);
         assert_eq!(bare.match_event(), Some("session_start"));
@@ -2718,7 +2897,7 @@ mod tests {
 
         // A PreToolUse event for a *different* tool, with a prompt that
         // happens to contain the regex pattern.
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("Write", serde_json::json!({"path": "/tmp/x"}))
             .with_prompt("I want to rm a file");
 
@@ -2748,13 +2927,14 @@ mod tests {
         let engine = HookEngine::new(config);
 
         // Case A: prompt contains "rm" ⇒ blocks.
-        let hit = HookInput::new(HookEvent::UserPromptSubmit).with_prompt("please rm -rf /tmp/foo");
+        let hit = HookInput::for_run(test_run(), HookEvent::UserPromptSubmit)
+            .with_prompt("please rm -rf /tmp/foo");
         let result_a = engine.run(HookEvent::UserPromptSubmit, &hit).await;
         assert!(!result_a.allowed, "matcher must hit the prompt slot");
 
         // Case B: prompt is benign, but tool_name happens to be "rm"
         // (would have falsely matched under the old heuristic).
-        let miss = HookInput::new(HookEvent::UserPromptSubmit)
+        let miss = HookInput::for_run(test_run(), HookEvent::UserPromptSubmit)
             .with_tool("rm", serde_json::json!({}))
             .with_prompt("hello world");
         let result_b = engine.run(HookEvent::UserPromptSubmit, &miss).await;
@@ -2791,7 +2971,7 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::SessionStart);
+        let input = HookInput::for_run(test_run(), HookEvent::SessionStart);
 
         // Hooks run in parallel and one of them blocks ⇒ allowed = false.
         // We can't distinguish *which* matched from HookResult alone, but we

@@ -1,42 +1,106 @@
-//! Stamp `schema_version: 1` onto the transcripts directory.
+//! Reconcile the legacy transcript schema marker without destructive guessing.
 //!
-//! Rationale: the transcript JSONL format shipped in commit b117e0a
-//! has no on-disk version marker. The first time we change the
-//! [`crate::transcript::SerializedMessage`] envelope — renamed field,
-//! new required field, etc. — a future migration needs to know whether
-//! the user's existing transcripts are v1 (old format) or v2 (new
-//! format). Without a baseline marker, that migration would have to
-//! sniff every transcript line to guess.
-//!
-//! This migration writes `<claude_home>/projects/.schema-version.json`
-//! once, containing `{"transcripts": 1}`. It's idempotent: re-running
-//! when the marker already exists is a no-op.
+//! S-038 owns replacement of this foreign compatibility marker with an
+//! `OpenClaudia`-owned import contract. Until then, this migration preserves
+//! unknown object fields, rejects malformed/future state, and uses the shared
+//! descriptor-safe atomic persistence primitive.
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use crate::persistence::{CommitState, FileClass, PersistenceError, PersistentStorage};
 
-use super::{Migration, MigrationContext, MigrationOutcome, RunPolicy};
+use super::{
+    Migration, MigrationContext, MigrationFailure, MigrationFailureKind, MigrationOutcome,
+    MigrationStore,
+};
 
-/// Current transcript schema version. Bump in lockstep with the
-/// envelope — and add a migration that upgrades the on-disk v1 data to
-/// the new format.
-const CURRENT_TRANSCRIPT_SCHEMA: u32 = 1;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SchemaMarker {
-    #[serde(default)]
-    transcripts: Option<u32>,
-}
+const CURRENT_TRANSCRIPT_SCHEMA: u64 = 1;
+const MARKER_NAME: &str = ".schema-version.json";
 
 pub struct StampTranscriptSchemaV1;
 
 impl StampTranscriptSchemaV1 {
-    fn marker_path(ctx: &MigrationContext) -> PathBuf {
-        ctx.claude_home
-            .join("projects")
-            .join(".schema-version.json")
+    fn marker_directory(ctx: &MigrationContext) -> PathBuf {
+        ctx.claude_home.join("projects")
+    }
+
+    const fn persistence_failure(
+        operation: &'static str,
+        error: &PersistenceError,
+    ) -> MigrationFailure {
+        let kind = match error {
+            PersistenceError::TooLarge { .. } => MigrationFailureKind::ResourceLimitExceeded,
+            PersistenceError::Conflict { .. } => MigrationFailureKind::ConcurrentChange,
+            PersistenceError::InvalidRoot { .. }
+            | PersistenceError::InvalidTarget { .. }
+            | PersistenceError::Io { .. }
+            | PersistenceError::Unchanged { .. }
+            | PersistenceError::UnsupportedPlatform { .. } => {
+                MigrationFailureKind::PublicationFailed
+            }
+        };
+        MigrationFailure::new(kind, MigrationStore::ClaudeTranscripts, operation)
+    }
+
+    fn replacement(bytes: Option<&[u8]>) -> Result<Option<Vec<u8>>, MigrationFailure> {
+        let Some(bytes) = bytes else {
+            return serde_json::to_vec_pretty(&serde_json::json!({
+                "transcripts": CURRENT_TRANSCRIPT_SCHEMA
+            }))
+            .map(Some)
+            .map_err(|_| {
+                MigrationFailure::new(
+                    MigrationFailureKind::InvalidPersistentState,
+                    MigrationStore::ClaudeTranscripts,
+                    "encode initial transcript schema marker",
+                )
+            });
+        };
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| {
+            MigrationFailure::new(
+                MigrationFailureKind::InvalidPersistentState,
+                MigrationStore::ClaudeTranscripts,
+                "decode transcript schema marker",
+            )
+        })?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            MigrationFailure::new(
+                MigrationFailureKind::InvalidPersistentState,
+                MigrationStore::ClaudeTranscripts,
+                "validate transcript schema marker",
+            )
+        })?;
+        let version = object
+            .get("transcripts")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                MigrationFailure::new(
+                    MigrationFailureKind::InvalidPersistentState,
+                    MigrationStore::ClaudeTranscripts,
+                    "read transcript schema version",
+                )
+            })?;
+        if version > CURRENT_TRANSCRIPT_SCHEMA {
+            return Err(MigrationFailure::new(
+                MigrationFailureKind::UnsupportedFutureSchema,
+                MigrationStore::ClaudeTranscripts,
+                "validate transcript schema version",
+            ));
+        }
+        if version == CURRENT_TRANSCRIPT_SCHEMA {
+            return Ok(None);
+        }
+        object.insert(
+            "transcripts".to_string(),
+            serde_json::Value::from(CURRENT_TRANSCRIPT_SCHEMA),
+        );
+        serde_json::to_vec_pretty(&value).map(Some).map_err(|_| {
+            MigrationFailure::new(
+                MigrationFailureKind::InvalidPersistentState,
+                MigrationStore::ClaudeTranscripts,
+                "encode transcript schema marker",
+            )
+        })
     }
 }
 
@@ -46,64 +110,102 @@ impl Migration for StampTranscriptSchemaV1 {
     }
 
     fn description(&self) -> &'static str {
-        "Write initial transcript schema-version marker (v1)"
+        "Reconcile legacy transcript schema marker at version 1"
     }
 
-    fn run_policy(&self) -> RunPolicy {
-        // Idempotent: the write is conditional on the marker being
-        // absent or stale. Doesn't need ledger bookkeeping.
-        RunPolicy::Idempotent
+    fn store(&self) -> MigrationStore {
+        MigrationStore::ClaudeTranscripts
     }
 
     fn run(&self, ctx: &MigrationContext) -> MigrationOutcome {
-        let path = Self::marker_path(ctx);
-
-        // Fast path: marker already exists and is at or ahead of the
-        // current version → nothing to do. We treat a higher version as
-        // "newer build wrote it, don't clobber" — this keeps downgrades
-        // safe for users who pin to an older release after upgrading.
-        //
-        // crosslink #734: distinguish "no marker" (Ok(None) → run
-        // migration) from "marker is unreadable" (Err → surface as
-        // failure). Treating the latter as "absent" would silently
-        // overwrite a marker we couldn't even inspect, and the previous
-        // `if let Ok(Some(_))` swallowed permission-denied errors so the
-        // operator never saw the underlying problem.
-        match super::read_json_if_exists(&path) {
-            Ok(Some(value)) => {
-                if let Ok(marker) = serde_json::from_value::<SchemaMarker>(value) {
-                    if marker.transcripts.unwrap_or(0) >= CURRENT_TRANSCRIPT_SCHEMA {
-                        return MigrationOutcome::Skipped;
-                    }
-                }
-                // Marker present but malformed/older → fall through to
-                // (re)write it with the current version.
+        let directory = Self::marker_directory(ctx);
+        match std::fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return MigrationOutcome::Current;
             }
-            Ok(None) => {
-                // No marker yet — first run on this machine; fall through.
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return MigrationOutcome::Failed(MigrationFailure::new(
+                    MigrationFailureKind::InvalidPersistentState,
+                    MigrationStore::ClaudeTranscripts,
+                    "validate transcript metadata directory",
+                ));
             }
-            Err(err) => {
-                return err.into();
+            Ok(_) => {}
+            Err(error) => {
+                return MigrationOutcome::Failed(MigrationFailure::from_io(
+                    MigrationFailureKind::InvalidPersistentState,
+                    MigrationStore::ClaudeTranscripts,
+                    "inspect transcript metadata directory",
+                    &error,
+                ));
             }
         }
-
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                return err.into();
+        let storage = match PersistentStorage::open(&directory) {
+            Ok(storage) => storage,
+            Err(error) => {
+                return MigrationOutcome::Failed(Self::persistence_failure(
+                    "open transcript metadata store",
+                    &error,
+                ));
             }
-        }
-        let marker = json!({ "transcripts": CURRENT_TRANSCRIPT_SCHEMA });
-        let Ok(text) = serde_json::to_string_pretty(&marker) else {
-            // Serializing a 2-field JSON object never fails in practice;
-            // if it does we'd rather skip than pretend we applied.
-            return MigrationOutcome::Skipped;
         };
-        match std::fs::write(&path, text) {
-            Ok(()) => MigrationOutcome::Applied(format!(
-                "wrote {} (transcripts: v{CURRENT_TRANSCRIPT_SCHEMA})",
-                path.display()
-            )),
-            Err(err) => err.into(),
+        let observed = match storage.read(MARKER_NAME, FileClass::Session) {
+            Ok(observed) => observed,
+            Err(error) => {
+                return MigrationOutcome::Failed(Self::persistence_failure(
+                    "read transcript schema marker",
+                    &error,
+                ));
+            }
+        };
+        let replacement = match observed.expose_bytes(Self::replacement) {
+            Ok(replacement) => replacement,
+            Err(failure) => return MigrationOutcome::Failed(failure),
+        };
+        let changed = replacement.is_some();
+        let bytes = match replacement {
+            Some(bytes) => bytes,
+            None => match observed.expose_bytes(|bytes| bytes.map(<[u8]>::to_vec)) {
+                Some(bytes) => bytes,
+                None => {
+                    return MigrationOutcome::Failed(MigrationFailure::new(
+                        MigrationFailureKind::ConcurrentChange,
+                        MigrationStore::ClaudeTranscripts,
+                        "reconcile missing transcript schema marker",
+                    ));
+                }
+            },
+        };
+        let receipt = match storage.commit(
+            MARKER_NAME,
+            FileClass::Session,
+            observed.generation(),
+            &bytes,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return MigrationOutcome::Failed(Self::persistence_failure(
+                    "publish transcript schema marker",
+                    &error,
+                ));
+            }
+        };
+        if receipt.state() == CommitState::PublishedDurabilityUncertain {
+            return MigrationOutcome::Failed(
+                MigrationFailure::new(
+                    MigrationFailureKind::DurabilityUncertain,
+                    MigrationStore::ClaudeTranscripts,
+                    "synchronize transcript schema marker",
+                )
+                .with_committed_artifacts(usize::from(changed)),
+            );
+        }
+        if changed {
+            MigrationOutcome::Applied {
+                changed_artifacts: 1,
+            }
+        } else {
+            MigrationOutcome::Current
         }
     }
 }

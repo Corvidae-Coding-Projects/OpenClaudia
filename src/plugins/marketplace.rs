@@ -1,7 +1,6 @@
 //! Marketplace schema types for plugin discovery and distribution.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use super::manifest::PluginAuthor;
 
@@ -202,7 +201,7 @@ pub enum MarketplaceSource {
     Url {
         url: String,
         #[serde(default)]
-        headers: Option<HashMap<String, String>>,
+        headers: Option<crate::secrets::SensitiveHeaders>,
     },
     /// Local file path
     #[serde(rename = "file")]

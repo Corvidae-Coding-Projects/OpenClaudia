@@ -1,9 +1,8 @@
 use super::models::get_available_models;
 use super::{get_data_dir, get_history_path, get_sessions_dir, list_chat_sessions};
-use crate::cli::commands::init::init_project_rules;
 use openclaudia::config::{Hook, HookEntry, HooksConfig, PermissionsConfig, SandboxMode};
 use openclaudia::memory;
-use openclaudia::permissions::{PermissionDecision, PermissionRule};
+use openclaudia::permissions::PermissionStoreSummary;
 use openclaudia::plugins;
 use openclaudia::skills;
 use openclaudia::tools::file_index::FileIndex;
@@ -231,69 +230,53 @@ pub fn slash_help() {
     println!();
 }
 
-pub fn slash_doctor() {
-    println!("\nRunning diagnostics...\n");
-    print!("  Git... ");
-    match git_command()
-        .and_then(|mut cmd| cmd.args(["--version"]).output().map_err(|e| e.to_string()))
-    {
-        Ok(o) if o.status.success() => {
-            println!("\u{2713} {}", String::from_utf8_lossy(&o.stdout).trim());
-        }
-        _ => println!("\u{2717} not found"),
-    }
-    print!("  Claude Code credentials... ");
-    if openclaudia::claude_credentials::has_claude_code_credentials() {
-        println!("\u{2713} found");
+pub fn slash_doctor(
+    run: Option<&openclaudia::tools::ToolRunContext>,
+    app_config: Option<&openclaudia::config::AppConfig>,
+    composed_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
+) {
+    let report = repl_doctor_report(run, app_config, composed_runtime);
+    print!("{}", report.render_human());
+}
+
+fn repl_doctor_report(
+    run: Option<&openclaudia::tools::ToolRunContext>,
+    app_config: Option<&openclaudia::config::AppConfig>,
+    composed_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
+) -> openclaudia::doctor::DoctorReport {
+    let config_exists = app_config.is_some() || openclaudia::config::config_file_exists();
+    let loaded_config = if app_config.is_none() && config_exists {
+        openclaudia::config::load_config().ok()
     } else {
-        println!("\u{2717} not found (~/.claude/.credentials.json)");
-    }
-    print!("  Config... ");
-    match openclaudia::config::load_config() {
-        Ok(_) => println!("\u{2713} loaded"),
-        Err(e) => println!("\u{2717} {e}"),
-    }
-    print!("  MCP config... ");
-    let mcp_path = std::path::PathBuf::from(".mcp.json");
-    if mcp_path.exists() {
-        match std::fs::read_to_string(&mcp_path) {
-            Ok(content) => {
-                let count = serde_json::from_str::<serde_json::Value>(&content)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("mcpServers")
-                            .and_then(|s| s.as_object())
-                            .map(serde_json::Map::len)
-                    })
-                    .unwrap_or(0);
-                println!("\u{2713} {count} server(s)");
-            }
-            Err(e) => println!("\u{2717} {e}"),
-        }
+        None
+    };
+    let unavailable_config = if config_exists {
+        openclaudia::doctor::DoctorConfig::Invalid
     } else {
-        println!("\u{00b7} not configured");
-    }
-    print!("  Skills... ");
-    let loaded_skills = skills::load_skills();
-    if loaded_skills.is_empty() {
-        println!("\u{00b7} none loaded");
-    } else {
-        println!("\u{2713} {} skill(s)", loaded_skills.len());
-    }
-    print!("  GitHub CLI (gh)... ");
-    match gh_command()
-        .and_then(|mut cmd| cmd.args(["--version"]).output().map_err(|e| e.to_string()))
-    {
-        Ok(o) if o.status.success() => println!(
-            "\u{2713} {}",
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .next()
-                .unwrap_or("installed")
-        ),
-        _ => println!("\u{00b7} not found (optional, for /commit-push-pr)"),
-    }
-    println!();
+        openclaudia::doctor::DoctorConfig::Missing
+    };
+    let config_state = app_config
+        .map(openclaudia::doctor::DoctorConfig::Attached)
+        .or_else(|| {
+            loaded_config
+                .as_ref()
+                .map(openclaudia::doctor::DoctorConfig::LoadedFromSources)
+        })
+        .unwrap_or(unavailable_config);
+    let runtime = composed_runtime.cloned().unwrap_or_else(|| {
+        run.map_or_else(
+            openclaudia::doctor::DoctorRuntimeSnapshot::standalone,
+            |run| {
+                let manager = openclaudia::mcp::registered_manager(run);
+                openclaudia::doctor::DoctorRuntimeSnapshot::from_run_with_mcp(run, manager.as_ref())
+            },
+        )
+    });
+    openclaudia::doctor::diagnose(
+        config_state,
+        &runtime,
+        &openclaudia::doctor::DoctorRequest::default(),
+    )
 }
 
 pub fn slash_config(args: &str) {
@@ -345,15 +328,19 @@ pub fn slash_permissions() -> SlashCommandResult {
     println!("\nPermissions:\n");
     match openclaudia::config::load_config() {
         Ok(cfg) => {
-            let persisted_path = Path::new(".openclaudia/permissions.json");
-            match load_persisted_permission_rules(persisted_path) {
-                Ok(rules) => {
-                    for line in permission_status_lines(&cfg.permissions, rules.as_deref(), None) {
+            let persisted_path = openclaudia::permissions::trusted_permission_store_path();
+            match openclaudia::permissions::inspect_permission_store(&persisted_path) {
+                Ok(summary) => {
+                    for line in
+                        permission_status_lines(&cfg.permissions, summary, None, &persisted_path)
+                    {
                         println!("  {line}");
                     }
                 }
                 Err(err) => {
-                    for line in permission_status_lines(&cfg.permissions, None, Some(&err)) {
+                    for line in
+                        permission_status_lines(&cfg.permissions, None, Some(&err), &persisted_path)
+                    {
                         println!("  {line}");
                     }
                 }
@@ -369,10 +356,26 @@ pub fn slash_hooks() -> SlashCommandResult {
     println!("\nHooks:\n");
     match openclaudia::config::load_config() {
         Ok(cfg) => {
-            let claude_hooks = openclaudia::hooks::load_claude_code_hooks();
-            let hooks = openclaudia::hooks::merge_hooks_config(cfg.hooks, claude_hooks);
+            let hooks = openclaudia::hooks::load_effective_hooks(cfg.hooks);
             for line in hook_status_lines(&hooks) {
                 println!("  {line}");
+            }
+            let imports = openclaudia::hooks::inspect_repository_hook_imports();
+            for proposal in imports.proposals {
+                println!(
+                    "  Import {:?}: {} ({})",
+                    proposal.state,
+                    proposal.source.display(),
+                    proposal.proposal_digest
+                );
+                println!(
+                    "    events: {}; effects: {}",
+                    proposal.requested_events.join(", "),
+                    proposal.requested_effects.join(", ")
+                );
+            }
+            for diagnostic in imports.diagnostics {
+                println!("  Import unavailable: {}", diagnostic.message);
             }
         }
         Err(e) => println!("  Config: failed to load ({e})"),
@@ -381,12 +384,15 @@ pub fn slash_hooks() -> SlashCommandResult {
     SlashCommandResult::Handled
 }
 
-pub fn slash_mcp(args: &str) -> SlashCommandResult {
+pub fn slash_mcp(
+    args: &str,
+    run: Option<&openclaudia::tools::ToolRunContext>,
+) -> SlashCommandResult {
     let mut parts = args.split_whitespace();
     let subcmd = parts.next().unwrap_or("").to_ascii_lowercase();
 
     match subcmd.as_str() {
-        "" | "status" | "list" => print_mcp_status(),
+        "" | "status" | "list" => print_mcp_status(run),
         "help" => print_mcp_help(),
         "enable" | "disable" | "reconnect" => {
             println!("\nMCP lifecycle controls are not available in the legacy REPL.");
@@ -419,22 +425,23 @@ fn print_mcp_help() {
     println!("Restart OpenClaudia after changing plugin MCP configuration.\n");
 }
 
-fn print_mcp_status() {
+fn print_mcp_status(run: Option<&openclaudia::tools::ToolRunContext>) {
     println!("\nMCP:\n");
-    print_plugin_mcp_status();
-    print_project_mcp_status(Path::new(".mcp.json"));
+    print_plugin_mcp_status(run);
+    print_project_mcp_status(run);
 
-    let manager_status = if openclaudia::mcp::registered_manager().is_some() {
-        "installed"
-    } else {
-        "not installed in this process"
-    };
-    println!("  Live MCP manager: {manager_status}");
+    println!(
+        "  Live MCP connections are isolated to the active run and exposed through MCP tools."
+    );
     println!();
 }
 
-fn print_plugin_mcp_status() {
-    let mut plugin_manager = match plugins::PluginManager::try_new() {
+fn print_plugin_mcp_status(run: Option<&openclaudia::tools::ToolRunContext>) {
+    let Some(run) = run else {
+        println!("  Plugin MCP servers: unavailable without a run context");
+        return;
+    };
+    let mut plugin_manager = match plugins::PluginManager::try_new_for_project(run.project_root()) {
         Ok(manager) => manager,
         Err(e) => {
             println!("  Plugin MCP servers: unavailable ({e})");
@@ -447,7 +454,7 @@ fn print_plugin_mcp_status() {
         println!("  Plugin discovery warnings: {}", discovery_errors.len());
     }
 
-    let mut servers = plugin_manager.all_mcp_servers();
+    let mut servers = plugin_manager.all_mcp_servers_for_run(run);
     if servers.is_empty() {
         println!("  Plugin MCP servers: none declared");
         return;
@@ -497,8 +504,12 @@ fn mcp_server_endpoint(server: &plugins::PluginMcpServer) -> String {
     }
 }
 
-fn print_project_mcp_status(path: &Path) {
-    match project_mcp_server_count(path) {
+fn print_project_mcp_status(run: Option<&openclaudia::tools::ToolRunContext>) {
+    let Some(run) = run else {
+        println!("  Project .mcp.json: unavailable without a run context");
+        return;
+    };
+    match project_mcp_server_count_for_run(run) {
         Ok(Some(count)) => println!(
             "  Project .mcp.json: {count} server(s) declared (diagnostic only in the legacy REPL)"
         ),
@@ -507,13 +518,14 @@ fn print_project_mcp_status(path: &Path) {
     }
 }
 
-fn project_mcp_server_count(path: &Path) -> Result<Option<usize>, String> {
+fn project_mcp_server_count_for_run(
+    run: &openclaudia::tools::ToolRunContext,
+) -> Result<Option<usize>, String> {
+    let path = run.working_directory().join(".mcp.json");
     if !path.exists() {
         return Ok(None);
     }
-
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let (_, content) = openclaudia::tools::read_capability_text_attachment(run, ".mcp.json")?;
     project_mcp_server_count_from_str(&content).map(Some)
 }
 
@@ -532,30 +544,55 @@ fn project_mcp_server_count_from_str(content: &str) -> Result<usize, String> {
     Ok(servers.len())
 }
 
-fn load_persisted_permission_rules(path: &Path) -> Result<Option<Vec<PermissionRule>>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let rules = serde_json::from_str::<Vec<PermissionRule>>(&content)
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-    Ok(Some(rules))
-}
-
 fn permission_status_lines(
     config: &PermissionsConfig,
-    persisted_rules: Option<&[PermissionRule]>,
+    persisted: Option<PermissionStoreSummary>,
     persisted_error: Option<&str>,
+    persisted_path: &Path,
 ) -> Vec<String> {
     let mut lines = vec![
-        format!("Enabled: {}", yes_no(config.enabled)),
+        "Host safety: always enabled (repository and approval settings cannot disable it)"
+            .to_string(),
+        format!("Approval prompts enabled: {}", yes_no(config.enabled)),
         format!(
             "Default allow: {}",
             summarize_strings(&config.default_allow, "none")
         ),
+        "Precedence: host hard deny > explicit deny > exact approval receipt > policy default"
+            .to_string(),
+        format!("Trusted approval store: {}", persisted_path.display()),
     ];
+
+    if let Some(proposal) = config.project_proposal.as_ref() {
+        lines.push(format!(
+            "Repository permission proposal: inert (schema {}, {})",
+            proposal.schema_version, proposal.proposal_digest
+        ));
+        lines.push(format!("  Source: {}", proposal.source.display()));
+        if proposal.requests_prompt_bypass {
+            lines.push("  Requested prompt bypass: ignored".to_string());
+        }
+        if !proposal.default_allow.is_empty() {
+            lines.push(format!(
+                "  Requested default allows: {} (ignored; approve exact calls instead)",
+                proposal.default_allow.len()
+            ));
+        }
+        if !proposal.mcp_tools.is_empty() {
+            let tool_count = proposal.mcp_tools.values().map(Vec::len).sum::<usize>();
+            lines.push(format!(
+                "  Requested MCP grants: {} tool(s) across {} server(s) (ignored; configure trusted host state)",
+                tool_count,
+                proposal.mcp_tools.len()
+            ));
+        }
+        if !proposal.web_fetch_preapproved_domains.is_empty() {
+            lines.push(format!(
+                "  Requested web preapprovals: {} (ignored; configure trusted host state)",
+                proposal.web_fetch_preapproved_domains.len()
+            ));
+        }
+    }
 
     if config.mcp.is_empty() {
         lines.push("MCP allowlists: none configured".to_string());
@@ -581,44 +618,22 @@ fn permission_status_lines(
         }
     }
 
-    match (persisted_rules, persisted_error) {
-        (Some(rules), _) => {
-            let always_allow = rules
-                .iter()
-                .filter(|rule| rule.decision == PermissionDecision::AlwaysAllow)
-                .count();
-            let deny = rules
-                .iter()
-                .filter(|rule| rule.decision == PermissionDecision::Deny)
-                .count();
+    match (persisted, persisted_error) {
+        (Some(summary), _) => {
             lines.push(format!(
-                "Persisted rules: {} total ({} always allow, {} deny)",
-                rules.len(),
-                always_allow,
-                deny
+                "Persisted exact approvals: {} (generation {}, expiring/use-limited)",
+                summary.approval_count, summary.capability_generation
             ));
-            for rule in rules.iter().take(STATUS_ITEM_LIMIT) {
-                lines.push(format!(
-                    "  {} {} -> {}",
-                    rule.tool,
-                    rule.pattern,
-                    permission_decision_label(&rule.decision)
-                ));
-            }
-            if rules.len() > STATUS_ITEM_LIMIT {
-                lines.push(format!(
-                    "  ... {} more rule(s)",
-                    rules.len() - STATUS_ITEM_LIMIT
-                ));
-            }
+            lines.push(format!(
+                "Persisted explicit denials: {}",
+                summary.denial_count
+            ));
         }
         (None, Some(err)) => {
             lines.push(format!("Persisted rules: unavailable ({err})"));
         }
         (None, None) => {
-            lines.push(
-                "Persisted rules: none (.openclaudia/permissions.json not found)".to_string(),
-            );
+            lines.push("Persisted approvals/denials: none".to_string());
         }
     }
 
@@ -639,7 +654,7 @@ fn hook_status_lines(config: &HooksConfig) -> Vec<String> {
         .sum();
 
     let mut lines = vec![
-        "Sources: .openclaudia/config.yaml plus Claude Code settings when present".to_string(),
+        "Sources: host config plus exact host-approved repository imports".to_string(),
         format!(
             "Configured: {}, {}, {}",
             count_label(active_slots, "active event", "active events"),
@@ -768,14 +783,6 @@ fn summarize_string_refs(items: &[&String], empty_label: &str) -> String {
         )
     } else {
         shown.join(", ")
-    }
-}
-
-const fn permission_decision_label(decision: &PermissionDecision) -> &'static str {
-    match decision {
-        PermissionDecision::Allow => "allow",
-        PermissionDecision::Deny => "deny",
-        PermissionDecision::AlwaysAllow => "always allow",
     }
 }
 
@@ -1019,47 +1026,23 @@ pub fn slash_commit_push_pr() -> SlashCommandResult {
     SlashCommandResult::Handled
 }
 
-pub fn slash_init() {
-    use std::path::Path;
-    if Path::new(".openclaudia/config.yaml").exists() {
-        println!("\n\u{26a0} Configuration already exists at .openclaudia/config.yaml");
-        println!("Use /config to view, or delete the file to reinitialize.\n");
-    } else {
-        let _ = std::fs::create_dir_all(".openclaudia/skills");
-        let mut project_types = Vec::new();
-        if Path::new("Cargo.toml").exists() {
-            project_types.push("Rust");
+pub fn slash_init(run: Option<&openclaudia::tools::ToolRunContext>) {
+    let Some(run) = run else {
+        println!("\n\u{2717} Initialization is unavailable without a run context.\n");
+        return;
+    };
+    match openclaudia::tools::initialize_project_for_run(run) {
+        Ok(openclaudia::tools::ProjectInitOutcome::AlreadyExists) => {
+            println!("\n\u{26a0} Configuration already exists at .openclaudia/config.yaml");
+            println!("Use /config to view, or delete the file to reinitialize.\n");
         }
-        if Path::new("package.json").exists() {
-            project_types.push("Node.js");
+        Ok(openclaudia::tools::ProjectInitOutcome::Created) => {
+            println!("\n\u{2713} Created .openclaudia/config.yaml");
+            println!("\u{2713} Created .openclaudia/skills/");
+            println!("\nEdit .openclaudia/config.yaml to configure providers and API keys.\n");
         }
-        if Path::new("pyproject.toml").exists() || Path::new("setup.py").exists() {
-            project_types.push("Python");
-        }
-        if Path::new("go.mod").exists() {
-            project_types.push("Go");
-        }
-        if Path::new("pom.xml").exists() {
-            project_types.push("Java");
-        }
-        if Path::new("Gemfile").exists() {
-            project_types.push("Ruby");
-        }
-        if !project_types.is_empty() {
-            println!("\nDetected: {}", project_types.join(", "));
-        }
-        let default_config = "# OpenClaudia Configuration\nproxy:\n  port: 8080\n  host: \"127.0.0.1\"\n  target: anthropic\n\nproviders:\n  anthropic:\n    base_url: https://api.anthropic.com\n\nsession:\n  timeout_minutes: 30\n  persist_path: .openclaudia/session\n";
-        let _ = std::fs::create_dir_all(".openclaudia");
-        match std::fs::write(".openclaudia/config.yaml", default_config) {
-            Ok(()) => {
-                println!("\n\u{2713} Created .openclaudia/config.yaml");
-                println!("\u{2713} Created .openclaudia/skills/");
-                println!("\nEdit .openclaudia/config.yaml to configure providers and API keys.\n");
-            }
-            Err(e) => println!("\n\u{2717} Failed to create config: {e}\n"),
-        }
+        Err(error) => println!("\n\u{2717} Failed to initialize project: {error}\n"),
     }
-    init_project_rules();
 }
 
 pub fn slash_model(
@@ -1265,8 +1248,25 @@ pub fn slash_plugin(args: &str) -> SlashCommandResult {
 }
 
 pub fn slash_skill(args: &str) -> SlashCommandResult {
+    slash_skill_scoped(args, None)
+}
+
+/// Invoke a user-facing skill through one immutable project boundary.
+pub fn slash_skill_for_run(
+    args: &str,
+    run: &openclaudia::tools::ToolRunContext,
+) -> SlashCommandResult {
+    slash_skill_scoped(args, Some(run))
+}
+
+fn slash_skill_scoped(
+    args: &str,
+    run: Option<&openclaudia::tools::ToolRunContext>,
+) -> SlashCommandResult {
     if args.is_empty() {
-        let all_skills = skills::load_skills();
+        let all_skills = run.map_or_else(skills::load_global_skills, |run| {
+            skills::load_skills_for_project(run.project_root(), run.working_directory())
+        });
         let invocable_skills = all_skills
             .iter()
             .filter(|skill| skill.user_invocable)
@@ -1287,7 +1287,17 @@ pub fn slash_skill(args: &str) -> SlashCommandResult {
         SlashCommandResult::Handled
     } else {
         let skill_name = args.trim();
-        if let Some(skill) = skills::get_user_invocable_skill(skill_name) {
+        let skill = run.map_or_else(
+            || skills::get_user_invocable_skill(skill_name),
+            |run| {
+                skills::get_user_invocable_skill_for_project(
+                    skill_name,
+                    run.project_root(),
+                    run.working_directory(),
+                )
+            },
+        );
+        if let Some(skill) = skill {
             println!("\n\x1b[36mInvoking skill: {}\x1b[0m\n", skill.name);
             SlashCommandResult::Skill(SkillInvocation {
                 prompt: skill.prompt,
@@ -1709,12 +1719,19 @@ pub fn slash_fast(provider: &str, current_model: &str) -> SlashCommandResult {
     }
 }
 
-pub fn slash_find(args: &str) -> SlashCommandResult {
+pub fn slash_find(
+    args: &str,
+    run: Option<&openclaudia::tools::ToolRunContext>,
+) -> SlashCommandResult {
     if args.is_empty() {
         println!("\nUsage: /find <query>\n");
     } else {
-        let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let index = FileIndex::build(&root);
+        let Some(run) = run else {
+            println!("\nFile search is unavailable without a run context.\n");
+            return SlashCommandResult::Handled;
+        };
+        let root = run.working_directory();
+        let index = FileIndex::build(root);
         let results = index.search(args, 20);
         if results.is_empty() {
             println!(
@@ -1748,13 +1765,25 @@ pub fn slash_find(args: &str) -> SlashCommandResult {
 /// Validates that `path` exists and is a directory, canonicalises it, then
 /// returns `AddWorkingDir(canonical_path)` for the REPL loop to store on the
 /// session.  Returns `Handled` (with an error message printed) on any failure.
-pub fn slash_add_dir(args: &str) -> SlashCommandResult {
+pub fn slash_add_dir(
+    args: &str,
+    run: Option<&openclaudia::tools::ToolRunContext>,
+) -> SlashCommandResult {
     let raw = args.trim();
     if raw.is_empty() {
         println!("\nUsage: /add-dir <path>\n");
         return SlashCommandResult::Handled;
     }
-    let path = std::path::Path::new(raw);
+    let Some(run) = run else {
+        println!("\nError: /add-dir is unavailable without a run context.\n");
+        return SlashCommandResult::Handled;
+    };
+    let supplied = std::path::Path::new(raw);
+    let path = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        run.working_directory().join(supplied)
+    };
     if !path.exists() {
         println!("\nError: path does not exist: {raw}\n");
         return SlashCommandResult::Handled;
@@ -1780,7 +1809,15 @@ pub fn slash_add_dir(args: &str) -> SlashCommandResult {
 /// Serialises the current message history to
 /// `.openclaudia/branches/<name>.json`.  `name` defaults to a timestamp
 /// with a UUID suffix when not supplied.  Returns `BranchSession(name)`.
-pub fn slash_branch(args: &str, messages: &[serde_json::Value]) -> SlashCommandResult {
+pub fn slash_branch(
+    args: &str,
+    messages: &[serde_json::Value],
+    run: Option<&openclaudia::tools::ToolRunContext>,
+) -> SlashCommandResult {
+    let Some(run) = run else {
+        println!("\nBranch snapshots are unavailable without a run context.\n");
+        return SlashCommandResult::Handled;
+    };
     let name: String = {
         let raw = args.trim();
         if raw.is_empty() {
@@ -1797,32 +1834,31 @@ pub fn slash_branch(args: &str, messages: &[serde_json::Value]) -> SlashCommandR
         return SlashCommandResult::Handled;
     }
 
-    let branches_dir = std::path::PathBuf::from(".openclaudia/branches");
-    if let Err(e) = fs::create_dir_all(&branches_dir) {
-        println!("\nError: could not create branches directory: {e}\n");
-        return SlashCommandResult::Handled;
-    }
-    let branch_path = branch_snapshot_path(&name);
-    if branch_path.exists() {
-        println!("\nError: branch '{name}' already exists. Choose a different name.\n");
-        return SlashCommandResult::Handled;
-    }
+    let branch_path = branch_snapshot_path(run, &name);
     let snapshot = serde_json::json!({
         "name": name,
         "created_at": chrono::Utc::now().to_rfc3339(),
         "messages": messages,
     });
     match serde_json::to_string_pretty(&snapshot) {
-        Ok(json) => match fs::write(&branch_path, json.as_bytes()) {
-            Ok(()) => {
+        Ok(json) => match openclaudia::tools::create_run_control_text_file(
+            run,
+            &branch_path.to_string_lossy(),
+            &json,
+        ) {
+            Ok(_) => {
                 println!(
                     "\nBranched session as {name}; snapshot saved to {}\n",
                     branch_path.display()
                 );
                 SlashCommandResult::BranchSession(name)
             }
-            Err(e) => {
-                println!("\nError: could not write branch file: {e}\n");
+            Err(error) if error.ends_with("already exists") => {
+                println!("\nError: branch '{name}' already exists. Choose a different name.\n");
+                SlashCommandResult::Handled
+            }
+            Err(error) => {
+                println!("\nError: could not write branch file: {error}\n");
                 SlashCommandResult::Handled
             }
         },
@@ -1833,8 +1869,10 @@ pub fn slash_branch(args: &str, messages: &[serde_json::Value]) -> SlashCommandR
     }
 }
 
-fn branch_snapshot_path(name: &str) -> PathBuf {
-    PathBuf::from(".openclaudia/branches").join(format!("{name}.json"))
+fn branch_snapshot_path(run: &openclaudia::tools::ToolRunContext, name: &str) -> PathBuf {
+    run.project_root()
+        .join(".openclaudia/branches")
+        .join(format!("{name}.json"))
 }
 
 fn validate_branch_snapshot_name(name: &str) -> Result<(), &'static str> {
@@ -1856,18 +1894,22 @@ fn validate_branch_snapshot_name(name: &str) -> Result<(), &'static str> {
     }
 }
 
-fn load_branch_snapshot(name: &str) -> Result<Vec<serde_json::Value>, String> {
+fn load_branch_snapshot(
+    run: &openclaudia::tools::ToolRunContext,
+    name: &str,
+) -> Result<Vec<serde_json::Value>, String> {
     validate_branch_snapshot_name(name)
         .map_err(|reason| format!("invalid branch name: {reason}"))?;
 
-    let path = branch_snapshot_path(name);
-    let raw = fs::read_to_string(&path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            format!("branch snapshot '{name}' was not found")
-        } else {
-            format!("could not read {}: {err}", path.display())
-        }
-    })?;
+    let path = branch_snapshot_path(run, name);
+    let (_, raw) = openclaudia::tools::read_run_control_text(run, &path.to_string_lossy())
+        .map_err(|error| {
+            if error.starts_with("NOT_FOUND:") {
+                format!("branch snapshot '{name}' was not found")
+            } else {
+                format!("could not read {}: {error}", path.display())
+            }
+        })?;
 
     let snapshot: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|err| format!("could not parse {}: {err}", path.display()))?;
@@ -1879,14 +1921,21 @@ fn load_branch_snapshot(name: &str) -> Result<Vec<serde_json::Value>, String> {
     Ok(messages.clone())
 }
 
-pub fn slash_teleport(args: &str) -> SlashCommandResult {
+pub fn slash_teleport(
+    args: &str,
+    run: Option<&openclaudia::tools::ToolRunContext>,
+) -> SlashCommandResult {
     let name = args.trim();
     if name.is_empty() {
         println!("\nUsage: /teleport <branch-name>\n");
         return SlashCommandResult::Handled;
     }
 
-    match load_branch_snapshot(name) {
+    let Some(run) = run else {
+        println!("\nTeleport is unavailable without a run context.\n");
+        return SlashCommandResult::Handled;
+    };
+    match load_branch_snapshot(run, name) {
         Ok(messages) => SlashCommandResult::TeleportSession {
             name: name.to_string(),
             messages,
@@ -1913,11 +1962,67 @@ pub fn slash_btw(args: &str) -> SlashCommandResult {
 }
 
 /// Handle slash commands, returns Some if command was handled
+#[cfg(test)]
 pub fn handle_slash_command(
     input: &str,
     messages: &mut Vec<serde_json::Value>,
     provider: &str,
     current_model: &str,
+) -> Option<SlashCommandResult> {
+    handle_slash_command_scoped(input, messages, provider, current_model, None, None, None)
+}
+
+/// Handle slash commands with one immutable run available to commands that
+/// discover project-owned resources.
+#[cfg(test)]
+pub fn handle_slash_command_for_run(
+    input: &str,
+    messages: &mut Vec<serde_json::Value>,
+    provider: &str,
+    current_model: &str,
+    run: &openclaudia::tools::ToolRunContext,
+) -> Option<SlashCommandResult> {
+    handle_slash_command_scoped(
+        input,
+        messages,
+        provider,
+        current_model,
+        Some(run),
+        None,
+        None,
+    )
+}
+
+/// Handle slash commands against the exact run and validated configuration
+/// already composed by the production legacy frontend.
+pub fn handle_slash_command_for_runtime(
+    input: &str,
+    messages: &mut Vec<serde_json::Value>,
+    provider: &str,
+    current_model: &str,
+    run: &openclaudia::tools::ToolRunContext,
+    app_config: &openclaudia::config::AppConfig,
+    doctor_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
+) -> Option<SlashCommandResult> {
+    handle_slash_command_scoped(
+        input,
+        messages,
+        provider,
+        current_model,
+        Some(run),
+        Some(app_config),
+        doctor_runtime,
+    )
+}
+
+fn handle_slash_command_scoped(
+    input: &str,
+    messages: &mut Vec<serde_json::Value>,
+    provider: &str,
+    current_model: &str,
+    run_context: Option<&openclaudia::tools::ToolRunContext>,
+    app_config: Option<&openclaudia::config::AppConfig>,
+    doctor_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
 ) -> Option<SlashCommandResult> {
     if !input.starts_with('/') {
         return None;
@@ -1944,6 +2049,9 @@ pub fn handle_slash_command(
         messages,
         provider,
         current_model,
+        run_context,
+        app_config,
+        doctor_runtime,
     };
 
     Some(
@@ -1956,8 +2064,15 @@ pub fn handle_slash_command(
     )
 }
 
-/// Handle /memory command for viewing auto-learned knowledge
-pub fn handle_memory_command(args: &str, memory_db: Option<&memory::MemoryDb>) {
+/// Handle `/memory` inspection. Technical lessons are explicit reference
+/// evidence; the legacy pattern tables remain visible only as compatibility
+/// data and are never fed into automatic learning.
+pub fn handle_memory_command(
+    args: &str,
+    memory_db: Option<&memory::MemoryDb>,
+    run: &openclaudia::tools::ToolRunContext,
+    automatic_learning_enabled: bool,
+) {
     let Some(db) = memory_db else {
         println!("\n\x1b[33mMemory database not available.\x1b[0m\n");
         return;
@@ -1968,19 +2083,51 @@ pub fn handle_memory_command(args: &str, memory_db: Option<&memory::MemoryDb>) {
     let subargs = parts.get(1).copied().unwrap_or("");
 
     match subcmd.as_str() {
-        "" | "stats" => match db.auto_learn_stats() {
-            Ok(stats) => {
-                println!("\n=== Auto-Learning Statistics ===");
-                println!("  Coding patterns:      {}", stats.coding_patterns);
-                println!("  File relationships:   {}", stats.file_relationships);
-                println!("  Error patterns:       {}", stats.error_patterns);
-                println!("  Errors resolved:      {}", stats.errors_resolved);
-                println!("  Learned preferences:  {}", stats.learned_preferences);
-                println!("  Database path:        {}", db.path().display());
-                println!();
+        "" | "status" | "stats" => {
+            let status = openclaudia::auto_learn::status_for_run(run);
+            println!("\n=== Automatic Technical Learning ===");
+            println!(
+                "  Capture policy:       {}",
+                if automatic_learning_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("  Pending exact checks: {}", status.pending_checks);
+            println!("  Candidate transitions: {}", status.candidates_stored);
+            println!("  Contradictions:        {}", status.contradictions_stored);
+            println!("  Degraded events:       {}", status.degraded_events);
+            println!("  Private store:         {}", db.path().display());
+            println!("  Authority:             untrusted reference evidence");
+            println!();
+        }
+        "list" | "lessons" => {
+            match db.query_technical_lessons(None, 20, chrono::Utc::now().timestamp()) {
+                Ok(result) if result.records.is_empty() => {
+                    println!("\nNo technical lessons are stored for this workspace.\n");
+                }
+                Ok(result) => {
+                    println!("\n=== Codebase Technical Lessons ===\n");
+                    for record in result.records {
+                        let review = if record.effectively_host_reviewed {
+                            "host-reviewed"
+                        } else if record.due_for_review {
+                            "review-due"
+                        } else {
+                            "candidate"
+                        };
+                        println!(
+                            "  {} (version {}, {review})",
+                            record.lesson.title,
+                            record.version.get()
+                        );
+                    }
+                    println!();
+                }
+                Err(error) => eprintln!("\nFailed to list technical lessons: {error}\n"),
             }
-            Err(e) => eprintln!("\nFailed to get auto-learn stats: {e}\n"),
-        },
+        }
         "patterns" => memory_show_patterns(db, subargs),
         "errors" => memory_show_errors(db, subargs),
         "prefs" | "preferences" => match db.get_all_preferences() {
@@ -2004,7 +2151,10 @@ pub fn handle_memory_command(args: &str, memory_db: Option<&memory::MemoryDb>) {
         "reset" => memory_reset(db, subargs),
         _ => {
             println!("\nUnknown memory subcommand: {subcmd}");
-            println!("Available: patterns, errors, prefs, files, reset\n");
+            println!(
+                "Available: status, list, patterns, errors, prefs, files, reset\n\
+                 patterns/errors/prefs/files are legacy compatibility views"
+            );
         }
     }
 }
@@ -2093,7 +2243,7 @@ fn memory_reset(db: &memory::MemoryDb, subargs: &str) {
     } else {
         println!("\n\x1b[31mWarning: This will delete ALL learned data!\x1b[0m");
         println!(
-            "This includes coding patterns, error patterns, preferences, and file relationships."
+            "This includes typed technical lessons and their causal history, plus legacy coding patterns, error patterns, preferences, and file relationships."
         );
         println!("\nTo confirm, run: /memory reset confirm\n");
     }
@@ -2336,11 +2486,19 @@ fn plugin_action_help() {
 pub trait PluginActionRunner {
     /// Execute this action against `plugin_manager`. Errors are surfaced
     /// to stdout/stderr by the impl — the CLI is the only consumer.
-    fn apply(self, plugin_manager: &mut plugins::PluginManager) -> PluginActionOutcome;
+    fn apply(
+        self,
+        plugin_manager: &mut plugins::PluginManager,
+        run: &openclaudia::tools::ToolRunContext,
+    ) -> PluginActionOutcome;
 }
 
 impl PluginActionRunner for PluginAction {
-    fn apply(self, plugin_manager: &mut plugins::PluginManager) -> PluginActionOutcome {
+    fn apply(
+        self,
+        plugin_manager: &mut plugins::PluginManager,
+        run: &openclaudia::tools::ToolRunContext,
+    ) -> PluginActionOutcome {
         match self {
             Self::Menu => {
                 plugin_action_menu(plugin_manager);
@@ -2354,7 +2512,12 @@ impl PluginActionRunner for PluginAction {
                 plugin,
                 marketplace,
             } => {
-                plugin_install(plugin.as_deref(), marketplace.as_deref(), plugin_manager);
+                plugin_install(
+                    plugin.as_deref(),
+                    marketplace.as_deref(),
+                    plugin_manager,
+                    run,
+                );
                 PluginActionOutcome::Handled
             }
             Self::Manage => {
@@ -2362,7 +2525,7 @@ impl PluginActionRunner for PluginAction {
                 PluginActionOutcome::Handled
             }
             Self::Uninstall { plugin } => {
-                plugin_action_uninstall(&plugin, plugin_manager);
+                plugin_action_uninstall(&plugin, plugin_manager, run);
                 PluginActionOutcome::Handled
             }
             Self::Enable { plugin } => {
@@ -2380,11 +2543,11 @@ impl PluginActionRunner for PluginAction {
                 PluginActionOutcome::Handled
             }
             Self::Validate { path } => {
-                plugin_validate(path);
+                plugin_validate(path, run);
                 PluginActionOutcome::Handled
             }
             Self::Marketplace { action, target } => {
-                plugin_marketplace(action.as_deref(), target.as_deref(), plugin_manager);
+                plugin_marketplace(action.as_deref(), target.as_deref(), plugin_manager, run);
                 PluginActionOutcome::Handled
             }
             Self::Reload => {
@@ -2426,18 +2589,21 @@ fn plugin_action_manage(plugin_manager: &plugins::PluginManager) {
 
 /// Remove a plugin from install tracking, delete its on-disk directory,
 /// and refresh the in-memory manager.
-fn plugin_action_uninstall(plugin: &str, plugin_manager: &mut plugins::PluginManager) {
-    let uninstall_dir = match plugin_install_dir_for_name(plugin) {
+fn plugin_action_uninstall(
+    plugin: &str,
+    plugin_manager: &mut plugins::PluginManager,
+    run: &openclaudia::tools::ToolRunContext,
+) {
+    let uninstall_dir = match plugin_install_dir_for_name(plugin, run.project_root()) {
         Ok(path) => path,
         Err(e) => {
             eprintln!("\nInvalid plugin name '{plugin}': {e}\n");
             return;
         }
     };
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut installed = plugins::InstalledPlugins::load(&project_root);
+    let mut installed = plugins::InstalledPlugins::load(run.project_root());
     if installed.remove(plugin) {
-        if let Err(e) = installed.save(&project_root) {
+        if let Err(e) = installed.save(run.project_root()) {
             tracing::warn!("Failed to save install tracking: {}", e);
         }
         if uninstall_dir.exists() {
@@ -2466,10 +2632,11 @@ fn plugin_install(
     plugin: Option<&str>,
     marketplace: Option<&str>,
     plugin_manager: &mut plugins::PluginManager,
+    run: &openclaudia::tools::ToolRunContext,
 ) {
     match (plugin, marketplace) {
         (Some(p), Some(m)) => plugin_install_from_marketplace(p, m, plugin_manager),
-        (Some(p), None) => plugin_install_from_source(p, plugin_manager),
+        (Some(p), None) => plugin_install_from_source(p, plugin_manager, run),
         (None, _) => print_available_plugin_installs(plugin_manager),
     }
 }
@@ -2487,11 +2654,24 @@ fn plugin_install_from_marketplace(
     }
 }
 
-fn plugin_install_from_source(plugin: &str, plugin_manager: &mut plugins::PluginManager) {
+fn plugin_install_from_source(
+    plugin: &str,
+    plugin_manager: &mut plugins::PluginManager,
+    run: &openclaudia::tools::ToolRunContext,
+) {
     println!("\nInstalling plugin '{plugin}'...");
-    let path = std::path::Path::new(plugin);
-    if path.exists() && path.is_dir() {
-        install_local_plugin_path(path, plugin_manager);
+    let requested = std::path::Path::new(plugin);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        run.working_directory().join(requested)
+    };
+    let local_path = candidate
+        .canonicalize()
+        .ok()
+        .filter(|path| path.is_dir() && run.permits_read(path));
+    if let Some(path) = local_path.as_deref() {
+        install_local_plugin_path(path, plugin_manager, run.project_root());
     } else if looks_like_git_plugin_source(plugin) {
         install_git_plugin_source(plugin, plugin_manager);
     } else {
@@ -2502,11 +2682,15 @@ fn plugin_install_from_source(plugin: &str, plugin_manager: &mut plugins::Plugin
     }
 }
 
-fn install_local_plugin_path(path: &std::path::Path, plugin_manager: &mut plugins::PluginManager) {
+fn install_local_plugin_path(
+    path: &std::path::Path,
+    plugin_manager: &mut plugins::PluginManager,
+    project_root: &std::path::Path,
+) {
     match plugins::Plugin::load(path) {
         Ok(loaded) => {
             let name = loaded.name().to_string();
-            let dest = match plugin_install_dir_for_name(&name) {
+            let dest = match plugin_install_dir_for_name(&name, project_root) {
                 Ok(path) => path,
                 Err(e) => {
                     eprintln!("Failed to install plugin: invalid plugin name '{name}': {e}\n");
@@ -2517,7 +2701,7 @@ fn install_local_plugin_path(path: &std::path::Path, plugin_manager: &mut plugin
                 eprintln!("Failed to install plugin: {e}\n");
                 return;
             }
-            record_local_plugin_install(&name, &dest, loaded.manifest.version);
+            record_local_plugin_install(&name, &dest, loaded.manifest.version, project_root);
             let _ = plugin_manager.reload();
             println!("Installed plugin '{name}'. Restart to apply changes.\n");
         }
@@ -2525,19 +2709,18 @@ fn install_local_plugin_path(path: &std::path::Path, plugin_manager: &mut plugin
     }
 }
 
-fn record_local_plugin_install(name: &str, dest: &std::path::Path, version: Option<String>) {
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut installed = plugins::InstalledPlugins::load(&project_root);
+fn record_local_plugin_install(
+    name: &str,
+    dest: &std::path::Path,
+    version: Option<String>,
+    project_root: &std::path::Path,
+) {
+    let mut installed = plugins::InstalledPlugins::load(project_root);
     installed.upsert(
         name,
         plugins::PluginInstallEntry {
             scope: plugins::InstallScope::Project,
-            project_path: Some(
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-            ),
+            project_path: Some(project_root.to_string_lossy().to_string()),
             install_path: dest.to_string_lossy().to_string(),
             version,
             installed_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -2545,7 +2728,7 @@ fn record_local_plugin_install(name: &str, dest: &std::path::Path, version: Opti
             git_commit_sha: None,
         },
     );
-    if let Err(e) = installed.save(&project_root) {
+    if let Err(e) = installed.save(project_root) {
         tracing::warn!("Failed to save install tracking: {}", e);
     }
 }
@@ -2587,11 +2770,24 @@ fn print_available_plugin_installs(plugin_manager: &plugins::PluginManager) {
     }
 }
 
-fn plugin_validate(path: Option<String>) {
+fn plugin_validate(path: Option<String>, run: &openclaudia::tools::ToolRunContext) {
     let target = path.unwrap_or_else(|| ".".to_string());
-    let target_path = std::path::Path::new(&target);
+    let requested = std::path::Path::new(&target);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        run.working_directory().join(requested)
+    };
+    let target_path = match candidate.canonicalize() {
+        Ok(path) if run.permits_read(&path) => path,
+        Ok(_) => {
+            println!("\nPath is outside the active run's readable roots: {target}\n");
+            return;
+        }
+        Err(_) => candidate,
+    };
     if target_path.is_dir() {
-        match plugins::Plugin::load(target_path) {
+        match plugins::Plugin::load(&target_path) {
             Ok(plugin) => {
                 println!("\n=== Plugin Validation: PASSED ===\n");
                 println!("  Name:        {}", plugin.name());
@@ -2613,8 +2809,11 @@ fn plugin_validate(path: Option<String>) {
             }
         }
     } else if target_path.is_file() {
-        match fs::read_to_string(target_path) {
-            Ok(content) => {
+        match openclaudia::tools::read_capability_text_attachment(
+            run,
+            &target_path.to_string_lossy(),
+        ) {
+            Ok((_, content)) => {
                 if let Ok(manifest) = serde_json::from_str::<plugins::PluginManifest>(&content) {
                     println!("\n=== Manifest Validation: PASSED ===\n");
                     println!("  Name:    {}", manifest.name);
@@ -2649,9 +2848,12 @@ fn plugin_validate(path: Option<String>) {
     }
 }
 
-fn plugin_install_dir_for_name(plugin: &str) -> Result<std::path::PathBuf, plugins::PluginError> {
+fn plugin_install_dir_for_name(
+    plugin: &str,
+    project_root: &std::path::Path,
+) -> Result<std::path::PathBuf, plugins::PluginError> {
     plugins::validate_plugin_dir_name(plugin)?;
-    Ok(std::path::PathBuf::from(".openclaudia/plugins").join(plugin))
+    Ok(project_root.join(".openclaudia/plugins").join(plugin))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2714,9 +2916,10 @@ fn plugin_marketplace(
     action: Option<&str>,
     target: Option<&str>,
     plugin_manager: &plugins::PluginManager,
+    run: &openclaudia::tools::ToolRunContext,
 ) {
     match action {
-        Some("add") => plugin_marketplace_add(target, plugin_manager),
+        Some("add") => plugin_marketplace_add(target, plugin_manager, run),
         Some("remove" | "rm") => plugin_marketplace_remove(target, plugin_manager),
         Some("update") => plugin_marketplace_update(target, plugin_manager),
         Some("list") => plugin_marketplace_list(plugin_manager),
@@ -2724,14 +2927,27 @@ fn plugin_marketplace(
     }
 }
 
-fn plugin_marketplace_add(target: Option<&str>, plugin_manager: &plugins::PluginManager) {
+fn plugin_marketplace_add(
+    target: Option<&str>,
+    plugin_manager: &plugins::PluginManager,
+    run: &openclaudia::tools::ToolRunContext,
+) {
     let Some(target) = target else {
         println!("\nUsage: /plugin marketplace add <path-or-git-url>#<ref>\n");
         return;
     };
 
-    let path = std::path::Path::new(target);
-    if path.exists() && path.is_dir() {
+    let requested = std::path::Path::new(target);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        run.working_directory().join(requested)
+    };
+    let local_path = candidate
+        .canonicalize()
+        .ok()
+        .filter(|path| path.is_dir() && run.permits_read(path));
+    if let Some(path) = local_path.as_deref() {
         add_marketplace_from_local_dir(path, plugin_manager);
     } else if looks_like_git_plugin_source(target) {
         add_marketplace_from_git_source(target, plugin_manager);
@@ -3067,19 +3283,93 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        gh_bin, git_bin, handle_slash_command, hook_status_lines, parse_pinned_git_source,
-        permission_status_lines, plugin_install_dir_for_name, project_mcp_server_count_from_str,
-        render_agents_listing, render_plugin_command_prompt, slash_plugin, PinnedGitSource,
-        PinnedGitSourceError, PluginAction, SlashCommandResult,
+        gh_bin, git_bin, handle_slash_command, handle_slash_command_for_run, hook_status_lines,
+        parse_pinned_git_source, permission_status_lines, plugin_install_dir_for_name,
+        project_mcp_server_count_from_str, render_agents_listing, render_plugin_command_prompt,
+        repl_doctor_report, slash_plugin, PinnedGitSource, PinnedGitSourceError, PluginAction,
+        SlashCommandResult,
     };
     use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, PermissionsConfig};
-    use openclaudia::permissions::{PermissionDecision, PermissionRule};
     use openclaudia::plugins::PluginCommand;
     use std::collections::{HashMap, HashSet};
 
     /// Convenience: empty message vec, dummy provider + model.
     fn ctx() -> Vec<serde_json::Value> {
         Vec::new()
+    }
+
+    #[test]
+    fn repl_doctor_uses_attached_config_without_claiming_a_file_read() {
+        let config: openclaudia::config::AppConfig = serde_yaml::from_str(
+            "proxy:\n  port: 8080\n  host: 127.0.0.1\n  target: local\nproviders:\n  local:\n    base_url: http://localhost:1234/v1\n",
+        )
+        .expect("typed test configuration");
+        let (_root, run) = scoped_run();
+        let client = reqwest::Client::new();
+        let adapter = openclaudia::providers::get_adapter("local").expect("local adapter");
+        let plugin_manager =
+            openclaudia::plugins::PluginManager::new_for_project(run.project_root());
+        let runtime = openclaudia::doctor::DoctorRuntimeSnapshot::from_run(&run)
+            .with_composed_provider_transport(&client, adapter)
+            .with_composed_plugin_manager(&plugin_manager);
+        let report = repl_doctor_report(Some(&run), Some(&config), Some(&runtime));
+        let receipt = report
+            .receipts()
+            .iter()
+            .find(|receipt| receipt.check_id() == "configuration")
+            .expect("configuration receipt");
+
+        assert_eq!(receipt.code(), "configuration.attached");
+        assert!(receipt.observed_effects().is_empty());
+        assert_eq!(
+            report
+                .receipts()
+                .iter()
+                .find(|receipt| receipt.check_id() == "runtime.context")
+                .expect("runtime context receipt")
+                .code(),
+            "runtime.context.composed"
+        );
+        assert_eq!(
+            report
+                .receipts()
+                .iter()
+                .find(|receipt| receipt.check_id() == "runtime.provider_transport")
+                .expect("provider transport receipt")
+                .code(),
+            "runtime.provider_transport.composed"
+        );
+        assert_eq!(
+            report
+                .receipts()
+                .iter()
+                .find(|receipt| receipt.check_id() == "runtime.plugins")
+                .expect("plugin receipt")
+                .code(),
+            "runtime.plugins.empty"
+        );
+    }
+
+    fn scoped_run() -> (
+        tempfile::TempDir,
+        std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    ) {
+        let root = tempfile::tempdir().expect("slash project root");
+        let run = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            root.path(),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider("slash-test")
+        .build()
+        .expect("slash run");
+        (root, run)
     }
 
     // ── §1 /compact ──────────────────────────────────────────────────────────
@@ -3596,6 +3886,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skill_invocation_uses_the_exact_run_project_layer() {
+        let root_a = tempfile::tempdir().expect("slash skill root A");
+        let root_b = tempfile::tempdir().expect("slash skill root B");
+        let skill_name = "s019-slash-run-bound-cc308c2e";
+        let skill_dir = root_a.path().join(".openclaudia/skills").join(skill_name);
+        std::fs::create_dir_all(&skill_dir).expect("slash skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {skill_name}\ndescription: exact slash run\n---\nS019-SLASH-RUN-A\n"
+            ),
+        )
+        .expect("slash skill fixture");
+        let make_run = |root: &std::path::Path| {
+            openclaudia::tools::ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+                .process(false)
+                .network(false)
+                .secrets(false)
+                .provider("slash-test")
+                .build()
+                .expect("slash test run")
+        };
+        let run_a = make_run(root_a.path());
+        let run_b = make_run(root_b.path());
+        let command = format!("/skill {skill_name}");
+
+        let own = handle_slash_command_for_run(
+            &command,
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+            &run_a,
+        );
+        assert!(matches!(
+            own,
+            Some(SlashCommandResult::Skill(invocation))
+                if invocation.prompt.contains("S019-SLASH-RUN-A")
+        ));
+
+        let foreign = handle_slash_command_for_run(
+            &command,
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+            &run_b,
+        );
+        assert!(
+            matches!(foreign, Some(SlashCommandResult::Handled)),
+            "a sibling run must not invoke the other project's skill"
+        );
+    }
+
     // ── §9 Unknown slash command ──────────────────────────────────────────────
 
     /// OC: any unrecognised command returns `Some(Handled)` (with `eprintln!`).
@@ -3680,7 +4027,7 @@ mod tests {
     fn plugin_install_dir_rejects_path_like_plugin_names() {
         for bad in ["../outside", "bad/name", "bad\\name", ".hidden", "CON"] {
             assert!(
-                plugin_install_dir_for_name(bad).is_err(),
+                plugin_install_dir_for_name(bad, std::path::Path::new("/project")).is_err(),
                 "plugin name {bad:?} must not be usable as an install path"
             );
         }
@@ -3688,11 +4035,13 @@ mod tests {
 
     #[test]
     fn plugin_install_dir_accepts_safe_plugin_name() {
-        let path = plugin_install_dir_for_name("safe-plugin").expect("safe name should pass");
+        let path =
+            plugin_install_dir_for_name("safe-plugin", std::path::Path::new("/explicit-project"))
+                .expect("safe name should pass");
 
         assert_eq!(
             path,
-            std::path::PathBuf::from(".openclaudia/plugins/safe-plugin")
+            std::path::PathBuf::from("/explicit-project/.openclaudia/plugins/safe-plugin")
         );
     }
 
@@ -4037,29 +4386,69 @@ mod tests {
             enabled: true,
             default_allow: vec!["git status".to_string()],
             mcp,
+            project_proposal: None,
         };
-        let persisted = vec![
-            PermissionRule {
-                tool: "Bash".to_string(),
-                pattern: "cargo test *".to_string(),
-                decision: PermissionDecision::AlwaysAllow,
-            },
-            PermissionRule {
-                tool: "Write".to_string(),
-                pattern: ".claude/settings.json".to_string(),
-                decision: PermissionDecision::Deny,
-            },
-        ];
+        let persisted = openclaudia::permissions::PermissionStoreSummary {
+            approval_count: 1,
+            denial_count: 1,
+            capability_generation: 4,
+        };
 
-        let lines = permission_status_lines(&config, Some(&persisted), None);
+        let lines = permission_status_lines(
+            &config,
+            Some(persisted),
+            None,
+            std::path::Path::new("/trusted/permissions-v1.json"),
+        );
         let joined = lines.join("\n");
 
-        assert!(joined.contains("Enabled: yes"));
+        assert!(joined.contains("Host safety: always enabled"));
+        assert!(joined.contains("Approval prompts enabled: yes"));
         assert!(joined.contains("Default allow: git status"));
         assert!(joined.contains("MCP allowlists: 2 server(s)"));
         assert!(joined.contains("blocked: deny all tools"));
         assert!(joined.contains("github: search, fetch"));
-        assert!(joined.contains("2 total (1 always allow, 1 deny)"));
+        assert!(joined.contains("Persisted exact approvals: 1 (generation 4"));
+        assert!(joined.contains("Persisted explicit denials: 1"));
+        assert!(joined.contains("host hard deny > explicit deny > exact approval receipt"));
+    }
+
+    #[test]
+    fn permission_status_exposes_inert_repository_grants_without_applying_them() {
+        let config = PermissionsConfig {
+            project_proposal: Some(openclaudia::config::ProjectPermissionProposal {
+                schema_version: openclaudia::config::PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION,
+                source: std::path::PathBuf::from("/project/.openclaudia/config.yaml"),
+                source_digest: "sha256:source".to_string(),
+                proposal_digest: "sha256:proposal".to_string(),
+                requests_prompt_bypass: true,
+                default_allow: vec!["Bash(git push)".to_string()],
+                mcp_tools: std::collections::BTreeMap::from([(
+                    "remote".to_string(),
+                    vec!["invoke".to_string()],
+                )]),
+                web_fetch_preapproved_domains: vec!["attacker.example".to_string()],
+            }),
+            ..Default::default()
+        };
+
+        let joined = permission_status_lines(
+            &config,
+            None,
+            None,
+            std::path::Path::new("/trusted/permissions-v1.json"),
+        )
+        .join("\n");
+
+        assert!(joined.contains(&format!(
+            "Repository permission proposal: inert (schema {}",
+            openclaudia::config::PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION
+        )));
+        assert!(joined.contains("Requested prompt bypass: ignored"));
+        assert!(joined.contains("Requested default allows: 1 (ignored"));
+        assert!(joined.contains("Requested MCP grants: 1 tool(s) across 1 server(s) (ignored"));
+        assert!(joined.contains("Requested web preapprovals: 1 (ignored"));
+        assert!(joined.contains("Approval prompts enabled: yes"));
     }
 
     #[test]
@@ -4138,9 +4527,11 @@ mod tests {
     /// canonicalised path.
     #[test]
     fn add_dir_valid_directory_returns_add_working_dir() {
+        let (_root, run) = scoped_run();
         let dir = std::env::temp_dir();
         let input = format!("/add-dir {}", dir.display());
-        let result = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+        let result =
+            handle_slash_command_for_run(&input, &mut ctx(), "anthropic", "claude-sonnet", &run);
         assert!(
             matches!(result, Some(SlashCommandResult::AddWorkingDir(_))),
             "/add-dir <valid-dir> must return AddWorkingDir"
@@ -4156,11 +4547,13 @@ mod tests {
     /// `/add-dir` with a path that does not exist returns `Handled`.
     #[test]
     fn add_dir_nonexistent_path_returns_handled() {
-        let result = handle_slash_command(
+        let (_root, run) = scoped_run();
+        let result = handle_slash_command_for_run(
             "/add-dir /this/path/does/not/exist/9f3a",
             &mut ctx(),
             "anthropic",
             "claude-sonnet",
+            &run,
         );
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
@@ -4171,9 +4564,11 @@ mod tests {
     /// `/add-dir` with a file path (not a directory) returns `Handled`.
     #[test]
     fn add_dir_file_path_returns_handled() {
+        let (_root, run) = scoped_run();
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         let input = format!("/add-dir {}", tmp.path().display());
-        let result = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+        let result =
+            handle_slash_command_for_run(&input, &mut ctx(), "anthropic", "claude-sonnet", &run);
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
             "/add-dir <file> must return Handled (only directories are accepted)"
@@ -4196,31 +4591,37 @@ mod tests {
     /// `BranchSession(name)`.
     #[test]
     fn branch_explicit_name_creates_file_and_returns_branch_session() {
+        let (root, run) = scoped_run();
         let name = format!("test-branch-{}", uuid::Uuid::new_v4().simple());
         let input = format!("/branch {name}");
-        let result = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+        let result =
+            handle_slash_command_for_run(&input, &mut ctx(), "anthropic", "claude-sonnet", &run);
         assert!(
             matches!(result, Some(SlashCommandResult::BranchSession(ref n)) if n == &name),
             "/branch <name> must return BranchSession(name)"
         );
-        let branch_path = std::path::PathBuf::from(format!(".openclaudia/branches/{name}.json"));
+        let branch_path = root
+            .path()
+            .join(format!(".openclaudia/branches/{name}.json"));
         assert!(branch_path.exists(), "branch file must be created on disk");
-        let _ = std::fs::remove_file(&branch_path);
     }
 
     /// `/branch` with no argument uses an auto-generated name and returns
     /// `BranchSession`.
     #[test]
     fn branch_no_arg_uses_generated_name() {
-        let result = handle_slash_command("/branch", &mut ctx(), "anthropic", "claude-sonnet");
+        let (root, run) = scoped_run();
+        let result =
+            handle_slash_command_for_run("/branch", &mut ctx(), "anthropic", "claude-sonnet", &run);
         if let Some(SlashCommandResult::BranchSession(ref name)) = result {
             assert!(
                 !name.is_empty(),
                 "auto-generated branch name must be non-empty"
             );
-            let branch_path =
-                std::path::PathBuf::from(format!(".openclaudia/branches/{name}.json"));
-            let _ = std::fs::remove_file(&branch_path);
+            let branch_path = root
+                .path()
+                .join(format!(".openclaudia/branches/{name}.json"));
+            assert!(branch_path.is_file());
         } else {
             panic!("/branch with no arg must return BranchSession");
         }
@@ -4229,34 +4630,37 @@ mod tests {
     /// `/branch <name>` called twice with the same name fails on the second call.
     #[test]
     fn branch_name_collision_returns_handled() {
+        let (_root, run) = scoped_run();
         let name = format!("test-collision-{}", uuid::Uuid::new_v4().simple());
         let input = format!("/branch {name}");
-        let first = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+        let first =
+            handle_slash_command_for_run(&input, &mut ctx(), "anthropic", "claude-sonnet", &run);
         assert!(
             matches!(first, Some(SlashCommandResult::BranchSession(_))),
             "first /branch must succeed"
         );
-        let second = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+        let second =
+            handle_slash_command_for_run(&input, &mut ctx(), "anthropic", "claude-sonnet", &run);
         assert!(
             matches!(second, Some(SlashCommandResult::Handled)),
             "/branch with duplicate name must return Handled"
         );
-        let branch_path = std::path::PathBuf::from(format!(".openclaudia/branches/{name}.json"));
-        let _ = std::fs::remove_file(&branch_path);
     }
 
     #[test]
     fn branch_rejects_path_traversal_name_without_writing_outside_branches() {
+        let (root, run) = scoped_run();
         let escape_name = format!("branch-escape-{}", uuid::Uuid::new_v4().simple());
         let input = format!("/branch ../{escape_name}");
 
-        let result = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+        let result =
+            handle_slash_command_for_run(&input, &mut ctx(), "anthropic", "claude-sonnet", &run);
 
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
             "path-like branch names must be rejected"
         );
-        let escaped_path = std::path::PathBuf::from(format!(".openclaudia/{escape_name}.json"));
+        let escaped_path = root.path().join(format!(".openclaudia/{escape_name}.json"));
         assert!(
             !escaped_path.exists(),
             "invalid branch name must not write outside .openclaudia/branches"
@@ -4265,9 +4669,16 @@ mod tests {
 
     #[test]
     fn branch_rejects_names_with_shell_or_path_punctuation() {
+        let (_root, run) = scoped_run();
         for bad in ["bad/name", "bad\\name", "bad name", "bad$name", ".hidden"] {
             let input = format!("/branch {bad}");
-            let result = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+            let result = handle_slash_command_for_run(
+                &input,
+                &mut ctx(),
+                "anthropic",
+                "claude-sonnet",
+                &run,
+            );
 
             assert!(
                 matches!(result, Some(SlashCommandResult::Handled)),
@@ -4278,7 +4689,14 @@ mod tests {
 
     #[test]
     fn teleport_missing_name_returns_usage_handled() {
-        let result = handle_slash_command("/teleport", &mut ctx(), "anthropic", "claude-sonnet");
+        let (_root, run) = scoped_run();
+        let result = handle_slash_command_for_run(
+            "/teleport",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+            &run,
+        );
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
             "/teleport without a name must return Handled usage"
@@ -4287,11 +4705,13 @@ mod tests {
 
     #[test]
     fn teleport_rejects_path_traversal_name() {
-        let result = handle_slash_command(
+        let (_root, run) = scoped_run();
+        let result = handle_slash_command_for_run(
             "/teleport ../escape",
             &mut ctx(),
             "anthropic",
             "claude-sonnet",
+            &run,
         );
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
@@ -4301,6 +4721,7 @@ mod tests {
 
     #[test]
     fn teleport_restores_named_branch_snapshot() {
+        let (_root, run) = scoped_run();
         let name = format!("test-teleport-{}", uuid::Uuid::new_v4().simple());
         let mut branched_messages = vec![
             serde_json::json!({"role": "user", "content": "saved prompt"}),
@@ -4308,8 +4729,13 @@ mod tests {
         ];
 
         let branch_input = format!("/branch {name}");
-        let branch_result =
-            handle_slash_command(&branch_input, &mut branched_messages, "anthropic", "claude");
+        let branch_result = handle_slash_command_for_run(
+            &branch_input,
+            &mut branched_messages,
+            "anthropic",
+            "claude",
+            &run,
+        );
         assert!(matches!(
             branch_result,
             Some(SlashCommandResult::BranchSession(_))
@@ -4317,32 +4743,64 @@ mod tests {
 
         let teleport_input = format!("/teleport {name}");
         let teleport_result =
-            handle_slash_command(&teleport_input, &mut ctx(), "anthropic", "claude");
+            handle_slash_command_for_run(&teleport_input, &mut ctx(), "anthropic", "claude", &run);
         match teleport_result {
             Some(SlashCommandResult::TeleportSession { messages, .. }) => {
                 assert_eq!(messages, branched_messages);
             }
             _ => panic!("/teleport must load branch snapshot"),
         }
+    }
 
-        let _ = std::fs::remove_file(super::branch_snapshot_path(&name));
+    #[test]
+    fn branch_snapshots_cannot_cross_run_roots() {
+        let (_first_root, first_run) = scoped_run();
+        let (_second_root, second_run) = scoped_run();
+        let name = format!("run-isolated-{}", uuid::Uuid::new_v4().simple());
+        let command = format!("/branch {name}");
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "FIRST-RUN-BRANCH-SECRET"
+        })];
+        let created = handle_slash_command_for_run(
+            &command,
+            &mut messages,
+            "anthropic",
+            "claude",
+            &first_run,
+        );
+        assert!(matches!(
+            created,
+            Some(SlashCommandResult::BranchSession(_))
+        ));
+
+        let foreign = handle_slash_command_for_run(
+            &format!("/teleport {name}"),
+            &mut ctx(),
+            "anthropic",
+            "claude",
+            &second_run,
+        );
+        assert!(matches!(foreign, Some(SlashCommandResult::Handled)));
+        assert!(!super::branch_snapshot_path(&second_run, &name).exists());
     }
 
     #[test]
     fn teleport_malformed_snapshot_returns_handled() {
+        let (_root, run) = scoped_run();
         let name = format!("test-teleport-bad-{}", uuid::Uuid::new_v4().simple());
-        let path = super::branch_snapshot_path(&name);
+        let path = super::branch_snapshot_path(&run, &name);
         std::fs::create_dir_all(path.parent().expect("branch path has parent")).unwrap();
         std::fs::write(&path, r#"{"name":"bad","messages":"not-array"}"#).unwrap();
 
         let input = format!("/teleport {name}");
-        let result = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+        let result =
+            handle_slash_command_for_run(&input, &mut ctx(), "anthropic", "claude-sonnet", &run);
 
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
             "malformed branch snapshots must not mutate the session"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     // ── §12 /btw (#179) ───────────────────────────────────────────────

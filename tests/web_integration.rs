@@ -21,15 +21,17 @@
 //!
 //! Gated behind `#[ignore]`. Opt in at runtime with:
 //! ```text
-//! cargo test -p openclaudia --test web_integration -- --ignored
+//! cargo test -p openclaudia --features browser --test web_integration -- --ignored
 //! ```
 //! Set `OPENCLAUDIA_TEST_BROWSER=1` to confirm opt-in intent (tests log a warning if absent).
 
 use openclaudia::permissions::{CheckResult, PermissionManager};
 #[cfg(feature = "browser")]
 use openclaudia::web::parse_duckduckgo_results_from_html;
-use openclaudia::web::{fetch_url, fetch_with_browser, format_search_results, SearchResult};
-use serde_json::{json, Value};
+use openclaudia::web::{format_search_results, FetchResult, SearchResult};
+use serde_json::json;
+#[cfg(feature = "browser")]
+use serde_json::Value;
 use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -37,6 +39,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+async fn fetch_url(url: &str) -> Result<FetchResult, String> {
+    openclaudia::web::fetch_url(url, std::sync::Arc::clone(support::shared_run_context())).await
+}
+
+fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
+    openclaudia::web::fetch_with_browser(url, support::shared_run_context().private_temp_root())
+}
 
 /// Build a wiremock server that returns the given body and status for GET /*.
 async fn serve_body(status: u16, body: &str) -> MockServer {
@@ -232,13 +242,13 @@ fn fetch_output_format_contains_url_header() {
             arguments: r#"{"url": "not-a-url"}"#.to_string(),
         },
     };
-    let result = execute_tool(&call);
+    let result = execute_tool(support::shared_run_context(), &call);
     // Spec §1 error path: prefix check fails → error string, is_error = true.
-    assert!(result.is_error, "invalid URL must return is_error=true");
+    assert!(result.is_error(), "invalid URL must return is_error=true");
     assert!(
-        result.content.contains("Invalid URL") || result.content.contains("Missing"),
+        result.content().contains("Invalid URL") || result.content().contains("Missing"),
         "expected error message, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -341,16 +351,17 @@ fn execute_web_fetch_prefix_check_catches_non_http() {
                 arguments: format!(r#"{{"url": "{bad_url}"}}"#),
             },
         };
-        let result = execute_tool(&call);
+        let result = execute_tool(support::shared_run_context(), &call);
         assert!(
-            result.is_error,
+            result.is_error(),
             "expected error for {bad_url}, got success: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Invalid URL") || result.content.contains("must start with"),
+            result.content().contains("Invalid URL")
+                || result.content().contains("must start with"),
             "wrong error message for {bad_url}: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -367,12 +378,12 @@ fn execute_web_fetch_missing_url_arg_returns_error() {
             arguments: r"{}".to_string(),
         },
     };
-    let result = execute_tool(&call);
-    assert!(result.is_error);
+    let result = execute_tool(support::shared_run_context(), &call);
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Missing"),
+        result.content().contains("Missing"),
         "expected 'Missing url' error, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -384,30 +395,59 @@ fn execute_web_fetch_missing_url_arg_returns_error() {
 // ===========================================================================
 
 #[cfg(feature = "browser")]
+fn assert_web_search_host_safety_denial(
+    result: &openclaudia::tools::ToolResult,
+    expected_reason: &str,
+) {
+    use openclaudia::tools::{ToolFailureCode, ToolOutcome, ToolRetryability};
+
+    assert!(result.is_error(), "web-search classification must deny");
+    assert!(matches!(
+        result.outcome(),
+        ToolOutcome::Error { failure }
+            if failure.code == ToolFailureCode::PermissionDenied
+                && failure.retryability == ToolRetryability::Never
+    ));
+    assert_eq!(
+        result.content(),
+        format!("Permission denied: Host safety: {expected_reason}")
+    );
+}
+
+#[cfg(feature = "browser")]
 #[test]
 fn execute_web_search_short_query_returns_error() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 
-    for bad_query in &["", "x"] {
-        let call = ToolCall {
-            id: "shortq".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "web_search".to_string(),
-                arguments: format!(r#"{{"query": "{bad_query}"}}"#),
-            },
-        };
-        let result = execute_tool(&call);
-        assert!(
-            result.is_error,
-            "expected error for short query {bad_query:?}"
-        );
-        assert!(
-            result.content.contains("at least 2 characters"),
-            "expected min-length message, got: {}",
-            result.content
-        );
-    }
+    let empty = ToolCall {
+        id: "empty-query".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "web_search".to_string(),
+            arguments: r#"{"query": ""}"#.to_string(),
+        },
+    };
+    let empty_result = execute_tool(support::shared_run_context(), &empty);
+    assert_web_search_host_safety_denial(
+        &empty_result,
+        "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+    );
+
+    let one_character = ToolCall {
+        id: "one-character-query".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "web_search".to_string(),
+            arguments: r#"{"query": "x"}"#.to_string(),
+        },
+    };
+    let short_result = execute_tool(support::shared_run_context(), &one_character);
+    assert!(short_result.is_error(), "one-character query must fail");
+    assert!(
+        short_result.content().contains("at least 2 characters"),
+        "expected min-length message, got: {}",
+        short_result.content()
+    );
 }
 
 #[cfg(feature = "browser")]
@@ -423,12 +463,12 @@ fn execute_web_search_missing_query_returns_error() {
             arguments: r"{}".to_string(),
         },
     };
-    let result = execute_tool(&call);
-    assert!(result.is_error);
+    let result = execute_tool(support::shared_run_context(), &call);
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Missing"),
+        result.content().contains("Missing"),
         "expected 'Missing query' error, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -437,11 +477,27 @@ fn execute_web_search_missing_query_returns_error() {
 fn execute_web_search_rejects_non_string_query_before_browser_launch() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 
-    for (name, value) in [
-        ("number", json!(42)),
-        ("array", json!(["rust", "release"])),
-        ("object", json!({"q": "rust release"})),
-        ("null", Value::Null),
+    for (name, value, expected_reason) in [
+        (
+            "number",
+            json!(42),
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "array",
+            json!(["rust", "release"]),
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "object",
+            json!({"q": "rust release"}),
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "null",
+            Value::Null,
+            "Denied: Missing 'query' argument required for web_search tool call",
+        ),
     ] {
         let call = ToolCall {
             id: format!("badquery-{name}"),
@@ -454,9 +510,8 @@ fn execute_web_search_rejects_non_string_query_before_browser_launch() {
                 .to_string(),
             },
         };
-        let result = execute_tool(&call);
-        assert!(result.is_error, "query case {name} should fail");
-        assert_eq!(result.content, "Invalid 'query' argument: expected string");
+        let result = execute_tool(support::shared_run_context(), &call);
+        assert_web_search_host_safety_denial(&result, expected_reason);
     }
 }
 
@@ -483,14 +538,14 @@ fn execute_web_search_rejects_invalid_limit_before_browser_launch() {
                 .to_string(),
             },
         };
-        let result = execute_tool(&call);
-        assert!(result.is_error, "limit case {name} should fail");
+        let result = execute_tool(support::shared_run_context(), &call);
+        assert!(result.is_error(), "limit case {name} should fail");
         assert!(
             result
-                .content
+                .content()
                 .contains("web_search limit must be an integer between 1 and 10"),
             "invalid limit should fail before search backend launch; got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -526,12 +581,12 @@ fn execute_web_search_rejects_invalid_domain_filters_before_browser_launch() {
                 .to_string(),
             },
         };
-        let result = execute_tool(&call);
-        assert!(result.is_error, "domain filter case {name} should fail");
+        let result = execute_tool(support::shared_run_context(), &call);
+        assert!(result.is_error(), "domain filter case {name} should fail");
         assert!(
-            result.content.contains(expected),
+            result.content().contains(expected),
             "invalid domain filter should fail before search backend launch; got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -770,18 +825,19 @@ async fn browser_fetch_success_contains_url_line() {
             arguments: r#"{"url": "https://example.com/"}"#.to_string(),
         },
     };
-    let result = execute_tool(&call);
-    if result.is_error {
+    let result = execute_tool(support::shared_run_context(), &call);
+    if result.is_error() {
         eprintln!(
             "Browser fetch failed (Chrome may not be installed): {}",
-            result.content
+            result.content()
         );
         return;
     }
     // Spec §4: output contains "URL: <url>" line
     assert!(
-        result.content.contains("URL: https://example.com/"),
+        result.content().contains("URL: https://example.com/"),
         "URL line missing from browser fetch output: {}",
-        result.content
+        result.content()
     );
 }
+mod support;

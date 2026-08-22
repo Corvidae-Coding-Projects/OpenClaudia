@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "review_id": "capability-corpus-review-v2",
+  "reviewer_id": "primary-orchestrator-6vw9",
+  "corpus_id": "capability-evidence-v1",
+  "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
+  "verdict": "approved",
+  "reviewed_scenario_ids": [
+    "registry-render-success",
+    "registry-rejects-docs-only",
+    "registry-rejects-missing-failure-evidence"
+  ],
+  "reviewed_dimensions": [
+    "final_environment_graders",
+    "success_and_failure_coverage",
+    "multi_trial_design",
+    "trace_assertions",
+    "effect_observation_assertions",
+    "artifact_bounds_and_isolation"
+  ],
+  "limitations": [
+    "S-012 changed only the deterministic registry-render expected file and final-environment digests for registry generation 3; the primary reviewer rechecked that exact internal-record/header projection delta and retained every scenario, trace, effect proof, trial, and failure grader unchanged.",
+    "S-006 changed only the deterministic registry-render expected file and final-environment digests for registry generation 2; the primary reviewer rechecked that exact projection delta and retained every scenario, trace, effect proof, trial, and failure grader unchanged.",
+    "Independent primary review approved the frozen registry and corpus after inspecting effect proof binding, final-state grading, trace identity, input bounds, executable scenarios, and adversarial tests; approval does not promote other runtime capabilities.",
+    "Three fresh deterministic trials prove repeatability only and do not add stochastic model coverage.",
+    "Path grading is authoritative only for the declared in-process, no-child executor; descriptor-safe traversal is required before concurrent or child-process scenarios are admitted.",
+    "Canonical alternate-model VDD remains pending until S-088 is implemented."
+  ]
+}

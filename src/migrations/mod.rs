@@ -1,31 +1,17 @@
-//! Startup migration framework for on-disk format changes.
+//! Fail-closed startup migrations for persistent agent state.
 //!
-//! Port of Claude Code's `migrations/` directory. Each migration is a
-//! small, self-contained unit that checks whether it applies, and if
-//! so, upgrades one on-disk artifact (settings file, transcript, memory
-//! DB, etc.). Migrations run in registration order at startup.
-//!
-//! # Kinds
-//!
-//! - **Idempotent** migrations inspect current state each run and
-//!   short-circuit when there's nothing to do. Preferred, because they
-//!   survive disk rollbacks and partial applies without a separate
-//!   completion ledger.
-//! - **Once-only** migrations are marked done after their first
-//!   successful run via [`CompletionLedger`]. Use only when the
-//!   migration can't introspect the target state to detect whether it
-//!   already ran (e.g. a one-time notification, an analytics event).
-//!
-//! # Failure model
-//!
-//! A migration failure must never crash startup. The runner logs the
-//! error and continues with the remaining migrations. Callers get the
-//! full per-migration result via [`run_all`]'s return value if they
-//! want to surface it.
+//! Every registered migration is required to be idempotent. The runner holds a
+//! bounded, store-scoped process lock, stops at the first failure, catches
+//! panic control flow, and returns a typed terminal state. A caller may start a
+//! writable agent surface only after receiving
+//! [`StartupMigrationStatus::Writable`]. Migration implementations must never
+//! place persisted content in a panic payload: Rust invokes the process-global
+//! panic hook before [`std::panic::catch_unwind`] returns control to the runner.
 
-use anyhow::Context as _;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 mod ledger;
 mod registry;
@@ -37,93 +23,312 @@ mod tests;
 
 pub use ledger::CompletionLedger;
 
-/// What a migration does when invoked.
+#[cfg(not(test))]
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+/// Persistent store whose startup state was inspected or changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MigrationStore {
+    /// Host-selected directories needed to construct the migration context.
+    StartupContext,
+    /// `OpenClaudia`-owned local application data.
+    OpenClaudiaData,
+    /// The legacy Claude transcript compatibility directory.
+    ClaudeTranscripts,
+}
+
+impl fmt::Display for MigrationStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::StartupContext => "startup context",
+            Self::OpenClaudiaData => "OpenClaudia data",
+            Self::ClaudeTranscripts => "legacy transcript metadata",
+        })
+    }
+}
+
+/// Stable category for a migration failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MigrationFailureKind {
+    ContextUnavailable,
+    LockUnavailable,
+    InvalidPersistentState,
+    UnsupportedFutureSchema,
+    ResourceLimitExceeded,
+    ConcurrentChange,
+    PublicationFailed,
+    DurabilityUncertain,
+    MigrationPanicked,
+    NonIdempotentRegistration,
+}
+
+impl MigrationFailureKind {
+    /// Stable machine-readable diagnostic code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ContextUnavailable => "migration_context_unavailable",
+            Self::LockUnavailable => "migration_lock_unavailable",
+            Self::InvalidPersistentState => "migration_invalid_persistent_state",
+            Self::UnsupportedFutureSchema => "migration_future_schema",
+            Self::ResourceLimitExceeded => "migration_resource_limit",
+            Self::ConcurrentChange => "migration_concurrent_change",
+            Self::PublicationFailed => "migration_publication_failed",
+            Self::DurabilityUncertain => "migration_durability_uncertain",
+            Self::MigrationPanicked => "migration_panicked",
+            Self::NonIdempotentRegistration => "migration_non_idempotent_registration",
+        }
+    }
+}
+
+/// Redacted, actionable cause returned by a migration.
 ///
-/// `Failed` carries a `String` rather than `anyhow::Error` so the outcome is
-/// `Clone`-able and easy to ship through channels / fan out across reporters
-/// (crosslink #894). Producers of `Failed` are expected to call `to_string()`
-/// on the underlying error (or use [`From<anyhow::Error>`]) at the failure
-/// site; the structured chain is lost on purpose — by the time a migration
-/// has returned `Failed`, downstream code only needs a stable human-readable
-/// summary for logs and the `migrate --dry-run` report.
-#[derive(Clone)]
+/// Paths, persisted bytes, parser excerpts, and panic payloads are
+/// intentionally absent. `io_kind` retains an operator-useful OS category
+/// without copying potentially sensitive error text into startup diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationFailure {
+    kind: MigrationFailureKind,
+    store: MigrationStore,
+    operation: &'static str,
+    io_kind: Option<io::ErrorKind>,
+    committed_artifacts: usize,
+}
+
+impl MigrationFailure {
+    pub(crate) const fn new(
+        kind: MigrationFailureKind,
+        store: MigrationStore,
+        operation: &'static str,
+    ) -> Self {
+        Self {
+            kind,
+            store,
+            operation,
+            io_kind: None,
+            committed_artifacts: 0,
+        }
+    }
+
+    pub(crate) fn from_io(
+        kind: MigrationFailureKind,
+        store: MigrationStore,
+        operation: &'static str,
+        error: &io::Error,
+    ) -> Self {
+        Self {
+            kind,
+            store,
+            operation,
+            io_kind: Some(error.kind()),
+            committed_artifacts: 0,
+        }
+    }
+
+    pub(crate) const fn with_committed_artifacts(mut self, count: usize) -> Self {
+        self.committed_artifacts = count;
+        self
+    }
+
+    /// Stable failure category.
+    #[must_use]
+    pub const fn kind(&self) -> MigrationFailureKind {
+        self.kind
+    }
+
+    /// Persistent store affected by the failed operation.
+    #[must_use]
+    pub const fn store(&self) -> MigrationStore {
+        self.store
+    }
+
+    /// Content-free name of the operation that failed.
+    #[must_use]
+    pub const fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// Standard-library I/O category, when the failure came from the OS.
+    #[must_use]
+    pub const fn io_kind(&self) -> Option<io::ErrorKind> {
+        self.io_kind
+    }
+
+    /// Number of artifacts atomically published before the terminal failure.
+    #[must_use]
+    pub const fn committed_artifacts(&self) -> usize {
+        self.committed_artifacts
+    }
+
+    /// Operator action that can move the store back toward a known state.
+    #[must_use]
+    pub const fn recovery(&self) -> &'static str {
+        match self.kind {
+            MigrationFailureKind::ContextUnavailable => {
+                "configure absolute user data/home directories and restart"
+            }
+            MigrationFailureKind::LockUnavailable => {
+                "wait for the other OpenClaudia process to finish, then restart"
+            }
+            MigrationFailureKind::InvalidPersistentState => {
+                "restore the affected store from a known-good backup or inspect it with an offline recovery tool, then restart"
+            }
+            MigrationFailureKind::UnsupportedFutureSchema => {
+                "start with an OpenClaudia version that supports the stored schema"
+            }
+            MigrationFailureKind::ResourceLimitExceeded => {
+                "reduce or archive the affected store with a backup retained, then restart"
+            }
+            MigrationFailureKind::ConcurrentChange => {
+                "stop other writers to the affected store and restart"
+            }
+            MigrationFailureKind::PublicationFailed => {
+                "repair storage capacity, ownership, and permissions, then restart; already-published artifacts are idempotent"
+            }
+            MigrationFailureKind::DurabilityUncertain => {
+                "verify the storage device and restart to reconcile the visible generation"
+            }
+            MigrationFailureKind::MigrationPanicked => {
+                "preserve the store and report the migration diagnostic code before retrying"
+            }
+            MigrationFailureKind::NonIdempotentRegistration => {
+                "remove or replace the non-idempotent startup migration before restarting"
+            }
+        }
+    }
+}
+
+impl fmt::Display for MigrationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} while performing {} on {}",
+            self.kind.code(),
+            self.operation,
+            self.store
+        )?;
+        if let Some(kind) = self.io_kind {
+            write!(formatter, " (I/O category: {kind:?})")?;
+        }
+        if self.committed_artifacts > 0 {
+            write!(
+                formatter,
+                " after {} atomic artifact publication(s)",
+                self.committed_artifacts
+            )?;
+        }
+        write!(formatter, "; recovery: {}", self.recovery())
+    }
+}
+
+impl std::error::Error for MigrationFailure {}
+
+/// Result of one registered migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MigrationOutcome {
-    /// Target state is already current — no action taken.
-    Skipped,
-    /// Migration ran and changed state. Message is surfaced in logs.
-    Applied(String),
-    /// Migration failed. Startup continues; error is logged. The payload
-    /// is the formatted error message (chain flattened to a single
-    /// `Display` string).
-    Failed(String),
+    /// The complete inspected store was already current.
+    Current,
+    /// The migration atomically published this many artifacts.
+    Applied { changed_artifacts: usize },
+    /// The store is not safe to open writable.
+    Failed(MigrationFailure),
 }
 
-impl From<anyhow::Error> for MigrationOutcome {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Failed(format!("{err:#}"))
-    }
-}
-
-impl From<std::io::Error> for MigrationOutcome {
-    fn from(err: std::io::Error) -> Self {
-        Self::Failed(err.to_string())
-    }
-}
-
-/// Whether the runner needs to consult the completion ledger before
-/// running this migration.
+/// Whether the runner may invoke a migration on every startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunPolicy {
-    /// Always invoke — the migration decides itself whether to act.
+    /// The migration detects current target state and can safely be retried.
     Idempotent,
-    /// Invoke at most once per machine; subsequent runs are skipped.
+    /// Legacy policy retained for API compatibility but rejected by the
+    /// fail-closed startup runner.
     OnceOnly,
 }
 
-/// Contract a migration implements. Stateless and side-effect free on
-/// construction — all work happens inside [`Migration::run`].
+/// Contract implemented by each ordered startup migration.
 pub trait Migration: Send + Sync {
-    /// Stable identifier. Used as the ledger key for once-only
-    /// migrations and in log output. Must not change between releases.
+    /// Stable identifier used in redacted diagnostics.
     fn id(&self) -> &'static str;
 
-    /// Short human-readable summary for logs / `openclaudia migrate --dry-run`.
+    /// Short content-free summary for logs and diagnostics.
     fn description(&self) -> &'static str;
 
-    /// Run policy — see [`RunPolicy`].
+    /// Store whose state is owned by this migration.
+    fn store(&self) -> MigrationStore;
+
+    /// Startup accepts only idempotent registrations.
     fn run_policy(&self) -> RunPolicy {
         RunPolicy::Idempotent
     }
 
-    /// Execute the migration. Must not panic; return
-    /// [`MigrationOutcome::Failed`] for recoverable errors.
+    /// Inspect, validate, and atomically publish this migration.
     fn run(&self, ctx: &MigrationContext) -> MigrationOutcome;
 }
 
-/// Read-only context handed to every migration. Carries the paths the
-/// migration is allowed to touch, so the unit under test doesn't resolve
-/// `dirs::home_dir()` itself.
+/// Explicit paths authorized for startup migration work.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationContext {
-    /// `~/.claude` (or `$CLAUDE_CONFIG_HOME_DIR` if set).
+    /// Legacy Claude transcript compatibility root.
     pub claude_home: PathBuf,
-    /// `~/.local/share/openclaudia` (or the platform equivalent).
+    /// `OpenClaudia`-owned application-data root.
     pub openclaudia_data: PathBuf,
 }
 
 impl MigrationContext {
-    /// Build a context from the user's real directories. Falls back to
-    /// `.` if any lookup fails — migrations must tolerate missing dirs.
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self {
-            claude_home: crate::transcript::claude_config_home_dir(),
-            openclaudia_data: dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("openclaudia"),
+    fn validate(&self) -> Result<(), MigrationFailure> {
+        if self.claude_home.is_absolute() && self.openclaudia_data.is_absolute() {
+            Ok(())
+        } else {
+            Err(MigrationFailure::new(
+                MigrationFailureKind::ContextUnavailable,
+                MigrationStore::StartupContext,
+                "validate absolute migration roots",
+            ))
         }
     }
 
-    /// Explicit constructor for tests that need to sandbox writes.
+    /// Resolve real startup roots without falling back to the ambient working
+    /// directory.
+    ///
+    /// # Errors
+    /// Returns a typed failure when a platform directory is unavailable or an
+    /// explicit environment override is relative.
+    pub fn from_env() -> Result<Self, MigrationFailure> {
+        let claude_home = std::env::var_os("CLAUDE_CONFIG_HOME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+            .ok_or_else(|| {
+                MigrationFailure::new(
+                    MigrationFailureKind::ContextUnavailable,
+                    MigrationStore::StartupContext,
+                    "resolve legacy transcript root",
+                )
+            })?;
+        let openclaudia_data = dirs::data_local_dir()
+            .map(|directory| directory.join("openclaudia"))
+            .ok_or_else(|| {
+                MigrationFailure::new(
+                    MigrationFailureKind::ContextUnavailable,
+                    MigrationStore::StartupContext,
+                    "resolve OpenClaudia data root",
+                )
+            })?;
+        let context = Self {
+            claude_home,
+            openclaudia_data,
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
+    /// Explicit constructor for tests and host code that already owns both
+    /// directory authorities.
     #[must_use]
     pub const fn with_paths(claude_home: PathBuf, openclaudia_data: PathBuf) -> Self {
         Self {
@@ -131,120 +336,327 @@ impl MigrationContext {
             openclaudia_data,
         }
     }
-
-    /// Where the once-only completion ledger lives.
-    ///
-    /// crosslink #960: scoped to `pub(crate)` so external callers cannot
-    /// reach in and mutate ledger state through a path they fabricated.
-    /// The ledger itself is a private detail of [`run_all`]; callers that
-    /// need to inspect what has run should consume the [`MigrationReport`]
-    /// stream instead of reading the file directly.
-    #[must_use]
-    pub(crate) fn ledger_path(&self) -> PathBuf {
-        self.openclaudia_data.join("migrations.json")
-    }
 }
 
-/// Per-migration outcome record returned by [`run_all`].
+/// Per-migration report returned in registry order.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationReport {
     pub id: &'static str,
     pub description: &'static str,
+    pub store: MigrationStore,
     pub outcome: MigrationOutcome,
 }
 
-/// Run every registered migration against `ctx` in declaration order.
-/// Never panics and never returns an error — individual migration
-/// failures are captured in the returned `Vec<MigrationReport>`.
-pub fn run_all(ctx: &MigrationContext) -> Vec<MigrationReport> {
-    // load() now returns Result so corruption is no longer silently
-    // coerced to "empty" inside the ledger itself (#741b). We preserve
-    // run_all's contract (never panic, never bubble up) by logging the
-    // failure here and degrading to an empty ledger — the signal is
-    // emitted at the boundary, not swallowed at the source.
-    let mut ledger = match CompletionLedger::load(&ctx.ledger_path()) {
-        Ok(l) => l,
-        Err(err) => {
-            tracing::warn!(
-                path = %ctx.ledger_path().display(),
-                error = %err,
-                "migration ledger unreadable; once-only migrations may replay"
-            );
-            CompletionLedger::default()
+/// Failure that prevents a normal writable startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupMigrationFailure {
+    migration_id: &'static str,
+    cause: MigrationFailure,
+}
+
+impl StartupMigrationFailure {
+    const fn new(migration_id: &'static str, cause: MigrationFailure) -> Self {
+        Self {
+            migration_id,
+            cause,
         }
+    }
+
+    /// Stable migration or startup-phase identifier.
+    #[must_use]
+    pub const fn migration_id(&self) -> &'static str {
+        self.migration_id
+    }
+
+    /// Typed, content-redacted failure cause.
+    #[must_use]
+    pub const fn cause(&self) -> &MigrationFailure {
+        &self.cause
+    }
+}
+
+impl fmt::Display for StartupMigrationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "startup blocked by migration {}: {}",
+            self.migration_id, self.cause
+        )
+    }
+}
+
+impl std::error::Error for StartupMigrationFailure {}
+
+/// Terminal state of the startup migration gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartupMigrationStatus {
+    /// All registered migrations reached a known current state. Writable
+    /// startup may continue.
+    Writable { reports: Vec<MigrationReport> },
+    /// Startup must stop or enter a separately implemented read-only recovery
+    /// surface. Normal writable agent sessions are forbidden.
+    RecoveryRequired {
+        reports: Vec<MigrationReport>,
+        failure: StartupMigrationFailure,
+    },
+}
+
+impl StartupMigrationStatus {
+    /// Ordered reports produced before the terminal state.
+    #[must_use]
+    pub fn reports(&self) -> &[MigrationReport] {
+        match self {
+            Self::Writable { reports } | Self::RecoveryRequired { reports, .. } => reports,
+        }
+    }
+
+    /// Whether the caller may open migrated stores writable.
+    #[must_use]
+    pub const fn is_writable(&self) -> bool {
+        matches!(self, Self::Writable { .. })
+    }
+
+    /// Consume the status at the composition root and enforce the gate.
+    ///
+    /// # Errors
+    /// Returns the typed terminal failure when writable startup is forbidden.
+    pub fn into_writable(self) -> Result<Vec<MigrationReport>, StartupMigrationFailure> {
+        match self {
+            Self::Writable { reports } => Ok(reports),
+            Self::RecoveryRequired { failure, .. } => Err(failure),
+        }
+    }
+}
+
+struct MigrationLock {
+    _file: std::fs::File,
+}
+
+impl MigrationLock {
+    fn open_file(lock_path: &Path) -> Result<std::fs::File, MigrationFailure> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options.open(lock_path).map_err(|error| {
+            MigrationFailure::from_io(
+                MigrationFailureKind::LockUnavailable,
+                MigrationStore::OpenClaudiaData,
+                "open migration lock",
+                &error,
+            )
+        })
+    }
+
+    #[cfg(unix)]
+    fn acquire_platform(file: &std::fs::File) -> Result<(), MigrationFailure> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                MigrationFailure::from_io(
+                    MigrationFailureKind::LockUnavailable,
+                    MigrationStore::OpenClaudiaData,
+                    "secure migration lock",
+                    &error,
+                )
+            })?;
+        let started = Instant::now();
+        loop {
+            // SAFETY: the descriptor is live for the call and `flock`
+            // retains neither the integer nor a pointer.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() != io::ErrorKind::WouldBlock || started.elapsed() >= LOCK_WAIT_TIMEOUT {
+                return Err(MigrationFailure::from_io(
+                    MigrationFailureKind::LockUnavailable,
+                    MigrationStore::OpenClaudiaData,
+                    "acquire bounded migration lock",
+                    &error,
+                ));
+            }
+            std::thread::sleep(LOCK_RETRY_DELAY);
+        }
+    }
+
+    #[cfg(windows)]
+    fn acquire_platform(file: &std::fs::File) -> Result<(), MigrationFailure> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+        const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+        let started = Instant::now();
+        loop {
+            let mut overlapped =
+                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+            // SAFETY: the handle remains live and a zeroed OVERLAPPED is
+            // valid for this synchronous whole-file lock attempt.
+            let result = unsafe {
+                windows_sys::Win32::Storage::FileSystem::LockFileEx(
+                    file.as_raw_handle() as _,
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    overlapped.as_mut_ptr(),
+                )
+            };
+            if result != 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if started.elapsed() >= LOCK_WAIT_TIMEOUT {
+                return Err(MigrationFailure::from_io(
+                    MigrationFailureKind::LockUnavailable,
+                    MigrationStore::OpenClaudiaData,
+                    "acquire bounded migration lock",
+                    &error,
+                ));
+            }
+            std::thread::sleep(LOCK_RETRY_DELAY);
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    const fn acquire_platform(_: &std::fs::File) -> Result<(), MigrationFailure> {
+        Err(MigrationFailure::new(
+            MigrationFailureKind::LockUnavailable,
+            MigrationStore::OpenClaudiaData,
+            "acquire migration lock on unsupported platform",
+        ))
+    }
+
+    fn acquire(ctx: &MigrationContext) -> Result<Self, MigrationFailure> {
+        std::fs::create_dir_all(&ctx.openclaudia_data).map_err(|error| {
+            MigrationFailure::from_io(
+                MigrationFailureKind::LockUnavailable,
+                MigrationStore::OpenClaudiaData,
+                "create migration lock directory",
+                &error,
+            )
+        })?;
+        let lock_path = ctx.openclaudia_data.join(".startup-migrations.lock");
+        let file = Self::open_file(&lock_path)?;
+        Self::acquire_platform(&file)?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn recovery_status(
+    reports: Vec<MigrationReport>,
+    migration_id: &'static str,
+    cause: MigrationFailure,
+) -> StartupMigrationStatus {
+    tracing::error!(
+        migration_id,
+        diagnostic_code = cause.kind().code(),
+        store = %cause.store(),
+        operation = cause.operation(),
+        committed_artifacts = cause.committed_artifacts(),
+        recovery = cause.recovery(),
+        "startup migration requires recovery"
+    );
+    StartupMigrationStatus::RecoveryRequired {
+        reports,
+        failure: StartupMigrationFailure::new(migration_id, cause),
+    }
+}
+
+fn run_registered(
+    ctx: &MigrationContext,
+    migrations: Vec<Box<dyn Migration>>,
+) -> StartupMigrationStatus {
+    if let Err(cause) = ctx.validate() {
+        return recovery_status(Vec::new(), "startup-context", cause);
+    }
+    let _lock = match MigrationLock::acquire(ctx) {
+        Ok(lock) => lock,
+        Err(cause) => return recovery_status(Vec::new(), "startup-store-lock", cause),
     };
-    let mut out = Vec::new();
-    for migration in registry::all() {
+    let mut reports = Vec::with_capacity(migrations.len());
+    for migration in migrations {
         let id = migration.id();
         let description = migration.description();
-        if migration.run_policy() == RunPolicy::OnceOnly && ledger.contains(id) {
-            out.push(MigrationReport {
+        let store = migration.store();
+        if migration.run_policy() != RunPolicy::Idempotent {
+            let cause = MigrationFailure::new(
+                MigrationFailureKind::NonIdempotentRegistration,
+                store,
+                "validate migration registration",
+            );
+            reports.push(MigrationReport {
                 id,
                 description,
-                outcome: MigrationOutcome::Skipped,
+                store,
+                outcome: MigrationOutcome::Failed(cause.clone()),
             });
-            continue;
+            return recovery_status(reports, id, cause);
         }
-        let outcome = migration.run(ctx);
-        match &outcome {
-            MigrationOutcome::Applied(msg) => {
-                tracing::info!(id, description, msg = %msg, "migration applied");
-                if migration.run_policy() == RunPolicy::OnceOnly {
-                    ledger.mark(id);
-                }
-            }
-            MigrationOutcome::Skipped => {
-                tracing::debug!(id, description, "migration skipped");
-            }
-            MigrationOutcome::Failed(err) => {
-                tracing::warn!(id, description, error = %err, "migration failed");
-            }
-        }
-        out.push(MigrationReport {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| migration.run(ctx)))
+            .unwrap_or_else(|_| {
+                MigrationOutcome::Failed(MigrationFailure::new(
+                    MigrationFailureKind::MigrationPanicked,
+                    store,
+                    "execute contained migration",
+                ))
+            });
+        let failure = match &outcome {
+            MigrationOutcome::Failed(cause) => Some(cause.clone()),
+            MigrationOutcome::Current | MigrationOutcome::Applied { .. } => None,
+        };
+        reports.push(MigrationReport {
             id,
             description,
+            store,
             outcome,
         });
-    }
-    // Best-effort ledger flush; failure here means next run may repeat
-    // a once-only migration, which is the failure mode we already
-    // accept for the whole framework.
-    if let Err(err) = ledger.save(&ctx.ledger_path()) {
-        tracing::warn!(error = %err, "failed to persist migration ledger");
-    }
-    out
-}
-
-/// Utility: convenience wrapper around [`run_all`] that returns only
-/// the count of applied migrations. Callers that don't care about per-
-/// migration details use this.
-#[must_use]
-pub fn run_all_count_applied(ctx: &MigrationContext) -> usize {
-    run_all(ctx)
-        .into_iter()
-        .filter(|r| matches!(r.outcome, MigrationOutcome::Applied(_)))
-        .count()
-}
-
-/// Convenience for migrations that just need to read a JSON file into
-/// a `serde_json::Value`. Returns `Ok(None)` only when the file is
-/// genuinely absent (`io::ErrorKind::NotFound`) — every other I/O
-/// failure (permission denied, I/O error, busy device, etc.) is
-/// propagated as `Err`.
-///
-/// This distinction matters for migrations that use the marker-file
-/// fast-path: silently treating "can't read the marker" as "marker
-/// is absent" would either re-run a destructive migration or — worse,
-/// per crosslink #734 — silently skip a needed migration when the
-/// caller pattern-matched on `Ok(_)` only.
-pub(crate) fn read_json_if_exists(path: &Path) -> anyhow::Result<Option<serde_json::Value>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(anyhow::Error::new(err).context(format!("reading {}", path.display())));
+        if let Some(cause) = failure {
+            return recovery_status(reports, id, cause);
         }
-    };
-    let value = serde_json::from_str(&text)
-        .with_context(|| format!("parsing JSON from {}", path.display()))?;
-    Ok(Some(value))
+    }
+    StartupMigrationStatus::Writable { reports }
+}
+
+/// Run every registered migration under the fail-closed startup gate.
+#[must_use]
+pub fn run_all(ctx: &MigrationContext) -> StartupMigrationStatus {
+    run_registered(ctx, registry::all())
+}
+
+/// Resolve the production migration context and run the complete gate.
+#[must_use]
+pub fn run_startup() -> StartupMigrationStatus {
+    match MigrationContext::from_env() {
+        Ok(context) => run_all(&context),
+        Err(cause) => recovery_status(Vec::new(), "startup-context", cause),
+    }
+}
+
+/// Count changed artifacts without discarding the terminal failure state.
+///
+/// # Errors
+/// Returns the same typed recovery requirement as [`run_all`].
+pub fn run_all_count_applied(ctx: &MigrationContext) -> Result<usize, StartupMigrationFailure> {
+    let reports = run_all(ctx).into_writable()?;
+    Ok(reports
+        .iter()
+        .map(|report| match &report.outcome {
+            MigrationOutcome::Applied { changed_artifacts } => *changed_artifacts,
+            MigrationOutcome::Current | MigrationOutcome::Failed(_) => 0,
+        })
+        .sum())
 }

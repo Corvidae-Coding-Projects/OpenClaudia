@@ -159,7 +159,7 @@ impl AnthropicAdapter {
     /// silently dropped. Anthropic's API takes a single `system` field, so
     /// we now concatenate every system-role text with `\n\n` separators
     /// so callers that route multiple system blocks (e.g. injected prompt
-    /// plus project rules) see all of them. Non-text parts (e.g. `image_url`)
+    /// plus host-provided instructions) see all of them. Non-text parts (e.g. `image_url`)
     /// are still dropped but with a `warn!` so the dropping is visible.
     fn extract_system(messages: &[ChatMessage]) -> Option<String> {
         let mut pieces: Vec<String> = Vec::new();
@@ -254,7 +254,7 @@ impl AnthropicAdapter {
         for (i, tool) in tools.iter().enumerate() {
             let func = tool.get("function").ok_or_else(|| {
                 ProviderError::RequestFailed(format!(
-                    "Tool at index {i} missing required 'function' object: {tool}"
+                    "Tool at index {i} missing required 'function' object"
                 ))
             })?;
             let name = func
@@ -263,7 +263,7 @@ impl AnthropicAdapter {
                 .filter(|n| !n.is_empty())
                 .ok_or_else(|| {
                     ProviderError::RequestFailed(format!(
-                        "Tool at index {i} missing required 'function.name' string field: {tool}"
+                        "Tool at index {i} missing required 'function.name' string field"
                     ))
                 })?;
 
@@ -306,7 +306,7 @@ impl AnthropicAdapter {
                     .enumerate()
                     .filter_map(|(i, tool)| {
                         let func = tool.get("function").or_else(|| {
-                            warn!(index = i, tool = %tool, "dropping tool missing 'function' object (crosslink #413)");
+                            warn!(index = i, "dropping tool missing 'function' object (crosslink #413)");
                             None
                         })?;
                         let name = func
@@ -314,7 +314,7 @@ impl AnthropicAdapter {
                             .and_then(|n| n.as_str())
                             .filter(|n| !n.is_empty())
                             .or_else(|| {
-                                warn!(index = i, tool = %tool, "dropping tool missing 'function.name' (crosslink #413)");
+                                warn!(index = i, "dropping tool missing 'function.name' (crosslink #413)");
                                 None
                             })?;
                         let mut tool_def = json!({
@@ -390,7 +390,7 @@ impl ProviderAdapter for AnthropicAdapter {
             body["stream"] = json!(true);
         }
 
-        debug!(body = %body, "Transformed request for Anthropic");
+        debug!("Transformed request for Anthropic");
         Ok(body)
     }
 
@@ -457,7 +457,7 @@ impl ProviderAdapter for AnthropicAdapter {
             .get("content")
             .and_then(|c| c.as_array())
             .ok_or_else(|| {
-                warn!(response = %response, "Anthropic response missing required 'content' array (crosslink #413)");
+                warn!("Anthropic response missing required 'content' array (crosslink #413)");
                 ProviderError::InvalidResponse(
                     "Anthropic response missing required 'content' array".to_string(),
                 )
@@ -497,12 +497,18 @@ impl ProviderAdapter for AnthropicAdapter {
         "/v1/messages".to_string()
     }
 
-    fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
-        vec![
-            ("x-api-key".to_string(), api_key.as_str().to_string()),
-            ("anthropic-version".to_string(), "2023-06-01".to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
-        ]
+    fn get_headers(&self, api_key: &ApiKey) -> crate::secrets::SensitiveHeaders {
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_secret(
+            reqwest::header::HeaderName::from_static("x-api-key"),
+            api_key.secret(),
+        );
+        headers.insert_static_literal(
+            reqwest::header::HeaderName::from_static("anthropic-version"),
+            "2023-06-01",
+        );
+        headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
+        headers
     }
 
     /// Anthropic native shape: `content` is an array of typed blocks;
@@ -564,21 +570,27 @@ impl AnthropicAdapter {
     /// Replaces the inline magic strings previously embedded in
     /// `proxy::proxy_anthropic_messages` — every Anthropic-specific header
     /// literal now lives in one place. See crosslink #338.
+    ///
+    /// # Panics
+    /// Panics only if a compile-time Anthropic header literal becomes invalid.
     #[must_use]
-    pub fn oauth_headers(bearer_token: &str) -> Vec<(String, String)> {
-        vec![
-            (
-                "authorization".to_string(),
-                format!("Bearer {bearer_token}"),
-            ),
-            (
-                "anthropic-beta".to_string(),
-                // Single source of truth — see crosslink #272.
+    pub fn oauth_headers(
+        bearer_token: &crate::secrets::OAuthToken,
+    ) -> crate::secrets::SensitiveHeaders {
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_bearer(reqwest::header::AUTHORIZATION, bearer_token.secret());
+        headers
+            .insert_literal(
+                "anthropic-beta",
                 crate::claude_credentials::claude_code_beta_header_value(),
-            ),
-            ("anthropic-version".to_string(), "2023-06-01".to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
-        ]
+            )
+            .expect("canonical Anthropic beta header must be valid");
+        headers.insert_static_literal(
+            reqwest::header::HeaderName::from_static("anthropic-version"),
+            "2023-06-01",
+        );
+        headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
+        headers
     }
 }
 
@@ -591,22 +603,25 @@ impl AnthropicAdapter {
 
 /// Extract a string field that MUST be present (any string value).
 fn require_str<'a>(response: &'a Value, field: &str) -> Result<&'a str, ProviderError> {
-    response
-        .get(field)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            warn!(response = %response, field, "Anthropic response missing required field (crosslink #413)");
-            ProviderError::InvalidResponse(format!(
-                "Anthropic response missing required '{field}' field"
-            ))
-        })
+    response.get(field).and_then(|v| v.as_str()).ok_or_else(|| {
+        warn!(
+            field,
+            "Anthropic response missing required field (crosslink #413)"
+        );
+        ProviderError::InvalidResponse(format!(
+            "Anthropic response missing required '{field}' field"
+        ))
+    })
 }
 
 /// Extract a string field that MUST be present AND non-empty.
 fn require_nonempty_str<'a>(response: &'a Value, field: &str) -> Result<&'a str, ProviderError> {
     let s = require_str(response, field)?;
     if s.is_empty() {
-        warn!(response = %response, field, "Anthropic response has empty required field (crosslink #413)");
+        warn!(
+            field,
+            "Anthropic response has empty required field (crosslink #413)"
+        );
         return Err(ProviderError::InvalidResponse(format!(
             "Anthropic response missing required '{field}' field"
         )));
@@ -637,9 +652,12 @@ fn walk_content_blocks(content_arr: &[Value]) -> Result<(String, Vec<Value>), Pr
     let mut tool_calls: Vec<Value> = Vec::new();
     for (i, block) in content_arr.iter().enumerate() {
         let block_type = block.get("type").and_then(|t| t.as_str()).ok_or_else(|| {
-            warn!(index = i, block = %block, "Anthropic content block missing 'type' (crosslink #413)");
+            warn!(
+                index = i,
+                "Anthropic content block missing 'type' (crosslink #413)"
+            );
             ProviderError::InvalidResponse(format!(
-                "Anthropic content block at index {i} missing 'type' field: {block}"
+                "Anthropic content block at index {i} missing 'type' field"
             ))
         })?;
 
@@ -661,9 +679,12 @@ fn walk_content_blocks(content_arr: &[Value]) -> Result<(String, Vec<Value>), Pr
 /// Extract the string body of a `text` content block.
 fn extract_text_block(index: usize, block: &Value) -> Result<&str, ProviderError> {
     block.get("text").and_then(|t| t.as_str()).ok_or_else(|| {
-        warn!(index, block = %block, "Anthropic text block missing string 'text' (crosslink #413)");
+        warn!(
+            index,
+            "Anthropic text block missing string 'text' (crosslink #413)"
+        );
         ProviderError::InvalidResponse(format!(
-            "Anthropic text block at index {index} missing string 'text' field: {block}"
+            "Anthropic text block at index {index} missing string 'text' field"
         ))
     })
 }
@@ -671,21 +692,30 @@ fn extract_text_block(index: usize, block: &Value) -> Result<&str, ProviderError
 /// Extract an `OpenAI`-shaped `tool_call` object from a `tool_use` content block.
 fn extract_tool_use_block(index: usize, block: &Value) -> Result<Value, ProviderError> {
     let tool_id = block.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
-        warn!(index, block = %block, "Anthropic tool_use block missing 'id' (crosslink #413)");
+        warn!(
+            index,
+            "Anthropic tool_use block missing 'id' (crosslink #413)"
+        );
         ProviderError::InvalidResponse(format!(
-            "Anthropic tool_use block at index {index} missing string 'id': {block}"
+            "Anthropic tool_use block at index {index} missing string 'id'"
         ))
     })?;
     let tool_name = block.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-        warn!(index, block = %block, "Anthropic tool_use block missing 'name' (crosslink #413)");
+        warn!(
+            index,
+            "Anthropic tool_use block missing 'name' (crosslink #413)"
+        );
         ProviderError::InvalidResponse(format!(
-            "Anthropic tool_use block at index {index} missing string 'name': {block}"
+            "Anthropic tool_use block at index {index} missing string 'name'"
         ))
     })?;
     let input = block.get("input").ok_or_else(|| {
-        warn!(index, block = %block, "Anthropic tool_use block missing 'input' (crosslink #413)");
+        warn!(
+            index,
+            "Anthropic tool_use block missing 'input' (crosslink #413)"
+        );
         ProviderError::InvalidResponse(format!(
-            "Anthropic tool_use block at index {index} missing 'input' field: {block}"
+            "Anthropic tool_use block at index {index} missing 'input' field"
         ))
     })?;
 
@@ -744,22 +774,27 @@ fn extract_usage(response: &Value) -> (u64, u64) {
 /// If the dynamic suffix is empty, only one block is returned.
 #[must_use]
 pub fn build_system_blocks(blocks: &crate::prompt::SystemPromptBlocks) -> Value {
-    if blocks.dynamic_suffix.is_empty() {
+    if blocks.dynamic_suffix().is_empty() {
         json!([{
             "type": "text",
-            "text": blocks.stable_prefix,
+            "text": blocks.stable_prefix(),
             "cache_control": {"type": "ephemeral"}
+        }])
+    } else if blocks.stable_prefix().is_empty() {
+        json!([{
+            "type": "text",
+            "text": blocks.dynamic_suffix()
         }])
     } else {
         json!([
             {
                 "type": "text",
-                "text": blocks.stable_prefix,
+                "text": blocks.stable_prefix(),
                 "cache_control": {"type": "ephemeral"}
             },
             {
                 "type": "text",
-                "text": blocks.dynamic_suffix
+                "text": blocks.dynamic_suffix()
             }
         ])
     }
@@ -811,9 +846,7 @@ pub fn convert_tool_definitions_to_anthropic_checked(
     tools: &Value,
 ) -> Result<Vec<Value>, ProviderError> {
     let tool_array = tools.as_array().ok_or_else(|| {
-        ProviderError::RequestFailed(format!(
-            "Anthropic tool definitions must be a JSON array: {tools}"
-        ))
+        ProviderError::RequestFailed("Anthropic tool definitions must be a JSON array".to_string())
     })?;
     convert_tools_to_anthropic_checked(tool_array)
 }
@@ -912,7 +945,7 @@ fn message_role_for_anthropic(
     else {
         return if strict {
             Err(ProviderError::RequestFailed(format!(
-                "Message at index {msg_index} missing non-empty string 'role': {msg}"
+                "Message at index {msg_index} missing non-empty string 'role'"
             )))
         } else {
             Ok("user")
@@ -923,7 +956,7 @@ fn message_role_for_anthropic(
         "system" | "tool" | "assistant" | "user" => Ok(role),
         _ if !strict => Ok(role),
         _ => Err(ProviderError::RequestFailed(format!(
-            "Message at index {msg_index} has unsupported role '{role}': {msg}"
+            "Message at index {msg_index} has unsupported role"
         ))),
     }
 }
@@ -942,7 +975,7 @@ fn convert_tool_result_message(
         None if strict_tool_arguments => {
             return Err(ProviderError::RequestFailed(format!(
                 "Tool result message at index {msg_index} missing non-empty string \
-                 'tool_call_id': {msg}"
+                 'tool_call_id'"
             )));
         }
         None => "",
@@ -951,7 +984,7 @@ fn convert_tool_result_message(
         Some(content) => content,
         None if strict_tool_arguments => {
             return Err(ProviderError::RequestFailed(format!(
-                "Tool result message at index {msg_index} missing string 'content': {msg}"
+                "Tool result message at index {msg_index} missing string 'content'"
             )));
         }
         None => "",
@@ -1003,7 +1036,7 @@ fn convert_assistant_tool_call_message(
             None if strict_tool_arguments => {
                 return Err(ProviderError::RequestFailed(format!(
                     "Assistant tool_call at message index {msg_index}, tool_call index \
-                     {tool_call_index} missing non-empty string 'id': {tc}"
+                     {tool_call_index} missing non-empty string 'id'"
                 )));
             }
             None => "",
@@ -1014,7 +1047,7 @@ fn convert_assistant_tool_call_message(
             None if strict_tool_arguments => {
                 return Err(ProviderError::RequestFailed(format!(
                     "Assistant tool_call at message index {msg_index}, tool_call index \
-                     {tool_call_index} missing required 'function' object: {tc}"
+                     {tool_call_index} missing required 'function' object"
                 )));
             }
             None => &empty_obj,
@@ -1029,13 +1062,13 @@ fn convert_assistant_tool_call_message(
             None if strict_tool_arguments => {
                 return Err(ProviderError::RequestFailed(format!(
                     "Assistant tool_call at message index {msg_index}, tool_call index \
-                     {tool_call_index} missing non-empty string 'function.name': {tc}"
+                     {tool_call_index} missing non-empty string 'function.name'"
                 )));
             }
             None => "",
         };
         let input =
-            convert_tool_call_input(msg_index, tool_call_index, tc, func, strict_tool_arguments)?;
+            convert_tool_call_input(msg_index, tool_call_index, func, strict_tool_arguments)?;
 
         content_blocks.push(json!({
             "type": "tool_use",
@@ -1057,7 +1090,6 @@ fn convert_assistant_tool_call_message(
 fn convert_tool_call_input(
     msg_index: usize,
     tool_call_index: usize,
-    tool_call: &Value,
     func: &Value,
     strict_tool_arguments: bool,
 ) -> Result<Value, ProviderError> {
@@ -1065,14 +1097,14 @@ fn convert_tool_call_input(
         return if strict_tool_arguments {
             Err(ProviderError::RequestFailed(format!(
                 "Assistant tool_call at message index {msg_index}, tool_call index \
-                 {tool_call_index} missing string 'function.arguments': {tool_call}"
+                 {tool_call_index} missing string 'function.arguments'"
             )))
         } else {
             Ok(json!({}))
         };
     };
 
-    match parse_tool_call_input_for_anthropic(msg_index, tool_call_index, tool_call, args_str) {
+    match parse_tool_call_input_for_anthropic(msg_index, tool_call_index, args_str) {
         Ok(input) => Ok(input),
         Err(e) if strict_tool_arguments => Err(e),
         Err(e) => {
@@ -1101,12 +1133,12 @@ fn convert_regular_message(
         }
         None if strict => {
             return Err(ProviderError::RequestFailed(format!(
-                "Message at index {msg_index} missing 'content': {msg}"
+                "Message at index {msg_index} missing 'content'"
             )));
         }
         Some(other) if strict => {
             return Err(ProviderError::RequestFailed(format!(
-                "Message at index {msg_index} has unsupported 'content' type {}: {msg}",
+                "Message at index {msg_index} has unsupported 'content' type {}",
                 json_value_type_name(other)
             )));
         }
@@ -1133,7 +1165,7 @@ fn convert_regular_content_parts(
                 None if strict => {
                     return Err(ProviderError::RequestFailed(format!(
                         "Text content part at message index {msg_index}, part index {part_index} \
-                         missing string 'text': {part}"
+                         missing string 'text'"
                     )));
                 }
                 None => out.push(json!({"type": "text", "text": ""})),
@@ -1142,22 +1174,21 @@ fn convert_regular_content_parts(
                 let source = anthropic_image_source_from_part(part).ok_or_else(|| {
                     ProviderError::RequestFailed(format!(
                         "Image content part at message index {msg_index}, part index {part_index} \
-                         missing Anthropic image source: {part}"
+                         missing Anthropic image source"
                     ))
                 })?;
                 out.push(json!({"type": "image", "source": source}));
             }
-            Some(other) => {
+            Some(_) => {
                 if strict {
                     return Err(ProviderError::RequestFailed(format!(
-                        "Unsupported content part type '{other}' at message index {msg_index}, \
-                         part index {part_index}: {part}"
+                        "Unsupported content part type at message index {msg_index}, part index \
+                         {part_index}"
                     )));
                 }
                 warn!(
                     message_index = msg_index,
                     part_index,
-                    part = %part,
                     "dropping unsupported content part in compatibility Anthropic converter"
                 );
             }
@@ -1166,14 +1197,13 @@ fn convert_regular_content_parts(
                     warn!(
                         message_index = msg_index,
                         part_index,
-                        part = %part,
                         "dropping content part missing type in compatibility Anthropic converter"
                     );
                     continue;
                 }
                 return Err(ProviderError::RequestFailed(format!(
                     "Content part at message index {msg_index}, part index {part_index} missing \
-                     string 'type': {part}"
+                     string 'type'"
                 )));
             }
         }
@@ -1207,21 +1237,19 @@ fn anthropic_image_source_from_part(part: &Value) -> Option<Value> {
 fn parse_tool_call_input_for_anthropic(
     msg_index: usize,
     tool_call_index: usize,
-    tool_call: &Value,
     args_str: &str,
 ) -> Result<Value, ProviderError> {
     let input: Value = serde_json::from_str(args_str).map_err(|e| {
         ProviderError::RequestFailed(format!(
             "Assistant tool_call at message index {msg_index}, tool_call index \
-             {tool_call_index} has invalid JSON in 'function.arguments': {e}; \
-             tool_call: {tool_call}"
+             {tool_call_index} has invalid JSON in 'function.arguments': {e}"
         ))
     })?;
     if !input.is_object() {
         return Err(ProviderError::RequestFailed(format!(
             "Assistant tool_call at message index {msg_index}, tool_call index \
              {tool_call_index} has non-object 'function.arguments': expected JSON \
-             object, got {}; tool_call: {tool_call}",
+             object, got {}",
             json_value_type_name(&input),
         )));
     }
@@ -1365,13 +1393,16 @@ mod tests {
 
     #[test]
     fn convert_messages_checked_errors_on_missing_role() {
-        let err = convert_messages_to_anthropic_checked(&[json!({"content": "hi"})])
-            .expect_err("missing role must fail checked Anthropic conversion");
+        let err = convert_messages_to_anthropic_checked(&[json!({
+            "content": "anthropic-message-secret-sentinel"
+        })])
+        .expect_err("missing role must fail checked Anthropic conversion");
 
         match err {
             ProviderError::RequestFailed(msg) => {
                 assert!(msg.contains("missing non-empty string 'role'"), "{msg}");
                 assert!(msg.contains("index 0"), "{msg}");
+                assert!(!msg.contains("anthropic-message-secret-sentinel"), "{msg}");
             }
             other => panic!("expected RequestFailed, got {other:?}"),
         }
@@ -1414,7 +1445,7 @@ mod tests {
     #[test]
     fn convert_messages_checked_errors_on_unsupported_role() {
         let err = convert_messages_to_anthropic_checked(&[json!({
-            "role": "developer",
+            "role": "anthropic-role-secret-sentinel",
             "content": "hi"
         })])
         .expect_err("unsupported role must fail checked Anthropic conversion");
@@ -1422,8 +1453,8 @@ mod tests {
         match err {
             ProviderError::RequestFailed(msg) => {
                 assert!(msg.contains("unsupported role"), "{msg}");
-                assert!(msg.contains("developer"), "{msg}");
                 assert!(msg.contains("index 0"), "{msg}");
+                assert!(!msg.contains("anthropic-role-secret-sentinel"), "{msg}");
             }
             other => panic!("expected RequestFailed, got {other:?}"),
         }
@@ -1480,7 +1511,8 @@ mod tests {
 
     #[test]
     fn transform_request_errors_on_malformed_assistant_tool_call_arguments() {
-        let request = request_with_assistant_tool_arguments("{not json");
+        let request =
+            request_with_assistant_tool_arguments("{not json anthropic-tool-secret-sentinel");
         let err = AnthropicAdapter::new()
             .transform_request(&request)
             .expect_err("malformed assistant tool_call arguments must fail request conversion");
@@ -1489,6 +1521,7 @@ mod tests {
                 assert!(msg.contains("function.arguments"), "{msg}");
                 assert!(msg.contains("invalid JSON"), "{msg}");
                 assert!(msg.contains("message index 1"), "{msg}");
+                assert!(!msg.contains("anthropic-tool-secret-sentinel"), "{msg}");
             }
             other => panic!("expected RequestFailed, got {other:?}"),
         }
@@ -1736,7 +1769,10 @@ mod tests {
             .expect_err("unknown content part must fail");
 
         match err {
-            ProviderError::RequestFailed(msg) => assert!(msg.contains("input_audio"), "{msg}"),
+            ProviderError::RequestFailed(msg) => {
+                assert!(msg.contains("content part type"), "{msg}");
+                assert!(!msg.contains("input_audio"), "{msg}");
+            }
             other => panic!("expected RequestFailed, got {other:?}"),
         }
     }
@@ -1745,21 +1781,18 @@ mod tests {
 
     #[test]
     fn oauth_headers_contains_all_required_fields() {
-        let h = AnthropicAdapter::oauth_headers("access-xyz");
-        let names: Vec<&str> = h.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(names.contains(&"authorization"));
-        assert!(names.contains(&"anthropic-beta"));
-        assert!(names.contains(&"anthropic-version"));
-        assert!(names.contains(&"content-type"));
-
-        let auth = h.iter().find(|(k, _)| k == "authorization").unwrap();
-        assert_eq!(auth.1, "Bearer access-xyz");
-
-        let beta = h.iter().find(|(k, _)| k == "anthropic-beta").unwrap();
-        assert!(beta.1.contains("claude-code-20250219"));
-        assert!(beta.1.contains("oauth-2025-04-20"));
-        assert!(beta.1.contains("interleaved-thinking-2025-05-14"));
-        assert!(beta.1.contains("fine-grained-tool-streaming-2025-05-14"));
+        let token =
+            crate::secrets::OAuthToken::try_from_string("access-xyz".to_string()).expect("token");
+        let h = AnthropicAdapter::oauth_headers(&token);
+        assert!(h.contains_name("authorization"));
+        assert!(h.contains_name("anthropic-beta"));
+        assert!(h.contains_name("anthropic-version"));
+        assert!(h.contains_name("content-type"));
+        assert!(h.matches_value("authorization", "Bearer access-xyz"));
+        assert!(h.matches_value(
+            "anthropic-beta",
+            &crate::claude_credentials::claude_code_beta_header_value()
+        ));
     }
 
     // --- Regression tests for crosslink #413 ---
@@ -1971,12 +2004,16 @@ mod tests {
 
     #[test]
     fn convert_tool_definitions_checked_errors_on_non_array() {
-        let err = convert_tool_definitions_to_anthropic_checked(&json!({"not": "tools"}))
-            .expect_err("non-array tool registry must fail closed");
+        let err = convert_tool_definitions_to_anthropic_checked(&json!({
+            "not": "tools",
+            "credential": "anthropic-registry-secret-sentinel"
+        }))
+        .expect_err("non-array tool registry must fail closed");
 
         match err {
             ProviderError::RequestFailed(msg) => {
                 assert!(msg.contains("JSON array"), "{msg}");
+                assert!(!msg.contains("anthropic-registry-secret-sentinel"), "{msg}");
             }
             other => panic!("expected RequestFailed, got {other:?}"),
         }

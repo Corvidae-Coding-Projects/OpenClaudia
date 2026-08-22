@@ -23,6 +23,13 @@ pub struct SlashCtx<'a> {
     pub provider: &'a str,
     /// Currently selected model name.
     pub current_model: &'a str,
+    /// Immutable run used for project-bounded commands. Compatibility callers
+    /// without one must fail closed to global/user application layers.
+    pub run_context: Option<&'a openclaudia::tools::ToolRunContext>,
+    /// Already-validated configuration from the real frontend composition.
+    pub app_config: Option<&'a openclaudia::config::AppConfig>,
+    /// Exact service snapshot supplied by a composed frontend for `/doctor`.
+    pub doctor_runtime: Option<&'a openclaudia::doctor::DoctorRuntimeSnapshot>,
 }
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
@@ -91,7 +98,8 @@ use super::slash::{
     slash_commit_push_pr, slash_config, slash_context, slash_continue, slash_copy, slash_cost,
     slash_debug, slash_doctor, slash_effort, slash_fast, slash_find, slash_help, slash_history,
     slash_hooks, slash_init, slash_login, slash_mcp, slash_model, slash_permissions, slash_plugin,
-    slash_rewind, slash_sessions, slash_skill, slash_teleport, slash_thinkback, slash_version,
+    slash_rewind, slash_sessions, slash_skill, slash_skill_for_run, slash_teleport,
+    slash_thinkback, slash_version,
 };
 use crate::cli::display::theme::handle_theme_command;
 
@@ -249,8 +257,13 @@ impl CommandHandler for EditorCommand {
     fn aliases(&self) -> &'static [&'static str] {
         &["edit", "e"]
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
-        open_external_editor().map_or(SlashCommandResult::Handled, SlashCommandResult::EditorInput)
+    fn handle(&self, ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
+        let Some(run) = ctx.run_context else {
+            eprintln!("External editor is unavailable without a run context.");
+            return SlashCommandResult::Handled;
+        };
+        open_external_editor(run)
+            .map_or(SlashCommandResult::Handled, SlashCommandResult::EditorInput)
     }
 }
 
@@ -300,8 +313,8 @@ impl CommandHandler for TeleportCommand {
     fn name(&self) -> &'static str {
         "teleport"
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
-        slash_teleport(args)
+    fn handle(&self, ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
+        slash_teleport(args, ctx.run_context)
     }
 }
 
@@ -339,8 +352,8 @@ impl CommandHandler for InitCommand {
     fn name(&self) -> &'static str {
         "init"
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
-        slash_init();
+    fn handle(&self, ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
+        slash_init(ctx.run_context);
         SlashCommandResult::Handled
     }
 }
@@ -514,8 +527,8 @@ impl CommandHandler for DoctorCommand {
     fn name(&self) -> &'static str {
         "doctor"
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
-        slash_doctor();
+    fn handle(&self, ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
+        slash_doctor(ctx.run_context, ctx.app_config, ctx.doctor_runtime);
         SlashCommandResult::Handled
     }
 }
@@ -540,8 +553,8 @@ impl CommandHandler for McpCommand {
     fn name(&self) -> &'static str {
         "mcp"
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
-        slash_mcp(args)
+    fn handle(&self, ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
+        slash_mcp(args, ctx.run_context)
     }
 }
 
@@ -616,8 +629,8 @@ impl CommandHandler for FindCommand {
     fn aliases(&self) -> &'static [&'static str] {
         &["f"]
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
-        slash_find(args)
+    fn handle(&self, ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
+        slash_find(args, ctx.run_context)
     }
 }
 
@@ -676,8 +689,9 @@ impl CommandHandler for SkillCommand {
     fn aliases(&self) -> &'static [&'static str] {
         &["skills"]
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
-        slash_skill(args)
+    fn handle(&self, ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
+        ctx.run_context
+            .map_or_else(|| slash_skill(args), |run| slash_skill_for_run(args, run))
     }
 }
 
@@ -765,8 +779,8 @@ impl CommandHandler for AddDirCommand {
     fn name(&self) -> &'static str {
         "add-dir"
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
-        slash_add_dir(args)
+    fn handle(&self, ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
+        slash_add_dir(args, ctx.run_context)
     }
 }
 
@@ -778,7 +792,7 @@ impl CommandHandler for BranchCommand {
         "branch"
     }
     fn handle(&self, ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
-        slash_branch(args, ctx.messages)
+        slash_branch(args, ctx.messages, ctx.run_context)
     }
 }
 

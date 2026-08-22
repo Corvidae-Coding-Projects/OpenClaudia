@@ -30,7 +30,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::{execute_tool, FunctionCall, SessionIdGuard, ToolCall};
+use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -40,10 +40,8 @@ use tempfile::tempdir_in;
 // Helpers
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Process-wide serializer for tests that use `SessionIdGuard`
-/// (thread-local) AND share the process-wide `READ_TRACKER`. Acquire
-/// this BEFORE creating the guard so a parallel test can't observe
-/// a half-set thread-local.
+/// Serializer for legacy cases that intentionally share one run-scoped read
+/// tracker. Isolation tests construct distinct immutable runs instead.
 static SESSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn session_lock() -> MutexGuard<'static, ()> {
@@ -65,24 +63,30 @@ fn call(name: &str, args: &Value) -> ToolCall {
 }
 
 fn read(path: &str) -> (String, bool) {
-    let r = execute_tool(&call("read_file", &json!({"path": path})));
-    (r.content, r.is_error)
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call("read_file", &json!({"path": path})),
+    );
+    (r.content().to_string(), r.is_error())
 }
 
 fn write(path: &str, content: &str) -> (String, bool) {
-    let r = execute_tool(&call(
-        "write_file",
-        &json!({"path": path, "content": content}),
-    ));
-    (r.content, r.is_error)
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call("write_file", &json!({"path": path, "content": content})),
+    );
+    (r.content().to_string(), r.is_error())
 }
 
 fn edit(path: &str, old: &str, new: &str) -> (String, bool) {
-    let r = execute_tool(&call(
-        "edit_file",
-        &json!({"path": path, "old_string": old, "new_string": new}),
-    ));
-    (r.content, r.is_error)
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call(
+            "edit_file",
+            &json!({"path": path, "old_string": old, "new_string": new}),
+        ),
+    );
+    (r.content().to_string(), r.is_error())
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -92,7 +96,6 @@ fn edit(path: &str, old: &str, new: &str) -> (String, bool) {
 #[test]
 fn edit_without_prior_read_is_refused() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-edit-no-read");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("target.txt");
@@ -112,7 +115,6 @@ fn edit_without_prior_read_is_refused() {
 #[test]
 fn edit_after_read_in_same_session_succeeds() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-edit-after-read");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("target.txt");
@@ -132,7 +134,6 @@ fn edit_after_read_in_same_session_succeeds() {
 #[test]
 fn second_edit_with_same_old_string_errors_because_already_replaced() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-edit-twice");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("target.txt");
@@ -159,7 +160,6 @@ fn second_edit_with_same_old_string_errors_because_already_replaced() {
 #[test]
 fn write_to_existing_file_without_read_is_refused() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-write-no-read");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("existing.txt");
@@ -179,7 +179,6 @@ fn write_to_existing_file_without_read_is_refused() {
 #[test]
 fn write_to_new_file_without_read_succeeds() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-write-new");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("brand-new.txt");
@@ -195,7 +194,6 @@ fn write_to_new_file_without_read_succeeds() {
 #[test]
 fn write_to_existing_file_after_read_succeeds() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-write-after-read");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("existing.txt");
@@ -217,7 +215,6 @@ fn write_to_existing_file_after_read_succeeds() {
 #[test]
 fn no_op_edit_is_refused_without_touching_file() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-noop-edit");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let path = dir.path().join("target.txt");
@@ -255,25 +252,35 @@ fn read_in_one_session_does_not_count_in_another() {
     let path = dir.path().join("isolated.txt");
     std::fs::write(&path, "content").expect("plant");
     let path_str = path.to_string_lossy().to_string();
+    let run_a = support::test_run_context(dir.path());
+    let run_b = support::test_run_context(dir.path());
 
-    {
-        let _guard_a = SessionIdGuard::set("sprint21-session-A");
-        let (_, is_err) = read(&path_str);
-        assert!(!is_err);
-    }
+    let read_result = execute_tool(&run_a, &call("read_file", &json!({"path": path_str})));
+    assert!(
+        !read_result.is_error(),
+        "run A read failed: {read_result:?}"
+    );
 
-    {
-        let _guard_b = SessionIdGuard::set("sprint21-session-B");
-        let (msg, is_err) = edit(&path_str, "content", "replaced-by-b");
-        assert!(
-            is_err,
-            "session B edit without B's own read must error; got msg={msg:?}"
-        );
-        assert!(
-            msg.to_lowercase().contains("read") && msg.to_lowercase().contains("before"),
-            "msg must mention read-before; got {msg:?}"
-        );
-    }
+    let edit_result = execute_tool(
+        &run_b,
+        &call(
+            "edit_file",
+            &json!({
+                "path": path_str,
+                "old_string": "content",
+                "new_string": "replaced-by-b"
+            }),
+        ),
+    );
+    assert!(
+        edit_result.is_error(),
+        "run B edit without B's own read must error; got {edit_result:?}"
+    );
+    assert!(
+        edit_result.content().to_lowercase().contains("read")
+            && edit_result.content().to_lowercase().contains("before"),
+        "message must mention read-before; got {edit_result:?}"
+    );
 
     let after = std::fs::read_to_string(&path).expect("read after");
     assert_eq!(after, "content", "file MUST be unchanged");
@@ -286,7 +293,6 @@ fn read_in_one_session_does_not_count_in_another() {
 #[test]
 fn write_creates_missing_parent_directories() {
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-write-parents");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let nested = dir.path().join("a/b/c/d/file.txt");
@@ -310,7 +316,6 @@ fn write_refuses_when_leaf_is_a_symlink() {
     // `O_NOFOLLOW` so a symlink at the leaf is refused with
     // ELOOP — even when canonicalize would have followed it.
     let _sess = session_lock();
-    let _guard = SessionIdGuard::set("sprint21-symlink-leaf");
 
     let dir = tempdir_in(".").expect("project-local tempdir");
     let real = dir.path().join("real.txt");
@@ -341,3 +346,4 @@ fn write_refuses_when_leaf_is_a_symlink() {
         "link MUST still be a symlink after refused write"
     );
 }
+mod support;

@@ -1,22 +1,16 @@
-//! Background memory agents + MEMORY.md discovery — crosslink #508.
+//! Repository technical-memory source lifecycle.
 //!
-//! Phased rollout (see `docs/designs/508-memdir.md`):
-//!
-//! - **Phase 1 (this commit)**: MEMORY.md entrypoint discovery +
-//!   loading + truncation. No background agents yet — callers read
-//!   the loaded text and inject it into the system prompt themselves.
-//! - **Phase 2+**: per-session notes writer, extractor subagent,
-//!   autoDream consolidation, prompt suggestion speculation.
-//!
-//! The module is deliberately additive for now: nothing else in the
-//! codebase calls into it. The `prompt.rs` builder can optionally
-//! invoke [`load_entrypoint`] to get a truncated MEMORY.md block,
-//! but the wiring lands as a follow-up so this commit can ship with
-//! only the new module under test.
+//! The retained `MEMORY.md` filenames carry strict versioned JSON technical
+//! lessons. They are untrusted import evidence, never prose capture, startup
+//! context, or system/developer instructions. Explicit canonical tools inspect
+//! and refresh these sources into the host-owned workspace memory store.
 
 pub mod entrypoint;
 
 pub use entrypoint::{
-    load_entrypoint, EntrypointFile, EntrypointTruncation, MAX_ENTRYPOINT_BYTES,
-    MAX_ENTRYPOINT_LINES,
+    load_entrypoint, EntrypointFile, EntrypointInspection, EntrypointIssue, EntrypointIssueCode,
+    TechnicalMemoryManifest, TechnicalMemoryManifestEntry, MAX_ENTRYPOINT_BYTES,
+    MAX_ENTRYPOINT_CITATIONS, MAX_ENTRYPOINT_CITATION_BYTES, MAX_ENTRYPOINT_CITATION_FILES,
+    MAX_ENTRYPOINT_CITATION_FILE_BYTES, MAX_ENTRYPOINT_LESSONS,
+    TECHNICAL_MEMORY_SOURCE_SCHEMA_VERSION,
 };

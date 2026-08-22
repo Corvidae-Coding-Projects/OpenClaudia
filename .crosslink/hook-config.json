@@ -1,0 +1,157 @@
+{
+  "agent": {
+    "provider": "claude",
+    "providers": {
+      "claude": {
+        "advanced_model": "opus",
+        "default_model": "opus",
+        "standard_model": "sonnet"
+      },
+      "codex": {
+        "advanced_model": null,
+        "approval": "auto-review",
+        "default_model": null,
+        "sandbox": "workspace-write",
+        "standard_model": null
+      }
+    }
+  },
+  "agent.provider": "claude",
+  "agent_overrides": {
+    "agent_lint_commands": [
+      "cargo clippy -- -D warnings",
+      "cargo fmt --check"
+    ],
+    "agent_test_commands": [
+      "cargo test"
+    ],
+    "blocked_git_commands": [
+      "git push --force",
+      "git push -f",
+      "git merge",
+      "git rebase",
+      "git cherry-pick",
+      "git reset",
+      "git clean -f",
+      "git clean -fd",
+      "git clean -fdx",
+      "git checkout .",
+      "git restore .",
+      "git stash",
+      "git tag",
+      "git am",
+      "git apply",
+      "git branch -d",
+      "git branch -D",
+      "git branch -m"
+    ],
+    "gated_git_commands": [
+      "git commit"
+    ],
+    "tracking_mode": "relaxed"
+  },
+  "allowed_bash_prefixes": [
+    "crosslink ",
+    "git status",
+    "git diff",
+    "git log",
+    "git branch",
+    "git show",
+    "jj log",
+    "jj diff",
+    "jj status",
+    "jj show",
+    "jj bookmark list",
+    "cargo test",
+    "cargo build",
+    "cargo check",
+    "cargo clippy",
+    "cargo fmt",
+    "npm test",
+    "npm run",
+    "npx ",
+    "tsc",
+    "node ",
+    "python ",
+    "ls",
+    "dir",
+    "pwd",
+    "echo",
+    "tail",
+    "head",
+    "grep",
+    "rg",
+    "wc",
+    "cat",
+    "sed -n",
+    "find ",
+    "sort",
+    "uniq",
+    "cut",
+    "jq",
+    "nl",
+    "column",
+    "true",
+    "test "
+  ],
+  "auto_steal_stale_locks": "false",
+  "blocked_git_commands": [
+    "git push",
+    "git merge",
+    "git rebase",
+    "git cherry-pick",
+    "git reset",
+    "git checkout .",
+    "git restore .",
+    "git clean",
+    "git stash",
+    "git tag",
+    "git am",
+    "git apply",
+    "git branch -d",
+    "git branch -D",
+    "git branch -m"
+  ],
+  "comment_discipline": "encouraged",
+  "cpitd_auto_install": true,
+  "gated_git_commands": [
+    "git commit"
+  ],
+  "intervention_tracking": true,
+  "kickoff_verification": "local",
+  "reminder_drift_threshold": "0",
+  "sentinel": {
+    "default_agent": {
+      "model_tier": "standard",
+      "timeout_minutes": 30,
+      "verify": "local"
+    },
+    "enabled": false,
+    "escalation": {
+      "cooldown_minutes": 30,
+      "enabled": true,
+      "max_attempts": 2,
+      "model_tier": "advanced",
+      "timeout_multiplier_pct": 150
+    },
+    "interval_minutes": 10,
+    "max_concurrent_agents": 3,
+    "sources": {
+      "github_labels": {
+        "enabled": true,
+        "labels": [
+          "agent-todo: replicate",
+          "agent-todo: fix"
+        ]
+      }
+    }
+  },
+  "sentinel.default_agent.verify": "local",
+  "sentinel.enabled": false,
+  "sentinel.escalation.enabled": true,
+  "sentinel.sources.cpitd.enabled": false,
+  "sentinel.sources.github_labels.enabled": true,
+  "signing_enforcement": "audit",
+  "tracker_remote": "origin",
+  "tracking_mode": "strict"
+}

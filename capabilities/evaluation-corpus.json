@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "corpus_id": "capability-evidence-v1",
+  "author_id": "s001-implementation",
+  "scenarios": [
+    {
+      "id": "registry-render-success",
+      "capability_id": "capability-evidence-registry",
+      "entrypoint_id": "registry.library",
+      "coverage": { "kind": "success" },
+      "action": "render_capability_documentation",
+      "trials": 3,
+      "test_target": "capability_evidence_e2e",
+      "test_name": "reviewed_corpus_executes_three_final_state_trials_per_scenario",
+      "execution_isolation": "in_process_no_child",
+      "grader": {
+        "expected_files": [
+          { "path": "release/binary-capability-matrix.md", "content_sha256": "sha256:40a50c35164ac8eb000376979f6e71511523dff1ffa92cfae48967198d69407d", "max_bytes": 131072 },
+          { "path": "release/outcome.json", "content_sha256": "sha256:7e5ab64d41a3b06ca8031419f32788979108b944776edc44d8d25dbb5ea8f36b", "max_bytes": 1024 }
+        ],
+        "absent_paths": ["release/operational.json", "release/rejected.json"],
+        "expected_environment_sha256": "sha256:e04d0c4861c2620a2cc18feb4d1b9d70206a31e124303f21c3eedf1bd56e1791",
+        "expected_trace": {
+          "schema_version": 1,
+          "scenario_id": "registry-render-success",
+          "outcome": { "kind": "success" },
+          "events": [
+            { "sequence": 1, "kind": "scenario_started" },
+            { "sequence": 2, "kind": "registry_loaded" },
+            { "sequence": 3, "kind": "registry_validated" },
+            { "sequence": 4, "kind": "documentation_rendered" },
+            { "sequence": 5, "kind": "final_environment_inspected" }
+          ]
+        },
+        "expected_trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a",
+        "effect_observations": [
+          { "effect_id": "registry.projection", "kind": "documentation_projection", "state": "occurred", "proof": { "proof": "final_file", "path": "release/binary-capability-matrix.md" } },
+          { "effect_id": "registry.final-state", "kind": "final_environment_observation", "state": "occurred", "proof": { "proof": "grader_execution" } },
+          { "effect_id": "registry.trace", "kind": "trace_emission", "state": "occurred", "proof": { "proof": "trace_event", "kind": "final_environment_inspected" } },
+          { "effect_id": "registry.release-promotion", "kind": "documentation_projection", "state": "did_not_occur", "proof": { "proof": "forbidden_path_absent", "path": "release/operational.json" } }
+        ],
+        "expected_effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662"
+      }
+    },
+    {
+      "id": "registry-rejects-docs-only",
+      "capability_id": "capability-evidence-registry",
+      "entrypoint_id": "registry.library",
+      "coverage": { "kind": "failure", "failure_mode": "documentation_only_claim" },
+      "action": "reject_documentation_only_operational_claim",
+      "trials": 3,
+      "test_target": "capability_evidence_e2e",
+      "test_name": "reviewed_corpus_executes_three_final_state_trials_per_scenario",
+      "execution_isolation": "in_process_no_child",
+      "grader": {
+        "expected_files": [
+          { "path": "claims/marketing.md", "content_sha256": "sha256:25391af525578f6a21b25afd9b9d46fa321a38e20c505d29dbad013d1bb8992e", "max_bytes": 1024 },
+          { "path": "release/rejected.json", "content_sha256": "sha256:ed5556567af13cade5e36b17447012a7b54112ddfb8618f2e2e4641e09a23925", "max_bytes": 1024 }
+        ],
+        "absent_paths": ["release/operational.json"],
+        "expected_environment_sha256": "sha256:ca9f8b63d167b9e8ad077edf7df92ac2f99dfbd0747912f1604aa085b2fdcbf5",
+        "expected_trace": {
+          "schema_version": 1,
+          "scenario_id": "registry-rejects-docs-only",
+          "outcome": { "kind": "rejected", "code": "operational_missing_success_evidence" },
+          "events": [
+            { "sequence": 1, "kind": "scenario_started" },
+            { "sequence": 2, "kind": "registry_loaded" },
+            { "sequence": 3, "kind": "registry_rejected" },
+            { "sequence": 4, "kind": "final_environment_inspected" }
+          ]
+        },
+        "expected_trace_sha256": "sha256:d121a70a18ba59cd9ed5d7151df426cce45263aeb5c8cae38185e03592388133",
+        "effect_observations": [
+          { "effect_id": "registry.final-state", "kind": "final_environment_observation", "state": "occurred", "proof": { "proof": "grader_execution" } },
+          { "effect_id": "registry.trace", "kind": "trace_emission", "state": "occurred", "proof": { "proof": "trace_event", "kind": "final_environment_inspected" } },
+          { "effect_id": "registry.release-promotion", "kind": "documentation_projection", "state": "did_not_occur", "proof": { "proof": "forbidden_path_absent", "path": "release/operational.json" } }
+        ],
+        "expected_effect_observations_sha256": "sha256:d86646a7abe87bd0ff44abc39d9b90f97ef1f99fead53f2dc006153b0323a687"
+      }
+    },
+    {
+      "id": "registry-rejects-missing-failure-evidence",
+      "capability_id": "capability-evidence-registry",
+      "entrypoint_id": "registry.library",
+      "coverage": { "kind": "failure", "failure_mode": "missing_failure_evidence" },
+      "action": "reject_operational_claim_missing_failure_evidence",
+      "trials": 3,
+      "test_target": "capability_evidence_e2e",
+      "test_name": "reviewed_corpus_executes_three_final_state_trials_per_scenario",
+      "execution_isolation": "in_process_no_child",
+      "grader": {
+        "expected_files": [
+          { "path": "release/rejected.json", "content_sha256": "sha256:fba3f84578613de6d139443f7f52a95c401d52fb394e69e924af60e3268f12e2", "max_bytes": 1024 }
+        ],
+        "absent_paths": ["release/operational.json"],
+        "expected_environment_sha256": "sha256:9521fb96346534a0b5a0b22eb2446494746687f7d3b6159482138e01ed6c58e4",
+        "expected_trace": {
+          "schema_version": 1,
+          "scenario_id": "registry-rejects-missing-failure-evidence",
+          "outcome": { "kind": "rejected", "code": "operational_missing_failure_evidence" },
+          "events": [
+            { "sequence": 1, "kind": "scenario_started" },
+            { "sequence": 2, "kind": "registry_loaded" },
+            { "sequence": 3, "kind": "registry_rejected" },
+            { "sequence": 4, "kind": "final_environment_inspected" }
+          ]
+        },
+        "expected_trace_sha256": "sha256:0ee9343ad646e43aeb09fc07de69a133c083c0195267dad3560ab14d80e15fbe",
+        "effect_observations": [
+          { "effect_id": "registry.final-state", "kind": "final_environment_observation", "state": "occurred", "proof": { "proof": "grader_execution" } },
+          { "effect_id": "registry.trace", "kind": "trace_emission", "state": "occurred", "proof": { "proof": "trace_event", "kind": "final_environment_inspected" } },
+          { "effect_id": "registry.release-promotion", "kind": "documentation_projection", "state": "did_not_occur", "proof": { "proof": "forbidden_path_absent", "path": "release/operational.json" } }
+        ],
+        "expected_effect_observations_sha256": "sha256:d86646a7abe87bd0ff44abc39d9b90f97ef1f99fead53f2dc006153b0323a687"
+      }
+    }
+  ]
+}

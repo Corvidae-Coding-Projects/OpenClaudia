@@ -16,33 +16,27 @@ use openclaudia::tools::remote_trigger::WebhookError;
 
 #[test]
 fn invalid_scheme_display_uses_documented_template() {
-    let err = WebhookError::InvalidScheme {
-        scheme: "ftp".to_string(),
-    };
+    let err = WebhookError::InvalidScheme {};
     let s = err.to_string();
     assert_eq!(
         s,
-        "webhook URL uses unsupported scheme 'ftp'; \
+        "webhook URL uses an unsupported scheme; \
          expected https (or http with explicit opt-in)"
     );
 }
 
 #[test]
-fn invalid_scheme_display_includes_scheme_field() {
-    let err = WebhookError::InvalidScheme {
-        scheme: "javascript".to_string(),
-    };
+fn invalid_scheme_display_does_not_include_untrusted_scheme() {
+    let err = WebhookError::InvalidScheme {};
     let s = err.to_string();
-    assert!(s.contains("'javascript'"));
+    assert!(!s.contains("javascript-secret-sentinel"));
 }
 
 #[test]
 fn invalid_scheme_with_empty_scheme_still_renders() {
-    let err = WebhookError::InvalidScheme {
-        scheme: String::new(),
-    };
+    let err = WebhookError::InvalidScheme {};
     let s = err.to_string();
-    assert!(s.contains("''"));
+    assert!(s.contains("unsupported scheme"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -51,13 +45,11 @@ fn invalid_scheme_with_empty_scheme_still_renders() {
 
 #[test]
 fn insecure_scheme_display_uses_documented_template() {
-    let err = WebhookError::InsecureScheme {
-        url: "http://example.com/x".to_string(),
-    };
+    let err = WebhookError::InsecureScheme {};
     let s = err.to_string();
     assert_eq!(
         s,
-        "webhook URL 'http://example.com/x' uses insecure http://; \
+        "webhook URL uses insecure http://; \
          build the registry with new_allow_plaintext() to opt in"
     );
 }
@@ -65,9 +57,7 @@ fn insecure_scheme_display_uses_documented_template() {
 #[test]
 fn insecure_scheme_display_mentions_new_allow_plaintext_opt_in() {
     // PINS DOC: the error guides operators to the opt-in builder.
-    let err = WebhookError::InsecureScheme {
-        url: "http://x".to_string(),
-    };
+    let err = WebhookError::InsecureScheme {};
     let s = err.to_string();
     assert!(s.contains("new_allow_plaintext()"));
 }
@@ -78,21 +68,16 @@ fn insecure_scheme_display_mentions_new_allow_plaintext_opt_in() {
 
 #[test]
 fn malformed_display_uses_documented_template() {
-    let err = WebhookError::Malformed {
-        url: "not-a-url".to_string(),
-    };
+    let err = WebhookError::Malformed {};
     let s = err.to_string();
-    assert_eq!(
-        s,
-        "webhook URL 'not-a-url' is not a valid absolute URL with a host"
-    );
+    assert_eq!(s, "webhook URL is not a valid absolute URL with a host");
 }
 
 #[test]
 fn malformed_with_empty_url_still_renders() {
-    let err = WebhookError::Malformed { url: String::new() };
+    let err = WebhookError::Malformed {};
     let s = err.to_string();
-    assert!(s.contains("''"));
+    assert!(s.contains("not a valid absolute URL"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -146,18 +131,9 @@ fn duplicate_includes_name_in_quotes() {
 #[test]
 fn five_variants_have_distinct_display_strings() {
     let variants = vec![
-        WebhookError::InvalidScheme {
-            scheme: "x".to_string(),
-        }
-        .to_string(),
-        WebhookError::InsecureScheme {
-            url: "x".to_string(),
-        }
-        .to_string(),
-        WebhookError::Malformed {
-            url: "x".to_string(),
-        }
-        .to_string(),
+        WebhookError::InvalidScheme {}.to_string(),
+        WebhookError::InsecureScheme {}.to_string(),
+        WebhookError::Malformed {}.to_string(),
         WebhookError::UnknownWebhook {
             name: "x".to_string(),
         }
@@ -201,9 +177,7 @@ fn webhook_error_partial_eq_different_payload_distinct() {
 
 #[test]
 fn webhook_error_clone_preserves_variant_and_payload() {
-    let original = WebhookError::InvalidScheme {
-        scheme: "ftp".to_string(),
-    };
+    let original = WebhookError::InvalidScheme {};
     let cloned = original.clone();
     assert_eq!(cloned, original);
 }
@@ -214,9 +188,7 @@ fn webhook_error_clone_preserves_variant_and_payload() {
 
 #[test]
 fn webhook_error_implements_std_error_trait() {
-    let err = WebhookError::Malformed {
-        url: "x".to_string(),
-    };
+    let err = WebhookError::Malformed {};
     let _: &dyn std::error::Error = &err;
 }
 

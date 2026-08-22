@@ -250,7 +250,7 @@ fn google_transform_parts_with_unsupported_type_rejects_instead_of_skipping() {
             role: "user".to_string(),
             content: MessageContent::Parts(vec![
                 ContentPart {
-                    content_type: "video".to_string(),
+                    content_type: "google-content-type-secret-sentinel".to_string(),
                     text: None,
                     image_url: None,
                 },
@@ -272,8 +272,9 @@ fn google_transform_parts_with_unsupported_type_rejects_instead_of_skipping() {
     let err = err.to_string();
     assert_eq!(
         err,
-        "Request failed: Unsupported Google content part type 'video' at message index 0, part index 0"
+        "Request failed: Unsupported Google content part type at message index 0, part index 0"
     );
+    assert!(!err.contains("google-content-type-secret-sentinel"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

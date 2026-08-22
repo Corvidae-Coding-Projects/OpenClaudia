@@ -1,0 +1,376 @@
+{
+  "schema_version": 1,
+  "corpus_id": "openclaudia-technical-memory-tuning-v1",
+  "split": "tuning",
+  "generator_id": "s105-corpus-builder",
+  "repository_revision_id": "12f5444119df1067351c876bf01f534f55b41ee4",
+  "repository_revision_digest": "sha256:90575780cc78c06e6d81d030ac93016803874f7808985c0bbe029fb94b47bbdd",
+  "evaluation_now_unix_seconds": 100,
+  "lessons": [
+    {
+      "id": "tune-certificate-docs",
+      "draft": {
+        "title": "Planned transport requirement",
+        "kind": "security",
+        "observation": "A certificate requirement appears in a remediation plan, not runtime evidence.",
+        "guidance": "Do not treat planned transport work as an implemented authentication fact.",
+        "applicability": {"paths": ["docs/remediation-slices/048-hardened-provider-http-transport.md"], "components": ["documentation"], "tags": ["docs"]},
+        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/048-hardened-provider-http-transport.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:18bb1587d385d4f1cbc9b9159071c88dfa7088f5fa9293306b1c1d32e9634f6d"}],
+        "confidence": "observed_once",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 30,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-diverse-duplicate",
+      "draft": {
+        "title": "Generation guard duplicate",
+        "kind": "testing",
+        "observation": "A second memory-runtime lesson repeats the same revision evidence.",
+        "guidance": "Prefer independent coverage after one cited store lesson is selected.",
+        "applicability": {"paths": ["src/memory.rs"], "components": ["memory-runtime"], "tags": ["testing"]},
+        "citations": [{"kind": "test", "locator": "tests/technical_memory_e2e.rs", "source_version": "worktree:s108", "digest": "sha256:faa232c23db1ed3f268d25ea98f4ba7a38fd2ef39bfce0f8c0527b9cb66c5893"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 55,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-diverse-independent",
+      "draft": {
+        "title": "Generation guard independent",
+        "kind": "testing",
+        "observation": "The tool boundary independently verifies the returned revision receipt.",
+        "guidance": "Retain independent tool-boundary coverage alongside the store-level assertion.",
+        "applicability": {"paths": ["src/tools/memory.rs"], "components": ["memory-tools"], "tags": ["verify"]},
+        "citations": [{"kind": "test", "locator": "tests/technical_memory_retrieval_e2e.rs", "source_version": "worktree:s105", "digest": "sha256:fcf4bff39ef8b0582d6d3ac011e0a0c5b5268b2f817ae37d9965c065006c6826"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 50,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-diverse-primary",
+      "draft": {
+        "title": "Generation guard primary",
+        "kind": "testing",
+        "observation": "The memory store verifies its revision before returning a technical lesson.",
+        "guidance": "Keep the primary store-level assertion in the retrieved set.",
+        "applicability": {"paths": ["src/memory.rs"], "components": ["memory-runtime"], "tags": ["testing"]},
+        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s108", "digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 60,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-expired-source",
+      "draft": {
+        "title": "Expired source generation",
+        "kind": "compatibility",
+        "observation": "A source observation past its retention boundary is not current technical evidence.",
+        "guidance": "Report the omission as partial rather than converting expiry into a clean no-hit.",
+        "applicability": {"paths": ["src/memory/source.rs"], "components": ["memory-source"], "tags": ["verify"]},
+        "citations": [{"kind": "source_file", "locator": "src/memory/source.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:99245690f24b07589fe2945e5048374a407db6d24a6ddc0c7cb9fd8b4596019c"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "expire_after", "unix_seconds": 30}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 10,
+      "due_for_review": false,
+      "state": "expired"
+    },
+    {
+      "id": "tune-field-body",
+      "draft": {
+        "title": "Runtime note",
+        "kind": "operational",
+        "observation": "The process generation receipt is recorded during supervised cleanup.",
+        "guidance": "Use process evidence only for the process runtime that emitted it.",
+        "applicability": {"paths": ["src/tools/bash/mod.rs"], "components": ["process-runtime"], "tags": ["operate"]},
+        "citations": [{"kind": "source_file", "locator": "src/tools/bash/mod.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:b6e1101eceaf15b20cc02a08db828e001706873b8448d6a35e7735737d1bd5cb"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 70,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-field-title",
+      "draft": {
+        "title": "Generation receipt",
+        "kind": "testing",
+        "observation": "The technical-memory result exposes the exact store generation used for retrieval.",
+        "guidance": "Prefer a title-scoped technical lesson when the query names its primary concept.",
+        "applicability": {"paths": ["src/memory.rs"], "components": ["technical-memory"], "tags": ["verify"]},
+        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s108", "digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 60,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-freshness-current",
+      "draft": {
+        "title": "Generation check",
+        "kind": "compatibility",
+        "observation": "The current contract validates after the store guard is acquired.",
+        "guidance": "Use the current cited contract for retrieval verification.",
+        "applicability": {"paths": ["src/memory.rs"], "components": ["technical-memory"], "tags": ["testing"]},
+        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s108", "digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 40,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-freshness-stale",
+      "draft": {
+        "title": "Generation check",
+        "kind": "compatibility",
+        "observation": "The audit-era contract predates the current store guard implementation.",
+        "guidance": "Revalidate this older contract before using it as technical evidence.",
+        "applicability": {"paths": ["src/memory.rs"], "components": ["technical-memory"], "tags": ["testing"]},
+        "citations": [{"kind": "documentation", "locator": "docs/full-codebase-audit-2026-08-16.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:67c11719308878460870202b1d8ad6541b9f0cce88ff1a601169f476f27e3a02"}],
+        "confidence": "observed_once",
+        "sensitivity": "internal",
+        "retention": {"policy": "review_after", "unix_seconds": 70}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 50,
+      "due_for_review": true,
+      "state": "available"
+    },
+    {
+      "id": "tune-memory-reader",
+      "draft": {
+        "title": "Memory reader generation check",
+        "kind": "testing",
+        "observation": "A reader must verify the exact SQLite generation before trusting a lesson.",
+        "guidance": "Re-read the generation after acquiring the store guard.",
+        "applicability": {"paths": ["src/memory.rs"], "symbols": ["MemoryDb::query_technical_lessons"], "components": ["technical-memory"], "tags": ["testing"]},
+        "citations": [{"kind": "test", "locator": "tests/technical_memory_e2e.rs", "source_version": "worktree:s108", "digest": "sha256:faa232c23db1ed3f268d25ea98f4ba7a38fd2ef39bfce0f8c0527b9cb66c5893"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 12,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-memory-writer",
+      "draft": {
+        "title": "Memory writer cleanup",
+        "kind": "debugging",
+        "observation": "Writer cleanup must preserve the exact SQLite generation.",
+        "guidance": "Inspect the memory transaction and generation receipt together.",
+        "applicability": {"paths": ["src/memory.rs"], "symbols": ["MemoryDb::save_technical_lesson_candidate"], "components": ["technical-memory"], "tags": ["debugging"]},
+        "citations": [{"kind": "source_file", "locator": "src/memory.rs", "source_version": "worktree:s108", "digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 10,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-process-writer",
+      "draft": {
+        "title": "Writer cleanup regression",
+        "kind": "operational",
+        "observation": "Writer cleanup can leave a descendant process behind.",
+        "guidance": "Supervise the process group and reap every child.",
+        "applicability": {"paths": ["src/tools/bash/mod.rs"], "components": ["process-runtime"], "tags": ["operate"]},
+        "citations": [{"kind": "test", "locator": "tests/bash_background_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:499da374ce23f79fbe5411ae61cee5303455b2fbc8224feb69f3b6fca80bc893"}],
+        "confidence": "reproduced",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 20,
+      "due_for_review": false,
+      "state": "available"
+    },
+    {
+      "id": "tune-review-stale",
+      "draft": {
+        "title": "Review deadline invalidation",
+        "kind": "security",
+        "observation": "A review deadline makes a prior host review stale.",
+        "guidance": "Return the cited lesson with an explicit stale state until the host reviews it again.",
+        "applicability": {"paths": ["src/memory/review.rs"], "components": ["technical-memory"], "tags": ["verify"]},
+        "citations": [{"kind": "source_file", "locator": "src/memory/review.rs", "source_version": "worktree:s108", "digest": "sha256:930ab1210565e710fa243c60e9339135695ed4f7a2fece8c37886b395cb81b3a"}],
+        "confidence": "verified_by_test",
+        "sensitivity": "confidential",
+        "retention": {"policy": "review_after", "unix_seconds": 50}
+      },
+      "scope": "user_private",
+      "captured_at_unix_seconds": 10,
+      "due_for_review": true,
+      "state": "available"
+    },
+    {
+      "id": "tune-team-conflict",
+      "draft": {
+        "title": "Team conflict heads",
+        "kind": "architecture",
+        "observation": "Two causal heads require explicit typed resolution.",
+        "guidance": "Do not select either lesson head as current evidence.",
+        "applicability": {"paths": ["src/team_memory/replication.rs"], "components": ["team-memory"], "tags": ["conflict"]},
+        "citations": [{"kind": "source_file", "locator": "src/team_memory/replication.rs", "source_version": "worktree:s108", "digest": "sha256:7e3740668a3333adc320feb0888426e52aa89502cc1bf22f2948c305b14001b7"}],
+        "confidence": "reproduced",
+        "sensitivity": "internal",
+        "retention": {"policy": "indefinite"}
+      },
+      "scope": "team_shared",
+      "captured_at_unix_seconds": 15,
+      "due_for_review": false,
+      "state": "conflicted"
+    }
+  ],
+  "cases": [
+    {
+      "id": "tune-conflicted-heads",
+      "query": "team conflict",
+      "context": {"stage": "analyze", "paths": ["src/team_memory/replication.rs"], "components": ["team-memory"]},
+      "limit": 5,
+      "candidate_ids": ["tune-team-conflict"],
+      "expected_relevant_ids": [],
+      "forbidden_ids": ["tune-team-conflict"],
+      "expected_top_id": null,
+      "expected_state": "conflicted"
+    },
+    {
+      "id": "tune-diversity-ablation",
+      "query": "generation guard",
+      "context": {"stage": "verify", "paths": ["src/memory.rs", "src/tools/memory.rs"], "components": ["memory-runtime", "memory-tools"]},
+      "limit": 2,
+      "candidate_ids": ["tune-diverse-duplicate", "tune-diverse-independent", "tune-diverse-primary"],
+      "expected_relevant_ids": ["tune-diverse-independent", "tune-diverse-primary"],
+      "forbidden_ids": ["tune-diverse-duplicate"],
+      "expected_top_id": "tune-diverse-primary",
+      "expected_state": "partial"
+    },
+    {
+      "id": "tune-expired-source-is-partial",
+      "query": "expired source generation",
+      "context": {"stage": "verify", "paths": ["src/memory/source.rs"], "components": ["memory-source"]},
+      "limit": 5,
+      "candidate_ids": ["tune-expired-source"],
+      "expected_relevant_ids": [],
+      "forbidden_ids": ["tune-expired-source"],
+      "expected_top_id": null,
+      "expected_state": "partial"
+    },
+    {
+      "id": "tune-field-weight-ablation",
+      "query": "generation",
+      "context": {"paths": ["src/memory.rs", "src/tools/bash/mod.rs"], "components": ["process-runtime", "technical-memory"]},
+      "limit": 1,
+      "candidate_ids": ["tune-field-body", "tune-field-title"],
+      "expected_relevant_ids": ["tune-field-title"],
+      "forbidden_ids": ["tune-field-body"],
+      "expected_top_id": "tune-field-title",
+      "expected_state": "partial"
+    },
+    {
+      "id": "tune-freshness-ablation",
+      "query": "generation check",
+      "context": {"stage": "verify", "paths": ["src/memory.rs"], "components": ["technical-memory"]},
+      "limit": 1,
+      "candidate_ids": ["tune-freshness-current", "tune-freshness-stale"],
+      "expected_relevant_ids": ["tune-freshness-current"],
+      "forbidden_ids": ["tune-freshness-stale"],
+      "expected_top_id": "tune-freshness-current",
+      "expected_state": "partial"
+    },
+    {
+      "id": "tune-memory-writer-task",
+      "query": "writer cleanup",
+      "context": {"stage": "reproduce", "paths": ["src/memory.rs"], "components": ["technical-memory"]},
+      "limit": 1,
+      "candidate_ids": ["tune-memory-writer", "tune-process-writer"],
+      "expected_relevant_ids": ["tune-memory-writer"],
+      "forbidden_ids": ["tune-process-writer"],
+      "expected_top_id": "tune-memory-writer",
+      "expected_state": "complete"
+    },
+    {
+      "id": "tune-no-hit-provider-rotation",
+      "query": "certificate rotation",
+      "context": {"stage": "operate", "paths": ["src/providers/http.rs"], "components": ["provider-transport"]},
+      "limit": 5,
+      "candidate_ids": ["tune-certificate-docs"],
+      "expected_relevant_ids": [],
+      "forbidden_ids": ["tune-certificate-docs"],
+      "expected_top_id": null,
+      "expected_state": "no_hit"
+    },
+    {
+      "id": "tune-reader-diversity",
+      "query": "memory generation",
+      "context": {"stage": "verify", "paths": ["src/memory.rs"], "components": ["technical-memory"]},
+      "limit": 2,
+      "candidate_ids": ["tune-memory-reader", "tune-memory-writer", "tune-process-writer"],
+      "expected_relevant_ids": ["tune-memory-reader", "tune-memory-writer"],
+      "forbidden_ids": ["tune-process-writer"],
+      "expected_top_id": "tune-memory-reader",
+      "expected_state": "complete"
+    },
+    {
+      "id": "tune-stale-review",
+      "query": "review deadline",
+      "context": {"stage": "verify", "paths": ["src/memory/review.rs"], "components": ["technical-memory"]},
+      "limit": 2,
+      "candidate_ids": ["tune-review-stale"],
+      "expected_relevant_ids": ["tune-review-stale"],
+      "forbidden_ids": [],
+      "expected_top_id": "tune-review-stale",
+      "expected_state": "stale"
+    },
+    {
+      "id": "tune-store-error",
+      "query": "sqlite corruption",
+      "context": {"stage": "reproduce", "paths": ["src/memory.rs"], "components": ["technical-memory"]},
+      "limit": 5,
+      "injected_failure": "store_error",
+      "candidate_ids": [],
+      "expected_relevant_ids": [],
+      "forbidden_ids": [],
+      "expected_top_id": null,
+      "expected_state": "store_error"
+    }
+  ]
+}

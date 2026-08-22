@@ -1,7 +1,6 @@
 //! End-to-end tests for the VDD finding/triage pipeline:
 //! `parse_findings_detailed` outcome discrimination + raw-finding
-//! to typed-Finding conversion + `format_findings_for_injection`
-//! rendering.
+//! to typed-Finding conversion + source-labeled VDD context rendering.
 //!
 //! Sprint 54 of the verification effort.
 
@@ -10,7 +9,7 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::vdd::{
-    format_findings_for_injection, parse_findings, parse_findings_detailed, Finding, FindingStatus,
+    findings_context_observation, parse_findings, parse_findings_detailed, Finding, FindingStatus,
     ParseErrorKind, ParseFindingsOutcome, Severity, StaticAnalysisResult,
 };
 
@@ -30,6 +29,22 @@ fn finding(severity: Severity, description: &str) -> Finding {
         adversary_reasoning: String::new(),
         iteration: 1,
     }
+}
+
+fn observation_content(findings: &[Finding], analysis: &[StaticAnalysisResult]) -> Option<String> {
+    findings_context_observation(findings, analysis).map(|item| {
+        assert_eq!(
+            item.source(),
+            openclaudia::context::ContextSource::Reference(
+                openclaudia::context::ReferenceSource::Vdd,
+            )
+        );
+        assert_eq!(
+            item.authority(),
+            openclaudia::context::ContextAuthority::Reference
+        );
+        item.content().to_string()
+    })
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -316,23 +331,22 @@ fn severity_ordering_matches_severity_strength() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section G — format_findings_for_injection
+// Section G — typed VDD context observations
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn injection_with_no_genuine_findings_and_passing_analysis_is_empty() {
+fn no_genuine_findings_and_passing_analysis_produces_no_observation() {
     let findings = vec![];
     let analysis: Vec<StaticAnalysisResult> = vec![];
-    let out = format_findings_for_injection(&findings, &analysis);
-    assert!(out.is_empty(), "nothing to inject → empty string");
+    assert!(observation_content(&findings, &analysis).is_none());
 }
 
 #[test]
-fn injection_only_renders_genuine_findings_not_false_positives() {
+fn observation_only_renders_genuine_findings_not_false_positives() {
     let mut fp = finding(Severity::High, "this is a false positive");
     fp.status = FindingStatus::FalsePositive;
     let real = finding(Severity::Critical, "real critical issue");
-    let out = format_findings_for_injection(&[fp, real], &[]);
+    let out = observation_content(&[fp, real], &[]).expect("VDD observation");
     assert!(
         out.contains("real critical issue"),
         "genuine finding MUST appear; got {out:?}"
@@ -344,16 +358,16 @@ fn injection_only_renders_genuine_findings_not_false_positives() {
 }
 
 #[test]
-fn injection_wraps_in_vdd_advisory_tag() {
+fn observation_uses_vdd_advisory_serialization() {
     let real = finding(Severity::High, "issue X");
-    let out = format_findings_for_injection(&[real], &[]);
+    let out = observation_content(&[real], &[]).expect("VDD observation");
     assert!(out.starts_with("<vdd-advisory>"));
 }
 
 #[test]
-fn injection_includes_severity_label_in_output() {
+fn observation_includes_severity_label_in_output() {
     let real = finding(Severity::Critical, "kabloom");
-    let out = format_findings_for_injection(&[real], &[]);
+    let out = observation_content(&[real], &[]).expect("VDD observation");
     assert!(
         out.contains("CRITICAL"),
         "severity label MUST appear; got {out:?}"
@@ -365,18 +379,18 @@ fn injection_includes_severity_label_in_output() {
 }
 
 #[test]
-fn injection_includes_cwe_when_present() {
+fn observation_includes_cwe_when_present() {
     let mut f = finding(Severity::High, "issue");
     f.cwe = Some("CWE-79".to_string());
-    let out = format_findings_for_injection(&[f], &[]);
+    let out = observation_content(&[f], &[]).expect("VDD observation");
     assert!(out.contains("CWE-79"), "cwe MUST be rendered; got {out:?}");
 }
 
 #[test]
-fn injection_includes_file_path_when_present() {
+fn observation_includes_file_path_when_present() {
     let mut f = finding(Severity::Medium, "issue");
     f.file_path = Some("src/handler.rs".to_string());
-    let out = format_findings_for_injection(&[f], &[]);
+    let out = observation_content(&[f], &[]).expect("VDD observation");
     assert!(
         out.contains("src/handler.rs"),
         "file_path MUST be rendered; got {out:?}"
@@ -384,11 +398,11 @@ fn injection_includes_file_path_when_present() {
 }
 
 #[test]
-fn injection_numbers_findings_starting_at_1() {
+fn observation_numbers_findings_starting_at_1() {
     let f1 = finding(Severity::High, "first");
     let f2 = finding(Severity::High, "second");
     let f3 = finding(Severity::High, "third");
-    let out = format_findings_for_injection(&[f1, f2, f3], &[]);
+    let out = observation_content(&[f1, f2, f3], &[]).expect("VDD observation");
     assert!(out.contains("1."), "first finding numbered 1");
     assert!(out.contains("2."));
     assert!(out.contains("3."));

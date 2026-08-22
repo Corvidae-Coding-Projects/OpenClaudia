@@ -9,12 +9,60 @@ permissions:
   contents: read
 
 jobs:
+  repository-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.0
+      - name: Verify tracked artifacts and retained history
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+          python3 scripts/check_repository_hygiene.py --repo-root .
+      - name: Verify locked dependency graphs
+        run: |
+          cargo metadata --locked --format-version 1 --no-deps >/dev/null
+          cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 --no-deps >/dev/null
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Enforce advisory, license, source, and duplicate policy
+        run: |
+          cargo deny --locked check advisories licenses sources bans
+          cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories licenses sources bans
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.0
+      - run: cargo check --locked --all-targets
+      - run: cargo check --locked --all-features --all-targets
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+
   linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.0
           components: rustfmt, clippy
       - name: Install and authorize Bubblewrap
         run: |
@@ -35,19 +83,33 @@ jobs:
             --dev /dev \
             -- /usr/bin/true
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets -- --test-threads=1
-      - run: cargo test --test sandbox_escape_e2e -- --test-threads=1
-      - run: cargo test --test session_filesystem_capabilities_e2e -- --test-threads=1
+      - run: cargo check --locked --all-targets
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features -- --test-threads=1
+      - name: Verify hermetic fuzz harnesses
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --test-threads=1
+      - run: cargo test --locked --all-features --test sandbox_escape_e2e -- --test-threads=1
+      - run: cargo test --locked --all-features --test session_filesystem_capabilities_e2e -- --test-threads=1
 
   platform-fail-closed:
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --all-targets
-      - run: cargo test --test sandbox_platform_fail_closed_e2e -- --test-threads=1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.0
+      - run: cargo check --locked --all-features --all-targets
+      - run: cargo test --locked --all-features --test sandbox_platform_fail_closed_e2e -- --test-threads=1

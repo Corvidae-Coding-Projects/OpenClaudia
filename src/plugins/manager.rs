@@ -18,18 +18,6 @@ use super::policy::{self, PluginPolicy, PolicyAction, PolicyRejection};
 use super::validate::{verify_signature, SignatureError};
 use super::{Plugin, PluginCommand, PluginError, PluginHook, PluginMcpServer};
 
-/// Resolve the project root that owns per-project tracking state
-/// (`<project_root>/.openclaudia/plugins/installed_plugins.json`).
-///
-/// Falls back to the current process cwd as a best-effort root; if even
-/// `current_dir()` fails (deleted cwd, etc.) we use `"."`, which the
-/// caller's atomic-save path will canonicalize via `create_dir_all`.
-/// This matches the value the install entries themselves already record
-/// in `project_path` (see [`PluginInstallEntry::project_path`]).
-fn project_root_cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
 /// Outcome of [`PluginManager::fetch_plugin_archive`].
 ///
 /// Encodes whether the fetch left the install destination already
@@ -79,6 +67,8 @@ pub struct PluginManager {
     search_paths: Vec<PathBuf>,
     /// Installation tracking
     installed: InstalledPlugins,
+    /// Exact project root for project-scoped discovery and install state.
+    project_root: PathBuf,
 }
 
 impl PluginManager {
@@ -92,7 +82,14 @@ impl PluginManager {
     /// search (crosslink #893).
     #[must_use]
     pub fn new() -> Self {
-        Self::build(dirs::home_dir())
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::build(dirs::home_dir(), project_root)
+    }
+
+    /// Create a lenient manager bound to an explicit project root.
+    #[must_use]
+    pub fn new_for_project(project_root: impl Into<PathBuf>) -> Self {
+        Self::build(dirs::home_dir(), project_root.into())
     }
 
     /// Create a new plugin manager, returning an error when no home directory
@@ -110,6 +107,19 @@ impl PluginManager {
     /// Returns [`PluginError::InstallError`] when `dirs::home_dir()` returns
     /// `None`. Tests can bypass via [`Self::with_paths`].
     pub fn try_new() -> Result<Self, PluginError> {
+        let project_root = std::env::current_dir().map_err(|error| {
+            PluginError::InstallError(format!("cannot determine project root: {error}"))
+        })?;
+        Self::try_new_for_project(project_root)
+    }
+
+    /// Create a production manager bound to an explicit project root.
+    ///
+    /// # Errors
+    /// Returns [`PluginError::InstallError`] when no home directory can be
+    /// resolved.
+    pub fn try_new_for_project(project_root: impl Into<PathBuf>) -> Result<Self, PluginError> {
+        let project_root = project_root.into();
         dirs::home_dir().map_or_else(
             || {
                 Err(PluginError::InstallError(
@@ -118,12 +128,12 @@ impl PluginManager {
                         .to_string(),
                 ))
             },
-            |home| Ok(Self::build(Some(home))),
+            |home| Ok(Self::build(Some(home), project_root)),
         )
     }
 
     /// Internal helper shared by [`Self::new`] and [`Self::try_new`].
-    fn build(home_dir: Option<PathBuf>) -> Self {
+    fn build(home_dir: Option<PathBuf>, project_root: PathBuf) -> Self {
         let mut search_paths = Vec::new();
 
         // User plugins directory
@@ -134,22 +144,31 @@ impl PluginManager {
         }
 
         // Project plugins directory
-        search_paths.push(PathBuf::from(".openclaudia/plugins"));
+        search_paths.push(project_root.join(".openclaudia/plugins"));
 
         Self {
             plugins: HashMap::new(),
             search_paths,
-            installed: InstalledPlugins::load(&project_root_cwd()),
+            installed: InstalledPlugins::load(&project_root),
+            project_root,
         }
     }
 
     /// Create a plugin manager with custom search paths
     #[must_use]
     pub fn with_paths(paths: Vec<PathBuf>) -> Self {
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_paths_for_project(paths, project_root)
+    }
+
+    /// Create a manager with custom search paths and an explicit project root.
+    #[must_use]
+    pub fn with_paths_for_project(paths: Vec<PathBuf>, project_root: impl Into<PathBuf>) -> Self {
         Self {
             plugins: HashMap::new(),
             search_paths: paths,
             installed: InstalledPlugins::default(),
+            project_root: project_root.into(),
         }
     }
 
@@ -310,6 +329,24 @@ impl PluginManager {
             .collect()
     }
 
+    /// Get enabled MCP servers resolved against one immutable run snapshot.
+    #[must_use]
+    pub fn all_mcp_servers_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Vec<(&Plugin, PluginMcpServer)> {
+        self.plugins
+            .values()
+            .filter(|plugin| plugin.enabled)
+            .flat_map(|plugin| {
+                plugin
+                    .resolved_mcp_servers_for_run(run)
+                    .into_iter()
+                    .map(move |server| (plugin, server))
+            })
+            .collect()
+    }
+
     /// Get the installation tracker
     #[must_use]
     pub const fn installed(&self) -> &InstalledPlugins {
@@ -352,7 +389,7 @@ impl PluginManager {
     /// Reload all plugins
     pub fn reload(&mut self) -> Vec<PluginError> {
         self.plugins.clear();
-        self.installed = InstalledPlugins::load(&project_root_cwd());
+        self.installed = InstalledPlugins::load(&self.project_root);
         self.discover()
     }
 
@@ -799,7 +836,7 @@ impl PluginManager {
         let manifest: MarketplaceManifest = serde_json::from_str(&content)
             .map_err(|e| PluginError::InvalidManifest(e.to_string()))?;
 
-        info!(name = %manifest.name, url = %url, plugins = manifest.plugins.len(), "Added git marketplace");
+        info!(name = %manifest.name, plugins = manifest.plugins.len(), "Added git marketplace");
         Ok(manifest)
     }
 
@@ -908,7 +945,7 @@ impl PluginManager {
         Self::extract_to_install_dir(&fetched, &plugins_dir, &dest)?;
 
         let plugin_id = format!("{plugin_name}@{marketplace_name}");
-        Self::register_install(&plugin_id, &dest, mp_plugin.version, commit_sha);
+        self.register_install(&plugin_id, &dest, mp_plugin.version, commit_sha);
         let _ = self.reload();
 
         if fetched.is_git() {
@@ -965,7 +1002,7 @@ impl PluginManager {
                 "Plugin name '{plugin_name}' contains invalid path characters"
             )));
         }
-        let plugins_dir = PathBuf::from(".openclaudia/plugins");
+        let plugins_dir = self.project_root.join(".openclaudia/plugins");
         let dest = plugins_dir.join(plugin_name);
         if dest.exists() {
             return Err(PluginError::InvalidManifest(format!(
@@ -1178,23 +1215,18 @@ impl PluginManager {
     /// Caller is responsible for calling [`Self::reload`] afterwards
     /// so the new plugin becomes active in this process.
     fn register_install(
+        &self,
         plugin_id: &str,
         dest: &Path,
         version: Option<String>,
         git_commit_sha: Option<String>,
     ) {
-        let project_root = project_root_cwd();
-        let mut installed = InstalledPlugins::load(&project_root);
+        let mut installed = InstalledPlugins::load(&self.project_root);
         installed.upsert(
             plugin_id,
             PluginInstallEntry {
                 scope: InstallScope::Project,
-                project_path: Some(
-                    std::env::current_dir()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                ),
+                project_path: Some(self.project_root.to_string_lossy().to_string()),
                 install_path: dest.to_string_lossy().to_string(),
                 version,
                 installed_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -1202,7 +1234,7 @@ impl PluginManager {
                 git_commit_sha,
             },
         );
-        if let Err(e) = installed.save(&project_root) {
+        if let Err(e) = installed.save(&self.project_root) {
             warn!("Failed to save install tracking: {}", e);
         }
     }
@@ -1247,7 +1279,7 @@ impl PluginManager {
         // `.openclaudia/plugins/` jail.
         let name = super::validate::derive_dir_name_from_url(url)?;
 
-        let plugins_dir = PathBuf::from(".openclaudia/plugins");
+        let plugins_dir = self.project_root.join(".openclaudia/plugins");
         let dest = plugins_dir.join(&name);
         if dest.exists() {
             return Err(PluginError::InvalidManifest(format!(
@@ -1268,18 +1300,12 @@ impl PluginManager {
             Ok(plugin) => {
                 let actual_name = plugin.name().to_string();
                 // Track installation
-                let project_root = project_root_cwd();
-                let mut installed = InstalledPlugins::load(&project_root);
+                let mut installed = InstalledPlugins::load(&self.project_root);
                 installed.upsert(
                     &actual_name,
                     PluginInstallEntry {
                         scope: InstallScope::Project,
-                        project_path: Some(
-                            std::env::current_dir()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string(),
-                        ),
+                        project_path: Some(self.project_root.to_string_lossy().to_string()),
                         install_path: dest.to_string_lossy().to_string(),
                         version: plugin.manifest.version,
                         installed_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -1287,11 +1313,11 @@ impl PluginManager {
                         git_commit_sha: Some(commit_sha),
                     },
                 );
-                if let Err(e) = installed.save(&project_root) {
+                if let Err(e) = installed.save(&self.project_root) {
                     warn!("Failed to save install tracking: {}", e);
                 }
                 let _ = self.reload();
-                info!(plugin = %actual_name, url = %url, "Installed plugin from git");
+                info!(plugin = %actual_name, "Installed plugin from git");
                 Ok(actual_name)
             }
             Err(e) => {
@@ -1358,7 +1384,10 @@ impl PluginManager {
         // way to find the clone — `install_from_git` returns the *plugin*
         // name from the manifest, which may differ from the dir name.
         let dir_name = super::validate::derive_dir_name_from_url(url)?;
-        let plugin_dir = PathBuf::from(".openclaudia/plugins").join(&dir_name);
+        let plugin_dir = self
+            .project_root
+            .join(".openclaudia/plugins")
+            .join(&dir_name);
         let cc_path = plugin_dir.join(".claude-plugin").join("plugin.json");
         let root_path = plugin_dir.join("plugin.json");
         let manifest_path = if cc_path.exists() { cc_path } else { root_path };
@@ -1397,10 +1426,9 @@ impl PluginManager {
                     );
                 }
             }
-            let project_root = project_root_cwd();
-            let mut installed = InstalledPlugins::load(&project_root);
+            let mut installed = InstalledPlugins::load(&self.project_root);
             installed.remove(&plugin_name);
-            if let Err(save_err) = installed.save(&project_root) {
+            if let Err(save_err) = installed.save(&self.project_root) {
                 warn!("Failed to update install tracking after rejection: {save_err}");
             }
             let _ = self.reload();
@@ -2118,20 +2146,13 @@ mod install_decomp_tests {
     /// is the single owner of.
     #[test]
     fn register_install_persists_entry_with_commit_sha() {
-        // crosslink #984 follow-up: `register_install` reads the process
-        // cwd to derive its project root, so this test must mutate it.
-        // Hold the shared cwd lock for the duration so concurrent tests
-        // do not observe a partially-mutated cwd (the same lock the
-        // worktree/cron suites once used).
-        let _cwd = crate::tools::testutil::process_cwd_lock();
         let tmp = TempDir::new().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let manager = PluginManager::new_for_project(tmp.path());
 
         let dest = tmp.path().join(".openclaudia").join("plugins").join("p");
         fs::create_dir_all(&dest).unwrap();
 
-        PluginManager::register_install(
+        manager.register_install(
             "p@m",
             &dest,
             Some("1.2.3".to_string()),
@@ -2139,8 +2160,6 @@ mod install_decomp_tests {
         );
 
         let reloaded = InstalledPlugins::load(tmp.path());
-        // Restore cwd before any assertion can panic.
-        std::env::set_current_dir(prev).unwrap();
 
         let entries = reloaded
             .plugins

@@ -16,7 +16,9 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "browser")]
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -49,18 +51,14 @@ pub(crate) const MAX_WEB_FETCH_BYTES: usize = 10 * 1024 * 1024;
 ///    aborts the moment the running total would exceed `cap`. This catches
 ///    servers that lie about (or omit) `Content-Length`.
 ///
-/// The error message names the configured cap and the offending URL so the
-/// failure is greppable in production logs.
-pub(crate) async fn read_bounded_text(
-    response: Response,
-    cap: usize,
-    url: &str,
-) -> Result<String, String> {
+/// The error message names the observed size and configured cap without
+/// retaining the requested URL, which may contain signed query credentials.
+pub(crate) async fn read_bounded_text(response: Response, cap: usize) -> Result<String, String> {
     // Pre-flight: trust server-advertised Content-Length when present.
     if let Some(advertised) = response.content_length() {
         if advertised > cap as u64 {
             return Err(format!(
-                "Response too large: {advertised} bytes exceeds cap {cap} at URL {url}"
+                "Response too large: {advertised} bytes exceeds cap {cap}"
             ));
         }
     }
@@ -73,7 +71,7 @@ pub(crate) async fn read_bounded_text(
         total = total.saturating_add(chunk.len());
         if total > cap {
             return Err(format!(
-                "Response too large: {total} bytes exceeds cap {cap} at URL {url}"
+                "Response too large: {total} bytes exceeds cap {cap}"
             ));
         }
         buf.extend_from_slice(&chunk);
@@ -505,7 +503,7 @@ pub fn html_to_markdown(html: &str) -> String {
 const DUCKDUCKGO_HTML_URL: &str = "https://html.duckduckgo.com/html/";
 
 #[cfg(feature = "browser")]
-const BROWSER_PROFILE_DIR: &str = ".openclaudia/browser_profile";
+const BROWSER_PROFILE_DIR: &str = "browser_profile";
 
 /// Result from `web_fetch`
 #[derive(Debug, Clone)]
@@ -545,7 +543,12 @@ pub struct SearchResult {
 ///
 /// Returns an error string if URL validation fails, both fetch tiers
 /// fail, or the response exceeds [`MAX_WEB_FETCH_BYTES`].
-pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
+pub async fn fetch_url(
+    url: &str,
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Result<FetchResult, String> {
+    run.require(crate::tools::ToolResource::Network)
+        .map_err(|error| error.to_string())?;
     // crosslink #673 — async DNS via tokio::net::lookup_host. The legacy
     // sync `validate_url` invoked the blocking std-library resolver from
     // inside this async function, which stalled the tokio worker for the
@@ -555,7 +558,7 @@ pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
     let direct_err = match fetch_url_direct(url).await {
         Ok(result) => return Ok(result),
         Err(e) => {
-            tracing::info!("direct fetch failed for {url}: {e}; falling back to headless browser");
+            tracing::info!("direct fetch failed: {e}; falling back to headless browser");
             e
         }
     };
@@ -565,8 +568,13 @@ pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
     // `browser` feature we surface a single combined error.
     #[cfg(feature = "browser")]
     {
+        let browser_scratch_root = browser_scratch_for_fallback(&run, &direct_err)?;
         let url_owned = url.to_string();
-        match tokio::task::spawn_blocking(move || fetch_with_browser(&url_owned)).await {
+        match tokio::task::spawn_blocking(move || {
+            fetch_with_browser(&url_owned, &browser_scratch_root)
+        })
+        .await
+        {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(browser_err)) => Err(format!(
                 "Both fetch tiers failed. Direct: {direct_err}. Browser: {browser_err}."
@@ -583,6 +591,18 @@ pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
              rebuild with `--features browser` to enable headless-Chrome fallback)"
         ))
     }
+}
+
+#[cfg(feature = "browser")]
+fn browser_scratch_for_fallback(
+    run: &crate::tools::ToolRunContext,
+    direct_error: &str,
+) -> Result<PathBuf, String> {
+    run.require(crate::tools::ToolResource::Process)
+        .map_err(|error| {
+            format!("Direct fetch failed: {direct_error}. Browser fallback is unavailable: {error}")
+        })?;
+    Ok(run.private_temp_root().to_path_buf())
 }
 
 /// Tier-1 direct HTTP fetch. HTML response bodies are converted to
@@ -616,7 +636,7 @@ async fn fetch_url_direct(url: &str) -> Result<FetchResult, String> {
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("text/html") || ct.contains("application/xhtml"));
 
-    let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES, url).await?;
+    let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES).await?;
 
     let (content, title) = if is_html {
         let title = extract_html_title(&body);
@@ -657,12 +677,16 @@ fn extract_html_title(html: &str) -> Option<String> {
 /// # Errors
 ///
 /// Returns an error string if all search backends fail.
-pub fn search_web(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+pub fn search_web(
+    browser_scratch_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
     let mut backend_errors = Vec::new();
 
     // Tier 1 — DuckDuckGo via headless Chromium in browser builds
     // (free, no API key).
-    match search_duckduckgo(query, limit) {
+    match search_duckduckgo(browser_scratch_root, query, limit) {
         Ok(results) => return Ok(results),
         Err(e) => {
             tracing::warn!("DuckDuckGo search failed: {e}");
@@ -672,7 +696,7 @@ pub fn search_web(query: &str, limit: usize) -> Result<Vec<SearchResult>, String
 
     // Tier 2 — Bing HTML scrape via headless Chromium in browser
     // builds.
-    match search_bing(query, limit) {
+    match search_bing(browser_scratch_root, query, limit) {
         Ok(results) if !results.is_empty() => return Ok(results),
         Ok(_) => {
             backend_errors.push("Bing: returned zero results (likely bot-challenged)".to_string());
@@ -685,7 +709,7 @@ pub fn search_web(query: &str, limit: usize) -> Result<Vec<SearchResult>, String
 
     Err(format!(
         "Web search failed: no free browser-backed backend returned usable results.\n  {}\n\
-         Install Chromium or rebuild with the default `browser` feature to enable free search.",
+         Install Chromium and rebuild with `--features browser` to enable free search.",
         backend_errors.join("\n  ")
     ))
 }
@@ -737,8 +761,12 @@ fn decode_bing_ck_url(href: &str) -> String {
 /// navigation times out, or if the rendered DOM exceeds
 /// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]
-pub fn search_bing(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
-    let browser = launch_browser_for_scraping()?;
+pub fn search_bing(
+    browser_scratch_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let browser = launch_browser_for_scraping(browser_scratch_root)?;
 
     let tab = browser
         .new_tab()
@@ -762,10 +790,9 @@ pub fn search_bing(query: &str, limit: usize) -> Result<Vec<SearchResult>, Strin
 
     if html.len() > MAX_WEB_FETCH_BYTES {
         return Err(format!(
-            "Response too large: {} bytes exceeds cap {} at URL {}",
+            "Response too large: {} bytes exceeds cap {}",
             html.len(),
-            MAX_WEB_FETCH_BYTES,
-            search_url
+            MAX_WEB_FETCH_BYTES
         ));
     }
 
@@ -823,7 +850,7 @@ pub fn parse_bing_results_from_html(html: &str, limit: usize) -> Result<Vec<Sear
         let url = decode_bing_ck_url(&raw_href);
         // SSRF guard — same threat model as the DDG path.
         if let Err(reason) = validate_url(&url) {
-            tracing::debug!(url = %url, reason = %reason, "Bing result URL dropped by SSRF guard");
+            tracing::debug!(reason = %reason, "Bing result URL dropped by SSRF guard");
             continue;
         }
         let snippet = el
@@ -848,7 +875,11 @@ pub fn parse_bing_results_from_html(html: &str, limit: usize) -> Result<Vec<Sear
 ///
 /// Always returns an error.
 #[cfg(not(feature = "browser"))]
-pub fn search_bing(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, String> {
+pub fn search_bing(
+    _browser_scratch_root: &Path,
+    _query: &str,
+    _limit: usize,
+) -> Result<Vec<SearchResult>, String> {
     Err("Bing search requires the browser feature".to_string())
 }
 
@@ -861,23 +892,18 @@ pub fn search_bing(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, Str
 /// Returns an error string if the browser cannot be launched or no results are found.
 /// Launch a headless Chromium for scraping.
 ///
-/// `LaunchOptions::path = None` plus the `fetch` feature on
-/// `headless_chrome` lets the upstream `Process::new` resolve the
-/// browser binary in two stages: first it consults the standard
-/// install dirs (`/usr/bin/chromium`, `/Applications/Google Chrome`,
-/// etc) via `FetcherOptions::with_allow_standard_dirs(true)`; if no
-/// system browser is present it auto-downloads a known-good Chromium
-/// revision into the user's data dir and caches it for future runs.
-///
-/// The combined behaviour matches user expectation — the tool just
-/// works on a fresh machine without manual Chromium installation —
-/// and the error path stays actionable when both fail (e.g. no
-/// network during first-run auto-download).
+/// `LaunchOptions::path = None` lets the upstream process resolver consult
+/// the standard install directories (`/usr/bin/chromium`,
+/// `/Applications/Google Chrome`, and similar locations). Runtime executable
+/// download is deliberately disabled, so an operator enabling the `browser`
+/// feature must install a compatible browser.
 #[cfg(feature = "browser")]
-fn launch_browser_for_scraping() -> Result<headless_chrome::Browser, String> {
+fn launch_browser_for_scraping(
+    browser_scratch_root: &Path,
+) -> Result<headless_chrome::Browser, String> {
     use headless_chrome::{Browser, LaunchOptions};
 
-    let user_data_dir = browser_profile_dir()?;
+    let user_data_dir = browser_profile_dir_under(browser_scratch_root)?;
     let opts = LaunchOptions::default_builder()
         .headless(true)
         .user_data_dir(Some(user_data_dir))
@@ -886,21 +912,14 @@ fn launch_browser_for_scraping() -> Result<headless_chrome::Browser, String> {
     Browser::new(opts).map_err(|e| {
         format!(
             "Failed to launch Chromium: {e}. Install chromium/google-chrome \
-             on PATH, or ensure network access for the first-run auto-download."
+             on PATH; this build does not download browser executables at runtime."
         )
     })
 }
 
 #[cfg(feature = "browser")]
-fn browser_profile_dir() -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("Failed to resolve current directory for browser profile: {e}"))?;
-    browser_profile_dir_under(&cwd)
-}
-
-#[cfg(feature = "browser")]
-fn browser_profile_dir_under(project_root: &Path) -> Result<PathBuf, String> {
-    let dir = project_root.join(BROWSER_PROFILE_DIR);
+fn browser_profile_dir_under(browser_scratch_root: &Path) -> Result<PathBuf, String> {
+    let dir = browser_scratch_root.join(BROWSER_PROFILE_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| {
         format!(
             "Failed to create Chromium browser profile directory '{}': {e}",
@@ -915,13 +934,17 @@ fn browser_profile_dir_under(project_root: &Path) -> Result<PathBuf, String> {
 ///
 /// # Errors
 ///
-/// Returns a descriptive message if Chromium cannot be launched
-/// (no system Chrome and the first-run auto-download failed), if
+/// Returns a descriptive message if Chromium cannot be launched because no
+/// compatible system browser is installed, if
 /// navigation times out, if the response exceeds the rendered-HTML
 /// cap, or if the DOM does not contain the expected selectors.
 #[cfg(feature = "browser")]
-pub fn search_duckduckgo(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
-    let browser = launch_browser_for_scraping()?;
+pub fn search_duckduckgo(
+    browser_scratch_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let browser = launch_browser_for_scraping(browser_scratch_root)?;
 
     let tab = browser
         .new_tab()
@@ -948,10 +971,9 @@ pub fn search_duckduckgo(query: &str, limit: usize) -> Result<Vec<SearchResult>,
     // materialize multi-GB DOMs from hostile pages; refuse to propagate that.
     if html.len() > MAX_WEB_FETCH_BYTES {
         return Err(format!(
-            "Response too large: {} bytes exceeds cap {} at URL {}",
+            "Response too large: {} bytes exceeds cap {}",
             html.len(),
-            MAX_WEB_FETCH_BYTES,
-            search_url
+            MAX_WEB_FETCH_BYTES
         ));
     }
 
@@ -1044,7 +1066,6 @@ pub fn parse_duckduckgo_results_from_html(
             // could embed private-IP / metadata URLs in result hrefs.
             if let Err(reason) = validate_url(&url) {
                 tracing::debug!(
-                    url = %url,
                     reason = %reason,
                     "DDG result URL dropped by SSRF guard"
                 );
@@ -1085,8 +1106,12 @@ pub fn parse_duckduckgo_results_from_html(
 ///
 /// Always returns an error when the browser feature is not enabled.
 #[cfg(not(feature = "browser"))]
-pub fn search_duckduckgo(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, String> {
-    Err("DuckDuckGo search requires the browser feature. Rebuild with the default `browser` feature to enable free search.".to_string())
+pub fn search_duckduckgo(
+    _browser_scratch_root: &Path,
+    _query: &str,
+    _limit: usize,
+) -> Result<Vec<SearchResult>, String> {
+    Err("DuckDuckGo search requires the browser feature. Rebuild with `--features browser` and install Chromium to enable free search.".to_string())
 }
 
 /// Fetch a URL using a headless Chromium browser, JS-rendered, then
@@ -1100,15 +1125,15 @@ pub fn search_duckduckgo(_query: &str, _limit: usize) -> Result<Vec<SearchResult
 ///
 /// # Errors
 ///
-/// Returns an error string if the URL is invalid, the browser fails
-/// to launch (system Chromium missing AND auto-download blocked),
+/// Returns an error string if the URL is invalid, an operator-installed
+/// Chromium cannot be found or launched,
 /// navigation times out, or the rendered DOM exceeds
 /// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]
-pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
+pub fn fetch_with_browser(url: &str, browser_scratch_root: &Path) -> Result<FetchResult, String> {
     validate_url(url)?;
 
-    let browser = launch_browser_for_scraping()?;
+    let browser = launch_browser_for_scraping(browser_scratch_root)?;
 
     let tab = browser
         .new_tab()
@@ -1138,10 +1163,9 @@ pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
     // DOM through headless Chrome, so refuse anything past the configured cap.
     if html.len() > MAX_WEB_FETCH_BYTES {
         return Err(format!(
-            "Response too large: {} bytes exceeds cap {} at URL {}",
+            "Response too large: {} bytes exceeds cap {}",
             html.len(),
-            MAX_WEB_FETCH_BYTES,
-            url
+            MAX_WEB_FETCH_BYTES
         ));
     }
 
@@ -1161,7 +1185,7 @@ pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
 ///
 /// Always returns an error when the browser feature is not enabled.
 #[cfg(not(feature = "browser"))]
-pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
+pub fn fetch_with_browser(url: &str, _browser_scratch_root: &Path) -> Result<FetchResult, String> {
     validate_url(url)?;
     Err("Browser feature not enabled. Rebuild with `cargo build --features browser`".to_string())
 }
@@ -1205,16 +1229,39 @@ mod tests {
 
     #[cfg(feature = "browser")]
     #[test]
-    fn browser_profile_dir_is_project_local_and_created() {
-        let root = tempfile::tempdir().expect("temp project root");
+    fn browser_profile_dir_is_run_scratch_local_and_created() {
+        let root = tempfile::tempdir().expect("temp run scratch root");
         let dir = browser_profile_dir_under(root.path()).expect("browser profile dir");
 
-        assert_eq!(dir, root.path().join(".openclaudia/browser_profile"));
+        assert_eq!(dir, root.path().join("browser_profile"));
         assert!(dir.is_dir(), "browser profile directory must be created");
         assert!(
             dir.starts_with(root.path()),
-            "browser profile must stay inside the project root"
+            "browser profile must stay inside the run scratch root"
         );
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn browser_fallback_requires_process_only_after_direct_tier_failure() {
+        let root = tempfile::tempdir().expect("network-only run root");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .process(false)
+                .network(true)
+                .secrets(false)
+                .provider("web-fallback-capability-test")
+                .build()
+                .expect("network-only run");
+
+        let error = browser_scratch_for_fallback(&run, "simulated direct failure")
+            .expect_err("browser fallback must require process authority");
+        assert!(error.contains("simulated direct failure"), "{error}");
+        assert!(error.contains("Process"), "{error}");
     }
 
     #[test]
@@ -1666,7 +1713,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let out = read_bounded_text(response, 8 * 1024, &url).await.unwrap();
+        let out = read_bounded_text(response, 8 * 1024).await.unwrap();
         assert_eq!(out, body, "small body must be returned verbatim");
     }
 
@@ -1704,7 +1751,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let err = read_bounded_text(response, MAX_WEB_FETCH_BYTES, &url)
+        let err = read_bounded_text(response, MAX_WEB_FETCH_BYTES)
             .await
             .expect_err("11 MiB body must trip the 10 MiB cap");
         assert!(
@@ -1716,8 +1763,8 @@ mod tests {
             "error must name the cap ({MAX_WEB_FETCH_BYTES}): {err}"
         );
         assert!(
-            err.contains(&url),
-            "error must include the offending URL ({url}): {err}"
+            !err.contains(&url),
+            "error must not retain URL {url}: {err}"
         );
     }
 
@@ -1748,7 +1795,7 @@ mod tests {
             .unwrap();
         // Cap > body so the streaming accumulator drains every chunk; the test
         // proves the running total stays accurate across multiple chunks.
-        let out = read_bounded_text(response, MAX_WEB_FETCH_BYTES, &url)
+        let out = read_bounded_text(response, MAX_WEB_FETCH_BYTES)
             .await
             .unwrap();
         assert_eq!(
@@ -1793,7 +1840,7 @@ mod tests {
             "wiremock did not honor the advertised Content-Length header"
         );
         let cap: usize = 1024 * 1024; // 1 MiB cap, well under the advertised size.
-        let err = read_bounded_text(response, cap, &url)
+        let err = read_bounded_text(response, cap)
             .await
             .expect_err("pre-flight Content-Length check must reject");
         assert!(
@@ -1809,8 +1856,8 @@ mod tests {
             "pre-flight error must echo the cap ({cap}): {err}"
         );
         assert!(
-            err.contains(&url),
-            "pre-flight error must echo the URL ({url}): {err}"
+            !err.contains(&url),
+            "error must not retain URL {url}: {err}"
         );
     }
 

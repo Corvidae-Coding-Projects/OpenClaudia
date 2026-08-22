@@ -577,8 +577,20 @@ fn tool_search_max_results_schema_advertises_bounds() {
     );
     assert_eq!(
         max_results_schema.get("maximum").and_then(Value::as_u64),
-        Some(50),
+        Some(8),
         "tool_search max_results schema must advertise the enforced ceiling"
+    );
+    assert_eq!(
+        def.pointer("/function/parameters/additionalProperties")
+            .and_then(Value::as_bool),
+        Some(false),
+        "tool_search must reject unrecognized control fields"
+    );
+    assert_eq!(
+        def.pointer("/function/parameters/properties/catalog_generation/type")
+            .and_then(Value::as_str),
+        Some("string"),
+        "tool_search must advertise the generation binding field"
     );
 }
 
@@ -619,6 +631,86 @@ fn grounding_context_schema_advertises_id_and_stale_contract() {
         include_stale_schema.get("type").and_then(Value::as_str),
         Some("boolean"),
         "grounding_context include_stale schema must match runtime boolean validation"
+    );
+}
+
+#[test]
+fn canonical_task_and_todo_schemas_advertise_runtime_bounds() {
+    let create = registry()
+        .get("task_create")
+        .expect("task_create registered")
+        .definition();
+    assert_eq!(
+        create
+            .pointer("/function/parameters/properties/subject/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_SUBJECT_BYTES as u64)
+    );
+    assert_eq!(
+        create
+            .pointer("/function/parameters/properties/description/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_DESCRIPTION_BYTES as u64)
+    );
+    assert_eq!(
+        create
+            .pointer("/function/parameters/properties/active_form/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_ACTIVE_FORM_BYTES as u64)
+    );
+
+    let update = registry()
+        .get("task_update")
+        .expect("task_update registered")
+        .definition();
+    for field in [
+        "add_blocks",
+        "add_blocked_by",
+        "remove_blocks",
+        "remove_blocked_by",
+    ] {
+        let pointer = format!("/function/parameters/properties/{field}");
+        let schema = update.pointer(&pointer).expect("edge schema");
+        assert_eq!(
+            schema.get("maxItems").and_then(Value::as_u64),
+            Some(openclaudia::task_graph::MAX_TASK_EDGES as u64),
+            "{field}"
+        );
+        assert_eq!(
+            schema.pointer("/items/maxLength").and_then(Value::as_u64),
+            Some(openclaudia::task_graph::MAX_TASK_ID_BYTES as u64),
+            "{field}"
+        );
+    }
+
+    let list = registry()
+        .get("task_list")
+        .expect("task_list registered")
+        .definition();
+    assert_eq!(
+        list.pointer("/function/parameters/properties/cursor/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_PAGE_CURSOR_BYTES as u64)
+    );
+
+    let todo = registry()
+        .get("todo_write")
+        .expect("todo_write registered")
+        .definition();
+    assert_eq!(
+        todo.pointer("/function/parameters/properties/todos/maxItems")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASKS as u64)
+    );
+    assert_eq!(
+        todo.pointer("/function/parameters/properties/todos/items/properties/content/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_SUBJECT_BYTES as u64)
+    );
+    assert_eq!(
+        todo.pointer("/function/parameters/properties/todos/items/properties/activeForm/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_ACTIVE_FORM_BYTES as u64)
     );
 }
 

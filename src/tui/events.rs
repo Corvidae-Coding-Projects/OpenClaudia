@@ -55,11 +55,11 @@ pub struct ProviderSwitch {
     /// Fully resolved chat endpoint used by subsequent API turns.
     pub endpoint: String,
     /// Fully resolved request headers, including auth and custom provider headers.
-    pub headers: Vec<(String, String)>,
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Wire protocol used for subsequent API turns.
     pub wire_api: crate::pipeline::WireApi,
     /// Claude Code OAuth bearer for Anthropic subscription auth.
-    pub claude_code_token: Option<String>,
+    pub claude_code_token: Option<crate::secrets::OAuthToken>,
     /// Runtime auth used by VDD's builder-side verifier after switching.
     pub vdd_builder_auth: crate::vdd::VddProviderAuth,
     /// Existing split system prompt blocks, preserved for Anthropic cache efficiency.
@@ -100,7 +100,7 @@ pub enum AppEvent {
     /// API response completed
     ResponseDone,
     /// API error
-    ApiError(String),
+    ApiError(crate::secrets::SafeDiagnostic),
     /// The upstream API request will be retried after a transient failure.
     ApiRetry {
         kind: ApiRetryKind,
@@ -136,8 +136,8 @@ pub enum AppEvent {
         tool_args: String,
         reply: tokio::sync::oneshot::Sender<PermissionResponse>,
     },
-    /// The `ask_user_question` tool returned its `USER_QUESTION_MARKER`
-    /// payload. The TUI should display a modal that walks the user
+    /// A trusted typed `ask_user_question` follow-up reached the TUI. The UI
+    /// should display a modal that walks the user
     /// through each question, collect answers, and send back a JSON
     /// object mapping `question_text → answer(s)` via the oneshot.
     ///
@@ -177,7 +177,7 @@ pub enum AppEvent {
         model_hint: String,
     },
     /// A `/provider <name>` background resolution completed successfully.
-    ProviderSwitchReady(ProviderSwitch),
+    ProviderSwitchReady(Box<ProviderSwitch>),
     /// A `/provider <name>` background resolution failed.
     ProviderSwitchError(String),
     /// A `/model list` background fetch completed.

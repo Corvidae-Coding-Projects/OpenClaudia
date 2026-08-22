@@ -13,32 +13,22 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::{ToolFollowUp, ToolFollowUpState, ToolResult};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch_exit_plan_mode(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("exit_plan_mode", args, &mut ctx)
-        .expect("exit_plan_mode must be registered")
+    support::dispatch_tool("exit_plan_mode", args)
 }
 
-fn dispatch_enter_plan_mode() -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("enter_plan_mode", &HashMap::new(), &mut ctx)
-        .expect("enter_plan_mode must be registered")
+fn dispatch_exit_plan_mode_typed(args: &HashMap<String, Value>) -> ToolResult {
+    support::dispatch_tool_result("exit_plan_mode", args)
+}
+
+fn dispatch_enter_plan_mode_typed() -> ToolResult {
+    support::dispatch_tool_result("enter_plan_mode", &HashMap::new())
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -46,20 +36,21 @@ fn dispatch_enter_plan_mode() -> (String, bool) {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn enter_plan_mode_dispatch_returns_marker_not_error() {
-    let (text, is_err) = dispatch_enter_plan_mode();
-    assert!(!is_err, "enter_plan_mode at top-level MUST NOT error");
-    // Returns a JSON marker the REPL intercepts.
-    let v: Value = serde_json::from_str(&text).expect("valid JSON");
-    assert!(v["type"].is_string());
+fn enter_plan_mode_dispatch_returns_typed_follow_up() {
+    let result = dispatch_enter_plan_mode_typed();
+    assert!(matches!(
+        result.follow_up(),
+        ToolFollowUp::EnterPlanMode {
+            state: ToolFollowUpState::Pending
+        }
+    ));
 }
 
 #[test]
 fn enter_plan_mode_dispatch_is_idempotent_at_tool_level() {
-    // PINS DOC: tool is stateless; calling twice yields same marker.
-    let (first, _) = dispatch_enter_plan_mode();
-    let (second, _) = dispatch_enter_plan_mode();
-    assert_eq!(first, second);
+    let first = dispatch_enter_plan_mode_typed();
+    let second = dispatch_enter_plan_mode_typed();
+    assert_eq!(first.follow_up(), second.follow_up());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -68,30 +59,38 @@ fn enter_plan_mode_dispatch_is_idempotent_at_tool_level() {
 
 #[test]
 fn exit_plan_mode_with_no_args_succeeds_with_empty_allowed_prompts() {
-    let (text, is_err) = dispatch_exit_plan_mode(&HashMap::new());
-    assert!(!is_err);
-    let v: Value = serde_json::from_str(&text).expect("valid JSON");
-    let arr = v["allowed_prompts"].as_array().expect("array");
-    assert!(arr.is_empty());
+    let result = dispatch_exit_plan_mode_typed(&HashMap::new());
+    let ToolFollowUp::ExitPlanMode {
+        allowed_prompts, ..
+    } = result.follow_up()
+    else {
+        panic!("expected typed exit follow-up");
+    };
+    assert!(allowed_prompts.is_empty());
 }
 
 #[test]
 fn exit_plan_mode_with_null_allowed_prompts_succeeds_with_empty() {
     let mut args = HashMap::new();
     args.insert("allowed_prompts".to_string(), Value::Null);
-    let (text, is_err) = dispatch_exit_plan_mode(&args);
-    assert!(!is_err);
-    let v: Value = serde_json::from_str(&text).expect("valid JSON");
-    let arr = v["allowed_prompts"].as_array().expect("array");
-    assert!(arr.is_empty());
+    let result = dispatch_exit_plan_mode_typed(&args);
+    let ToolFollowUp::ExitPlanMode {
+        allowed_prompts, ..
+    } = result.follow_up()
+    else {
+        panic!("expected typed exit follow-up");
+    };
+    assert!(allowed_prompts.is_empty());
 }
 
 #[test]
 fn exit_plan_mode_with_empty_array_succeeds() {
     let mut args = HashMap::new();
     args.insert("allowed_prompts".to_string(), json!([]));
-    let (_text, is_err) = dispatch_exit_plan_mode(&args);
-    assert!(!is_err);
+    assert!(matches!(
+        dispatch_exit_plan_mode_typed(&args).follow_up(),
+        ToolFollowUp::ExitPlanMode { .. }
+    ));
 }
 
 #[test]
@@ -101,13 +100,16 @@ fn exit_plan_mode_with_well_formed_single_prompt_succeeds() {
         "allowed_prompts".to_string(),
         json!([{"tool": "bash", "prompt": "ls -la"}]),
     );
-    let (text, is_err) = dispatch_exit_plan_mode(&args);
-    assert!(!is_err);
-    let v: Value = serde_json::from_str(&text).expect("valid JSON");
-    let arr = v["allowed_prompts"].as_array().expect("array");
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["tool"], "bash");
-    assert_eq!(arr[0]["prompt"], "ls -la");
+    let result = dispatch_exit_plan_mode_typed(&args);
+    let ToolFollowUp::ExitPlanMode {
+        allowed_prompts, ..
+    } = result.follow_up()
+    else {
+        panic!("expected typed exit follow-up");
+    };
+    assert_eq!(allowed_prompts.len(), 1);
+    assert_eq!(allowed_prompts[0].tool, "bash");
+    assert_eq!(allowed_prompts[0].prompt, "ls -la");
 }
 
 #[test]
@@ -121,14 +123,17 @@ fn exit_plan_mode_with_multiple_prompts_preserves_order_and_count() {
             {"tool": "edit_file", "prompt": "y.rs"},
         ]),
     );
-    let (text, is_err) = dispatch_exit_plan_mode(&args);
-    assert!(!is_err);
-    let v: Value = serde_json::from_str(&text).expect("valid JSON");
-    let arr = v["allowed_prompts"].as_array().expect("array");
-    assert_eq!(arr.len(), 3);
-    assert_eq!(arr[0]["tool"], "bash");
-    assert_eq!(arr[1]["tool"], "read_file");
-    assert_eq!(arr[2]["tool"], "edit_file");
+    let result = dispatch_exit_plan_mode_typed(&args);
+    let ToolFollowUp::ExitPlanMode {
+        allowed_prompts, ..
+    } = result.follow_up()
+    else {
+        panic!("expected typed exit follow-up");
+    };
+    assert_eq!(allowed_prompts.len(), 3);
+    assert_eq!(allowed_prompts[0].tool, "bash");
+    assert_eq!(allowed_prompts[1].tool, "read_file");
+    assert_eq!(allowed_prompts[2].tool, "edit_file");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

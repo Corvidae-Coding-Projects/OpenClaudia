@@ -16,20 +16,15 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::effect::ToolEffect;
+use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod support;
+
 fn dispatch(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch(name, args, &mut ctx)
-        .expect("tool must be registered")
+    support::dispatch_tool(name, args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -101,8 +96,11 @@ fn list_mcp_resources_with_arbitrary_args_reports_error_no_panic() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn read_mcp_resource_no_args_reports_missing_server_before_manager_lookup() {
-    let (msg, is_err) = dispatch("read_mcp_resource", &HashMap::new());
+fn read_mcp_resource_with_uri_but_no_server_reports_missing_server_before_manager_lookup() {
+    // Supply the classification target so the handler can validate its other
+    // required field through the same canonical path used in production.
+    let args = args_with(&[("uri", json!("file:///example"))]);
+    let (msg, is_err) = dispatch("read_mcp_resource", &args);
     assert!(is_err);
     assert!(
         msg.contains("read_mcp_resource: missing required argument `server`"),
@@ -116,7 +114,7 @@ fn read_mcp_resource_with_server_but_no_uri_reports_missing_uri() {
     let (msg, is_err) = dispatch("read_mcp_resource", &args);
     assert!(is_err);
     assert!(
-        msg.contains("read_mcp_resource: missing required argument `uri`"),
+        msg.contains("Host safety") && msg.contains("Missing 'uri' argument"),
         "must validate required uri arg before manager lookup; got {msg:?}"
     );
 }
@@ -138,7 +136,7 @@ fn read_mcp_resource_rejects_non_string_uri_before_manager_lookup() {
     let (msg, is_err) = dispatch("read_mcp_resource", &args);
     assert!(is_err);
     assert!(
-        msg.contains("read_mcp_resource: Invalid 'uri' argument: expected string"),
+        msg.contains("Host safety") && msg.contains("malformed arguments") && msg.contains("'uri'"),
         "uri type error should be explicit and precede manager lookup; got {msg:?}"
     );
     assert!(
@@ -250,7 +248,7 @@ fn mcp_resource_tool_diagnostics_no_longer_claim_unimplemented_stub() {
 #[test]
 fn read_mcp_resource_argument_errors_name_the_offending_tool() {
     let (r_msg, _) = dispatch("read_mcp_resource", &HashMap::new());
-    assert!(r_msg.starts_with("read_mcp_resource"));
+    assert!(r_msg.contains("read_mcp_resource"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -264,17 +262,18 @@ fn both_mcp_resource_tools_registered_in_registry() {
 }
 
 #[test]
-fn both_handlers_have_no_permission_target_read_only_classification() {
-    // PINS DOC: read-only tools (no mutation of user state)
-    // return None from permission_target.
-    let list_handler = registry().get("list_mcp_resources").expect("registered");
-    let read_handler = registry().get("read_mcp_resource").expect("registered");
-    assert!(
-        list_handler.permission_target().is_none(),
-        "list_mcp_resources MUST be read-only (no perm target)"
-    );
-    assert!(
-        read_handler.permission_target().is_none(),
-        "read_mcp_resource MUST be read-only (no perm target)"
-    );
+fn both_mcp_resource_handlers_require_authorization() {
+    // S-016 reclassification. These tools were pinned as "read-only (no perm
+    // target)", but reading an MCP resource contacts a third-party server the
+    // host does not own and returns untrusted bytes. McpManager may also
+    // reconnect/spawn the long-lived service or mark it disconnected, so the
+    // honest ceiling is ExternalMutation. The previous pin asserted the
+    // absence of a declaration, which is indistinguishable from never having
+    // classified the tool at all (F-001).
+    for name in ["list_mcp_resources", "read_mcp_resource"] {
+        let spec = registry().get(name).expect("registered").effect_spec();
+        assert_eq!(spec.effect, ToolEffect::ExternalMutation, "{name}");
+        assert!(spec.effect.requires_authorization());
+        assert_eq!(spec.canonical, "McpRead");
+    }
 }

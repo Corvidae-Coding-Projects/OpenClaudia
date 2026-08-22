@@ -2,10 +2,13 @@ use std::fs;
 use std::path::Path;
 
 #[cfg(windows)]
-fn resolved_process_command(binary: &str) -> Result<std::process::Command, String> {
-    which::which(binary)
+fn resolved_process_command(
+    run: &openclaudia::tools::ToolRunContext,
+    binary: &str,
+) -> Result<std::process::Command, String> {
+    run.resolve_executable(binary)
         .map(std::process::Command::new)
-        .map_err(|e| format!("{binary} binary not found on PATH: {e}"))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(not(windows))]
@@ -19,14 +22,19 @@ fn editor_command_tokens(editor: &str) -> Result<Vec<String>, String> {
 }
 
 pub fn run_external_editor(
+    run: &openclaudia::tools::ToolRunContext,
     editor: &str,
     target_file: &Path,
 ) -> Result<std::process::ExitStatus, String> {
     #[cfg(windows)]
     {
         let target = target_file.to_string_lossy();
-        resolved_process_command("cmd").and_then(|mut command| {
+        resolved_process_command(run, "cmd").and_then(|mut command| {
+            command.env_clear();
+            run.environment_grants().apply_std(&mut command);
             command
+                .env("PATH", run.executable_search_path())
+                .current_dir(run.working_directory())
                 .args(["/C", editor, target.as_ref()])
                 .status()
                 .map_err(|e| e.to_string())
@@ -37,7 +45,15 @@ pub fn run_external_editor(
     {
         let mut tokens = editor_command_tokens(editor)?;
         let program = tokens.remove(0);
-        std::process::Command::new(&program)
+        let program = run
+            .resolve_executable(&program)
+            .map_err(|error| error.to_string())?;
+        let mut command = std::process::Command::new(program);
+        command.env_clear();
+        run.environment_grants().apply_std(&mut command);
+        command
+            .env("PATH", run.executable_search_path())
+            .current_dir(run.working_directory())
             .args(tokens)
             .arg(target_file)
             .status()
@@ -173,26 +189,35 @@ pub fn handle_user_questions(questions: &[serde_json::Value]) -> String {
 }
 
 /// Open external editor for composing a message
-pub fn open_external_editor() -> Option<String> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| {
-            #[cfg(windows)]
-            {
-                "notepad".to_string()
-            }
-            #[cfg(not(windows))]
-            {
-                "vim".to_string()
-            }
+pub fn open_external_editor(run: &openclaudia::tools::ToolRunContext) -> Option<String> {
+    let temp_file = run
+        .private_temp_root()
+        .join(format!("openclaudia_{}.txt", uuid::Uuid::new_v4()));
+
+    let configured = run
+        .environment_grants()
+        .with_value("VISUAL", |editor| {
+            run_external_editor(run, editor, &temp_file)
+        })
+        .or_else(|| {
+            run.environment_grants().with_value("EDITOR", |editor| {
+                run_external_editor(run, editor, &temp_file)
+            })
         });
-
-    let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join(format!("openclaudia_{}.txt", uuid::Uuid::new_v4()));
-
-    println!("\nOpening {editor}...");
-
-    let status = run_external_editor(&editor, &temp_file);
+    let status = configured.map_or_else(
+        || {
+            #[cfg(windows)]
+            let editor = "notepad";
+            #[cfg(not(windows))]
+            let editor = "vim";
+            println!("\nOpening {editor}...");
+            run_external_editor(run, editor, &temp_file)
+        },
+        |status| {
+            println!("\nOpening configured editor...");
+            status
+        },
+    );
 
     match status {
         Ok(s) if s.success() => fs::read_to_string(&temp_file).map_or_else(
@@ -217,14 +242,15 @@ pub fn open_external_editor() -> Option<String> {
             None
         }
         Err(e) => {
-            eprintln!("Failed to open editor '{editor}': {e}\n");
+            let safe = run.environment_grants().sanitize_diagnostic(&e);
+            eprintln!("Failed to open editor: {safe}\n");
             None
         }
     }
 }
 
-/// Expand @file references in input to include file contents
-pub fn expand_file_references(input: &str) -> String {
+/// Expand `@file` references through the exact run filesystem capability.
+pub fn expand_file_references(run: &openclaudia::tools::ToolRunContext, input: &str) -> String {
     use regex::Regex;
 
     let Ok(re) = Regex::new(r#"@"([^"]+)"|@(\S+)"#) else {
@@ -233,8 +259,6 @@ pub fn expand_file_references(input: &str) -> String {
 
     let mut result = input.to_string();
     let mut replacements = Vec::new();
-
-    let cwd = std::env::current_dir().unwrap_or_default();
 
     for cap in re.captures_iter(input) {
         let Some(full_match) = cap.get(0) else {
@@ -246,52 +270,20 @@ pub fn expand_file_references(input: &str) -> String {
         };
         let raw_path = raw_path.as_str();
 
-        // Resolve and validate path — reject traversal attempts
-        let resolved = if std::path::Path::new(raw_path).is_absolute() {
-            std::path::PathBuf::from(raw_path)
-        } else {
-            cwd.join(raw_path)
-        };
-
-        if resolved
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
-            replacements.push((
-                full_match.to_string(),
-                format!("[Path traversal blocked: {raw_path}]"),
-            ));
-            continue;
-        }
-
-        match fs::canonicalize(&resolved) {
-            Ok(canonical) if canonical.starts_with(&cwd) => match fs::read_to_string(&canonical) {
-                Ok(content) => {
-                    let file_context = format!(
-                        "\n<file path=\"{}\">\n{}\n</file>\n",
-                        canonical.display(),
-                        content.trim()
-                    );
-                    replacements.push((full_match.to_string(), file_context));
-                }
-                Err(e) => {
-                    eprintln!("Warning: Could not read {raw_path}: {e}");
-                    replacements.push((
-                        full_match.to_string(),
-                        format!("[Cannot read {raw_path}: {e}]"),
-                    ));
-                }
-            },
-            Ok(_) => {
-                replacements.push((
-                    full_match.to_string(),
-                    format!("[File outside project directory: {raw_path}]"),
-                ));
+        match openclaudia::tools::read_capability_text_attachment(run, raw_path) {
+            Ok((resolved, content)) => {
+                let file_context = format!(
+                    "\n<file path=\"{}\">\n{}\n</file>\n",
+                    resolved.display(),
+                    content.trim()
+                );
+                replacements.push((full_match.to_string(), file_context));
             }
-            Err(_) => {
+            Err(error) => {
+                eprintln!("Warning: Could not read {raw_path}: {error}");
                 replacements.push((
                     full_match.to_string(),
-                    format!("[File not found: {raw_path}]"),
+                    format!("[Cannot read {raw_path}: {error}]"),
                 ));
             }
         }
@@ -308,6 +300,38 @@ pub fn expand_file_references(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn attachment_run(root: &Path) -> std::sync::Arc<openclaudia::tools::ToolRunContext> {
+        openclaudia::tools::ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+            .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("repl-input-test")
+            .build()
+            .expect("attachment run")
+    }
+
+    #[test]
+    fn file_references_are_bound_to_the_exact_run_root() {
+        let own = tempfile::TempDir::new().expect("own root");
+        let foreign = tempfile::TempDir::new().expect("foreign root");
+        fs::write(own.path().join("own.txt"), "OWN_ATTACHMENT").expect("own fixture");
+        fs::write(foreign.path().join("foreign.txt"), "FOREIGN_SECRET").expect("foreign fixture");
+        let run = attachment_run(own.path());
+
+        let own_expansion = expand_file_references(&run, "inspect @own.txt");
+        assert!(own_expansion.contains("OWN_ATTACHMENT"));
+
+        let foreign_reference =
+            format!("inspect @{}", foreign.path().join("foreign.txt").display());
+        let foreign_expansion = expand_file_references(&run, &foreign_reference);
+        assert!(!foreign_expansion.contains("FOREIGN_SECRET"));
+        assert!(foreign_expansion.contains("Cannot read"));
+    }
+
     #[test]
     fn repl_editor_windows_shell_uses_resolved_cmd() {
         let source = include_str!("input.rs");
@@ -322,8 +346,8 @@ mod tests {
             "external editor wrapper must not invoke bare cmd"
         );
         assert!(
-            production.contains("which::which(binary)"),
-            "external editor wrapper must resolve cmd through the Rust resolver"
+            production.contains("run.resolve_executable(binary)"),
+            "external editor wrapper must resolve cmd through the immutable run"
         );
         assert!(
             !production.contains("Command::new(&editor)")

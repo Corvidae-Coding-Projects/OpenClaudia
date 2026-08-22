@@ -38,6 +38,9 @@ pub struct SessionState {
     pub conversation: Conversation,
     pub ui: UiState,
     pub modes: ModesState,
+    /// Live invocation authority. This field is process-local and is never
+    /// serialized into a conversation/session document.
+    #[serde(skip)]
     pub permissions: PermissionsState,
     pub budgets: BudgetsState,
     #[serde(default)]
@@ -107,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_is_lossless() {
+    fn serde_roundtrip_preserves_non_authority_state() {
         let mut state = SessionState::new(std::path::PathBuf::from("/x"));
         state.conversation.messages.push(serde_json::json!({
             "role": "user",
@@ -124,5 +127,21 @@ mod tests {
         assert_eq!(round.budgets.effort_level, state.budgets.effort_level);
         assert!(round.ui.plan_mode.has_exited);
         assert_eq!(round.ide.active_file, state.ide.active_file);
+    }
+
+    #[test]
+    fn serialized_state_omits_live_permission_authority() {
+        let mut state = SessionState::new(std::path::PathBuf::from("/x"));
+        state.permissions.bypass_mode = true;
+        state.permissions.trust_accepted = true;
+        state.permissions.persistence_disabled = true;
+
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert!(encoded.get("permissions").is_none());
+
+        let decoded: SessionState = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.permissions.bypass_mode);
+        assert!(!decoded.permissions.trust_accepted);
+        assert!(!decoded.permissions.persistence_disabled);
     }
 }

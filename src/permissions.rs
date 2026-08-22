@@ -2,18 +2,28 @@
 //!
 //! Provides glob-pattern-based permission rules that control tool execution:
 //! - Per-tool rules with glob patterns matching commands or file paths
-//! - Three decision levels: Allow, Deny, `AlwaysAllow` (persisted across sessions)
-//! - Configurable defaults and persistence to `.openclaudia/permissions.json`
+//! - Three compatibility rule decisions: Allow, Deny, and `AlwaysAllow`
+//! - Tool-scoped defaults plus exact receipts in trusted per-user state
 //!
-//! Check order: always-allow rules -> session rules -> config `default_allow` -> Deny (prompt user)
+//! Every call is classified first. Unclassifiable calls deny; classified calls
+//! then pass through hard safety, explicit denials, effect policy, scoped
+//! approvals, and finally the caller's prompt/default-deny behavior.
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use tracing::{debug, info, warn};
+
+mod receipts;
+pub(crate) use receipts::{approval_workspace_digest, HostApprovalEvidence};
+use receipts::{digest_text, ApprovalStore};
+pub use receipts::{
+    inspect_permission_store, trusted_permission_store_path, ApprovalBinding, ApprovalProvenance,
+    ConsumedExecutionPermit, ExecutionPermit, LocalApprovalCache, LocalApprovalDecision,
+    PermissionStoreSummary, APPROVAL_RECEIPT_SCHEMA_VERSION,
+};
 
 /// Global cache for compiled glob-to-regex patterns.
 /// Avoids recompiling the same glob pattern into a `Regex` on every permission check.
@@ -28,7 +38,10 @@ pub enum PermissionDecision {
     Allow,
     /// Deny this specific invocation
     Deny,
-    /// Always allow this pattern (persisted across sessions)
+    /// Reuse this pattern for the current in-memory policy scope.
+    ///
+    /// Durable approval authority is represented by exact, expiring approval
+    /// receipts instead of serializing this broad compatibility rule.
     AlwaysAllow,
 }
 
@@ -39,7 +52,7 @@ pub struct PermissionRule {
     pub tool: String,
     /// Glob-style pattern matched against the tool's primary argument.
     /// For Bash: matched against the command string.
-    /// For Edit/Write: matched against the `file_path`.
+    /// For Edit/Write: matched against the canonicalized `path` target.
     pub pattern: String,
     /// The decision to apply when this rule matches.
     pub decision: PermissionDecision,
@@ -99,6 +112,18 @@ fn parse_allowed_tool_spec(spec: &str) -> (&str, Option<&str>) {
     (tool, Some(pattern))
 }
 
+fn parse_default_policy_rule(configured: &str) -> (Option<&'static str>, &str) {
+    let (tool, pattern) = parse_allowed_tool_spec(configured);
+    match pattern {
+        Some(pattern) if !pattern.is_empty() => {
+            let canonical = canonical_permission_tool(tool)
+                .or_else(|| crate::tools::effect::lookup(tool).map(|(_, spec)| spec.canonical));
+            canonical.map_or((None, configured), |tool| (Some(tool), pattern))
+        }
+        _ => (None, configured),
+    }
+}
+
 fn canonical_permission_tool(tool: &str) -> Option<&'static str> {
     let normalized: String = tool
         .chars()
@@ -113,6 +138,13 @@ fn canonical_permission_tool(tool: &str) -> Option<&'static str> {
         "webfetch" => Some("WebFetch"),
         _ => None,
     }
+}
+
+fn requires_fresh_host_approval(canonical_tool: &str) -> bool {
+    matches!(
+        canonical_tool,
+        "MemoryReview" | "MemoryExport" | "MemoryImport"
+    )
 }
 
 fn normalize_bash_allowed_tool_pattern(pattern: &str) -> String {
@@ -174,6 +206,42 @@ pub enum CheckResult {
     NeedsPrompt { tool: String, target: String },
 }
 
+/// Call-bound authorization result used by interactive frontends.
+///
+/// An allowed result carries an opaque, single-use permit. The permit is the
+/// only way an outer prompt may authorize unchecked execution; callers cannot
+/// replace it with a Boolean or serialize it into session state.
+#[derive(Debug)]
+pub enum AuthorizationResult {
+    /// The exact invocation may proceed once.
+    Allowed(ExecutionPermit),
+    /// Hard policy or an explicit denial rejected the invocation.
+    Denied(String),
+    /// No approval or policy default matched; the caller must ask the user.
+    NeedsPrompt { tool: String, target: String },
+}
+
+fn parse_tool_call_arguments(
+    tool_call: &crate::tools::ToolCall,
+) -> Result<serde_json::Value, String> {
+    let value = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).map_err(
+        |error| {
+            format!(
+                "Invalid tool arguments JSON for '{}': {error}",
+                tool_call.function.name
+            )
+        },
+    )?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(format!(
+            "Invalid tool arguments JSON for '{}': expected an object",
+            tool_call.function.name
+        ))
+    }
+}
+
 /// Maximum number of *consecutive* denials before the agent should abort.
 ///
 /// Parity target: CC `denialTracking.ts` `DENIAL_LIMITS.maxConsecutive`.
@@ -202,112 +270,30 @@ pub enum EscalationState {
     ShouldAbort,
 }
 
-/// Bayesian-style auto-allow score for `(tool_name, args)` (crosslink #571).
+/// Typed auto-allow score for `(tool_name, args)` (S-020; F-045).
 ///
-/// Pure function — no manager state required, no I/O. Exposed at the
-/// module level so callers (auto-mode glue, tests, future telemetry)
-/// can read the score without going through a manager instance.
-///
-/// Returns a number in `[0.0, 1.0]`:
-///   * `1.0` — definitely safe (read-only tool category).
-///   * `≥ 0.9` — high confidence (read-only `bash` verbs like `ls`,
-///     `pwd`, `cat`, `git status`).
-///   * `~0.6` — moderate (edits to files inside the project tree).
-///   * `0.3` — default; caller should not auto-allow.
-///   * `0.0` — explicit unsafety (destructive bash tokens or dangerous
-///     shell constructs).
-///
-/// Heuristic only — pairs with `check_auto_allow` which gates on a
-/// caller-supplied threshold and also consults explicit deny rules.
+/// This compatibility API deliberately has only two outcomes. A concrete
+/// invocation that resolves through the mandatory tool registry to
+/// [`crate::tools::effect::ToolEffect::ReadOnly`] scores `1.0`; every
+/// effectful, malformed, or unknown invocation scores `0.0`. In particular,
+/// arbitrary Bash text is never parsed or guessed into a read-only effect.
+/// Callers that need filesystem inspection should use the typed `read_file`,
+/// `list_files`, `glob`, or `grep` tools instead of a shell string.
 #[must_use]
 pub fn auto_allow_score(tool_name: &str, tool_args: &serde_json::Value) -> f32 {
-    // Read-only tools (no permission target) → unconditionally safe.
-    let target = crate::tools::registry::registry()
-        .get(tool_name)
-        .and_then(crate::tools::ToolHandler::permission_target);
-    let Some(target) = target else {
-        return 1.0;
+    // S-016/F-001: an unclassifiable call scores 0.0, not 1.0. Previously an
+    // unknown tool — or any registered handler that had not overridden
+    // `permission_target` — returned `None` here and was scored as
+    // unconditionally safe, which is the fail-open the finding records.
+    let Ok(resolved) = crate::tools::effect::resolve_for_call(tool_name, tool_args) else {
+        return 0.0;
     };
 
-    let arg_val = tool_args
-        .get(target.arg_key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-
-    match target.canonical {
-        "Bash" => bash_auto_allow_score(arg_val),
-        "Edit" | "Write" => edit_auto_allow_score(arg_val),
-        _ => 0.3,
+    if resolved.effect.requires_authorization() {
+        0.0
+    } else {
+        1.0
     }
-}
-
-fn bash_auto_allow_score(cmd: &str) -> f32 {
-    // Destructive tokens veto first.
-    const DESTRUCTIVE: &[&str] = &[
-        "rm -rf",
-        "rm -fr",
-        "chmod 777",
-        "sudo ",
-        "dd ",
-        "mkfs",
-        ":>",
-        ">/dev/",
-        "> /dev/",
-        "curl ",
-        "wget ",
-        "shutdown",
-        "reboot",
-    ];
-    const SAFE_PREFIXES: &[&str] = &[
-        "ls",
-        "pwd",
-        "cat ",
-        "echo ",
-        "head ",
-        "tail ",
-        "wc ",
-        "git status",
-        "git diff",
-        "git log",
-        "git branch",
-        "git remote",
-        "git show",
-    ];
-    let lower = cmd.trim_start();
-    if crate::tools::dangerous_shell_construct(lower).is_some() {
-        return 0.0;
-    }
-    for tok in DESTRUCTIVE {
-        if lower.contains(tok) {
-            return 0.0;
-        }
-    }
-    for prefix in SAFE_PREFIXES {
-        if lower.starts_with(prefix) {
-            return 0.95;
-        }
-    }
-    0.3
-}
-
-fn edit_auto_allow_score(path: &str) -> f32 {
-    // System-path edits are clearly unsafe.
-    const UNSAFE_PREFIXES: &[&str] = &["/etc/", "/usr/", "/bin/", "/boot/", "/dev/", "/proc/"];
-    for p in UNSAFE_PREFIXES {
-        if path.starts_with(p) {
-            return 0.0;
-        }
-    }
-    // Project-tree edits get moderate confidence.
-    if path.starts_with("src/")
-        || path.starts_with("tests/")
-        || path.starts_with("examples/")
-        || path.starts_with("./")
-        || !path.starts_with('/')
-    {
-        return 0.6;
-    }
-    0.3
 }
 
 /// Denial-tracking newtype — crosslink #577.
@@ -466,12 +452,15 @@ pub enum PermissionContext {
 /// Manages permission rules for tool execution.
 ///
 /// Rules are checked in priority order:
-/// 1. Persisted always-allow rules (loaded from disk)
-/// 2. Session rules (added at runtime via user responses)
-/// 3. Config-level `default_allow` patterns
-/// 4. If nothing matches, returns `NeedsPrompt`
+/// 1. Current explicit deny rules
+/// 2. Exact, unexpired approval receipts
+/// 3. Effect-level policy (read-only/session-local defaults)
+/// 4. Tool-scoped config policy and compatibility session rules
+/// 5. If nothing matches, returns `NeedsPrompt`
 pub struct PermissionManager {
-    /// Persisted rules (`AlwaysAllow`) loaded from `.openclaudia/permissions.json`
+    /// Persisted explicit denials loaded from trusted host state. Legacy broad
+    /// allows are deliberately not migrated because they cannot be narrowed
+    /// without inventing actor/resource/generation scope.
     persisted_rules: Vec<PermissionRule>,
     /// Transient session rules (Allow/Deny added during this session)
     session_rules: Vec<PermissionRule>,
@@ -479,8 +468,8 @@ pub struct PermissionManager {
     default_allow: Vec<String>,
     /// `WebFetch` hosts that bypass the interactive prompt.
     web_fetch_preapproved_domains: Vec<String>,
-    /// Path to the persistence file
-    persist_path: PathBuf,
+    /// Exact reusable approvals, exact denials, and capability generation.
+    approval_store: ApprovalStore,
     /// Whether the permission system is enabled
     enabled: bool,
     /// Consecutive denial counter — resets to 0 on any allowed outcome.
@@ -489,17 +478,9 @@ pub struct PermissionManager {
     /// Total denial counter — never resets within a session.
     /// Parity: CC `DenialTrackingState.totalDenials`.
     total_denials: u32,
-    /// Tool names the user has selected "Always allow" for in the interactive
-    /// TUI permission prompt. Lives for the entire `PermissionManager` lifetime
-    /// (one per session), so the decision survives across API turns and
-    /// agentic-loop iterations. See crosslink #724.
-    tui_always_allowed: Mutex<HashSet<String>>,
-    /// Tool names the user has selected "Always deny" for in the interactive
-    /// TUI permission prompt. Same scope as `tui_always_allowed`. See crosslink #724.
-    tui_always_denied: Mutex<HashSet<String>>,
 }
 
-struct HardSafetyDenial {
+struct UnrestrictedSafetyDenial {
     reason: String,
     target: String,
 }
@@ -530,13 +511,38 @@ impl PermissionManager {
         default_allow: Vec<String>,
         web_fetch_preapproved_domains: Vec<String>,
     ) -> Self {
-        let persist_path = persist_path.into();
-        let persisted_rules = Self::load_persisted_rules(&persist_path);
+        Self::new_with_binding_and_web_fetch_preapproved(
+            persist_path,
+            enabled,
+            default_allow,
+            web_fetch_preapproved_domains,
+            ApprovalBinding::current(),
+        )
+    }
+
+    /// Create a manager with an explicit actor/workspace binding.
+    ///
+    /// Production composition roots normally use [`Self::trusted`]. This
+    /// constructor exists for hosts that already own an authenticated binding
+    /// and for deterministic receipt tests.
+    pub fn new_with_binding_and_web_fetch_preapproved(
+        persist_path: impl Into<PathBuf>,
+        enabled: bool,
+        default_allow: Vec<String>,
+        web_fetch_preapproved_domains: Vec<String>,
+        binding: ApprovalBinding,
+    ) -> Self {
+        let approval_store = ApprovalStore::load(persist_path.into(), binding);
+        let persisted_rules = approval_store.persisted_denials();
 
         // Pre-validate default_allow patterns at load time so invalid globs fail fast
-        for pattern in &default_allow {
+        for configured in &default_allow {
+            let (_, pattern) = parse_default_policy_rule(configured);
             if Self::glob_to_regex_cached(pattern).is_none() {
-                warn!(pattern = %pattern, "Invalid default_allow glob pattern will never match");
+                warn!(
+                    pattern_digest = %digest_text(pattern),
+                    "Invalid default_allow glob pattern will never match"
+                );
             }
         }
 
@@ -545,18 +551,49 @@ impl PermissionManager {
             session_rules: Vec::new(),
             default_allow,
             web_fetch_preapproved_domains,
-            persist_path,
+            approval_store,
             enabled,
             consecutive_denials: 0,
             total_denials: 0,
-            tui_always_allowed: Mutex::new(HashSet::new()),
-            tui_always_denied: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Construct a production manager rooted in trusted per-user host state.
+    #[must_use]
+    pub fn trusted(
+        enabled: bool,
+        default_allow: Vec<String>,
+        web_fetch_preapproved_domains: Vec<String>,
+    ) -> Self {
+        Self::new_with_web_fetch_preapproved(
+            trusted_permission_store_path(),
+            enabled,
+            default_allow,
+            web_fetch_preapproved_domains,
+        )
+    }
+
+    /// Construct a production manager bound to one exact run generation.
+    #[must_use]
+    pub fn trusted_for_run(
+        run: &crate::tools::ToolRunContext,
+        enabled: bool,
+        default_allow: Vec<String>,
+        web_fetch_preapproved_domains: Vec<String>,
+    ) -> Self {
+        Self::new_with_binding_and_web_fetch_preapproved(
+            trusted_permission_store_path(),
+            enabled,
+            default_allow,
+            web_fetch_preapproved_domains,
+            ApprovalBinding::for_run(run),
+        )
     }
 
     /// Build an explicitly unrestricted manager that skips prompts and rules.
     ///
-    /// Hard safety checks still apply: catastrophic bash commands, dangerous
+    /// Classification and hard safety checks still apply: unknown tools,
+    /// malformed typed operations, catastrophic bash commands, dangerous
     /// shell constructs, prompt-injected sandbox escalation, and writes to
     /// protected control files are denied before the `enabled=false` shortcut
     /// fires.
@@ -569,32 +606,69 @@ impl PermissionManager {
     /// missing argument. See crosslink #460.
     #[must_use]
     pub fn unrestricted() -> Self {
-        // `enabled = false` short-circuits `check()` to `CheckResult::Allowed`.
+        // `enabled = false` suppresses user rules/prompts after mandatory
+        // effect classification and hard safety have both run.
         Self {
             persisted_rules: Vec::new(),
             session_rules: Vec::new(),
             default_allow: Vec::new(),
             web_fetch_preapproved_domains: Vec::new(),
-            persist_path: PathBuf::new(),
+            approval_store: ApprovalStore::empty(ApprovalBinding::current()),
             enabled: false,
             consecutive_denials: 0,
             total_denials: 0,
-            tui_always_allowed: Mutex::new(HashSet::new()),
-            tui_always_denied: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Check whether a tool invocation is allowed.
-    ///
-    /// - `tool_name`: e.g. "bash", "`edit_file`", "`write_file`"
-    /// - `tool_args`: the parsed arguments map from the tool call
-    ///
-    /// Returns `Allowed`, `Denied`, or `NeedsPrompt`.
-    pub fn check(&self, tool_name: &str, tool_args: &serde_json::Value) -> CheckResult {
-        if let Some(denial) = Self::hard_safety_denial(tool_name, tool_args) {
-            Self::log_permission_decision("denied", "hard_safety", tool_name, &denial.target, "");
-            return CheckResult::Denied(denial.reason);
+    /// Build an unrestricted manager whose receipt identity is still bound to
+    /// one exact run. Mandatory host-safety gates remain active.
+    #[must_use]
+    pub fn unrestricted_for_run(run: &crate::tools::ToolRunContext) -> Self {
+        Self {
+            persisted_rules: Vec::new(),
+            session_rules: Vec::new(),
+            default_allow: Vec::new(),
+            web_fetch_preapproved_domains: Vec::new(),
+            approval_store: ApprovalStore::empty(ApprovalBinding::for_run(run)),
+            enabled: false,
+            consecutive_denials: 0,
+            total_denials: 0,
         }
+    }
+
+    fn classify_for_policy(
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+    ) -> Result<crate::tools::effect::ResolvedEffect, CheckResult> {
+        crate::tools::host_safety::HostSafetyPolicy::enforce(tool_name, tool_args).map_err(
+            |reason| {
+                warn!(tool = %tool_name, "Host safety denied tool invocation");
+                CheckResult::Denied(format!("Host safety: {reason}"))
+            },
+        )
+    }
+
+    fn matching_explicit_deny<'a>(
+        &'a self,
+        canonical_tool: &str,
+        target: &str,
+    ) -> Option<&'a PermissionRule> {
+        self.session_rules
+            .iter()
+            .chain(self.persisted_rules.iter())
+            .find(|rule| {
+                rule.decision == PermissionDecision::Deny
+                    && Self::rule_matches(rule, canonical_tool, target)
+            })
+    }
+
+    fn classify_after_non_bypassable_denials(
+        &self,
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+        session_id: Option<&str>,
+    ) -> Result<crate::tools::effect::ResolvedEffect, CheckResult> {
+        let resolved = Self::classify_for_policy(tool_name, tool_args)?;
 
         if !self.enabled {
             if let Some(denial) =
@@ -607,41 +681,89 @@ impl PermissionManager {
                     &denial.target,
                     "",
                 );
-                return CheckResult::Denied(denial.reason);
+                return Err(CheckResult::Denied(denial.reason));
             }
+        }
+
+        if let Some(rule) = self.matching_explicit_deny(&resolved.canonical, &resolved.target) {
+            Self::log_permission_decision(
+                "denied",
+                "explicit_deny_rule",
+                &resolved.canonical,
+                &resolved.target,
+                &rule.pattern,
+            );
+            return Err(CheckResult::Denied(format!(
+                "Denied by rule: {} on pattern '{}'",
+                resolved.canonical, rule.pattern
+            )));
+        }
+
+        let scope = self
+            .approval_store
+            .scope_for(&resolved, tool_args, session_id);
+        if self.approval_store.exact_denial_matches(&scope) {
+            Self::log_permission_decision(
+                "denied",
+                "exact_denial_receipt",
+                &resolved.canonical,
+                &resolved.target,
+                "",
+            );
+            return Err(CheckResult::Denied(format!(
+                "Denied by exact approval-scope denial for {}",
+                resolved.canonical
+            )));
+        }
+
+        Ok(resolved)
+    }
+
+    fn policy_default_outcome(
+        &self,
+        resolved: crate::tools::effect::ResolvedEffect,
+        transient_allow_rules: &[PermissionRule],
+    ) -> CheckResult {
+        let canonical_tool = resolved.canonical;
+        let target = resolved.target;
+
+        if !self.enabled {
+            Self::log_permission_decision(
+                "allowed",
+                "explicit_unrestricted_policy",
+                &canonical_tool,
+                &target,
+                "",
+            );
             return CheckResult::Allowed;
         }
 
-        // Determine the canonical tool category and the target string to match against
-        let (canonical_tool, target) = match Self::extract_target(tool_name, tool_args) {
-            Some(Ok(pair)) => pair,
-            Some(Err(tool)) => {
-                // Tool requires permission but args are malformed (e.g. command=123)
-                warn!(
-                    tool = %tool,
-                    "Malformed tool args: required argument is not a string — denying"
-                );
-                return CheckResult::Denied(format!(
-                    "Denied: {tool} tool call has malformed arguments (expected string, got wrong type)"
-                ));
-            }
-            None => {
-                // Tools without a matchable target are always allowed
-                return CheckResult::Allowed;
-            }
-        };
+        if !resolved.effect.requires_authorization() {
+            return CheckResult::Allowed;
+        }
 
-        // Permission-decision audit logging (crosslink #870) — see
-        // `log_permission_decision` for the structured event shape.
+        if resolved.effect == crate::tools::effect::ToolEffect::SessionMutation {
+            Self::log_permission_decision(
+                "allowed",
+                "session_mutation_default",
+                &canonical_tool,
+                &target,
+                "",
+            );
+            return CheckResult::Allowed;
+        }
 
-        // 1. Check persisted always-allow rules
-        for rule in &self.persisted_rules {
-            if rule.decision == PermissionDecision::AlwaysAllow
-                && Self::rule_matches(rule, &canonical_tool, &target)
+        // Session Allow rules are compatibility policy inputs, not approval
+        // receipts. They remain below every denial and exact receipt.
+        for rule in &self.session_rules {
+            if matches!(
+                rule.decision,
+                PermissionDecision::Allow | PermissionDecision::AlwaysAllow
+            ) && Self::rule_matches(rule, &canonical_tool, &target)
             {
                 Self::log_permission_decision(
                     "allowed",
-                    "persisted_always_allow",
+                    "session_policy_rule",
                     &canonical_tool,
                     &target,
                     &rule.pattern,
@@ -650,45 +772,34 @@ impl PermissionManager {
             }
         }
 
-        // 2. Check session rules
-        for rule in &self.session_rules {
-            if Self::rule_matches(rule, &canonical_tool, &target) {
-                match &rule.decision {
-                    PermissionDecision::Allow | PermissionDecision::AlwaysAllow => {
-                        Self::log_permission_decision(
-                            "allowed",
-                            "session_rule",
-                            &canonical_tool,
-                            &target,
-                            &rule.pattern,
-                        );
-                        return CheckResult::Allowed;
-                    }
-                    PermissionDecision::Deny => {
-                        Self::log_permission_decision(
-                            "denied",
-                            "session_rule",
-                            &canonical_tool,
-                            &target,
-                            &rule.pattern,
-                        );
-                        return CheckResult::Denied(format!(
-                            "Denied by session rule: {} on pattern '{}'",
-                            canonical_tool, rule.pattern
-                        ));
-                    }
-                }
+        for rule in transient_allow_rules {
+            if matches!(
+                rule.decision,
+                PermissionDecision::Allow | PermissionDecision::AlwaysAllow
+            ) && Self::rule_matches(rule, &canonical_tool, &target)
+            {
+                Self::log_permission_decision(
+                    "allowed",
+                    "transient_allow_policy",
+                    &canonical_tool,
+                    &target,
+                    &rule.pattern,
+                );
+                return CheckResult::Allowed;
             }
         }
 
-        // 3. CC-parity web_fetch prompt bypass for known documentation hosts.
         if self.web_fetch_preapproved_allowed(&canonical_tool, &target) {
             return CheckResult::Allowed;
         }
 
-        // 4. Check config default_allow patterns
-        for pattern in &self.default_allow {
-            if Self::glob_matches(pattern, &target) {
+        // Legacy unqualified config entries are constrained to Bash. New
+        // entries can name an exact canonical tool as `Tool(pattern)`.
+        for configured in &self.default_allow {
+            let (tool_scope, pattern) = parse_default_policy_rule(configured);
+            let tool_matches =
+                tool_scope.map_or_else(|| canonical_tool == "Bash", |tool| tool == canonical_tool);
+            if tool_matches && Self::glob_matches(pattern, &target) {
                 Self::log_permission_decision(
                     "allowed",
                     "default_allow_config",
@@ -700,11 +811,28 @@ impl PermissionManager {
             }
         }
 
-        // 5. No rule matched -- caller should prompt the user
         CheckResult::NeedsPrompt {
             tool: canonical_tool,
             target,
         }
+    }
+
+    /// Check whether policy alone allows a tool invocation.
+    ///
+    /// - `tool_name`: e.g. "bash", "`edit_file`", "`write_file`"
+    /// - `tool_args`: the parsed arguments map from the tool call
+    ///
+    /// Returns `Allowed`, `Denied`, or `NeedsPrompt`. This legacy projection
+    /// deliberately does not inspect or consume approval receipts because it
+    /// cannot return the execution permit required at dispatch. Callers that
+    /// need receipt-aware authorization must use [`Self::authorize_tool_call`].
+    pub fn check(&self, tool_name: &str, tool_args: &serde_json::Value) -> CheckResult {
+        let resolved = match self.classify_after_non_bypassable_denials(tool_name, tool_args, None)
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return denied,
+        };
+        self.policy_default_outcome(resolved, &[])
     }
 
     /// Check a tool invocation with additional turn-scoped allow rules.
@@ -719,29 +847,283 @@ impl PermissionManager {
         tool_args: &serde_json::Value,
         transient_allow_rules: &[PermissionRule],
     ) -> CheckResult {
-        match self.check(tool_name, tool_args) {
-            CheckResult::NeedsPrompt { tool, target } => {
-                for rule in transient_allow_rules {
-                    if matches!(
-                        rule.decision,
-                        PermissionDecision::Allow | PermissionDecision::AlwaysAllow
-                    ) && Self::rule_matches(rule, &tool, &target)
-                    {
-                        Self::log_permission_decision(
-                            "allowed",
-                            "transient_allow_rule",
-                            &tool,
-                            &target,
-                            &rule.pattern,
-                        );
-                        return CheckResult::Allowed;
-                    }
-                }
+        let resolved = match self.classify_after_non_bypassable_denials(tool_name, tool_args, None)
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return denied,
+        };
+        self.policy_default_outcome(resolved, transient_allow_rules)
+    }
 
-                CheckResult::NeedsPrompt { tool, target }
+    /// Authorize one exact tool call and return an opaque one-use permit.
+    ///
+    /// Precedence is deterministic: hard safety, broad and exact explicit
+    /// denials, an exact reusable approval receipt, then policy defaults. A
+    /// receipt is consumed before the permit is returned and the executor
+    /// independently consumes that permit before dispatch.
+    pub fn authorize_tool_call(
+        &self,
+        tool_call: &crate::tools::ToolCall,
+        session_id: Option<&str>,
+    ) -> AuthorizationResult {
+        self.authorize_tool_call_with_transient_rules(tool_call, session_id, &[])
+    }
+
+    /// Receipt-aware authorization with additional turn-scoped policy rules.
+    pub fn authorize_tool_call_with_transient_rules(
+        &self,
+        tool_call: &crate::tools::ToolCall,
+        session_id: Option<&str>,
+        transient_allow_rules: &[PermissionRule],
+    ) -> AuthorizationResult {
+        let arguments = match parse_tool_call_arguments(tool_call) {
+            Ok(arguments) => arguments,
+            Err(reason) => return AuthorizationResult::Denied(reason),
+        };
+        let resolved = match self.classify_after_non_bypassable_denials(
+            &tool_call.function.name,
+            &arguments,
+            session_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(CheckResult::Denied(reason)) => return AuthorizationResult::Denied(reason),
+            Err(other) => {
+                return AuthorizationResult::Denied(format!(
+                    "permission denial classifier returned an invalid outcome: {other:?}"
+                ));
             }
-            other => other,
+        };
+        let scope = self
+            .approval_store
+            .scope_for(&resolved, &arguments, session_id);
+        if requires_fresh_host_approval(&resolved.canonical) {
+            return AuthorizationResult::NeedsPrompt {
+                tool: resolved.canonical,
+                target: resolved.target,
+            };
         }
+        match self.approval_store.take_approval(&scope, &tool_call.id) {
+            Ok(Some(permit)) => {
+                Self::log_permission_decision(
+                    "allowed",
+                    "scoped_approval_receipt",
+                    &resolved.canonical,
+                    &resolved.target,
+                    "",
+                );
+                return AuthorizationResult::Allowed(permit);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return AuthorizationResult::Denied(format!(
+                    "Permission approval store could not consume a receipt: {error}"
+                ));
+            }
+        }
+
+        match self.policy_default_outcome(resolved, transient_allow_rules) {
+            CheckResult::Allowed => AuthorizationResult::Allowed(self.approval_store.mint_once(
+                scope,
+                &tool_call.id,
+                ApprovalProvenance::PolicyEvaluation,
+            )),
+            CheckResult::Denied(reason) => AuthorizationResult::Denied(reason),
+            CheckResult::NeedsPrompt { tool, target } => {
+                AuthorizationResult::NeedsPrompt { tool, target }
+            }
+        }
+    }
+
+    /// Grant the current exact call once after an interactive decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call is malformed, unclassified, explicitly
+    /// denied, or the persisted capability generation cannot be synchronized.
+    pub fn approve_tool_call_once(
+        &self,
+        tool_call: &crate::tools::ToolCall,
+        session_id: Option<&str>,
+        provenance: ApprovalProvenance,
+    ) -> Result<ExecutionPermit, String> {
+        let (arguments, resolved, scope) = self.approvable_scope(tool_call, session_id)?;
+        let _ = arguments;
+        if requires_fresh_host_approval(&resolved.canonical)
+            && !matches!(
+                provenance,
+                ApprovalProvenance::InteractiveUser
+                    | ApprovalProvenance::AcpClient
+                    | ApprovalProvenance::HostAdministrator
+            )
+        {
+            return Err(
+                "durable technical-memory authority requires a one-use authenticated host decision"
+                    .to_string(),
+            );
+        }
+        Self::log_permission_decision(
+            "allowed",
+            "one_use_approval",
+            &resolved.canonical,
+            &resolved.target,
+            "",
+        );
+        Ok(self
+            .approval_store
+            .mint_once(scope, &tool_call.id, provenance))
+    }
+
+    /// Grant repeated use of this exact normalized invocation for the current
+    /// session, bounded to eight hours and 128 total uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call is malformed, unclassified, explicitly
+    /// denied, or the persisted capability generation cannot be synchronized.
+    pub fn approve_tool_call_for_session(
+        &self,
+        tool_call: &crate::tools::ToolCall,
+        session_id: &str,
+        provenance: ApprovalProvenance,
+    ) -> Result<ExecutionPermit, String> {
+        let (_arguments, resolved, scope) = self.approvable_scope(tool_call, Some(session_id))?;
+        if requires_fresh_host_approval(&resolved.canonical) {
+            return Err(
+                "durable technical-memory authority cannot use a reusable session approval"
+                    .to_string(),
+            );
+        }
+        let permit = self
+            .approval_store
+            .approve_for_session(scope, &tool_call.id, provenance);
+        Self::log_permission_decision(
+            "allowed",
+            "session_approval_receipt",
+            &resolved.canonical,
+            &resolved.target,
+            "",
+        );
+        Ok(permit)
+    }
+
+    /// Persist repeated use of this exact normalized invocation in the trusted
+    /// host store, bounded to 30 days and 64 total uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when authorization is invalid or denied, when the
+    /// trusted store cannot be locked or written, or when its generation
+    /// changed while approval was in flight.
+    pub fn approve_tool_call_persisted(
+        &self,
+        tool_call: &crate::tools::ToolCall,
+        session_id: Option<&str>,
+        provenance: ApprovalProvenance,
+    ) -> Result<ExecutionPermit, String> {
+        let (_arguments, resolved, scope) = self.approvable_scope(tool_call, session_id)?;
+        if requires_fresh_host_approval(&resolved.canonical) {
+            return Err(
+                "durable technical-memory authority cannot use a persisted approval".to_string(),
+            );
+        }
+        let permit = self
+            .approval_store
+            .approve_persisted(scope, &tool_call.id, provenance)?;
+        Self::log_permission_decision(
+            "allowed",
+            "persisted_approval_receipt",
+            &resolved.canonical,
+            &resolved.target,
+            "",
+        );
+        Ok(permit)
+    }
+
+    /// Record an exact session denial and rotate the capability generation so
+    /// every permit/approval minted before the denial becomes unusable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call cannot be classified or the generation
+    /// rotation cannot be written to trusted state. The in-memory denial is
+    /// still retained when a persistence write fails.
+    pub fn deny_tool_call_for_session(
+        &self,
+        tool_call: &crate::tools::ToolCall,
+        session_id: &str,
+        provenance: ApprovalProvenance,
+    ) -> Result<(), String> {
+        let arguments = parse_tool_call_arguments(tool_call)?;
+        let resolved = Self::classify_for_policy(&tool_call.function.name, &arguments)
+            .map_err(|outcome| format!("{outcome:?}"))?;
+        let scope = self
+            .approval_store
+            .scope_for(&resolved, &arguments, Some(session_id));
+        self.approval_store.add_session_denial(scope, provenance)?;
+        Self::log_permission_decision(
+            "denied",
+            "exact_session_denial",
+            &resolved.canonical,
+            &resolved.target,
+            "",
+        );
+        Ok(())
+    }
+
+    /// Revalidate and atomically consume a call-bound execution permit.
+    ///
+    /// The denial pipeline runs again at dispatch time. Consequently a permit
+    /// cannot race a later denial or a capability-generation rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when trusted-state synchronization fails, the permit
+    /// is expired, stale, already used, or bound to a different exact call, or
+    /// a current denial rejects the invocation.
+    pub fn consume_execution_permit(
+        &self,
+        permit: &ExecutionPermit,
+        tool_call: &crate::tools::ToolCall,
+        session_id: Option<&str>,
+    ) -> Result<ConsumedExecutionPermit, String> {
+        if !permit.matches_call_id(tool_call) {
+            return Err("execution permit belongs to a different tool call id".to_string());
+        }
+        let arguments = parse_tool_call_arguments(tool_call)?;
+        let resolved = self
+            .classify_after_non_bypassable_denials(&tool_call.function.name, &arguments, session_id)
+            .map_err(|outcome| match outcome {
+                CheckResult::Denied(reason) => reason,
+                other => format!("invalid permit validation outcome: {other:?}"),
+            })?;
+        self.approval_store
+            .validate_permit_scope(permit, &resolved, &arguments, session_id)
+    }
+
+    fn approvable_scope(
+        &self,
+        tool_call: &crate::tools::ToolCall,
+        session_id: Option<&str>,
+    ) -> Result<
+        (
+            serde_json::Value,
+            crate::tools::effect::ResolvedEffect,
+            receipts::ApprovalScope,
+        ),
+        String,
+    > {
+        self.approval_store.sync_generation()?;
+        let arguments = parse_tool_call_arguments(tool_call)?;
+        let resolved = self
+            .classify_after_non_bypassable_denials(&tool_call.function.name, &arguments, session_id)
+            .map_err(|outcome| match outcome {
+                CheckResult::Denied(reason) => reason,
+                other => format!("invalid approval validation outcome: {other:?}"),
+            })?;
+        let scope = self
+            .approval_store
+            .scope_for(&resolved, &arguments, session_id);
+        Ok((arguments, resolved, scope))
     }
 
     fn web_fetch_preapproved_allowed(&self, canonical_tool: &str, target: &str) -> bool {
@@ -797,28 +1179,14 @@ impl PermissionManager {
         }
     }
 
-    /// Classifier-based auto-allow check (crosslink #571).
+    /// Typed-effect auto-allow check (crosslink #571; S-020).
     ///
-    /// Computes a confidence score in `[0.0, 1.0]` that the tool call is
-    /// safe to auto-approve, based on the (`tool_name`, `target_shape`)
-    /// pair. If the score clears `threshold` AND no explicit deny rule
-    /// matches, returns [`CheckResult::Allowed`]; otherwise falls
-    /// through to the normal [`Self::check_with_context`] pipeline.
-    ///
-    /// The classifier is a small Bayesian-style scorer:
-    /// * Read-only tools (no `PermissionTarget`) → score 1.0 (always
-    ///   auto-allow).
-    /// * `Bash` commands matching a known-safe verb prefix (`ls`, `cat`,
-    ///   `pwd`, `echo`, `git status`, `git diff`, `git log`) → 0.95.
-    /// * `Bash` commands containing destructive tokens (`rm -rf`,
-    ///   `chmod 777`, `sudo`, `dd `, `mkfs`, `:>`, `>/dev/`) → 0.0.
-    /// * `Bash` commands containing dangerous shell constructs → 0.0.
-    /// * `Edit` / `Write` to paths under `src/` or `tests/` → 0.6.
-    /// * Everything else → 0.3.
-    ///
-    /// An explicit `Deny` session rule short-circuits to 0.0 regardless
-    /// of the heuristic score. Mirrors CC `classifyYoloAction` in
-    /// `utils/permissions/yoloClassifier.ts`.
+    /// Only a successfully parsed invocation whose mandatory declaration is
+    /// `ReadOnly` can be auto-approved. Bash, edits, writes, and every other
+    /// effectful operation always fall through to explicit policy, regardless
+    /// of lexical appearance or `threshold`. Explicit denials are evaluated
+    /// first and remain authoritative. Non-finite or out-of-range thresholds
+    /// disable this compatibility shortcut rather than weakening it.
     pub fn check_auto_allow(
         &self,
         tool_name: &str,
@@ -830,13 +1198,15 @@ impl PermissionManager {
             return CheckResult::Denied(reason);
         }
         let score = auto_allow_score(tool_name, tool_args);
+        let valid_threshold = threshold.is_finite() && (0.0..=1.0).contains(&threshold);
         debug!(
             tool = %tool_name,
             score,
             threshold,
-            "auto-allow classifier score"
+            valid_threshold,
+            "typed auto-allow classification"
         );
-        if score > 0.0 && score >= threshold {
+        if valid_threshold && score > 0.0 && score >= threshold {
             return CheckResult::Allowed;
         }
         // Fall through to the normal pipeline (with interactive context
@@ -849,159 +1219,28 @@ impl PermissionManager {
     pub fn add_session_rule(&mut self, rule: PermissionRule) {
         info!(
             tool = %rule.tool,
-            pattern = %rule.pattern,
+            pattern_digest = %digest_text(&rule.pattern),
             decision = ?rule.decision,
             "Added session permission rule"
         );
+        if rule.decision == PermissionDecision::Deny {
+            if let Err(error) = self.approval_store.bump_generation() {
+                warn!(%error, "Could not persist permission capability rotation");
+            }
+        }
         self.session_rules.push(rule);
-    }
-
-    /// Add and persist an always-allow rule.
-    pub fn add_always_allow(&mut self, tool: &str, pattern: &str) {
-        let rule = PermissionRule {
-            tool: tool.to_string(),
-            pattern: pattern.to_string(),
-            decision: PermissionDecision::AlwaysAllow,
-        };
-        self.persisted_rules.push(rule);
-        if let Err(e) = self.save_persisted_rules() {
-            warn!(error = %e, "Failed to persist always-allow rule");
-        }
-        info!(
-            tool = %tool,
-            pattern = %pattern,
-            "Added and persisted always-allow rule"
-        );
-    }
-
-    /// Extract the canonical tool name and the target string for pattern matching.
-    ///
-    /// Returns:
-    /// - `Some(Ok((tool, target)))` for tools that need permission checks with valid args
-    /// - `Some(Err(tool))` for tools that need permission checks but have malformed args
-    /// - `None` for tools that don't need permission checks (e.g. read-only tools)
-    ///
-    /// # Registry-driven dispatch (crosslink #782)
-    ///
-    /// This function was historically an exhaustive `match` over three
-    /// hard-coded tool names — `bash`, `edit_file`, `write_file` — with an
-    /// `_ => None` catch-all. That catch-all silently fail-opened every
-    /// other tool: adding `delete_file`, `chmod`, `run_subprocess`, or any
-    /// MCP-provided write tool would bypass permission checks entirely.
-    /// It also created an invisible coupling: the list of "permission-relevant"
-    /// tools lived here in `permissions.rs`, while the tool definitions
-    /// lived in `tools/registry.rs`, with no compile-time link between them.
-    ///
-    /// The fix inverts the dependency. Each [`ToolHandler`] now declares its
-    /// own [`PermissionTarget`] via `ToolHandler::permission_target()`,
-    /// defaulting to `None` (read-only / safe). `extract_target` looks up
-    /// the handler in the global registry and uses whatever target the
-    /// handler declared:
-    ///
-    /// - Handler not registered (unknown tool) → `None`. The caller treats
-    ///   this as `CheckResult::Allowed` because there is no target string
-    ///   to match rules against. Unknown tools also fail elsewhere in the
-    ///   dispatch pipeline, so this isn't a security regression — it just
-    ///   matches the pre-#782 behaviour for unregistered names.
-    /// - Handler declares no `PermissionTarget` → `None`. Same fall-through.
-    /// - Handler declares a target → look up the target's `arg_key` in the
-    ///   tool args. Missing key → empty-string target (preserves the
-    ///   pre-#782 "key absent" branch). Present-but-non-string key → `Err`
-    ///   (malformed args, caller denies).
-    fn extract_target(
-        tool_name: &str,
-        tool_args: &serde_json::Value,
-    ) -> Option<Result<(String, String), String>> {
-        let target = crate::tools::registry::registry()
-            .get(tool_name)
-            .and_then(crate::tools::ToolHandler::permission_target)?;
-
-        let canonical = target.canonical.to_string();
-        match tool_args.get(target.arg_key) {
-            // Key present and a string — happy path.
-            Some(v) if v.is_string() => {
-                Some(Ok((canonical, v.as_str().unwrap_or_default().to_string())))
-            }
-            // Key absent OR present-but-wrong-type — both are malformed
-            // args from a permission standpoint (crosslink #855:
-            // absent-key previously returned Ok((canonical, "")) which
-            // allowed a permission rule with `default_allow = ""` to fire
-            // on a malformed Bash call that omitted the `command` field
-            // entirely; that bypass is gone). Tools that legitimately
-            // have no permission target are filtered earlier via the
-            // `permission_target()?` short-circuit, so this branch only
-            // fires for tools that DECLARED a target arg and then
-            // either didn't supply it or supplied a non-string value.
-            _ => Some(Err(canonical)),
-        }
-    }
-
-    /// Non-negotiable safety checks that survive explicit permission bypasses.
-    ///
-    /// This sits before the `enabled=false` shortcut used by
-    /// [`Self::unrestricted`], matching Claude Code's bypass mode: operators
-    /// can skip prompts, but prompt-injected sandbox escalation, hard-denylisted
-    /// shell payloads, and writes to protected control files still fail closed.
-    fn hard_safety_denial(
-        tool_name: &str,
-        tool_args: &serde_json::Value,
-    ) -> Option<HardSafetyDenial> {
-        match tool_name.to_ascii_lowercase().as_str() {
-            "bash" => Self::bash_hard_safety_denial(tool_args),
-            "edit" | "edit_file" | "write" | "write_file" => {
-                Self::write_target_hard_safety_denial(tool_args, "path")
-            }
-            "notebook_edit" => Self::write_target_hard_safety_denial(tool_args, "notebook_path"),
-            _ => None,
-        }
-    }
-
-    fn bash_hard_safety_denial(tool_args: &serde_json::Value) -> Option<HardSafetyDenial> {
-        if tool_args
-            .get("dangerously_disable_sandbox")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            let target = tool_args
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            tracing::error!(
-                target: "openclaudia::permissions",
-                event = "sandbox_escalation_attempt",
-                tool = "Bash",
-                target_arg = %target,
-                "model attempted dangerously_disable_sandbox=true in tool \
-                 args — REJECTED. The flag is only honoured from user-level \
-                 configuration; this invocation is denied (crosslink #795)."
-            );
-            return Some(HardSafetyDenial {
-                reason: "dangerously_disable_sandbox cannot be set from tool \
-                         arguments — only from user-level configuration"
-                    .to_string(),
-                target: target.to_string(),
-            });
-        }
-
-        let command = tool_args.get("command")?.as_str()?;
-        crate::tools::validate_command(command)
-            .err()
-            .map(|reason| HardSafetyDenial {
-                reason: format!("Denied by bash hard safety check: {reason}"),
-                target: command.to_string(),
-            })
     }
 
     fn unrestricted_bash_construct_hard_safety_denial(
         tool_name: &str,
         tool_args: &serde_json::Value,
-    ) -> Option<HardSafetyDenial> {
+    ) -> Option<UnrestrictedSafetyDenial> {
         if !tool_name.eq_ignore_ascii_case("bash") {
             return None;
         }
 
         let command = tool_args.get("command")?.as_str()?;
-        crate::tools::dangerous_shell_construct(command).map(|reason| HardSafetyDenial {
+        crate::tools::dangerous_shell_construct(command).map(|reason| UnrestrictedSafetyDenial {
             reason: format!(
                 "Denied by unrestricted bash hard safety check: dangerous shell construct: {reason}"
             ),
@@ -1009,70 +1248,30 @@ impl PermissionManager {
         })
     }
 
-    fn write_target_hard_safety_denial(
-        tool_args: &serde_json::Value,
-        path_key: &str,
-    ) -> Option<HardSafetyDenial> {
-        let path = tool_args.get(path_key)?.as_str()?;
-        Self::protected_write_target_reason(path).map(|reason| HardSafetyDenial {
-            reason: reason.to_string(),
-            target: path.to_string(),
-        })
-    }
-
-    fn protected_write_target_reason(path: &str) -> Option<&'static str> {
-        let components = Self::normalised_path_components(path);
-
-        if components.iter().any(|component| component == ".git") {
-            return Some("Denied by hard safety check: writes inside .git are protected");
-        }
-
-        components.windows(2).find_map(|window| {
-            if window[0] == ".claude" && window[1] == "settings.json" {
-                Some("Denied by hard safety check: .claude/settings.json is protected")
-            } else {
-                None
-            }
-        })
-    }
-
-    fn normalised_path_components(path: &str) -> Vec<String> {
-        let slash_path = path.replace('\\', "/");
-        let mut components = Vec::new();
-        for raw in slash_path.split('/') {
-            match raw {
-                "" | "." => {}
-                ".." => {
-                    components.pop();
-                }
-                component => components.push(component.to_ascii_lowercase()),
-            }
-        }
-        components
-    }
-
     /// Emit a structured permission-decision audit event (crosslink #870).
     ///
     /// `decision` is `"allowed"` or `"denied"`; `decision_source` is a
-    /// stable short label like `"persisted_always_allow"`,
-    /// `"session_rule"`, or `"default_allow_config"`. The event target is
+    /// stable short label like `"scoped_approval_receipt"`,
+    /// `"session_policy_rule"`, or `"default_allow_config"`. The event target is
     /// always `"openclaudia::permissions"` and the event name
     /// `"permission_decision"` so log consumers can pivot uniformly.
     fn log_permission_decision(
         decision: &'static str,
         decision_source: &'static str,
         tool: &str,
-        target_arg: &str,
+        target: &str,
         pattern: &str,
     ) {
+        let target_digest = digest_text(target);
+        let pattern_digest = digest_text(pattern);
         tracing::info!(
             target: "openclaudia::permissions",
             event = "permission_decision",
             decision = decision,
             decision_source = decision_source,
             tool = %tool,
-            target_arg = %target_arg,
-            pattern = %pattern,
+            target_digest = %target_digest,
+            pattern_digest = %pattern_digest,
             "permission decision"
         );
     }
@@ -1136,7 +1335,7 @@ impl PermissionManager {
         }
         drop(cache);
         if let Err(e) = compiled {
-            warn!(pattern = %pattern, error = %e, "Invalid glob pattern");
+            warn!(pattern_digest = %digest_text(pattern), error = %e, "Invalid glob pattern");
         }
         outcome
     }
@@ -1185,50 +1384,7 @@ impl PermissionManager {
         regex
     }
 
-    /// Load persisted rules from disk.
-    fn load_persisted_rules(path: &Path) -> Vec<PermissionRule> {
-        if !path.exists() {
-            return Vec::new();
-        }
-        match fs::read_to_string(path) {
-            Ok(content) => match serde_json::from_str::<Vec<PermissionRule>>(&content) {
-                Ok(rules) => {
-                    info!(count = rules.len(), path = ?path, "Loaded persisted permission rules");
-                    rules
-                }
-                Err(e) => {
-                    warn!(error = %e, path = ?path, "Failed to parse permissions file");
-                    Vec::new()
-                }
-            },
-            Err(e) => {
-                warn!(error = %e, path = ?path, "Failed to read permissions file");
-                Vec::new()
-            }
-        }
-    }
-
-    /// Save persisted rules to disk.
-    fn save_persisted_rules(&self) -> anyhow::Result<()> {
-        // Only persist AlwaysAllow rules
-        let to_persist: Vec<&PermissionRule> = self
-            .persisted_rules
-            .iter()
-            .filter(|r| r.decision == PermissionDecision::AlwaysAllow)
-            .collect();
-
-        // Ensure parent directory exists
-        if let Some(parent) = self.persist_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let json = serde_json::to_string_pretty(&to_persist)?;
-        fs::write(&self.persist_path, json)?;
-        debug!(path = ?self.persist_path, count = to_persist.len(), "Saved permission rules");
-        Ok(())
-    }
-
-    /// Get all persisted rules (for inspection/debugging).
+    /// Get persisted explicit denials for inspection/debugging.
     #[must_use]
     pub fn persisted_rules(&self) -> &[PermissionRule] {
         &self.persisted_rules
@@ -1248,6 +1404,15 @@ impl PermissionManager {
 
     /// Clear all session rules (called at session end).
     pub fn clear_session_rules(&mut self) {
+        if self
+            .session_rules
+            .iter()
+            .any(|rule| rule.decision == PermissionDecision::Deny)
+        {
+            if let Err(error) = self.approval_store.bump_generation() {
+                warn!(%error, "Could not persist permission capability rotation");
+            }
+        }
         self.session_rules.clear();
     }
 
@@ -1320,50 +1485,11 @@ impl PermissionManager {
         self.total_denials = 0;
     }
 
-    /// Record that the user selected "Always allow" for `tool_name` in the
-    /// interactive TUI permission prompt. The decision survives across
-    /// `execute_tool_calls_for_tui` batches for the rest of the session.
-    /// Parity target: CC session-scoped "always allow" cache. See crosslink #724.
-    pub fn tui_remember_always_allowed(&self, tool_name: String) {
-        let mut guard = self
-            .tui_always_allowed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(tool_name);
-    }
-
-    /// Record that the user selected "Always deny" for `tool_name` in the
-    /// interactive TUI permission prompt. The decision survives across
-    /// `execute_tool_calls_for_tui` batches for the rest of the session.
-    /// See crosslink #724.
-    pub fn tui_remember_always_denied(&self, tool_name: String) {
-        let mut guard = self
-            .tui_always_denied
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(tool_name);
-    }
-
-    /// Whether the user has previously selected "Always allow" for `tool_name`
-    /// in this session. See crosslink #724.
+    /// Current capability generation, exposed for deterministic receipt tests
+    /// and trace correlation.
     #[must_use]
-    pub fn tui_is_always_allowed(&self, tool_name: &str) -> bool {
-        let guard = self
-            .tui_always_allowed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.contains(tool_name)
-    }
-
-    /// Whether the user has previously selected "Always deny" for `tool_name`
-    /// in this session. See crosslink #724.
-    #[must_use]
-    pub fn tui_is_always_denied(&self, tool_name: &str) -> bool {
-        let guard = self
-            .tui_always_denied
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.contains(tool_name)
+    pub fn approval_capability_generation(&self) -> u64 {
+        self.approval_store.capability_generation()
     }
 }
 
@@ -1378,6 +1504,17 @@ mod tests {
         let persist_path = dir.path().join("permissions.json");
         let mgr = PermissionManager::new(persist_path, enabled, default_allow);
         (mgr, dir)
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> crate::tools::ToolCall {
+        crate::tools::ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
     }
 
     /// Fix #282/#586: a manager built with `enabled = false` still auto-allows
@@ -1634,18 +1771,33 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let persist_path = dir.path().join("permissions.json");
 
-        // Create manager and add always-allow rule
-        {
-            let mut mgr = PermissionManager::new(&persist_path, true, vec![]);
-            mgr.add_always_allow("Edit", "src/**/*.rs");
-        }
+        let approved = tool_call(
+            "approve",
+            "edit_file",
+            &json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+        );
 
-        // Create new manager from same path -- should load the persisted rule
+        // Persist one exact invocation; no raw path/content glob is stored.
         {
             let mgr = PermissionManager::new(&persist_path, true, vec![]);
-            assert_eq!(mgr.persisted_rules().len(), 1);
-            let result = mgr.check("edit_file", &json!({"path": "src/main.rs"}));
-            assert_eq!(result, CheckResult::Allowed);
+            let _initial_permit = mgr
+                .approve_tool_call_persisted(&approved, None, ApprovalProvenance::InteractiveUser)
+                .expect("persist exact approval");
+        }
+
+        // A new manager with the same actor/workspace/generation can consume
+        // the exact record for the same invocation under a fresh call id.
+        {
+            let mgr = PermissionManager::new(&persist_path, true, vec![]);
+            let replay = tool_call(
+                "replay",
+                "edit_file",
+                &json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+            );
+            assert!(matches!(
+                mgr.authorize_tool_call(&replay, None),
+                AuthorizationResult::Allowed(_)
+            ));
         }
     }
 
@@ -1685,6 +1837,15 @@ mod tests {
     }
 
     #[test]
+    fn test_glob_engine_retains_empty_string_semantics() {
+        // Pin the glob primitive independently of call classification. A
+        // permission check must still reject an empty required tool target
+        // before this matcher is consulted.
+        assert!(PermissionManager::glob_matches("", ""));
+        assert!(PermissionManager::glob_matches("**", ""));
+    }
+
+    #[test]
     fn test_glob_to_regex_question_mark() {
         let re = PermissionManager::glob_to_regex("file?.txt");
         let re = Regex::new(&re).unwrap();
@@ -1718,7 +1879,7 @@ mod tests {
         // processing (so the call usually surfaced as NeedsPrompt).
         // The fix denies the call outright so the escalation attempt
         // is bounded into a hard refusal AND captured in the audit log
-        // via the `sandbox_escalation_attempt` tracing event.
+        // via the generation-bound `host_safety_decision` tracing event.
         let (mgr, _dir) = make_manager(true, vec![]);
         let result = mgr.check(
             "bash",
@@ -1896,33 +2057,40 @@ mod tests {
     }
 
     #[test]
-    fn test_persisted_rules_priority_over_session() {
+    fn test_current_session_deny_overrides_persisted_allow() {
         let dir = TempDir::new().unwrap();
         let persist_path = dir.path().join("permissions.json");
         let mut mgr = PermissionManager::new(&persist_path, true, vec![]);
 
-        // Add always-allow for edit on *.rs
-        mgr.add_always_allow("Edit", "**/*.rs");
-        // Add session deny for edit on *.rs -- should NOT override the always-allow
-        // because persisted rules are checked first
+        let call = tool_call(
+            "edit",
+            "edit_file",
+            &json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+        );
+        let _old_permit = mgr
+            .approve_tool_call_persisted(&call, None, ApprovalProvenance::InteractiveUser)
+            .expect("persist exact approval");
+        // A current explicit deny revokes an older persisted approval.
         mgr.add_session_rule(PermissionRule {
             tool: "Edit".to_string(),
             pattern: "**/*.rs".to_string(),
             decision: PermissionDecision::Deny,
         });
 
-        let result = mgr.check("edit_file", &json!({"path": "src/main.rs"}));
-        assert_eq!(result, CheckResult::Allowed);
+        assert!(matches!(
+            mgr.authorize_tool_call(&call, None),
+            AuthorizationResult::Denied(_)
+        ));
     }
 }
 
 /// Phase 2 spec-pinning tests for issue #546.
 ///
-/// These tests pin the CURRENT behaviour of `PermissionManager` against
-/// the Phase 1 spec extracted in crosslink #531. They do **not** fix
-/// bugs — they document divergences from CC so that regressions are
-/// caught and so that each gap issue (#570, #572, #576, #581) plus the
-/// #586 hard-safety regression has an explicit, labelled test.
+/// These began as pins of `PermissionManager` behavior against the Phase 1
+/// spec extracted in crosslink #531. Security expectations are updated when a
+/// confirmed audit finding and canonical design supersede an unsafe historical
+/// pin; the test name/comment records that change rather than preserving the
+/// vulnerability as compatibility behavior.
 ///
 /// Security-critical divergences are marked `// SECURITY: #<issue>`.
 /// Denial paths are the dominant test style, matching the permission
@@ -1967,29 +2135,45 @@ mod phase2_spec_pins {
         (mgr, dir)
     }
 
-    // ── B1 · Check order: always-allow → session → default_allow → NeedsPrompt ─
+    fn tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> crate::tools::ToolCall {
+        crate::tools::ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
 
-    /// B1-allow-1: persisted always-allow fires before every other tier.
+    // ── B1 · Check order: explicit deny → scoped allow → default → prompt ─
+
+    /// Security correction: a current deny revokes an older persisted allow.
+    /// The previous phase pin demanded the inverse ordering, which is F-030.
     #[test]
-    fn b1_persisted_always_allow_beats_session_deny() {
+    fn b1_current_session_deny_beats_persisted_always_allow() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("perms.json");
         let mut mgr = PermissionManager::new(&path, true, vec![]);
 
-        mgr.add_always_allow("Edit", "src/**");
+        let call = tool_call(
+            "edit",
+            "edit_file",
+            &json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+        );
+        let _old_permit = mgr
+            .approve_tool_call_persisted(&call, None, ApprovalProvenance::InteractiveUser)
+            .expect("persist exact approval");
         mgr.add_session_rule(PermissionRule {
             tool: "Edit".to_string(),
             pattern: "src/**".to_string(),
             decision: PermissionDecision::Deny,
         });
 
-        // Spec §B1: persisted always-allow is step 1 — session deny is step 2.
-        // Result MUST be Allowed.
-        let r = mgr.check("edit_file", &json!({"path": "src/main.rs"}));
-        assert_eq!(
-            r,
-            CheckResult::Allowed,
-            "B1: persisted always-allow must beat session deny"
+        let r = mgr.authorize_tool_call(&call, None);
+        assert!(
+            matches!(r, AuthorizationResult::Denied(_)),
+            "current explicit deny must revoke stale persisted approval, got {r:?}"
         );
     }
 
@@ -2368,7 +2552,7 @@ mod phase2_spec_pins {
     /// Deny: session Deny on `write_file` fires before `default_allow`.
     #[test]
     fn deny_session_deny_write_beats_default_allow() {
-        let (mut mgr, _dir) = enabled(vec!["**"]);
+        let (mut mgr, _dir) = enabled(vec!["Write(**)"]);
         mgr.add_session_rule(PermissionRule {
             tool: "Write".to_string(),
             pattern: "**".to_string(),
@@ -2377,20 +2561,20 @@ mod phase2_spec_pins {
         let r = mgr.check("write_file", &json!({"path": "anywhere/file.txt"}));
         assert!(
             matches!(r, CheckResult::Denied(_)),
-            "deny: session Deny on Write must fire before default_allow '**'"
+            "deny: session Deny on Write must fire before default_allow 'Write(**)'"
         );
     }
 
     /// Deny: session Deny on a different tool does not affect another tool.
     #[test]
     fn deny_session_deny_does_not_cross_tool_boundary() {
-        let (mut mgr, _dir) = enabled(vec!["**"]);
+        let (mut mgr, _dir) = enabled(vec!["Write(**)"]);
         mgr.add_session_rule(PermissionRule {
             tool: "Bash".to_string(),
             pattern: "**".to_string(),
             decision: PermissionDecision::Deny,
         });
-        // Write is not denied — its default_allow "**" still fires.
+        // Write is not denied — its explicitly scoped default still fires.
         let r = mgr.check("write_file", &json!({"path": "foo.txt"}));
         assert_eq!(
             r,
@@ -2399,22 +2583,42 @@ mod phase2_spec_pins {
         );
     }
 
+    #[test]
+    fn legacy_unqualified_default_allow_cannot_cross_from_bash_to_write() {
+        let (mgr, _dir) = enabled(vec!["src/**"]);
+        let result = mgr.check("write_file", &json!({"path": "src/main.rs"}));
+        assert!(matches!(result, CheckResult::NeedsPrompt { .. }));
+    }
+
+    #[test]
+    fn scoped_default_allow_canonicalizes_wire_tool_alias() {
+        let (mgr, _dir) = enabled(vec!["write_file(src/**)"]);
+        assert_eq!(
+            mgr.check("write_file", &json!({"path": "src/main.rs"})),
+            CheckResult::Allowed
+        );
+        assert!(matches!(
+            mgr.check("edit_file", &json!({"path": "src/main.rs"})),
+            CheckResult::NeedsPrompt { .. }
+        ));
+    }
+
     /// Deny: malformed bash args (non-string command) are denied, not allowed.
     /// This is a security invariant regardless of `default_allow`.
     #[test]
     fn deny_malformed_bash_args_denied_regardless_of_default_allow() {
-        let (mgr, _dir) = enabled(vec!["**"]);
+        let (mgr, _dir) = enabled(vec!["Bash(**)"]);
         let r = mgr.check("bash", &json!({"command": true}));
         assert!(
             matches!(r, CheckResult::Denied(_)),
-            "malformed bash args must be Denied even when default_allow='**'"
+            "malformed bash args must be Denied even when default_allow='Bash(**)'"
         );
     }
 
     /// Deny: malformed `edit_file` args are denied even with permissive `default_allow`.
     #[test]
     fn deny_malformed_edit_args_denied_regardless_of_default_allow() {
-        let (mgr, _dir) = enabled(vec!["**"]);
+        let (mgr, _dir) = enabled(vec!["Edit(**)"]);
         let r = mgr.check("edit_file", &json!({"path": 42}));
         assert!(matches!(r, CheckResult::Denied(_)));
     }
@@ -2436,241 +2640,133 @@ mod phase2_spec_pins {
     }
 
     // ------------------------------------------------------------------
-    // crosslink #724 — TUI session-scoped always-allow / always-deny cache
+    // crosslink #724 / S-017 — exact session approvals replace tool caches
     // ------------------------------------------------------------------
 
-    /// #724: `tui_remember_always_allowed` stores the decision so a follow-up
-    /// `tui_is_always_allowed` returns true.
     #[test]
-    fn tui_724_remember_always_allowed_persists() {
-        let (mgr, _dir) = enabled(vec![]);
-        assert!(
-            !mgr.tui_is_always_allowed("Bash"),
-            "fresh manager must not have any always-allow entries"
-        );
-        mgr.tui_remember_always_allowed("Bash".to_string());
-        assert!(
-            mgr.tui_is_always_allowed("Bash"),
-            "#724: tui_remember_always_allowed must be visible to tui_is_always_allowed"
-        );
-        // Other tools remain unaffected.
-        assert!(!mgr.tui_is_always_allowed("Write"));
-    }
-
-    /// #724: `tui_remember_always_denied` stores the decision so a follow-up
-    /// `tui_is_always_denied` returns true.
-    #[test]
-    fn tui_724_remember_always_denied_persists() {
-        let (mgr, _dir) = enabled(vec![]);
-        assert!(
-            !mgr.tui_is_always_denied("Bash"),
-            "fresh manager must not have any always-deny entries"
-        );
-        mgr.tui_remember_always_denied("Bash".to_string());
-        assert!(
-            mgr.tui_is_always_denied("Bash"),
-            "#724: tui_remember_always_denied must be visible to tui_is_always_denied"
-        );
-        assert!(!mgr.tui_is_always_denied("Edit"));
-    }
-
-    /// #724: `tui_is_always_allowed` returns false for an unseen tool — guards
-    /// against an "everything is allowed" regression.
-    #[test]
-    fn tui_724_is_always_allowed_default_false() {
-        let (mgr, _dir) = enabled(vec![]);
-        assert!(!mgr.tui_is_always_allowed("Bash"));
-        assert!(!mgr.tui_is_always_allowed("Write"));
-        assert!(!mgr.tui_is_always_allowed("Edit"));
-    }
-
-    /// #724: `tui_is_always_denied` returns false for an unseen tool — and the
-    /// allow/deny caches are independent (remembering allow does not deny).
-    #[test]
-    fn tui_724_is_always_denied_default_false_and_caches_independent() {
-        let (mgr, _dir) = enabled(vec![]);
-        assert!(!mgr.tui_is_always_denied("Bash"));
-        // Recording allow must NOT flip is_always_denied to true.
-        mgr.tui_remember_always_allowed("Bash".to_string());
-        assert!(
-            !mgr.tui_is_always_denied("Bash"),
-            "#724: tui_always_allowed and tui_always_denied must be independent caches"
-        );
-        // And recording deny on a different tool must not affect Bash.
-        mgr.tui_remember_always_denied("Write".to_string());
-        assert!(mgr.tui_is_always_denied("Write"));
-        assert!(!mgr.tui_is_always_denied("Bash"));
-    }
-
-    /// #724: the `Mutex` is `Send + Sync`, so the cache survives being shared
-    /// across the `Arc<PermissionManager>` boundary that the TUI pipeline uses.
-    /// This test mimics the pipeline flow: clone an `Arc`, remember from one
-    /// handle, observe from the other.
-    #[test]
-    fn tui_724_decision_survives_arc_sharing() {
+    fn tui_724_exact_session_approval_survives_arc_sharing() {
         use std::sync::Arc;
         let (mgr, _dir) = enabled(vec![]);
         let shared = Arc::new(mgr);
         let clone = Arc::clone(&shared);
+        let first = tool_call("first", "bash", &json!({"command": "git status"}));
+        let replay = tool_call("replay", "bash", &json!({"command": "git status"}));
 
-        // Batch 1 (clone): user picks "Always allow" for Bash.
-        clone.tui_remember_always_allowed("Bash".to_string());
+        let _first_permit = clone
+            .approve_tool_call_for_session(&first, "session-1", ApprovalProvenance::InteractiveUser)
+            .expect("session approval");
 
-        // Batch 2 (shared): a later `execute_tool_calls_for_tui` invocation
-        // sees the decision without re-prompting.
         assert!(
-            shared.tui_is_always_allowed("Bash"),
-            "#724: always-allow decision must persist across Arc handles \
-             (i.e. across execute_tool_calls_for_tui batches)"
+            matches!(
+                shared.authorize_tool_call(&replay, Some("session-1")),
+                AuthorizationResult::Allowed(_)
+            ),
+            "the exact approval must persist across Arc handles and batches"
         );
     }
 
-    // ── #782 registry-driven extract_target ─────────────────────────────────
+    #[test]
+    fn tui_724_session_approval_does_not_cross_arguments_or_session() {
+        let (mgr, _dir) = enabled(vec![]);
+        let approved = tool_call("approved", "bash", &json!({"command": "git status"}));
+        let changed = tool_call("changed", "bash", &json!({"command": "git push"}));
+        let replay = tool_call("replay", "bash", &json!({"command": "git status"}));
+        let _permit = mgr
+            .approve_tool_call_for_session(
+                &approved,
+                "session-1",
+                ApprovalProvenance::InteractiveUser,
+            )
+            .expect("session approval");
+
+        assert!(matches!(
+            mgr.authorize_tool_call(&changed, Some("session-1")),
+            AuthorizationResult::NeedsPrompt { .. }
+        ));
+        assert!(matches!(
+            mgr.authorize_tool_call(&replay, Some("session-2")),
+            AuthorizationResult::NeedsPrompt { .. }
+        ));
+    }
+
+    #[test]
+    fn tui_724_exact_session_denial_dominates_older_approval() {
+        let (mgr, _dir) = enabled(vec![]);
+        let call = tool_call("call", "bash", &json!({"command": "git status"}));
+        let _permit = mgr
+            .approve_tool_call_for_session(&call, "session-1", ApprovalProvenance::InteractiveUser)
+            .expect("session approval");
+        mgr.deny_tool_call_for_session(&call, "session-1", ApprovalProvenance::InteractiveUser)
+            .expect("exact denial");
+
+        assert!(matches!(
+            mgr.authorize_tool_call(&call, Some("session-1")),
+            AuthorizationResult::Denied(_)
+        ));
+    }
+
+    // ── S-016 mandatory effect classification ───────────────────────────
     //
-    // Before #782, `extract_target` exhaustively matched on three hard-coded
-    // tool names (`bash`, `edit_file`, `write_file`). Any new tool added to
-    // the registry would silently fall through to `_ => None`, which
-    // `check()` treats as "no target → Allowed". These tests pin the
-    // post-#782 behaviour: the canonical-tool name and target-arg key come
-    // from the `ToolHandler::permission_target()` declaration, so each
-    // tool's permission posture is co-located with its `execute` body.
+    // These replace the #782 `permission_target()` pins. #782 inverted the
+    // dependency so each handler declared its own target, but left the
+    // declaration optional: `permission_target()` defaulted to `None`, `None`
+    // meant "read-only / safe", and the accompanying test accepted a
+    // hand-maintained `KNOWN_SAFE` allowlist as an "explicit decision".
+    // Twenty-eight handlers sat in that allowlist, including worktree
+    // removal, cron mutation and Crosslink writes. F-001 records that shape
+    // as fail-open and F-052 records the Crosslink case specifically.
+    //
+    // The declaration is now mandatory (no trait default) and the allowlist
+    // is gone. What these tests prove is behaviour, not the presence of a
+    // constant: that a classified mutation actually reaches a decision, and
+    // that an unclassifiable call is actually denied.
 
-    /// #782: `bash` resolves to its declared (Bash, command) target.
-    /// Pinning this guards against a regression where a handler edit drops
-    /// the `permission_target` override and bash silently fail-opens.
+    /// `bash` resolves through its declaration to the (Bash, command) pair.
     #[test]
-    fn registry_782_bash_target_key_resolves_command() {
-        let (mut mgr, _dir) = enabled(vec![]);
-        // Add a session Deny on Bash with a glob that requires the command
-        // string to be extracted correctly from the args.
-        mgr.add_session_rule(PermissionRule {
-            tool: "Bash".to_string(),
-            pattern: "rm **".to_string(),
-            decision: PermissionDecision::Deny,
-        });
-        let r = mgr.check("bash", &json!({"command": "rm -rf /tmp/x"}));
-        assert!(
-            matches!(r, CheckResult::Denied(_)),
-            "#782: bash's permission_target must canonicalise to Bash + arg_key='command', got: {r:?}"
-        );
+    fn effect_bash_resolves_declared_target() {
+        let r = crate::tools::effect::resolve_for_call("bash", &json!({"command": "ls -la"}))
+            .expect("bash must classify");
+        assert_eq!(r.canonical, "Bash");
+        assert_eq!(r.target, "ls -la");
+        assert_eq!(r.effect, crate::tools::effect::ToolEffect::Destructive);
     }
 
-    /// #782: `write_file` resolves to its declared (Write, path) target.
-    /// Independently exercises a different (`canonical`, `arg_key`) pair to
-    /// catch a swap-bug between the bash and write handlers.
+    /// Malformed args for a declared target argument deny, even under a
+    /// permissive `default_allow`.
     #[test]
-    fn registry_782_write_file_target_key_resolves_path() {
-        let (mut mgr, _dir) = enabled(vec![]);
-        mgr.add_session_rule(PermissionRule {
-            tool: "Write".to_string(),
-            pattern: "src/**/*.rs".to_string(),
-            decision: PermissionDecision::Allow,
-        });
-        let r = mgr.check("write_file", &json!({"path": "src/lib.rs"}));
-        assert_eq!(
-            r,
-            CheckResult::Allowed,
-            "#782: write_file's permission_target must canonicalise to Write + arg_key='path'"
-        );
-        // And a path outside the rule must still require a prompt.
-        let r2 = mgr.check("write_file", &json!({"path": "/etc/passwd"}));
-        assert!(
-            matches!(r2, CheckResult::NeedsPrompt { .. }),
-            "#782: write_file target extraction must use the path arg, got: {r2:?}"
-        );
-    }
-
-    /// #782: `edit_file` resolves to its declared (Edit, path) target.
-    #[test]
-    fn registry_782_edit_file_target_key_resolves_path() {
-        let (mut mgr, _dir) = enabled(vec![]);
-        mgr.add_session_rule(PermissionRule {
-            tool: "Edit".to_string(),
-            pattern: "src/**".to_string(),
-            decision: PermissionDecision::Allow,
-        });
-        let r = mgr.check("edit_file", &json!({"path": "src/main.rs"}));
-        assert_eq!(
-            r,
-            CheckResult::Allowed,
-            "#782: edit_file's permission_target must canonicalise to Edit + arg_key='path'"
-        );
-    }
-
-    /// #782: `notebook_edit` was the pre-fix latent hole — it mutates
-    /// `.ipynb` files on disk but was not in the hard-coded match arm.
-    /// Post-#782 it declares `(Edit, notebook_path)` so an existing Edit
-    /// session rule naturally covers notebook writes too. This is the test
-    /// that would have failed BEFORE the fix and passes after it.
-    #[test]
-    fn registry_782_notebook_edit_no_longer_fails_open() {
-        let (mut mgr, _dir) = enabled(vec![]);
-        // Deny all Edit operations on /etc/**.
-        mgr.add_session_rule(PermissionRule {
-            tool: "Edit".to_string(),
-            pattern: "/etc/**".to_string(),
-            decision: PermissionDecision::Deny,
-        });
+    fn malformed_args_for_any_target_are_denied() {
+        let (mgr, _dir) = enabled(vec!["Edit(**)"]);
         let r = mgr.check(
             "notebook_edit",
-            &json!({"notebook_path": "/etc/secret.ipynb", "new_source": "evil"}),
+            &json!({"notebook_path": 42, "new_source": "x"}),
         );
         assert!(
             matches!(r, CheckResult::Denied(_)),
-            "#782: notebook_edit must be denied by the Edit rule — pre-fix this fail-opened. Got: {r:?}"
+            "malformed notebook_path (int) must be Denied regardless of default_allow, got: {r:?}"
         );
+    }
 
-        // And without a matching rule, notebook_edit must prompt — not
-        // silently allow — confirming the registry lookup is wired in.
-        let (mgr2, _dir2) = enabled(vec![]);
-        let r2 = mgr2.check(
-            "notebook_edit",
-            &json!({"notebook_path": "/tmp/x.ipynb", "new_source": "x"}),
-        );
+    /// F-001's headline: an unknown tool name is denied, not allowed.
+    ///
+    /// The old `extract_target` returned `None` for an unregistered name and
+    /// `check` read that as allow.
+    #[test]
+    fn unknown_tool_is_denied_not_allowed() {
+        let (mgr, _dir) = enabled(vec!["**"]);
+        let r = mgr.check("definitely_not_a_tool", &json!({"path": "/etc/passwd"}));
         assert!(
-            matches!(r2, CheckResult::NeedsPrompt { .. }),
-            "#782: notebook_edit must NeedsPrompt when no rule matches, not Allowed. Got: {r2:?}"
+            matches!(r, CheckResult::Denied(_)),
+            "an unclassified tool name must be denied, got: {r:?}"
         );
     }
 
-    /// #782: an unknown tool (not registered) returns `Allowed`. There is
-    /// no target string to match rules against, and dispatch will fail at
-    /// the executor anyway. This is the same behaviour as the pre-#782
-    /// `_ => None` arm for unknown names — preserved on purpose so existing
-    /// callers don't see a regression on typo'd or experimental tool names.
+    /// F-001: an unknown tool must not score as unconditionally safe.
     #[test]
-    fn registry_782_unknown_tool_returns_allowed() {
-        let (mgr, _dir) = enabled(vec![]);
-        let r = mgr.check(
-            "definitely_not_a_real_tool_name",
-            &json!({"command": "rm -rf /"}),
+    fn unknown_tool_auto_allow_score_is_zero() {
+        assert!(
+            auto_allow_score("definitely_not_a_tool", &json!({})) < f32::EPSILON,
+            "an unclassified tool scored as auto-allowable is the #F-001 fail-open"
         );
-        assert_eq!(
-            r,
-            CheckResult::Allowed,
-            "#782: an unregistered tool must short-circuit to Allowed (no target to match); \
-             dispatch will reject the call downstream. Got: {r:?}"
-        );
-    }
-
-    /// #782: a registered handler that returns `None` from
-    /// `permission_target` (i.e. a read-only tool like `read_file`) also
-    /// short-circuits to `Allowed` — same path as an unknown tool but
-    /// reached because the trait method explicitly opted out.
-    #[test]
-    fn registry_782_read_only_handler_returns_allowed() {
-        let (mgr, _dir) = enabled(vec![]);
-        // read_file is registered but its handler returns None from
-        // permission_target() (the trait default), so check() must allow.
-        let r = mgr.check("read_file", &json!({"path": "/etc/passwd"}));
-        assert_eq!(
-            r,
-            CheckResult::Allowed,
-            "#782: a registered handler with permission_target()==None must short-circuit to Allowed"
-        );
-        // list_files also has no permission target.
-        let r2 = mgr.check("list_files", &json!({"path": "/etc"}));
-        assert_eq!(r2, CheckResult::Allowed);
     }
 
     /// #603: `web_fetch` declares a permission target, but the default
@@ -2718,97 +2814,57 @@ mod phase2_spec_pins {
         );
     }
 
-    /// #782: malformed args (wrong JSON type for the declared `arg_key`)
-    /// must be Denied — the legacy invariant for `bash`/`edit_file`/
-    /// `write_file` is preserved by the registry-driven lookup, and now
-    /// extends automatically to any new tool that declares a
-    /// `PermissionTarget`.
+    /// Every registered handler carries a structurally valid declaration.
+    ///
+    /// The declaration itself is compulsory at compile time, so this asserts
+    /// the part the compiler cannot: that the declaration is usable by the
+    /// rule engine, and that no handler is silently unreachable.
     #[test]
-    fn registry_782_malformed_args_for_any_target_are_denied() {
-        let (mgr, _dir) = enabled(vec!["**"]);
-        // notebook_edit declares notebook_path as its target arg_key — a
-        // non-string value must trip the malformed-args branch even with a
-        // permissive default_allow.
-        let r = mgr.check(
-            "notebook_edit",
-            &json!({"notebook_path": 42, "new_source": "x"}),
-        );
-        assert!(
-            matches!(r, CheckResult::Denied(_)),
-            "#782: malformed notebook_path (int) must be Denied regardless of default_allow, got: {r:?}"
-        );
+    fn every_handler_declares_a_valid_effect() {
+        for handler in crate::tools::registry::iter_handlers() {
+            let name = handler.name();
+            let spec = handler.effect_spec();
+            spec.validate(name)
+                .unwrap_or_else(|e| panic!("handler '{name}' has an unusable declaration: {e}"));
+        }
     }
 
-    /// #782 forensic / regression-prevention: enumerate every handler in
-    /// the registry and require an *explicit decision* — either it declares
-    /// a `PermissionTarget`, or it appears in a known-safe allowlist. A new
-    /// mutating tool added without either step trips this test loudly,
-    /// preventing the silent fail-open that #782 was filed for.
+    /// Every tool that mutates state, spawns a process, or leaves the host
+    /// must reach an authorization decision.
+    ///
+    /// This is the concrete list F-001 named as fail-open. It is expressed as
+    /// "must NOT be read-only" rather than as an allowlist of exceptions, so
+    /// the test cannot be satisfied by adding a name to a table.
     #[test]
-    fn registry_782_every_handler_makes_explicit_permission_decision() {
-        use crate::tools::registry::iter_handlers;
-        use crate::tools::PermissionTarget;
-
-        // Handlers whose permission_target() correctly returns None because
-        // they are genuinely read-only or non-filesystem-mutating. Every
-        // entry here is an intentional opt-out; a *new* tool added to the
-        // registry that does not declare a PermissionTarget AND is not in
-        // this list will fail this test until a decision is made.
-        const KNOWN_SAFE: &[&str] = &[
-            "bash_output",           // reads buffered output, no mutation
-            "kill_shell",            // operates on internal shell handles
-            "kill_shells_for_agent", // operates on internal shell handles
-            "read_file",             // pure read
-            "grounding_context",     // hydrates existing ledger observations
-            "list_files",            // pure read
-            "glob",                  // pure read (#567)
-            "grep",                  // pure read (#568)
-            "crosslink",             // library-backed issue tracker
-            "web_search",            // network read
-            "web_browser",           // network read
-            "todo_write",            // in-memory session state
-            "todo_read",             // in-memory session state
-            "ask_user_question",     // user interaction
-            "task_create",           // session task state
-            "task_update",           // session task state
-            "task_get",              // session task state
-            "task_list",             // session task state
-            "enter_plan_mode",       // mode flag
-            "exit_plan_mode",        // mode flag
-            "list_mcp_resources",    // MCP read
-            "read_mcp_resource",     // MCP read
-            "lsp",                   // LSP read
-            "enter_worktree",        // git worktree create (gated separately)
-            "exit_worktree",         // git worktree remove (gated separately)
-            "list_worktrees",        // git read
-            "cron_create",           // schedule registration (gated separately)
-            "cron_delete",           // schedule removal (gated separately)
-            "cron_list",             // schedule read
-            // crosslink #612 / #614 — pure read-side: skill loads a markdown
-            // body from disk; tool_search returns schemas from the registry.
-            // Neither mutates user state.
-            "skill",
-            "tool_search",
-        ];
-
-        for handler in iter_handlers() {
-            let name = handler.name();
-            let target: Option<PermissionTarget> = handler.permission_target();
-            let in_safelist = KNOWN_SAFE.contains(&name);
+    fn known_effectful_tools_require_authorization() {
+        for name in [
+            "bash",
+            "write_file",
+            "edit_file",
+            "notebook_edit",
+            "crosslink",
+            "cron_create",
+            "cron_delete",
+            "enter_worktree",
+            "exit_worktree",
+            "task_create",
+            "task_update",
+            "todo_write",
+            "kill_shell",
+            "kill_shells_for_agent",
+            "lsp",
+            "list_mcp_resources",
+            "read_mcp_resource",
+            "web_fetch",
+            "enter_plan_mode",
+            "exit_plan_mode",
+        ] {
+            let handler = crate::tools::registry::registry()
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
             assert!(
-                target.is_some() || in_safelist,
-                "#782 REGRESSION: handler '{name}' declares no PermissionTarget and is not in \
-                 KNOWN_SAFE. Either add a `fn permission_target()` override in \
-                 src/tools/registry.rs OR (only if the tool is genuinely read-only) add the \
-                 name to KNOWN_SAFE in this test. This guards against the silent fail-open \
-                 that crosslink #782 closed."
-            );
-            // Conversely, if a handler ends up declaring a target, the
-            // safelist entry should be removed so the two stay in sync.
-            assert!(
-                !(target.is_some() && in_safelist),
-                "#782: handler '{name}' declares a PermissionTarget AND is listed in \
-                 KNOWN_SAFE. Remove it from KNOWN_SAFE — the declaration is the source of truth."
+                handler.effect_spec().effect.requires_authorization(),
+                "{name} was named in F-001 as fail-open; it must not be classified read-only"
             );
         }
     }
@@ -2876,56 +2932,41 @@ mod phase2_spec_pins {
         assert!(matches!(r, CheckResult::Denied(_)));
     }
 
-    // ── Crosslink #571: classifier auto-allow tests ────────────────────────
+    // ── Crosslink #571 / S-020: typed auto-allow tests ─────────────────────
 
     /// Pin: read-only tools (e.g. `read_file`, `list_files`) score 1.0.
     #[test]
     fn auto_allow_score_read_only_is_one() {
         assert!(
             (auto_allow_score("read_file", &json!({"path": "/x"})) - 1.0).abs() < f32::EPSILON,
-            "#571: read_file (no permission target) must score 1.0"
+            "read_file's declared ReadOnly effect must score 1.0"
         );
         assert!((auto_allow_score("list_files", &json!({})) - 1.0).abs() < f32::EPSILON);
     }
 
-    /// Pin: safe `bash` verb prefixes score high (>=0.9).
+    /// Bash remains effectful regardless of how benign its text appears.
     #[test]
-    fn auto_allow_score_safe_bash_prefixes_high() {
-        assert!(auto_allow_score("bash", &json!({"command": "ls -la"})) >= 0.9);
-        assert!(auto_allow_score("bash", &json!({"command": "git status"})) >= 0.9);
-        assert!(auto_allow_score("bash", &json!({"command": "git diff HEAD"})) >= 0.9);
+    fn auto_allow_score_every_bash_shape_is_zero() {
+        for command in [
+            "ls -la",
+            "git status",
+            "git push origin HEAD",
+            "python3 -c 'print(1)'",
+            "cat input | rm -f output",
+        ] {
+            assert!(auto_allow_score("bash", &json!({"command": command})) < f32::EPSILON);
+        }
     }
 
-    /// Pin: destructive bash tokens score 0.0 (hard veto).
+    /// A benign-looking Bash command falls through to explicit policy.
     #[test]
-    fn auto_allow_score_destructive_bash_is_zero() {
-        assert!(auto_allow_score("bash", &json!({"command": "rm -rf /"})) < f32::EPSILON);
-        assert!(auto_allow_score("bash", &json!({"command": "sudo apt update"})) < f32::EPSILON);
-        assert!(auto_allow_score("bash", &json!({"command": "chmod 777 /etc"})) < f32::EPSILON);
-    }
-
-    /// Pin: dangerous shell constructs score 0.0 even when the outer
-    /// command starts with a normally safe verb.
-    #[test]
-    fn auto_allow_score_dangerous_shell_constructs_are_zero() {
-        assert!(auto_allow_score("bash", &json!({"command": "echo hi | sh"})) < f32::EPSILON);
-        assert!(auto_allow_score("bash", &json!({"command": "cat <(printf hi)"})) < f32::EPSILON);
-    }
-
-    /// Pin: `check_auto_allow` allows safe bash above threshold.
-    #[test]
-    fn check_auto_allow_safe_bash_passes() {
+    fn check_auto_allow_bash_requires_policy() {
         let (mgr, _dir) = enabled(vec![]);
-        let r = mgr.check_auto_allow("bash", &json!({"command": "ls"}), 0.8);
-        assert_eq!(
-            r,
-            CheckResult::Allowed,
-            "#571: safe bash above threshold must auto-allow"
-        );
+        let r = mgr.check_auto_allow("bash", &json!({"command": "ls"}), 0.0);
+        assert!(matches!(r, CheckResult::NeedsPrompt { .. }));
     }
 
-    /// Pin: `check_auto_allow` respects explicit deny rules even when
-    /// the classifier would allow.
+    /// Explicit denials remain authoritative before typed auto-approval.
     #[test]
     fn check_auto_allow_explicit_deny_overrides_classifier() {
         let (mut mgr, _dir) = enabled(vec![]);
@@ -2937,23 +2978,18 @@ mod phase2_spec_pins {
         let r = mgr.check_auto_allow("bash", &json!({"command": "ls"}), 0.8);
         assert!(
             matches!(r, CheckResult::Denied(_)),
-            "#571: explicit Deny must beat classifier auto-allow, got: {r:?}"
+            "explicit Deny must beat typed auto-approval, got: {r:?}"
         );
     }
 
-    /// Pin: low-confidence calls fall through to the normal pipeline
-    /// (`NeedsPrompt` under interactive context).
+    /// Invalid thresholds cannot create auto-approval authority.
     #[test]
-    fn check_auto_allow_low_score_falls_through() {
+    fn check_auto_allow_invalid_threshold_falls_through() {
         let (mgr, _dir) = enabled(vec![]);
-        // `wget` is in the destructive list — score 0.0, threshold 0.5
-        // is never met. Without an explicit Deny rule, the fall-through
-        // is NeedsPrompt.
-        let r = mgr.check_auto_allow("bash", &json!({"command": "echo ok && wget x"}), 0.5);
-        assert!(
-            matches!(r, CheckResult::NeedsPrompt { .. }),
-            "#571: low score must fall through to NeedsPrompt, got: {r:?}"
-        );
+        for threshold in [f32::NAN, -0.1, 1.1] {
+            let r = mgr.check_auto_allow("bash", &json!({"command": "ls"}), threshold);
+            assert!(matches!(r, CheckResult::NeedsPrompt { .. }));
+        }
     }
 
     // ── Crosslink #577: DenialTracker tests ────────────────────────────────

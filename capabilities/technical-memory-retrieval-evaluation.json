@@ -1,0 +1,1655 @@
+{
+  "schema_version": 1,
+  "evaluation_id": "openclaudia-technical-memory-retrieval-evaluation-v1",
+  "generator_id": "s105-evaluation-runner",
+  "evaluator_model_id": "openclaudia-deterministic-retrieval-evaluator-v1",
+  "evaluator_config_digest": "sha256:127969295a539ae27223a5a9cb76c342aa1453a5277383fc9e5bbca67c7deded",
+  "tuning_corpus_id": "openclaudia-technical-memory-tuning-v1",
+  "tuning_corpus_digest": "sha256:6d7c88a1c602c59cc951cee19355bf6fe856aec9c380c74a0a87f4273d47dfcc",
+  "held_out_corpus_id": "openclaudia-technical-memory-heldout-v1",
+  "held_out_corpus_digest": "sha256:6471612b4ddd5c9e06134ee8ba4f740b8eb5dc187f87921004e800680db65592",
+  "trial_count": 3,
+  "selected_policy": "task_conditioned_diverse_v1",
+  "budgets": {
+    "max_candidates_per_case": 128,
+    "max_runtime_candidates_per_call": 512,
+    "max_result_records": 20,
+    "max_runtime_output_bytes": 65536,
+    "max_runtime_evidence_tokens": 65536,
+    "max_context_items": 64,
+    "max_deterministic_work_units_per_trial": 4210688,
+    "max_evidence_tokens_per_trial": 32768,
+    "max_latency_micros_per_trial": 1000000,
+    "max_remote_cost_microusd_per_trial": 0
+  },
+  "mechanisms": [
+    {
+      "mechanism": "lexical_candidate_generation",
+      "status": "evaluated",
+      "reason": "Bounded lexical retrieval is retained as the simple compatibility baseline."
+    },
+    {
+      "mechanism": "semantic_embeddings",
+      "status": "rejected",
+      "reason": "No approved local model artifact or private remote embedding transport is configured."
+    },
+    {
+      "mechanism": "task_conditioning",
+      "status": "evaluated",
+      "reason": "Explicit stage and code-surface context is evaluated without reading ambient prose."
+    },
+    {
+      "mechanism": "hybrid_dense_sparse",
+      "status": "unavailable",
+      "reason": "Hybrid retrieval requires the unavailable approved semantic backend."
+    },
+    {
+      "mechanism": "sparse_field_reranking",
+      "status": "evaluated",
+      "reason": "Field-weighted reranking executes over the bounded typed candidate set."
+    },
+    {
+      "mechanism": "diversity",
+      "status": "evaluated",
+      "reason": "Deterministic component/tag overlap penalties are measured in every trial."
+    },
+    {
+      "mechanism": "freshness",
+      "status": "evaluated",
+      "reason": "Due-for-review records receive a ranking penalty and remain explicitly stale."
+    },
+    {
+      "mechanism": "sufficiency_threshold",
+      "status": "evaluated",
+      "reason": "The selected policy abstains when bounded evidence does not meet its minimum score."
+    }
+  ],
+  "citation_verification_receipts": [
+    {
+      "kind": "configuration",
+      "locator": "rust-toolchain.toml",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:495c69d1db93f25f53e3d0d2d40d812313366cc368de317871c2ace6c6ffafa4",
+      "observed_digest": "sha256:495c69d1db93f25f53e3d0d2d40d812313366cc368de317871c2ace6c6ffafa4",
+      "byte_len": 86
+    },
+    {
+      "kind": "documentation",
+      "locator": "docs/full-codebase-audit-2026-08-16.md",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:67c11719308878460870202b1d8ad6541b9f0cce88ff1a601169f476f27e3a02",
+      "observed_digest": "sha256:67c11719308878460870202b1d8ad6541b9f0cce88ff1a601169f476f27e3a02",
+      "byte_len": 568342
+    },
+    {
+      "kind": "documentation",
+      "locator": "docs/remediation-slices/002-repository-artifact-dependency-policy.md",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:64ba5bacfdfe549b12c16a879fd03ca95d8da55707b472e00f24afb55bf8fda2",
+      "observed_digest": "sha256:64ba5bacfdfe549b12c16a879fd03ca95d8da55707b472e00f24afb55bf8fda2",
+      "byte_len": 16212
+    },
+    {
+      "kind": "documentation",
+      "locator": "docs/remediation-slices/038-session-schema-migration-and-ownership.md",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:0fde32e71faf941b770529d142f4e12bd6bd9596a12e0f1153ccc56a24bb5440",
+      "observed_digest": "sha256:0fde32e71faf941b770529d142f4e12bd6bd9596a12e0f1153ccc56a24bb5440",
+      "byte_len": 1546
+    },
+    {
+      "kind": "documentation",
+      "locator": "docs/remediation-slices/048-hardened-provider-http-transport.md",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:18bb1587d385d4f1cbc9b9159071c88dfa7088f5fa9293306b1c1d32e9634f6d",
+      "observed_digest": "sha256:18bb1587d385d4f1cbc9b9159071c88dfa7088f5fa9293306b1c1d32e9634f6d",
+      "byte_len": 1494
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/main.rs",
+      "source_version": "worktree:s064",
+      "expected_digest": "sha256:ae0fe24999ad3ca165fa2acd41935adcfeab89aa32b20955af9299b23aa6ef1e",
+      "observed_digest": "sha256:ae0fe24999ad3ca165fa2acd41935adcfeab89aa32b20955af9299b23aa6ef1e",
+      "byte_len": 121698
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/memory.rs",
+      "source_version": "worktree:s108",
+      "expected_digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f",
+      "observed_digest": "sha256:e3d7104cc819a6a24cbc53c7d3c0bd407130e40e523df584e57bcb6f63696f6f",
+      "byte_len": 306293
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/memory/review.rs",
+      "source_version": "worktree:s108",
+      "expected_digest": "sha256:930ab1210565e710fa243c60e9339135695ed4f7a2fece8c37886b395cb81b3a",
+      "observed_digest": "sha256:930ab1210565e710fa243c60e9339135695ed4f7a2fece8c37886b395cb81b3a",
+      "byte_len": 47283
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/memory/source.rs",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:99245690f24b07589fe2945e5048374a407db6d24a6ddc0c7cb9fd8b4596019c",
+      "observed_digest": "sha256:99245690f24b07589fe2945e5048374a407db6d24a6ddc0c7cb9fd8b4596019c",
+      "byte_len": 57226
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/migrations/mod.rs",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:71a8f4f2edf115d463b6f29daa4751e2c5a2e534711990a21d2b40599c5fc42d",
+      "observed_digest": "sha256:71a8f4f2edf115d463b6f29daa4751e2c5a2e534711990a21d2b40599c5fc42d",
+      "byte_len": 22684
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/oauth.rs",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:4ebe3395bdbb1c962f948cf8086baa434ece1cb8fab314c60bea7ed0b12b91f7",
+      "observed_digest": "sha256:4ebe3395bdbb1c962f948cf8086baa434ece1cb8fab314c60bea7ed0b12b91f7",
+      "byte_len": 61795
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/providers/model_catalog.rs",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:0558349bae548233710fd6ff89ecbdca5ad2078880499482325167f46398c3ae",
+      "observed_digest": "sha256:0558349bae548233710fd6ff89ecbdca5ad2078880499482325167f46398c3ae",
+      "byte_len": 14919
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/team_memory/authority.rs",
+      "source_version": "worktree:s108",
+      "expected_digest": "sha256:b2b4713cf81c88860846def28ca5b6ed9660675d21399c1de5dab92af565db5c",
+      "observed_digest": "sha256:b2b4713cf81c88860846def28ca5b6ed9660675d21399c1de5dab92af565db5c",
+      "byte_len": 140519
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/team_memory/replication.rs",
+      "source_version": "worktree:s108",
+      "expected_digest": "sha256:7e3740668a3333adc320feb0888426e52aa89502cc1bf22f2948c305b14001b7",
+      "observed_digest": "sha256:7e3740668a3333adc320feb0888426e52aa89502cc1bf22f2948c305b14001b7",
+      "byte_len": 165995
+    },
+    {
+      "kind": "source_file",
+      "locator": "src/tools/bash/mod.rs",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:b6e1101eceaf15b20cc02a08db828e001706873b8448d6a35e7735737d1bd5cb",
+      "observed_digest": "sha256:b6e1101eceaf15b20cc02a08db828e001706873b8448d6a35e7735737d1bd5cb",
+      "byte_len": 78597
+    },
+    {
+      "kind": "test",
+      "locator": "tests/bash_background_e2e.rs",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:499da374ce23f79fbe5411ae61cee5303455b2fbc8224feb69f3b6fca80bc893",
+      "observed_digest": "sha256:499da374ce23f79fbe5411ae61cee5303455b2fbc8224feb69f3b6fca80bc893",
+      "byte_len": 13295
+    },
+    {
+      "kind": "test",
+      "locator": "tests/migrations_runner_e2e.rs",
+      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
+      "expected_digest": "sha256:d70230a137c6cd67e37be47911a4c56d30a7459f548d7313422e8ceb26049e6c",
+      "observed_digest": "sha256:d70230a137c6cd67e37be47911a4c56d30a7459f548d7313422e8ceb26049e6c",
+      "byte_len": 7785
+    },
+    {
+      "kind": "test",
+      "locator": "tests/technical_memory_e2e.rs",
+      "source_version": "worktree:s108",
+      "expected_digest": "sha256:faa232c23db1ed3f268d25ea98f4ba7a38fd2ef39bfce0f8c0527b9cb66c5893",
+      "observed_digest": "sha256:faa232c23db1ed3f268d25ea98f4ba7a38fd2ef39bfce0f8c0527b9cb66c5893",
+      "byte_len": 42858
+    },
+    {
+      "kind": "test",
+      "locator": "tests/technical_memory_retrieval_e2e.rs",
+      "source_version": "worktree:s105",
+      "expected_digest": "sha256:fcf4bff39ef8b0582d6d3ac011e0a0c5b5268b2f817ae37d9965c065006c6826",
+      "observed_digest": "sha256:fcf4bff39ef8b0582d6d3ac011e0a0c5b5268b2f817ae37d9965c065006c6826",
+      "byte_len": 13768
+    }
+  ],
+  "tuning_reports": [
+    {
+      "policy": "no_memory",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 0,
+        "recall_denominator": 8,
+        "precision_numerator": 0,
+        "precision_denominator": 0,
+        "citations_correct": 0,
+        "citations_returned": 0,
+        "harmful_returns": 0,
+        "stale_returns": 0,
+        "evidence_choice_successes": 4,
+        "state_classification_successes": 1,
+        "evidence_bytes": 0,
+        "estimated_evidence_tokens": 0,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 0
+      },
+      "case_receipts": [
+        {
+          "case_id": "tune-conflicted-heads",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-diversity-ablation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-expired-source-is-partial",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-field-weight-ablation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-freshness-ablation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-memory-writer-task",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-no-hit-provider-rotation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-reader-diversity",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-stale-review",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-store-error",
+          "state": "no_hit",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:566e65c2cf38a2d8169110d4c0e59ea1c7f0677362b0299f2acfe97ba32aa1e5",
+          "elapsed_micros": 111
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:08eb0cd75327cabbceb73f19021eaab5da1177522652c5b64bac8c3d824daff3",
+          "elapsed_micros": 88
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:5e279a69a259bb40a81041cc320cc1d47e86f28b40a3f8f1b177210c47f1faeb",
+          "elapsed_micros": 88
+        }
+      ]
+    },
+    {
+      "policy": "lexical_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 4,
+        "recall_denominator": 8,
+        "precision_numerator": 4,
+        "precision_denominator": 9,
+        "citations_correct": 9,
+        "citations_returned": 9,
+        "harmful_returns": 5,
+        "stale_returns": 2,
+        "evidence_choice_successes": 6,
+        "state_classification_successes": 8,
+        "evidence_bytes": 14326,
+        "estimated_evidence_tokens": 14326,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 50
+      },
+      "case_receipts": [
+        {
+          "case_id": "tune-conflicted-heads",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-diverse-primary",
+            "tune-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "tune-expired-source-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-field-body"
+          ]
+        },
+        {
+          "case_id": "tune-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-freshness-stale"
+          ]
+        },
+        {
+          "case_id": "tune-memory-writer-task",
+          "state": "partial",
+          "returned_ids": [
+            "tune-process-writer"
+          ]
+        },
+        {
+          "case_id": "tune-no-hit-provider-rotation",
+          "state": "complete",
+          "returned_ids": [
+            "tune-certificate-docs"
+          ]
+        },
+        {
+          "case_id": "tune-reader-diversity",
+          "state": "complete",
+          "returned_ids": [
+            "tune-memory-reader",
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-stale-review",
+          "state": "stale",
+          "returned_ids": [
+            "tune-review-stale"
+          ]
+        },
+        {
+          "case_id": "tune-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:8289a8bc02cb4f099c90092986270c70c66da345fb1dc650335f6803f3524c37",
+          "elapsed_micros": 3243
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:2cf9a7107a498bab9ae21c2d7bec86b19f1421802eee2f0904a575f957cd1189",
+          "elapsed_micros": 3191
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:24563ce15f63e065913c341881e40df39e51b0bece4473a4fb4eb12b8b1ebb21",
+          "elapsed_micros": 3189
+        }
+      ]
+    },
+    {
+      "policy": "field_weighted_sparse_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 5,
+        "recall_denominator": 8,
+        "precision_numerator": 5,
+        "precision_denominator": 9,
+        "citations_correct": 9,
+        "citations_returned": 9,
+        "harmful_returns": 4,
+        "stale_returns": 2,
+        "evidence_choice_successes": 7,
+        "state_classification_successes": 8,
+        "evidence_bytes": 14308,
+        "estimated_evidence_tokens": 14308,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 50
+      },
+      "case_receipts": [
+        {
+          "case_id": "tune-conflicted-heads",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-diverse-primary",
+            "tune-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "tune-expired-source-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-field-title"
+          ]
+        },
+        {
+          "case_id": "tune-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-freshness-stale"
+          ]
+        },
+        {
+          "case_id": "tune-memory-writer-task",
+          "state": "partial",
+          "returned_ids": [
+            "tune-process-writer"
+          ]
+        },
+        {
+          "case_id": "tune-no-hit-provider-rotation",
+          "state": "complete",
+          "returned_ids": [
+            "tune-certificate-docs"
+          ]
+        },
+        {
+          "case_id": "tune-reader-diversity",
+          "state": "complete",
+          "returned_ids": [
+            "tune-memory-reader",
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-stale-review",
+          "state": "stale",
+          "returned_ids": [
+            "tune-review-stale"
+          ]
+        },
+        {
+          "case_id": "tune-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:5b165035aa946d07d4ddda1e37b49ee61a21e1ab488c549d43420cd2ca7f5860",
+          "elapsed_micros": 3400
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:10cbd32d69ba836b455e6b6955930e377347774da4a0379dc22ca51990f76ed2",
+          "elapsed_micros": 2642
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:e82c3d24bb57ec8d412a462cd615f490bfaa62629fb8dd3c113780c74c262b71",
+          "elapsed_micros": 2648
+        }
+      ]
+    },
+    {
+      "policy": "task_conditioned_sparse_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 6,
+        "recall_denominator": 8,
+        "precision_numerator": 6,
+        "precision_denominator": 9,
+        "citations_correct": 9,
+        "citations_returned": 9,
+        "harmful_returns": 3,
+        "stale_returns": 2,
+        "evidence_choice_successes": 8,
+        "state_classification_successes": 8,
+        "evidence_bytes": 14338,
+        "estimated_evidence_tokens": 14338,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 50
+      },
+      "case_receipts": [
+        {
+          "case_id": "tune-conflicted-heads",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-diverse-primary",
+            "tune-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "tune-expired-source-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-field-title"
+          ]
+        },
+        {
+          "case_id": "tune-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-freshness-stale"
+          ]
+        },
+        {
+          "case_id": "tune-memory-writer-task",
+          "state": "partial",
+          "returned_ids": [
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-no-hit-provider-rotation",
+          "state": "complete",
+          "returned_ids": [
+            "tune-certificate-docs"
+          ]
+        },
+        {
+          "case_id": "tune-reader-diversity",
+          "state": "complete",
+          "returned_ids": [
+            "tune-memory-reader",
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-stale-review",
+          "state": "stale",
+          "returned_ids": [
+            "tune-review-stale"
+          ]
+        },
+        {
+          "case_id": "tune-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:6832b540c92625bb07b52f4ca6440740df00e82490c3a77860274ab6a39c4a2c",
+          "elapsed_micros": 2712
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:d4af2b5bc85bc0e3d893d8ac9894d94b8836d0f4de44c65f1bda17176f62c14d",
+          "elapsed_micros": 2734
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:89f80cdc06f447f64d95bec24a43b398413c21bb978cf393427fe2793c8aa53d",
+          "elapsed_micros": 2760
+        }
+      ]
+    },
+    {
+      "policy": "task_conditioned_freshness_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 7,
+        "recall_denominator": 8,
+        "precision_numerator": 7,
+        "precision_denominator": 9,
+        "citations_correct": 9,
+        "citations_returned": 9,
+        "harmful_returns": 2,
+        "stale_returns": 1,
+        "evidence_choice_successes": 9,
+        "state_classification_successes": 8,
+        "evidence_bytes": 14247,
+        "estimated_evidence_tokens": 14247,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 50
+      },
+      "case_receipts": [
+        {
+          "case_id": "tune-conflicted-heads",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-diverse-primary",
+            "tune-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "tune-expired-source-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-field-title"
+          ]
+        },
+        {
+          "case_id": "tune-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-freshness-current"
+          ]
+        },
+        {
+          "case_id": "tune-memory-writer-task",
+          "state": "partial",
+          "returned_ids": [
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-no-hit-provider-rotation",
+          "state": "complete",
+          "returned_ids": [
+            "tune-certificate-docs"
+          ]
+        },
+        {
+          "case_id": "tune-reader-diversity",
+          "state": "complete",
+          "returned_ids": [
+            "tune-memory-reader",
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-stale-review",
+          "state": "stale",
+          "returned_ids": [
+            "tune-review-stale"
+          ]
+        },
+        {
+          "case_id": "tune-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:d79069cad38e7f0f2222231fc2944f1f6f47d197854ad41ff8eedae752d2aa82",
+          "elapsed_micros": 2746
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:c6b2bf77e6e890341725e6534c3a61b8966c9867e8536ed80b3f3d49c35c1393",
+          "elapsed_micros": 2776
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:8e6fe539bb58373378f00b52408e7b3c820d1f5c76c2f060c784fdb3f144ee9a",
+          "elapsed_micros": 2807
+        }
+      ]
+    },
+    {
+      "policy": "task_conditioned_threshold_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 7,
+        "recall_denominator": 8,
+        "precision_numerator": 7,
+        "precision_denominator": 8,
+        "citations_correct": 8,
+        "citations_returned": 8,
+        "harmful_returns": 1,
+        "stale_returns": 1,
+        "evidence_choice_successes": 10,
+        "state_classification_successes": 10,
+        "evidence_bytes": 12555,
+        "estimated_evidence_tokens": 12555,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 50
+      },
+      "case_receipts": [
+        {
+          "case_id": "tune-conflicted-heads",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-diverse-primary",
+            "tune-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "tune-expired-source-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-field-title"
+          ]
+        },
+        {
+          "case_id": "tune-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-freshness-current"
+          ]
+        },
+        {
+          "case_id": "tune-memory-writer-task",
+          "state": "complete",
+          "returned_ids": [
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-no-hit-provider-rotation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-reader-diversity",
+          "state": "complete",
+          "returned_ids": [
+            "tune-memory-reader",
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-stale-review",
+          "state": "stale",
+          "returned_ids": [
+            "tune-review-stale"
+          ]
+        },
+        {
+          "case_id": "tune-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:51960ec31856bb2726d454053dfb39093741afe4696b0ac6d7e81de04c8e7b14",
+          "elapsed_micros": 2630
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:0b403fb71d3753cb96f3efe9d8b96e94a85abcc62b11c95d3d894a82c3b6ccc8",
+          "elapsed_micros": 2596
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:0d139af0d4cc0e639c49bf4c9ba94ec1d424ffcc7ebc555611d295063db9b8fa",
+          "elapsed_micros": 2614
+        }
+      ]
+    },
+    {
+      "policy": "task_conditioned_diverse_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 8,
+        "recall_denominator": 8,
+        "precision_numerator": 8,
+        "precision_denominator": 8,
+        "citations_correct": 8,
+        "citations_returned": 8,
+        "harmful_returns": 0,
+        "stale_returns": 1,
+        "evidence_choice_successes": 10,
+        "state_classification_successes": 10,
+        "evidence_bytes": 12584,
+        "estimated_evidence_tokens": 12584,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 84
+      },
+      "case_receipts": [
+        {
+          "case_id": "tune-conflicted-heads",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-diverse-primary",
+            "tune-diverse-independent"
+          ]
+        },
+        {
+          "case_id": "tune-expired-source-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-field-title"
+          ]
+        },
+        {
+          "case_id": "tune-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "tune-freshness-current"
+          ]
+        },
+        {
+          "case_id": "tune-memory-writer-task",
+          "state": "complete",
+          "returned_ids": [
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-no-hit-provider-rotation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "tune-reader-diversity",
+          "state": "complete",
+          "returned_ids": [
+            "tune-memory-reader",
+            "tune-memory-writer"
+          ]
+        },
+        {
+          "case_id": "tune-stale-review",
+          "state": "stale",
+          "returned_ids": [
+            "tune-review-stale"
+          ]
+        },
+        {
+          "case_id": "tune-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:5d317e4e7a4cf7caa13b51a5abf6a95b221ab7000248fbdd438ab5f78d7d3284",
+          "elapsed_micros": 2605
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:35c88aa1b7389a2a8804980d3af911f8a1d54171d8ddae94902bf2c96e34ed33",
+          "elapsed_micros": 2647
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:515b1b125e2fa9791b4e6e8d661fc77af43c527882e4726aaae3aceb143e1eb5",
+          "elapsed_micros": 2629
+        }
+      ]
+    }
+  ],
+  "held_out_reports": [
+    {
+      "policy": "no_memory",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 0,
+        "recall_denominator": 7,
+        "precision_numerator": 0,
+        "precision_denominator": 0,
+        "citations_correct": 0,
+        "citations_returned": 0,
+        "harmful_returns": 0,
+        "stale_returns": 0,
+        "evidence_choice_successes": 4,
+        "state_classification_successes": 1,
+        "evidence_bytes": 0,
+        "estimated_evidence_tokens": 0,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 0
+      },
+      "case_receipts": [
+        {
+          "case_id": "held-build-toolchain-task",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-conflicted-schema",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-diversity-ablation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-expired-membership-is-partial",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-field-weight-ablation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-freshness-ablation",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-migration-lock-task",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-no-hit-oauth-refresh",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-stale-provider-cache",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-store-error",
+          "state": "no_hit",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:856ac89c77f1a217b92abac7242bb35f640fd340102902a69cad374f4cf41fe6",
+          "elapsed_micros": 66
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:6aeae3561539270ba0a7d4936298be5159c3bc1498de4fdbf5d4a45ee7e5d365",
+          "elapsed_micros": 64
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:5d5bd967d4c43d64feb66ebbea6710ed720dbd9358eb72b1b0110587fdf87148",
+          "elapsed_micros": 64
+        }
+      ]
+    },
+    {
+      "policy": "lexical_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 2,
+        "recall_denominator": 7,
+        "precision_numerator": 2,
+        "precision_denominator": 8,
+        "citations_correct": 8,
+        "citations_returned": 8,
+        "harmful_returns": 6,
+        "stale_returns": 2,
+        "evidence_choice_successes": 5,
+        "state_classification_successes": 7,
+        "evidence_bytes": 12961,
+        "estimated_evidence_tokens": 12961,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 44
+      },
+      "case_receipts": [
+        {
+          "case_id": "held-build-toolchain-task",
+          "state": "partial",
+          "returned_ids": [
+            "held-rust-doc-note"
+          ]
+        },
+        {
+          "case_id": "held-conflicted-schema",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-diverse-primary",
+            "held-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "held-expired-membership-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-field-body"
+          ]
+        },
+        {
+          "case_id": "held-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-freshness-stale"
+          ]
+        },
+        {
+          "case_id": "held-migration-lock-task",
+          "state": "partial",
+          "returned_ids": [
+            "held-migration-doctor"
+          ]
+        },
+        {
+          "case_id": "held-no-hit-oauth-refresh",
+          "state": "complete",
+          "returned_ids": [
+            "held-rust-doc-note"
+          ]
+        },
+        {
+          "case_id": "held-stale-provider-cache",
+          "state": "stale",
+          "returned_ids": [
+            "held-cache-stale"
+          ]
+        },
+        {
+          "case_id": "held-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:53692287577d117b91ac0b977eb53872fb634e6d09ea98a5ffb307d7fd46bfff",
+          "elapsed_micros": 2368
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:b89da651ecd976f484a2f9a141f631703d391d1fa2dca86b5e61d6997f62770b",
+          "elapsed_micros": 2362
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:9a069098cfffe95f7dd3d14c53995e7843ad20984e4c1cc56d74c064c9651f14",
+          "elapsed_micros": 2363
+        }
+      ]
+    },
+    {
+      "policy": "field_weighted_sparse_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 4,
+        "recall_denominator": 7,
+        "precision_numerator": 4,
+        "precision_denominator": 8,
+        "citations_correct": 8,
+        "citations_returned": 8,
+        "harmful_returns": 4,
+        "stale_returns": 2,
+        "evidence_choice_successes": 7,
+        "state_classification_successes": 7,
+        "evidence_bytes": 12790,
+        "estimated_evidence_tokens": 12790,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 44
+      },
+      "case_receipts": [
+        {
+          "case_id": "held-build-toolchain-task",
+          "state": "partial",
+          "returned_ids": [
+            "held-toolchain-config"
+          ]
+        },
+        {
+          "case_id": "held-conflicted-schema",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-diverse-primary",
+            "held-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "held-expired-membership-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-field-title"
+          ]
+        },
+        {
+          "case_id": "held-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-freshness-stale"
+          ]
+        },
+        {
+          "case_id": "held-migration-lock-task",
+          "state": "partial",
+          "returned_ids": [
+            "held-migration-doctor"
+          ]
+        },
+        {
+          "case_id": "held-no-hit-oauth-refresh",
+          "state": "complete",
+          "returned_ids": [
+            "held-rust-doc-note"
+          ]
+        },
+        {
+          "case_id": "held-stale-provider-cache",
+          "state": "stale",
+          "returned_ids": [
+            "held-cache-stale"
+          ]
+        },
+        {
+          "case_id": "held-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:f8af0c9d66e8598df4518e6cca7ea3d63b1f52f96a7412c6f729ec2858bfaa52",
+          "elapsed_micros": 2520
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:70a50c037ca54858907ea4bebcfd40426699f4324fbd2fca420932a2327060d9",
+          "elapsed_micros": 2498
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:4c9cfe7901cb06f70dae7565c1d4441e3fc812657268defde7c5eff5ed8afafe",
+          "elapsed_micros": 2497
+        }
+      ]
+    },
+    {
+      "policy": "task_conditioned_sparse_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 5,
+        "recall_denominator": 7,
+        "precision_numerator": 5,
+        "precision_denominator": 8,
+        "citations_correct": 8,
+        "citations_returned": 8,
+        "harmful_returns": 3,
+        "stale_returns": 2,
+        "evidence_choice_successes": 8,
+        "state_classification_successes": 7,
+        "evidence_bytes": 12861,
+        "estimated_evidence_tokens": 12861,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 44
+      },
+      "case_receipts": [
+        {
+          "case_id": "held-build-toolchain-task",
+          "state": "partial",
+          "returned_ids": [
+            "held-toolchain-config"
+          ]
+        },
+        {
+          "case_id": "held-conflicted-schema",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-diverse-primary",
+            "held-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "held-expired-membership-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-field-title"
+          ]
+        },
+        {
+          "case_id": "held-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-freshness-stale"
+          ]
+        },
+        {
+          "case_id": "held-migration-lock-task",
+          "state": "partial",
+          "returned_ids": [
+            "held-migration-lock"
+          ]
+        },
+        {
+          "case_id": "held-no-hit-oauth-refresh",
+          "state": "complete",
+          "returned_ids": [
+            "held-rust-doc-note"
+          ]
+        },
+        {
+          "case_id": "held-stale-provider-cache",
+          "state": "stale",
+          "returned_ids": [
+            "held-cache-stale"
+          ]
+        },
+        {
+          "case_id": "held-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:ff200dddba55a34eac64d4fe13915facfeac11d63a9400a107f8e6beb2f75c11",
+          "elapsed_micros": 2599
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:cda18a11c3c4cf5c00084e401b2262ac83a438badf4a308028d446150cbce48f",
+          "elapsed_micros": 2550
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:6a3c372ebbb9f1dbc92a682224c7745406ff70981c783da0d66d3978b323e03e",
+          "elapsed_micros": 2549
+        }
+      ]
+    },
+    {
+      "policy": "task_conditioned_freshness_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 6,
+        "recall_denominator": 7,
+        "precision_numerator": 6,
+        "precision_denominator": 8,
+        "citations_correct": 8,
+        "citations_returned": 8,
+        "harmful_returns": 2,
+        "stale_returns": 1,
+        "evidence_choice_successes": 9,
+        "state_classification_successes": 7,
+        "evidence_bytes": 12822,
+        "estimated_evidence_tokens": 12822,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 44
+      },
+      "case_receipts": [
+        {
+          "case_id": "held-build-toolchain-task",
+          "state": "partial",
+          "returned_ids": [
+            "held-toolchain-config"
+          ]
+        },
+        {
+          "case_id": "held-conflicted-schema",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-diverse-primary",
+            "held-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "held-expired-membership-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-field-title"
+          ]
+        },
+        {
+          "case_id": "held-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-freshness-current"
+          ]
+        },
+        {
+          "case_id": "held-migration-lock-task",
+          "state": "partial",
+          "returned_ids": [
+            "held-migration-lock"
+          ]
+        },
+        {
+          "case_id": "held-no-hit-oauth-refresh",
+          "state": "complete",
+          "returned_ids": [
+            "held-rust-doc-note"
+          ]
+        },
+        {
+          "case_id": "held-stale-provider-cache",
+          "state": "stale",
+          "returned_ids": [
+            "held-cache-stale"
+          ]
+        },
+        {
+          "case_id": "held-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:116aceb71535a376fdf7c7d6fd356cb3d3a5a423b2b4a2e56164bf37521a0365",
+          "elapsed_micros": 2535
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:a9e3b9ff06be915534ab4f23057cbad1f9b856537914d421428695493820c247",
+          "elapsed_micros": 2539
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:858b998faaf6f87bdf064711de87ca07cff3dcb0d895fadb67a3485bc252b953",
+          "elapsed_micros": 2547
+        }
+      ]
+    },
+    {
+      "policy": "task_conditioned_threshold_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 6,
+        "recall_denominator": 7,
+        "precision_numerator": 6,
+        "precision_denominator": 7,
+        "citations_correct": 7,
+        "citations_returned": 7,
+        "harmful_returns": 1,
+        "stale_returns": 1,
+        "evidence_choice_successes": 10,
+        "state_classification_successes": 10,
+        "evidence_bytes": 11155,
+        "estimated_evidence_tokens": 11155,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 44
+      },
+      "case_receipts": [
+        {
+          "case_id": "held-build-toolchain-task",
+          "state": "complete",
+          "returned_ids": [
+            "held-toolchain-config"
+          ]
+        },
+        {
+          "case_id": "held-conflicted-schema",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-diverse-primary",
+            "held-diverse-duplicate"
+          ]
+        },
+        {
+          "case_id": "held-expired-membership-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-field-title"
+          ]
+        },
+        {
+          "case_id": "held-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-freshness-current"
+          ]
+        },
+        {
+          "case_id": "held-migration-lock-task",
+          "state": "complete",
+          "returned_ids": [
+            "held-migration-lock"
+          ]
+        },
+        {
+          "case_id": "held-no-hit-oauth-refresh",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-stale-provider-cache",
+          "state": "stale",
+          "returned_ids": [
+            "held-cache-stale"
+          ]
+        },
+        {
+          "case_id": "held-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:c8dc7e84016dd49577d0144d03cb82590c016018dc44748574a90cfb2438a15c",
+          "elapsed_micros": 2407
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:2ffaff5b78b56877fe344651a919a3661992a12139d17431b9721c52f24ff4cc",
+          "elapsed_micros": 2417
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:70140bde6962e5ce808b90b4766a87946ffa79caf4da3332541d87e429ed2873",
+          "elapsed_micros": 2407
+        }
+      ]
+    },
+    {
+      "policy": "task_conditioned_diverse_v1",
+      "metrics": {
+        "cases": 10,
+        "recall_numerator": 7,
+        "recall_denominator": 7,
+        "precision_numerator": 7,
+        "precision_denominator": 7,
+        "citations_correct": 7,
+        "citations_returned": 7,
+        "harmful_returns": 0,
+        "stale_returns": 1,
+        "evidence_choice_successes": 10,
+        "state_classification_successes": 10,
+        "evidence_bytes": 11142,
+        "estimated_evidence_tokens": 11142,
+        "remote_cost_microusd": 0,
+        "deterministic_work_units": 73
+      },
+      "case_receipts": [
+        {
+          "case_id": "held-build-toolchain-task",
+          "state": "complete",
+          "returned_ids": [
+            "held-toolchain-config"
+          ]
+        },
+        {
+          "case_id": "held-conflicted-schema",
+          "state": "conflicted",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-diversity-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-diverse-primary",
+            "held-diverse-independent"
+          ]
+        },
+        {
+          "case_id": "held-expired-membership-is-partial",
+          "state": "partial",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-field-weight-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-field-title"
+          ]
+        },
+        {
+          "case_id": "held-freshness-ablation",
+          "state": "partial",
+          "returned_ids": [
+            "held-freshness-current"
+          ]
+        },
+        {
+          "case_id": "held-migration-lock-task",
+          "state": "complete",
+          "returned_ids": [
+            "held-migration-lock"
+          ]
+        },
+        {
+          "case_id": "held-no-hit-oauth-refresh",
+          "state": "no_hit",
+          "returned_ids": []
+        },
+        {
+          "case_id": "held-stale-provider-cache",
+          "state": "stale",
+          "returned_ids": [
+            "held-cache-stale"
+          ]
+        },
+        {
+          "case_id": "held-store-error",
+          "state": "store_error",
+          "returned_ids": []
+        }
+      ],
+      "trials": [
+        {
+          "trial": 1,
+          "output_digest": "sha256:8b7101b28e0f9642dbd415d3a8effb9324a829f1f428e87aba5a4a145b6b55e3",
+          "elapsed_micros": 2429
+        },
+        {
+          "trial": 2,
+          "output_digest": "sha256:c5de28fd8169477e14628cbc21372561f7f355d10be79c4e7c578240156d467d",
+          "elapsed_micros": 2417
+        },
+        {
+          "trial": 3,
+          "output_digest": "sha256:264f9e0eb460c7b6fbd0bc2e1dd448d2a2d27e99ce1b02dff8431712e7fb4e22",
+          "elapsed_micros": 2417
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Three deterministic trials prove repeatability and bounded final-environment execution, not stochastic model generalization.",
+    "No approved private semantic backend exists in this build; semantic and hybrid policies remain unavailable instead of sending private lessons to a remote service.",
+    "Evidence-choice success measures whether the retrieval result supplies the expected cited lesson; alternate-model downstream task grading remains part of canonical VDD S-088.",
+    "Citation verification rejects symbolic-link traversal and binds exact bytes in a trusted quiescent checkout; descriptor-safe verification under concurrent repository mutation remains a release/VDD boundary."
+  ]
+}

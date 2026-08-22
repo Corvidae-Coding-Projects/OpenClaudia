@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::process::Command;
 
 /// Kill a background shell
-pub fn execute_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_kill_shell(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let shell_id = match args.get("shell_id") {
         None => return ("Missing 'shell_id' argument".to_string(), true),
         Some(Value::String(shell_id)) => shell_id.as_str(),
@@ -19,14 +22,17 @@ pub fn execute_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
         }
     };
 
-    match BACKGROUND_SHELLS.kill(shell_id) {
+    match BACKGROUND_SHELLS.kill(run, shell_id) {
         Ok(msg) => (msg, false),
         Err(e) => (e, true),
     }
 }
 
 /// Kill every background shell owned by an agent/session id.
-pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_kill_shells_for_agent(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     let agent_id = match args.get("agent_id") {
         None => return ("Missing 'agent_id' argument".to_string(), true),
         Some(Value::String(agent_id)) => agent_id.as_str(),
@@ -41,7 +47,7 @@ pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, 
     if agent_id.is_empty() {
         return ("Missing 'agent_id' argument".to_string(), true);
     }
-    let caller = crate::tools::todo::current_session_key();
+    let caller = run.process_owner();
     if agent_id != caller {
         tracing::warn!(
             target: "openclaudia::bash",
@@ -56,7 +62,7 @@ pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, 
         );
     }
 
-    (BACKGROUND_SHELLS.kill_for_agent(agent_id), false)
+    (BACKGROUND_SHELLS.kill_for_run(run), false)
 }
 
 /// Terminate a process and its entire process group.
@@ -69,6 +75,11 @@ pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, 
 ///
 /// On Windows, uses `taskkill /T` which terminates the process tree.
 pub fn terminate_process_tree(pid: u32) {
+    if pid == 0 {
+        tracing::debug!("terminate_process_tree: refusing process-group sentinel PID 0");
+        return;
+    }
+
     #[cfg(target_os = "linux")]
     {
         terminate_linux_process_tree(pid);
@@ -149,6 +160,125 @@ pub fn terminate_process_tree(pid: u32) {
     }
 }
 
+/// Force-stop a synchronous sandbox tree without allowing signal handlers to
+/// fork a replacement process during cancellation.
+///
+/// Bubblewrap creates a new session inside its PID namespace. That terminal
+/// isolation means the inner command is not necessarily in the outer
+/// wrapper's process group. Linux cancellation therefore freezes the wrapper,
+/// discovers and freezes every current descendant, and only then sends
+/// `SIGKILL`. The ordinary [`terminate_process_tree`] path remains graceful
+/// for user-requested background-shell termination; this stronger path is
+/// reserved for a cancelled synchronous sandbox whose authority is revoked.
+pub fn terminate_sandbox_process_tree(pid: u32) {
+    if pid == 0 {
+        tracing::debug!("terminate_sandbox_process_tree: refusing process-group sentinel PID 0");
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        force_terminate_linux_process_tree(pid);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        terminate_process_tree(pid);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn force_terminate_linux_process_tree(pid: u32) {
+    use std::collections::{HashSet, VecDeque};
+    use std::time::Duration;
+
+    let Ok(root) = i32::try_from(pid) else {
+        return;
+    };
+    let descendants = || {
+        let mut found = Vec::new();
+        let mut seen = HashSet::from([root]);
+        let mut queue = VecDeque::from([root]);
+        while let Some(parent) = queue.pop_front() {
+            let task_dir = format!("/proc/{parent}/task");
+            let Ok(tasks) = std::fs::read_dir(task_dir) else {
+                continue;
+            };
+            for task in tasks.flatten() {
+                let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+                    continue;
+                };
+                for child in children
+                    .split_whitespace()
+                    .filter_map(|value| value.parse::<i32>().ok())
+                {
+                    if child > 0 && seen.insert(child) {
+                        found.push(child);
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+        found
+    };
+
+    // Stop the group leader before taking a descendant snapshot. Otherwise a
+    // wrapper can fork the namespace child after the snapshot but before the
+    // terminating signal reaches it.
+    // SAFETY: `root` is a positive PID representable by `pid_t`; negative
+    // values select its process group. `kill(2)` does not dereference memory.
+    unsafe {
+        libc::kill(-root, libc::SIGSTOP);
+        libc::kill(root, libc::SIGSTOP);
+    }
+
+    let mut frozen = HashSet::from([root]);
+    let mut stable_rounds = 0_u8;
+    for _ in 0..32 {
+        let mut added = false;
+        for descendant in descendants() {
+            if frozen.insert(descendant) {
+                // SAFETY: descendants are positive PIDs read from procfs;
+                // `kill(2)` does not dereference memory.
+                unsafe {
+                    libc::kill(descendant, libc::SIGSTOP);
+                }
+                added = true;
+            }
+        }
+        if added {
+            stable_rounds = 0;
+        } else {
+            stable_rounds = stable_rounds.saturating_add(1);
+            if stable_rounds >= 2 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Every observed process is stopped, so no TERM trap can fork a new
+    // session between the final snapshot and termination.
+    for descendant in frozen
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != root)
+    {
+        // SAFETY: each target is a positive PID previously read from procfs
+        // and frozen by this function; `kill(2)` does not dereference memory.
+        unsafe {
+            libc::kill(descendant, libc::SIGKILL);
+        }
+    }
+    // SAFETY: same validated root/process-group identity as the SIGSTOP calls
+    // above; `kill(2)` does not dereference memory.
+    unsafe {
+        libc::kill(-root, libc::SIGKILL);
+        libc::kill(root, libc::SIGKILL);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+}
+
 #[cfg(target_os = "linux")]
 fn terminate_linux_process_tree(pid: u32) {
     use std::collections::{HashSet, VecDeque};
@@ -221,6 +351,10 @@ fn terminate_linux_process_tree(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
     use std::collections::HashMap;
 
     #[test]
@@ -248,6 +382,79 @@ mod tests {
         terminate_process_tree(out_of_range_pid);
     }
 
+    #[test]
+    fn process_tree_termination_refuses_process_group_sentinel_pid_zero() {
+        terminate_process_tree(0);
+        terminate_sandbox_process_tree(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_sandbox_termination_prevents_a_descendant_from_forking_on_term() {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        which::which("setsid").expect("Linux cancellation fixture requires the setsid utility");
+        let fixture = tempfile::tempdir().expect("cancellation fixture");
+        let marker_path = fixture.path().join("escaped-marker");
+        let pid_file_path = fixture.path().join("escaped-pid");
+        let marker = shlex::try_quote(marker_path.to_str().expect("UTF-8 marker")).expect("quote");
+        let pid_file =
+            shlex::try_quote(pid_file_path.to_str().expect("UTF-8 pid file")).expect("quote");
+        let descendant_script = fixture.path().join("term-fork.sh");
+        std::fs::write(
+            &descendant_script,
+            format!(
+                "#!/bin/sh\n\
+                 trap 'setsid sh -c \"sleep 1; echo survived > {marker}\" & exit 0' TERM\n\
+                 echo $$ > {pid_file}\n\
+                 while :; do sleep 1; done\n"
+            ),
+        )
+        .expect("write signal-handler fixture");
+        let descendant_script =
+            shlex::try_quote(descendant_script.to_str().expect("UTF-8 descendant script"))
+                .expect("quote");
+        let script = format!("sh {descendant_script} & sleep 30");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn process tree");
+
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_file_path.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            pid_file_path.exists(),
+            "signal-handler descendant did not start"
+        );
+
+        terminate_sandbox_process_tree(child.id());
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(1_200));
+
+        if let Ok(pid) = std::fs::read_to_string(&pid_file_path) {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                if pid > 0 {
+                    // SAFETY: this is a best-effort cleanup of the positive PID
+                    // written by the test fixture; `kill(2)` dereferences no memory.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        assert!(
+            !marker_path.exists(),
+            "a signal handler forked a replacement process during sandbox termination"
+        );
+    }
+
     // ── Phase 2 pinning tests (crosslink #541) ────────────────────────────────
     // Pins OC's CURRENT kill_shell contracts per spec crosslink #526 §B2.
 
@@ -257,7 +464,7 @@ mod tests {
     #[test]
     fn b2_kill_missing_shell_id_arg() {
         let args: HashMap<String, serde_json::Value> = HashMap::new();
-        let (msg, is_error) = execute_kill_shell(&args);
+        let (msg, is_error) = execute_kill_shell(test_run(), &args);
         assert!(is_error, "b2_kill_missing_arg: must be is_error=true");
         assert!(
             msg.contains("Missing"),
@@ -269,7 +476,7 @@ mod tests {
     fn b2_kill_rejects_non_string_shell_id_arg() {
         let mut args = HashMap::new();
         args.insert("shell_id".to_string(), serde_json::json!(42));
-        let (msg, is_error) = execute_kill_shell(&args);
+        let (msg, is_error) = execute_kill_shell(test_run(), &args);
         assert!(is_error, "non-string shell_id must be rejected: {msg}");
         assert!(
             msg.contains("Invalid 'shell_id' argument: expected string"),
@@ -281,7 +488,7 @@ mod tests {
     fn kill_shells_for_agent_rejects_non_string_agent_id_arg() {
         let mut args = HashMap::new();
         args.insert("agent_id".to_string(), serde_json::json!(42));
-        let (msg, is_error) = execute_kill_shells_for_agent(&args);
+        let (msg, is_error) = execute_kill_shells_for_agent(test_run(), &args);
         assert!(is_error, "non-string agent_id must be rejected: {msg}");
         assert!(
             msg.contains("Invalid 'agent_id' argument: expected string"),
@@ -299,7 +506,7 @@ mod tests {
             "shell_id".to_string(),
             serde_json::Value::String("deadbeef".to_string()),
         );
-        let (msg, is_error) = execute_kill_shell(&args);
+        let (msg, is_error) = execute_kill_shell(test_run(), &args);
         assert!(is_error, "b2_kill_unknown_id: must be is_error=true");
         assert!(
             msg.contains("not found"),
@@ -317,7 +524,7 @@ mod tests {
     fn b2_kill_running_shell_returns_terminated_message() {
         // Spawn a long-running background shell via the manager
         let shell_id = super::super::BACKGROUND_SHELLS
-            .spawn("sleep 30")
+            .spawn(test_run(), "sleep 30")
             .expect("b2_kill_running: spawn must succeed");
 
         let mut args = HashMap::new();
@@ -325,7 +532,7 @@ mod tests {
             "shell_id".to_string(),
             serde_json::Value::String(shell_id.clone()),
         );
-        let (msg, is_error) = execute_kill_shell(&args);
+        let (msg, is_error) = execute_kill_shell(test_run(), &args);
 
         assert!(
             !is_error,
@@ -349,7 +556,7 @@ mod tests {
     #[cfg(unix)]
     fn b2_kill_same_shell_twice_second_is_not_found() {
         let shell_id = super::super::BACKGROUND_SHELLS
-            .spawn("sleep 30")
+            .spawn(test_run(), "sleep 30")
             .expect("b2_kill_twice: spawn must succeed");
 
         let make_args = |id: &str| {
@@ -361,10 +568,10 @@ mod tests {
             args
         };
 
-        let (_, first_err) = execute_kill_shell(&make_args(&shell_id));
+        let (_, first_err) = execute_kill_shell(test_run(), &make_args(&shell_id));
         assert!(!first_err, "b2_kill_twice: first kill must succeed");
 
-        let (msg2, second_err) = execute_kill_shell(&make_args(&shell_id));
+        let (msg2, second_err) = execute_kill_shell(test_run(), &make_args(&shell_id));
         assert!(
             second_err,
             "b2_kill_twice: second kill must be is_error=true (entry removed)"

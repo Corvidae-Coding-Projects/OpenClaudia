@@ -4,15 +4,17 @@ mod grep;
 mod list;
 mod notebook;
 mod read;
-mod secure_fs;
+pub mod secure_fs;
 mod write;
 
 pub use edit::execute_edit_file;
 pub use glob::execute_glob;
 pub use grep::execute_grep;
 pub use list::execute_list_files;
-#[allow(unused_imports)] // used by tests in tools::mod
-pub use notebook::{execute_notebook_edit, source_to_line_array};
+#[cfg(test)]
+pub use notebook::execute_notebook_edit;
+pub use notebook::execute_notebook_edit_typed;
+pub use notebook::source_to_line_array;
 #[allow(unused_imports)] // used by tests in tools::mod
 pub use read::{
     detect_file_type, parse_page_range, read_image_file, read_notebook_file, read_text_file,
@@ -22,7 +24,7 @@ pub use write::execute_write_file;
 
 use crate::tools::args::{ToolArgError, ToolArgs as _};
 use std::collections::HashMap;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
@@ -32,11 +34,11 @@ const LEDGER_EXCERPT_MAX_BYTES: usize = 100_000;
 
 /// Maximum number of entries in the read tracker, per session, before
 /// the oldest write is evicted from the front of the list. Per-session so
-/// a noisy session cannot evict another session's reads. Matches the
+/// a noisy run cannot evict another run's reads. Matches the
 /// previous global ceiling.
 const READ_TRACKER_MAX_ENTRIES: usize = 10_000;
 
-/// Per-session bucket: canonical path → monotonic insertion counter.
+/// Per-run bucket: canonical path → monotonic insertion counter.
 ///
 /// Counter values are pulled from a single tracker-wide [`AtomicU64`] so
 /// the smallest counter in the bucket is the least-recently-read path
@@ -44,16 +46,13 @@ const READ_TRACKER_MAX_ENTRIES: usize = 10_000;
 /// the cap scans the bucket once.
 type Bucket = HashMap<PathBuf, u64>;
 
-/// Tracks which files have been read, bucketed per session id.
+/// Tracks which files have been read, bucketed by exact run identity.
 ///
-/// Each session id (set via `crate::tools::SessionIdGuard`) has its
-/// own [`HashSet`]-equivalent of canonicalized paths (stored as a
+/// Each run has its own [`HashSet`]-equivalent of canonicalized paths (stored as a
 /// `HashMap<PathBuf, u64>` so we can drive LRU eviction without
 /// paying the per-lookup linear scan a `Vec` required). `edit_file`
 /// will fail if the file hasn't been read first **in the same
-/// session**. Without an active guard the bucket falls back to the
-/// shared default key so the chat REPL and legacy tests keep working
-/// out of the box.
+/// run**. There is no ambient session lookup or shared default bucket.
 ///
 /// crosslink #986: the previous doc-comment called this an "LRU" list,
 /// which is ambiguous — true LRU bumps the entry on read too. Here, only
@@ -68,17 +67,16 @@ type Bucket = HashMap<PathBuf, u64>;
 /// canonical absolute against a raw relative). `mark_read` on a path
 /// whose `canonicalize` fails logs a warning and skips the insertion.
 ///
-/// crosslink #440 phase 1: session isolation lives inside this singleton,
-/// keyed by the thread-local session id rather than threaded through
-/// `ToolContext`.
+/// The tracker is process-shared storage, but every bucket is keyed by the
+/// exact immutable run identity passed by the caller. There is no current
+/// session lookup or default bucket.
 ///
 /// [`HashSet`]: std::collections::HashSet
 pub static READ_TRACKER: LazyLock<ReadFileTracker> = LazyLock::new(ReadFileTracker::new);
 
 pub struct ReadFileTracker {
-    /// Per-session buckets. Key is the session id from the thread-local
-    /// guard (or the shared default key when no guard is active). Inner
-    /// map is canonical path → insertion counter (see [`Bucket`]).
+    /// Per-run buckets. The inner map is canonical path → insertion counter
+    /// (see [`Bucket`]).
     /// `has_been_read` does not promote — see crosslink #986.
     buckets: Mutex<HashMap<String, Bucket>>,
     /// Monotonic counter used to assign each successful `mark_read` a
@@ -107,7 +105,7 @@ impl ReadFileTracker {
         }
     }
 
-    /// Mark a file as having been read in the **current session**.
+    /// Mark a file as having been read by this exact run.
     ///
     /// `path` is canonicalized first. If canonicalization fails (file
     /// does not exist, permission denied, symlink loop, etc.) the call
@@ -115,8 +113,13 @@ impl ReadFileTracker {
     /// raw path would let `has_been_read` succeed via the same fallback
     /// and defeat the read-before-edit gate (see crosslink #363).
     /// Other sessions' buckets are untouched.
-    pub(crate) fn mark_read(&self, path: &Path) {
-        let resolved = match std::fs::canonicalize(path) {
+    pub(crate) fn mark_read(&self, run: &super::security::ToolRunContext, path: &Path) {
+        let anchored = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            run.working_directory().join(path)
+        };
+        let resolved = match std::fs::canonicalize(&anchored) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -127,10 +130,18 @@ impl ReadFileTracker {
                 return;
             }
         };
+        if !run.permits_read(&resolved) {
+            tracing::warn!(
+                path = %resolved.display(),
+                run_id = %run.run_id(),
+                "READ_TRACKER.mark_read: path is outside the run capability"
+            );
+            return;
+        }
         let stamp = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let key = super::todo::current_session_key();
+        let key = run.run_id().to_string();
         let Some(mut buckets) = self.buckets_guard("mark_read") else {
             return;
         };
@@ -157,20 +168,28 @@ impl ReadFileTracker {
         }
     }
 
-    /// Check whether a file has been read in the **current session**.
+    /// Check whether a file has been read by this exact run.
     ///
     /// `path` is canonicalized first. If canonicalization fails (file
     /// does not exist, permission denied, symlink loop, etc.) this
     /// returns `false` — the caller must read the file before the
     /// check can pass. A read in another session does not satisfy this
     /// check.
-    pub(crate) fn has_been_read(&self, path: &Path) -> bool {
-        let Ok(check_path) = std::fs::canonicalize(path) else {
+    pub(crate) fn has_been_read(&self, run: &super::security::ToolRunContext, path: &Path) -> bool {
+        let anchored = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            run.working_directory().join(path)
+        };
+        let Ok(check_path) = std::fs::canonicalize(anchored) else {
             // Strict mode: refuse to silently fall back to the raw path.
             // The agent must perform a real read first. See crosslink #363.
             return false;
         };
-        let key = super::todo::current_session_key();
+        if !run.permits_read(&check_path) {
+            return false;
+        }
+        let key = run.run_id().to_string();
         let Some(buckets) = self.buckets_guard("has_been_read") else {
             return false;
         };
@@ -179,21 +198,26 @@ impl ReadFileTracker {
             .is_some_and(|f| f.contains_key(&check_path))
     }
 
-    /// Invalidate the current session's read marker for a file after mutation.
+    /// Invalidate this exact run's read marker for a file after mutation.
     ///
     /// A successful write/edit makes the previous file observation stale. The
     /// ledger records that for prompt grounding; this keeps the live
     /// read-before-edit gate in sync so a second mutation must be preceded by a
     /// fresh read.
-    pub(crate) fn mark_stale(&self, path: &Path) {
-        let Ok(check_path) = std::fs::canonicalize(path) else {
+    pub(crate) fn mark_stale(&self, run: &super::security::ToolRunContext, path: &Path) {
+        let anchored = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            run.working_directory().join(path)
+        };
+        let Ok(check_path) = std::fs::canonicalize(anchored) else {
             tracing::warn!(
                 path = %path.display(),
                 "READ_TRACKER.mark_stale: canonicalize failed; skipping removal"
             );
             return;
         };
-        let key = super::todo::current_session_key();
+        let key = run.run_id().to_string();
         let Some(mut buckets) = self.buckets_guard("mark_stale") else {
             return;
         };
@@ -202,12 +226,16 @@ impl ReadFileTracker {
         }
     }
 
-    /// Clear every session's bucket. Used by tests and at
-    /// session-start by `crate::tools::reset_read_tracker`. A
-    /// per-session `clear()` is intentionally deferred to phase 2
-    /// (follow-up issue): until `ToolContext` owns the tracker there
-    /// is no caller that has a session id without the thread-local
-    /// guard, so adding it now would be dead code rejected by clippy.
+    /// Clear one exact run's bucket without invalidating other runs.
+    pub(crate) fn clear_run(&self, run: &super::security::ToolRunContext) {
+        let Some(mut buckets) = self.buckets_guard("clear_run") else {
+            return;
+        };
+        buckets.remove(&run.run_id().to_string());
+    }
+
+    /// Clear every run bucket in the crate test harness.
+    #[cfg(test)]
     pub(crate) fn clear_all(&self) {
         let Some(mut buckets) = self.buckets_guard("clear_all") else {
             return;
@@ -216,12 +244,27 @@ impl ReadFileTracker {
     }
 }
 
-fn project_root() -> Result<PathBuf, String> {
-    crate::tools::security::current_context().map(|context| context.project_root().to_path_buf())
+fn project_root(run: &super::security::ToolRunContext) -> Result<PathBuf, String> {
+    run.require(super::security::ToolResource::WorkspaceRead)
+        .map_err(|error| error.to_string())?;
+    Ok(run.project_root().to_path_buf())
 }
 
-fn resolve_path(path: &str) -> Result<PathBuf, String> {
-    let security = crate::tools::security::current_context()?;
+/// Resolve a caller-supplied path through one immutable run capability.
+///
+/// Relative paths are anchored to the run working directory, existing path
+/// components are canonicalized, and successful results remain inside a root
+/// for which the run has read authority.
+///
+/// # Errors
+///
+/// Returns an error when workspace reads are not granted, the input contains a
+/// parent traversal component, no existing ancestor can be resolved, or the
+/// normalized path is outside every root granted to the run.
+pub fn resolve_path(run: &super::security::ToolRunContext, path: &str) -> Result<PathBuf, String> {
+    run.require(super::security::ToolResource::WorkspaceRead)
+        .map_err(|error| error.to_string())?;
+    let security = run;
     let p = Path::new(path);
     let absolute = if p.is_absolute() {
         p.to_path_buf()
@@ -269,15 +312,230 @@ fn resolve_path(path: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+fn resolve_host_control_path(
+    run: &super::security::ToolRunContext,
+    path: &str,
+) -> Result<PathBuf, String> {
+    run.require(super::security::ToolResource::WorkspaceRead)
+        .map_err(|error| error.to_string())?;
+    let supplied = Path::new(path);
+    let absolute = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        run.project_root().join(supplied)
+    };
+    if absolute
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(format!("Host-control path traversal not allowed: '{path}'"));
+    }
+    let resolved = canonicalize_or_walk_up(&absolute, path)?;
+    if !resolved.starts_with(run.project_root()) || !run.is_denied_path(&resolved) {
+        return Err(format!(
+            "Path '{}' is not masked host-control state below run project '{}'",
+            resolved.display(),
+            run.project_root().display()
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Open an agent-supplied path through the same immutable capability and
 /// descriptor-relative traversal used by `read_file`.
 ///
 /// Agent-adjacent consumers such as the LSP adapter must use this rather than
 /// reopening a validated path by name.
-pub fn open_capability_regular_read(user_path: &str) -> Result<(PathBuf, std::fs::File), String> {
-    let resolved = resolve_path(user_path)?;
-    let file = secure_fs::open_regular_read(&resolved)?;
+pub fn open_capability_regular_read(
+    run: &super::security::ToolRunContext,
+    user_path: &str,
+) -> Result<(PathBuf, std::fs::File), String> {
+    let resolved = resolve_path(run, user_path)?;
+    let file = secure_fs::open_regular_read(run, &resolved)?;
     Ok((resolved, file))
+}
+
+/// Read one UTF-8 attachment through the exact run filesystem capability.
+///
+/// Frontend prompt affordances such as legacy-REPL `@file` expansion use this
+/// helper so they share the file tool's descriptor-relative traversal and
+/// size limit instead of reopening a path beneath the process CWD.
+///
+/// # Errors
+///
+/// Returns an error when the run lacks read authority, the path is outside or
+/// masked from the run, descriptor-relative opening fails, the file exceeds
+/// the attachment limit, or its bytes are not UTF-8.
+pub fn read_capability_text_attachment(
+    run: &super::security::ToolRunContext,
+    user_path: &str,
+) -> Result<(PathBuf, String), String> {
+    let (resolved, file) = open_capability_regular_read(run, user_path)?;
+    let mut bytes = Vec::new();
+    file.take(read::MAX_FILE_SIZE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Failed to read '{}': {error}", resolved.display()))?;
+    if bytes.len() > usize::try_from(read::MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX) {
+        return Err(format!(
+            "File '{}' exceeds the {}-byte attachment limit",
+            resolved.display(),
+            read::MAX_FILE_SIZE_BYTES
+        ));
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|error| format!("File '{}' is not valid UTF-8: {error}", resolved.display()))?;
+    READ_TRACKER.mark_read(run, &resolved);
+    Ok((resolved, content))
+}
+
+/// Create one UTF-8 frontend-owned file without ever overwriting an existing
+/// object. Parent creation and the final open use the same descriptor-relative
+/// capability path as `write_file`.
+///
+/// # Errors
+///
+/// Returns an error when the run lacks write authority, the path is outside or
+/// masked from the run, guardrails reject it, secure creation fails, the target
+/// already exists, or the content cannot be written.
+pub fn create_capability_text_file(
+    run: &super::security::ToolRunContext,
+    user_path: &str,
+    content: &str,
+) -> Result<PathBuf, String> {
+    let resolved = resolve_path(run, user_path)?;
+    let open_path = resolve_open_path(run, user_path)?;
+    let mut effect_reservation =
+        crate::guardrails::reserve_workspace_mutation(run, &resolved.to_string_lossy())?;
+    let (lines_added, lines_removed) = changed_line_counts("", content);
+    let mut line_reservation = crate::guardrails::reserve_changed_lines(
+        run,
+        u64::from(lines_added) + u64::from(lines_removed),
+    )?;
+    let (mut file, existed) = secure_fs::open_regular_update_or_create(run, &open_path)?;
+    if existed {
+        return Err(format!("File '{}' already exists", resolved.display()));
+    }
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        // `existed == false` proves the descriptor open created the target, so
+        // this is a partial mutation even if zero payload bytes were durable.
+        // Reconcile what can be observed and conservatively commit both
+        // reservations before returning the legacy error surface.
+        if let Ok(actual_content) = secure_fs::read_to_string(&mut file, &resolved) {
+            let (actual_added, actual_removed) = changed_line_counts("", &actual_content);
+            line_reservation
+                .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
+            crate::guardrails::record_file_modification(
+                run,
+                &resolved.to_string_lossy(),
+                actual_added,
+                actual_removed,
+            );
+        } else {
+            line_reservation.commit();
+        }
+        effect_reservation.commit();
+        return Err(format!("Failed to write '{}': {error}", resolved.display()));
+    }
+    line_reservation.commit();
+    effect_reservation.commit();
+    crate::guardrails::record_file_modification(
+        run,
+        &resolved.to_string_lossy(),
+        lines_added,
+        lines_removed,
+    );
+    Ok(resolved)
+}
+
+/// Read host-owned control text below the exact run project.
+///
+/// This is a frontend lifecycle boundary, not an agent file-tool primitive:
+/// it can enter masked `.openclaudia` state but cannot escape the pinned run
+/// project or follow symlinks.
+#[doc(hidden)]
+pub fn read_run_control_text(
+    run: &super::security::ToolRunContext,
+    user_path: &str,
+) -> Result<(PathBuf, String), String> {
+    let resolved = resolve_host_control_path(run, user_path)?;
+    let file = secure_fs::open_host_control_regular_read(run, &resolved)?;
+    let mut bytes = Vec::new();
+    file.take(read::MAX_FILE_SIZE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Failed to read '{}': {error}", resolved.display()))?;
+    if bytes.len() > usize::try_from(read::MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX) {
+        return Err(format!(
+            "Control file '{}' exceeds the {}-byte limit",
+            resolved.display(),
+            read::MAX_FILE_SIZE_BYTES
+        ));
+    }
+    let content = String::from_utf8(bytes).map_err(|error| {
+        format!(
+            "Control file '{}' is not valid UTF-8: {error}",
+            resolved.display()
+        )
+    })?;
+    Ok((resolved, content))
+}
+
+/// Create one host-owned control text file without overwriting an existing
+/// object, using the run's pinned project descriptor.
+#[doc(hidden)]
+pub fn create_run_control_text_file(
+    run: &super::security::ToolRunContext,
+    user_path: &str,
+    content: &str,
+) -> Result<PathBuf, String> {
+    let resolved = resolve_host_control_path(run, user_path)?;
+    let (mut file, existed) =
+        secure_fs::open_host_control_regular_update_or_create(run, &resolved)?;
+    if existed {
+        return Err(format!("File '{}' already exists", resolved.display()));
+    }
+    file.write_all(content.as_bytes())
+        .map_err(|error| format!("Failed to write '{}': {error}", resolved.display()))?;
+    Ok(resolved)
+}
+
+/// Securely create one host-owned control directory below the run project.
+#[doc(hidden)]
+pub fn create_run_control_directory(
+    run: &super::security::ToolRunContext,
+    user_path: &str,
+) -> Result<PathBuf, String> {
+    let resolved = resolve_host_control_path(run, user_path)?;
+    secure_fs::create_host_control_directories(run, &resolved)?;
+    Ok(resolved)
+}
+
+/// Result of initializing the run's project-owned `OpenClaudia` control state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectInitOutcome {
+    Created,
+    AlreadyExists,
+}
+
+/// Initialize `.openclaudia/config.yaml` and the project skill directory
+/// through the exact run's pinned host-control capability.
+#[doc(hidden)]
+pub fn initialize_project_for_run(
+    run: &super::security::ToolRunContext,
+) -> Result<ProjectInitOutcome, String> {
+    let config_path = run.project_root().join(".openclaudia/config.yaml");
+    match read_run_control_text(run, &config_path.to_string_lossy()) {
+        Ok(_) => return Ok(ProjectInitOutcome::AlreadyExists),
+        Err(error) if error.starts_with("NOT_FOUND:") => {}
+        Err(error) => return Err(error),
+    }
+    let skills_path = run.project_root().join(".openclaudia/skills");
+    create_run_control_directory(run, &skills_path.to_string_lossy())?;
+    let default_config = "# OpenClaudia Configuration\nproxy:\n  port: 8080\n  host: \"127.0.0.1\"\n  target: anthropic\n\nproviders:\n  anthropic:\n    base_url: https://api.anthropic.com\n\nsession:\n  timeout_minutes: 30\n  persist_path: .openclaudia/session\n";
+    match create_run_control_text_file(run, &config_path.to_string_lossy(), default_config) {
+        Ok(_) => Ok(ProjectInitOutcome::Created),
+        Err(error) if error.ends_with("already exists") => Ok(ProjectInitOutcome::AlreadyExists),
+        Err(error) => Err(error),
+    }
 }
 
 /// Canonicalise a path that may not yet exist by walking the deepest
@@ -319,8 +577,13 @@ pub(super) fn canonicalize_or_walk_up(p: &Path, user_path: &str) -> Result<PathB
     }
 }
 
-pub fn resolve_open_path(user_path: &str) -> Result<PathBuf, String> {
-    let security = crate::tools::security::current_context()?;
+pub fn resolve_open_path(
+    run: &super::security::ToolRunContext,
+    user_path: &str,
+) -> Result<PathBuf, String> {
+    run.require(super::security::ToolResource::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    let security = run;
     let p = Path::new(user_path);
     let absolute = if p.is_absolute() {
         p.to_path_buf()
@@ -376,6 +639,7 @@ pub fn resolve_open_path(user_path: &str) -> Result<PathBuf, String> {
 }
 
 pub fn execute_read_file(
+    run: &super::security::ToolRunContext,
     args: &std::collections::HashMap<String, serde_json::Value>,
 ) -> (String, bool) {
     let path = match args.arg_str_strict("path") {
@@ -383,14 +647,14 @@ pub fn execute_read_file(
         Err(e) => return e.into_tool_error(),
     };
 
-    let resolved = match resolve_path(path) {
+    let resolved = match resolve_path(run, path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };
     let resolved_str = resolved.to_string_lossy();
 
     let (content, is_error) = match detect_file_type(&resolved_str) {
-        FileType::Image(kind) => read_image_file(&resolved_str, kind),
+        FileType::Image(kind) => read_image_file(run, &resolved_str, kind),
         FileType::Pdf => {
             let pages = match args.get("pages") {
                 None => None,
@@ -403,31 +667,32 @@ pub fn execute_read_file(
                     .into_tool_error();
                 }
             };
-            read::read_pdf_file(&resolved_str, pages)
+            read::read_pdf_file(run, &resolved_str, pages)
         }
-        FileType::Notebook => read_notebook_file(&resolved_str),
-        FileType::Text => read_text_file(&resolved_str, args),
+        FileType::Notebook => read_notebook_file(run, &resolved_str),
+        FileType::Text => read_text_file(run, &resolved_str, args),
     };
 
     if !is_error {
-        READ_TRACKER.mark_read(&resolved);
-        record_active_file_read_observation(&resolved, args, &content);
+        READ_TRACKER.mark_read(run, &resolved);
+        record_active_file_read_observation(run, &resolved, args, &content);
     }
 
     (content, is_error)
 }
 
 fn record_active_file_read_observation(
+    run: &super::security::ToolRunContext,
     resolved: &Path,
     args: &std::collections::HashMap<String, serde_json::Value>,
     output: &str,
 ) {
-    let session_key = super::todo::current_session_key();
-    let Some(ledger) = crate::ledger::active_ledger_for_session(&session_key) else {
+    let session_key = run.session_id();
+    let Some(ledger) = crate::ledger::active_ledger_for_session(session_key) else {
         return;
     };
 
-    let bytes = match read_file_bytes_for_ledger(resolved) {
+    let bytes = match read_file_bytes_for_ledger(run, resolved) {
         Ok(bytes) => bytes,
         Err(err) => {
             tracing::warn!(
@@ -446,6 +711,7 @@ fn record_active_file_read_observation(
         err.into_inner()
     });
     if let Err(err) = ledger.observe_file_read_bytes(
+        run,
         resolved.to_string_lossy().to_string(),
         &bytes,
         start_line,
@@ -461,11 +727,12 @@ fn record_active_file_read_observation(
 }
 
 pub(super) fn require_fresh_file_observation_if_ledger_active(
+    run: &super::security::ToolRunContext,
     path: &Path,
     action: &str,
 ) -> Result<(), String> {
-    let session_key = super::todo::current_session_key();
-    let Some(ledger) = crate::ledger::active_ledger_for_session(&session_key) else {
+    let session_key = run.session_id();
+    let Some(ledger) = crate::ledger::active_ledger_for_session(session_key) else {
         return Ok(());
     };
     let path = path.to_string_lossy().to_string();
@@ -475,7 +742,8 @@ pub(super) fn require_fresh_file_observation_if_ledger_active(
             err.into_inner()
         });
         ledger.observations_chronological().into_iter().any(|obs| {
-            obs.authority == crate::ledger::Authority::Filesystem
+            obs.provenance.trust == crate::ledger::EvidenceTrust::RuntimeObserved
+                && obs.provenance.is_bound_to(run)
                 && !ledger.is_stale(obs.id)
                 && matches!(
                     &obs.kind,
@@ -492,8 +760,11 @@ pub(super) fn require_fresh_file_observation_if_ledger_active(
     ))
 }
 
-fn read_file_bytes_for_ledger(path: &Path) -> std::io::Result<Vec<u8>> {
-    let file = secure_fs::open_regular_read(path).map_err(std::io::Error::other)?;
+fn read_file_bytes_for_ledger(
+    run: &super::security::ToolRunContext,
+    path: &Path,
+) -> std::io::Result<Vec<u8>> {
+    let file = secure_fs::open_regular_read(run, path).map_err(std::io::Error::other)?;
     let mut bytes = Vec::new();
     file.take(read::MAX_FILE_SIZE_BYTES)
         .read_to_end(&mut bytes)?;
@@ -532,13 +803,36 @@ fn count_display_lines(text: &str) -> usize {
     text.lines().count().max(1)
 }
 
-pub(super) fn record_active_diff_observation(path: &str, before: &str, after: &str) {
+/// Count inserted and deleted lines in the exact before/after payload.
+///
+/// This is shared by file writers, blast-radius reservations, diff-monitor
+/// accounting, and reality-ledger output so all four boundaries use the same
+/// unit instead of estimating from input fragments.
+pub(super) fn changed_line_counts(before: &str, after: &str) -> (u32, u32) {
+    let mut added = 0_u32;
+    let mut removed = 0_u32;
+    for change in TextDiff::from_lines(before, after).iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => added = added.saturating_add(1),
+            similar::ChangeTag::Delete => removed = removed.saturating_add(1),
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (added, removed)
+}
+
+pub(super) fn record_active_diff_observation(
+    run: &super::security::ToolRunContext,
+    path: &str,
+    before: &str,
+    after: &str,
+) {
     if before == after {
         return;
     }
-    READ_TRACKER.mark_stale(Path::new(path));
-    let session_key = super::todo::current_session_key();
-    let Some(ledger) = crate::ledger::active_ledger_for_session(&session_key) else {
+    READ_TRACKER.mark_stale(run, Path::new(path));
+    let session_key = run.session_id();
+    let Some(ledger) = crate::ledger::active_ledger_for_session(session_key) else {
         return;
     };
     let diff_patch = TextDiff::from_lines(before, after)
@@ -549,7 +843,7 @@ pub(super) fn record_active_diff_observation(path: &str, before: &str, after: &s
         tracing::error!("active reality ledger lock poisoned; recovering inner state");
         err.into_inner()
     });
-    if let Err(err) = ledger.observe_diff(vec![path.to_string()], diff_patch) {
+    if let Err(err) = ledger.observe_diff(run, vec![path.to_string()], diff_patch) {
         tracing::warn!(
             path,
             error = %err,
@@ -578,6 +872,16 @@ mod tests {
     use super::*;
     use std::sync::MutexGuard;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
+    fn fresh_run() -> std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context_for(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )))
+    }
+
     fn tracker_lock() -> MutexGuard<'static, ()> {
         // Delegate to the crate-wide lock so write::tests and
         // edit::tests can serialize against this module's tests.
@@ -585,6 +889,61 @@ mod tests {
         // previously allowed concurrent corruption of READ_TRACKER
         // state across sibling test modules.
         super::shared_tracker_lock()
+    }
+
+    #[test]
+    fn changed_line_counts_use_the_exact_before_after_diff() {
+        assert_eq!(changed_line_counts("", "one\ntwo\n"), (2, 0));
+        assert_eq!(changed_line_counts("one\ntwo\n", "one\nthree\n"), (1, 1));
+        assert_eq!(changed_line_counts("same\n", "same\n"), (0, 0));
+        assert_eq!(
+            changed_line_counts("same\n", "same"),
+            (1, 1),
+            "trailing-newline changes must not disappear from line accounting"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_initialization_is_exact_run_scoped_and_control_state_stays_masked() {
+        let first_root = tempfile::tempdir().expect("first project root");
+        let second_root = tempfile::tempdir().expect("second project root");
+        let first_run = crate::tools::security::test_run_context_for(first_root.path());
+        let second_run = crate::tools::security::test_run_context_for(second_root.path());
+
+        assert_eq!(
+            initialize_project_for_run(&first_run).expect("initialize first project"),
+            ProjectInitOutcome::Created
+        );
+        let first_config = first_root.path().join(".openclaudia/config.yaml");
+        assert!(first_config.is_file());
+        assert!(first_root.path().join(".openclaudia/skills").is_dir());
+        assert!(!second_root.path().join(".openclaudia").exists());
+        assert!(
+            read_capability_text_attachment(&first_run, &first_config.to_string_lossy()).is_err(),
+            "agent attachment reads must not inherit host-control authority"
+        );
+        assert!(
+            read_run_control_text(&first_run, &first_config.to_string_lossy()).is_ok(),
+            "the exact frontend run must retain host-control access"
+        );
+
+        std::fs::create_dir_all(second_root.path().join(".openclaudia"))
+            .expect("second control directory");
+        std::fs::write(
+            second_root.path().join(".openclaudia/config.yaml"),
+            "SECOND-RUN-SENTINEL",
+        )
+        .expect("second config sentinel");
+        assert_eq!(
+            initialize_project_for_run(&second_run).expect("inspect second project"),
+            ProjectInitOutcome::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_root.path().join(".openclaudia/config.yaml"))
+                .expect("preserved second config"),
+            "SECOND-RUN-SENTINEL"
+        );
     }
 
     fn two_temp_paths() -> (
@@ -600,43 +959,25 @@ mod tests {
         (a, b, pa, pb)
     }
 
-    /// crosslink #440 phase 1: a read marked in session A is NOT
-    /// visible in session B, despite the shared global tracker.
+    /// A read marked by run A is not visible to run B even though the backing
+    /// tracker is process-shared.
     #[test]
-    fn read_tracker_isolates_marks_between_sessions() {
+    fn read_tracker_isolates_marks_between_runs() {
         let _lock = tracker_lock();
         READ_TRACKER.clear_all();
         let (_keep_a, _keep_b, path_a, path_b) = two_temp_paths();
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-a-440");
-            READ_TRACKER.mark_read(&path_a);
-            assert!(READ_TRACKER.has_been_read(&path_a));
-        }
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-b-440");
-            assert!(
-                !READ_TRACKER.has_been_read(&path_a),
-                "session-b must NOT see session-a's read"
-            );
-            assert!(!READ_TRACKER.has_been_read(&path_b));
-            READ_TRACKER.mark_read(&path_b);
-            assert!(READ_TRACKER.has_been_read(&path_b));
-            assert!(
-                !READ_TRACKER.has_been_read(&path_a),
-                "session-a's read still invisible after session-b writes its own"
-            );
-        }
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-a-440");
-            assert!(
-                READ_TRACKER.has_been_read(&path_a),
-                "session-a's mark survives session-b activity"
-            );
-            assert!(
-                !READ_TRACKER.has_been_read(&path_b),
-                "session-a must NOT see session-b's read"
-            );
-        }
+        let run_a = fresh_run();
+        let run_b = fresh_run();
+
+        READ_TRACKER.mark_read(&run_a, &path_a);
+        assert!(READ_TRACKER.has_been_read(&run_a, &path_a));
+        assert!(!READ_TRACKER.has_been_read(&run_b, &path_a));
+
+        READ_TRACKER.mark_read(&run_b, &path_b);
+        assert!(READ_TRACKER.has_been_read(&run_b, &path_b));
+        assert!(!READ_TRACKER.has_been_read(&run_b, &path_a));
+        assert!(READ_TRACKER.has_been_read(&run_a, &path_a));
+        assert!(!READ_TRACKER.has_been_read(&run_a, &path_b));
     }
 
     /// crosslink #440 phase 1: same-session mark-then-check round-trip.
@@ -644,76 +985,72 @@ mod tests {
     fn read_tracker_same_session_round_trip() {
         let _lock = tracker_lock();
         READ_TRACKER.clear_all();
-        let _g = crate::tools::SessionIdGuard::set("session-round-trip-440");
         let (_keep, _keep_b, path_a, _path_b) = two_temp_paths();
         assert!(
-            !READ_TRACKER.has_been_read(&path_a),
-            "fresh session sees nothing"
+            !READ_TRACKER.has_been_read(test_run(), &path_a),
+            "fresh run sees nothing"
         );
-        READ_TRACKER.mark_read(&path_a);
+        READ_TRACKER.mark_read(test_run(), &path_a);
         assert!(
-            READ_TRACKER.has_been_read(&path_a),
-            "round-trip works inside one session"
+            READ_TRACKER.has_been_read(test_run(), &path_a),
+            "round-trip works inside one run"
         );
-        READ_TRACKER.mark_read(&path_a);
-        assert!(READ_TRACKER.has_been_read(&path_a), "re-mark stays visible");
+        READ_TRACKER.mark_read(test_run(), &path_a);
+        assert!(
+            READ_TRACKER.has_been_read(test_run(), &path_a),
+            "re-mark stays visible"
+        );
     }
 
     #[test]
-    fn read_tracker_mark_stale_only_clears_current_session() {
+    fn read_tracker_mark_stale_only_clears_exact_run() {
         let _lock = tracker_lock();
         READ_TRACKER.clear_all();
         let (_keep_a, _keep_b, path_a, _path_b) = two_temp_paths();
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-stale-a");
-            READ_TRACKER.mark_read(&path_a);
-            assert!(READ_TRACKER.has_been_read(&path_a));
-        }
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-stale-b");
-            READ_TRACKER.mark_read(&path_a);
-            assert!(READ_TRACKER.has_been_read(&path_a));
-        }
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-stale-a");
-            READ_TRACKER.mark_stale(&path_a);
-            assert!(!READ_TRACKER.has_been_read(&path_a));
-        }
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-stale-b");
-            assert!(READ_TRACKER.has_been_read(&path_a));
-        }
+        let run_a = fresh_run();
+        let run_b = fresh_run();
+        READ_TRACKER.mark_read(&run_a, &path_a);
+        READ_TRACKER.mark_read(&run_b, &path_a);
+        READ_TRACKER.mark_stale(&run_a, &path_a);
+        assert!(!READ_TRACKER.has_been_read(&run_a, &path_a));
+        assert!(READ_TRACKER.has_been_read(&run_b, &path_a));
     }
 
-    /// crosslink #440 phase 1: `clear_all()` wipes every session's bucket.
+    /// Clearing one run never invalidates another run's observation.
     #[test]
-    fn read_tracker_clear_all_wipes_every_bucket() {
+    fn read_tracker_clear_run_preserves_other_buckets() {
         let _lock = tracker_lock();
         READ_TRACKER.clear_all();
         let (_keep_a, _keep_b, path_a, path_b) = two_temp_paths();
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-clear-a-440");
-            READ_TRACKER.mark_read(&path_a);
-        }
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-clear-b-440");
-            READ_TRACKER.mark_read(&path_b);
-        }
+        let run_a = fresh_run();
+        let run_b = fresh_run();
+        READ_TRACKER.mark_read(&run_a, &path_a);
+        READ_TRACKER.mark_read(&run_b, &path_b);
+        READ_TRACKER.clear_run(&run_a);
+        assert!(!READ_TRACKER.has_been_read(&run_a, &path_a));
+        assert!(READ_TRACKER.has_been_read(&run_b, &path_b));
+    }
+
+    #[test]
+    fn dropping_last_run_handle_clears_only_its_tracker_bucket() {
+        let _lock = tracker_lock();
         READ_TRACKER.clear_all();
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-clear-a-440");
-            assert!(
-                !READ_TRACKER.has_been_read(&path_a),
-                "clear_all wipes session-a's bucket"
-            );
-        }
-        {
-            let _g = crate::tools::SessionIdGuard::set("session-clear-b-440");
-            assert!(
-                !READ_TRACKER.has_been_read(&path_b),
-                "clear_all wipes session-b's bucket"
-            );
-        }
+        let (_keep_a, _keep_b, path_a, path_b) = two_temp_paths();
+        let run_a = fresh_run();
+        let run_b = fresh_run();
+        let dropped_run_key = run_a.run_id().to_string();
+        let retained_run_key = run_b.run_id().to_string();
+        READ_TRACKER.mark_read(&run_a, &path_a);
+        READ_TRACKER.mark_read(&run_b, &path_b);
+
+        drop(run_a);
+
+        let buckets = READ_TRACKER
+            .buckets_guard("drop lifecycle test")
+            .expect("tracker lock");
+        assert!(!buckets.contains_key(&dropped_run_key));
+        assert!(buckets.contains_key(&retained_run_key));
+        drop(buckets);
     }
 
     // ---------------------------------------------------------------
@@ -726,11 +1063,10 @@ mod tests {
     fn read_tracker_363_canonical_round_trip_returns_true() {
         let _lock = tracker_lock();
         READ_TRACKER.clear_all();
-        let _g = crate::tools::SessionIdGuard::set("session-363-canonical");
         let (_keep, _keep_b, path_a, _path_b) = two_temp_paths();
-        READ_TRACKER.mark_read(&path_a);
+        READ_TRACKER.mark_read(test_run(), &path_a);
         assert!(
-            READ_TRACKER.has_been_read(&path_a),
+            READ_TRACKER.has_been_read(test_run(), &path_a),
             "canonical mark must satisfy canonical check"
         );
     }
@@ -742,29 +1078,27 @@ mod tests {
     fn read_tracker_363_relative_then_absolute_resolves() {
         let _lock = tracker_lock();
         READ_TRACKER.clear_all();
-        let _g = crate::tools::SessionIdGuard::set("session-363-rel-abs");
 
         let dir = tempfile::tempdir_in(".").expect("tempdir");
         let canon_dir = dir.path().canonicalize().expect("canonicalize dir");
         let abs_file = canon_dir.join("rel_target.txt");
         std::fs::write(&abs_file, b"hello").expect("write file");
 
-        // Build a relative path to `abs_file` from the current CWD.
-        let cwd = std::env::current_dir().expect("cwd");
-        let rel_file = pathdiff_relative(&cwd, &abs_file)
+        // Build a relative path from the explicit run working directory.
+        let rel_file = pathdiff_relative(test_run().working_directory(), &abs_file)
             .expect("relative path between cwd and tempdir target exists");
         assert!(
             rel_file.is_relative(),
             "test precondition: derived path must be relative"
         );
 
-        READ_TRACKER.mark_read(&rel_file);
+        READ_TRACKER.mark_read(test_run(), &rel_file);
         assert!(
-            READ_TRACKER.has_been_read(&abs_file),
+            READ_TRACKER.has_been_read(test_run(), &abs_file),
             "relative mark must be visible via the canonical absolute path"
         );
         assert!(
-            READ_TRACKER.has_been_read(&rel_file),
+            READ_TRACKER.has_been_read(test_run(), &rel_file),
             "relative path query must also succeed (it canonicalizes to the same key)"
         );
     }
@@ -775,7 +1109,6 @@ mod tests {
     fn read_tracker_363_nonexistent_path_returns_false() {
         let _lock = tracker_lock();
         READ_TRACKER.clear_all();
-        let _g = crate::tools::SessionIdGuard::set("session-363-nonexistent");
 
         // Path under a real tempdir but with a leaf that does not exist
         // on disk: canonicalize on the leaf will fail.
@@ -787,25 +1120,25 @@ mod tests {
         );
 
         assert!(
-            !READ_TRACKER.has_been_read(&ghost),
+            !READ_TRACKER.has_been_read(test_run(), &ghost),
             "nonexistent path must NOT be considered read (strict canonicalize)"
         );
 
         // mark_read on a nonexistent path must also be a no-op (warning
         // logged inside); a subsequent has_been_read still returns false
         // even if we later create the file, because no insertion happened.
-        READ_TRACKER.mark_read(&ghost);
+        READ_TRACKER.mark_read(test_run(), &ghost);
         assert!(
-            !READ_TRACKER.has_been_read(&ghost),
+            !READ_TRACKER.has_been_read(test_run(), &ghost),
             "mark_read on a nonexistent path must NOT silently store the raw path"
         );
 
         // Sanity: once the file exists and is marked, the gate works.
         std::fs::write(&ghost, b"materialized").expect("write ghost");
         let canon = ghost.canonicalize().expect("now canonicalizable");
-        READ_TRACKER.mark_read(&canon);
+        READ_TRACKER.mark_read(test_run(), &canon);
         assert!(
-            READ_TRACKER.has_been_read(&canon),
+            READ_TRACKER.has_been_read(test_run(), &canon),
             "after real read on an existing file, the gate must pass"
         );
     }
@@ -819,7 +1152,6 @@ mod tests {
 
         let _lock = tracker_lock();
         READ_TRACKER.clear_all();
-        let _g = crate::tools::SessionIdGuard::set("session-363-concurrent");
 
         let dir = tempfile::tempdir_in(".").expect("tempdir");
         let canon_dir = dir.path().canonicalize().expect("canonicalize dir");
@@ -831,17 +1163,13 @@ mod tests {
             paths.push(p);
         }
 
-        // Hand each path to a fresh thread. The session guard is
-        // thread-local; inside each thread we re-set it so all
-        // marks land in the same bucket.
-        let session = "session-363-concurrent".to_string();
+        // Hand each path to a fresh thread. Every worker uses the same exact
+        // immutable run capability, so all marks land in one bucket.
         let mut handles = Vec::with_capacity(N);
         for p in &paths {
             let p = p.clone();
-            let session = session.clone();
             handles.push(std::thread::spawn(move || {
-                let _g = crate::tools::SessionIdGuard::set(&session);
-                READ_TRACKER.mark_read(&p);
+                READ_TRACKER.mark_read(test_run(), &p);
             }));
         }
         for h in handles {
@@ -850,7 +1178,7 @@ mod tests {
 
         for p in &paths {
             assert!(
-                READ_TRACKER.has_been_read(p),
+                READ_TRACKER.has_been_read(test_run(), p),
                 "concurrent mark must not drop path {}",
                 p.display()
             );

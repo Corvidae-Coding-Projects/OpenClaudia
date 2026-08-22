@@ -15,7 +15,12 @@ use openclaudia::claude_credentials::{
     claude_code_beta_header_value, get_oauth_endpoint, get_oauth_headers, inject_oauth_prefix_only,
     strip_cache_control_ttl, ClaudeAiOauth, CredentialsFile, CLAUDE_CODE_SYSTEM_PROMPT,
 };
+use openclaudia::secrets::OAuthToken;
 use serde_json::json;
+
+fn token(value: &str) -> OAuthToken {
+    OAuthToken::try_from_string(value.to_string()).expect("valid token")
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — claude_code_beta_header_value
@@ -61,50 +66,29 @@ fn beta_header_is_comma_separated() {
 
 #[test]
 fn get_oauth_headers_includes_authorization_bearer() {
-    let headers = get_oauth_headers("test-token-xyz");
-    let auth = headers
-        .iter()
-        .find(|(k, _)| k == "Authorization")
-        .expect("Authorization header MUST be present");
-    assert_eq!(
-        auth.1, "Bearer test-token-xyz",
-        "Authorization header MUST be Bearer-formatted"
-    );
+    let token = token("test-token-xyz");
+    let headers = get_oauth_headers(&token);
+    assert!(headers.matches_value("Authorization", "Bearer test-token-xyz"));
 }
 
 #[test]
 fn get_oauth_headers_includes_anthropic_version() {
-    let headers = get_oauth_headers("t");
-    let version = headers
-        .iter()
-        .find(|(k, _)| k == "anthropic-version")
-        .expect("anthropic-version MUST be present");
-    assert_eq!(
-        version.1, "2023-06-01",
-        "anthropic-version MUST be 2023-06-01"
-    );
+    let headers = get_oauth_headers(&token("t"));
+    assert!(headers.matches_value("anthropic-version", "2023-06-01"));
 }
 
 #[test]
 fn get_oauth_headers_includes_content_type_json() {
-    let headers = get_oauth_headers("t");
-    let ct = headers
-        .iter()
-        .find(|(k, _)| k == "content-type")
-        .expect("content-type MUST be present");
-    assert_eq!(ct.1, "application/json");
+    let headers = get_oauth_headers(&token("t"));
+    assert!(headers.matches_value("content-type", "application/json"));
 }
 
 #[test]
 fn get_oauth_headers_anthropic_beta_matches_beta_header_value() {
-    let headers = get_oauth_headers("t");
-    let beta = headers
-        .iter()
-        .find(|(k, _)| k == "anthropic-beta")
-        .expect("anthropic-beta MUST be present");
+    let headers = get_oauth_headers(&token("t"));
     // The header MUST match the single-source-of-truth value
     // — pins crosslink #272.
-    assert_eq!(beta.1, claude_code_beta_header_value());
+    assert!(headers.matches_value("anthropic-beta", &claude_code_beta_header_value()));
 }
 
 #[test]
@@ -113,20 +97,28 @@ fn get_oauth_headers_does_not_leak_access_token_into_other_headers() {
     // Authorization ONLY. Spotting it leaking to
     // anthropic-version or content-type would indicate a
     // header-construction bug.
-    let token = "SECRET-BEARER-XYZ";
-    let headers = get_oauth_headers(token);
-    for (k, v) in &headers {
-        if k == "Authorization" {
-            assert!(
-                v.contains(token),
-                "Authorization MUST carry the token; got {v:?}"
-            );
+    let raw = "SECRET-BEARER-XYZ";
+    let token = token(raw);
+    let headers = get_oauth_headers(&token);
+    assert!(headers.matches_value("Authorization", "Bearer SECRET-BEARER-XYZ"));
+    assert!(!format!("{headers:?}").contains(raw));
+    assert!(!serde_json::to_string(&headers)
+        .expect("serialize redacted headers")
+        .contains(raw));
+
+    let request = headers
+        .apply(reqwest::Client::new().get("https://example.com"))
+        .expect("apply headers")
+        .build()
+        .expect("request");
+    for (name, value) in request.headers() {
+        let value = value.to_str().expect("ASCII header value");
+        if name == reqwest::header::AUTHORIZATION {
+            assert_eq!(value, "Bearer SECRET-BEARER-XYZ");
         } else {
-            assert!(
-                !v.contains(token),
-                "header {k:?} MUST NOT leak the token; got {v:?}"
-            );
+            assert!(!value.contains(raw), "header {name} leaked the token");
         }
+        assert!(request.headers()[name].is_sensitive());
     }
 }
 
@@ -296,11 +288,11 @@ fn strip_cache_control_ttl_terminates_on_pathologically_long_array() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn credentials_file_round_trips_through_json() {
+fn credentials_file_generic_serde_redacts_and_refuses_lossy_round_trip() {
     let cred = CredentialsFile {
         claude_ai_oauth: Some(ClaudeAiOauth {
-            access_token: "tok-123".to_string(),
-            refresh_token: Some("refresh-456".to_string()),
+            access_token: token("tok-123"),
+            refresh_token: Some(token("refresh-456")),
             expires_at: 1_700_000_000_000,
             scopes: vec!["read".to_string(), "write".to_string()],
             subscription_type: Some("pro".to_string()),
@@ -308,12 +300,9 @@ fn credentials_file_round_trips_through_json() {
         }),
     };
     let json = serde_json::to_string(&cred).expect("serialize");
-    let back: CredentialsFile = serde_json::from_str(&json).expect("deserialize");
-    let oauth = back.claude_ai_oauth.expect("present");
-    assert_eq!(oauth.access_token, "tok-123");
-    assert_eq!(oauth.refresh_token.as_deref(), Some("refresh-456"));
-    assert_eq!(oauth.expires_at, 1_700_000_000_000);
-    assert_eq!(oauth.scopes, vec!["read".to_string(), "write".to_string()]);
+    assert!(!json.contains("tok-123"));
+    assert!(!json.contains("refresh-456"));
+    assert!(serde_json::from_str::<CredentialsFile>(&json).is_err());
 }
 
 #[test]
@@ -332,8 +321,11 @@ fn credentials_file_deserializes_real_world_camel_case_keys() {
     }"#;
     let cred: CredentialsFile = serde_json::from_str(json).expect("parse");
     let oauth = cred.claude_ai_oauth.expect("present");
-    assert_eq!(oauth.access_token, "AT");
-    assert_eq!(oauth.refresh_token.as_deref(), Some("RT"));
+    assert!(oauth.access_token.matches("AT"));
+    assert!(oauth
+        .refresh_token
+        .as_ref()
+        .is_some_and(|token| token.matches("RT")));
     assert_eq!(oauth.expires_at, 9999);
 }
 

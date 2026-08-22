@@ -134,13 +134,16 @@ async fn b1_retry_max_matches_cc_10_attempts() {
     let endpoint = format!("{}/v1/messages", server.uri());
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
+    let headers = openclaudia::secrets::SensitiveHeaders::new();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
-        headers: &[],
+        headers: &headers,
         request_body: &request_body,
         provider: "anthropic",
+        model_identity: "claude-sonnet-4-6",
         memory_db: None,
         app_config: None,
         permission_mgr: None,
@@ -198,13 +201,16 @@ async fn b1_503_is_retried() {
     let endpoint = format!("{}/v1/messages", server.uri());
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
+    let headers = openclaudia::secrets::SensitiveHeaders::new();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
-        headers: &[],
+        headers: &headers,
         request_body: &request_body,
         provider: "anthropic",
+        model_identity: "claude-sonnet-4-6",
         memory_db: None,
         app_config: None,
         permission_mgr: None,
@@ -262,13 +268,16 @@ async fn b1_retry_after_zero_retries_without_sleep() {
     // Capture events to verify the retry is a structured side-band event
     // instead of provider-visible assistant text.
     let (tx, rx) = std::sync::mpsc::channel();
+    let headers = openclaudia::secrets::SensitiveHeaders::new();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
-        headers: &[],
+        headers: &headers,
         request_body: &request_body,
         provider: "anthropic",
+        model_identity: "claude-sonnet-4-6",
         memory_db: None,
         app_config: None,
         permission_mgr: None,
@@ -345,13 +354,16 @@ async fn b1_408_is_retried() {
     let endpoint = format!("{}/v1/messages", server.uri());
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
+    let headers = openclaudia::secrets::SensitiveHeaders::new();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
-        headers: &[],
+        headers: &headers,
         request_body: &request_body,
         provider: "anthropic",
+        model_identity: "claude-sonnet-4-6",
         memory_db: None,
         app_config: None,
         permission_mgr: None,
@@ -368,6 +380,8 @@ async fn b1_408_is_retried() {
 
     assert!(result.is_ok(), "408 must be retried and succeed on 2nd try");
 }
+
+mod support;
 
 // ── B3: process_sse_event pure-function contract ──────────────────────────────
 

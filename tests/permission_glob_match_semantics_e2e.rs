@@ -1,7 +1,9 @@
 //! End-to-end tests for `permissions::PermissionManager` glob
 //! match semantics — `*` (non-`/`), `**` (cross-`/`), `?`
 //! (single non-`/` char), special-char escaping for `.`/`(`/etc.
-//! Pins `glob_to_regex` behaviour via session rule matching.
+//! Pins permission-rule matching after mandatory call classification.
+//! Pure glob edge cases that cannot be valid tool targets are pinned by the
+//! permissions module's internal glob tests instead.
 //!
 //! Sprint 213 of the verification effort.
 
@@ -196,15 +198,18 @@ fn prefix_only_match_uses_star_suffix() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn empty_pattern_only_matches_empty_command() {
-    // ^$ matches only empty string.
+fn empty_pattern_cannot_authorize_an_empty_required_command() {
+    // The primitive glob is still ^$, but an empty required Bash target is an
+    // invalid call and is denied before rule matching.
     assert!(!matches_pattern("", "ls"));
-    assert!(matches_pattern("", ""));
+    assert!(!matches_pattern("", ""));
 }
 
 #[test]
-fn pattern_with_only_double_star_matches_any_command_including_empty() {
-    assert!(matches_pattern("**", ""));
+fn pattern_with_only_double_star_matches_any_valid_command_not_empty() {
+    // `**` remains broad for valid targets; it must not turn a missing/empty
+    // required effect target into an allowed invocation.
+    assert!(!matches_pattern("**", ""));
     assert!(matches_pattern("**", "anything goes"));
     assert!(matches_pattern("**", "with/slashes"));
 }

@@ -7,6 +7,7 @@
 //! 4. Environment variables with `OPENCLAUDIA_` prefix
 
 mod acp;
+mod environment;
 mod guardrails;
 mod hooks;
 mod keybindings;
@@ -21,6 +22,10 @@ mod vdd;
 pub mod webfetch;
 
 pub use acp::AcpConfig;
+pub use environment::{
+    environment_variable_metadata, EnvironmentConfigError, EnvironmentDeprecation,
+    EnvironmentPrecedence, EnvironmentSecrecy, EnvironmentValueParser, EnvironmentVariableMetadata,
+};
 pub use guardrails::{
     BlastRadiusConfig, DiffMonitorConfig, GuardrailAction, GuardrailMode, GuardrailsConfig,
     QualityCheck, QualityGatesConfig, RunAfter,
@@ -35,7 +40,12 @@ pub use crate::keybindings::{
 };
 pub use memory::MemoryConfig;
 pub use path_validation::{validate_persist_path, PathValidationError, ALLOW_OUT_OF_ROOT_ENV};
-pub use permissions::PermissionsConfig;
+pub(crate) use permissions::{
+    valid_mcp_server_identity, valid_mcp_tool_identity, MAX_MCP_IDENTITY_COMPONENT_BYTES,
+};
+pub use permissions::{
+    PermissionsConfig, ProjectPermissionProposal, PROJECT_PERMISSION_PROPOSAL_SCHEMA_VERSION,
+};
 pub use provider::{
     adaptive_budget_for, is_local_provider_name, validate_base_url, validate_provider_base_url,
     ProviderConfig, ThinkingConfig,
@@ -50,7 +60,7 @@ pub use webfetch::{
     default_preapproved_domains, is_preapproved, WebFetchConfig, CC_MAX_MARKDOWN_LENGTH,
 };
 
-use config::{Config, ConfigError, Environment, File};
+use config::{Config, ConfigError, File, FileFormat};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -77,8 +87,8 @@ pub struct AppConfig {
     pub guardrails: GuardrailsConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
-    /// Memory subsystem configuration (per-user + optional shared team store).
-    /// See crosslink #604 for the team-memory parity work.
+    /// Memory subsystem configuration (host-owned private store plus an
+    /// optional authenticated, encrypted team replica).
     #[serde(default)]
     pub memory: MemoryConfig,
     /// Web-fetch tool configuration, including the preapproved-domain
@@ -134,33 +144,6 @@ pub fn config_file_exists() -> bool {
     false
 }
 
-/// Set a config override only when `value` is non-empty.
-///
-/// An empty value is treated as "unset" to avoid surfacing `ApiKeyError::Empty`
-/// when users export `FOO_API_KEY=""`.
-fn maybe_set_api_key(
-    builder: config::ConfigBuilder<config::builder::DefaultState>,
-    path: &str,
-    value: String,
-) -> Result<config::ConfigBuilder<config::builder::DefaultState>, ConfigError> {
-    if value.trim().is_empty() {
-        return Ok(builder);
-    }
-    builder.set_override(path, value)
-}
-
-/// Return the first non-empty API key from a provider's accepted environment
-/// variable names. Names are ordered from `OpenClaudia`'s existing convention to
-/// documented/ecosystem aliases so adding compatibility never changes which
-/// key wins for users who already export more than one.
-fn first_api_key_from_env(names: &[&str]) -> Option<String> {
-    names.iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .filter(|key| !key.trim().is_empty())
-    })
-}
-
 /// Load configuration from all sources.
 ///
 /// # Errors
@@ -169,6 +152,7 @@ fn first_api_key_from_env(names: &[&str]) -> Option<String> {
 #[allow(clippy::too_many_lines)] // configuration source assembly is intentionally linear
 pub fn load_config() -> Result<AppConfig, ConfigError> {
     let mut builder = Config::builder();
+    let mut project_permission_proposal = None;
 
     // Set defaults
     builder = builder
@@ -225,10 +209,41 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
             "http://localhost:5000/v1",
         )?;
 
-    // Load from project config file
+    // Load repository configuration without granting its `hooks:` block
+    // executable or instruction authority. The hook importer discovers that
+    // block separately as an inert, digest-bound proposal; trusted home/env
+    // sources below remain ordinary host configuration.
     let project_config = PathBuf::from(".openclaudia/config.yaml");
     if project_config.exists() {
-        builder = builder.add_source(File::from(project_config).required(false));
+        let content =
+            zeroize::Zeroizing::new(std::fs::read_to_string(&project_config).map_err(|error| {
+                ConfigError::Message(format!(
+                    "failed to read project config {}: {error}",
+                    project_config.display()
+                ))
+            })?);
+        let mut document: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|error| {
+            ConfigError::Message(format!(
+                "failed to parse project config {}: {error}",
+                project_config.display()
+            ))
+        })?;
+        project_permission_proposal = permissions::take_project_permission_proposal(
+            &mut document,
+            &project_config,
+            content.as_bytes(),
+        )
+        .map_err(ConfigError::Message)?;
+        if let Some(mapping) = document.as_mapping_mut() {
+            mapping.remove(serde_yaml::Value::String("hooks".to_string()));
+        }
+        let inert_project_config = serde_yaml::to_string(&document).map_err(|error| {
+            ConfigError::Message(format!(
+                "failed to normalize project config {}: {error}",
+                project_config.display()
+            ))
+        })?;
+        builder = builder.add_source(File::from_str(&inert_project_config, FileFormat::Yaml));
     }
 
     // Load from home directory config file
@@ -239,105 +254,16 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         }
     }
 
-    // Load from environment variables with OPENCLAUDIA_ prefix
-    // e.g., OPENCLAUDIA_PROXY_PORT=9090, OPENCLAUDIA_PROVIDERS_ANTHROPIC_API_KEY=sk-...
-    //
-    // `ignore_empty(true)` ensures that an exported-but-empty env var
-    // (`export OPENCLAUDIA_PROVIDERS_ANTHROPIC_API_KEY=""`) does NOT
-    // silently overwrite a value that came from a config file. Without this,
-    // `Environment` forwards the empty string to the builder and the loaded
-    // config value is replaced with `""`, which then fails `ApiKey`
-    // deserialization (or, for non-`ApiKey` fields, simply blanks the slot).
-    // Closes crosslink #696.
-    builder = builder.add_source(
-        Environment::with_prefix("OPENCLAUDIA")
-            .separator("_")
-            .ignore_empty(true)
-            .try_parsing(true),
-    );
+    // Apply only names declared by the typed environment registry. This runs
+    // after both file sources and before callers apply explicit CLI arguments,
+    // matching the source precedence recorded in each registry descriptor.
+    // No underscore rewriting or unknown-key fallback remains.
+    let mut merged = builder.build()?;
+    environment::apply_process_environment(&mut merged)
+        .map_err(|error| ConfigError::Message(error.to_string()))?;
 
-    // Also check provider API-key variables explicitly. Besides supporting
-    // each provider's standard/ecosystem names, this repairs the advertised
-    // `OPENCLAUDIA_PROVIDERS_<NAME>_API_KEY` form: the generic environment
-    // source above treats every `_` as a path separator and would otherwise
-    // deserialize its final component as `api.key` instead of `api_key`.
-    // Closes crosslink #256 mandated refactor point 2.
-    if let Some(key) = first_api_key_from_env(&[
-        "ANTHROPIC_API_KEY",
-        "OPENCLAUDIA_PROVIDERS_ANTHROPIC_API_KEY",
-    ]) {
-        builder = maybe_set_api_key(builder, "providers.anthropic.api_key", key)?;
-    }
-    if let Some(key) =
-        first_api_key_from_env(&["OPENAI_API_KEY", "OPENCLAUDIA_PROVIDERS_OPENAI_API_KEY"])
-    {
-        builder = maybe_set_api_key(builder, "providers.openai.api_key", key)?;
-    }
-    if let Some(key) = first_api_key_from_env(&[
-        "GOOGLE_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENCLAUDIA_PROVIDERS_GOOGLE_API_KEY",
-    ]) {
-        builder = maybe_set_api_key(builder, "providers.google.api_key", key)?;
-    }
-    if let Some(key) = first_api_key_from_env(&["ZAI_API_KEY", "OPENCLAUDIA_PROVIDERS_ZAI_API_KEY"])
-    {
-        builder = maybe_set_api_key(builder, "providers.zai.api_key", key)?;
-    }
-    if let Some(key) =
-        first_api_key_from_env(&["DEEPSEEK_API_KEY", "OPENCLAUDIA_PROVIDERS_DEEPSEEK_API_KEY"])
-    {
-        builder = maybe_set_api_key(builder, "providers.deepseek.api_key", key)?;
-    }
-    if let Some(key) = first_api_key_from_env(&[
-        "QWEN_API_KEY",
-        "DASHSCOPE_API_KEY",
-        "ALIYUN_API_KEY",
-        "OPENCLAUDIA_PROVIDERS_QWEN_API_KEY",
-    ]) {
-        builder = maybe_set_api_key(builder, "providers.qwen.api_key", key)?;
-    }
-    let kimi_key = first_api_key_from_env(&[
-        "KIMI_API_KEY",
-        "MOONSHOT_API_KEY",
-        "OPENCLAUDIA_PROVIDERS_KIMI_API_KEY",
-    ]);
-    if let Some(key) = kimi_key {
-        builder = maybe_set_api_key(builder, "providers.kimi.api_key", key)?;
-    }
-    if let Some(key) =
-        first_api_key_from_env(&["MINIMAX_API_KEY", "OPENCLAUDIA_PROVIDERS_MINIMAX_API_KEY"])
-    {
-        builder = maybe_set_api_key(builder, "providers.minimax.api_key", key)?;
-    }
-    if let Some(key) = first_api_key_from_env(&[
-        "OPENROUTER_API_KEY",
-        "OPEN_ROUTER_API_KEY",
-        "OPENCLAUDIA_PROVIDERS_OPENROUTER_API_KEY",
-    ]) {
-        builder = maybe_set_api_key(builder, "providers.openrouter.api_key", key)?;
-    }
-    if let Some(key) = first_api_key_from_env(&[
-        "OPENCODE_API_KEY",
-        "OPENCODE_GO_API_KEY",
-        "OPENCLAUDIA_PROVIDERS_OPENCODE_API_KEY",
-    ]) {
-        builder = maybe_set_api_key(builder, "providers.opencode.api_key", key)?;
-    }
-    let openai_compatible_key = first_api_key_from_env(&[
-        "OPENAI_COMPATIBLE_API_KEY",
-        "API_KEY",
-        "OPENCLAUDIA_PROVIDERS_OPENAI_COMPATIBLE_API_KEY",
-    ]);
-    if let Some(key) = openai_compatible_key {
-        builder = maybe_set_api_key(builder, "providers.openai-compatible.api_key", key)?;
-    }
-
-    // `ApiKey::deserialize` (invoked transitively here) enforces non-empty,
-    // ASCII, and control-char-free keys. The whitespace-only normalization
-    // previously performed post-load is redundant — the newtype simply
-    // refuses to exist in an invalid state. See crosslink #256.
-    let mut config: AppConfig = builder.build()?.try_deserialize()?;
+    let mut config: AppConfig = merged.try_deserialize()?;
+    config.permissions.project_proposal = project_permission_proposal;
 
     // Validate VDD settings that do not depend on the final runtime target.
     // Provider-pair validation runs after CLI/TUI target overrides and startup
@@ -353,6 +279,16 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         return Err(ConfigError::Message(e));
     }
 
+    // The pre-S-103 shared-path proposal is permanently rejected. A repository
+    // may select a strict team ID, but membership and credentials are resolved
+    // only from the host-owned authority store and signed service descriptor.
+    if config.memory.team_memory_path.is_some() {
+        return Err(ConfigError::Message(
+            "memory.team_memory_path is unsupported: a filesystem path is never authenticated team authority; configure memory.team_id after host enrollment and import a signed service descriptor with `openclaudia team configure-service`"
+                .to_string(),
+        ));
+    }
+
     // Validate each provider's base_url for SSRF / scheme safety (crosslink #329).
     let mut names: Vec<&String> = config.providers.keys().collect();
     names.sort();
@@ -365,11 +301,11 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         }
     }
 
-    // Validate filesystem paths that flow into `std::fs::write` /
-    // `create_dir_all` from user / managed-settings input. Closes
-    // crosslink #342: a malicious managed-settings file specifying
-    // `vdd.tracking.path: /etc/cron.d` previously made the VDD logger
-    // write to system-privileged directories under elevated privileges.
+    // Diagnose configured persistence paths before subsystem startup. This
+    // rejects known system trees, lexical escape, and existing link
+    // components, but deliberately does not confer filesystem authority:
+    // path checks can race. Persistent I/O must use the descriptor-bound
+    // `persistence` API at its actual read/write boundary.
     //
     // `project_root` is the current working directory at config load
     // time — the same anchor used by the existing default `.openclaudia/…`
@@ -448,7 +384,7 @@ mod tests {
                 api_key: Some(test_api_key("key")),
                 base_url: "https://api.anthropic.com".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -473,10 +409,11 @@ mod tests {
 
         let active = config.active_provider();
         assert!(active.is_some());
-        assert_eq!(
-            active.unwrap().api_key.as_ref().map(ApiKey::as_str),
-            Some("key-0000000000")
-        );
+        assert!(active
+            .unwrap()
+            .api_key
+            .as_ref()
+            .is_some_and(|key| key.matches("key-0000000000")));
     }
 
     #[test]
@@ -488,7 +425,7 @@ mod tests {
                 api_key: Some(test_api_key("openai-key")),
                 base_url: "https://api.openai.com".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -498,7 +435,7 @@ mod tests {
                 api_key: Some(test_api_key("anthropic-key")),
                 base_url: "https://api.anthropic.com".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -532,7 +469,7 @@ mod tests {
                 api_key: Some(test_api_key("kimi-key")),
                 base_url: "https://api.moonshot.ai/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -555,13 +492,10 @@ mod tests {
             managed_settings_path: None,
         };
 
-        assert_eq!(
-            config
-                .active_provider()
-                .and_then(|provider| provider.api_key.as_ref())
-                .map(ApiKey::as_str),
-            Some("kimi-key-0000000000")
-        );
+        assert!(config
+            .active_provider()
+            .and_then(|provider| provider.api_key.as_ref())
+            .is_some_and(|key| key.matches("kimi-key-0000000000")));
         assert!(config.get_provider("MOONSHOT").is_some());
     }
 
@@ -574,7 +508,7 @@ mod tests {
                 api_key: Some(test_api_key("opencode")),
                 base_url: "https://opencode.ai/zen/go/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -584,7 +518,7 @@ mod tests {
                 api_key: Some(test_api_key("router")),
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -604,13 +538,10 @@ mod tests {
             managed_settings_path: None,
         };
 
-        assert_eq!(
-            config
-                .get_provider("opencode-go")
-                .and_then(|provider| provider.api_key.as_ref())
-                .map(ApiKey::as_str),
-            Some("opencode-0000000000")
-        );
+        assert!(config
+            .get_provider("opencode-go")
+            .and_then(|provider| provider.api_key.as_ref())
+            .is_some_and(|key| key.matches("opencode-0000000000")));
         assert!(config.get_provider("OPENROUTER").is_some());
     }
 
@@ -623,7 +554,7 @@ mod tests {
                 api_key: Some(test_api_key("canonical")),
                 base_url: "https://api.moonshot.ai/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -633,7 +564,7 @@ mod tests {
                 api_key: Some(test_api_key("alias")),
                 base_url: "https://proxy.example.com/v1".to_string(),
                 model: None,
-                headers: HashMap::new(),
+                headers: crate::secrets::SensitiveHeaders::new(),
                 thinking: ThinkingConfig::default(),
             },
         );
@@ -656,13 +587,10 @@ mod tests {
             managed_settings_path: None,
         };
 
-        assert_eq!(
-            config
-                .active_provider()
-                .and_then(|provider| provider.api_key.as_ref())
-                .map(ApiKey::as_str),
-            Some("alias-0000000000")
-        );
+        assert!(config
+            .active_provider()
+            .and_then(|provider| provider.api_key.as_ref())
+            .is_some_and(|key| key.matches("alias-0000000000")));
     }
 
     #[test]
@@ -683,7 +611,7 @@ mod tests {
                     api_key: None,
                     base_url: base_url.to_string(),
                     model: None,
-                    headers: HashMap::new(),
+                    headers: crate::secrets::SensitiveHeaders::new(),
                     thinking: ThinkingConfig::default(),
                 },
             );
@@ -810,163 +738,5 @@ mod tests {
             Some(path.as_path()),
             "managed_settings_path must hold the path when explicitly set"
         );
-    }
-
-    // ── crosslink #696: empty env vars must not overwrite loaded config ───────
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: env-mutation is serialized under `ENV_LOCK`; no other
-            // thread reads or writes env in the locked critical section.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: see `set` above.
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: see `set` above.
-            unsafe {
-                match &self.previous {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
-    /// Build a `Config` mirroring `load_config()`'s env source, seeded with
-    /// a value at `proxy.target`. We use `proxy.target` (a single-segment
-    /// leaf) rather than `providers.anthropic.api_key` because the
-    /// `Environment` source uses `_` as a path separator and would split
-    /// `API_KEY` into `api.key`. The `proxy.target` slot avoids that
-    /// ambiguity so the test isolates the empty-skip behaviour from the
-    /// separator overlap, which `load_config()` handles explicitly for API
-    /// keys after installing the generic environment source.
-    fn build_with_env_source(ignore_empty: bool) -> Result<Config, ConfigError> {
-        let env = Environment::with_prefix("OPENCLAUDIA")
-            .separator("_")
-            .ignore_empty(ignore_empty)
-            .try_parsing(true);
-        Config::builder()
-            .set_default("proxy.target", "anthropic")?
-            .add_source(env)
-            .build()
-    }
-
-    /// #696 case 1: empty env var must NOT overwrite the loaded value.
-    /// This is the regression. Pre-fix (`ignore_empty(false)`) the empty
-    /// string would land in `proxy.target`; post-fix it is filtered out.
-    #[test]
-    fn issue_696_empty_env_does_not_overwrite_loaded_key() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvGuard::set("OPENCLAUDIA_PROXY_TARGET", "");
-        let cfg = build_with_env_source(true).expect("build ok");
-        let v: String = cfg.get("proxy.target").expect("slot present");
-        assert_eq!(
-            v, "anthropic",
-            "empty env must not overwrite loaded config (#696)"
-        );
-    }
-
-    /// #696 case 2: non-empty env var DOES override the loaded value.
-    /// Pins that `ignore_empty(true)` only filters empty strings.
-    #[test]
-    fn issue_696_non_empty_env_does_override_loaded_key() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvGuard::set("OPENCLAUDIA_PROXY_TARGET", "openai");
-        let cfg = build_with_env_source(true).expect("build ok");
-        let v: String = cfg.get("proxy.target").expect("slot present");
-        assert_eq!(
-            v, "openai",
-            "non-empty env must still override (#696 regression guard)"
-        );
-    }
-
-    /// #696 case 3: unset env var preserves the loaded value.
-    #[test]
-    fn issue_696_unset_env_preserves_loaded_key() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvGuard::unset("OPENCLAUDIA_PROXY_TARGET");
-        let cfg = build_with_env_source(true).expect("build ok");
-        let v: String = cfg.get("proxy.target").expect("slot present");
-        assert_eq!(
-            v, "anthropic",
-            "unset env must leave loaded config untouched (#696)"
-        );
-    }
-
-    /// #696 forensic-evidence pin: pre-fix behaviour. With `ignore_empty(false)`
-    /// — the state of `load_config()` before this fix — an empty env var
-    /// silently blanks the loaded slot. This test reproduces the bug to make
-    /// the regression visible if anyone ever reverts the fix.
-    #[test]
-    fn issue_696_forensic_evidence_pre_fix_behaviour() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvGuard::set("OPENCLAUDIA_PROXY_TARGET", "");
-        // Pre-fix: ignore_empty defaulted to false.
-        let cfg = build_with_env_source(false).expect("build ok");
-        let v: String = cfg.get("proxy.target").expect("slot present");
-        assert_eq!(
-            v, "",
-            "FORENSIC: without ignore_empty, empty env DOES blank the slot — this is the bug fixed by #696"
-        );
-    }
-
-    /// #696 helper pin: `maybe_set_api_key` skips empty AND whitespace.
-    #[test]
-    fn issue_696_maybe_set_api_key_skips_empty_and_whitespace() {
-        let builder = Config::builder()
-            .set_default("providers.anthropic.api_key", "sk-loaded-ZZZZ")
-            .expect("default");
-
-        let after_empty = maybe_set_api_key(builder, "providers.anthropic.api_key", String::new())
-            .expect("empty is a no-op");
-        let cfg = after_empty.build_cloned().expect("build");
-        let key: String = cfg.get("providers.anthropic.api_key").expect("key present");
-        assert_eq!(key, "sk-loaded-ZZZZ", "empty bare-env no-op (#696)");
-
-        let builder2 = Config::builder()
-            .set_default("providers.anthropic.api_key", "sk-loaded-ZZZZ")
-            .expect("default");
-        let after_ws = maybe_set_api_key(
-            builder2,
-            "providers.anthropic.api_key",
-            "   \t  ".to_string(),
-        )
-        .expect("whitespace is a no-op");
-        let cfg2 = after_ws.build().expect("build");
-        let key2: String = cfg2
-            .get("providers.anthropic.api_key")
-            .expect("key present");
-        assert_eq!(key2, "sk-loaded-ZZZZ", "whitespace bare-env no-op (#696)");
     }
 }

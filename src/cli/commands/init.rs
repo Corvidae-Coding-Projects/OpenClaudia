@@ -68,7 +68,6 @@ pub fn cmd_init(force: bool) -> anyhow::Result<()> {
     // Create directories
     fs::create_dir_all(&config_dir)?;
     fs::create_dir_all(config_dir.join("hooks"))?;
-    fs::create_dir_all(config_dir.join("rules"))?;
     fs::create_dir_all(config_dir.join("plugins"))?;
 
     // Write default config
@@ -161,11 +160,6 @@ providers:
 #       hooks:
 #         - type: command
 #           command: python .openclaudia/hooks/validate-write.py
-#   user_prompt_submit:
-#     - hooks:
-#         - type: command
-#           command: python .openclaudia/hooks/prompt-guard.py
-
 session:
   timeout_minutes: 30
   persist_path: .openclaudia/session
@@ -228,7 +222,10 @@ session:
 #       - ".env"
 #       - "secrets/**"
 #       - "*.pem"
-#     max_files_per_turn: 10   # 0 = unlimited
+#     max_files_per_run: 10
+#     max_lines_per_run: 500
+#     max_tool_calls_per_run: 200
+#     max_mutations_per_run: 50
 #   diff_monitor:
 #     enabled: true
 #     max_lines_changed: 500   # 0 = unlimited
@@ -282,28 +279,9 @@ if __name__ == "__main__":
 
     fs::write(config_dir.join("hooks/session-start.py"), example_hook)?;
 
-    // Write example rule
-    let example_rule = r"# Global Rules
-
-These rules are injected into every conversation.
-
-## Code Quality
-- Write clean, readable code
-- Include error handling
-- No hardcoded secrets
-
-## Security
-- Validate all user input
-- Use parameterized queries
-- Follow OWASP guidelines
-";
-
-    fs::write(config_dir.join("rules/global.md"), example_rule)?;
-
     info!("Initialized OpenClaudia configuration in .openclaudia/");
     info!("  config.yaml  - Main configuration");
     info!("  hooks/       - Hook scripts");
-    info!("  rules/       - Markdown rules");
     info!("  plugins/     - Plugin directory");
     info!("");
     info!("Set your API key:");
@@ -313,126 +291,4 @@ These rules are injected into every conversation.
     info!("  openclaudia");
 
     Ok(())
-}
-
-/// Detect project type from current directory
-pub fn detect_project_type() -> Vec<(&'static str, &'static str)> {
-    let mut detected = Vec::new();
-
-    // Check for various project indicators
-    if std::path::Path::new("Cargo.toml").exists() {
-        detected.push(("rust", "Rust project detected (Cargo.toml)"));
-    }
-    if std::path::Path::new("package.json").exists() {
-        detected.push(("node", "Node.js project detected (package.json)"));
-    }
-    if std::path::Path::new("pyproject.toml").exists() || std::path::Path::new("setup.py").exists()
-    {
-        detected.push(("python", "Python project detected"));
-    }
-    if std::path::Path::new("go.mod").exists() {
-        detected.push(("go", "Go project detected (go.mod)"));
-    }
-    if std::path::Path::new("pom.xml").exists() || std::path::Path::new("build.gradle").exists() {
-        detected.push(("java", "Java project detected"));
-    }
-    if std::path::Path::new(".git").exists() {
-        detected.push(("git", "Git repository detected"));
-    }
-
-    detected
-}
-
-/// Generate project rules based on detected type
-pub fn generate_project_rules(project_types: &[(&str, &str)]) -> String {
-    let mut rules = String::new();
-    rules.push_str("# Project Rules\n\n");
-    rules.push_str("Auto-generated rules based on project structure.\n\n");
-
-    for (ptype, _) in project_types {
-        match *ptype {
-            "rust" => {
-                rules.push_str("## Rust Guidelines\n\n");
-                rules.push_str("- Use `cargo fmt` before committing\n");
-                rules.push_str("- Run `cargo clippy` to check for common mistakes\n");
-                rules.push_str("- Prefer `?` operator over `.unwrap()` for error handling\n");
-                rules.push_str("- Use `anyhow::Result` for application errors\n");
-                rules.push_str("- Run `cargo test` before pushing changes\n\n");
-            }
-            "node" => {
-                rules.push_str("## Node.js Guidelines\n\n");
-                rules.push_str("- Use consistent code style (prettier/eslint)\n");
-                rules.push_str("- Run `npm test` before committing\n");
-                rules.push_str("- Keep dependencies up to date\n");
-                rules.push_str("- Use async/await over callbacks\n\n");
-            }
-            "python" => {
-                rules.push_str("## Python Guidelines\n\n");
-                rules.push_str("- Follow PEP 8 style guide\n");
-                rules.push_str("- Use type hints where possible\n");
-                rules.push_str("- Run tests with pytest before committing\n");
-                rules.push_str("- Use virtual environments\n\n");
-            }
-            "go" => {
-                rules.push_str("## Go Guidelines\n\n");
-                rules.push_str("- Run `go fmt` before committing\n");
-                rules.push_str("- Use `go vet` to check for issues\n");
-                rules.push_str("- Handle all errors explicitly\n");
-                rules.push_str("- Run `go test ./...` before pushing\n\n");
-            }
-            "java" => {
-                rules.push_str("## Java Guidelines\n\n");
-                rules.push_str("- Follow Java naming conventions\n");
-                rules.push_str("- Run tests before committing\n");
-                rules.push_str("- Use dependency injection where appropriate\n\n");
-            }
-            "git" => {
-                rules.push_str("## Git Guidelines\n\n");
-                rules.push_str("- Write clear, descriptive commit messages\n");
-                rules.push_str("- Keep commits atomic and focused\n");
-                rules.push_str("- Don't commit secrets or API keys\n\n");
-            }
-            _ => {}
-        }
-    }
-
-    rules
-}
-
-/// Initialize project rules from codebase analysis
-pub fn init_project_rules() {
-    let detected = detect_project_type();
-
-    if detected.is_empty() {
-        println!("\nNo recognized project type detected.");
-        println!("Creating generic rules file.\n");
-    } else {
-        println!("\nDetected project types:");
-        for (_, desc) in &detected {
-            println!("  - {desc}");
-        }
-    }
-
-    let rules_dir = std::path::Path::new(".openclaudia/rules");
-    if let Err(e) = fs::create_dir_all(rules_dir) {
-        eprintln!("\nFailed to create rules directory: {e}\n");
-        return;
-    }
-
-    let rules_content = generate_project_rules(&detected);
-    let rules_path = rules_dir.join("project.md");
-
-    if rules_path.exists() {
-        println!("\nRules file already exists at {}", rules_path.display());
-        println!("Use a text editor to modify it.\n");
-        return;
-    }
-
-    match fs::write(&rules_path, &rules_content) {
-        Ok(()) => {
-            println!("\nGenerated rules at: {}", rules_path.display());
-            println!("Edit this file to customize rules for your project.\n");
-        }
-        Err(e) => eprintln!("\nFailed to write rules: {e}\n"),
-    }
 }

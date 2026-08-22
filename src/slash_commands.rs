@@ -70,7 +70,7 @@ const CORE: &[SlashCommand] = &[
     cmd("/model list", "List available models for current provider"),
     cmd("/model <name>", "Switch to a different model"),
     cmd("/copy", "Copy last assistant response to clipboard"),
-    cmd("/init", "Initialize project config with auto-detection"),
+    cmd("/init", "Initialize project config and skills directory"),
     cmd("/review", "Review uncommitted git changes"),
     cmd(
         "/commit",
@@ -111,13 +111,14 @@ const CORE: &[SlashCommand] = &[
 ];
 
 const MEMORY: &[SlashCommand] = &[
-    cmd("/memory", "Show auto-learning stats"),
-    cmd("/memory patterns", "Show learned coding patterns"),
-    cmd("/memory errors <path>", "Show known errors for a file"),
-    cmd("/memory prefs", "Show learned preferences"),
+    cmd("/memory", "Show causal technical-learning status"),
+    cmd("/memory list", "List typed codebase technical lessons"),
+    cmd("/memory patterns", "Show legacy coding-pattern data"),
+    cmd("/memory errors <path>", "Show legacy error-pattern data"),
+    cmd("/memory prefs", "Show legacy preference data"),
     cmd(
         "/memory files <path>",
-        "Show co-edit relationships for a file",
+        "Show legacy co-edit relationship data",
     ),
     cmd(
         "/memory reset",
@@ -317,8 +318,8 @@ mod tests {
             .split_once("## Slash Commands (Default TUI)")
             .expect("README must document default TUI slash commands")
             .1
-            .split_once("### TUI Shell & Files")
-            .expect("default TUI slash command section must end before shell syntax")
+            .split_once("## Keyboard Shortcuts (Default TUI)")
+            .expect("default TUI slash command section must end before keyboard shortcuts")
             .0;
 
         section

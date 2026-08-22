@@ -13,9 +13,15 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::skill::execute_skill;
+use openclaudia::tools::skill::execute_skill as execute_skill_for_run;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+mod support;
+
+fn execute_skill(args: &HashMap<String, Value>) -> (String, bool) {
+    execute_skill_for_run(support::shared_run_context().as_ref(), args)
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — Missing / wrong-type `name` argument

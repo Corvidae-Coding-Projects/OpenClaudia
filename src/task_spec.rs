@@ -1,7 +1,7 @@
 //! Task specification derived from user-authored ledger observations.
 
 use crate::evidence::Denial;
-use crate::ledger::{Authority, ObsId, ObservationKind, RealityLedger};
+use crate::ledger::{EvidenceTrust, ObsId, ObservationKind, RealityLedger};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -18,16 +18,21 @@ impl TaskSpec {
     /// # Errors
     ///
     /// Returns [`Denial`] when the observation is missing, is not from user
-    /// authority, or is not a user-task observation.
+    /// provenance, or is not a user-task observation.
     pub fn from_user_observation(
         ledger: &RealityLedger,
+        run: &crate::tools::ToolRunContext,
         source_obs: ObsId,
     ) -> Result<Self, Denial> {
         let observation = ledger
             .get(source_obs)
             .ok_or_else(|| Denial::new(format!("unknown task observation {source_obs}")))?;
-        if observation.authority != Authority::User {
-            return Err(Denial::new("task spec must come from user authority"));
+        if observation.provenance.trust != EvidenceTrust::UserInput
+            || !observation.provenance.is_bound_to(run)
+        {
+            return Err(Denial::new(
+                "task spec must come from current-run user input",
+            ));
         }
         let ObservationKind::UserTask { content } = &observation.kind else {
             return Err(Denial::new("task spec source must be a user task"));

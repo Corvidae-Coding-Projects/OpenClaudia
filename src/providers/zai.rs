@@ -69,7 +69,7 @@ impl ProviderAdapter for ZaiAdapter {
         self.0.chat_endpoint(model)
     }
 
-    fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
+    fn get_headers(&self, api_key: &ApiKey) -> crate::secrets::SensitiveHeaders {
         self.0.get_headers(api_key)
     }
 

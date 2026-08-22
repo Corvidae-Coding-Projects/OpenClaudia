@@ -7,7 +7,7 @@
 //! `vdd.tracking.path: /etc/cron.d` would silently make the harness write
 //! cron jobs into a system directory when run with elevated privileges.
 //!
-//! [`validate_persist_path`] is the choke-point. It:
+//! [`validate_persist_path`] is a configuration diagnostic precheck. It:
 //!   1. Lexically resolves `..` / `.` components without touching the
 //!      filesystem (no [`Path::canonicalize`] — that follows symlinks and
 //!      requires the path to exist).
@@ -19,15 +19,18 @@
 //!        - [`dirs::data_dir`], OR
 //!        - [`dirs::cache_dir`], OR
 //!        - `<home>/.openclaudia/`.
-//!   4. Refuses symlinks at the target path (if the target exists) — the
-//!      attacker-controlled symlink trick is the whole reason we don't use
-//!      [`Path::canonicalize`].
+//!   4. Refuses every existing symlink component, including parent links.
 //!   5. Honours `OPENCLAUDIA_ALLOW_OUT_OF_ROOT=1` as an explicit opt-out for
 //!      operators who genuinely need an external location. The escape hatch
 //!      still rejects the hard-coded system-tree denylist (we never write to
 //!      `/etc` no matter what the operator asks for) but lets `/opt/foo/state`
 //!      or `/srv/openclaudia/state` through. A `warn!` is emitted so the
 //!      managed-settings audit log captures the escape.
+//!
+//! The returned [`PathBuf`] is never an authorization capability: all checks
+//! can race a later path-based open. Persistent readers and writers must use
+//! [`crate::persistence::PersistentStorage`] (or another descriptor-bound
+//! capability) for the authoritative operation.
 
 use std::env;
 use std::path::{Component, Path, PathBuf};
@@ -56,7 +59,7 @@ pub enum PathValidationError {
         "persist path '{path}' is outside the project root, data dir, and home/.openclaudia — set OPENCLAUDIA_ALLOW_OUT_OF_ROOT=1 to override"
     )]
     OutsideProjectRoot { path: String },
-    #[error("persist path '{path}' is a symlink — refusing to follow for safety")]
+    #[error("persist path traverses symlink '{path}' — refusing diagnostic path")]
     SymlinkRejected { path: String },
 }
 
@@ -163,17 +166,31 @@ fn check_system_denylist(cleaned: &Path) -> Result<(), PathValidationError> {
     Ok(())
 }
 
-/// Refuse if the target itself is a symlink. We deliberately do NOT walk
-/// parent components because writing into a directory whose grandparent is a
-/// symlink is a normal pattern (e.g. macOS `/var → /private/var`); the
-/// dangerous case is a symlink AT the path the operator is asked to trust.
-fn check_not_symlink(cleaned: &Path) -> Result<(), PathValidationError> {
-    match std::fs::symlink_metadata(cleaned) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(PathValidationError::SymlinkRejected {
-            path: cleaned.display().to_string(),
-        }),
-        _ => Ok(()),
+/// Diagnose every existing symlink component. This closes the obvious parent
+/// link bypass in configuration feedback, but is intentionally not represented
+/// as a race-safe authority boundary; the later I/O still needs a descriptor-
+/// bound capability.
+fn check_existing_components_not_symlinks(cleaned: &Path) -> Result<(), PathValidationError> {
+    let mut prefix = PathBuf::new();
+    for component in cleaned.components() {
+        prefix.push(component.as_os_str());
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(PathValidationError::SymlinkRejected {
+                    path: prefix.display().to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => {
+                // This function is a lexical/configuration diagnostic. Leave
+                // permission and transient I/O failures to the authoritative
+                // descriptor operation, which returns a typed source error.
+                break;
+            }
+        }
     }
+    Ok(())
 }
 
 /// Validate `p` for use as a directory or file path that the harness will
@@ -186,7 +203,8 @@ fn check_not_symlink(cleaned: &Path) -> Result<(), PathValidationError> {
 ///
 /// Returns [`PathValidationError`] if the path is empty, contains a NUL byte,
 /// lands in a system directory, lives outside all allowed roots (without the
-/// escape hatch set), or is a symlink.
+/// escape hatch set), or traverses an existing symlink. A successful result is
+/// a normalized diagnostic value, not permission to perform path-based I/O.
 pub fn validate_persist_path(
     p: &Path,
     project_root: &Path,
@@ -210,8 +228,9 @@ pub fn validate_persist_path(
     //     unlock `/etc/cron.d`.
     check_system_denylist(&cleaned)?;
 
-    // (4) Symlink check on the target (if it exists).
-    check_not_symlink(&cleaned)?;
+    // (4) Diagnose existing parent and leaf links. The persistence capability
+    //     repeats this invariant authoritatively during descriptor lookup.
+    check_existing_components_not_symlinks(&cleaned)?;
 
     // (5) Allowed roots: project root, dirs::data_dir, dirs::cache_dir,
     //     home/.openclaudia/.
@@ -263,6 +282,7 @@ pub fn validate_persist_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -410,6 +430,28 @@ mod tests {
         let err =
             validate_persist_path(&link, root.path()).expect_err("symlink target must be rejected");
         assert!(matches!(err, PathValidationError::SymlinkRejected { .. }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_symlink_is_diagnosed_but_not_treated_as_authority() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvGuard::unset();
+        let root = project();
+        let outside = project();
+        let linked_parent = root.path().join("linked-parent");
+        std::os::unix::fs::symlink(outside.path(), &linked_parent).expect("parent symlink");
+
+        let err = validate_persist_path(&linked_parent.join("state.json"), root.path())
+            .expect_err("an existing parent symlink must be diagnosed");
+        assert_eq!(
+            err,
+            PathValidationError::SymlinkRejected {
+                path: linked_parent.display().to_string(),
+            }
+        );
     }
 
     // ── #342 test 6: escape hatch admits /tmp/state.json ────────────────────

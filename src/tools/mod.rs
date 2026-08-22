@@ -6,11 +6,22 @@
 //! - Write: Write/create files
 //! - Edit: Make targeted edits to files
 //!
-//! Stateful mode adds memory tools:
-//! - `memory_save`: Store information in archival memory
-//! - `memory_search`: Search archival memory
-//! - `memory_update`: Update existing memory
-//! - `core_memory_update`: Update core memory sections
+//! Stateful mode adds typed codebase-lesson tools:
+//! - `memory_save`: Store one cited, codebase-specific technical lesson
+//! - `memory_search`: Retrieve bounded cited lessons as reference evidence
+//! - `memory_list`: List recent typed lessons
+//! - `memory_learning_status`: Inspect causal capture and degradation metadata
+//! - `memory_conflicts`: Inspect bounded cited branches and exact head sets
+//! - `memory_update`: Correct one exact head or resolve a complete conflict set
+//! - `memory_delete`: Tombstone an exact lesson revision
+//! - `memory_review`: Apply or revoke a fresh host-authorized review
+//! - `memory_export`: Publish a bounded portable causal package
+//! - `memory_import`: Strictly verify and atomically restore that package
+//! - `memory_source_status`: Inspect a strict repository lesson source
+//! - `memory_source_refresh`: Atomically import/refresh that explicit source
+//!
+//! Conversation prose, transcripts, and legacy core-memory sections are not
+//! exposed through these model-facing tools.
 //!
 
 mod accumulator;
@@ -18,19 +29,33 @@ pub(crate) mod args;
 mod ask_user;
 mod bash;
 pub(crate) use bash::record_command_observation_for_session;
-pub use bash::sandbox::{sandbox_diagnostics, sandbox_preflight, SandboxDiagnostics};
+pub use bash::sandbox::{
+    sandbox_diagnostics, sandbox_diagnostics_for_run, sandbox_preflight, SandboxDiagnostics,
+};
 pub(crate) use bash::sandbox::{sandboxed_hook_command, sandboxed_process_command, SandboxProfile};
+pub mod catalog;
 pub(crate) mod command;
+mod continuation;
 mod cron;
-pub(crate) mod crosslink;
+pub mod crosslink;
+pub mod effect;
 /// Re-export the cron command entry points so the E2E test suite
 /// (`tests/cron_e2e.rs`) can drive create/list/delete + the
 /// validator perimeter directly. Internal call sites continue to
 /// reach these via the module path.
-pub use cron::{execute_cron_create, execute_cron_delete, execute_cron_list};
-mod file;
+pub use cron::{
+    execute_cron_create, execute_cron_delete, execute_cron_list, validate_cron_expression,
+};
+pub(crate) mod file;
 pub(crate) use file::open_capability_regular_read;
+pub use file::{
+    create_capability_text_file, create_run_control_directory, create_run_control_text_file,
+    initialize_project_for_run, read_capability_text_attachment, read_run_control_text,
+    resolve_path as resolve_capability_path, ProjectInitOutcome,
+};
 mod grounding;
+pub(crate) mod host_safety;
+pub use host_safety::HOST_SAFETY_POLICY_GENERATION;
 pub mod security;
 /// Re-export the notebook-source-to-line-array helper so the
 /// E2E test suite (`tests/notebook_edit_e2e.rs`) can construct
@@ -40,9 +65,11 @@ pub mod security;
 pub use file::source_to_line_array;
 pub mod file_index;
 pub mod lsp;
+mod memory;
 mod plan_mode;
 pub mod registry;
 pub mod remote_trigger;
+mod result;
 pub mod skill;
 // `task` is exposed so the end-to-end test suite (`tests/tools_e2e.rs`)
 // can drive `execute_task_create` / `_update` / `_get` / `_list` against
@@ -55,6 +82,23 @@ pub mod tool_search;
 mod web;
 pub mod worktree;
 
+/// Whether a registry handler consumes the caller's canonical task graph.
+/// Frontends use this before taking their task-manager mutex so unrelated
+/// tools never serialize behind planning-state persistence.
+#[must_use]
+pub fn uses_canonical_task_graph(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "task_create"
+            | "task_update"
+            | "task_get"
+            | "task_list"
+            | "todo_write"
+            | "todo_read"
+            | "crosslink"
+    )
+}
+
 // Re-exports
 pub use accumulator::{
     AnthropicContentBlock, AnthropicToolAccumulator, PartialToolCall, ToolCallAccumulator,
@@ -63,47 +107,43 @@ pub use accumulator::{
 /// Credential-sensitivity classifier re-exported for use outside the tools
 /// module (e.g. `hooks::mod` env-scrub logic). Avoids making `bash` public.
 pub(crate) use bash::is_sensitive_env;
-/// Bash command-policy gates re-exported for the security E2E test suite
-/// (`tests/tools_security_e2e.rs`). Exposed at this layer so attack-catalog
-/// tests can drive the gates directly without spawning the attacker
-/// payloads — the alternative (calling `execute_tool`) would actually
-/// execute any payload that slipped past the policy, hanging the runner
-/// (e.g. `find / -name '*.key' -exec cat {} +`). Keeping the bash
-/// submodule itself private avoids pedantic-lint churn on its other
-/// pub-fns.
+/// Bash command-policy gates re-exported for the security E2E test suite.
+/// Attack-catalog tests drive the deny-only defence-in-depth checks without
+/// spawning the payloads. Effect classification and auto-approval come only
+/// from the typed registry, never from these string scanners.
 pub use bash::policy::{
-    dangerous_shell_construct, is_safe_for_auto_allow, is_sensitive_env as is_sensitive_env_pub,
-    validate_command, MAX_COMMAND_LEN,
+    dangerous_shell_construct, is_sensitive_env as is_sensitive_env_pub, validate_command,
+    MAX_COMMAND_LEN,
 };
 /// Process-wide background shell registry, re-exported so the
 /// coordinator's [`crate::coordinator::tasks::LocalShellTask`]
 /// (crosslink #611) can query running shells without taking a
 /// dependency on the private `bash` submodule.
 pub(crate) use bash::BACKGROUND_SHELLS;
-/// Bash path-allowlist gate (crosslink #594). Re-exported so the permission
-/// layer and proxy startup can install a process-wide constraint set
-/// derived from `additionalWorkingDirectories` without making the entire
-/// `bash` module public.
-pub use bash::{
-    check_command_against_global as check_bash_path_against_global, clear_global_path_constraints,
-    install_global_path_constraints, PathConstraints,
-};
 pub(crate) use bash::{terminate_process_tree, terminate_session_background_jobs};
 pub(crate) use command::run_sandboxed_with_timeout_with_env;
 pub(crate) use command::{
-    cancel_all_sandbox_processes, cancel_session_sandbox_processes,
-    clear_session_process_cancellation,
+    cancel_all_sandbox_processes, cancel_run_sandbox_processes, cancel_session_sandbox_processes,
 };
 pub(crate) use command::{run_prepared_sandboxed_with_timeout, CommandError};
-/// RAII guard that marks the current thread as executing inside a subagent
-/// task, so `execute_enter_plan_mode` refuses with the CC-parity error
-/// (crosslink #620). Subagent runners construct one of these for the
-/// duration of a `task` tool invocation; tests construct one directly.
-pub use plan_mode::{in_agent_task, AgentContextGuard};
-pub use registry::{PermissionTarget, ToolContext, ToolHandler, ToolRegistry};
-pub use todo::{
-    clear_all_todo_lists, clear_todo_list, get_todo_list, SessionIdGuard, TodoItem, TodoStatus,
+pub use continuation::{
+    ToolContinuation, ToolContinuationError, ToolExchange, TOOL_CONTINUATION_SCHEMA_VERSION,
 };
+pub use registry::{ToolContext, ToolHandler, ToolRegistry};
+pub use result::{
+    ToolAllowedPrompt, ToolArtifact, ToolAttachment, ToolCompleteness, ToolContent, ToolDiff,
+    ToolDisplay, ToolExecutionResult, ToolFailure, ToolFailureCode, ToolFollowUp,
+    ToolFollowUpState, ToolHandlerResult, ToolInvocation, ToolObservation, ToolOutcome,
+    ToolQuestion, ToolQuestionOption, ToolResult, ToolResultError, ToolRetryability,
+    ToolSensitivity, ToolUsage, TOOL_RESULT_SCHEMA_VERSION,
+};
+pub use security::{
+    ToolCapabilityError, ToolExecutableError, ToolResource, ToolRunContext, ToolRunContextBuilder,
+    WorkspaceAccess,
+};
+
+pub(crate) const TECHNICAL_LEARNING_CAPTURE_OBSERVATION_KIND: &str = "technical_learning_capture";
+pub use todo::{clear_all_todo_lists, clear_todo_list, get_todo_list, TodoItem, TodoStatus};
 /// Web-fetch output formatter + cap constant. Curated re-export so the
 /// content-extraction E2E tests (`tests/web_content_extraction_e2e.rs`,
 /// sprint 41) can drive `format_fetch_output` directly without spawning
@@ -114,7 +154,9 @@ pub use worktree::cwd_cache_generation;
 
 use crate::config::AppConfig;
 use crate::memory::MemoryDb;
-use crate::permissions::{CheckResult, PermissionManager};
+use crate::permissions::{
+    AuthorizationResult, CheckResult, ConsumedExecutionPermit, ExecutionPermit, PermissionManager,
+};
 use crate::session::TaskManager;
 use crate::subagent;
 use serde::{Deserialize, Serialize};
@@ -137,16 +179,40 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 
 /// Reset the read tracker. Used by tests and at session-start.
 ///
-/// Clears every per-session bucket so legacy callers that do not
-/// activate a `SessionIdGuard` get a clean slate the same way they
-/// did before crosslink #440.
+/// Clears only the exact run bucket; no ambient session identity participates.
 #[doc(hidden)]
-pub fn reset_read_tracker() {
-    file::READ_TRACKER.clear_all();
+pub fn reset_read_tracker(run: &ToolRunContext) {
+    file::READ_TRACKER.clear_run(run);
+}
+
+/// Retire one exact frontend run before replacing its session generation.
+///
+/// This host lifecycle boundary cancels the run tree and terminates only the
+/// synchronous processes, background shells, and background agents owned by
+/// that run. Concurrent runs and later generations are unaffected.
+pub fn retire_run(run: &ToolRunContext) {
+    let _ = run
+        .runtime()
+        .cancellation()
+        .cancel(crate::runtime::CancellationReason::FrontendDisconnected);
+    let sandbox_processes = cancel_run_sandbox_processes(run);
+    let background_shells = BACKGROUND_SHELLS.kill_for_run(run);
+    let background_agents = crate::subagent::BACKGROUND_AGENTS.stop_all_for_run(run);
+    crate::auto_learn::retire_run(run);
+    tracing::info!(
+        target: "openclaudia::capabilities",
+        event = "run_retired",
+        run_id = %run.run_id(),
+        generation = %run.generation(),
+        sandbox_processes,
+        background_agents,
+        background_shells,
+        "Retired exact frontend run resources"
+    );
 }
 
 /// Tool call from the model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -155,30 +221,11 @@ pub struct ToolCall {
 }
 
 /// Function call details
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
     pub arguments: String,
 }
-
-/// Result of executing a tool
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub tool_call_id: String,
-    pub content: String,
-    pub is_error: bool,
-}
-
-/// Marker type for `ask_user_question` results.
-/// The tool returns a JSON object with type "`user_question`" that the main loop
-/// intercepts to display questions and collect answers from the user.
-pub const USER_QUESTION_MARKER: &str = "user_question";
-
-/// Marker type for `enter_plan_mode` results.
-pub const ENTER_PLAN_MODE_MARKER: &str = "enter_plan_mode";
-
-/// Marker type for `exit_plan_mode` results.
-pub const EXIT_PLAN_MODE_MARKER: &str = "exit_plan_mode";
 
 /// Get all tool definitions for the API request (`OpenAI` function format).
 ///
@@ -196,69 +243,70 @@ pub fn get_tool_definitions() -> Value {
     )
 }
 
-/// Execute a tool call and return the result (non-stateful mode).
+/// Execute a tool call with an explicit host-owned unrestricted prompt policy.
 ///
-/// Legacy back-compat entry: no [`PermissionManager`] supplied. The permission
-/// gate is still consulted internally — it will bypass fail-open with a
-/// structured `tracing::debug!` (and a one-time `tracing::warn!` per
-/// session — see [`warn_missing_permission_manager_once`]). New call sites
-/// should migrate to [`execute_tool_with_permission_required`] which takes
-/// `&PermissionManager` by reference. See crosslink #460.
+/// This convenience entry point never means "no policy object". It constructs
+/// an explicit unrestricted [`PermissionManager`], which suppresses approval
+/// prompts while retaining mandatory effect classification, the non-bypassable
+/// host ceiling, exact dispatch authorization, and the sandbox/capability
+/// boundary.
 #[must_use]
-pub fn execute_tool(tool_call: &ToolCall) -> ToolResult {
-    execute_tool_with_memory(tool_call, None, None)
+pub fn execute_tool(run: &std::sync::Arc<ToolRunContext>, tool_call: &ToolCall) -> ToolResult {
+    let permission_manager = PermissionManager::unrestricted_for_run(run);
+    execute_tool_with_memory(run, tool_call, None, &permission_manager)
 }
 
-/// Warn exactly once per process when a dispatch entry point is called
-/// without a [`PermissionManager`]. This keeps logs from drowning while
-/// still surfacing the migration target for call sites that haven't yet
-/// threaded a manager through. See crosslink #460.
-fn warn_missing_permission_manager_once(entry_point: &'static str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            entry_point,
-            "{entry_point} called without PermissionManager. Legacy fail-open posture preserved \
-             for back-compat. New call sites should use execute_tool_with_permission_required(). \
-             See crosslink #460."
-        );
-    }
+/// Fail-closed compatibility probe for callers that have no run capability.
+///
+/// This function never dispatches a handler. It exists so adapters can turn a
+/// missing composition-root binding into a typed tool result without deriving
+/// authority from process CWD or thread-local state.
+#[must_use]
+pub fn execute_tool_without_context(tool_call: &ToolCall) -> ToolResult {
+    ToolResult::failure(
+        tool_call,
+        ToolFailureCode::Unavailable,
+        "Tool execution is unavailable because no explicit run capability was supplied".to_string(),
+        ToolRetryability::Never,
+    )
 }
 
 fn invalid_tool_arguments_result(
     tool_call: &ToolCall,
     detail: impl std::fmt::Display,
 ) -> ToolResult {
-    ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content: format!(
+    ToolResult::failure(
+        tool_call,
+        ToolFailureCode::InvalidArguments,
+        format!(
             "Invalid tool arguments JSON for '{}': {detail}",
             tool_call.function.name
         ),
-        is_error: true,
-    }
+        ToolRetryability::Never,
+    )
 }
 
-fn parse_tool_arguments_value(tool_call: &ToolCall) -> Result<Value, ToolResult> {
+fn parse_tool_arguments_value(tool_call: &ToolCall) -> Result<Value, Box<ToolResult>> {
     let value = serde_json::from_str::<Value>(&tool_call.function.arguments)
-        .map_err(|err| invalid_tool_arguments_result(tool_call, err))?;
+        .map_err(|err| Box::new(invalid_tool_arguments_result(tool_call, err)))?;
     if !value.is_object() {
-        return Err(invalid_tool_arguments_result(
+        return Err(Box::new(invalid_tool_arguments_result(
             tool_call,
             format_args!("expected a JSON object, got {}", value_type_name(&value)),
-        ));
+        )));
     }
     Ok(value)
 }
 
-fn parse_tool_arguments_map(tool_call: &ToolCall) -> Result<HashMap<String, Value>, ToolResult> {
+fn parse_tool_arguments_map(
+    tool_call: &ToolCall,
+) -> Result<HashMap<String, Value>, Box<ToolResult>> {
     let value = parse_tool_arguments_value(tool_call)?;
     let Value::Object(map) = value else {
-        return Err(invalid_tool_arguments_result(
+        return Err(Box::new(invalid_tool_arguments_result(
             tool_call,
             format_args!("expected a JSON object, got {}", value_type_name(&value)),
-        ));
+        )));
     };
     Ok(map.into_iter().collect())
 }
@@ -274,30 +322,187 @@ const fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// Gate a tool call through the permission system and return either a
-/// ready-to-return [`ToolResult`] (for Denied / `NeedsPrompt` in legacy
-/// string form) or `None` to signal "continue with normal dispatch".
-///
-/// This is the internal choke point used by every `execute_tool*` dispatch
-/// entry point. It guarantees that no dispatch body runs without the
-/// permission check having been consulted first. See crosslink #460.
-fn gate_or_legacy_result(
+fn host_safety_dispatch_permit(
+    run: &ToolRunContext,
     tool_call: &ToolCall,
-    permission_mgr: Option<&PermissionManager>,
-) -> Option<ToolResult> {
-    match check_tool_permission_outcome(tool_call, permission_mgr) {
-        PermissionOutcome::Allowed => None,
-        PermissionOutcome::Denied(result) => Some(result),
-        PermissionOutcome::NeedsPrompt {
-            tool_call_id,
-            tool,
-            target,
-        } => Some(ToolResult {
-            tool_call_id,
-            content: legacy_permission_prompt(&tool, &target),
-            is_error: true,
-        }),
+    args: &HashMap<String, Value>,
+    authorization: Option<&ConsumedExecutionPermit>,
+) -> Result<registry::ToolDispatchPermit, Box<ToolResult>> {
+    let arguments = Value::Object(
+        args.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    host_safety::HostSafetyPolicy::enforce(&tool_call.function.name, &arguments).map_err(
+        |reason| {
+            Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by non-bypassable host safety: {reason}"),
+                ToolRetryability::Never,
+            ))
+        },
+    )?;
+    Ok(authorization.map_or_else(
+        || registry::ToolDispatchPermit::new(&tool_call.id, &tool_call.function.name, args),
+        |authorization| {
+            registry::ToolDispatchPermit::new_with_authorization(
+                &tool_call.id,
+                &tool_call.function.name,
+                args,
+                authorization,
+                run,
+            )
+        },
+    ))
+}
+
+/// Guardrail reservation for an async dynamic dispatcher that cannot use the
+/// static handler registry. Dropping it without [`Self::commit`] releases the
+/// pending blast-radius charge.
+pub(crate) struct DynamicToolEffectReservation {
+    reservation: crate::guardrails::EffectReservation,
+}
+
+impl DynamicToolEffectReservation {
+    pub fn commit(mut self) {
+        self.reservation.commit();
     }
+}
+
+pub(crate) fn reserve_dynamic_tool_effect(
+    run: &ToolRunContext,
+    tool_call: &ToolCall,
+    args: &HashMap<String, Value>,
+    authorization: &ConsumedExecutionPermit,
+) -> Result<DynamicToolEffectReservation, Box<ToolResult>> {
+    let arguments = Value::Object(
+        args.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let resolved = host_safety::HostSafetyPolicy::enforce(&tool_call.function.name, &arguments)
+        .map_err(|reason| {
+            Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by non-bypassable host safety: {reason}"),
+                ToolRetryability::Never,
+            ))
+        })?;
+    run.require(ToolResource::Mcp).map_err(|error| {
+        Box::new(ToolResult::failure(
+            tool_call,
+            ToolFailureCode::Unavailable,
+            format!("MCP execution capability is unavailable: {error}"),
+            ToolRetryability::Never,
+        ))
+    })?;
+    // Reconstructing the registry permit verifies that the consumed approval
+    // remains bound to this exact run/tool/argument tuple. Dynamic dispatch
+    // does not expose the permit to an untrusted server.
+    let _permit = host_safety_dispatch_permit(run, tool_call, args, Some(authorization))?;
+    let reservation = crate::guardrails::reserve_tool_effect(run, &resolved).map_err(|reason| {
+        Box::new(ToolResult::failure(
+            tool_call,
+            ToolFailureCode::PolicyDenied,
+            format!("Blocked by blast radius guardrails: {reason}"),
+            ToolRetryability::Never,
+        ))
+    })?;
+    Ok(DynamicToolEffectReservation { reservation })
+}
+
+fn dispatch_registered_with_permit(
+    tool_call: &ToolCall,
+    args: &HashMap<String, Value>,
+    ctx: &mut ToolContext<'_>,
+    permit: &registry::ToolDispatchPermit,
+) -> ToolResult {
+    let resolved = match effect::resolve_for_call(
+        &tool_call.function.name,
+        &Value::Object(
+            args.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                error.reason(),
+                ToolRetryability::Never,
+            );
+        }
+    };
+    let mut guardrail_reservation = match crate::guardrails::reserve_tool_effect(ctx.run, &resolved)
+    {
+        Ok(reservation) => reservation,
+        Err(reason) => {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by blast radius guardrails: {reason}"),
+                ToolRetryability::Never,
+            );
+        }
+    };
+    let handler_result = registry::registry()
+        .dispatch(tool_call.function.name.as_str(), args, ctx, permit)
+        .unwrap_or_else(|| {
+            ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::Unavailable,
+                format!("Unknown tool: {}", tool_call.function.name),
+                ToolRetryability::Never,
+            ))
+        });
+    let result = ToolResult::bind(tool_call, &tool_call.function.name, handler_result);
+    if !result.is_error() {
+        guardrail_reservation.commit();
+    }
+    attach_automatic_learning(
+        ctx.run,
+        ctx.memory_db,
+        ctx.app_config,
+        ctx.task_mgr.as_deref(),
+        result,
+    )
+}
+
+pub(crate) fn attach_automatic_learning(
+    run: &ToolRunContext,
+    memory_db: Option<&MemoryDb>,
+    app_config: Option<&AppConfig>,
+    task_manager: Option<&TaskManager>,
+    result: ToolResult,
+) -> ToolResult {
+    if !app_config.is_some_and(|config| config.memory.automatic_learning_enabled) {
+        return result;
+    }
+    let Some(memory_db) = memory_db else {
+        return result;
+    };
+    let Some(receipt) =
+        crate::auto_learn::observe_tool_result(run, memory_db, task_manager, &result)
+    else {
+        return result;
+    };
+    result.with_observation(receipt.into_tool_observation())
+}
+
+fn dispatch_registered_after_authorization(
+    tool_call: &ToolCall,
+    args: &HashMap<String, Value>,
+    ctx: &mut ToolContext<'_>,
+    authorization: Option<&ConsumedExecutionPermit>,
+) -> ToolResult {
+    let permit = match host_safety_dispatch_permit(ctx.run, tool_call, args, authorization) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+    dispatch_registered_with_permit(tool_call, args, ctx, &permit)
 }
 
 /// Describe the effective authority behind an interactive tool permission.
@@ -330,35 +535,34 @@ fn legacy_permission_prompt(tool: &str, target: &str) -> String {
     )
 }
 
-/// Execute a tool call with optional memory and permission manager.
-///
-/// The permission gate runs BEFORE the tool body; passing `None` preserves
-/// the historical fail-open posture for back-compat and emits a one-time
-/// migration warning. New callers should prefer
-/// [`execute_tool_with_permission_required`]. See crosslink #460.
+/// Execute a tool call with optional memory and a required permission manager.
 #[must_use]
 pub fn execute_tool_with_memory(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> ToolResult {
-    if permission_mgr.is_none() {
-        warn_missing_permission_manager_once("execute_tool_with_memory");
-    }
-    if let Some(gated) = gate_or_legacy_result(tool_call, permission_mgr) {
-        return gated;
-    }
-
-    execute_tool_with_memory_unchecked(tool_call, memory_db)
+    let permit = match authorization_or_legacy_prompt(tool_call, permission_mgr) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return *result,
+    };
+    execute_tool_with_memory_after_authorization(run, tool_call, memory_db, Some(&authorization))
 }
 
-fn execute_tool_with_memory_unchecked(
+fn execute_tool_with_memory_after_authorization(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
+    authorization: Option<&ConsumedExecutionPermit>,
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
 
     // Subagent tools require full config context; surface a clear error here
@@ -367,63 +571,83 @@ fn execute_tool_with_memory_unchecked(
         tool_call.function.name.as_str(),
         "task" | "agent_output" | "task_stop"
     ) {
-        return ToolResult {
-            tool_call_id: tool_call.id.clone(),
-            content:
-                "Subagent tools require configuration context. Use execute_tool_full() instead."
-                    .to_string(),
-            is_error: true,
-        };
+        return ToolResult::failure(
+            tool_call,
+            ToolFailureCode::Unavailable,
+            "Subagent tools require configuration context. Use execute_tool_full() instead."
+                .to_string(),
+            ToolRetryability::Never,
+        );
     }
 
     let mut ctx = ToolContext {
-        security: security::current_context(),
+        run,
         memory_db,
         app_config: None,
         task_mgr: None,
     };
-
-    let (content, is_error) = registry::registry()
-        .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-        .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true));
-
-    ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content,
-        is_error,
-    }
+    dispatch_registered_after_authorization(tool_call, &args, &mut ctx, authorization)
 }
 
 /// Execute a tool call with full context (memory + config for subagents).
-///
-/// The permission gate runs BEFORE the tool body. Passing `None` for
-/// `permission_mgr` preserves the historical fail-open posture and emits
-/// a one-time migration warning. See crosslink #460.
 #[must_use]
 pub fn execute_tool_full(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> ToolResult {
-    if permission_mgr.is_none() {
-        warn_missing_permission_manager_once("execute_tool_full");
-    }
-    if let Some(gated) = gate_or_legacy_result(tool_call, permission_mgr) {
-        return gated;
-    }
-
-    execute_tool_full_unchecked(tool_call, memory_db, app_config)
+    let permit = match authorization_or_legacy_prompt(tool_call, permission_mgr) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return *result,
+    };
+    execute_tool_full_after_authorization(
+        run,
+        tool_call,
+        memory_db,
+        app_config,
+        Some(&authorization),
+    )
 }
 
-fn execute_tool_full_unchecked(
+fn execute_tool_full_after_authorization(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
+    authorization: Option<&ConsumedExecutionPermit>,
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
-        Err(result) => return result,
+        Err(result) => return *result,
+    };
+    let dispatch_permit = match host_safety_dispatch_permit(run, tool_call, &args, authorization) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+
+    let resolved = match effect::resolve_for_call(
+        &tool_call.function.name,
+        &Value::Object(
+            args.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                error.reason(),
+                ToolRetryability::Never,
+            );
+        }
     };
 
     // Check for subagent tools first (they need config). Each match arm
@@ -431,36 +655,70 @@ fn execute_tool_full_unchecked(
     // wrapping happens *after* the match so there is a single return point
     // (crosslink #491 — previously the default arm returned mid-match,
     // bypassing the wrapper and creating asymmetric control flow).
-    let (content, is_error) = match tool_call.function.name.as_str() {
-        "task" => app_config.map_or_else(
-            || {
-                (
-                    "Task tool requires application configuration".to_string(),
-                    true,
-                )
-            },
-            |config| subagent::execute_task_tool(&args, config),
-        ),
-        "agent_output" => subagent::execute_agent_output_tool(&args),
-        "task_stop" => subagent::execute_task_stop_tool(&args),
+    let mut guardrail_reservation = if matches!(
+        tool_call.function.name.as_str(),
+        "task" | "agent_output" | "task_stop"
+    ) {
+        match crate::guardrails::reserve_tool_effect(run, &resolved) {
+            Ok(reservation) => Some(reservation),
+            Err(reason) => {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::PolicyDenied,
+                    format!("Blocked by blast radius guardrails: {reason}"),
+                    ToolRetryability::Never,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let handler_result = match tool_call.function.name.as_str() {
+        "task" => run
+            .require(ToolResource::Network)
+            .and_then(|()| run.require(ToolResource::Secrets))
+            .map_or_else(
+                |error| {
+                    ToolHandlerResult::error(ToolFailure::new(
+                        ToolFailureCode::Unavailable,
+                        format!("Task execution is unavailable: {error}"),
+                        ToolRetryability::Never,
+                    ))
+                },
+                |()| {
+                    app_config.map_or_else(
+                        || {
+                            ToolHandlerResult::error(ToolFailure::new(
+                                ToolFailureCode::Unavailable,
+                                "Task tool requires application configuration".to_string(),
+                                ToolRetryability::Never,
+                            ))
+                        },
+                        |config| subagent::execute_task_tool_typed(run, &args, config, memory_db),
+                    )
+                },
+            ),
+        "agent_output" => subagent::execute_agent_output_tool_typed(run, &args),
+        "task_stop" => subagent::execute_task_stop_tool_typed(run, &args),
         _ => {
             let mut ctx = ToolContext {
-                security: security::current_context(),
+                run,
                 memory_db,
                 app_config,
                 task_mgr: None,
             };
-            registry::registry()
-                .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-                .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true))
+            return dispatch_registered_with_permit(tool_call, &args, &mut ctx, &dispatch_permit);
         }
     };
 
-    ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content,
-        is_error,
+    let result = ToolResult::bind(tool_call, &tool_call.function.name, handler_result);
+    if !result.is_error() {
+        if let Some(reservation) = guardrail_reservation.as_mut() {
+            reservation.commit();
+        }
     }
+    attach_automatic_learning(run, memory_db, app_config, None, result)
 }
 
 /// Get all tool definitions, optionally including subagent tools
@@ -482,94 +740,45 @@ pub fn get_all_tool_definitions(subagents: bool) -> Value {
     tools
 }
 
-/// Typed control-plane signal carried by a tool result.
+/// Publish the run-owned progressive view of built-in and optional subagent
+/// definitions for one provider request.
 ///
-/// crosslink #980: the `enter_plan_mode` / `exit_plan_mode` / `ask_user_question`
-/// tools used to communicate with the main loop via JSON payloads whose `type`
-/// field carried a magic string marker. The dispatcher had to substring-parse
-/// every tool result and route on the marker. This enum is the typed control
-/// plane that the dispatcher should match on instead.
+/// # Errors
 ///
-/// The legacy [`check_tool_result_marker`] returning `Option<String>` is kept
-/// for back-compat callers but should be considered deprecated in favour of
-/// [`parse_tool_control_signal`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolControlSignal {
-    /// `ask_user_question` — the dispatcher must prompt the user and feed
-    /// the answers back into the conversation.
-    UserQuestion,
-    /// `enter_plan_mode` — flip the session into read-only / plan mode.
-    EnterPlanMode,
-    /// `exit_plan_mode` — restore the previous permission posture and show
-    /// the proposed plan to the user for approval.
-    ExitPlanMode,
+/// Returns an error if the trusted registry cannot be represented as a valid,
+/// bounded, generation-bound catalog.
+pub fn get_progressive_tool_definitions(
+    run: &ToolRunContext,
+    messages: &[Value],
+    subagents: bool,
+) -> Result<catalog::ToolCatalogSnapshot, String> {
+    get_progressive_tool_definitions_with_additional(run, messages, subagents, &[])
 }
 
-impl ToolControlSignal {
-    /// Marker string the tool layer embeds in its JSON `type` field. Used by
-    /// [`parse_tool_control_signal`] to recognise the signal.
-    #[must_use]
-    pub const fn marker(self) -> &'static str {
-        match self {
-            Self::UserQuestion => USER_QUESTION_MARKER,
-            Self::EnterPlanMode => ENTER_PLAN_MODE_MARKER,
-            Self::ExitPlanMode => EXIT_PLAN_MODE_MARKER,
-        }
-    }
-}
-
-/// Attempt to interpret `content` as a typed [`ToolControlSignal`].
+/// Publish a progressive catalog view with additional already-validated
+/// dynamic definitions, such as the healthy snapshot from an MCP manager.
 ///
-/// Returns `None` for ordinary tool results (the overwhelmingly common case)
-/// — only the three control tools produce signals here. crosslink #980.
-#[must_use]
-pub fn parse_tool_control_signal(content: &str) -> Option<ToolControlSignal> {
-    let parsed: Value = serde_json::from_str(content).ok()?;
-    let marker_type = parsed.get("type").and_then(|v| v.as_str())?;
-    match marker_type {
-        USER_QUESTION_MARKER => Some(ToolControlSignal::UserQuestion),
-        ENTER_PLAN_MODE_MARKER => Some(ToolControlSignal::EnterPlanMode),
-        EXIT_PLAN_MODE_MARKER => Some(ToolControlSignal::ExitPlanMode),
-        _ => None,
-    }
-}
-
-/// Legacy back-compat shim around [`parse_tool_control_signal`] that returns
-/// the marker as `Option<String>` rather than the typed [`ToolControlSignal`].
-/// New call sites should prefer the typed variant.
-#[must_use]
-pub fn check_tool_result_marker(content: &str) -> Option<String> {
-    parse_tool_control_signal(content).map(|sig| sig.marker().to_string())
-}
-
-/// Parse user questions from a tool result with the `user_question` marker.
-#[must_use]
-pub fn parse_user_questions(content: &str) -> Option<Vec<Value>> {
-    let parsed: Value = serde_json::from_str(content).ok()?;
-    parsed.get("questions").and_then(|v| v.as_array()).cloned()
-}
-
-/// Parse allowed prompts from an `exit_plan_mode` tool result.
-#[must_use]
-pub fn parse_exit_plan_mode_prompts(content: &str) -> Vec<crate::session::AllowedPrompt> {
-    let parsed: Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    parsed
-        .get("allowed_prompts")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let tool = item.get("tool")?.as_str()?.to_string();
-                    let prompt = item.get("prompt")?.as_str()?.to_string();
-                    Some(crate::session::AllowedPrompt { tool, prompt })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// Dynamic definitions gain no authority by appearing here: colliding or
+/// malformed names are rejected, unclassified names are retained only as
+/// typed unavailability diagnostics, and invocation still passes through the
+/// canonical executor and permission boundary.
+///
+/// # Errors
+///
+/// Returns an error when the combined trusted and dynamic definitions are
+/// malformed, colliding, unclassified, or exceed catalog bounds.
+pub fn get_progressive_tool_definitions_with_additional(
+    run: &ToolRunContext,
+    messages: &[Value],
+    subagents: bool,
+    additional: &[Value],
+) -> Result<catalog::ToolCatalogSnapshot, String> {
+    let mut definitions = get_all_tool_definitions(subagents)
+        .as_array()
+        .ok_or_else(|| "trusted tool definitions must be a JSON array".to_string())?
+        .clone();
+    definitions.extend_from_slice(additional);
+    run.tool_catalog().snapshot(run, messages, &definitions)
 }
 
 // =========================================================================
@@ -586,7 +795,7 @@ pub enum PermissionOutcome {
     /// Tool may proceed.
     Allowed,
     /// Tool is denied; `ToolResult` is ready to return to the model.
-    Denied(ToolResult),
+    Denied(Box<ToolResult>),
     /// Caller must interactively prompt the user before proceeding.
     /// `tool_call_id` is preserved so the final result can be stitched back
     /// onto the originating call.
@@ -599,18 +808,13 @@ pub enum PermissionOutcome {
 
 /// Check permissions before executing a tool and return a structured outcome.
 ///
-/// **Fail-open posture when `permission_mgr` is None** — matches the library
-/// contract today; callers that want strict "no manager means deny" should
-/// use [`check_tool_permission_strict`]. A disabled manager (`is_enabled()`
-/// returns false) is also allowed — operators opted out explicitly.
-///
 /// Emits a structured tracing event at every decision point (allowed,
-/// denied, needs-prompt, bypass) so the audit trail is queryable without
-/// re-running the session. See crosslink #460 mandated point 4.
+/// denied, or needs-prompt) so the audit trail is queryable without re-running
+/// the session.
 #[must_use]
 pub fn check_tool_permission_outcome(
     tool_call: &ToolCall,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> PermissionOutcome {
     let tool_name = tool_call.function.name.as_str();
     let args = match parse_tool_arguments_value(tool_call) {
@@ -618,22 +822,7 @@ pub fn check_tool_permission_outcome(
         Err(result) => return PermissionOutcome::Denied(result),
     };
 
-    let Some(mgr) = permission_mgr else {
-        tracing::debug!(
-            tool = %tool_name,
-            "permission check bypassed: no PermissionManager supplied by caller"
-        );
-        return PermissionOutcome::Allowed;
-    };
-    if !mgr.is_enabled() {
-        tracing::debug!(
-            tool = %tool_name,
-            "permission check bypassed: PermissionManager is disabled"
-        );
-        return PermissionOutcome::Allowed;
-    }
-
-    match mgr.check(tool_name, &args) {
+    match permission_mgr.check(tool_name, &args) {
         CheckResult::Allowed => {
             tracing::debug!(tool = %tool_name, "permission allowed");
             PermissionOutcome::Allowed
@@ -644,11 +833,12 @@ pub fn check_tool_permission_outcome(
                 reason = %reason,
                 "permission DENIED"
             );
-            PermissionOutcome::Denied(ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!("Permission denied: {reason}"),
-                is_error: true,
-            })
+            PermissionOutcome::Denied(Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: {reason}"),
+                ToolRetryability::Never,
+            )))
         }
         CheckResult::NeedsPrompt { tool, target } => {
             tracing::info!(
@@ -665,42 +855,6 @@ pub fn check_tool_permission_outcome(
     }
 }
 
-/// Strict variant that fails closed when no permission manager is provided.
-///
-/// A disabled manager is treated as an **explicit** allow-all override (that's
-/// the semantic meaning of [`PermissionManager::unrestricted`]): the caller
-/// constructed a concrete manager and chose disabled-posture deliberately, so
-/// the strict check defers to the normal outcome path which returns `Allowed`
-/// on disabled.
-///
-/// Use this from new dispatch paths that want certainty that no tool call
-/// can bypass the gate due to a forgotten argument. See crosslink #460
-/// mandated point 1.
-#[must_use]
-pub fn check_tool_permission_strict(
-    tool_call: &ToolCall,
-    permission_mgr: Option<&PermissionManager>,
-) -> PermissionOutcome {
-    let tool_name = tool_call.function.name.as_str();
-    permission_mgr.map_or_else(
-        || {
-            tracing::warn!(
-                tool = %tool_name,
-                "strict permission check DENIED: no PermissionManager supplied"
-            );
-            PermissionOutcome::Denied(ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!(
-                    "Permission denied: no permission manager is configured for tool '{tool_name}'. \
-                     Construct PermissionManager::unrestricted() if you explicitly want allow-all."
-                ),
-                is_error: true,
-            })
-        },
-        |m| check_tool_permission_outcome(tool_call, Some(m)),
-    )
-}
-
 /// Back-compat wrapper: returns `None` on Allowed, `Some(ToolResult)` on Denied.
 ///
 /// Returns a `PERMISSION_PROMPT:` stringly-typed result on `NeedsPrompt`. New
@@ -709,21 +863,87 @@ pub fn check_tool_permission_strict(
 #[must_use]
 pub fn check_tool_permission(
     tool_call: &ToolCall,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> Option<ToolResult> {
     match check_tool_permission_outcome(tool_call, permission_mgr) {
         PermissionOutcome::Allowed => None,
-        PermissionOutcome::Denied(result) => Some(result),
+        PermissionOutcome::Denied(result) => Some(*result),
         PermissionOutcome::NeedsPrompt {
-            tool_call_id,
+            tool_call_id: _,
             tool,
             target,
-        } => Some(ToolResult {
-            tool_call_id,
-            content: legacy_permission_prompt(&tool, &target),
-            is_error: true,
+        } => Some(ToolResult::failure(
+            tool_call,
+            ToolFailureCode::PermissionDenied,
+            legacy_permission_prompt(&tool, &target),
+            ToolRetryability::Never,
+        )),
+    }
+}
+
+fn authorize_for_execution(
+    tool_call: &ToolCall,
+    permission_mgr: &PermissionManager,
+) -> Result<ExecutionPermit, PermissionOutcome> {
+    // Preserve the public executor's validation contract before asking the
+    // permission layer to classify the invocation. `PermissionManager` also
+    // parses defensively, but its string denial cannot carry the typed
+    // `InvalidArguments` outcome expected at the tool boundary.
+    if let Err(result) = parse_tool_arguments_value(tool_call) {
+        return Err(PermissionOutcome::Denied(result));
+    }
+    match permission_mgr.authorize_tool_call(tool_call, None) {
+        AuthorizationResult::Allowed(permit) => Ok(permit),
+        AuthorizationResult::Denied(reason) => {
+            Err(PermissionOutcome::Denied(Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: {reason}"),
+                ToolRetryability::Never,
+            ))))
+        }
+        AuthorizationResult::NeedsPrompt { tool, target } => Err(PermissionOutcome::NeedsPrompt {
+            tool_call_id: tool_call.id.clone(),
+            tool,
+            target,
         }),
     }
+}
+
+fn authorization_or_legacy_prompt(
+    tool_call: &ToolCall,
+    permission_mgr: &PermissionManager,
+) -> Result<ExecutionPermit, Box<ToolResult>> {
+    match authorize_for_execution(tool_call, permission_mgr) {
+        Ok(permit) => Ok(permit),
+        Err(PermissionOutcome::Denied(result)) => Err(result),
+        Err(PermissionOutcome::NeedsPrompt { tool, target, .. }) => {
+            Err(Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                legacy_permission_prompt(&tool, &target),
+                ToolRetryability::Never,
+            )))
+        }
+        Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
+    }
+}
+
+fn consume_for_execution(
+    tool_call: &ToolCall,
+    permission_mgr: &PermissionManager,
+    permit: &ExecutionPermit,
+) -> Result<ConsumedExecutionPermit, Box<ToolResult>> {
+    permission_mgr
+        .consume_execution_permit(permit, tool_call, None)
+        .map_err(|reason| {
+            Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                format!("Permission denied: execution permit rejected: {reason}"),
+                ToolRetryability::Never,
+            ))
+        })
 }
 
 /// Execute a tool call with task manager support.
@@ -735,41 +955,51 @@ pub fn check_tool_permission(
 /// - Memory tools (via `memory_db`)
 /// - All standard tools
 ///
-/// Passing `None` for `permission_mgr` preserves the historical fail-open
-/// posture and emits a one-time migration warning. See crosslink #460.
 #[must_use]
 pub fn execute_tool_with_tasks(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
     task_mgr: Option<&mut TaskManager>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> ToolResult {
-    if permission_mgr.is_none() {
-        warn_missing_permission_manager_once("execute_tool_with_tasks");
-    }
-    if let Some(gated) = gate_or_legacy_result(tool_call, permission_mgr) {
-        return gated;
-    }
+    let permit = match authorization_or_legacy_prompt(tool_call, permission_mgr) {
+        Ok(permit) => permit,
+        Err(result) => return *result,
+    };
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return *result,
+    };
 
-    execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
+    execute_tool_after_authorization(
+        run,
+        tool_call,
+        memory_db,
+        app_config,
+        task_mgr,
+        Some(&authorization),
+    )
 }
 
-/// Execute a tool after the caller has already made the permission decision.
+/// Execute a tool after the caller has already made the approval decision.
 ///
-/// Interactive callers use this after a typed permission result or user
-/// prompt so a one-time approval cannot be converted into a nested legacy
-/// `PERMISSION_PROMPT` result.
+/// This is crate-visible for the shared executor only. It still applies the
+/// non-bypassable host ceiling and mints an opaque exact registry permit, so
+/// "after authorization" never means "unchecked".
 #[must_use]
-pub(crate) fn execute_tool_with_tasks_unchecked(
+pub(crate) fn execute_tool_after_authorization(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
     task_mgr: Option<&mut TaskManager>,
+    authorization: Option<&ConsumedExecutionPermit>,
 ) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
-        Err(result) => return result,
+        Err(result) => return *result,
     };
 
     // Subagent tools (task / agent_output / task_stop) need app_config and are handled
@@ -778,27 +1008,25 @@ pub(crate) fn execute_tool_with_tasks_unchecked(
         tool_call.function.name.as_str(),
         "task" | "agent_output" | "task_stop"
     ) {
-        return execute_tool_full_unchecked(tool_call, memory_db, app_config);
+        return execute_tool_full_after_authorization(
+            run,
+            tool_call,
+            memory_db,
+            app_config,
+            authorization,
+        );
     }
 
     // All other tools — including task_create/task_update/task_get/task_list —
     // go through the registry with the full context bundle.
     let mut ctx = ToolContext {
-        security: security::current_context(),
+        run,
         memory_db,
         app_config,
         task_mgr,
     };
 
-    let (content, is_error) = registry::registry()
-        .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
-        .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true));
-
-    ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content,
-        is_error,
-    }
+    dispatch_registered_after_authorization(tool_call, &args, &mut ctx, authorization)
 }
 
 /// New canonical dispatch: requires a [`PermissionManager`] and uses the strict fail-closed check.
@@ -809,29 +1037,38 @@ pub(crate) fn execute_tool_with_tasks_unchecked(
 /// crosslink #460 mandated point 1.
 #[must_use]
 pub fn execute_tool_with_permission_required(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
     task_mgr: Option<&mut TaskManager>,
     permission_mgr: &PermissionManager,
 ) -> ToolResult {
-    // Strict gate: no Option, no bypass path.
-    match check_tool_permission_strict(tool_call, Some(permission_mgr)) {
-        PermissionOutcome::Denied(result) => return result,
-        PermissionOutcome::NeedsPrompt {
-            tool_call_id,
-            tool,
-            target,
-        } => {
-            return ToolResult {
-                tool_call_id,
-                content: legacy_permission_prompt(&tool, &target),
-                is_error: true,
-            };
+    let permit = match authorize_for_execution(tool_call, permission_mgr) {
+        Err(PermissionOutcome::Denied(result)) => return *result,
+        Err(PermissionOutcome::NeedsPrompt { tool, target, .. }) => {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PermissionDenied,
+                legacy_permission_prompt(&tool, &target),
+                ToolRetryability::Never,
+            );
         }
-        PermissionOutcome::Allowed => {}
-    }
-    execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
+        Ok(permit) => permit,
+        Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
+    };
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return *result,
+    };
+    execute_tool_after_authorization(
+        run,
+        tool_call,
+        memory_db,
+        app_config,
+        task_mgr,
+        Some(&authorization),
+    )
 }
 
 /// Typed-outcome dispatch: runs the permission gate and returns a structured [`ExecutionOutcome`].
@@ -842,29 +1079,41 @@ pub fn execute_tool_with_permission_required(
 /// #460 mandated point 3.
 #[must_use]
 pub fn execute_tool_gated(
+    run: &std::sync::Arc<ToolRunContext>,
     tool_call: &ToolCall,
     memory_db: Option<&MemoryDb>,
     app_config: Option<&AppConfig>,
     task_mgr: Option<&mut TaskManager>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
 ) -> ExecutionOutcome {
-    match check_tool_permission_outcome(tool_call, permission_mgr) {
-        PermissionOutcome::Denied(result) => ExecutionOutcome::Result(result),
-        PermissionOutcome::NeedsPrompt {
+    let permit = match authorize_for_execution(tool_call, permission_mgr) {
+        Ok(permit) => permit,
+        Err(PermissionOutcome::Denied(result)) => return ExecutionOutcome::Result(result),
+        Err(PermissionOutcome::NeedsPrompt {
             tool_call_id,
             tool,
             target,
-        } => ExecutionOutcome::NeedsPrompt {
-            tool_call_id,
-            tool,
-            target,
-        },
-        PermissionOutcome::Allowed => {
-            let result =
-                execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr);
-            ExecutionOutcome::Result(result)
+        }) => {
+            return ExecutionOutcome::NeedsPrompt {
+                tool_call_id,
+                tool,
+                target,
+            };
         }
-    }
+        Err(PermissionOutcome::Allowed) => unreachable!("authorization cannot return bare allow"),
+    };
+    let authorization = match consume_for_execution(tool_call, permission_mgr, &permit) {
+        Ok(authorization) => authorization,
+        Err(result) => return ExecutionOutcome::Result(result),
+    };
+    ExecutionOutcome::Result(Box::new(execute_tool_after_authorization(
+        run,
+        tool_call,
+        memory_db,
+        app_config,
+        task_mgr,
+        Some(&authorization),
+    )))
 }
 
 /// Structured outcome of a gated dispatch. Either the tool ran (or was
@@ -877,7 +1126,7 @@ pub fn execute_tool_gated(
 pub enum ExecutionOutcome {
     /// Tool completed (allowed path) or was denied (rule-denied path).
     /// In both cases the `ToolResult` is ready to hand back to the model.
-    Result(ToolResult),
+    Result(Box<ToolResult>),
     /// No rule matched; the caller must interactively prompt the user and
     /// then retry the dispatch (typically after recording the user's
     /// decision on the `PermissionManager`).
@@ -894,6 +1143,78 @@ mod tests {
     use crate::session::TaskManager;
     use base64::Engine;
     use serde_json::json;
+
+    fn test_run() -> &'static std::sync::Arc<ToolRunContext> {
+        security::test_run_context()
+    }
+
+    #[test]
+    fn canonical_task_graph_consumers_are_an_exact_closed_set() {
+        for name in [
+            "task_create",
+            "task_update",
+            "task_get",
+            "task_list",
+            "todo_write",
+            "todo_read",
+            "crosslink",
+        ] {
+            assert!(uses_canonical_task_graph(name), "{name}");
+        }
+        for name in ["bash", "read_file", "memory_search", "agent", "task_stop"] {
+            assert!(!uses_canonical_task_graph(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn post_authorization_boundary_still_denies_catastrophic_bash() {
+        let tool_call = ToolCall {
+            id: "host-safety-after-authorization-bash".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "bash".to_string(),
+                arguments: json!({"command": "rm -rf /"}).to_string(),
+            },
+        };
+
+        let result =
+            execute_tool_after_authorization(test_run(), &tool_call, None, None, None, None);
+        assert!(result.is_error());
+        assert!(matches!(
+            result.outcome(),
+            ToolOutcome::Error { failure }
+                if failure.code == ToolFailureCode::PolicyDenied
+                    && failure.retryability == ToolRetryability::Never
+        ));
+        assert!(result.content().contains("non-bypassable host safety"));
+    }
+
+    #[test]
+    fn post_authorization_boundary_still_denies_protected_write() {
+        let tool_call = ToolCall {
+            id: "host-safety-after-authorization-write".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": ".claude/settings.json",
+                    "content": "must not be written"
+                })
+                .to_string(),
+            },
+        };
+
+        let result =
+            execute_tool_after_authorization(test_run(), &tool_call, None, None, None, None);
+        assert!(result.is_error());
+        assert!(matches!(
+            result.outcome(),
+            ToolOutcome::Error { failure }
+                if failure.code == ToolFailureCode::PolicyDenied
+                    && failure.retryability == ToolRetryability::Never
+        ));
+        assert!(result.content().contains("non-bypassable host safety"));
+    }
 
     /// Temporary forensic dump used to verify byte-for-byte equivalence of
     /// `get_tool_definitions()` against the pre-#463 baseline. Writes to a
@@ -1033,7 +1354,7 @@ mod tests {
     fn test_bash_execution() {
         let mut args = HashMap::new();
         args.insert("command".to_string(), json!("echo hello"));
-        let (output, is_error) = bash::execute_bash(&args);
+        let (output, is_error) = bash::execute_bash(test_run(), &args);
         assert!(!is_error);
         assert!(output.contains("hello"));
     }
@@ -1060,9 +1381,11 @@ mod tests {
                 arguments: json!({ "command": "echo hello" }).to_string(),
             },
         };
-        let result = execute_tool_full(&call, None, None, None);
+        let permission_manager = PermissionManager::unrestricted();
+        let result = execute_tool_full(test_run(), &call, None, None, &permission_manager);
         assert_eq!(
-            result.tool_call_id, "call-#491-test",
+            result.tool_call_id(),
+            "call-#491-test",
             "default match arm must round-trip the tool_call_id through the single wrapper"
         );
         // Subagent arms behave the same — drive `agent_output` with no
@@ -1076,9 +1399,11 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         };
-        let agent_result = execute_tool_full(&agent_call, None, None, None);
+        let agent_result =
+            execute_tool_full(test_run(), &agent_call, None, None, &permission_manager);
         assert_eq!(
-            agent_result.tool_call_id, "call-#491-agent",
+            agent_result.tool_call_id(),
+            "call-#491-agent",
             "subagent match arm must round-trip the tool_call_id through the single wrapper"
         );
     }
@@ -1095,7 +1420,7 @@ mod tests {
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), json!(dir.path().to_str().unwrap()));
-        let (output, is_error) = file::execute_list_files(&args);
+        let (output, is_error) = file::execute_list_files(test_run(), &args);
         assert!(!is_error, "list_files should succeed for temp fixture");
         assert!(!output.is_empty(), "temp fixture should contain files");
         assert!(
@@ -1445,7 +1770,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        let (output, is_error) = read_notebook_file(nb_path.to_str().unwrap());
+        let (output, is_error) = read_notebook_file(test_run(), nb_path.to_str().unwrap());
         assert!(!is_error, "read_notebook_file should succeed: {output}");
         assert!(output.contains("Cell 0 (markdown)"));
         assert!(output.contains("# Title"));
@@ -1478,7 +1803,7 @@ mod tests {
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
         // Mark as read first
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1488,7 +1813,7 @@ mod tests {
         args.insert("cell_number".to_string(), json!(0));
         args.insert("new_source".to_string(), json!("new code\nline 2"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit replace should succeed: {output}");
         assert!(output.contains("Replaced cell 0"));
 
@@ -1520,7 +1845,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1532,7 +1857,7 @@ mod tests {
         args.insert("cell_type".to_string(), json!("markdown"));
         args.insert("edit_mode".to_string(), json!("insert"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit insert should succeed: {output}");
         assert!(output.contains("Inserted new markdown cell"));
 
@@ -1572,7 +1897,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1583,7 +1908,7 @@ mod tests {
         args.insert("new_source".to_string(), json!(""));
         args.insert("edit_mode".to_string(), json!("delete"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit delete should succeed: {output}");
         assert!(output.contains("Deleted cell 0"));
 
@@ -1607,7 +1932,7 @@ mod tests {
         args.insert("cell_number".to_string(), json!(0));
         args.insert("new_source".to_string(), json!("test"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error, "Should fail without reading first");
         assert!(output.contains("must read"));
     }
@@ -1632,7 +1957,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1642,7 +1967,7 @@ mod tests {
         args.insert("cell_number".to_string(), json!(5));
         args.insert("new_source".to_string(), json!("test"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error, "Should fail for out-of-bounds cell");
         assert!(output.contains("out of bounds"));
     }
@@ -1659,7 +1984,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1671,7 +1996,7 @@ mod tests {
         args.insert("edit_mode".to_string(), json!("insert"));
         // No cell_type provided
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error, "Should fail without cell_type for insert");
         assert!(output.contains("cell_type is required"));
     }
@@ -1686,8 +2011,11 @@ mod tests {
         let fake_png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         fs::write(&img_path, &fake_png).unwrap();
 
-        let (output, is_error) =
-            read_image_file(img_path.to_str().unwrap(), super::file::ImageKind::Png);
+        let (output, is_error) = read_image_file(
+            test_run(),
+            img_path.to_str().unwrap(),
+            super::file::ImageKind::Png,
+        );
         assert!(!is_error, "read_image_file should succeed");
         assert!(output.contains("[Image: test.png"));
         assert!(output.contains("image/png"));
@@ -1711,7 +2039,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1723,7 +2051,7 @@ mod tests {
         args.insert("cell_type".to_string(), json!("code"));
         args.insert("edit_mode".to_string(), json!("insert"));
 
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "insert code cell should succeed: {output}");
 
         let content = fs::read_to_string(&nb_path).unwrap();
@@ -1755,7 +2083,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         // Replace by cell_id — no cell_number supplied.
         let mut args = HashMap::new();
@@ -1765,7 +2093,7 @@ mod tests {
         );
         args.insert("cell_id".to_string(), json!("cell-b"));
         args.insert("new_source".to_string(), json!("replaced-b"));
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "replace by cell_id should succeed: {output}");
 
         let updated: Value = serde_json::from_str(&fs::read_to_string(&nb_path).unwrap()).unwrap();
@@ -1786,7 +2114,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         // Insert AFTER "one" — should land at position 1, pushing "two" to position 2.
         let mut args = HashMap::new();
@@ -1798,7 +2126,7 @@ mod tests {
         args.insert("edit_mode".to_string(), json!("insert"));
         args.insert("cell_type".to_string(), json!("markdown"));
         args.insert("new_source".to_string(), json!("inserted"));
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "insert after cell_id should succeed: {output}");
 
         let updated: Value = serde_json::from_str(&fs::read_to_string(&nb_path).unwrap()).unwrap();
@@ -1821,7 +2149,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(&nb_path);
+        READ_TRACKER.mark_read(test_run(), &nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1830,7 +2158,7 @@ mod tests {
         );
         args.insert("cell_id".to_string(), json!("does-not-exist"));
         args.insert("new_source".to_string(), json!("x"));
-        let (output, is_error) = file::execute_notebook_edit(&args);
+        let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error);
         assert!(output.contains("does-not-exist"));
     }
@@ -1843,6 +2171,7 @@ mod tests {
     fn test_task_create() {
         let mut task_mgr = TaskManager::new();
         let mut args = HashMap::new();
+        args.insert("expected_generation".to_string(), json!(0));
         args.insert("subject".to_string(), json!("Fix the bug"));
         args.insert(
             "description".to_string(),
@@ -1864,11 +2193,18 @@ mod tests {
     #[test]
     fn test_task_update_status() {
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Task A".to_string(), "Desc A".to_string(), None);
+        task_mgr
+            .create_task("Task A".to_string(), "Desc A".to_string(), None)
+            .expect("valid task fixture");
 
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-1"));
         args.insert("status".to_string(), json!("in_progress"));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
+        args.insert("expected_task_revision".to_string(), json!(1));
 
         let (output, is_error) = task::execute_task_update(&args, &mut task_mgr);
         assert!(!is_error, "task_update should succeed: {output}");
@@ -1878,17 +2214,30 @@ mod tests {
     #[test]
     fn test_task_only_one_in_progress() {
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Task A".to_string(), "Desc A".to_string(), None);
-        task_mgr.create_task("Task B".to_string(), "Desc B".to_string(), None);
+        task_mgr
+            .create_task("Task A".to_string(), "Desc A".to_string(), None)
+            .expect("valid task fixture");
+        task_mgr
+            .create_task("Task B".to_string(), "Desc B".to_string(), None)
+            .expect("valid task fixture");
 
         // Set task-1 to in_progress
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-1"));
         args.insert("status".to_string(), json!("in_progress"));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
+        args.insert("expected_task_revision".to_string(), json!(1));
         task::execute_task_update(&args, &mut task_mgr);
 
         // Set task-2 to in_progress -- task-1 should be demoted to pending
         args.insert("task_id".to_string(), json!("task-2"));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
         task::execute_task_update(&args, &mut task_mgr);
 
         let task1 = task_mgr.get_task("task-1").unwrap();
@@ -1899,10 +2248,10 @@ mod tests {
 
     #[test]
     fn test_task_list_empty() {
-        let task_mgr = TaskManager::new();
-        let (output, is_error) = task::execute_task_list(&task_mgr);
+        let mut task_mgr = TaskManager::new();
+        let (output, is_error) = task::execute_task_list(&HashMap::new(), &mut task_mgr);
         assert!(!is_error);
-        assert_eq!(output, "No tasks.");
+        assert!(output.starts_with("No tasks."));
     }
 
     #[test]
@@ -1912,10 +2261,10 @@ mod tests {
         // earlier OC behaviour returned `is_error=true` with a "not found"
         // string, which forced the model into a recovery path for what is
         // a legitimate outcome (e.g. polling a deleted task).
-        let task_mgr = TaskManager::new();
+        let mut task_mgr = TaskManager::new();
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-999"));
-        let (output, is_error) = task::execute_task_get(&args, &task_mgr);
+        let (output, is_error) = task::execute_task_get(&args, &mut task_mgr);
         assert!(
             !is_error,
             "task_get for missing id must be a successful lookup, not an error: {output}"
@@ -1933,10 +2282,12 @@ mod tests {
         // crosslink #588 regression guard: the success path for an existing
         // task must still emit the human-readable detail block, not null.
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Real task".to_string(), "Desc".to_string(), None);
+        task_mgr
+            .create_task("Real task".to_string(), "Desc".to_string(), None)
+            .expect("valid task fixture");
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-1"));
-        let (output, is_error) = task::execute_task_get(&args, &task_mgr);
+        let (output, is_error) = task::execute_task_get(&args, &mut task_mgr);
         assert!(!is_error, "found task must succeed: {output}");
         assert_ne!(
             output, "null",
@@ -1951,11 +2302,18 @@ mod tests {
     #[test]
     fn test_task_delete() {
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Task to delete".to_string(), "Desc".to_string(), None);
+        task_mgr
+            .create_task("Task to delete".to_string(), "Desc".to_string(), None)
+            .expect("valid task fixture");
 
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-1"));
         args.insert("status".to_string(), json!("deleted"));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
+        args.insert("expected_task_revision".to_string(), json!(1));
         let (output, is_error) = task::execute_task_update(&args, &mut task_mgr);
         assert!(!is_error, "delete should not be an error: {output}");
         assert!(output.contains("deleted"));
@@ -1965,13 +2323,22 @@ mod tests {
     #[test]
     fn test_task_dependencies() {
         let mut task_mgr = TaskManager::new();
-        task_mgr.create_task("Setup DB".to_string(), "Create schema".to_string(), None);
-        task_mgr.create_task("Add API".to_string(), "REST endpoints".to_string(), None);
+        task_mgr
+            .create_task("Setup DB".to_string(), "Create schema".to_string(), None)
+            .expect("valid task fixture");
+        task_mgr
+            .create_task("Add API".to_string(), "REST endpoints".to_string(), None)
+            .expect("valid task fixture");
 
         // task-2 is blocked by task-1
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-2"));
         args.insert("add_blocked_by".to_string(), json!(["task-1"]));
+        args.insert(
+            "expected_generation".to_string(),
+            json!(task_mgr.generation().get()),
+        );
+        args.insert("expected_task_revision".to_string(), json!(1));
         let (_, is_error) = task::execute_task_update(&args, &mut task_mgr);
         assert!(!is_error);
 
@@ -1988,7 +2355,7 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn test_check_tool_permission_none_manager() {
+    fn test_check_tool_permission_explicit_unrestricted_manager() {
         let tool_call = ToolCall {
             id: "call_1".to_string(),
             call_type: "function".to_string(),
@@ -1997,37 +2364,12 @@ mod tests {
                 arguments: r#"{"command": "ls"}"#.to_string(),
             },
         };
-        // No permission manager -- should return None (allow) in legacy fail-open mode
-        assert!(check_tool_permission(&tool_call, None).is_none());
-    }
-
-    // --- Regression tests for crosslink #460 ---
-
-    #[test]
-    fn strict_permission_denies_when_manager_absent() {
-        let tool_call = ToolCall {
-            id: "call_1".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "bash".to_string(),
-                arguments: r#"{"command": "ls"}"#.to_string(),
-            },
-        };
-        match check_tool_permission_strict(&tool_call, None) {
-            PermissionOutcome::Denied(r) => {
-                assert!(r.is_error);
-                assert!(r.content.contains("no permission manager"));
-            }
-            other => panic!("expected Denied, got {other:?}"),
-        }
+        let manager = PermissionManager::unrestricted();
+        assert!(check_tool_permission(&tool_call, &manager).is_none());
     }
 
     #[test]
-    fn strict_permission_allows_when_manager_is_explicitly_disabled() {
-        // Under crosslink #460's refined contract, an explicitly disabled
-        // PermissionManager is an explicit "allow all" override rather than
-        // a reason to deny. The strict helper only denies when the caller
-        // supplied NO manager at all (the true bypass risk).
+    fn outcome_permission_allows_safe_call_when_prompts_are_explicitly_disabled() {
         let tool_call = ToolCall {
             id: "call_1".to_string(),
             call_type: "function".to_string(),
@@ -2038,7 +2380,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = PermissionManager::new(tmp.path().join("p.json"), false, vec![]);
-        match check_tool_permission_strict(&tool_call, Some(&mgr)) {
+        match check_tool_permission_outcome(&tool_call, &mgr) {
             PermissionOutcome::Allowed => {}
             other => {
                 panic!("expected Allowed for explicitly-disabled (unrestricted) mgr, got {other:?}")
@@ -2059,7 +2401,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr =
             PermissionManager::new(tmp.path().join("p.json"), true, vec!["echo *".to_string()]);
-        match check_tool_permission_outcome(&tool_call, Some(&mgr)) {
+        match check_tool_permission_outcome(&tool_call, &mgr) {
             PermissionOutcome::Allowed => {}
             other => panic!("expected Allowed, got {other:?}"),
         }
@@ -2077,7 +2419,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = PermissionManager::new(tmp.path().join("p.json"), true, vec![]);
-        match check_tool_permission_outcome(&tool_call, Some(&mgr)) {
+        match check_tool_permission_outcome(&tool_call, &mgr) {
             PermissionOutcome::NeedsPrompt {
                 tool_call_id, tool, ..
             } => {
@@ -2119,18 +2461,18 @@ mod tests {
             },
         };
         let (mgr, _tmp) = deny_all_bash_manager();
-        match execute_tool_gated(&tool_call, None, None, None, Some(&mgr)) {
+        match execute_tool_gated(test_run(), &tool_call, None, None, None, &mgr) {
             ExecutionOutcome::Result(r) => {
-                assert!(r.is_error, "denial should mark the result as error");
+                assert!(r.is_error(), "denial should mark the result as error");
                 assert!(
-                    r.content.to_lowercase().contains("denied"),
+                    r.content().to_lowercase().contains("denied"),
                     "expected 'denied' in content, got: {}",
-                    r.content
+                    r.content()
                 );
                 assert!(
-                    !r.content.contains("SHOULD_NOT_RUN"),
+                    !r.content().contains("SHOULD_NOT_RUN"),
                     "tool body ran despite denial — gate bypassed: {}",
-                    r.content
+                    r.content()
                 );
             }
             other @ ExecutionOutcome::NeedsPrompt { .. } => {
@@ -2152,17 +2494,17 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr =
             PermissionManager::new(tmp.path().join("p.json"), true, vec!["echo *".to_string()]);
-        match execute_tool_gated(&tool_call, None, None, None, Some(&mgr)) {
+        match execute_tool_gated(test_run(), &tool_call, None, None, None, &mgr) {
             ExecutionOutcome::Result(r) => {
                 assert!(
-                    !r.is_error,
+                    !r.is_error(),
                     "allowed bash echo should not error; content={}",
-                    r.content
+                    r.content()
                 );
                 assert!(
-                    r.content.contains("HELLO_GATED"),
+                    r.content().contains("HELLO_GATED"),
                     "expected tool body to have run; got: {}",
-                    r.content
+                    r.content()
                 );
             }
             other @ ExecutionOutcome::NeedsPrompt { .. } => {
@@ -2184,7 +2526,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         // enabled manager, no matching rule -> NeedsPrompt
         let mgr = PermissionManager::new(tmp.path().join("p.json"), true, vec![]);
-        match execute_tool_gated(&tool_call, None, None, None, Some(&mgr)) {
+        match execute_tool_gated(test_run(), &tool_call, None, None, None, &mgr) {
             ExecutionOutcome::NeedsPrompt {
                 tool_call_id,
                 tool,
@@ -2204,10 +2546,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_tool_gated_strict_no_mgr_is_denied() {
-        // Construct a tool call and run through the strict entry point with
-        // a PermissionManager::unrestricted — then verify the *strict*
-        // helper itself denies when None is passed.
+    fn required_manager_dispatch_accepts_explicit_unrestricted_policy() {
         let tool_call = ToolCall {
             id: "gated_strict_1".to_string(),
             call_type: "function".to_string(),
@@ -2216,30 +2555,14 @@ mod tests {
                 arguments: r#"{"command": "echo strict"}"#.to_string(),
             },
         };
-        // Direct assertion of the strict-check gate: no manager -> Denied.
-        match check_tool_permission_strict(&tool_call, None) {
-            PermissionOutcome::Denied(r) => {
-                assert!(r.is_error);
-                assert!(
-                    r.content.contains("no permission manager"),
-                    "expected strict-denial message; got {}",
-                    r.content
-                );
-            }
-            other => panic!("expected strict Denied for None mgr, got {other:?}"),
-        }
-
-        // And the strict-dispatch entry point with an unrestricted manager
-        // should execute normally — proving the fail-closed posture only
-        // fires when there is genuinely no manager, not when the intent of
-        // the caller is an explicit "allow all".
         let mgr = PermissionManager::unrestricted();
-        let result = execute_tool_with_permission_required(&tool_call, None, None, None, &mgr);
+        let result =
+            execute_tool_with_permission_required(test_run(), &tool_call, None, None, None, &mgr);
         assert!(
-            !result.is_error,
+            !result.is_error(),
             "unrestricted manager should pass through; got: {}",
-            result.content
+            result.content()
         );
-        assert!(result.content.contains("strict"));
+        assert!(result.content().contains("strict"));
     }
 }

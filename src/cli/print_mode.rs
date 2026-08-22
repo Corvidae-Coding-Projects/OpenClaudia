@@ -66,13 +66,13 @@ fn build_print_request(
     adapter: &dyn ProviderAdapter,
     request: &openclaudia::proxy::ChatCompletionRequest,
     thinking: &openclaudia::config::ThinkingConfig,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
 ) -> Result<serde_json::Value, String> {
     let mut body = adapter
         .transform_request_with_thinking(request, thinking)
         .map_err(|e| format!("request transform error: {e}"))?;
     if claude_code_token.is_some() {
-        openclaudia::claude_credentials::inject_system_prompt(&mut body);
+        openclaudia::claude_credentials::inject_oauth_prefix_only(&mut body);
     }
     Ok(body)
 }
@@ -81,17 +81,23 @@ fn build_print_chat_request(
     adapter: &dyn ProviderAdapter,
     model: &str,
     prompt: String,
+    run: &openclaudia::tools::ToolRunContext,
 ) -> openclaudia::proxy::ChatCompletionRequest {
+    let user_messages = vec![openclaudia::proxy::ChatMessage {
+        role: "user".to_string(),
+        content: openclaudia::proxy::MessageContent::Text(prompt),
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+        extra: std::collections::HashMap::new(),
+    }];
+    let prompt_context = openclaudia::prompt::build_prompt_context_for_run(
+        &openclaudia::modes::BehaviorMode::default(),
+        run,
+    );
     openclaudia::proxy::ChatCompletionRequest {
         model: model.to_string(),
-        messages: vec![openclaudia::proxy::ChatMessage {
-            role: "user".to_string(),
-            content: openclaudia::proxy::MessageContent::Text(prompt),
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-            extra: std::collections::HashMap::new(),
-        }],
+        messages: prompt_context.prepare_chat_messages(&user_messages),
         temperature: None,
         max_tokens: Some(openclaudia::DEFAULT_MAX_TOKENS),
         stream: Some(adapter.name() != "google"),
@@ -122,7 +128,7 @@ fn resolve_print_endpoint(
     model: &str,
     provider: &openclaudia::config::ProviderConfig,
     adapter: &dyn ProviderAdapter,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
 ) -> String {
     if claude_code_token.is_some() {
         return openclaudia::claude_credentials::get_oauth_endpoint(model);
@@ -249,6 +255,23 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         options.model_override.as_deref(),
         options.target_override.as_deref(),
     )?;
+    let print_root = std::env::current_dir()
+        .map_err(|error| anyhow::anyhow!("could not resolve print-mode project root: {error}"))?;
+    let print_run = openclaudia::tools::ToolRunContext::builder(
+        openclaudia::state::SessionId::new(),
+        &print_root,
+    )
+    .working_directory(&print_root)
+    .read_only_roots(Vec::new())
+    .read_write_roots(Vec::new())
+    .environment_grants(std::collections::HashMap::new())
+    .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+    .process(false)
+    .network(true)
+    .secrets(true)
+    .provider(config.proxy.target.clone())
+    .build()
+    .map_err(anyhow::Error::msg)?;
     let provider = config.active_provider().ok_or_else(|| {
         anyhow::anyhow!(
             "no provider configured for target '{}'",
@@ -282,39 +305,35 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         &config.proxy.target,
     );
     let adapter = openclaudia::providers::get_adapter(&config.proxy.target)?;
-    let chat_request = build_print_chat_request(adapter, &model, options.prompt);
+    let chat_request = build_print_chat_request(adapter, &model, options.prompt, &print_run);
     enforce_print_request_policy(&config, &chat_request)?;
     let request_body = build_print_request(
         adapter,
         &chat_request,
         &provider.thinking,
-        claude_code_token.as_deref(),
+        claude_code_token.as_ref(),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
-    let endpoint = resolve_print_endpoint(&model, provider, adapter, claude_code_token.as_deref());
-    let extra_headers: Vec<(String, String)> = provider
-        .headers
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let endpoint = resolve_print_endpoint(&model, provider, adapter, claude_code_token.as_ref());
+    let extra_headers = provider.headers.clone();
     let headers = openclaudia::pipeline::resolve_headers(
         &config.proxy.target,
         api_key.as_ref(),
-        claude_code_token.as_deref(),
+        claude_code_token.as_ref(),
         &extra_headers,
     )?;
 
     let client = reqwest::Client::new();
-    let mut request = client.post(endpoint).json(&request_body);
-    for (key, value) in &headers {
-        request = request.header(key.as_str(), value.as_str());
-    }
+    let request = headers.apply(client.post(endpoint).json(&request_body))?;
 
     let response = request.send().await?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| String::new());
-        anyhow::bail!("API error {}: {body}", status.as_u16());
+        let body = openclaudia::secrets::read_bounded_diagnostic_body(response)
+            .await
+            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+        let diagnostic = headers.sanitize_diagnostic(&body);
+        anyhow::bail!("API error {}: {diagnostic}", status.as_u16());
     }
 
     if response_is_json(&response) {
@@ -329,6 +348,27 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, OnceLock};
+
+    fn print_test_run() -> &'static openclaudia::tools::ToolRunContext {
+        static RUN: OnceLock<Arc<openclaudia::tools::ToolRunContext>> = OnceLock::new();
+        RUN.get_or_init(|| {
+            openclaudia::tools::ToolRunContext::builder(
+                openclaudia::state::SessionId::new(),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            )
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(true)
+            .secrets(true)
+            .provider("print-test")
+            .build()
+            .expect("print test run")
+        })
+    }
 
     fn test_config_with_policy(
         policy: openclaudia::services::policy::EnterprisePolicy,
@@ -418,6 +458,7 @@ mod tests {
             openclaudia::providers::get_adapter("openai").expect("adapter"),
             "blocked-model",
             "hello".to_string(),
+            print_test_run(),
         );
 
         let err = enforce_print_request_policy(&config, &request).unwrap_err();
@@ -435,6 +476,7 @@ mod tests {
             openclaudia::providers::get_adapter("openai").expect("adapter"),
             "any-model",
             "this prompt is intentionally longer than one estimated token".to_string(),
+            print_test_run(),
         );
 
         let err = enforce_print_request_policy(&config, &request).unwrap_err();
@@ -445,7 +487,8 @@ mod tests {
     #[test]
     fn print_request_has_no_tools_and_streams_non_google() {
         let adapter = openclaudia::providers::get_adapter("openai").unwrap();
-        let request = build_print_chat_request(adapter, "gpt-5.5", "hi".to_string());
+        let request =
+            build_print_chat_request(adapter, "gpt-5.5", "hi".to_string(), print_test_run());
         let body = build_print_request(
             adapter,
             &request,
@@ -465,7 +508,8 @@ mod tests {
             ..Default::default()
         };
 
-        let request = build_print_chat_request(adapter, "gpt-5.5", "hi".to_string());
+        let request =
+            build_print_chat_request(adapter, "gpt-5.5", "hi".to_string(), print_test_run());
         let body = build_print_request(adapter, &request, &thinking, None).unwrap();
 
         assert_eq!(body["reasoning_effort"], "xhigh");
@@ -479,7 +523,12 @@ mod tests {
             ..openclaudia::config::ThinkingConfig::default()
         };
 
-        let request = build_print_chat_request(adapter, "gemini-3.5-flash", "hi".to_string());
+        let request = build_print_chat_request(
+            adapter,
+            "gemini-3.5-flash",
+            "hi".to_string(),
+            print_test_run(),
+        );
         let body = build_print_request(adapter, &request, &thinking, None).unwrap();
 
         assert_eq!(
@@ -495,7 +544,7 @@ mod tests {
             api_key: None,
             base_url: "https://generativelanguage.googleapis.com".to_string(),
             model: None,
-            headers: std::collections::HashMap::new(),
+            headers: openclaudia::secrets::SensitiveHeaders::new(),
             thinking: openclaudia::config::ThinkingConfig::default(),
         };
         let endpoint = resolve_print_endpoint("gemini-3.5-flash", &provider, adapter, None);

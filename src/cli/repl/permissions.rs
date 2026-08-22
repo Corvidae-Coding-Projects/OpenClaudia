@@ -2,18 +2,12 @@
 pub fn prompt_permission(
     operation: &str,
     details: &str,
-    always_allowed: &mut std::collections::HashSet<String>,
+    approvals: &mut openclaudia::permissions::LocalApprovalCache,
 ) -> bool {
     use std::io::{self, Write};
 
-    let key = format!("{operation}:{details}");
-
-    if always_allowed.contains(&key) {
-        return true;
-    }
-
-    if always_allowed.contains(&format!("!{key}")) {
-        return false;
+    if let Some(decision) = approvals.decision(operation, details) {
+        return decision == openclaudia::permissions::LocalApprovalDecision::Allowed;
     }
 
     println!("\n=== Permission Required ===");
@@ -35,13 +29,21 @@ pub fn prompt_permission(
     match input.trim().to_lowercase().as_str() {
         "y" | "yes" => true,
         "a" | "always" => {
-            always_allowed.insert(key);
-            println!("(Will always allow this operation)\n");
+            approvals.remember_allowed(
+                operation,
+                details,
+                openclaudia::permissions::ApprovalProvenance::InteractiveUser,
+            );
+            println!("(Will allow this exact operation for a bounded session receipt)\n");
             true
         }
         "d" => {
-            always_allowed.insert(format!("!{key}"));
-            println!("(Will always deny this operation)\n");
+            approvals.remember_denied(
+                operation,
+                details,
+                openclaudia::permissions::ApprovalProvenance::InteractiveUser,
+            );
+            println!("(Will deny this exact operation for the session)\n");
             false
         }
         _ => {
@@ -62,8 +64,9 @@ pub struct ShellCommandExecution {
 
 /// Execute a shell command and print output (with permission check)
 pub fn execute_shell_command_with_permission(
+    run: &openclaudia::tools::ToolRunContext,
     cmd: &str,
-    permissions: &mut std::collections::HashSet<String>,
+    permissions: &mut openclaudia::permissions::LocalApprovalCache,
 ) -> Option<ShellCommandExecution> {
     let dangerous_patterns = [
         // Destructive file operations
@@ -108,37 +111,45 @@ pub fn execute_shell_command_with_permission(
         return None;
     }
 
-    execute_shell_command_internal(cmd)
+    execute_shell_command_internal(run, cmd)
 }
 
-fn resolved_process_command(binary: &str) -> Result<std::process::Command, String> {
-    which::which(binary)
+fn resolved_process_command(
+    run: &openclaudia::tools::ToolRunContext,
+    binary: &str,
+) -> Result<std::process::Command, String> {
+    run.resolve_executable(binary)
         .map(std::process::Command::new)
-        .map_err(|e| format!("{binary} binary not found on PATH: {e}"))
+        .map_err(|error| error.to_string())
 }
 
 /// Execute a shell command and print output
-pub fn execute_shell_command_internal(cmd: &str) -> Option<ShellCommandExecution> {
+pub fn execute_shell_command_internal(
+    run: &openclaudia::tools::ToolRunContext,
+    cmd: &str,
+) -> Option<ShellCommandExecution> {
     println!();
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(err) => {
-            eprintln!("Failed to determine current directory: {err}");
-            return None;
-        }
-    };
+    let cwd = run.working_directory().to_path_buf();
 
     #[cfg(windows)]
-    let output = resolved_process_command("cmd").and_then(|mut command| {
+    let output = resolved_process_command(run, "cmd").and_then(|mut command| {
+        command.env_clear();
+        run.environment_grants().apply_std(&mut command);
         command
+            .env("PATH", run.executable_search_path())
+            .current_dir(&cwd)
             .args(["/C", cmd])
             .output()
             .map_err(|e| e.to_string())
     });
 
     #[cfg(not(windows))]
-    let output = resolved_process_command("sh").and_then(|mut command| {
+    let output = resolved_process_command(run, "sh").and_then(|mut command| {
+        command.env_clear();
+        run.environment_grants().apply_std(&mut command);
         command
+            .env("PATH", run.executable_search_path())
+            .current_dir(&cwd)
             .args(["-c", cmd])
             .output()
             .map_err(|e| e.to_string())
@@ -196,20 +207,33 @@ mod tests {
             "permission shell runner must not invoke bare sh"
         );
         assert!(
-            production.contains("which::which(binary)"),
-            "permission shell runner must resolve shell binaries through the Rust resolver"
+            production.contains("run.resolve_executable(binary)"),
+            "permission shell runner must resolve shell binaries through the immutable run"
         );
     }
 
     #[test]
     fn shell_command_internal_returns_execution_metadata() {
-        let execution = execute_shell_command_internal("printf openclaudia-ledger")
+        let root = tempfile::TempDir::new().expect("shell test root");
+        let run = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            root.path(),
+        )
+        .host_startup_grants()
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("repl-shell-test")
+        .build()
+        .expect("shell test run");
+        let execution = execute_shell_command_internal(&run, "printf openclaudia-ledger")
             .expect("shell command should run");
 
         assert_eq!(execution.command, "printf openclaudia-ledger");
         assert_eq!(execution.exit_code, 0);
         assert_eq!(execution.stdout, "openclaudia-ledger");
         assert!(execution.stderr.is_empty());
-        assert!(execution.cwd.is_absolute());
+        assert_eq!(execution.cwd, root.path().canonicalize().expect("root"));
     }
 }

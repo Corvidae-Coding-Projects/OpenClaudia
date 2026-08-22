@@ -11,6 +11,9 @@ use crate::vdd::static_analysis::StaticAnalysisResult;
 
 #[derive(Error, Debug)]
 pub enum VddError {
+    #[error(transparent)]
+    Capability(#[from] crate::tools::ToolCapabilityError),
+
     #[error("Adversary provider request failed: {0}")]
     AdversaryRequestFailed(String),
 
@@ -55,7 +58,7 @@ pub enum VddResult {
 /// Advisory mode result
 pub struct VddAdvisoryResult {
     pub findings: Vec<Finding>,
-    pub context_injection: String,
+    pub context_observation: Option<crate::context::ContextItem>,
     pub static_analysis: Vec<StaticAnalysisResult>,
     pub tokens_used: TokenUsage,
 }

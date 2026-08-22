@@ -10,19 +10,30 @@ use std::collections::HashMap;
 /// `read_dir().flatten()`, which discarded any `DirEntry` that errored — the
 /// caller saw a clean listing with no signal that entries were hidden, and
 /// the model then acted on incomplete information.
-pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_list_files(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     // crosslink #675: typed accessor (default-with-fallback variant).
     let raw_path = match args.arg_str_or_strict("path", ".") {
         Ok(path) => path,
         Err(e) => return e.into_tool_error(),
     };
 
-    let path = match resolve_path(raw_path) {
+    let path = match resolve_path(run, raw_path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };
 
-    match secure_fs::open_directory(&path).and_then(|directory| directory.entries()) {
+    let mut resource_batch = match crate::guardrails::begin_path_resource_batch(run) {
+        Ok(batch) => batch,
+        Err(error) => return (format!("Blocked by blast radius guardrails: {error}"), true),
+    };
+    if let Err(error) = resource_batch.check_scope(run, &path) {
+        return (format!("Blocked by blast radius guardrails: {error}"), true);
+    }
+
+    match secure_fs::open_directory(run, &path).and_then(|directory| directory.entries()) {
         Ok(entries) => {
             // (is_dir, name) tuples — sort puts every dir before every
             // file (false < true under default Ord, so `is_dir`'s
@@ -37,6 +48,15 @@ pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
             for entry in entries {
                 let name = entry.name.to_string_lossy().to_string();
                 let is_dir = entry.kind == secure_fs::SecureFileType::Directory;
+                let entry_path = path.join(&entry.name);
+                let admission = if is_dir {
+                    resource_batch.check_disclosed_scope(run, &entry_path)
+                } else {
+                    resource_batch.reserve_file(run, &entry_path)
+                };
+                if let Err(error) = admission {
+                    return (format!("Blocked by blast radius guardrails: {error}"), true);
+                }
                 items.push((is_dir, name));
             }
             // Primary key: dirs before files (so invert is_dir).
@@ -46,6 +66,7 @@ pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
                 .into_iter()
                 .map(|(is_dir, name)| if is_dir { format!("{name}/") } else { name })
                 .collect();
+            resource_batch.commit();
             (rendered.join("\n"), false)
         }
         Err(e) => (
@@ -64,6 +85,10 @@ mod tests {
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     /// Process-wide lock so concurrent tests don't interleave their captures
     /// of the global tracing dispatcher state.
@@ -134,7 +159,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
         let mut args = HashMap::new();
         args.insert("path".to_string(), json!(tmp.path().to_str().unwrap()));
-        let (out, is_err) = execute_list_files(&args);
+        let (out, is_err) = execute_list_files(test_run(), &args);
         assert!(!is_err);
         assert!(out.contains("a.txt"));
 

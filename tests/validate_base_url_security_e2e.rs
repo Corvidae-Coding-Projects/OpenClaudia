@@ -246,18 +246,17 @@ fn url_with_garbage_text_rejected() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section G — Error message carries diagnostic info
+// Section G — Error message carries safe diagnostic info
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn error_message_includes_offending_url_for_log_diagnostics() {
-    let url = "http://localhost/some/path";
-    let err = validate_base_url(url).unwrap_err();
-    // PINS DOC: error message includes URL so log readers can pivot.
-    assert!(
-        err.contains(url),
-        "error MUST include URL {url:?}; got {err}"
-    );
+fn error_message_omits_sensitive_url_components_but_retains_reason() {
+    let sentinel = "signed-url-secret-sentinel";
+    let url = format!("http://localhost/some/path?signature={sentinel}");
+    let err = validate_base_url(&url).unwrap_err();
+    assert!(err.contains("internal/metadata endpoint"), "got {err}");
+    assert!(!err.contains(sentinel), "signed query leaked: {err}");
+    assert!(!err.contains(&url), "full URL leaked: {err}");
 }
 
 #[test]

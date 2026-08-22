@@ -45,7 +45,7 @@ impl OllamaAdapter {
 
 fn convert_multipart_message_content(
     msg_index: usize,
-    role: &str,
+    _role: &str,
     parts: &[ContentPart],
 ) -> Result<String, ProviderError> {
     let mut text_parts = Vec::new();
@@ -58,7 +58,7 @@ fn convert_multipart_message_content(
 
         if part.content_type == "text" {
             return Err(ProviderError::RequestFailed(format!(
-                "Ollama message at index {msg_index} (role '{role}') has text content part at \
+                "Ollama message at index {msg_index} has text content part at \
                  index {part_index} without string 'text'"
             )));
         }
@@ -66,14 +66,13 @@ fn convert_multipart_message_content(
         if part.content_type == "image_url" || part.image_url.is_some() {
             return Err(ProviderError::Unsupported(format!(
                 "Ollama adapter does not support image content parts; message index {msg_index}, \
-                 part index {part_index}, role '{role}'"
+                 part index {part_index}"
             )));
         }
 
         return Err(ProviderError::Unsupported(format!(
-            "Ollama adapter does not support content part type '{}' at message index \
-             {msg_index}, part index {part_index}, role '{role}'",
-            part.content_type
+            "Ollama adapter does not support this content part type at message index \
+             {msg_index}, part index {part_index}"
         )));
     }
 
@@ -95,7 +94,7 @@ fn convert_tools_checked(tools: &[Value]) -> Result<Vec<Value>, ProviderError> {
             .filter(|value| value.is_object())
             .ok_or_else(|| {
                 ProviderError::RequestFailed(format!(
-                    "Tool at index {index} missing required 'function' object: {tool}"
+                    "Tool at index {index} missing required 'function' object"
                 ))
             })?;
 
@@ -105,7 +104,7 @@ fn convert_tools_checked(tools: &[Value]) -> Result<Vec<Value>, ProviderError> {
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
                 ProviderError::RequestFailed(format!(
-                    "Tool at index {index} missing non-empty string 'function.name': {tool}"
+                    "Tool at index {index} missing non-empty string 'function.name'"
                 ))
             })?;
 
@@ -114,7 +113,7 @@ fn convert_tools_checked(tools: &[Value]) -> Result<Vec<Value>, ProviderError> {
             Some(value @ Value::String(_)) => value.clone(),
             Some(_) => {
                 return Err(ProviderError::RequestFailed(format!(
-                    "Tool at index {index} has non-string 'function.description': {tool}"
+                    "Tool at index {index} has non-string 'function.description'"
                 )));
             }
         };
@@ -124,7 +123,7 @@ fn convert_tools_checked(tools: &[Value]) -> Result<Vec<Value>, ProviderError> {
             Some(value @ Value::Object(_)) => value.clone(),
             Some(_) => {
                 return Err(ProviderError::RequestFailed(format!(
-                    "Tool at index {index} has non-object 'function.parameters': {tool}"
+                    "Tool at index {index} has non-object 'function.parameters'"
                 )));
             }
         };
@@ -175,7 +174,7 @@ impl ProviderAdapter for OllamaAdapter {
             }
         }
 
-        debug!(body = %body, "Transformed request for Ollama");
+        debug!("Transformed request for Ollama");
         Ok(body)
     }
 
@@ -187,17 +186,17 @@ impl ProviderAdapter for OllamaAdapter {
             .and_then(Value::as_str)
             .filter(|model| !model.is_empty())
             .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Ollama response missing non-empty string 'model': {response}"
-                ))
+                ProviderError::InvalidResponse(
+                    "Ollama response missing non-empty string 'model'".to_string(),
+                )
             })?;
         let message = response
             .get("message")
             .filter(|message| message.is_object())
             .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Ollama response missing object 'message': {response}"
-                ))
+                ProviderError::InvalidResponse(
+                    "Ollama response missing object 'message'".to_string(),
+                )
             })?;
 
         let role = message
@@ -205,24 +204,23 @@ impl ProviderAdapter for OllamaAdapter {
             .and_then(Value::as_str)
             .filter(|role| !role.is_empty())
             .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Ollama response message missing non-empty string 'role': {message}"
-                ))
+                ProviderError::InvalidResponse(
+                    "Ollama response message missing non-empty string 'role'".to_string(),
+                )
             })?;
         if role != "assistant" {
-            return Err(ProviderError::InvalidResponse(format!(
-                "Ollama response message has unsupported role '{role}', expected 'assistant': \
-                 {message}"
-            )));
+            return Err(ProviderError::InvalidResponse(
+                "Ollama response message has unsupported role; expected 'assistant'".to_string(),
+            ));
         }
 
         let content = message
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Ollama response message missing string 'content': {message}"
-                ))
+                ProviderError::InvalidResponse(
+                    "Ollama response message missing string 'content'".to_string(),
+                )
             })?;
 
         let mut openai_message = json!({
@@ -240,9 +238,7 @@ impl ProviderAdapter for OllamaAdapter {
             .get("done")
             .and_then(Value::as_bool)
             .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Ollama response missing boolean 'done': {response}"
-                ))
+                ProviderError::InvalidResponse("Ollama response missing boolean 'done'".to_string())
             })?;
         let finish_reason = if !done {
             "length"
@@ -284,9 +280,11 @@ impl ProviderAdapter for OllamaAdapter {
         "/api/chat".to_string()
     }
 
-    fn get_headers(&self, _api_key: &super::ApiKey) -> Vec<(String, String)> {
+    fn get_headers(&self, _api_key: &super::ApiKey) -> crate::secrets::SensitiveHeaders {
         // Ollama doesn't require authentication by default
-        vec![("content-type".to_string(), "application/json".to_string())]
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
+        headers
     }
 
     fn supports_model_listing(&self) -> bool {
@@ -353,7 +351,7 @@ fn convert_ollama_tool_calls(message: &Value) -> Result<Option<Vec<Value>>, Prov
 fn convert_ollama_tool_call((index, call): (usize, &Value)) -> Result<Value, ProviderError> {
     let func = call.get("function").ok_or_else(|| {
         ProviderError::InvalidResponse(format!(
-            "Ollama tool_call at index {index} missing 'function' object: {call}"
+            "Ollama tool_call at index {index} missing 'function' object"
         ))
     })?;
     let name = func
@@ -362,15 +360,15 @@ fn convert_ollama_tool_call((index, call): (usize, &Value)) -> Result<Value, Pro
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
             ProviderError::InvalidResponse(format!(
-                "Ollama tool_call at index {index} missing non-empty function.name: {call}"
+                "Ollama tool_call at index {index} missing non-empty function.name"
             ))
         })?;
     let arguments = func.get("arguments").ok_or_else(|| {
         ProviderError::InvalidResponse(format!(
-            "Ollama tool_call at index {index} missing function.arguments: {call}"
+            "Ollama tool_call at index {index} missing function.arguments"
         ))
     })?;
-    let arguments = stringify_ollama_tool_arguments(index, call, arguments)?;
+    let arguments = stringify_ollama_tool_arguments(index, arguments)?;
 
     Ok(json!({
         "id": format!("call_{}", uuid::Uuid::new_v4()),
@@ -384,14 +382,12 @@ fn convert_ollama_tool_call((index, call): (usize, &Value)) -> Result<Value, Pro
 
 fn stringify_ollama_tool_arguments(
     index: usize,
-    call: &Value,
     arguments: &Value,
 ) -> Result<String, ProviderError> {
     let parsed = if let Some(args) = arguments.as_str() {
         serde_json::from_str::<Value>(args).map_err(|e| {
             ProviderError::InvalidResponse(format!(
-                "Ollama tool_call at index {index} has invalid JSON function.arguments: {e}; \
-                 tool_call: {call}"
+                "Ollama tool_call at index {index} has invalid JSON function.arguments: {e}"
             ))
         })?
     } else {
@@ -401,15 +397,14 @@ fn stringify_ollama_tool_arguments(
     if !parsed.is_object() {
         return Err(ProviderError::InvalidResponse(format!(
             "Ollama tool_call at index {index} has non-object function.arguments: expected JSON \
-             object, got {}; tool_call: {call}",
+             object, got {}",
             json_value_type_name(&parsed),
         )));
     }
 
     serde_json::to_string(&parsed).map_err(|e| {
         ProviderError::InvalidResponse(format!(
-            "Ollama tool_call at index {index} has unserializable function.arguments: {e}; \
-             tool_call: {call}"
+            "Ollama tool_call at index {index} has unserializable function.arguments: {e}"
         ))
     })
 }
@@ -534,7 +529,10 @@ mod tests {
             .expect_err("unknown content part must not be dropped");
 
         match err {
-            ProviderError::Unsupported(msg) => assert!(msg.contains("input_audio"), "{msg}"),
+            ProviderError::Unsupported(msg) => {
+                assert!(msg.contains("content part type"), "{msg}");
+                assert!(!msg.contains("input_audio"), "{msg}");
+            }
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }
@@ -613,7 +611,10 @@ mod tests {
 
     #[test]
     fn transform_request_errors_on_tool_missing_function_object() {
-        let request = request_with_tools(vec![json!({"type": "function"})]);
+        let request = request_with_tools(vec![json!({
+            "type": "function",
+            "credential": "ollama-tool-secret-sentinel"
+        })]);
 
         let err = OllamaAdapter::new()
             .transform_request(&request)
@@ -622,6 +623,7 @@ mod tests {
         match err {
             ProviderError::RequestFailed(msg) => {
                 assert!(msg.contains("function"), "{msg}");
+                assert!(!msg.contains("ollama-tool-secret-sentinel"), "{msg}");
             }
             other => panic!("expected RequestFailed, got {other:?}"),
         }

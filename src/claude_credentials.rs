@@ -7,6 +7,7 @@
 //! This enables `OpenClaudia` users who have Claude Code installed and logged in
 //! to use their existing subscription without an API key or proxy.
 
+use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -63,9 +64,9 @@ pub struct CredentialsFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeAiOauth {
     #[serde(rename = "accessToken")]
-    pub access_token: String,
+    pub access_token: crate::secrets::OAuthToken,
     #[serde(rename = "refreshToken")]
-    pub refresh_token: Option<String>,
+    pub refresh_token: Option<crate::secrets::OAuthToken>,
     #[serde(rename = "expiresAt")]
     pub expires_at: i64, // milliseconds since epoch
     pub scopes: Vec<String>,
@@ -78,7 +79,7 @@ pub struct ClaudeAiOauth {
 /// Result of loading credentials
 #[derive(Debug, Clone)]
 pub struct LoadedCredentials {
-    pub access_token: String,
+    pub access_token: crate::secrets::OAuthToken,
     pub subscription_type: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub scopes: Vec<String>,
@@ -233,8 +234,10 @@ pub async fn load_credentials() -> Result<LoadedCredentials, String> {
     // because `load_credentials` still returns `Result<_, String>` for
     // backwards-compat with existing callers; the rendered message now
     // always names the file and the source chain.
-    let content = crate::file_error::read_file(&path)
-        .map_err(|e: crate::file_error::FileError| e.to_string())?;
+    let content = zeroize::Zeroizing::new(
+        crate::file_error::read_file(&path)
+            .map_err(|e: crate::file_error::FileError| e.to_string())?,
+    );
 
     let creds: CredentialsFile = serde_json::from_str(&content)
         .map_err(crate::file_error::FileError::json_with_path(&path))
@@ -280,33 +283,40 @@ pub async fn load_credentials() -> Result<LoadedCredentials, String> {
 /// racing on the same file.
 /// Call the OAuth token-refresh endpoint and return the raw JSON response body.
 async fn call_token_refresh_api(
-    refresh_token: &str,
+    refresh_token: &crate::secrets::OAuthToken,
     scopes: &str,
-) -> Result<serde_json::Value, String> {
+) -> Result<TokenRefreshResponse, String> {
+    #[derive(Serialize)]
+    struct TokenRefreshRequest<'a> {
+        grant_type: &'static str,
+        refresh_token: &'a str,
+        client_id: &'static str,
+        scope: &'a str,
+    }
+
     let client = reqwest::Client::new();
-    let response = client
-        .post(TOKEN_URL)
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLAUDE_CODE_CLIENT_ID,
-            "scope": scopes,
-        }))
+    let request = refresh_token.expose(|refresh_raw| {
+        client.post(TOKEN_URL).json(&TokenRefreshRequest {
+            grant_type: "refresh_token",
+            refresh_token: refresh_raw,
+            client_id: CLAUDE_CODE_CLIENT_ID,
+            scope: scopes,
+        })
+    });
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Token refresh request failed: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        // Never propagate the raw body — Anthropic echoes `refresh_token`
-        // values in its validation errors (crosslink #263). Log at debug
-        // for operators, return the sanitized form to the caller.
-        tracing::debug!("token_refresh_failed body (not shipped to caller): {body}");
-        return Err(format!(
-            "Token refresh failed ({status}): {}",
-            crate::oauth::redact_oauth_error_body(&body)
-        ));
+        let body = crate::secrets::read_bounded_diagnostic_body(response)
+            .await
+            .map_err(|error| format!("Failed to read token refresh error body: {error}"))?;
+        let known = refresh_token.secret();
+        let safe = crate::secrets::sanitize_diagnostic(&body, [&known]);
+        tracing::debug!(status = %status, body = %safe, "token refresh failed");
+        return Err(format!("Token refresh failed ({status}): {safe}"));
     }
 
     response
@@ -315,17 +325,25 @@ async fn call_token_refresh_api(
         .map_err(|e| format!("Failed to parse refresh response: {e}"))
 }
 
+#[derive(Deserialize)]
+struct TokenRefreshResponse {
+    access_token: crate::secrets::OAuthToken,
+    refresh_token: Option<crate::secrets::OAuthToken>,
+    expires_in: i64,
+    scope: Option<String>,
+}
+
 /// Resolve the `refresh_token` to persist after a successful refresh.
 ///
 /// Returns the response's `refresh_token` field when present. When absent,
 /// requires `OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE=1` to be set before
 /// silently reusing the old one — see crosslink #825.
 fn resolve_new_refresh_token(
-    response_field: Option<&str>,
-    previous_refresh_token: &str,
-) -> Result<String, String> {
-    if let Some(s) = response_field {
-        return Ok(s.to_string());
+    response_field: Option<crate::secrets::OAuthToken>,
+    previous_refresh_token: &crate::secrets::OAuthToken,
+) -> Result<crate::secrets::OAuthToken, String> {
+    if let Some(token) = response_field {
+        return Ok(token);
     }
     let allow_reuse = std::env::var("OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE")
         .ok()
@@ -344,7 +362,7 @@ fn resolve_new_refresh_token(
          refresh token under OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE=1 — if your \
          provider rotates refresh tokens this will break on the next refresh"
     );
-    Ok(previous_refresh_token.to_string())
+    Ok(previous_refresh_token.clone())
 }
 
 async fn refresh_and_load(path: &Path, oauth: &ClaudeAiOauth) -> Result<LoadedCredentials, String> {
@@ -353,16 +371,13 @@ async fn refresh_and_load(path: &Path, oauth: &ClaudeAiOauth) -> Result<LoadedCr
 
     let refresh_token = oauth
         .refresh_token
-        .as_deref()
+        .as_ref()
         .ok_or("No refresh token available — re-login with Claude Code")?;
 
     let scopes = oauth.scopes.join(" ");
     let refresh_response = call_token_refresh_api(refresh_token, &scopes).await?;
 
-    let new_access_token = refresh_response["access_token"]
-        .as_str()
-        .ok_or("No access_token in refresh response")?
-        .to_string();
+    let new_access_token = refresh_response.access_token;
 
     // Crosslink #825: when the refresh response omits the `refresh_token`
     // field, the OAuth server may either (a) be using non-rotating refresh
@@ -373,7 +388,7 @@ async fn refresh_and_load(path: &Path, oauth: &ClaudeAiOauth) -> Result<LoadedCr
     // opt-in (`OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE=1`) before reusing,
     // and `warn!` so it shows up in logs either way.
     let new_refresh_token =
-        resolve_new_refresh_token(refresh_response["refresh_token"].as_str(), refresh_token)?;
+        resolve_new_refresh_token(refresh_response.refresh_token, refresh_token)?;
 
     // `expires_in` is required by the OAuth spec — refuse to silently
     // default to 3600 when the field is missing or malformed. A missing
@@ -381,9 +396,7 @@ async fn refresh_and_load(path: &Path, oauth: &ClaudeAiOauth) -> Result<LoadedCr
     // Clamp the received value to [60s, 30d] with a tracing warn on any
     // clamp to avoid 401-retry loops (too short) and multi-year tokens
     // (too long). See crosslink #480.
-    let expires_in_raw = refresh_response["expires_in"]
-        .as_i64()
-        .ok_or("Refresh response missing required 'expires_in' field")?;
+    let expires_in_raw = refresh_response.expires_in;
     if expires_in_raw <= 0 {
         return Err(format!(
             "Refresh response returned non-positive 'expires_in' ({expires_in_raw})"
@@ -410,7 +423,7 @@ async fn refresh_and_load(path: &Path, oauth: &ClaudeAiOauth) -> Result<LoadedCr
     let new_expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
 
     // Parse scopes from response
-    let new_scopes: Vec<String> = refresh_response["scope"].as_str().map_or_else(
+    let new_scopes: Vec<String> = refresh_response.scope.as_deref().map_or_else(
         || oauth.scopes.clone(),
         |s| s.split_whitespace().map(String::from).collect(),
     );
@@ -452,6 +465,51 @@ fn reject_credentials_symlink(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Explicit serializer for Claude Code's owner-only credential file.
+/// Generic `CredentialsFile` serialization remains redacted.
+struct PersistedCredentialsFileRef<'a>(&'a CredentialsFile);
+
+impl Serialize for PersistedCredentialsFileRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("CredentialsFile", 1)?;
+        let oauth = self
+            .0
+            .claude_ai_oauth
+            .as_ref()
+            .map(PersistedClaudeAiOauthRef);
+        state.serialize_field("claudeAiOauth", &oauth)?;
+        state.end()
+    }
+}
+
+struct PersistedClaudeAiOauthRef<'a>(&'a ClaudeAiOauth);
+
+impl Serialize for PersistedClaudeAiOauthRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let oauth = self.0;
+        let mut state = serializer.serialize_struct("ClaudeAiOauth", 6)?;
+        oauth
+            .access_token
+            .expose(|raw| state.serialize_field("accessToken", raw))?;
+        if let Some(refresh_token) = &oauth.refresh_token {
+            refresh_token.expose(|raw| state.serialize_field("refreshToken", raw))?;
+        } else {
+            state.serialize_field("refreshToken", &Option::<&str>::None)?;
+        }
+        state.serialize_field("expiresAt", &oauth.expires_at)?;
+        state.serialize_field("scopes", &oauth.scopes)?;
+        state.serialize_field("subscriptionType", &oauth.subscription_type)?;
+        state.serialize_field("rateLimitTier", &oauth.rate_limit_tier)?;
+        state.end()
+    }
+}
+
 /// Serialize and atomically write a [`CredentialsFile`] to `path`.
 ///
 /// The target must not be a symlink. The replacement is written to a random
@@ -469,9 +527,11 @@ fn write_credentials_file(path: &Path, creds: &CredentialsFile) -> Result<(), St
     })?;
     crate::file_error::create_dir_all(parent).map_err(|e| e.to_string())?;
 
-    let json = serde_json::to_vec_pretty(creds)
-        .map_err(crate::file_error::FileError::json_with_path(path))
-        .map_err(|e| e.to_string())?;
+    let json = zeroize::Zeroizing::new(
+        serde_json::to_vec_pretty(&PersistedCredentialsFileRef(creds))
+            .map_err(crate::file_error::FileError::json_with_path(path))
+            .map_err(|e| e.to_string())?,
+    );
 
     let tmp = match write_secret_tmp(parent, &json) {
         Ok(tmp) => tmp,
@@ -552,13 +612,16 @@ fn read_existing_oauth(path: &Path) -> Option<ClaudeAiOauth> {
     }
     crate::file_error::read_file(path)
         .ok()
-        .and_then(|content| serde_json::from_str::<CredentialsFile>(&content).ok())
+        .and_then(|content| {
+            let content = zeroize::Zeroizing::new(content);
+            serde_json::from_str::<CredentialsFile>(&content).ok()
+        })
         .and_then(|creds| creds.claude_ai_oauth)
 }
 
 fn merge_oauth_fields(
-    access_token: &str,
-    refresh_token: Option<&str>,
+    access_token: &crate::secrets::OAuthToken,
+    refresh_token: Option<&crate::secrets::OAuthToken>,
     expires_at_ms: i64,
     scopes: Vec<String>,
     subscription_type: Option<String>,
@@ -566,9 +629,9 @@ fn merge_oauth_fields(
     existing: Option<&ClaudeAiOauth>,
 ) -> ClaudeAiOauth {
     ClaudeAiOauth {
-        access_token: access_token.to_string(),
+        access_token: access_token.clone(),
         refresh_token: refresh_token
-            .map(String::from)
+            .cloned()
             .or_else(|| existing.and_then(|oauth| oauth.refresh_token.clone())),
         expires_at: expires_at_ms,
         scopes,
@@ -589,8 +652,8 @@ fn merge_oauth_fields(
 /// Returns an error when the config directory cannot be resolved, the target is
 /// a symlink, or the credential file cannot be written.
 pub fn store_credentials(
-    access_token: &str,
-    refresh_token: Option<&str>,
+    access_token: &crate::secrets::OAuthToken,
+    refresh_token: Option<&crate::secrets::OAuthToken>,
     expires_at_ms: i64,
     scopes: Vec<String>,
     subscription_type: Option<String>,
@@ -657,7 +720,8 @@ pub fn peek_credentials() -> Result<Option<CredentialStatus>, String> {
     };
     reject_credentials_symlink(&path)?;
 
-    let content = crate::file_error::read_file(&path).map_err(|e| e.to_string())?;
+    let content =
+        zeroize::Zeroizing::new(crate::file_error::read_file(&path).map_err(|e| e.to_string())?);
     let creds: CredentialsFile = serde_json::from_str(&content)
         .map_err(crate::file_error::FileError::json_with_path(&path))
         .map_err(|e| e.to_string())?;
@@ -686,21 +750,10 @@ fn status_from_oauth(oauth: &ClaudeAiOauth, now_ms: i64) -> CredentialStatus {
 ///
 /// These headers replace the `x-api-key` header used with API keys.
 #[must_use]
-pub fn get_oauth_headers(access_token: &str) -> Vec<(String, String)> {
-    vec![
-        (
-            "Authorization".to_string(),
-            format!("Bearer {access_token}"),
-        ),
-        ("anthropic-version".to_string(), "2023-06-01".to_string()),
-        ("content-type".to_string(), "application/json".to_string()),
-        // Beta headers matching what Claude Code sends (required for OAuth model access).
-        // Uses claude_code_beta_header_value() as the single source of truth — see crosslink #272.
-        (
-            "anthropic-beta".to_string(),
-            claude_code_beta_header_value(),
-        ),
-    ]
+pub fn get_oauth_headers(
+    access_token: &crate::secrets::OAuthToken,
+) -> crate::secrets::SensitiveHeaders {
+    crate::providers::AnthropicAdapter::oauth_headers(access_token)
 }
 
 /// Get the API endpoint for OAuth-authenticated requests.
@@ -730,37 +783,27 @@ pub fn get_oauth_endpoint(_model: &str) -> String {
 ///    (alongside the bearer token and `anthropic-beta` header), not a
 ///    free-form prompt fragment, and so belongs in the credentials module
 ///    that owns the rest of that contract.
-/// 2. **Single source of truth.** Both `inject_system_prompt` (full chat
-///    mode) and `inject_oauth_prefix_only` (proxy mode) reference the same
-///    constant; moving the literal into `prompt.rs` would split the OAuth
-///    contract across two crates with no compile-time link between them.
+/// 2. **Single source of truth.** Every OAuth-authenticated transport uses
+///    `inject_oauth_prefix_only`; behavioral context is assembled separately
+///    by the typed prompt authority boundary.
 /// 3. **Operational risk is bounded.** If Anthropic changes the literal,
 ///    the failure mode is a 401 from `/v1/messages` with a clear server
 ///    message ("invalid system prefix") — not a silent degradation.
 ///    Updating the constant is a one-line fix in one file.
 ///
-/// The follow-up work to move OAuth prefix-block construction into
-/// `build_system_prompt_blocks(..., oauth_prefix: Option<&str>)` is
-/// tracked in the same issue thread but is deferred because it would
-/// require threading the credential state through every prompt-builder
-/// callsite without changing what the wire actually carries.
+/// The prefix remains a provider-protocol compatibility credential, not a
+/// general prompt extension API.
 pub const CLAUDE_CODE_SYSTEM_PROMPT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
-
-/// Additional system prompt content sent as a separate block after the prefix.
-/// This is where behavioral instructions and persona go.
-pub const CLAUDIA_SYSTEM_PROMPT: &str = include_str!("claude_code_prompt.txt");
 
 /// Inject only the Claude Code prefix block required for OAuth tokens.
 ///
 /// Block 0: The exact one-liner prefix (API validates this string for OAuth)
 /// Block 1+: Whatever was already in the system field (preserved as-is)
 ///
-/// Unlike [`inject_system_prompt`], this does NOT prepend the Claudia
-/// behavioral persona — it is the minimum mutation required for the
-/// Anthropic API to accept an OAuth Bearer request, and is used by the
-/// `/v1/messages` proxy endpoint where the caller (an arbitrary
-/// Anthropic SDK client) owns its own system prompt content.
+/// This does not prepend behavioral prose. It is the minimum mutation required
+/// for the Anthropic API to accept an OAuth Bearer request; caller/system
+/// context remains owned by the typed prompt or proxy boundary.
 ///
 /// Centralized here so that the magic-string prefix and the three-way
 /// match on the existing `system` shape live in one place. Previously
@@ -848,49 +891,13 @@ fn strip_cache_control_ttl_inner(value: &mut serde_json::Value, depth: usize, pa
     }
 }
 
-/// Inject the Claude Code system prompt into a request body.
-///
-/// Block 0: The exact one-liner prefix (API validates this string for OAuth)
-/// Block 1: Full behavioral instructions + Claudia persona (from `claude_code_prompt.txt`)
-/// Block 2+: Whatever was already in the system array (our per-session prompt)
-///
-/// This matches Claude Code's multi-block system array structure.
-pub fn inject_system_prompt(request: &mut serde_json::Value) {
-    // Block 0: exact prefix — API validates this for OAuth access
-    let prefix_block = serde_json::json!({
-        "type": "text",
-        "text": CLAUDE_CODE_SYSTEM_PROMPT,
-    });
-
-    // Block 1: behavioral instructions + Claudia persona (cached)
-    let behavioral_block = serde_json::json!({
-        "type": "text",
-        "text": CLAUDIA_SYSTEM_PROMPT,
-        "cache_control": {"type": "ephemeral"}
-    });
-
-    match request.get_mut("system") {
-        Some(serde_json::Value::Array(arr)) => {
-            // Existing blocks become block 2+
-            arr.insert(0, behavioral_block);
-            arr.insert(0, prefix_block);
-        }
-        Some(serde_json::Value::String(existing)) => {
-            let existing_obj = serde_json::json!({
-                "type": "text",
-                "text": existing.clone(),
-            });
-            request["system"] = serde_json::json!([prefix_block, behavioral_block, existing_obj]);
-        }
-        _ => {
-            request["system"] = serde_json::json!([prefix_block, behavioral_block]);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token(value: &str) -> crate::secrets::OAuthToken {
+        crate::secrets::OAuthToken::try_from_string(value.to_string()).expect("valid test token")
+    }
 
     // --- Crosslink #825: refresh_token rotation policy ---
 
@@ -899,8 +906,10 @@ mod tests {
     /// path doesn't touch env vars so it can run in parallel with anything.
     #[test]
     fn resolve_new_refresh_token_uses_response_field_when_present() {
-        let result = resolve_new_refresh_token(Some("new-rotated-token"), "old-token");
-        assert_eq!(result.as_deref(), Ok("new-rotated-token"));
+        let old = token("old-token");
+        let result = resolve_new_refresh_token(Some(token("new-rotated-token")), &old)
+            .expect("rotated token");
+        assert!(result.matches("new-rotated-token"));
     }
 
     /// Spec — both env-var-sensitive branches of [`resolve_new_refresh_token`]
@@ -919,12 +928,13 @@ mod tests {
         unsafe {
             std::env::remove_var(VAR);
         }
-        let err_result = resolve_new_refresh_token(None, "old-token");
+        let old = token("old-token");
+        let err_result = resolve_new_refresh_token(None, &old);
         // SAFETY: see comment above.
         unsafe {
             std::env::set_var(VAR, "1");
         }
-        let reuse_result = resolve_new_refresh_token(None, "old-token");
+        let reuse_result = resolve_new_refresh_token(None, &old);
         // Restore before any assertion that might unwind.
         // SAFETY: see comment above.
         unsafe {
@@ -939,11 +949,9 @@ mod tests {
             err.contains(VAR),
             "error must name the opt-in env var; got: {err}"
         );
-        assert_eq!(
-            reuse_result.as_deref(),
-            Ok("old-token"),
-            "with opt-in set, helper must return the previous token"
-        );
+        assert!(reuse_result
+            .expect("with opt-in set, helper must return the previous token")
+            .matches("old-token"));
     }
 
     #[test]
@@ -972,8 +980,11 @@ mod tests {
 
         let creds: CredentialsFile = serde_json::from_str(json).unwrap();
         let oauth = creds.claude_ai_oauth.unwrap();
-        assert_eq!(oauth.access_token, "test-token");
-        assert_eq!(oauth.refresh_token, Some("test-refresh".to_string()));
+        assert!(oauth.access_token.matches("test-token"));
+        assert!(oauth
+            .refresh_token
+            .as_ref()
+            .is_some_and(|token| token.matches("test-refresh")));
         assert_eq!(oauth.subscription_type, Some("max".to_string()));
         assert!(oauth.scopes.contains(&"user:inference".to_string()));
     }
@@ -987,16 +998,10 @@ mod tests {
 
     #[test]
     fn test_get_oauth_headers() {
-        let headers = get_oauth_headers("test-token-123");
-        assert!(headers
-            .iter()
-            .any(|(k, v)| k == "Authorization" && v == "Bearer test-token-123"));
-        assert!(headers
-            .iter()
-            .any(|(k, v)| k == "anthropic-beta" && v.contains("oauth-2025-04-20")));
-        assert!(headers
-            .iter()
-            .any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
+        let headers = get_oauth_headers(&token("test-token-123"));
+        assert!(headers.matches_value("Authorization", "Bearer test-token-123"));
+        assert!(headers.matches_value("anthropic-beta", &claude_code_beta_header_value()));
+        assert!(headers.matches_value("anthropic-version", "2023-06-01"));
     }
 
     #[test]
@@ -1011,8 +1016,8 @@ mod tests {
         let path = dir.path().join(".credentials.json");
         let creds = CredentialsFile {
             claude_ai_oauth: Some(ClaudeAiOauth {
-                access_token: "sk-ant-oat01-test".to_string(),
-                refresh_token: Some("sk-ant-ort01-refresh".to_string()),
+                access_token: token("sk-ant-oat01-test"),
+                refresh_token: Some(token("sk-ant-ort01-refresh")),
                 expires_at: 1_999_999_999_999,
                 scopes: vec!["user:inference".to_string(), "user:profile".to_string()],
                 subscription_type: Some("pro".to_string()),
@@ -1030,8 +1035,11 @@ mod tests {
 
         let parsed: CredentialsFile = serde_json::from_str(&content).unwrap();
         let oauth = parsed.claude_ai_oauth.unwrap();
-        assert_eq!(oauth.access_token, "sk-ant-oat01-test");
-        assert_eq!(oauth.refresh_token.as_deref(), Some("sk-ant-ort01-refresh"));
+        assert!(oauth.access_token.matches("sk-ant-oat01-test"));
+        assert!(oauth
+            .refresh_token
+            .as_ref()
+            .is_some_and(|token| token.matches("sk-ant-ort01-refresh")));
         assert_eq!(oauth.subscription_type.as_deref(), Some("pro"));
 
         #[cfg(unix)]
@@ -1063,16 +1071,17 @@ mod tests {
     #[test]
     fn merge_oauth_fields_preserves_existing_metadata_when_missing() {
         let existing = ClaudeAiOauth {
-            access_token: "old-access".into(),
-            refresh_token: Some("old-refresh".into()),
+            access_token: token("old-access"),
+            refresh_token: Some(token("old-refresh")),
             expires_at: 1,
             scopes: vec!["old".into()],
             subscription_type: Some("max".into()),
             rate_limit_tier: Some("tier-x".into()),
         };
 
+        let new_access = token("new-access");
         let merged = merge_oauth_fields(
-            "new-access",
+            &new_access,
             None,
             42,
             vec!["user:inference".into()],
@@ -1081,9 +1090,12 @@ mod tests {
             Some(&existing),
         );
 
-        assert_eq!(merged.access_token, "new-access");
+        assert!(merged.access_token.matches("new-access"));
         assert_eq!(merged.expires_at, 42);
-        assert_eq!(merged.refresh_token.as_deref(), Some("old-refresh"));
+        assert!(merged
+            .refresh_token
+            .as_ref()
+            .is_some_and(|token| token.matches("old-refresh")));
         assert_eq!(merged.subscription_type.as_deref(), Some("max"));
         assert_eq!(merged.rate_limit_tier.as_deref(), Some("tier-x"));
         assert_eq!(merged.scopes, vec!["user:inference"]);
@@ -1092,17 +1104,19 @@ mod tests {
     #[test]
     fn merge_oauth_fields_prefers_fresh_values() {
         let existing = ClaudeAiOauth {
-            access_token: "old-access".into(),
-            refresh_token: Some("old-refresh".into()),
+            access_token: token("old-access"),
+            refresh_token: Some(token("old-refresh")),
             expires_at: 1,
             scopes: vec![],
             subscription_type: Some("pro".into()),
             rate_limit_tier: Some("tier-old".into()),
         };
 
+        let new_access = token("new-access");
+        let new_refresh = token("new-refresh");
         let merged = merge_oauth_fields(
-            "new-access",
-            Some("new-refresh"),
+            &new_access,
+            Some(&new_refresh),
             99,
             vec!["user:inference".into()],
             Some("max".into()),
@@ -1110,7 +1124,10 @@ mod tests {
             Some(&existing),
         );
 
-        assert_eq!(merged.refresh_token.as_deref(), Some("new-refresh"));
+        assert!(merged
+            .refresh_token
+            .as_ref()
+            .is_some_and(|token| token.matches("new-refresh")));
         assert_eq!(merged.subscription_type.as_deref(), Some("max"));
         assert_eq!(merged.rate_limit_tier.as_deref(), Some("tier-new"));
     }
@@ -1118,7 +1135,7 @@ mod tests {
     #[test]
     fn status_from_oauth_flags_expiry_refresh_buffer_and_scope() {
         let base = ClaudeAiOauth {
-            access_token: "token".into(),
+            access_token: token("token"),
             refresh_token: None,
             expires_at: REFRESH_BUFFER_MS * 100,
             scopes: vec!["user:inference".into(), "user:profile".into()],
@@ -1189,15 +1206,11 @@ mod tests {
 
     #[test]
     fn get_oauth_headers_beta_includes_fine_grained_tool_streaming() {
-        let headers = get_oauth_headers("tok");
-        let beta = headers
-            .iter()
-            .find(|(k, _)| k == "anthropic-beta")
-            .expect("anthropic-beta header must be present");
-        assert!(
-            beta.1.contains("fine-grained-tool-streaming-2025-05-14"),
-            "fine-grained-tool-streaming missing from anthropic-beta: {}",
-            beta.1
+        let headers = get_oauth_headers(&token("tok"));
+        assert_eq!(
+            headers.with_value("anthropic-beta", |value| value
+                .contains("fine-grained-tool-streaming-2025-05-14")),
+            Some(true)
         );
     }
 
@@ -1243,9 +1256,8 @@ mod tests {
         assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
     }
 
-    /// Spec — `inject_oauth_prefix_only` does NOT inject the Claudia
-    /// behavioral persona block. That belongs to `inject_system_prompt`
-    /// for the CLI client, not to the proxy's pass-through behavior.
+    /// Spec — `inject_oauth_prefix_only` does not inject a second behavioral
+    /// prompt. Behavioral context comes from the typed context projector.
     #[test]
     fn inject_oauth_prefix_only_does_not_add_behavioral_block() {
         let mut req = serde_json::json!({});

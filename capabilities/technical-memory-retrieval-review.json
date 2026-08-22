@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "review_id": "openclaudia-technical-memory-retrieval-review-v1",
+  "reviewer_id": "unassigned-independent-reviewer",
+  "reviewer_model_id": "unassigned",
+  "reviewer_config_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "evaluation_generator_id": "s105-evaluation-runner",
+  "tuning_corpus_digest": "sha256:6d7c88a1c602c59cc951cee19355bf6fe856aec9c380c74a0a87f4273d47dfcc",
+  "held_out_corpus_digest": "sha256:6471612b4ddd5c9e06134ee8ba4f740b8eb5dc187f87921004e800680db65592",
+  "evaluation_digest": "sha256:239db50819b322a8469166a671778dd487ec6d601ad4fb6f69c0090ce94ab673",
+  "verdict": "rejected",
+  "reviewed_dimensions": [],
+  "limitations": [
+    "Independent corpus and evaluation review has not yet been performed; runtime promotion must fail closed to the lexical baseline."
+  ]
+}

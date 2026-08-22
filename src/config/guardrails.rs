@@ -1,10 +1,11 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroU32;
 
 use super::default_true;
 
 /// Top-level guardrails configuration
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct GuardrailsConfig {
     /// Blast radius limiting: constrain file access per request
     #[serde(default)]
@@ -18,7 +19,7 @@ pub struct GuardrailsConfig {
 }
 
 /// Guardrail enforcement mode
-#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GuardrailMode {
     /// Block operations that violate the guardrail
@@ -38,7 +39,7 @@ impl fmt::Display for GuardrailMode {
 }
 
 /// Action to take when a guardrail threshold is exceeded
-#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailAction {
     /// Log a warning
@@ -61,7 +62,7 @@ impl fmt::Display for GuardrailAction {
 }
 
 /// When to run quality gate checks
-#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunAfter {
     /// After every file edit
@@ -84,7 +85,7 @@ impl fmt::Display for RunAfter {
 }
 
 /// Blast radius limiting configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BlastRadiusConfig {
     /// Enable blast radius limiting
     #[serde(default)]
@@ -98,9 +99,23 @@ pub struct BlastRadiusConfig {
     /// Glob patterns for denied file paths (takes priority over allowed)
     #[serde(default)]
     pub denied_paths: Vec<String>,
-    /// Maximum files the agent can modify per turn (0 = unlimited)
+    /// Maximum distinct capability-resolved paths admitted during one run.
+    ///
+    /// `max_files_per_turn` remains a deserialization alias so existing
+    /// non-zero configurations migrate without silently changing which value
+    /// wins. Supplying both names is a duplicate-field error, and zero is
+    /// rejected by [`NonZeroU32`] instead of ambiguously meaning "unlimited".
+    #[serde(default, alias = "max_files_per_turn")]
+    pub max_files_per_run: Option<NonZeroU32>,
+    /// Maximum changed lines committed by file mutations during one run.
     #[serde(default)]
-    pub max_files_per_turn: u32,
+    pub max_lines_per_run: Option<NonZeroU32>,
+    /// Maximum classified tool calls committed during one run.
+    #[serde(default)]
+    pub max_tool_calls_per_run: Option<NonZeroU32>,
+    /// Maximum state-mutating tool calls committed during one run.
+    #[serde(default)]
+    pub max_mutations_per_run: Option<NonZeroU32>,
 }
 
 impl Default for BlastRadiusConfig {
@@ -110,13 +125,16 @@ impl Default for BlastRadiusConfig {
             mode: GuardrailMode::Advisory,
             allowed_paths: Vec::new(),
             denied_paths: Vec::new(),
-            max_files_per_turn: 0,
+            max_files_per_run: None,
+            max_lines_per_run: None,
+            max_tool_calls_per_run: None,
+            max_mutations_per_run: None,
         }
     }
 }
 
 /// Diff size monitoring configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DiffMonitorConfig {
     /// Enable diff monitoring
     #[serde(default)]
@@ -152,7 +170,7 @@ impl Default for DiffMonitorConfig {
 }
 
 /// Quality gates configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct QualityGatesConfig {
     /// Enable quality gates
     #[serde(default)]
@@ -188,7 +206,7 @@ impl Default for QualityGatesConfig {
 }
 
 /// A single quality check definition
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct QualityCheck {
     /// Human-readable name for the check
     pub name: String,

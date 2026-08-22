@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-use super::merge::{enforce_total_size, merge_claude_hooks, merge_settings_file};
+use super::compat_import::load_approved_repository_hooks;
+use super::merge::{enforce_total_size, merge_claude_hooks, merge_host_hooks, merge_settings_file};
 
 /// Claude Code settings.json structure
 #[derive(Debug, Deserialize, Default)]
@@ -21,6 +22,7 @@ pub struct ClaudeCodeSettings {
 
 /// Claude Code hook entry format
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaudeCodeHookEntry {
     #[serde(default)]
     pub matcher: Option<String>,
@@ -30,7 +32,7 @@ pub struct ClaudeCodeHookEntry {
 
 /// Claude Code hook definition
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ClaudeCodeHook {
     #[serde(rename = "command")]
     Command {
@@ -45,12 +47,12 @@ const fn default_claude_timeout() -> Option<u64> {
     Some(60)
 }
 
-/// Load hooks from Claude Code-compatible settings layers.
+/// Load hooks from Claude Code-compatible settings sources.
 ///
 /// This is the runtime-facing helper used by the CLI, ACP, and proxy paths.
-/// It intentionally routes through [`load_claude_code_hooks_layered`] so all
-/// call sites honor the same user, project, project-local, and managed
-/// settings precedence.
+/// User-global and managed host settings remain compatibility sources.
+/// Repository and project-local settings are inert proposals until an exact
+/// host approval is recorded by the explicit import workflow.
 #[must_use]
 pub fn load_claude_code_hooks() -> HooksConfig {
     let (config, _) = load_claude_code_hooks_layered();
@@ -71,16 +73,15 @@ pub struct LayeredSettings {
     pub managed_settings_path: Option<PathBuf>,
 }
 
-/// Load Claude settings from all layers, merging them in order.
+/// Load host-owned Claude settings, merging them in authority order.
 ///
 /// Load order (later overrides earlier):
 /// 1. `~/.claude/settings.json` (user global)
-/// 2. `.claude/settings.json` (project, committed)
-/// 3. `.claude/settings.local.json` (project, gitignored)
-/// 4. System-level managed settings (enterprise)
+/// 2. System-level managed settings (enterprise)
 ///
-/// Deep merge: arrays concatenate, objects merge recursively,
-/// scalars from later files override.
+/// Repository settings are deliberately absent from this function. They are
+/// discovered only through the explicit proposal/approval path in
+/// `compat_import`.
 pub fn load_claude_settings() -> LayeredSettings {
     let mut settings = Value::Object(serde_json::Map::default());
 
@@ -93,21 +94,7 @@ pub fn load_claude_settings() -> LayeredSettings {
         }
     }
 
-    // 2. Project settings (committed)
-    let project_settings = Path::new(".claude/settings.json");
-    if project_settings.exists() {
-        merge_settings_file(&mut settings, project_settings);
-        debug!(path = ?project_settings, "Loaded project Claude settings");
-    }
-
-    // 3. Project local settings (gitignored)
-    let local_settings = Path::new(".claude/settings.local.json");
-    if local_settings.exists() {
-        merge_settings_file(&mut settings, local_settings);
-        debug!(path = ?local_settings, "Loaded project-local Claude settings");
-    }
-
-    // 4. System-level managed settings (enterprise). Only Linux and macOS
+    // 2. System-level managed settings (enterprise). Only Linux and macOS
     // have well-known managed locations; on other platforms this is None.
     let managed_path: Option<PathBuf> = {
         #[cfg(target_os = "linux")]
@@ -134,11 +121,8 @@ pub fn load_claude_settings() -> LayeredSettings {
         merge_settings_file(&mut settings, path);
     }
 
-    // Post-merge size guard: a hostile combination of the four
-    // settings layers could still pump megabytes of data in even when
-    // each individual file is fine. Fall back to an empty object
-    // rather than handing the harness an oversized blob to walk
-    // (crosslink #333).
+    // Post-merge size guard for the host-owned settings tree. Fall back to an
+    // empty object rather than handing the harness an oversized blob to walk.
     if let Err(e) = enforce_total_size(&settings) {
         tracing::error!(
             error = %e,
@@ -172,23 +156,44 @@ pub fn load_claude_settings() -> LayeredSettings {
     }
 }
 
-/// Load hooks from all layered settings files.
+/// Load compatible hooks while enforcing the repository trust boundary.
 ///
-/// Uses the new 4-layer settings loading instead of the old 2-layer approach.
-/// Returns merged `HooksConfig` with Claude Code hooks converted to `OpenClaudia` format.
+/// The returned [`LayeredSettings`] remains a diagnostic view of host-owned
+/// settings sources. It is never the source of executable hooks. Runtime hooks are built
+/// from user-global settings, exact approved repository proposals, and finally
+/// managed host settings, in increasing authority order.
 pub fn load_claude_code_hooks_layered() -> (HooksConfig, LayeredSettings) {
     let layered = load_claude_settings();
-    let mut config = HooksConfig::default();
-
-    // Parse hooks from the merged settings
-    if let Some(hooks_obj) = layered.settings.get("hooks") {
-        if let Ok(settings) =
-            serde_json::from_value::<ClaudeCodeSettings>(json!({ "hooks": hooks_obj }))
-        {
-            merge_claude_hooks(&mut config, &settings);
-            info!("Loaded hooks from layered Claude settings");
-        }
+    let user_hooks = dirs::home_dir().map_or_else(HooksConfig::default, |home| {
+        load_hooks_from_trusted_settings(&home.join(".claude/settings.json"))
+    });
+    let approved_repository_hooks = load_approved_repository_hooks();
+    let mut config = merge_host_hooks(approved_repository_hooks, user_hooks);
+    if let Some(managed_path) = layered.managed_settings_path.as_deref() {
+        config = merge_host_hooks(config, load_hooks_from_trusted_settings(managed_path));
     }
 
     (config, layered)
+}
+
+fn load_hooks_from_trusted_settings(path: &Path) -> HooksConfig {
+    if !path.exists() {
+        return HooksConfig::default();
+    }
+    let mut value = Value::Object(serde_json::Map::default());
+    merge_settings_file(&mut value, path);
+    let Some(hooks) = value.get("hooks") else {
+        return HooksConfig::default();
+    };
+    let settings = match serde_json::from_value::<ClaudeCodeSettings>(json!({ "hooks": hooks })) {
+        Ok(settings) => settings,
+        Err(error) => {
+            warn!(path = ?path, error = %error, "Failed to parse trusted Claude hook settings");
+            return HooksConfig::default();
+        }
+    };
+    let mut config = HooksConfig::default();
+    merge_claude_hooks(&mut config, &settings);
+    info!(path = ?path, "Loaded host-owned Claude-compatible hooks");
+    config
 }

@@ -37,7 +37,7 @@ use openclaudia::session::{TaskManager, TaskStatus, TaskUpdateParams, TaskUpdate
 // Section A — TaskManager invariants
 // ───────────────────────────────────────────────────────────────────────────
 
-const fn mk_mgr() -> TaskManager {
+fn mk_mgr() -> TaskManager {
     TaskManager::new()
 }
 
@@ -49,10 +49,12 @@ fn only_one_task_in_progress_at_a_time() {
     let mut mgr = mk_mgr();
     let a_id = mgr
         .create_task("a".into(), "task A".into(), None)
+        .expect("valid task fixture")
         .id
         .clone();
     let b_id = mgr
         .create_task("b".into(), "task B".into(), None)
+        .expect("valid task fixture")
         .id
         .clone();
 
@@ -94,10 +96,12 @@ fn blocker_must_be_completed_before_dependent_can_progress() {
     let mut mgr = mk_mgr();
     let blocker = mgr
         .create_task("blk".into(), "blocker".into(), None)
+        .expect("valid task fixture")
         .id
         .clone();
     let dependent = mgr
         .create_task("dep".into(), "dependent".into(), None)
+        .expect("valid task fixture")
         .id
         .clone();
 
@@ -150,8 +154,16 @@ fn blocker_must_be_completed_before_dependent_can_progress() {
 fn add_blocked_by_creates_symmetric_blocks_edge() {
     // Adding "b blocks a" via blocked_by MUST also populate a.blocks.
     let mut mgr = mk_mgr();
-    let a_id = mgr.create_task("a".into(), "a".into(), None).id.clone();
-    let b_id = mgr.create_task("b".into(), "b".into(), None).id.clone();
+    let a_id = mgr
+        .create_task("a".into(), "a".into(), None)
+        .expect("valid task fixture")
+        .id
+        .clone();
+    let b_id = mgr
+        .create_task("b".into(), "b".into(), None)
+        .expect("valid task fixture")
+        .id
+        .clone();
 
     mgr.update_task(
         &a_id,
@@ -174,7 +186,11 @@ fn add_blocked_by_creates_symmetric_blocks_edge() {
 #[test]
 fn nonexistent_blocker_id_is_rejected() {
     let mut mgr = mk_mgr();
-    let a_id = mgr.create_task("a".into(), "a".into(), None).id.clone();
+    let a_id = mgr
+        .create_task("a".into(), "a".into(), None)
+        .expect("valid task fixture")
+        .id
+        .clone();
     let outcome = mgr.update_task(
         &a_id,
         TaskUpdateParams {
@@ -191,7 +207,11 @@ fn nonexistent_blocker_id_is_rejected() {
 #[test]
 fn deleted_status_removes_task_and_returns_none() {
     let mut mgr = mk_mgr();
-    let id = mgr.create_task("a".into(), "a".into(), None).id.clone();
+    let id = mgr
+        .create_task("a".into(), "a".into(), None)
+        .expect("valid task fixture")
+        .id
+        .clone();
     let outcome = mgr
         .update_task(
             &id,
@@ -228,9 +248,21 @@ fn update_unknown_task_id_errors() {
 #[test]
 fn task_ids_increase_monotonically() {
     let mut mgr = mk_mgr();
-    let id1 = mgr.create_task("a".into(), "a".into(), None).id.clone();
-    let id2 = mgr.create_task("b".into(), "b".into(), None).id.clone();
-    let id3 = mgr.create_task("c".into(), "c".into(), None).id.clone();
+    let id1 = mgr
+        .create_task("a".into(), "a".into(), None)
+        .expect("valid task fixture")
+        .id
+        .clone();
+    let id2 = mgr
+        .create_task("b".into(), "b".into(), None)
+        .expect("valid task fixture")
+        .id
+        .clone();
+    let id3 = mgr
+        .create_task("c".into(), "c".into(), None)
+        .expect("valid task fixture")
+        .id
+        .clone();
     assert_eq!(id1, "task-1");
     assert_eq!(id2, "task-2");
     assert_eq!(id3, "task-3");

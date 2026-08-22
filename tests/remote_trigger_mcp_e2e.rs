@@ -40,7 +40,7 @@ fn validate_url_accepts_explicit_https() {
     let canon = reg
         .validate_url("https://example.com/hook")
         .expect("explicit https must pass");
-    assert!(canon.starts_with("https://"));
+    assert!(canon.matches("https://example.com/hook"));
 }
 
 #[test]
@@ -50,10 +50,7 @@ fn validate_url_upgrades_scheme_less_input_to_https() {
     let canon = reg
         .validate_url("example.com/hook")
         .expect("scheme-less input must upgrade to https");
-    assert!(
-        canon.starts_with("https://"),
-        "scheme-less input must canonicalise to https://, got {canon:?}"
-    );
+    assert!(canon.matches("https://example.com/hook"));
 }
 
 #[test]
@@ -73,7 +70,7 @@ fn validate_url_accepts_explicit_http_in_plaintext_registry() {
     let canon = reg
         .validate_url("http://localhost:8080/hook")
         .expect("http:// must be accepted when plaintext was opted in");
-    assert!(canon.starts_with("http://"));
+    assert!(canon.matches("http://localhost:8080/hook"));
 }
 
 /// Schemes that MUST be refused by both the strict registry AND the
@@ -158,7 +155,11 @@ fn register_duplicate_name_is_rejected() {
     // `replace` MUST overwrite without error.
     reg.replace("notify", "https://example.com/b", HashMap::new())
         .expect("replace must succeed where register would refuse");
-    assert_eq!(reg.get("notify").unwrap().url, "https://example.com/b");
+    assert!(reg
+        .get("notify")
+        .unwrap()
+        .url
+        .matches("https://example.com/b"));
 }
 
 #[test]
@@ -177,10 +178,16 @@ fn headers_round_trip_byte_exact_including_hostile_values() {
     reg.register("hook", "https://example.com/h", headers.clone())
         .expect("register");
     let got = &reg.get("hook").expect("registered").headers;
-    assert_eq!(
-        got, &headers,
-        "headers must round-trip byte-exact (no normalisation, no mutation)"
-    );
+    for (name, value) in &headers {
+        assert!(
+            got.matches_value(name, value),
+            "header {name} must reach protected storage byte-exact"
+        );
+    }
+    let debug = format!("{got:?}");
+    for value in headers.values() {
+        assert!(!debug.contains(value), "Debug must redact header values");
+    }
 }
 
 #[test]
