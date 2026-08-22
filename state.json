@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1088,
+  "next_display_id": 1089,
   "next_comment_id": 1158,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -994,6 +994,7 @@
     "fb1560f3-c16f-4da2-959b-a528a54ace46": 577,
     "fb1e430f-9423-4e10-9e49-02882a457227": 1009,
     "fb1e9842-2b78-47cf-8320-a029850342c1": 673,
+    "fb2a17c8-d8bc-4d73-8a54-da7f97090f54": 1088,
     "fb8198cd-98ae-43a4-b351-b7e3e9de3004": 29,
     "fbad4f79-3807-444c-8c0f-96a8eaca9403": 858,
     "fc07d641-ce9d-4532-b64e-e5644cbab6d6": 689,
@@ -26812,6 +26813,18 @@
         "qa-review"
       ]
     },
+    "fb2a17c8-d8bc-4d73-8a54-da7f97090f54": {
+      "uuid": "fb2a17c8-d8bc-4d73-8a54-da7f97090f54",
+      "display_id": 1088,
+      "title": "Exit cleanly when stdout consumer closes the pipe",
+      "description": "crosslink issue show panics in std::io::stdio when its stdout is piped to a consumer such as head that exits after a bounded prefix. The command should treat BrokenPipe as a normal early consumer close, exit without a Rust panic/backtrace, and preserve other write failures as explicit errors. Reproduced on issue show for #1083/#1084/#1085/#1086/#1087.",
+      "status": "open",
+      "priority": "low",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T08:49:05.342478120Z",
+      "updated_at": "2026-08-22T08:49:05.342478120Z"
+    },
     "fb8198cd-98ae-43a4-b351-b7e3e9de3004": {
       "uuid": "fb8198cd-98ae-43a4-b351-b7e3e9de3004",
       "display_id": 29,
@@ -31959,11 +31972,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 890,
       "timestamp": "2026-08-22T08:48:39.814594504Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 891,
+      "timestamp": "2026-08-22T08:49:05.342478120Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:48:39.814594504Z",
+    "timestamp": "2026-08-22T08:49:05.342478120Z",
     "agent_id": "6Vw9",
-    "agent_seq": 890
+    "agent_seq": 891
   }
 }
