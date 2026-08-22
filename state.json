@@ -20770,12 +20770,13 @@
       "display_id": 1090,
       "title": "Preserve typed partial outcomes across the ACP tool boundary",
       "description": "ACP execute_local_tool_with_permission currently projects canonical ToolResult to AcpToolResult { content, is_error }. ToolOutcome::Partial therefore becomes is_error=false; execute_tool_via_acp fires PostToolUse instead of PostToolUseFailure, the provider/UI cannot distinguish partial completion, and record_acp_tool_result_observation reconstructs a false legacy success. Preserve the canonical typed result or an exact lossless ACP projection through hook selection, provider continuation, UI display, and grounded-loop evidence. Add nonzero Bash and partial mutation regression tests.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T13:22:49.666859875Z",
-      "updated_at": "2026-08-22T16:44:48.760497199Z",
+      "updated_at": "2026-08-22T16:45:00.042816787Z",
+      "closed_at": "2026-08-22T16:45:00.042815375Z",
       "labels": [
         "remediation"
       ],
@@ -32575,11 +32576,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 940,
       "timestamp": "2026-08-22T16:44:48.760497199Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 941,
+      "timestamp": "2026-08-22T16:45:00.042816787Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T16:44:48.760497199Z",
+    "timestamp": "2026-08-22T16:45:00.042816787Z",
     "agent_id": "6Vw9",
-    "agent_seq": 940
+    "agent_seq": 941
   }
 }
