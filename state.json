@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1173,
+  "next_comment_id": 1174,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9119,7 +9119,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:53:08.818081581Z",
-      "updated_at": "2026-08-22T14:06:45.341133630Z",
+      "updated_at": "2026-08-22T14:08:22.713124186Z",
       "labels": [
         "remediation"
       ],
@@ -9234,6 +9234,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7GjX34aDDiRb3Xq1d4kYHIH2PP9XQwzLswUAfhi5Ti5HkTQqQjjCcN0PS/jxOMgezymTW2V0VBpghNzXvKJ3AQ=="
+        },
+        "a84b7faf-6be2-4ca7-a685-68c722d3bc35": {
+          "display_id": 1173,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit 62d1d6a50b9e91f083da5fe8ece04b468c508946 (feat(memory): bind automatic learning to causal evidence). Verification: Rust 1.98 strict Clippy pass; exact-final native all-feature/all-target suite pass; Windows GNU all-feature/all-target check pass; causal E2E 13/13; automatic-learning evaluation 1/1; retrieval evidence 7/7; formatting and diff checks pass. Signature: dollspace-gay, ED25519 SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A.",
+          "created_at": "2026-08-22T14:08:22.710665508Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqc75Rg55qVn/LcRIQ2pC+Zcpth/RJX/yf8RbqafxNtopUK/g7dq75lseL+t3hwClDZL6yD8gAqd86+bD8n28Cw=="
         },
         "b7098895-98b3-47fe-9776-dde5e79598f5": {
           "display_id": 1168,
@@ -32273,11 +32282,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 915,
       "timestamp": "2026-08-22T14:06:45.341133630Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 916,
+      "timestamp": "2026-08-22T14:08:22.713124186Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T14:06:45.341133630Z",
+    "timestamp": "2026-08-22T14:08:22.713124186Z",
     "agent_id": "6Vw9",
-    "agent_seq": 915
+    "agent_seq": 916
   }
 }
