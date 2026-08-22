@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1179,
+  "next_comment_id": 1180,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14457,7 +14457,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T01:12:28.361756220Z",
-      "updated_at": "2026-08-22T15:01:32.063569402Z",
+      "updated_at": "2026-08-22T15:46:35.429532064Z",
       "labels": [
         "remediation"
       ],
@@ -14470,6 +14470,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9ICXVnHkz87W0ZZk4Jza33lANIGgQ4a/BCaUyjJvn8l1IBaoLFA81NO3O1oRedaBf7AI+/+MX/vgH57viAHlAw=="
+        },
+        "2511f16b-45ff-409d-b88b-0bef9d0dd2f9": {
+          "display_id": 1179,
+          "author": "6Vw9",
+          "content": "[action] Final #1081 verification after QA fixes: migration backfill now uses an isolated pre-v7 linear encoder; artifact-bound retrieval evidence regenerated and rejected review rebound; focused 117 tests, evidence 9/9, Rust 1.98 strict Clippy, and Windows GNU all-target check pass; final full matrix running",
+          "created_at": "2026-08-22T15:46:35.425012434Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAawGjJTjQdEY1FrkWlTZBkZJHnOgkc60xj0Ua3CvPl9t3PL9j/Wc9FcIefPDziT8/gdOqj/3x8TxZNBPeyFIcDA=="
         },
         "458667e1-b3f8-410e-b015-353d862e04af": {
           "display_id": 1176,
@@ -32375,11 +32384,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 924,
       "timestamp": "2026-08-22T15:01:32.063569402Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 925,
+      "timestamp": "2026-08-22T15:46:35.429532064Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T15:01:32.063569402Z",
+    "timestamp": "2026-08-22T15:46:35.429532064Z",
     "agent_id": "6Vw9",
-    "agent_seq": 924
+    "agent_seq": 925
   }
 }
