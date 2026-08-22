@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1099,
+  "next_display_id": 1100,
   "next_comment_id": 1238,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -121,6 +121,7 @@
     "1d6ae074-8c12-4ebb-ba0f-a332b0bb53a9": 956,
     "1dfc54e3-2756-418a-ba57-0701319e001d": 590,
     "1e1f9526-d6c4-4477-8297-525d3fabe61f": 153,
+    "1eb2eb0d-fb39-4017-aef8-aa6329f22319": 1099,
     "1ed272be-0a2c-44cc-975d-f650004b7b1c": 113,
     "1ed3dbdb-1b7f-4cf5-8fb0-19d1e2d08819": 371,
     "1ede2198-1849-43a4-96d7-1ec62172ff10": 81,
@@ -4091,6 +4092,17 @@
       "labels": [
         "qa"
       ]
+    },
+    "1eb2eb0d-fb39-4017-aef8-aa6329f22319": {
+      "uuid": "1eb2eb0d-fb39-4017-aef8-aa6329f22319",
+      "display_id": 1099,
+      "title": "Eliminate Windows GNU all-target warning debt",
+      "description": "Rust 1.98 command CARGO_BUILD_JOBS=4 cargo +1.98.0 check --locked --target x86_64-pc-windows-gnu --all-features --all-targets exits 0 but reports cfg-dependent unused imports, dead helpers, and one SecureDirectory.context dead field across library/tests. Add precise cfg gates or structural fixes and make the cross-target gate warning-clean without blanket allows. Discovered during S-044 verification; keep separate from provider-native state contract.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T21:56:43.875839539Z",
+      "updated_at": "2026-08-22T21:56:43.875839539Z"
     },
     "1ed272be-0a2c-44cc-975d-f650004b7b1c": {
       "uuid": "1ed272be-0a2c-44cc-975d-f650004b7b1c",
@@ -33548,11 +33560,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1022,
       "timestamp": "2026-08-22T21:48:50.763332559Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1023,
+      "timestamp": "2026-08-22T21:56:43.875839539Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T21:48:50.763332559Z",
+    "timestamp": "2026-08-22T21:56:43.875839539Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1022
+    "agent_seq": 1023
   }
 }
