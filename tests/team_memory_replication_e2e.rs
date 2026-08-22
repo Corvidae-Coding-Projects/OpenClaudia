@@ -139,13 +139,28 @@ fn assert_scoped_reads(run: &Arc<ToolRunContext>, db: &MemoryDb) {
         db,
         "s104-search-team",
         "memory_search",
-        json!({"query": "causal parents", "limit": 5, "scope": "team"}),
+        json!({
+            "query": "causal parents",
+            "limit": 5,
+            "scope": "team",
+            "context": {
+                "stage": "operate",
+                "paths": ["src/team_memory/replication.rs"],
+                "symbols": ["TeamReplica"]
+            }
+        }),
     );
     assert!(!searched.is_error(), "team search: {}", searched.content());
     let searched = searched.structured().expect("team search result");
     assert_eq!(searched["scope"], "team");
     assert_eq!(searched["status"], "stale");
     assert_eq!(searched["team_freshness"], "unconfigured");
+    assert_eq!(searched["retrieval"]["policy"], "lexical_v1");
+    assert_eq!(
+        searched["retrieval"]["policy_status"],
+        "evidence_rejected_fallback"
+    );
+    assert_eq!(searched["retrieval"]["context"]["stage"], "operate");
     assert_eq!(searched["records"].as_array().expect("records").len(), 1);
     assert!(!searched
         .to_string()

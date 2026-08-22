@@ -607,6 +607,7 @@ pub enum TechnicalLessonQueryStatus {
     Complete,
     NoHit,
     Partial,
+    Stale,
 }
 
 /// Bounded typed retrieval envelope returned by the canonical tool.
@@ -618,6 +619,7 @@ pub struct TechnicalLessonQueryResult {
     pub authority: &'static str,
     pub status: TechnicalLessonQueryStatus,
     pub query: Option<String>,
+    pub retrieval: super::TechnicalRetrievalTrace,
     pub records: Vec<TechnicalLessonRecord>,
     pub omitted_expired: usize,
     pub omitted_conflicted: usize,

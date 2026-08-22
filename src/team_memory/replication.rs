@@ -33,9 +33,9 @@ use crate::memory::{
     LogicalMemoryId, MemoryConflictHead, MemoryDb, MemoryDigest, MemoryRecordScope, MemoryRevision,
     MemoryRevisionState, MemorySourceEvidence, TechnicalLessonCorrectionRequest,
     TechnicalLessonDraft, TechnicalLessonError, TechnicalLessonQueryResult,
-    TechnicalLessonQueryStatus, TechnicalLessonRecord, TechnicalLessonStoreError,
-    WorkspaceMemoryId, MAX_TECHNICAL_QUERY_RESULT_BYTES, TECHNICAL_LESSON_SCHEMA_VERSION,
-    TECHNICAL_LESSON_TAG,
+    TechnicalLessonQueryStatus, TechnicalLessonRecord, TechnicalLessonRetrievalRequest,
+    TechnicalLessonStoreError, WorkspaceMemoryId, MAX_TECHNICAL_QUERY_RESULT_BYTES,
+    TECHNICAL_LESSON_SCHEMA_VERSION, TECHNICAL_LESSON_TAG,
 };
 use crate::persistence::{
     CommitState, FileClass, PersistenceError, PersistentStorage, StorageGeneration,
@@ -313,6 +313,7 @@ pub struct ScopedTechnicalLessonQueryResult {
     pub scope: MemoryScope,
     pub status: ScopedTechnicalLessonQueryStatus,
     pub query: Option<String>,
+    pub retrieval: crate::memory::TechnicalRetrievalTrace,
     pub records: Vec<TechnicalLessonRecord>,
     pub private_status: Option<TechnicalLessonQueryStatus>,
     pub team_freshness: Option<TeamReplicaFreshness>,
@@ -1764,14 +1765,34 @@ impl TeamReplica {
         limit: usize,
         now_unix_seconds: i64,
     ) -> Result<TeamTechnicalLessonQueryResult, TeamReplicationError> {
-        let operation = if query.is_some() {
+        self.retrieve_technical_lessons(
+            &TechnicalLessonRetrievalRequest {
+                query: query.map(str::to_string),
+                context: None,
+                limit,
+            },
+            now_unix_seconds,
+        )
+    }
+
+    /// Query the local team replica with explicit task-conditioned context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed authorization, integrity, persistence, validation, or
+    /// output-budget error when the bounded query cannot complete truthfully.
+    pub fn retrieve_technical_lessons(
+        &self,
+        request: &TechnicalLessonRetrievalRequest,
+        now_unix_seconds: i64,
+    ) -> Result<TeamTechnicalLessonQueryResult, TeamReplicationError> {
+        let operation = if request.query.is_some() {
             TeamMemoryOperation::Search
         } else {
             TeamMemoryOperation::List
         };
         let request_digest = canonical_digest(&LocalQueryRequest {
-            query,
-            limit,
+            request,
             now_unix_seconds,
         })?;
         let permit = self.authorize_local(operation, request_digest)?;
@@ -1787,7 +1808,7 @@ impl TeamReplica {
         }
         let mut result = runtime
             .database
-            .query_technical_lessons(query, limit, now_unix_seconds)
+            .retrieve_technical_lessons(request, now_unix_seconds)
             .map_err(TeamReplicationError::Store)?;
         let conflicts = collect_conflicts(&runtime.database)?;
         result.omitted_conflicted = conflicts.len();
@@ -2003,8 +2024,7 @@ struct LocalSaveRequest<'a> {
 
 #[derive(Serialize)]
 struct LocalQueryRequest<'a> {
-    query: Option<&'a str>,
-    limit: usize,
+    request: &'a TechnicalLessonRetrievalRequest,
     now_unix_seconds: i64,
 }
 
@@ -2306,6 +2326,12 @@ fn bound_team_query_result(
         .result
         .records
         .extend(records.into_iter().take(retained));
+    result.result.retrieval.stale_records_returned = result
+        .result
+        .records
+        .iter()
+        .filter(|record| record.due_for_review)
+        .count();
     ensure_bounded_query_result(result)
 }
 

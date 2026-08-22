@@ -21,6 +21,8 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as 
 mod lesson;
 pub(crate) mod portable;
 mod record;
+mod retrieval;
+mod retrieval_evidence;
 mod review;
 mod source;
 
@@ -46,6 +48,26 @@ pub use record::{
     LogicalMemoryId, MemoryAttribution, MemoryDigest, MemoryProvenance, MemoryRecordError,
     MemoryRecordScope, MemoryRevision, MemoryRevisionState, MemorySourceEvidence, MemorySourceKind,
     MemoryStoreId, MemoryVersion, MEMORY_PROVENANCE_SCHEMA_VERSION,
+};
+pub(crate) use retrieval::rank_technical_lessons;
+pub use retrieval::{
+    TechnicalLessonRetrievalRequest, TechnicalRetrievalContext, TechnicalRetrievalError,
+    TechnicalRetrievalPolicyId, TechnicalRetrievalPolicyStatus, TechnicalRetrievalStage,
+    TechnicalRetrievalTrace, TechnicalSemanticBackendStatus, MAX_RETRIEVAL_CANDIDATES_SCANNED,
+    MAX_RETRIEVAL_CONTEXT_ITEMS, MAX_RETRIEVAL_CONTEXT_ITEM_BYTES,
+    MAX_RETRIEVAL_CONTEXT_TOTAL_ITEMS, MAX_RETRIEVAL_QUERY_TERMS,
+    TECHNICAL_RETRIEVAL_SCHEMA_VERSION,
+};
+pub use retrieval_evidence::{
+    build_technical_retrieval_evaluation, evaluate_technical_retrieval_corpus,
+    RetrievalCaseOutcomeReceipt, RetrievalCitationVerificationReceipt, RetrievalCorpusLesson,
+    RetrievalCorpusSplit, RetrievalEvaluationBudgets, RetrievalEvaluationCase,
+    RetrievalEvaluationMetrics, RetrievalExpectedState, RetrievalFixtureState,
+    RetrievalInjectedFailure, RetrievalMechanism, RetrievalMechanismAssessment,
+    RetrievalMechanismStatus, RetrievalPolicyReport, RetrievalReviewDimension,
+    RetrievalReviewVerdict, RetrievalTrialReceipt, TechnicalRetrievalCorpus,
+    TechnicalRetrievalEvaluation, TechnicalRetrievalEvidenceBundle, TechnicalRetrievalEvidenceCode,
+    TechnicalRetrievalEvidenceError, TechnicalRetrievalReview,
 };
 pub(crate) use review::TechnicalLessonReviewRequest;
 pub use review::{
@@ -113,7 +135,6 @@ const MAX_TECHNICAL_REVISION_TAGS_BYTES: usize = 1_024;
 const MAX_TECHNICAL_PROVENANCE_BYTES: usize = 4 * 1_024;
 /// Querying does not materialize the entire maximum-sized store. A partial
 /// result explicitly reports when newer records exhausted either scan budget.
-const MAX_TECHNICAL_QUERY_SCAN_RECORDS: usize = 512;
 const MAX_TECHNICAL_QUERY_SCAN_BYTES: usize = 4 * 1_024 * 1_024;
 
 /// Short-term memory expiration (hours)
@@ -332,7 +353,8 @@ struct ValidatedTechnicalLessonQuery {
 }
 
 struct TechnicalLessonCandidates {
-    ranked: Vec<(usize, TechnicalLessonRecord)>,
+    records: Vec<TechnicalLessonRecord>,
+    scanned: usize,
     omitted_expired: usize,
     omitted_conflicted: usize,
     truncated_by_budget: bool,
@@ -3521,10 +3543,33 @@ impl MemoryDb {
         limit: usize,
         now_unix_seconds: i64,
     ) -> Result<TechnicalLessonQueryResult> {
+        self.retrieve_technical_lessons(
+            &TechnicalLessonRetrievalRequest {
+                query: query.map(str::to_string),
+                context: None,
+                limit,
+            },
+            now_unix_seconds,
+        )
+    }
+
+    /// Retrieve bounded typed lessons using explicit task context supplied by
+    /// the current memory tool call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query/context bounds, corrupt tagged
+    /// records, workspace/provenance mismatch, oversized stores, or database
+    /// failures.
+    pub fn retrieve_technical_lessons(
+        &self,
+        request: &TechnicalLessonRetrievalRequest,
+        now_unix_seconds: i64,
+    ) -> Result<TechnicalLessonQueryResult> {
         const MAX_RESULT_COUNT: usize = 20;
 
         anyhow::ensure!(
-            (1..=MAX_RESULT_COUNT).contains(&limit),
+            (1..=MAX_RESULT_COUNT).contains(&request.limit),
             "technical lesson result limit must be between 1 and {MAX_RESULT_COUNT}"
         );
         anyhow::ensure!(
@@ -3536,34 +3581,38 @@ impl MemoryDb {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("technical lessons require a workspace-bound store"))?;
         let authority_scope = self.technical_authority_scope()?;
-        let query = Self::validate_technical_lesson_query(query)?;
-        let mut candidates = self.collect_technical_lesson_candidates(
+        let query = Self::validate_technical_lesson_query(request.query.as_deref())?;
+        let context = request
+            .context
+            .clone()
+            .map(TechnicalRetrievalContext::canonicalize)
+            .transpose()?;
+        let (policy, policy_status) =
+            retrieval_evidence::runtime_policy_selection(context.is_some());
+        let candidates = self.collect_technical_lesson_candidates(
             &workspace_id,
             authority_scope,
-            &query.terms,
             now_unix_seconds,
         )?;
-        candidates
-            .ranked
-            .sort_by(|(left_score, left), (right_score, right)| {
-                right_score
-                    .cmp(left_score)
-                    .then_with(|| {
-                        right
-                            .lesson
-                            .captured_at_unix_seconds
-                            .cmp(&left.lesson.captured_at_unix_seconds)
-                    })
-                    .then_with(|| right.version.cmp(&left.version))
-                    .then_with(|| left.logical_id.cmp(&right.logical_id))
-            });
-        let truncated = candidates.ranked.len() > limit;
-        let records = candidates
-            .ranked
+        let candidates_scanned = candidates.scanned;
+        let ranked = retrieval::rank_technical_lessons(
+            candidates.records,
+            query.normalized.as_deref(),
+            &query.terms,
+            context.as_ref(),
+            policy,
+        );
+        let candidates_matched = ranked.len();
+        let truncated = ranked.len() > request.limit;
+        let records = ranked
             .into_iter()
-            .take(limit)
-            .map(|(_, record)| record)
+            .take(request.limit)
+            .map(|ranked| ranked.record)
             .collect::<Vec<_>>();
+        let stale_records_returned = records
+            .iter()
+            .filter(|record| record.due_for_review)
+            .count();
         let status = if truncated
             || candidates.truncated_by_budget
             || candidates.omitted_expired > 0
@@ -3572,15 +3621,27 @@ impl MemoryDb {
             TechnicalLessonQueryStatus::Partial
         } else if records.is_empty() {
             TechnicalLessonQueryStatus::NoHit
+        } else if stale_records_returned > 0 {
+            TechnicalLessonQueryStatus::Stale
         } else {
             TechnicalLessonQueryStatus::Complete
         };
+        let mut retrieval = TechnicalRetrievalTrace::new(
+            policy,
+            policy_status,
+            TechnicalSemanticBackendStatus::NotConfigured,
+            context,
+        );
+        retrieval.candidates_scanned = candidates_scanned;
+        retrieval.candidates_matched = candidates_matched;
+        retrieval.stale_records_returned = stale_records_returned;
         let mut result = TechnicalLessonQueryResult {
             schema_version: TECHNICAL_LESSON_SCHEMA_VERSION,
             workspace_id,
             authority: "untrusted_reference_evidence",
             status,
             query: query.normalized,
+            retrieval,
             records,
             omitted_expired: candidates.omitted_expired,
             omitted_conflicted: candidates.omitted_conflicted,
@@ -3594,6 +3655,11 @@ impl MemoryDb {
             result.status = TechnicalLessonQueryStatus::Partial;
             result.truncated_by_budget = true;
         }
+        result.retrieval.stale_records_returned = result
+            .records
+            .iter()
+            .filter(|record| record.due_for_review)
+            .count();
         Ok(result)
     }
 
@@ -3601,8 +3667,6 @@ impl MemoryDb {
         query: Option<&str>,
     ) -> Result<ValidatedTechnicalLessonQuery> {
         const MAX_QUERY_BYTES: usize = 512;
-        const MAX_QUERY_TERMS: usize = 16;
-
         let normalized = query
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -3625,7 +3689,7 @@ impl MemoryDb {
                     .map(str::to_lowercase)
                     .collect::<Vec<_>>();
                 anyhow::ensure!(
-                    terms.len() <= MAX_QUERY_TERMS,
+                    terms.len() <= MAX_RETRIEVAL_QUERY_TERMS,
                     "technical lesson query has too many terms"
                 );
                 Ok::<_, anyhow::Error>(terms)
@@ -3639,14 +3703,12 @@ impl MemoryDb {
         &self,
         workspace_id: &WorkspaceMemoryId,
         authority_scope: MemoryRecordScope,
-        query_terms: &[String],
         now_unix_seconds: i64,
     ) -> Result<TechnicalLessonCandidates> {
         Self::collect_technical_lesson_candidates_on(
             &*self.lock_conn()?,
             workspace_id,
             authority_scope,
-            query_terms,
             now_unix_seconds,
         )
     }
@@ -3655,23 +3717,24 @@ impl MemoryDb {
         conn: &Connection,
         workspace_id: &WorkspaceMemoryId,
         authority_scope: MemoryRecordScope,
-        query_terms: &[String],
         now_unix_seconds: i64,
     ) -> Result<TechnicalLessonCandidates> {
         let rows = Self::memory_search_by_tag_on(
             conn,
             TECHNICAL_LESSON_TAG,
-            MAX_TECHNICAL_QUERY_SCAN_RECORDS + 1,
+            MAX_RETRIEVAL_CANDIDATES_SCANNED + 1,
         )?;
-        let row_budget_exhausted = rows.len() > MAX_TECHNICAL_QUERY_SCAN_RECORDS;
+        let row_budget_exhausted = rows.len() > MAX_RETRIEVAL_CANDIDATES_SCANNED;
         let mut result = TechnicalLessonCandidates {
-            ranked: Vec::with_capacity(rows.len().min(MAX_TECHNICAL_QUERY_SCAN_RECORDS)),
+            records: Vec::with_capacity(rows.len().min(MAX_RETRIEVAL_CANDIDATES_SCANNED)),
+            scanned: 0,
             omitted_expired: 0,
             omitted_conflicted: 0,
             truncated_by_budget: row_budget_exhausted,
         };
         let mut scanned_bytes = 0_usize;
-        for row in rows.into_iter().take(MAX_TECHNICAL_QUERY_SCAN_RECORDS) {
+        for row in rows.into_iter().take(MAX_RETRIEVAL_CANDIDATES_SCANNED) {
+            result.scanned = result.scanned.saturating_add(1);
             anyhow::ensure!(
                 row.content.len() <= MAX_TECHNICAL_LESSON_BYTES,
                 "technical lesson exceeds its record byte budget"
@@ -3694,32 +3757,17 @@ impl MemoryDb {
                 result.omitted_conflicted += 1;
                 continue;
             }
-            let projection = lesson.search_projection().to_lowercase();
-            let score = if query_terms.is_empty() {
-                1
-            } else {
-                query_terms
-                    .iter()
-                    .filter(|term| projection.contains(term.as_str()))
-                    .count()
-            };
-            if score > 0 {
-                result.ranked.push((
-                    score,
-                    TechnicalLessonRecord {
-                        logical_id: row.logical_id,
-                        version: row.version,
-                        record_digest: row.record_digest,
-                        scope: row.provenance.scope,
-                        provenance: row.provenance,
-                        conflicted: false,
-                        due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
-                        effectively_host_reviewed: lesson
-                            .is_effectively_host_reviewed_at(now_unix_seconds),
-                        lesson,
-                    },
-                ));
-            }
+            result.records.push(TechnicalLessonRecord {
+                logical_id: row.logical_id,
+                version: row.version,
+                record_digest: row.record_digest,
+                scope: row.provenance.scope,
+                provenance: row.provenance,
+                conflicted: false,
+                due_for_review: lesson.is_due_for_review_at(now_unix_seconds),
+                effectively_host_reviewed: lesson.is_effectively_host_reviewed_at(now_unix_seconds),
+                lesson,
+            });
         }
         Ok(result)
     }
