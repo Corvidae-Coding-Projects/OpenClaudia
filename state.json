@@ -1,6 +1,6 @@
 {
   "next_display_id": 1090,
-  "next_comment_id": 1159,
+  "next_comment_id": 1160,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9118,10 +9118,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T08:53:08.818081581Z",
-      "updated_at": "2026-08-22T08:53:13.284477488Z",
+      "updated_at": "2026-08-22T08:53:22.822139395Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "54b183e7-12d8-4889-b4ad-445b32c2c666": {
+          "display_id": 1159,
+          "author": "6Vw9",
+          "content": "Architectural preflight: establish one evidence-to-proposal pipeline over canonical run/task/tool receipts; persist observations separately from inferred technical lessons; require typed evidence gates or host review; keep all learned content repository-scoped, cited, bounded, untrusted, and explicitly retrievable by memory tools. Compare this against patching legacy AutoLearner callbacks before editing.",
+          "created_at": "2026-08-22T08:53:22.819698677Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqd0uVndnftdq5Feb8UNAIABqOTbzan+z8eQu8KRsN+Z9yJDmBzOIKqHJX1+iKyrJCr2u4Y6N2Gh3FakArKO3Ag=="
+        }
+      }
     },
     "552ec323-8483-4b53-b9b8-44cc9c90c336": {
       "uuid": "552ec323-8483-4b53-b9b8-44cc9c90c336",
@@ -32026,11 +32037,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 895,
       "timestamp": "2026-08-22T08:53:18.210478087Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 896,
+      "timestamp": "2026-08-22T08:53:22.822139395Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:53:18.210478087Z",
+    "timestamp": "2026-08-22T08:53:22.822139395Z",
     "agent_id": "6Vw9",
-    "agent_seq": 895
+    "agent_seq": 896
   }
 }
