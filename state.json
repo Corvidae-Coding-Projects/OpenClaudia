@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1089,
+  "next_display_id": 1090,
   "next_comment_id": 1159,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -321,6 +321,7 @@
     "520463dd-a97d-4333-b04d-1a1da6a66d17": 411,
     "539c2e9e-58f3-4cef-bcf2-f2398d2f6201": 923,
     "54381422-378f-4c1c-b599-e2ce011bf718": 100,
+    "544b8c7c-d9ee-4ef3-a1ec-8254387161a3": 1089,
     "552ec323-8483-4b53-b9b8-44cc9c90c336": 56,
     "55fca4e0-969b-4eca-8524-92dbc31ea3d6": 191,
     "5675befc-7757-40a9-b973-e287d6266c86": 176,
@@ -9102,6 +9103,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "544b8c7c-d9ee-4ef3-a1ec-8254387161a3": {
+      "uuid": "544b8c7c-d9ee-4ef3-a1ec-8254387161a3",
+      "display_id": 1089,
+      "title": "S-055: Rebuild automatic learning around causal technical evidence",
+      "description": "Implement docs/remediation-slices/055-evidence-bound-automatic-learning.md. Replace legacy prose/keyword auto-learning with an explicit canonical consumer of typed user/tool/task/run evidence that proposes repository-scoped technical lessons with exact provenance, citations, review/expiry/contradiction lifecycle, privacy and retention policy, bounded diagnostics, and observable partial/degraded outcomes across supported frontends. Preserve intended learning behavior by wiring it; never harvest transcripts or treat repeated prose as truth.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-22T08:53:08.818081581Z",
+      "updated_at": "2026-08-22T08:53:08.818081581Z"
     },
     "552ec323-8483-4b53-b9b8-44cc9c90c336": {
       "uuid": "552ec323-8483-4b53-b9b8-44cc9c90c336",
@@ -31991,11 +32004,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 892,
       "timestamp": "2026-08-22T08:49:28.764363968Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 893,
+      "timestamp": "2026-08-22T08:53:08.818081581Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T08:49:28.764363968Z",
+    "timestamp": "2026-08-22T08:53:08.818081581Z",
     "agent_id": "6Vw9",
-    "agent_seq": 892
+    "agent_seq": 893
   }
 }
