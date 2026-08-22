@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1190,
+  "next_comment_id": 1191,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20775,7 +20775,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T13:22:49.666859875Z",
-      "updated_at": "2026-08-22T16:44:25.471811401Z",
+      "updated_at": "2026-08-22T16:44:44.820898803Z",
       "labels": [
         "remediation"
       ],
@@ -20815,6 +20815,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA3Wq12URPBQ9leo1EwK3/aiziG+/GL0HMl94KABLHzvKrisjRij3vGHnrR79AEn6nmSp/g/fHXsQd6dRK13b3Ag=="
+        },
+        "f17fc8c7-d85c-4fc5-8d60-e2f93db4b43c": {
+          "display_id": 1190,
+          "author": "6Vw9",
+          "content": "Remove the lossy ACP-only content/is_error projection because it misclassified partial execution. Carry canonical ToolResult through dispatch, restore the exact provider invocation after local alias normalization, derive post-hook routing/provider/UI/ledger projections from that single value, and prove the boundary with typed malformed-input, nonzero Bash, and effectful partial-mutation tests. Leave broader ACP session and transport work to their existing slices.",
+          "created_at": "2026-08-22T16:44:44.818361672Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxIL8wlWZwU8Zthp474pPkGxRmwKyQ6A4HNY8QGX+YzqlMM8YysaFZnTqSqSmozAwJgR1YObvMo7W6hO/icURCQ=="
         },
         "f8fd5385-a6d2-4a07-afd3-7681fa3134c0": {
           "display_id": 1189,
@@ -32547,11 +32556,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 938,
       "timestamp": "2026-08-22T16:44:25.471811401Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 939,
+      "timestamp": "2026-08-22T16:44:44.820898803Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T16:44:25.471811401Z",
+    "timestamp": "2026-08-22T16:44:44.820898803Z",
     "agent_id": "6Vw9",
-    "agent_seq": 938
+    "agent_seq": 939
   }
 }
