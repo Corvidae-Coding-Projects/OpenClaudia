@@ -15174,11 +15174,12 @@
       "display_id": 1093,
       "title": "Make the ACP automatic-learning citation test full-suite deterministic",
       "description": "PR #66 Linux runner fails acp::session_mode_tests::acp_automatic_learning_citations_bind_provider_call_ids only in the complete serialized all-feature suite: expected one technical lesson but observed zero. Reproduce under runner order, identify shared-state or lifecycle cause, and fix production/test isolation without weakening citation assertions.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T17:47:46.977597406Z",
-      "updated_at": "2026-08-22T18:03:54.705192099Z",
+      "updated_at": "2026-08-22T18:04:01.637604752Z",
+      "closed_at": "2026-08-22T18:04:01.637600026Z",
       "labels": [
         "ci"
       ],
@@ -32907,11 +32908,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 969,
       "timestamp": "2026-08-22T18:03:54.705192099Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 970,
+      "timestamp": "2026-08-22T18:04:01.637604752Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T18:03:54.705192099Z",
+    "timestamp": "2026-08-22T18:04:01.637604752Z",
     "agent_id": "6Vw9",
-    "agent_seq": 969
+    "agent_seq": 970
   }
 }
