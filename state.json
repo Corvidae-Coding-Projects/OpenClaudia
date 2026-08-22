@@ -1,6 +1,6 @@
 {
   "next_display_id": 1091,
-  "next_comment_id": 1178,
+  "next_comment_id": 1179,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14457,11 +14457,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T01:12:28.361756220Z",
-      "updated_at": "2026-08-22T14:13:44.913979147Z",
+      "updated_at": "2026-08-22T15:01:32.063569402Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "19398f63-9ae3-4aad-ad8a-e759085a1fd1": {
+          "display_id": 1178,
+          "author": "6Vw9",
+          "content": "Implementation checkpoint: typed multi-parent revisions, schema v7, private/team conflict inspection and resolution, ACP/tool routing, and portable branching histories are wired. Skeptical verification found two additional root-cause defects and repaired them: legitimate schema-v6 stores were rejected because preflight queried the v7-only additional-parent column before migration; v6 validation now projects an exact empty legacy parent set and a real v1-to-v6 fixture proves backup plus byte-stable linear migration. Portable validation previously accepted a claimed head without proving it was the sole graph-derived head; it now requires exactly one unsuperseded revision. Focused private resolution (5/5), record graph (11/11), offline team convergence/tombstone resolution (3/3), authority role matrix (1/1), portable E2E (6/6), portable units (5/5), ACP resolution routing (1/1), and strict Rust 1.98 all-feature/all-target Clippy pass.",
+          "created_at": "2026-08-22T15:01:32.060590519Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9ICXVnHkz87W0ZZk4Jza33lANIGgQ4a/BCaUyjJvn8l1IBaoLFA81NO3O1oRedaBf7AI+/+MX/vgH57viAHlAw=="
+        },
         "458667e1-b3f8-410e-b015-353d862e04af": {
           "display_id": 1176,
           "author": "6Vw9",
@@ -32361,11 +32370,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 923,
       "timestamp": "2026-08-22T14:13:44.913979147Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 924,
+      "timestamp": "2026-08-22T15:01:32.063569402Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-22T14:13:44.913979147Z",
+    "timestamp": "2026-08-22T15:01:32.063569402Z",
     "agent_id": "6Vw9",
-    "agent_seq": 923
+    "agent_seq": 924
   }
 }
