@@ -1444,11 +1444,12 @@
       "display_id": 1110,
       "title": "Bind narrow behavioral scope to explicit approved targets",
       "description": "Behavioral Scope::Narrow and Scope::Adjacent remain style guidance because the runtime has no authoritative requested-resource set to compile. Add a typed user/task-approved target set and derive filesystem/tool policy from it; reject ambiguous narrow-scope activation rather than inferring paths from prose. Wire CLI, TUI, resume, and child runs through the generation-bound scope capability, with tests for target escape and transition.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:38.668193082Z",
-      "updated_at": "2026-08-23T12:15:22.087901204Z",
+      "updated_at": "2026-08-23T12:15:26.530490875Z",
+      "closed_at": "2026-08-23T12:15:26.530489357Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
@@ -35621,11 +35622,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1198,
       "timestamp": "2026-08-23T12:15:22.087901204Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1199,
+      "timestamp": "2026-08-23T12:15:26.530490875Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T12:15:22.087901204Z",
+    "timestamp": "2026-08-23T12:15:26.530490875Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1198
+    "agent_seq": 1199
   }
 }
