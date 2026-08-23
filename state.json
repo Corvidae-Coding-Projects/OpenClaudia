@@ -1,6 +1,6 @@
 {
   "next_display_id": 1105,
-  "next_comment_id": 1281,
+  "next_comment_id": 1282,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16782,7 +16782,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T03:46:31.098891631Z",
-      "updated_at": "2026-08-23T03:50:00.615817372Z",
+      "updated_at": "2026-08-23T04:28:07.114865711Z",
       "labels": [
         "remediation"
       ],
@@ -16795,6 +16795,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcl56IDn+DIYsPbdHYc0UoPiiIApqNHaBGp3c8xvKNeIocwAFnWMKcXStxFidPKCtqD8C3Xjro1sx8x3N3aj3Ag=="
+        },
+        "7c5f511e-c5ec-4228-bad6-f5992f9e3a0a": {
+          "display_id": 1281,
+          "author": "6Vw9",
+          "content": "Implemented the S-048 transport boundary across production provider/auth paths: process-shared Rustls client with redirects disabled, explicit system-proxy provenance, connect/read/header/total deadlines, endpoint validation with local-provider identity preserved, bounded JSON/credential reads, and raw pre-parser stream byte caps. Pipeline retries retain the established 10-retry compatibility ceiling but now share a 60s monotonic window, cap Retry-After at 15s, and only replay model POSTs on explicit pre-admission statuses or connection-stage failure. VDD adversary/builder/verifier traffic now uses the same endpoint/send/body policy and one configured absolute deadline. Focused evidence: strict Rust 1.98 all-target/all-feature Clippy green; provider_transport 7/7, proxy 48/48, pipeline integration 16/16, VDD transport 5/5, Claude credentials 25/25, OAuth 28/28.",
+          "created_at": "2026-08-23T04:28:07.111526339Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2YuJAzX3X/TteC1uKG2ow4NIAHomYtAlQU/fjNTGcv4wJt7RMcCvp9DeXkbYG1zG4Je8uo0QURLSTypK1+vBAQ=="
         },
         "a63d5a01-438e-48a3-be4e-d499a81d6c93": {
           "display_id": 1280,
@@ -34390,11 +34399,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1092,
       "timestamp": "2026-08-23T03:50:00.615817372Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1093,
+      "timestamp": "2026-08-23T04:28:07.114865711Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T03:50:00.615817372Z",
+    "timestamp": "2026-08-23T04:28:07.114865711Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1092
+    "agent_seq": 1093
   }
 }
