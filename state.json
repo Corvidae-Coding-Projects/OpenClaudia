@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1110,
+  "next_display_id": 1111,
   "next_comment_id": 1318,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -20,6 +20,7 @@
     "03ac3f85-0c2e-438b-90b5-2bde35252c37": 248,
     "03bbd045-3892-4f31-a58c-502efbb1feb6": 119,
     "04384912-2a3d-471a-8ccb-50a372833a6f": 127,
+    "043f7401-aebe-4cf3-ad6a-8a34576034db": 1110,
     "04a1506d-8eef-47d7-8dc9-3e31fa5fefba": 598,
     "0507ef75-b69b-4555-94e0-ca265adb4ff0": 332,
     "050b750d-c346-4214-8287-088d2e80041e": 202,
@@ -1434,6 +1435,17 @@
       "labels": [
         "qa"
       ]
+    },
+    "043f7401-aebe-4cf3-ad6a-8a34576034db": {
+      "uuid": "043f7401-aebe-4cf3-ad6a-8a34576034db",
+      "display_id": 1110,
+      "title": "Bind narrow behavioral scope to explicit approved targets",
+      "description": "Behavioral Scope::Narrow and Scope::Adjacent remain style guidance because the runtime has no authoritative requested-resource set to compile. Add a typed user/task-approved target set and derive filesystem/tool policy from it; reject ambiguous narrow-scope activation rather than inferring paths from prose. Wire CLI, TUI, resume, and child runs through the generation-bound scope capability, with tests for target escape and transition.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T09:58:38.668193082Z",
+      "updated_at": "2026-08-23T09:58:38.668193082Z"
     },
     "04a1506d-8eef-47d7-8dc9-3e31fa5fefba": {
       "uuid": "04a1506d-8eef-47d7-8dc9-3e31fa5fefba",
@@ -35156,11 +35168,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1158,
       "timestamp": "2026-08-23T08:54:21.014672504Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1159,
+      "timestamp": "2026-08-23T09:58:38.668193082Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T08:54:21.014672504Z",
+    "timestamp": "2026-08-23T09:58:38.668193082Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1158
+    "agent_seq": 1159
   }
 }
