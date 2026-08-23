@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1117,
+  "next_display_id": 1118,
   "next_comment_id": 1380,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -972,6 +972,7 @@
     "eef0395e-9c3b-4f33-8be2-09a13ff54730": 147,
     "ef1a32ee-1127-4c6d-b036-f6bf8fc3fd2f": 711,
     "ef1e2d25-11c7-422b-935d-6b4594065a86": 505,
+    "ef6a64a9-fad0-415d-969e-088494abe9e8": 1117,
     "f027c012-1642-4192-94cf-c953933d6243": 237,
     "f077029d-871f-492b-9564-dca726d4bf1e": 886,
     "f0d12bc0-8efa-4a9c-8773-3bcc683dab49": 216,
@@ -28190,6 +28191,18 @@
         }
       }
     },
+    "ef6a64a9-fad0-415d-969e-088494abe9e8": {
+      "uuid": "ef6a64a9-fad0-415d-969e-088494abe9e8",
+      "display_id": 1117,
+      "title": "S-042: Enforce least-privilege sandbox profiles",
+      "description": "Implement docs/remediation-slices/042-least-privilege-sandbox-profiles.md now that S-019 and S-040 are complete. Give document parsing, LSP, repository hooks, Git/worktree, shell, MCP stdio, browser, static-analysis, and quality-gate subprocesses only their declared filesystem, network, environment, device, and child-process authority. Compile protected descriptor roots and profile-specific mounts before spawn; close writable-tree and symlink-swap bypasses without removing intended execution paths. Keep the scope on realistic application behavior, use Rust 1.98.0 with CARGO_BUILD_JOBS=4 and serialized Cargo/tests, and defer unrelated platform perfection.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T15:33:45.737689540Z",
+      "updated_at": "2026-08-23T15:33:45.737689540Z"
+    },
     "f027c012-1642-4192-94cf-c953933d6243": {
       "uuid": "f027c012-1642-4192-94cf-c953933d6243",
       "display_id": 237,
@@ -36409,11 +36422,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1267,
       "timestamp": "2026-08-23T15:32:46.336745437Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1268,
+      "timestamp": "2026-08-23T15:33:45.737689540Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:32:46.336745437Z",
+    "timestamp": "2026-08-23T15:33:45.737689540Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1267
+    "agent_seq": 1268
   }
 }
