@@ -8086,12 +8086,13 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-23T09:59:00.363072401Z",
+      "updated_at": "2026-08-23T09:59:08.372642824Z",
       "labels": [
         "remediation"
       ],
       "related": [
         "043f7401-aebe-4cf3-ad6a-8a34576034db",
+        "7bb5d5db-e5a7-487e-8679-0618d3a1b54b",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
       ],
       "comments": {
@@ -14605,8 +14606,9 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:43.428627970Z",
-      "updated_at": "2026-08-23T09:59:04.426292107Z",
+      "updated_at": "2026-08-23T09:59:08.372642824Z",
       "related": [
+        "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
       ]
     },
@@ -35215,11 +35217,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1163,
       "timestamp": "2026-08-23T09:59:04.426292107Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1164,
+      "timestamp": "2026-08-23T09:59:08.372642824Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T09:59:04.426292107Z",
+    "timestamp": "2026-08-23T09:59:08.372642824Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1163
+    "agent_seq": 1164
   }
 }
