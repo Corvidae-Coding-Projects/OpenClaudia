@@ -1,6 +1,6 @@
 {
   "next_display_id": 1107,
-  "next_comment_id": 1295,
+  "next_comment_id": 1296,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22196,11 +22196,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T04:54:39.590578744Z",
-      "updated_at": "2026-08-23T05:50:08.572217335Z",
+      "updated_at": "2026-08-23T05:51:28.132398747Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "27b1c8ee-cdaf-4c50-8c5a-441c57b32dc1": {
+          "display_id": 1295,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 684a812. Provider success is now a shared typed terminal contract; incomplete streams, truncation, refusal, filtering, malformed/partial tools, cancellation, and loop aborts remain failures across TUI, REPL, print, ACP, child-agent, and VDD paths. Rust 1.98 formatting, build, strict Clippy, focused negative tests, complete all-feature tests, and diff/security checks pass.",
+          "created_at": "2026-08-23T05:51:28.129915742Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAoZ15Z7mqRYwiHK04FOAp14QkktAYzdwNFS1ML2SfOLqtyGbAGeW1+h+bGGEa1qr0YhzxCN6biUiPchnUdvTlCg=="
+        },
         "8aaa1723-e96d-4795-b61b-9666c59c7bfb": {
           "display_id": 1290,
           "author": "6Vw9",
@@ -34674,11 +34683,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1116,
       "timestamp": "2026-08-23T05:51:14.927385831Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1117,
+      "timestamp": "2026-08-23T05:51:28.132398747Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T05:51:14.927385831Z",
+    "timestamp": "2026-08-23T05:51:28.132398747Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1116
+    "agent_seq": 1117
   }
 }
