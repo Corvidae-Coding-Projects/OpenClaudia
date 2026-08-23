@@ -1,6 +1,6 @@
 {
   "next_display_id": 1113,
-  "next_comment_id": 1319,
+  "next_comment_id": 1320,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28150,7 +28150,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T08:45:03.862099956Z",
-      "updated_at": "2026-08-23T10:01:22.337565899Z",
+      "updated_at": "2026-08-23T10:02:54.586103607Z",
       "labels": [
         "remediation"
       ],
@@ -28178,6 +28178,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1C0REjouu7ydT2U+TiMfUwshUHjyA32ed4CYDpk83MJytCgc+rFF4PAhJLYj8H3+I9m8hydOT/iakaVKZCQdAA=="
+        },
+        "8f459f31-8f23-4197-9853-5afb83397652": {
+          "display_id": 1319,
+          "author": "6Vw9",
+          "content": "[action] S-014 core complete and in final Rust 1.98 verification: generation-bound Standard/ReadOnly/Plan/Coordinator profiles enforce catalog and dispatch across CLI/TUI/ACP/proxy/resume; exact pinned plan write and direct-shortcut gates are wired. Full-suite regressions found and fixed at cause (Standard-mode gate ordering; model-facing plan description contract). Follow-ups #1110 narrow scope targets, #1111 TUI typed plan follow-ups, #1112 in-flight background revocation are tracked.",
+          "created_at": "2026-08-23T10:02:54.581889907Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAn77PsYctZFQ7kgkIZmojEuZSEMrVp8vNoyNsesyV9O5T155j4af552rZ23QSbZMZ4/33QWo+92+Vh1EjwE6UAg=="
         },
         "eb1e4005-daf8-44bd-911b-d3cd570b3f9a": {
           "display_id": 1316,
@@ -35269,11 +35278,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1168,
       "timestamp": "2026-08-23T10:01:26.529298042Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1169,
+      "timestamp": "2026-08-23T10:02:54.586103607Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T10:01:26.529298042Z",
+    "timestamp": "2026-08-23T10:02:54.586103607Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1168
+    "agent_seq": 1169
   }
 }
