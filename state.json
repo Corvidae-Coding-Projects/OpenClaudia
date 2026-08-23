@@ -1,6 +1,6 @@
 {
   "next_display_id": 1102,
-  "next_comment_id": 1255,
+  "next_comment_id": 1256,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25697,7 +25697,18 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T23:44:49.419688674Z",
-      "updated_at": "2026-08-22T23:44:49.419688674Z"
+      "updated_at": "2026-08-23T00:24:57.821170180Z",
+      "comments": {
+        "61dab9dd-34ad-4296-8cac-fd799fb75b23": {
+          "display_id": 1255,
+          "author": "6Vw9",
+          "content": "Commit the verification-policy version bump, explicit exclusion of ignored Crosslink runtime/control-plane state, and adversarial coverage proving tracked Crosslink configuration remains source evidence. Verification: focused ledger and prior failing CLI quality-gate regressions, strict Rust 1.98 Clippy, full all-target suite, Windows GNU check, fuzz gates, repository policy/hygiene, locked metadata, and cargo-deny all pass.",
+          "created_at": "2026-08-23T00:24:57.818096629Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXMhcIkDxIl2SFrpIYDndFc7cPKoZ0N9RpWMT/IYO2IJuVwSCbR2qG5o+cUI4Si9oVlTDk9HRF9b4x+PwnaXNAw=="
+        }
+      }
     },
     "e7eb22d0-91ee-4661-ab75-6e45c813079b": {
       "uuid": "e7eb22d0-91ee-4661-ab75-6e45c813079b",
@@ -33875,11 +33886,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1047,
       "timestamp": "2026-08-23T00:24:53.170798920Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1048,
+      "timestamp": "2026-08-23T00:24:57.821170180Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T00:24:53.170798920Z",
+    "timestamp": "2026-08-23T00:24:57.821170180Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1047
+    "agent_seq": 1048
   }
 }
