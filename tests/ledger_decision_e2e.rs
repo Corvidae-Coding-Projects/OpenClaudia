@@ -378,6 +378,7 @@ struct CachePolicyFixture {
     nested_source: std::path::PathBuf,
     excluded_paths: Vec<std::path::PathBuf>,
     reviewed_seed: std::path::PathBuf,
+    reviewed_crosslink_config: std::path::PathBuf,
 }
 
 fn create_cache_policy_fixture(root: &std::path::Path) -> CachePolicyFixture {
@@ -393,6 +394,12 @@ fn create_cache_policy_fixture(root: &std::path::Path) -> CachePolicyFixture {
     let fuzz_artifact = root.join("fuzz/artifacts/fuzz_path_resolve/crash-input");
     let fuzz_coverage = root.join("fuzz/coverage/report.profraw");
     let discovered_corpus = root.join("fuzz/corpus/fuzz_path_resolve/0123456789abcdef");
+    let crosslink_issue_store = root.join(".crosslink/issues.db");
+    let crosslink_issue_wal = root.join(".crosslink/issues.db-wal");
+    let crosslink_private_key = root.join(".crosslink/keys/test_ed25519");
+    let crosslink_runtime = root.join(".crosslink/runtime/agent-state.json");
+    let crosslink_generated_hook = root.join(".crosslink/integrations/hooks/heartbeat.py");
+    let crosslink_local_rules = root.join(".crosslink/rules.local/project.md");
     for path in [
         &cache,
         &worktree_cache,
@@ -400,6 +407,12 @@ fn create_cache_policy_fixture(root: &std::path::Path) -> CachePolicyFixture {
         &fuzz_artifact,
         &fuzz_coverage,
         &discovered_corpus,
+        &crosslink_issue_store,
+        &crosslink_issue_wal,
+        &crosslink_private_key,
+        &crosslink_runtime,
+        &crosslink_generated_hook,
+        &crosslink_local_rules,
     ] {
         std::fs::create_dir_all(path.parent().expect("fixture path has parent"))
             .expect("create excluded cache parent");
@@ -412,6 +425,8 @@ fn create_cache_policy_fixture(root: &std::path::Path) -> CachePolicyFixture {
         .expect("create sparse oversized fuzz build cache");
     let reviewed_seed = root.join("fuzz/corpus/fuzz_path_resolve/seed-reviewed");
     std::fs::write(&reviewed_seed, b"a").expect("write reviewed corpus seed");
+    let reviewed_crosslink_config = root.join(".crosslink/hook-config.json");
+    std::fs::write(&reviewed_crosslink_config, b"a").expect("write reviewed Crosslink config");
 
     CachePolicyFixture {
         nested_source,
@@ -423,8 +438,15 @@ fn create_cache_policy_fixture(root: &std::path::Path) -> CachePolicyFixture {
             fuzz_artifact,
             fuzz_coverage,
             discovered_corpus,
+            crosslink_issue_store,
+            crosslink_issue_wal,
+            crosslink_private_key,
+            crosslink_runtime,
+            crosslink_generated_hook,
+            crosslink_local_rules,
         ],
         reviewed_seed,
+        reviewed_crosslink_config,
     }
 }
 
@@ -448,9 +470,9 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     };
     assert_eq!(
         binding.artifacts.dependency_policy,
-        openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV3
+        openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV4
     );
-    assert_eq!(binding.freshness.policy_version, 3);
+    assert_eq!(binding.freshness.policy_version, 4);
     let legacy_policy: openclaudia::ledger::WorkspaceDependencyPolicy =
         serde_json::from_str("\"project_source_tree_v1\"")
             .expect("legacy policy tag remains deserializable");
@@ -464,6 +486,13 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
     assert_eq!(
         prior_policy,
         openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV2
+    );
+    let previous_policy: openclaudia::ledger::WorkspaceDependencyPolicy =
+        serde_json::from_str("\"project_source_tree_v3\"")
+            .expect("previous policy tag remains deserializable");
+    assert_eq!(
+        previous_policy,
+        openclaudia::ledger::WorkspaceDependencyPolicy::ProjectSourceTreeV3
     );
     assert_eq!(
         binding.freshness.import_generation,
@@ -483,6 +512,22 @@ fn excluded_runtime_and_build_cache_changes_preserve_versioned_verification() {
         &run,
     )
     .expect("explicit runtime/build-cache exclusions must not stale source verification");
+
+    std::fs::write(&fixture.reviewed_crosslink_config, b"b")
+        .expect("change reviewed Crosslink config byte");
+    let denial = validate_decision(
+        &verification_decision("cache-policy-check", verification),
+        &ledger,
+        &run,
+    )
+    .expect_err("versioned Crosslink config must remain covered");
+    assert!(
+        denial.reason().contains("artifact set changed"),
+        "unexpected denial: {}",
+        denial.reason()
+    );
+    std::fs::write(&fixture.reviewed_crosslink_config, b"a")
+        .expect("restore reviewed Crosslink config byte");
 
     std::fs::write(&fixture.reviewed_seed, b"b").expect("change reviewed corpus seed byte");
     let denial = validate_decision(
