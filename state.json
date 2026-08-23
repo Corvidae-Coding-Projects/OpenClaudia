@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1111,
+  "next_display_id": 1112,
   "next_comment_id": 1318,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -494,6 +494,7 @@
     "7ace8980-ed9d-4732-8114-ddc6e6778fa4": 744,
     "7b7677f6-2896-4c57-bc57-cd7566fff977": 493,
     "7ba08817-664f-47bb-b216-76a0abf734e4": 1046,
+    "7bb5d5db-e5a7-487e-8679-0618d3a1b54b": 1111,
     "7c18165c-0dbd-455e-b0c3-a4cfd6efa312": 157,
     "7c1b3042-c65c-4d05-a17f-e558fd443e87": 802,
     "7c758d3a-5b3a-4238-ac7f-d42dc6f7cc29": 729,
@@ -14589,6 +14590,17 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQqWbslY3QDIxGcZhfI1kQhBzWdMCLsOVGAJviRk6xLKaMPM84ducUqUA63CuM/w5OwHKRTLCqF0DvVM1nvrsDA=="
         }
       }
+    },
+    "7bb5d5db-e5a7-487e-8679-0618d3a1b54b": {
+      "uuid": "7bb5d5db-e5a7-487e-8679-0618d3a1b54b",
+      "display_id": 1111,
+      "title": "Complete typed plan-mode follow-ups in the full-screen TUI",
+      "description": "The full-screen TUI currently cancels pending EnterPlanMode and ExitPlanMode ToolFollowUp values as unsupported. Add a typed UI handshake that routes model-requested entry through the canonical pinned-plan transition and model-requested exit through explicit digest/version-bound user approval, restoring runtime capabilities atomically. Keep direct user /mode cancellation distinct from plan approval and test both paths end to end.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T09:58:43.428627970Z",
+      "updated_at": "2026-08-23T09:58:43.428627970Z"
     },
     "7c18165c-0dbd-455e-b0c3-a4cfd6efa312": {
       "uuid": "7c18165c-0dbd-455e-b0c3-a4cfd6efa312",
@@ -35173,11 +35185,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1159,
       "timestamp": "2026-08-23T09:58:38.668193082Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1160,
+      "timestamp": "2026-08-23T09:58:43.428627970Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T09:58:38.668193082Z",
+    "timestamp": "2026-08-23T09:58:43.428627970Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1159
+    "agent_seq": 1160
   }
 }
