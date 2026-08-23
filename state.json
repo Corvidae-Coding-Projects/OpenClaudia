@@ -1,6 +1,6 @@
 {
   "next_display_id": 1121,
-  "next_comment_id": 1406,
+  "next_comment_id": 1407,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16235,11 +16235,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T20:55:04.838797192Z",
-      "updated_at": "2026-08-23T20:55:44.192725600Z",
+      "updated_at": "2026-08-23T20:55:48.447054291Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "54014f0f-7d54-4bea-8374-09e782c2048a": {
+          "display_id": 1406,
+          "author": "6Vw9",
+          "content": "[action] Starting S-015 preflight: inventory canonical skill discovery, trust decisions, runtime activation, frontend consumers, and tests before choosing the minimal complete capability design.",
+          "created_at": "2026-08-23T20:55:48.444511539Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJFsODBAXhJjpWiVyhk+maA+CYjj8q2h07uxkVRo9TuEBr9tuJ/vUFvf4uIBB3pieQqDdLPbPfjHksDj7qHonBw=="
+        },
         "b6feca90-293d-4af4-b465-e84063eb541c": {
           "display_id": 1405,
           "author": "6Vw9",
@@ -36960,11 +36969,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1314,
       "timestamp": "2026-08-23T20:55:44.192725600Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1315,
+      "timestamp": "2026-08-23T20:55:48.447054291Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T20:55:44.192725600Z",
+    "timestamp": "2026-08-23T20:55:48.447054291Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1314
+    "agent_seq": 1315
   }
 }
