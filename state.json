@@ -1,6 +1,6 @@
 {
   "next_display_id": 1121,
-  "next_comment_id": 1416,
+  "next_comment_id": 1417,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16231,12 +16231,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T20:55:04.838797192Z",
-      "updated_at": "2026-08-23T22:35:06.189857382Z",
+      "updated_at": "2026-08-23T22:35:21.295937633Z",
       "closed_at": "2026-08-23T22:35:06.189851858Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "069dd09d-1bd6-4fb0-bbe1-ba534cc851b6": {
+          "display_id": 1416,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 6ad3c4c1: exact-run, provenance-aware skill discovery and host trust; one-turn capability intersection; shared CLI/REPL/TUI/prompt/tool/hook wiring; revocation, collision, freshness, containment, provider, and artifact evidence. Rust 1.98 full tests, strict Clippy, Windows GNU check, repository policy/hygiene, root/fuzz dependency policy, and diff checks all passed.",
+          "created_at": "2026-08-23T22:35:21.293522513Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABACQt3jy0ZANWd4jUHO9C91j/Q7LmkJbypvuu0fDKSDKJGMX7EAonOxcppwoTza9WqVkC+bpMpZ/kFagcPh03vDg=="
+        },
         "1f645d61-7c0b-402f-9316-7c6c1dbf3978": {
           "display_id": 1415,
           "author": "6Vw9",
@@ -37120,11 +37129,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1328,
       "timestamp": "2026-08-23T22:35:10.391482557Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1329,
+      "timestamp": "2026-08-23T22:35:21.295937633Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T22:35:10.391482557Z",
+    "timestamp": "2026-08-23T22:35:21.295937633Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1328
+    "agent_seq": 1329
   }
 }
