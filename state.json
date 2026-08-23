@@ -1,6 +1,6 @@
 {
   "next_display_id": 1105,
-  "next_comment_id": 1285,
+  "next_comment_id": 1286,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22189,7 +22189,18 @@
       "priority": "high",
       "created_by": "lOrm",
       "created_at": "2026-05-18T21:49:30.653707361Z",
-      "updated_at": "2026-05-18T21:49:30.653707361Z"
+      "updated_at": "2026-08-23T04:52:04.355928984Z",
+      "comments": {
+        "7d722716-f418-4362-9547-960ffd0ef0c8": {
+          "display_id": 1285,
+          "author": "6Vw9",
+          "content": "Resolved by commit 3117fd9. Every production provider SSE path now wraps the raw reqwest byte stream in provider_transport::bounded_byte_stream before eventsource or custom framing. The aggregate cap is enforced before a never-terminated frame can grow parser memory without bound, and bounded_stream_rejects_an_unterminated_oversized_frame proves the exact hostile shape. This supersedes the proposed parser-local BytesMut fix with one central pre-parser invariant.",
+          "created_at": "2026-08-23T04:52:04.353453109Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAjarFfMr5vHOUFu5EU1Tn9fclr5+iix3mZB2GjVKRD3c7coM8NgIQDgPf8glcnO3URtzUj6Li5K2922B+kje7Dg=="
+        }
+      }
     },
     "c16f0cbc-19e6-4406-99b8-98a725d8a8fb": {
       "uuid": "c16f0cbc-19e6-4406-99b8-98a725d8a8fb",
@@ -34446,11 +34457,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1096,
       "timestamp": "2026-08-23T04:51:46.556941938Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1097,
+      "timestamp": "2026-08-23T04:52:04.355928984Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T04:51:46.556941938Z",
+    "timestamp": "2026-08-23T04:52:04.355928984Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1096
+    "agent_seq": 1097
   }
 }
