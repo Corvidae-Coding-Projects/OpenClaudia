@@ -22185,11 +22185,12 @@
       "display_id": 1000,
       "title": "SSE buffer can grow unbounded when upstream never emits newlines",
       "description": "## Severity\nCritical\n## Dimension\nsecurity\n## Location\nsrc/pipeline.rs:516-543\n## Violation\nThe SSE parsing loop in `stream_sse_response` accumulates upstream bytes into an unbounded `String` until a `\\n` is found. A hostile or broken upstream that streams large payloads without `\\n` (or a single very long SSE event) will inflate `buffer` until the process OOMs. The only timeout (`last_data_time.elapsed()`) is reset by every byte received, so a 1 MiB/s newline-free stream is welcomed.\n\n```rust\nlet mut buffer = String::new();\n...\nbuffer.push_str(&String::from_utf8_lossy(&chunk));\nwhile let Some(line_end) = buffer.find('\\n') {\n```\n## Mandated refactor\nIntroduce `MAX_SSE_LINE_BYTES` and `MAX_SSE_BUFFER_BYTES` constants; abort the stream and emit `AppEvent::ApiError` when either is exceeded. Switch to `BytesMut` and `memchr` over raw bytes to avoid the per-chunk UTF-8 round-trip. Track total bytes against an absolute ceiling separate from the inactivity timeout.\n## Filed from QA review dispatch",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "lOrm",
       "created_at": "2026-05-18T21:49:30.653707361Z",
-      "updated_at": "2026-08-23T04:52:04.355928984Z",
+      "updated_at": "2026-08-23T04:52:08.411490084Z",
+      "closed_at": "2026-08-23T04:52:08.411488682Z",
       "comments": {
         "7d722716-f418-4362-9547-960ffd0ef0c8": {
           "display_id": 1285,
@@ -34462,11 +34463,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1097,
       "timestamp": "2026-08-23T04:52:04.355928984Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1098,
+      "timestamp": "2026-08-23T04:52:08.411490084Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T04:52:04.355928984Z",
+    "timestamp": "2026-08-23T04:52:08.411490084Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1097
+    "agent_seq": 1098
   }
 }
