@@ -1,6 +1,6 @@
 {
   "next_display_id": 1116,
-  "next_comment_id": 1371,
+  "next_comment_id": 1372,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17243,7 +17243,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T14:22:39.418758535Z",
-      "updated_at": "2026-08-23T14:37:10.664690733Z",
+      "updated_at": "2026-08-23T15:01:13.802220290Z",
       "labels": [
         "remediation"
       ],
@@ -17256,6 +17256,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxfosW7B/3bLncK4mvgrjTytibvTzLPX5P0p1HH0vrmFZDtFUM0FN+7IOulc42mNHz/EgnG2ilsbYgJYi54W7DA=="
+        },
+        "54442e36-ae60-47bc-a59d-e29987cf743c": {
+          "display_id": 1371,
+          "author": "6Vw9",
+          "content": "Implemented the practical S-041 job lifecycle: full UUID/generation-bound persisted records, ordered fixed-byte stdout/stderr events under a 2 MiB cap, 256 KiB cursor pages with non-destructive replay, finite background deadlines, typed exit/kill/timeout/cancel/delivery-failed/lost states, run/session/owner isolation, retained post-kill output, process-tree reap, and restart reconciliation without PID reattachment. Focused Bash unit/E2E/schema/effect tests pass; strict Rust 1.98 all-target/all-feature Clippy and Windows GNU cross-target check pass. Final full suite, evidence rebind after final source digest, implementation record, review, and commit remain.",
+          "created_at": "2026-08-23T15:01:13.797210838Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAc3R4CBQSUkAVAu3IZKfUyUjVEBPWJ8axDshqQer+e8gJB9TwhaW8SxSxAsf6v/5jM2WlXJ/k6QrA6r9AQ53uCg=="
         },
         "c669129b-268d-4eab-8c94-9b2696374d7e": {
           "display_id": 1368,
@@ -36228,11 +36237,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1251,
       "timestamp": "2026-08-23T14:37:10.664690733Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1252,
+      "timestamp": "2026-08-23T15:01:13.802220290Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T14:37:10.664690733Z",
+    "timestamp": "2026-08-23T15:01:13.802220290Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1251
+    "agent_seq": 1252
   }
 }
