@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1115,
+  "next_display_id": 1116,
   "next_comment_id": 1368,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -565,6 +565,7 @@
     "8ccbbf95-aef7-46b5-b332-9f6148ed4f19": 172,
     "8cf66fd0-9684-448c-933d-15e322cdc1cd": 120,
     "8de5caaf-be57-4083-bc07-c9f33e5e7759": 580,
+    "8e03afe6-d146-43e7-84bc-4084c696a4dc": 1115,
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": 384,
     "8ea62b4d-468c-4d61-bf8f-b69d261b2756": 26,
     "8ecebe13-cf84-408b-b5c1-f803b0b77dc4": 291,
@@ -17231,6 +17232,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA50lzp/YYVKORKPlNpCP90KksxhmRGcwJpIqIbFupUTmW3PuMuEOjlU6lOlEr0u1RxCzgtsFFHbx5Al0hCU7qCg=="
         }
       }
+    },
+    "8e03afe6-d146-43e7-84bc-4084c696a4dc": {
+      "uuid": "8e03afe6-d146-43e7-84bc-4084c696a4dc",
+      "display_id": 1115,
+      "title": "S-041: Own background process lifetime and output",
+      "description": "Implement docs/remediation-slices/041-owned-background-processes.md now that S-040 and S-051 are complete. Replace detached line readers and destructive global buffers with generation-bound supervised jobs: full collision-safe IDs, run/session/workspace/capability/budget identity, bounded chunk capture, ordered cursor-based replay, explicit running/exited/killed/timed_out/delivery_failed/lost states, cancellation/deadline enforcement, confirmed reap, bounded retention, and crash/restart reconciliation that never acts on a recovered PID. Preserve Bash background execution and existing lifecycle callers; do not expand into cgroup perfection, frontend redesign, or unrelated process services. Use Rust 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo, and --test-threads=1.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T14:22:39.418758535Z",
+      "updated_at": "2026-08-23T14:22:39.418758535Z"
     },
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": {
       "uuid": "8e4a5961-7f8d-4650-81ff-7ea7d29be200",
@@ -36148,11 +36161,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1244,
       "timestamp": "2026-08-23T14:15:57.675448697Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1245,
+      "timestamp": "2026-08-23T14:22:39.418758535Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T14:15:57.675448697Z",
+    "timestamp": "2026-08-23T14:22:39.418758535Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1244
+    "agent_seq": 1245
   }
 }
