@@ -1,6 +1,6 @@
 {
   "next_display_id": 1114,
-  "next_comment_id": 1343,
+  "next_comment_id": 1344,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8931,12 +8931,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T10:01:17.823149320Z",
-      "updated_at": "2026-08-23T12:18:20.521987272Z",
+      "updated_at": "2026-08-23T12:25:54.626083996Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
       ],
       "comments": {
+        "b5b57840-403f-4356-85c0-c2ebefa95670": {
+          "display_id": 1343,
+          "author": "6Vw9",
+          "content": "[action] Preflight #1112 complete: exact-run shell and agent registries are the lifecycle truth. Implement a per-run registration/transition gate; restrictive Plan/ReadOnly transitions fail typed and leave generation unchanged while active effects exist; explicit kill_shell/task_stop then retry. No automatic cancellation or unrelated lifecycle redesign.",
+          "created_at": "2026-08-23T12:25:54.622814103Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAscV7l7YGs6OddJeEkJ7bVJxUwiXa2jSO0yFKx15y1L95cmwbGNefaLLAEYgHDHzlZUkUX04cTkzO4BewdG63DA=="
+        },
         "ffad6154-9179-4b40-80d9-bfdd5175748d": {
           "display_id": 1342,
           "author": "6Vw9",
@@ -35695,11 +35704,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1205,
       "timestamp": "2026-08-23T12:18:20.521987272Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1206,
+      "timestamp": "2026-08-23T12:25:54.626083996Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T12:18:20.521987272Z",
+    "timestamp": "2026-08-23T12:25:54.626083996Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1205
+    "agent_seq": 1206
   }
 }
