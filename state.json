@@ -1,6 +1,6 @@
 {
   "next_display_id": 1121,
-  "next_comment_id": 1407,
+  "next_comment_id": 1408,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16235,7 +16235,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T20:55:04.838797192Z",
-      "updated_at": "2026-08-23T20:55:48.447054291Z",
+      "updated_at": "2026-08-23T21:07:41.703962645Z",
       "labels": [
         "remediation"
       ],
@@ -16248,6 +16248,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJFsODBAXhJjpWiVyhk+maA+CYjj8q2h07uxkVRo9TuEBr9tuJ/vUFvf4uIBB3pieQqDdLPbPfjHksDj7qHonBw=="
+        },
+        "60ec858f-8302-41fe-9791-dca322404179": {
+          "display_id": 1407,
+          "author": "6Vw9",
+          "content": "[action] Preflight complete. Canonical defect: project metadata/body currently activates on checkout entry; slash invocation turns declarations into transient authority; model invocation emits pseudo-XML with no typed capability semantics; paths/hooks/argument hints are incomplete; cache misses in-place edits and same-layer collision order is nondeterministic. Preferred design is one run-bound provenance/trust catalog plus typed activation shared by prompt, CLI, TUI, ACP/proxy, and tool dispatch. Rejecting fragmented call-site gates because they remain bypass-prone. Plugin supply chain/activation stays in S-061/S-063.",
+          "created_at": "2026-08-23T21:07:41.701673163Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPQWJEreqJXfjxklttTdC1d6ZA0Kj2NfFcloWxRdLit+RAuEwdf6ieacuO3REzzeF4Tu1QdgZTvQD9t1Jy1v3Aw=="
         },
         "b6feca90-293d-4af4-b465-e84063eb541c": {
           "display_id": 1405,
@@ -36974,11 +36983,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1315,
       "timestamp": "2026-08-23T20:55:48.447054291Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1316,
+      "timestamp": "2026-08-23T21:07:41.703962645Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T20:55:48.447054291Z",
+    "timestamp": "2026-08-23T21:07:41.703962645Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1315
+    "agent_seq": 1316
   }
 }
