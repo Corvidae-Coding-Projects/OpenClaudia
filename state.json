@@ -28094,11 +28094,12 @@
       "uuid": "f5eb100a-4902-49bd-8713-b92f9293090b",
       "display_id": 1109,
       "title": "S-014: Make behavioral modes enforce capabilities",
+      "description": "Implement S-014 end to end: turn behavioral modes into validated runtime capability profiles defining allowed effects, tools, budgets, transitions, conflicts, and approval semantics. Route CLI, TUI, ACP, proxy, and resumed sessions through one atomic mode transition; keep prompts as explanatory projections. Plan/read-only profiles must deny direct and indirect mutation. Dependencies S-010, S-016, and S-019 are implemented. Parent workstream: #1071.",
       "status": "open",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T08:45:03.862099956Z",
-      "updated_at": "2026-08-23T08:45:46.143449785Z",
+      "updated_at": "2026-08-23T08:46:02.548361450Z",
       "labels": [
         "remediation"
       ],
@@ -35120,11 +35121,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1155,
       "timestamp": "2026-08-23T08:45:46.143449785Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1156,
+      "timestamp": "2026-08-23T08:46:02.548361450Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T08:45:46.143449785Z",
+    "timestamp": "2026-08-23T08:46:02.548361450Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1155
+    "agent_seq": 1156
   }
 }
