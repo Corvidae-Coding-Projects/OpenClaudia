@@ -1,6 +1,6 @@
 {
   "next_display_id": 1121,
-  "next_comment_id": 1405,
+  "next_comment_id": 1406,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16235,10 +16235,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T20:55:04.838797192Z",
-      "updated_at": "2026-08-23T20:55:09.297572479Z",
+      "updated_at": "2026-08-23T20:55:44.192725600Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "b6feca90-293d-4af4-b465-e84063eb541c": {
+          "display_id": 1405,
+          "author": "6Vw9",
+          "content": "Map every skill source, loader, activation path, cache, frontend projection, and tool/hook grant before editing. Then introduce one bounded provenance/trust/capability contract at the canonical loader, preserve explicitly trusted user/provider skills, deny untrusted project activation and undeclared effects, bind cache entries to workspace generation and digest, and verify invocation/revocation/collision/containment across frontends. Keep plugin supply-chain work in S-061/S-063 and do not remove operational skills.",
+          "created_at": "2026-08-23T20:55:44.190300607Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAalumZyOCv97C9h/Dw1R/ln2+4EcK57jIYXqPNAe8IB/cJUZo25bUi3jBtJ4WkaEYV2uFc0RmZ+GGDdV7tmmrCw=="
+        }
+      }
     },
     "83912b7f-f456-455b-ae95-547340005f4e": {
       "uuid": "83912b7f-f456-455b-ae95-547340005f4e",
@@ -36944,11 +36955,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1313,
       "timestamp": "2026-08-23T20:55:14.460304057Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1314,
+      "timestamp": "2026-08-23T20:55:44.192725600Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T20:55:14.460304057Z",
+    "timestamp": "2026-08-23T20:55:44.192725600Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1313
+    "agent_seq": 1314
   }
 }
