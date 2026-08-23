@@ -172,6 +172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Quiesce in-flight background effects before restrictive mode transitions (#1112)
 - Bind narrow behavioral scope to explicit approved targets (#1110)
 - Complete typed plan-mode follow-ups in the full-screen TUI (#1111)
 - S-014: Make behavioral modes enforce capabilities (#1109)
