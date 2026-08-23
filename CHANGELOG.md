@@ -172,6 +172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-047: Replace static model-name capability guesses (#1103)
 - S-046: Repair Gemini and Ollama tool history (#1102)
 - S-045: Preserve OpenAI Responses continuation (#1100)
 - Exclude Crosslink runtime state from verification artifact snapshots (#1101)
