@@ -1,6 +1,6 @@
 {
   "next_display_id": 1115,
-  "next_comment_id": 1362,
+  "next_comment_id": 1363,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15363,7 +15363,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T13:28:40.687327778Z",
-      "updated_at": "2026-08-23T14:14:17.404854933Z",
+      "updated_at": "2026-08-23T14:14:48.358143651Z",
       "labels": [
         "remediation"
       ],
@@ -15389,6 +15389,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfk9TQWTcPscDso/Lc5OkPEvHi4Q4Du5RLsVCflZWdFb0JY1rZ6w8zx7ZU4H4O2jwOR//Iy+B0vg2QM8UCvouAQ=="
+        },
+        "1af76620-28f9-4323-9818-910b9ab97708": {
+          "display_id": 1362,
+          "author": "6Vw9",
+          "content": "Consolidate the real foreground lifecycle failures into one run-owned supervisor so Bash, hooks, quality gates, VDD, and synchronous helpers share the same bounded stdin/output, deadline, cancellation, tree-termination, and reap contract. Keep long-lived MCP/LSP/background-service redesign in their existing slices, while repairing #1020 and the directly shared #1067 cleanup path.",
+          "created_at": "2026-08-23T14:14:48.355727850Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA95e6ECaT4OENWo3/yXbRLAJJtsyy7rwUYUfELruG5ZOclofUlseyEiFE3mdE8tQ6duaCcbVR7aVcrODzrHukAA=="
         },
         "2a28259f-3b86-4c19-8077-075788480f11": {
           "display_id": 1354,
@@ -36045,11 +36054,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1234,
       "timestamp": "2026-08-23T14:14:17.404854933Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1235,
+      "timestamp": "2026-08-23T14:14:48.358143651Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T14:14:17.404854933Z",
+    "timestamp": "2026-08-23T14:14:48.358143651Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1234
+    "agent_seq": 1235
   }
 }
