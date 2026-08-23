@@ -8,7 +8,7 @@ use crate::config::ThinkingConfig;
 use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
 use crate::session::TokenUsage;
 
-use super::{ApiKey, ProviderAdapter, ProviderError};
+use super::{ApiKey, ProviderAdapter, ProviderError, ReasoningProfile};
 
 /// Whether the model rejects manual extended thinking budgets.
 ///
@@ -16,11 +16,10 @@ use super::{ApiKey, ProviderAdapter, ProviderError};
 /// sending `thinking: {type: "enabled", budget_tokens: ...}` returns 400.
 #[must_use]
 pub fn anthropic_rejects_manual_thinking(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.starts_with("claude-fable-5")
-        || model.starts_with("claude-mythos-5")
-        || model.starts_with("claude-opus-4-8")
-        || model.starts_with("claude-opus-4-7")
+    super::resolve_model("anthropic", model)
+        .capabilities()
+        .reasoning_profile
+        == ReasoningProfile::AnthropicAdaptive
 }
 
 fn anthropic_rejects_sampling_parameters(model: &str) -> bool {
@@ -28,8 +27,12 @@ fn anthropic_rejects_sampling_parameters(model: &str) -> bool {
 }
 
 fn anthropic_has_implicit_adaptive_thinking(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.starts_with("claude-fable-5") || model.starts_with("claude-mythos-5")
+    super::resolve_model("anthropic", model)
+        .entry
+        .is_some_and(|entry| {
+            entry.canonical_id.eq_ignore_ascii_case("claude-fable-5")
+                || entry.canonical_id.eq_ignore_ascii_case("claude-mythos-5")
+        })
 }
 
 /// Normalize a user-facing Anthropic effort level for `output_config.effort`.
@@ -416,7 +419,10 @@ impl ProviderAdapter for AnthropicAdapter {
         // Add Anthropic extended thinking params if enabled
         // See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
         if thinking.enabled {
-            if anthropic_rejects_manual_thinking(&request.model) {
+            let profile = super::resolve_model("anthropic", &request.model)
+                .capabilities()
+                .reasoning_profile;
+            if profile == ReasoningProfile::AnthropicAdaptive {
                 apply_anthropic_adaptive_thinking(
                     &mut body,
                     &request.model,
@@ -426,6 +432,14 @@ impl ProviderAdapter for AnthropicAdapter {
                     model = %request.model,
                     effort = ?thinking.reasoning_effort,
                     "Added Anthropic adaptive thinking params"
+                );
+                return Ok(body);
+            }
+
+            if profile != ReasoningProfile::AnthropicManual {
+                warn!(
+                    model = %request.model,
+                    "thinking requested without current Anthropic model-capability evidence; omitting thinking controls",
                 );
                 return Ok(body);
             }
@@ -521,6 +535,18 @@ impl ProviderAdapter for AnthropicAdapter {
         );
         headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
         headers
+    }
+
+    fn supports_model_listing(&self) -> bool {
+        true
+    }
+
+    fn model_catalog_format(&self) -> Option<super::ModelCatalogFormat> {
+        Some(super::ModelCatalogFormat::Anthropic)
+    }
+
+    fn models_endpoint(&self) -> &'static str {
+        "/v1/models?limit=1000"
     }
 
     /// Anthropic native shape: `content` is an array of typed blocks;

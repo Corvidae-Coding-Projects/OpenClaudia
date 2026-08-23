@@ -515,7 +515,8 @@ impl ChatRepl {
             args.model_override,
             provider.model.clone(),
             &config.proxy.target,
-        );
+        )
+        .map_err(anyhow::Error::msg)?;
         // Crosslink #433: typo in `proxy.target` fails fast at REPL setup
         // instead of silently falling back to OpenAIAdapter.
         let Some(adapter) = resolve_repl_adapter(&config.proxy.target) else {

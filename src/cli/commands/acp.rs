@@ -88,7 +88,14 @@ pub async fn cmd_acp(
 
     let model = model_override
         .or(provider_model)
-        .unwrap_or_else(|| openclaudia::providers::default_model_for_target(&target).to_string());
+        .or_else(|| {
+            openclaudia::providers::default_model_for_target(&target).map(str::to_string)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider '{target}' has no configured model; set providers.{target}.model or pass --model"
+            )
+        })?;
 
     openclaudia::acp::run_acp_server(
         config,

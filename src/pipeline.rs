@@ -9,9 +9,8 @@ use crate::permissions::{
     ApprovalProvenance, AuthorizationResult, ExecutionPermit, PermissionManager, PermissionRule,
 };
 use crate::providers::{
-    anthropic_rejects_manual_thinking, apply_anthropic_adaptive_thinking,
-    convert_messages_to_anthropic_checked, convert_tool_definitions_to_anthropic_checked,
-    get_adapter,
+    apply_anthropic_adaptive_thinking, convert_messages_to_anthropic_checked,
+    convert_tool_definitions_to_anthropic_checked, get_adapter, ReasoningProfile,
 };
 use crate::proxy::{self, normalize_base_url};
 use crate::services::policy::{PolicyEnforcer, PolicyError};
@@ -186,28 +185,40 @@ fn build_anthropic_request_with_tools(
     }
 
     // Apply effort level. `high` / `max` switch Anthropic into thinking mode.
-    // Newer models (Fable/Mythos, Opus 4.8/4.7) reject manual thinking
-    // budgets, so they use the adaptive-thinking + output_config.effort
-    // shape. Older/manual-capable models keep the Claude Code budget path.
+    // Models with exact adaptive evidence use adaptive thinking; models with
+    // exact manual evidence keep the Claude Code budget path. Unknown models
+    // receive no optional thinking fields.
     // MAX_THINKING_TOKENS env var overrides manual budgets outright. See
     // `crate::thinking` for the precedence chain and keyword-trigger logic
     // (ultrathink / think ultra hard).
     match effort_level {
         "high" | "max" | "xhigh" => {
-            if anthropic_rejects_manual_thinking(model) {
-                apply_anthropic_adaptive_thinking(&mut req, model, Some(effort_level));
-                req["max_tokens"] = serde_json::json!(40_000);
-            } else if let Some(budget) =
-                crate::thinking::anthropic_thinking_budget(Some(effort_level))
-            {
-                req["thinking"] = serde_json::json!({
-                    "type": "enabled",
-                    "budget_tokens": budget,
-                });
-                // Headroom for the thinking block plus the answer. Claude
-                // Code uses max_tokens > budget_tokens; 40k covers 32k
-                // thinking + ~8k answer comfortably.
-                req["max_tokens"] = serde_json::json!(40_000);
+            let profile = crate::providers::resolve_model("anthropic", model)
+                .capabilities()
+                .reasoning_profile;
+            match profile {
+                ReasoningProfile::AnthropicAdaptive => {
+                    apply_anthropic_adaptive_thinking(&mut req, model, Some(effort_level));
+                    req["max_tokens"] = serde_json::json!(40_000);
+                }
+                ReasoningProfile::AnthropicManual => {
+                    if let Some(budget) =
+                        crate::thinking::anthropic_thinking_budget(Some(effort_level))
+                    {
+                        req["thinking"] = serde_json::json!({
+                            "type": "enabled",
+                            "budget_tokens": budget,
+                        });
+                        // Headroom for the thinking block plus the answer.
+                        req["max_tokens"] = serde_json::json!(40_000);
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        model,
+                        "thinking requested without current Anthropic model-capability evidence; omitting thinking controls",
+                    );
+                }
             }
         }
         "low" => {
@@ -614,7 +625,10 @@ fn build_adapter_request(
 /// Returns an error if the built-in tool definitions cannot be represented as
 /// Gemini function declarations.
 pub fn build_google_request(messages: &[Value], effort_level: &str) -> Result<Value, String> {
+    let model = crate::providers::default_model_for_target("google")
+        .ok_or_else(|| "Google provider has no maintained default model".to_string())?;
     build_google_request_with_tools(
+        model,
         messages,
         effort_level,
         &tools::get_all_tool_definitions(true),
@@ -622,6 +636,7 @@ pub fn build_google_request(messages: &[Value], effort_level: &str) -> Result<Va
 }
 
 fn build_google_request_with_tools(
+    model: &str,
     messages: &[Value],
     effort_level: &str,
     openai_tools: &Value,
@@ -635,7 +650,7 @@ fn build_google_request_with_tools(
             }
         }
     }
-    let mut request = build_chat_completion_request_with_tools("gemini", messages, openai_tools)?;
+    let mut request = build_chat_completion_request_with_tools(model, messages, openai_tools)?;
     request.max_tokens = Some(4096);
     let mut thinking = thinking_config_for_pipeline_effort("google", effort_level);
     if let Some(thinking) = thinking.as_mut() {
@@ -973,9 +988,12 @@ fn build_request_for_wire_with_tools(
                 prompt_blocks,
                 tool_definitions,
             ),
-            "google" | "gemini" => {
-                build_google_request_with_tools(effective_messages, effective, tool_definitions)
-            }
+            "google" | "gemini" => build_google_request_with_tools(
+                model,
+                effective_messages,
+                effective,
+                tool_definitions,
+            ),
             _ => build_adapter_request(
                 provider,
                 model,
@@ -5697,12 +5715,12 @@ memory:
         assert_eq!(zai["thinking"]["type"], "enabled");
         assert_eq!(zai["reasoning_effort"], "high");
 
-        let zai_legacy = build_request("zai", "glm-4.7", &messages, "max", None, None)
-            .expect("zai legacy request should build");
-        assert_eq!(zai_legacy["thinking"]["type"], "enabled");
+        let unknown_zai = build_request("zai", "glm-4.7", &messages, "max", None, None)
+            .expect("unknown Z.AI request should still build");
         assert!(
-            zai_legacy.get("reasoning_effort").is_none(),
-            "non-GLM-5.2 Z.AI models must not receive reasoning_effort: {zai_legacy}"
+            unknown_zai.get("thinking").is_none()
+                && unknown_zai.get("reasoning_effort").is_none(),
+            "models without exact capability evidence must not receive optional controls: {unknown_zai}"
         );
 
         let minimax = build_request("minimax", "MiniMax-M3", &messages, "high", None, None)
@@ -5907,14 +5925,13 @@ memory:
         assert_eq!(opus48["output_config"]["effort"], "high");
         assert_eq!(opus48["max_tokens"], 40_000);
 
-        let opus47 = build_anthropic_request("claude-opus-4-7", &messages, "max", None, None)
-            .expect("opus 4.7 max-effort request should build");
-        assert_eq!(opus47["thinking"]["type"], "adaptive");
+        let unknown_opus = build_anthropic_request("claude-opus-4-7", &messages, "max", None, None)
+            .expect("unknown Opus request should still build");
         assert!(
-            opus47["thinking"].get("budget_tokens").is_none(),
-            "Opus 4.7 rejects manual thinking budgets: {opus47}"
+            unknown_opus.get("thinking").is_none()
+                && unknown_opus.get("output_config").is_none(),
+            "models without exact capability evidence must receive no optional thinking controls: {unknown_opus}"
         );
-        assert_eq!(opus47["output_config"]["effort"], "max");
 
         let fable = build_anthropic_request("claude-fable-5", &messages, "high", None, None)
             .expect("fable high-effort request should build");

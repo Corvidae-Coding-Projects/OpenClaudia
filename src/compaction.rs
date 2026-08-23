@@ -14,41 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Context window sizes for different models (in tokens)
-const CLAUDE_1M_CONTEXT: usize = 1_000_000;
-const CLAUDE_OPUS_CONTEXT: usize = 200_000;
-const CLAUDE_SONNET_CONTEXT: usize = 200_000;
-const CLAUDE_HAIKU_CONTEXT: usize = 200_000;
-const GPT5_LONG_CONTEXT: usize = 1_050_000;
-const GPT5_PRO_LONG_CONTEXT: usize = 1_050_000;
-const GPT5_CONTEXT: usize = 400_000;
-const GPT4_CONTEXT: usize = 128_000;
-const GPT4O_CONTEXT: usize = 128_000;
-const GPT41_CONTEXT: usize = 1_000_000;
-const GPT35_CONTEXT: usize = 16_385;
-const GEMINI_PRO_CONTEXT: usize = 1_000_000;
-const DEEPSEEK_V4_CONTEXT: usize = 1_000_000;
-const ZAI_1M_CONTEXT: usize = 1_000_000;
-const ZAI_200K_CONTEXT: usize = 200_000;
-const ZAI_128K_CONTEXT: usize = 128_000;
-const ZAI_64K_CONTEXT: usize = 64_000;
-const QWEN_10M_CONTEXT: usize = 10_000_000;
-const QWEN_1M_CONTEXT: usize = 1_000_000;
-const QWEN_256K_CONTEXT: usize = 262_144;
-const QWEN_128K_CONTEXT: usize = 128_000;
-const QWEN_80K_CONTEXT: usize = 80_000;
-const QWEN_64K_CONTEXT: usize = 64_000;
-const QWEN_MAX_CONTEXT: usize = 32_768;
-const QWEN_32K_CONTEXT: usize = 32_000;
-const QWEN_16K_CONTEXT: usize = 16_000;
-const QWEN_8K_CONTEXT: usize = 8_000;
-const KIMI_256K_CONTEXT: usize = 262_144;
-const MOONSHOT_V1_128K_CONTEXT: usize = 131_072;
-const MOONSHOT_V1_32K_CONTEXT: usize = 32_768;
-const MOONSHOT_V1_8K_CONTEXT: usize = 8_192;
-const MINIMAX_M3_CONTEXT: usize = 1_000_000;
-const MINIMAX_M2_CONTEXT: usize = 204_800;
-const MINIMAX_M2_HER_CONTEXT: usize = 65_536;
+/// Conservative ceiling used until the provider catalog supplies an exact limit.
 const DEFAULT_CONTEXT: usize = 128_000;
 
 /// Safety margin - trigger compaction before hitting the limit
@@ -303,387 +269,13 @@ pub fn extract_compact_boundary_metadata(msg: &ChatMessage) -> Option<CompactBou
     serde_json::from_str::<CompactBoundaryMetadata>(after_marker.trim()).ok()
 }
 
-/// Substring → context-window-tokens lookup row. Order matters: the
-/// first row whose `needle` is contained in the lowercase model name
-/// wins. More-specific names MUST precede their less-specific
-/// supersets (e.g. `gpt-4o` before `gpt-4`, `opus`/`sonnet`/`haiku`
-/// before the bare `claude` fallback). Adding a provider is now a
-/// table edit, not an if/else cascade (crosslink #754).
-struct ContextWindowRow {
-    needle: &'static str,
-    tokens: usize,
-}
-
-/// Ordered table walked by [`get_context_window`]. Sorted from
-/// most-specific to least-specific within each provider family so
-/// substring matching cannot accidentally promote `gpt-4o` →
-/// `gpt-4` or `claude-3-5-sonnet-gpt-bridge` → `gpt-4`.
-const CONTEXT_WINDOW_TABLE: &[ContextWindowRow] = &[
-    // Claude family — current 1M models before broad family fallbacks.
-    ContextWindowRow {
-        needle: "claude-fable-5",
-        tokens: CLAUDE_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "claude-mythos-5",
-        tokens: CLAUDE_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "claude-mythos-preview",
-        tokens: CLAUDE_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "claude-opus-4-8",
-        tokens: CLAUDE_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "claude-opus-4-7",
-        tokens: CLAUDE_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "claude-opus-4-6",
-        tokens: CLAUDE_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "claude-sonnet-4-6",
-        tokens: CLAUDE_1M_CONTEXT,
-    },
-    // Older/general Claude family fallbacks.
-    ContextWindowRow {
-        needle: "opus",
-        tokens: CLAUDE_OPUS_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "sonnet",
-        tokens: CLAUDE_SONNET_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "haiku",
-        tokens: CLAUDE_HAIKU_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "claude",
-        tokens: CLAUDE_SONNET_CONTEXT,
-    },
-    // OpenAI GPT family — gpt-4.1 / gpt-4o must precede bare gpt-4
-    // because `"gpt-4o".contains("gpt-4")` would otherwise win
-    // accidentally. The 4.1 / 4o / 4 ordering is the contract.
-    ContextWindowRow {
-        needle: "gpt-5.5-pro",
-        tokens: GPT5_PRO_LONG_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-5.5",
-        tokens: GPT5_LONG_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-5.4-pro",
-        tokens: GPT5_PRO_LONG_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-5.4-mini",
-        tokens: GPT5_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-5.4-nano",
-        tokens: GPT5_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-5.4",
-        tokens: GPT5_LONG_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-5",
-        tokens: GPT5_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-4.1",
-        tokens: GPT41_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-4o",
-        tokens: GPT4O_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-4",
-        tokens: GPT4_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "gpt-3.5",
-        tokens: GPT35_CONTEXT,
-    },
-    // Google Gemini.
-    ContextWindowRow {
-        needle: "gemini",
-        tokens: GEMINI_PRO_CONTEXT,
-    },
-    // DeepSeek V4 family and compatibility aliases.
-    ContextWindowRow {
-        needle: "deepseek-v4",
-        tokens: DEEPSEEK_V4_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "deepseek-chat",
-        tokens: DEEPSEEK_V4_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "deepseek-reasoner",
-        tokens: DEEPSEEK_V4_CONTEXT,
-    },
-    // Z.AI GLM text and vision chat families.
-    ContextWindowRow {
-        needle: "glm-5.2",
-        tokens: ZAI_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-5v-turbo",
-        tokens: ZAI_200K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-5.1",
-        tokens: ZAI_200K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-5-turbo",
-        tokens: ZAI_200K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-5",
-        tokens: ZAI_200K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-4.7",
-        tokens: ZAI_200K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-4.6v",
-        tokens: ZAI_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-4.6",
-        tokens: ZAI_200K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-4.5v",
-        tokens: ZAI_64K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-4.5-flash",
-        tokens: ZAI_200K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-4.5",
-        tokens: ZAI_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "glm-4-32b-0414-128k",
-        tokens: ZAI_128K_CONTEXT,
-    },
-    // Qwen current commercial families. Specific rows precede any broad
-    // `qwen` fallback because matching is substring-based.
-    ContextWindowRow {
-        needle: "qwen-long",
-        tokens: QWEN_10M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen-mt",
-        tokens: QWEN_16K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen-plus-character",
-        tokens: QWEN_32K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen-flash-character",
-        tokens: QWEN_8K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen2.5-omni",
-        tokens: QWEN_32K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen-omni-turbo",
-        tokens: QWEN_32K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.5-omni",
-        tokens: QWEN_64K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.7",
-        tokens: QWEN_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.6-plus",
-        tokens: QWEN_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.6-flash",
-        tokens: QWEN_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.6-max-preview",
-        tokens: QWEN_256K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.6-35b-a3b",
-        tokens: QWEN_256K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.5-plus",
-        tokens: QWEN_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.5-flash",
-        tokens: QWEN_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-next",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-235b",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-30b-a3b-thinking-2507",
-        tokens: QWEN_80K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-30b",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-32b",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-14b",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-8b",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3.5",
-        tokens: QWEN_256K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-coder-next",
-        tokens: QWEN_256K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-coder-480b",
-        tokens: QWEN_256K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-coder-30b",
-        tokens: QWEN_256K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-coder",
-        tokens: QWEN_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen3-max",
-        tokens: QWEN_256K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen-plus",
-        tokens: QWEN_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen-flash",
-        tokens: QWEN_1M_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen-max",
-        tokens: QWEN_MAX_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwen-turbo",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qwq",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "qvq",
-        tokens: QWEN_128K_CONTEXT,
-    },
-    // Kimi / Moonshot.
-    ContextWindowRow {
-        needle: "kimi-k2",
-        tokens: KIMI_256K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "moonshot-v1-128k",
-        tokens: MOONSHOT_V1_128K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "moonshot-v1-32k",
-        tokens: MOONSHOT_V1_32K_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "moonshot-v1-8k",
-        tokens: MOONSHOT_V1_8K_CONTEXT,
-    },
-    // MiniMax.
-    ContextWindowRow {
-        needle: "minimax-m3",
-        tokens: MINIMAX_M3_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "minimax-m2.7",
-        tokens: MINIMAX_M2_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "minimax-m2.5",
-        tokens: MINIMAX_M2_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "minimax-m2.1",
-        tokens: MINIMAX_M2_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "minimax-m2",
-        tokens: MINIMAX_M2_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "m2-her",
-        tokens: MINIMAX_M2_HER_CONTEXT,
-    },
-    // OpenAI reasoning family share the gpt-4o window; one row each
-    // so a future divergence can be applied without ratchet-untangling.
-    ContextWindowRow {
-        needle: "o1",
-        tokens: GPT4O_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "o3",
-        tokens: GPT4O_CONTEXT,
-    },
-    ContextWindowRow {
-        needle: "o4",
-        tokens: GPT4O_CONTEXT,
-    },
-];
-
-/// Get context window size for a model.
+/// Get the exact discovered or fresh-fallback context window for a model.
 ///
-/// Walks [`CONTEXT_WINDOW_TABLE`] in declaration order; the first
-/// row whose `needle` appears in `model.to_lowercase()` wins. Falls
-/// back to [`DEFAULT_CONTEXT`] for unknown models so the compactor
-/// still has a safe upper bound even on a brand-new provider name.
+/// Unknown models retain a conservative operational ceiling instead of being
+/// promoted by a coincidental substring in their name.
 #[must_use]
 pub fn get_context_window(model: &str) -> usize {
-    let model_lower = model.to_lowercase();
-    CONTEXT_WINDOW_TABLE
-        .iter()
-        .find(|row| model_lower.contains(row.needle))
-        .map_or(DEFAULT_CONTEXT, |row| row.tokens)
+    crate::providers::known_model_context_window(model).unwrap_or(DEFAULT_CONTEXT)
 }
 
 /// ASCII characters per emitted token. Subword tokenizers (BPE,
@@ -1993,47 +1585,19 @@ mod tests {
 
     #[test]
     fn test_get_context_window() {
-        assert_eq!(get_context_window("claude-fable-5"), CLAUDE_1M_CONTEXT);
-        assert_eq!(get_context_window("claude-opus-4-8"), CLAUDE_1M_CONTEXT);
-        assert_eq!(get_context_window("claude-opus-4-7"), CLAUDE_1M_CONTEXT);
-        assert_eq!(get_context_window("claude-sonnet-4-6"), CLAUDE_1M_CONTEXT);
-        assert_eq!(
-            get_context_window("claude-3-opus-20240229"),
-            CLAUDE_OPUS_CONTEXT
-        );
-        assert_eq!(
-            get_context_window("claude-3-5-sonnet-20241022"),
-            CLAUDE_SONNET_CONTEXT
-        );
-        assert_eq!(get_context_window("gpt-4o"), GPT4O_CONTEXT);
-        assert_eq!(get_context_window("gpt-4"), GPT4_CONTEXT);
-        assert_eq!(get_context_window("gpt-3.5-turbo"), GPT35_CONTEXT);
-        assert_eq!(get_context_window("gemini-pro"), GEMINI_PRO_CONTEXT);
-        assert_eq!(get_context_window("deepseek-v4-pro"), DEEPSEEK_V4_CONTEXT);
-        assert_eq!(get_context_window("deepseek-v4-flash"), DEEPSEEK_V4_CONTEXT);
-        assert_eq!(get_context_window("deepseek-chat"), DEEPSEEK_V4_CONTEXT);
-        assert_eq!(get_context_window("deepseek-reasoner"), DEEPSEEK_V4_CONTEXT);
-        assert_eq!(get_context_window("qwen3.7-plus"), QWEN_1M_CONTEXT);
-        assert_eq!(
-            get_context_window("qwen3.7-max-2026-05-17"),
-            QWEN_1M_CONTEXT
-        );
-        assert_eq!(get_context_window("qwen3.6-flash"), QWEN_1M_CONTEXT);
-        assert_eq!(get_context_window("qwen3.6-max-preview"), QWEN_256K_CONTEXT);
-        assert_eq!(get_context_window("qwen3.5-397b-a17b"), QWEN_256K_CONTEXT);
-        assert_eq!(get_context_window("qwen-max"), QWEN_MAX_CONTEXT);
-        assert_eq!(get_context_window("kimi-k2.7-code"), KIMI_256K_CONTEXT);
-        assert_eq!(
-            get_context_window("moonshot-v1-128k-vision-preview"),
-            MOONSHOT_V1_128K_CONTEXT
-        );
-        assert_eq!(get_context_window("MiniMax-M3"), MINIMAX_M3_CONTEXT);
-        assert_eq!(
-            get_context_window("MiniMax-M2.7-highspeed"),
-            MINIMAX_M2_CONTEXT
-        );
-        assert_eq!(get_context_window("M2-her"), MINIMAX_M2_HER_CONTEXT);
+        assert_eq!(get_context_window("claude-opus-4-8"), 1_000_000);
+        assert_eq!(get_context_window("claude-haiku-4-5"), 200_000);
+        assert_eq!(get_context_window("gpt-5.6-sol"), 1_050_000);
+        assert_eq!(get_context_window("gemini-3.7-flash"), 1_048_576);
+        assert_eq!(get_context_window("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(get_context_window("qwen3.7-plus"), 1_000_000);
+        assert_eq!(get_context_window("kimi-k2.7-code"), 262_144);
+        assert_eq!(get_context_window("MiniMax-M3"), 1_000_000);
         assert_eq!(get_context_window("unknown-model"), DEFAULT_CONTEXT);
+        assert_eq!(
+            get_context_window("prefix-gpt-5.6-sol-copy"),
+            DEFAULT_CONTEXT
+        );
     }
 
     #[test]
@@ -2201,14 +1765,14 @@ mod tests {
 
     #[test]
     fn test_compaction_config_for_model() {
-        let config = CompactionConfig::for_model("claude-3-opus");
-        assert_eq!(config.max_context_tokens, CLAUDE_OPUS_CONTEXT);
+        let config = CompactionConfig::for_model("claude-opus-4-8");
+        assert_eq!(config.max_context_tokens, 1_000_000);
 
-        let config = CompactionConfig::for_model("gpt-4o-mini");
-        assert_eq!(config.max_context_tokens, GPT4O_CONTEXT);
+        let config = CompactionConfig::for_model("gpt-5.6-sol");
+        assert_eq!(config.max_context_tokens, 1_050_000);
 
-        let config = CompactionConfig::for_model("gemini-3.5-flash");
-        assert_eq!(config.max_context_tokens, GEMINI_PRO_CONTEXT);
+        let config = CompactionConfig::for_model("gemini-3.7-flash");
+        assert_eq!(config.max_context_tokens, 1_048_576);
     }
 
     #[test]
@@ -2509,13 +2073,10 @@ mod tests {
 
     #[test]
     fn test_get_context_window_edge_cases() {
-        // Test model name variations
-        assert_eq!(get_context_window("CLAUDE-3-OPUS"), CLAUDE_OPUS_CONTEXT);
-        assert_eq!(get_context_window("Claude-Sonnet"), CLAUDE_SONNET_CONTEXT);
-        assert_eq!(get_context_window("GPT-4O-2024-05-13"), GPT4O_CONTEXT);
-        assert_eq!(get_context_window("gpt-3.5-turbo-16k"), GPT35_CONTEXT);
-        assert_eq!(get_context_window("o1-preview"), GPT4O_CONTEXT);
-        assert_eq!(get_context_window("o3-mini"), GPT4O_CONTEXT);
+        assert_eq!(get_context_window("CLAUDE-OPUS-4-8"), 1_000_000);
+        assert_eq!(get_context_window("GPT-5.6"), 1_050_000);
+        assert_eq!(get_context_window("gpt-5.6-sol-future"), DEFAULT_CONTEXT);
+        assert_eq!(get_context_window("claude"), DEFAULT_CONTEXT);
     }
 
     #[test]
@@ -2546,36 +2107,36 @@ mod tests {
 
     #[test]
     fn test_check_context_budget_normal() {
-        let (warn, compact, _) = check_context_budget(50_000, "claude-sonnet-4-5");
+        let (warn, compact, _) = check_context_budget(50_000, "claude-haiku-4-5");
         assert!(!warn);
         assert!(!compact);
     }
 
     #[test]
     fn test_check_context_budget_warn() {
-        // Claude sonnet context is 200k, 85% = 170k
-        let (warn, compact, _) = check_context_budget(175_000, "claude-sonnet-4-5");
+        // Claude Haiku context is 200k, 85% = 170k.
+        let (warn, compact, _) = check_context_budget(175_000, "claude-haiku-4-5");
         assert!(warn);
         assert!(!compact);
     }
 
     #[test]
     fn test_check_context_budget_compact() {
-        let (warn, compact, _) = check_context_budget(185_000, "claude-sonnet-4-5");
+        let (warn, compact, _) = check_context_budget(185_000, "claude-haiku-4-5");
         assert!(warn);
         assert!(compact);
     }
 
     #[test]
     fn test_check_context_budget_percentage() {
-        let (_, _, pct) = check_context_budget(100_000, "claude-sonnet-4-5");
+        let (_, _, pct) = check_context_budget(100_000, "claude-haiku-4-5");
         // 100k / 200k = 50%
         assert!((pct - 50.0).abs() < 0.1);
     }
 
     #[test]
     fn test_check_context_budget_zero() {
-        let (warn, compact, pct) = check_context_budget(0, "claude-sonnet-4-5");
+        let (warn, compact, pct) = check_context_budget(0, "claude-haiku-4-5");
         assert!(!warn);
         assert!(!compact);
         assert!((pct - 0.0).abs() < 0.01);
@@ -2839,18 +2400,12 @@ mod tests {
 
     // -- B3: CompactionConfig::for_model / get_context_window ----------------
 
-    /// B3a — gpt-4.1 and gpt-5 entries (not in original test).
+    /// B3a — current exact `OpenAI` entries and aliases.
     #[test]
     fn b3_context_window_gpt41_and_gpt5() {
-        assert_eq!(get_context_window("gpt-4.1"), GPT41_CONTEXT);
-        assert_eq!(get_context_window("gpt-4.1-mini"), GPT41_CONTEXT);
-        assert_eq!(get_context_window("gpt-5.5-pro"), GPT5_PRO_LONG_CONTEXT);
-        assert_eq!(get_context_window("gpt-5.5"), GPT5_LONG_CONTEXT);
-        assert_eq!(get_context_window("gpt-5.4-pro"), GPT5_PRO_LONG_CONTEXT);
-        assert_eq!(get_context_window("gpt-5.4"), GPT5_LONG_CONTEXT);
-        assert_eq!(get_context_window("gpt-5.4-mini"), GPT5_CONTEXT);
-        assert_eq!(get_context_window("gpt-5.4-nano"), GPT5_CONTEXT);
-        assert_eq!(get_context_window("gpt-5"), GPT5_CONTEXT);
+        assert_eq!(get_context_window("gpt-5.6"), 1_050_000);
+        assert_eq!(get_context_window("gpt-5.6-sol"), 1_050_000);
+        assert_eq!(get_context_window("gpt-5.6-luna"), 1_050_000);
     }
 
     #[test]
@@ -2858,27 +2413,24 @@ mod tests {
         for model in [
             "claude-fable-5",
             "claude-mythos-5",
-            "claude-mythos-preview",
             "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-opus-4-6",
             "claude-sonnet-4-6",
         ] {
-            assert_eq!(get_context_window(model), CLAUDE_1M_CONTEXT, "{model}");
+            assert_eq!(get_context_window(model), 1_000_000, "{model}");
         }
     }
 
-    /// B3b — plain "claude" (no specific variant) falls back to `CLAUDE_SONNET_CONTEXT`.
+    /// B3b — an unverified family name receives the conservative ceiling.
     #[test]
     fn b3_claude_generic_returns_sonnet_context() {
-        assert_eq!(get_context_window("claude"), CLAUDE_SONNET_CONTEXT);
+        assert_eq!(get_context_window("claude"), DEFAULT_CONTEXT);
     }
 
     /// B3c — `for_model` sets other fields to Default (threshold=0.85, `preserve_recent=4`, etc.).
     #[test]
     fn b3_for_model_uses_default_fields_except_context_window() {
-        let config = CompactionConfig::for_model("gpt-4");
-        assert_eq!(config.max_context_tokens, GPT4_CONTEXT);
+        let config = CompactionConfig::for_model("gpt-5.6-sol");
+        assert_eq!(config.max_context_tokens, 1_050_000);
         assert!((config.threshold - COMPACTION_THRESHOLD).abs() < f32::EPSILON);
         assert_eq!(config.preserve_recent, 4);
         assert!(config.preserve_system);
@@ -3665,11 +3217,11 @@ mod tests {
             preserve_tool_calls: Some(false),
             summary_prompt: Some("custom".to_string()),
         };
-        let compactor = ContextCompactor::for_model_with_overrides("claude-3-opus", &overrides);
+        let compactor = ContextCompactor::for_model_with_overrides("claude-opus-4-8", &overrides);
         let cfg = compactor.config();
 
         // Model-derived defaults preserved (overrides set `None`).
-        assert_eq!(cfg.max_context_tokens, CLAUDE_OPUS_CONTEXT);
+        assert_eq!(cfg.max_context_tokens, 1_000_000);
         assert!((cfg.threshold - COMPACTION_THRESHOLD).abs() < f32::EPSILON);
 
         // Overridden fields applied.

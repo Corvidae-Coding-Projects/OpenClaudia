@@ -3030,9 +3030,9 @@ mod token_tracking {
 
     #[test]
     fn test_context_window_sizes() {
-        assert_eq!(get_context_window("claude-3-opus-20240229"), 200_000);
-        assert_eq!(get_context_window("claude-3-5-sonnet-20241022"), 200_000);
-        assert_eq!(get_context_window("gpt-4o"), 128_000);
+        assert_eq!(get_context_window("claude-haiku-4-5"), 200_000);
+        assert_eq!(get_context_window("claude-opus-4-8"), 1_000_000);
+        assert_eq!(get_context_window("gpt-5.6-sol"), 1_050_000);
         assert_eq!(get_context_window("gemini-3.5-flash"), 1_000_000);
         assert_eq!(get_context_window("unknown-model"), 128_000);
     }

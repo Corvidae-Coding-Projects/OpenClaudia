@@ -617,7 +617,7 @@ fn get_adapter_returns_static_dispatch() {
 #[test]
 fn anthropic_thinking_budget_lands_in_request() {
     let adapter = AnthropicAdapter::new();
-    let req = minimal_request("claude-3-5-sonnet-latest");
+    let req = minimal_request("claude-sonnet-4-6");
     let thinking = ThinkingConfig {
         enabled: true,
         budget_tokens: Some(7777),

@@ -672,7 +672,9 @@ fn acp_model_option_ids(target: &str, current_model: &str) -> Vec<String> {
         }
     }
     if ids.is_empty() {
-        ids.push(crate::providers::default_model_for_target(&target).to_string());
+        if let Some(default) = crate::providers::default_model_for_target(&target) {
+            ids.push(default.to_string());
+        }
     }
     ids
 }

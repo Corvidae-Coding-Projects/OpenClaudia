@@ -1386,8 +1386,11 @@ impl ProviderAdapter for OllamaAdapter {
     }
 
     fn models_endpoint(&self) -> &'static str {
-        // Ollama uses /api/tags for model listing, but also supports /v1/models
-        "/v1/models"
+        "/api/tags"
+    }
+
+    fn model_catalog_format(&self) -> Option<super::ModelCatalogFormat> {
+        Some(super::ModelCatalogFormat::Ollama)
     }
 
     /// Ollama native shape: `message.content`. The default `OpenAI`

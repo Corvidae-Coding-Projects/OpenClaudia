@@ -99,12 +99,7 @@ fn anthropic_transform_includes_temperature_only_when_set() {
 #[test]
 fn anthropic_transform_omits_temperature_for_models_that_reject_sampling_params() {
     let adapter = get_adapter("anthropic").unwrap();
-    for model in [
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-fable-5",
-        "claude-mythos-5",
-    ] {
+    for model in ["claude-opus-4-8", "claude-fable-5", "claude-mythos-5"] {
         let mut request = req(model, vec![msg("user", "hi")]);
         request.temperature = Some(0.5);
         let body = adapter.transform_request(&request).expect("ok");

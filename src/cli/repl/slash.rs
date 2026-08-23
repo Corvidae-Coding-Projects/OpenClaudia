@@ -1094,7 +1094,13 @@ pub fn slash_model(
         return SlashCommandResult::Handled;
     }
     if args.eq_ignore_ascii_case("default") {
-        let default_model = openclaudia::providers::default_model_for_target(provider).to_string();
+        let Some(default_model) = openclaudia::providers::default_model_for_target(provider) else {
+            println!(
+                "\nProvider \x1b[36m{provider}\x1b[0m has no built-in default; choose an installed model explicitly.\n"
+            );
+            return SlashCommandResult::Handled;
+        };
+        let default_model = default_model.to_string();
         println!("\nSwitching to default model: \x1b[36m{default_model}\x1b[0m\n");
         return SlashCommandResult::SwitchModel(default_model);
     }
@@ -1664,16 +1670,12 @@ pub fn slash_effort(args: &str) -> SlashCommandResult {
 }
 
 fn fast_model_for_provider(provider: &str) -> Option<&'static str> {
-    let static_provider = match provider {
-        "gemini" => "google",
-        "glm" | "zhipu" => "zai",
-        "alibaba" => "qwen",
-        "moonshot" => "kimi",
-        other => other,
-    };
-    let preferred: &[&str] = match static_provider {
+    let static_provider =
+        openclaudia::providers::canonical_static_catalog_provider(provider).to_ascii_lowercase();
+    let preferred: &[&str] = match static_provider.as_str() {
         "anthropic" => &["claude-haiku-4-5-20251001"],
         "openai" => &[
+            "gpt-5.6-luna",
             "gpt-5.4-mini",
             "gpt-5.4-nano",
             "gpt-5-mini",
@@ -1694,11 +1696,17 @@ fn fast_model_for_provider(provider: &str) -> Option<&'static str> {
         "minimax" => &["MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"],
         _ => return None,
     };
-    let available = get_available_models(static_provider);
-    preferred
-        .iter()
-        .copied()
-        .find(|candidate| available.contains(candidate))
+    preferred.iter().copied().find(|candidate| {
+        let resolved = openclaudia::providers::resolve_model(&static_provider, candidate);
+        resolved.entry.is_some_and(|entry| {
+            entry.access != openclaudia::providers::ModelAccessState::Unavailable
+                && !matches!(
+                    entry.lifecycle,
+                    openclaudia::providers::ModelLifecycle::Deprecated
+                        | openclaudia::providers::ModelLifecycle::Retired
+                )
+        })
+    })
 }
 
 pub fn slash_fast(provider: &str, current_model: &str) -> SlashCommandResult {
@@ -3605,6 +3613,19 @@ mod tests {
     }
 
     #[test]
+    fn spec_fast_openai_switches_to_luna_and_low_effort() {
+        let result = handle_slash_command("/fast", &mut ctx(), "openai", "gpt-5.6-sol");
+        assert!(
+            matches!(
+                result,
+                Some(SlashCommandResult::FastMode { ref effort, ref model })
+                    if effort == "low" && model.as_deref() == Some("gpt-5.6-luna")
+            ),
+            "/fast must set low effort and switch OpenAI sessions to Luna"
+        );
+    }
+
+    #[test]
     fn spec_fast_keeps_model_when_already_fast() {
         let result = handle_slash_command(
             "/fast",
@@ -3780,7 +3801,7 @@ mod tests {
             "claude-sonnet-4-5",
         );
         assert!(
-            matches!(result, Some(SlashCommandResult::SwitchModel(model)) if model == openclaudia::providers::default_model_for_target("anthropic")),
+            matches!(result, Some(SlashCommandResult::SwitchModel(model)) if Some(model.as_str()) == openclaudia::providers::default_model_for_target("anthropic")),
             "/model default must switch to the provider default model"
         );
     }
@@ -3789,7 +3810,7 @@ mod tests {
     fn spec_model_default_reset_is_case_insensitive() {
         let result = handle_slash_command("/model DEFAULT", &mut ctx(), "qwen", "qwen3.7-coder");
         assert!(
-            matches!(result, Some(SlashCommandResult::SwitchModel(model)) if model == openclaudia::providers::default_model_for_target("qwen")),
+            matches!(result, Some(SlashCommandResult::SwitchModel(model)) if Some(model.as_str()) == openclaudia::providers::default_model_for_target("qwen")),
             "/model DEFAULT must reset using the provider default table"
         );
     }

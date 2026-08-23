@@ -368,6 +368,7 @@ proxy:
 providers:
   local:
     base_url: http://localhost:1234/v1
+    model: local-test-model
 "#,
     )
     .expect("config file");
@@ -471,6 +472,7 @@ proxy:
 providers:
   local:
     base_url: {base_url}
+    model: local-test-model
 "#,
         ),
     )
@@ -491,8 +493,10 @@ proxy:
 providers:
   local:
     base_url: http://127.0.0.1:1
+    model: unused-local-test-model
   lmstudio:
     base_url: {base_url}
+    model: lmstudio-test-model
 "#,
         ),
     )
@@ -513,6 +517,7 @@ proxy:
 providers:
   local:
     base_url: {base_url}
+    model: local-test-model
 hooks:
   stop:
     - hooks:

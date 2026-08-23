@@ -885,7 +885,8 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         options.model_override,
         provider.model.clone(),
         &config.proxy.target,
-    );
+    )
+    .map_err(anyhow::Error::msg)?;
     let wire_api = if codex_responses_auth.is_some() {
         openclaudia::pipeline::WireApi::OpenAiResponses
     } else {
@@ -1535,10 +1536,15 @@ fn resolve_model_name(
     model_override: Option<String>,
     provider_model: Option<String>,
     target: &str,
-) -> String {
+) -> Result<String, String> {
     model_override
         .or(provider_model)
-        .unwrap_or_else(|| openclaudia::providers::default_model_for_target(target).to_string())
+        .or_else(|| openclaudia::providers::default_model_for_target(target).map(str::to_string))
+        .ok_or_else(|| {
+            format!(
+                "provider '{target}' has no configured model; set providers.{target}.model or pass --model"
+            )
+        })
 }
 
 /// Parse a behavioral-mode string (`--mode`) into a `BehaviorMode`.
@@ -3044,42 +3050,64 @@ mod tests {
             Some("custom-model".to_string()),
             Some("provider-default".to_string()),
             "anthropic",
-        );
+        )
+        .expect("explicit model");
         assert_eq!(got, "custom-model");
     }
 
     #[test]
     fn resolve_model_falls_back_to_provider_config() {
-        let got = resolve_model_name(None, Some("provider-default".to_string()), "openai");
+        let got = resolve_model_name(None, Some("provider-default".to_string()), "openai")
+            .expect("configured model");
         assert_eq!(got, "provider-default");
     }
 
     #[test]
     fn resolve_model_per_target_defaults() {
         assert_eq!(
-            resolve_model_name(None, None, "anthropic"),
+            resolve_model_name(None, None, "anthropic").expect("known default"),
             "claude-opus-4-8"
         );
-        assert_eq!(resolve_model_name(None, None, "openai"), "gpt-5.5");
-        assert_eq!(resolve_model_name(None, None, "google"), "gemini-3.5-flash");
-        assert_eq!(resolve_model_name(None, None, "gemini"), "gemini-3.5-flash");
-        assert_eq!(resolve_model_name(None, None, "zai"), "glm-5.2");
-        assert_eq!(resolve_model_name(None, None, "glm"), "glm-5.2");
-        assert_eq!(resolve_model_name(None, None, "zhipu"), "glm-5.2");
         assert_eq!(
-            resolve_model_name(None, None, "deepseek"),
+            resolve_model_name(None, None, "openai").unwrap(),
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            resolve_model_name(None, None, "google").unwrap(),
+            "gemini-3.7-flash"
+        );
+        assert_eq!(
+            resolve_model_name(None, None, "gemini").unwrap(),
+            "gemini-3.7-flash"
+        );
+        assert_eq!(resolve_model_name(None, None, "zai").unwrap(), "glm-5.2");
+        assert_eq!(resolve_model_name(None, None, "glm").unwrap(), "glm-5.2");
+        assert_eq!(resolve_model_name(None, None, "zhipu").unwrap(), "glm-5.2");
+        assert_eq!(
+            resolve_model_name(None, None, "deepseek").unwrap(),
             "deepseek-v4-pro"
         );
-        assert_eq!(resolve_model_name(None, None, "qwen"), "qwen3.7-plus");
-        assert_eq!(resolve_model_name(None, None, "alibaba"), "qwen3.7-plus");
-        assert_eq!(resolve_model_name(None, None, "kimi"), "kimi-k2.7-code");
-        assert_eq!(resolve_model_name(None, None, "moonshot"), "kimi-k2.7-code");
-        assert_eq!(resolve_model_name(None, None, "minimax"), "MiniMax-M3");
-        // Unknown target falls back to the OpenAI default.
         assert_eq!(
-            resolve_model_name(None, None, "unknown-provider"),
-            "gpt-5.5"
+            resolve_model_name(None, None, "qwen").unwrap(),
+            "qwen3.7-plus"
         );
+        assert_eq!(
+            resolve_model_name(None, None, "alibaba").unwrap(),
+            "qwen3.7-plus"
+        );
+        assert_eq!(
+            resolve_model_name(None, None, "kimi").unwrap(),
+            "kimi-k2.7-code"
+        );
+        assert_eq!(
+            resolve_model_name(None, None, "moonshot").unwrap(),
+            "kimi-k2.7-code"
+        );
+        assert_eq!(
+            resolve_model_name(None, None, "minimax").unwrap(),
+            "MiniMax-M3"
+        );
+        assert!(resolve_model_name(None, None, "unknown-provider").is_err());
     }
 
     #[test]
@@ -3117,9 +3145,15 @@ mod tests {
         );
         assert_eq!(anthropic["max_tokens"], 40_000);
 
-        let openai =
-            build_chat_request_body("openai", &messages, "o3", &prompt_blocks, "max", None)
-                .expect("openai-like request must build");
+        let openai = build_chat_request_body(
+            "openai",
+            &messages,
+            "gpt-5.6-sol",
+            &prompt_blocks,
+            "max",
+            None,
+        )
+        .expect("openai-like request must build");
         assert_eq!(openai["reasoning_effort"], "xhigh");
 
         let gpt5 =
@@ -3130,7 +3164,7 @@ mod tests {
         let google = build_chat_request_body(
             "google",
             &messages,
-            "gemini-2.5-pro",
+            "gemini-3.7-flash",
             &prompt_blocks,
             "max",
             None,
@@ -3163,23 +3197,21 @@ mod tests {
     #[test]
     fn default_models_table_is_canonical_for_resolver() {
         for (target, expected_model) in openclaudia::providers::DEFAULT_MODELS_BY_TARGET {
-            let got = resolve_model_name(None, None, target);
+            let got = resolve_model_name(None, None, target).expect("known default");
             assert_eq!(
                 got, *expected_model,
                 "DEFAULT_MODELS_BY_TARGET entry for `{target}` must round-trip through resolve_model_name"
             );
             assert_eq!(
                 openclaudia::providers::default_model_for_target(target),
-                *expected_model,
+                Some(*expected_model),
                 "default_model_for_target must agree with DEFAULT_MODELS_BY_TARGET for `{target}`"
             );
         }
-        // The fallback constant pins the openai/unknown default literal too.
         assert_eq!(
             openclaudia::providers::default_model_for_target("definitely-not-a-known-target"),
-            openclaudia::providers::DEFAULT_MODEL_FALLBACK
+            None
         );
-        assert_eq!(openclaudia::providers::DEFAULT_MODEL_FALLBACK, "gpt-5.5");
     }
 
     /// #802 (companion): the table must not contain duplicate target keys —

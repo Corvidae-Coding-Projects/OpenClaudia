@@ -56,9 +56,12 @@ pub use google::{
 pub use kimi::KimiAdapter;
 pub use minimax::MiniMaxAdapter;
 pub use model_catalog::{
-    canonical_static_catalog_provider, static_models_for_provider, ANTHROPIC_MODELS,
-    DEEPSEEK_MODELS, GOOGLE_MODELS, KIMI_MODELS, MINIMAX_MODELS, OPENAI_MODELS, QWEN_MODELS,
-    STATIC_MODEL_CATALOG_PROVIDERS, ZAI_MODELS,
+    cached_model_catalog, canonical_static_catalog_provider, emergency_fallback_catalog,
+    known_model_context_window, resolve_model, static_models_for_provider, ModelAccessState,
+    ModelCapabilities, ModelCatalogEntry, ModelCatalogFormat, ModelCatalogProvenance,
+    ModelCatalogSnapshot, ModelEvidenceSource, ModelLifecycle, ModelPricingState, ModelSupport,
+    ReasoningProfile, ResolvedModel, ANTHROPIC_MODELS, DEEPSEEK_MODELS, GOOGLE_MODELS, KIMI_MODELS,
+    MINIMAX_MODELS, OPENAI_MODELS, QWEN_MODELS, STATIC_MODEL_CATALOG_PROVIDERS, ZAI_MODELS,
 };
 pub use ollama::{advance_ollama_chat_state, OllamaAdapter, OllamaChatTurnOutput};
 pub(crate) use openai::finalize_responses_request;
@@ -230,6 +233,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// Check if this provider supports model listing
     fn supports_model_listing(&self) -> bool {
         false
+    }
+
+    /// Response schema used by the provider's model-list endpoint.
+    fn model_catalog_format(&self) -> Option<ModelCatalogFormat> {
+        self.supports_model_listing()
+            .then_some(ModelCatalogFormat::OpenAi)
     }
 
     /// Get the models endpoint path (for providers that support it)
@@ -554,8 +563,9 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &[
 /// freshly-started session.
 pub const DEFAULT_MODELS_BY_TARGET: &[(&str, &str)] = &[
     ("anthropic", "claude-opus-4-8"),
-    ("google", "gemini-3.5-flash"),
-    ("gemini", "gemini-3.5-flash"),
+    ("openai", "gpt-5.6-sol"),
+    ("google", "gemini-3.7-flash"),
+    ("gemini", "gemini-3.7-flash"),
     ("zai", "glm-5.2"),
     ("glm", "glm-5.2"),
     ("zhipu", "glm-5.2"),
@@ -570,18 +580,16 @@ pub const DEFAULT_MODELS_BY_TARGET: &[(&str, &str)] = &[
     ("opencode-go", "kimi-k2.7-code"),
 ];
 
-/// Fallback model for targets not listed in [`DEFAULT_MODELS_BY_TARGET`].
-/// Currently every non-table target is treated as OpenAI-compatible.
-pub const DEFAULT_MODEL_FALLBACK: &str = "gpt-5.5";
-
-/// Look up the canonical default model for a target, or [`DEFAULT_MODEL_FALLBACK`].
+/// Look up the canonical default model for a provider with a maintained default.
+///
+/// Local and custom OpenAI-compatible targets intentionally return `None`:
+/// their installed model inventory is runtime state, not an `OpenAI` default.
 #[must_use]
-pub fn default_model_for_target(target: &str) -> &'static str {
+pub fn default_model_for_target(target: &str) -> Option<&'static str> {
     let target = target.trim();
     DEFAULT_MODELS_BY_TARGET
         .iter()
         .find_map(|(t, m)| t.eq_ignore_ascii_case(target).then_some(*m))
-        .unwrap_or(DEFAULT_MODEL_FALLBACK)
 }
 
 /// Environment variable users should set for a provider API key.
@@ -683,52 +691,25 @@ pub fn get_adapter(provider: &str) -> Result<&'static dyn ProviderAdapter, Provi
     Ok(adapter)
 }
 
+#[cfg(test)]
 fn parse_models_response(body: &Value) -> Result<Vec<ModelInfo>, ProviderError> {
-    // Parse OpenAI-style response: { "data": [...], "object": "list" }
-    let data = body.get("data").and_then(Value::as_array).ok_or_else(|| {
-        ProviderError::InvalidResponse("Expected 'data' array in response".to_string())
-    })?;
-
-    let mut models = Vec::with_capacity(data.len());
-    for (index, model) in data.iter().enumerate() {
-        let id = model
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Model entry at index {index} missing non-empty string 'id': {model}"
-                ))
-            })?
-            .to_string();
-
-        let owned_by = match model.get("owned_by") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(value.as_str().ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Model entry at index {index} has non-string 'owned_by': {model}"
-                ))
-            })?),
-        }
-        .map(str::to_string);
-
-        let created = match model.get("created") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(value.as_i64().ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Model entry at index {index} has non-integer 'created': {model}"
-                ))
-            })?),
-        };
-
-        models.push(ModelInfo {
-            id,
-            owned_by,
-            created,
-        });
-    }
-
-    Ok(models)
+    let snapshot = model_catalog::parse_discovered_catalog(
+        "openai",
+        "https://example.invalid/v1/models",
+        ModelCatalogFormat::OpenAi,
+        body,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(ProviderError::InvalidResponse)?;
+    Ok(snapshot
+        .models
+        .into_iter()
+        .map(|model| ModelInfo {
+            id: model.canonical_id,
+            owned_by: model.owned_by,
+            created: model.created,
+        })
+        .collect())
 }
 
 /// Fetch available models from a provider's `/v1/models` endpoint.
@@ -759,12 +740,43 @@ pub async fn fetch_models_with_headers(
     extra_headers: &SensitiveHeaders,
     adapter: &dyn ProviderAdapter,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
+    let snapshot =
+        discover_model_catalog_with_headers(base_url, api_key, extra_headers, adapter).await?;
+    Ok(snapshot
+        .models
+        .into_iter()
+        .map(|model| ModelInfo {
+            id: model.canonical_id,
+            owned_by: model.owned_by,
+            created: model.created,
+        })
+        .collect())
+}
+
+/// Discover and cache the account-scoped model catalogue exposed by a provider.
+///
+/// # Errors
+///
+/// Returns a `ProviderError` when listing is unsupported, the endpoint fails,
+/// or the provider returns a malformed response.
+pub async fn discover_model_catalog_with_headers(
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+) -> Result<ModelCatalogSnapshot, ProviderError> {
     if !adapter.supports_model_listing() {
         return Err(ProviderError::Unsupported(format!(
             "Provider '{}' does not support model listing",
             adapter.name()
         )));
     }
+    let format = adapter.model_catalog_format().ok_or_else(|| {
+        ProviderError::Unsupported(format!(
+            "Provider '{}' does not declare a model catalogue format",
+            adapter.name()
+        ))
+    })?;
 
     let client = reqwest::Client::new();
 
@@ -774,6 +786,10 @@ pub async fn fetch_models_with_headers(
     // `/v1beta` for Gemini, now only needs to land in one place).
     let normalized_base = crate::proxy::normalize_base_url(base_url);
     let url = format!("{}{}", normalized_base, adapter.models_endpoint());
+    let now_unix = chrono::Utc::now().timestamp();
+    if let Some(snapshot) = cached_model_catalog(adapter.name(), &url, now_unix) {
+        return Ok(snapshot);
+    }
 
     let mut headers = SensitiveHeaders::new();
 
@@ -803,7 +819,11 @@ pub async fn fetch_models_with_headers(
         ProviderError::InvalidResponse(format!("Failed to parse models response: {e}"))
     })?;
 
-    parse_models_response(&body)
+    let snapshot =
+        model_catalog::parse_discovered_catalog(adapter.name(), &url, format, &body, now_unix)
+            .map_err(ProviderError::InvalidResponse)?;
+    model_catalog::cache_discovered_catalog(&url, snapshot.clone());
+    Ok(snapshot)
 }
 
 #[cfg(test)]
@@ -1372,7 +1392,7 @@ mod tests {
 
         match err {
             ProviderError::InvalidResponse(msg) => {
-                assert!(msg.contains("index 1"), "{msg}");
+                assert!(msg.contains("entry 1"), "{msg}");
                 assert!(msg.contains("'id'"), "{msg}");
             }
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1386,7 +1406,7 @@ mod tests {
 
         match err {
             ProviderError::InvalidResponse(msg) => {
-                assert!(msg.contains("index 0"), "{msg}");
+                assert!(msg.contains("entry 0"), "{msg}");
                 assert!(msg.contains("'id'"), "{msg}");
             }
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1443,7 +1463,8 @@ mod tests {
                 "request missing custom header:\n{request}"
             );
 
-            let body = r#"{"object":"list","data":[{"id":"openrouter/test-model"}]}"#;
+            let body =
+                r#"{"object":"list","has_more":true,"data":[{"id":"openrouter/test-model"}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -1520,6 +1541,107 @@ mod tests {
 
         server.join().expect("server thread must finish");
         assert_eq!(models[0].id, "test-model");
+    }
+
+    #[tokio::test]
+    async fn native_google_catalog_discovery_uses_gemini_shape_and_auth() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1beta/models"))
+            .and(query_param("pageSize", "1000"))
+            .and(header("x-goog-api-key", "google-model-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{
+                    "name": "models/gemini-live",
+                    "inputTokenLimit": 1_048_576,
+                    "outputTokenLimit": 65536,
+                    "supportedGenerationMethods": ["generateContent"]
+                }],
+                "nextPageToken": "more"
+            })))
+            .mount(&server)
+            .await;
+
+        let key = ApiKey::try_from_string("google-model-key".to_string()).expect("valid key");
+        let snapshot = discover_model_catalog_with_headers(
+            &server.uri(),
+            Some(&key),
+            &SensitiveHeaders::new(),
+            &GOOGLE,
+        )
+        .await
+        .expect("Gemini model discovery");
+        assert_eq!(snapshot.models[0].canonical_id, "gemini-live");
+        assert_eq!(
+            snapshot.models[0].capabilities.input_context_tokens,
+            Some(1_048_576)
+        );
+        assert!(!snapshot.complete);
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_catalog_discovery_uses_models_shape() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(query_param("limit", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "claude-live",
+                    "display_name": "Claude Live",
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "max_input_tokens": 1_000_000,
+                    "max_tokens": 128_000
+                }],
+                "has_more": true
+            })))
+            .mount(&server)
+            .await;
+
+        let key = ApiKey::try_from_string("anthropic-model-key".to_string()).expect("valid key");
+        let snapshot = discover_model_catalog_with_headers(
+            &server.uri(),
+            Some(&key),
+            &SensitiveHeaders::new(),
+            &ANTHROPIC,
+        )
+        .await
+        .expect("Anthropic model discovery");
+        assert_eq!(snapshot.models[0].canonical_id, "claude-live");
+        assert_eq!(snapshot.models[0].access, ModelAccessState::Available);
+        assert!(!snapshot.complete);
+    }
+
+    #[tokio::test]
+    async fn native_ollama_catalog_discovery_uses_installed_tags() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "local-model:latest"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let snapshot = discover_model_catalog_with_headers(
+            &server.uri(),
+            None,
+            &SensitiveHeaders::new(),
+            &OLLAMA,
+        )
+        .await
+        .expect("Ollama model discovery");
+        assert_eq!(snapshot.models[0].canonical_id, "local-model:latest");
+        assert_eq!(snapshot.models[0].access, ModelAccessState::Available);
     }
 
     #[test]

@@ -30,7 +30,7 @@ use tracing::{debug, warn};
 use crate::config::ThinkingConfig;
 use crate::proxy::ChatCompletionRequest;
 
-use super::{ApiKey, ProviderAdapter, ProviderError};
+use super::{ApiKey, ProviderAdapter, ProviderError, ReasoningProfile};
 
 /// How the provider expects the "thinking mode" toggle to be encoded in
 /// the request body.
@@ -90,6 +90,37 @@ impl ThinkingInjector {
     /// (currently only `OpenAiReasoningEffort`).
     #[allow(clippy::too_many_lines)]
     fn inject(self, body: &mut Value, thinking: &ThinkingConfig, model: &str) {
+        let (provider, supported_profiles): (&str, &[ReasoningProfile]) = match self {
+            Self::OpenAiReasoningEffort => ("openai", &[ReasoningProfile::OpenAiEffort]),
+            Self::DeepSeekThinking => ("deepseek", &[ReasoningProfile::DeepSeekThinking]),
+            Self::QwenEnableThinking => ("qwen", &[ReasoningProfile::QwenThinking]),
+            Self::GlmThinking => (
+                "zai",
+                &[
+                    ReasoningProfile::GlmThinking,
+                    ReasoningProfile::GlmThinkingWithEffort,
+                ],
+            ),
+            Self::MiniMaxThinking => ("minimax", &[ReasoningProfile::MiniMaxAdaptive]),
+            Self::KimiThinking => (
+                "kimi",
+                &[ReasoningProfile::KimiAlways, ReasoningProfile::KimiToggle],
+            ),
+        };
+        let profile = super::resolve_model(provider, model)
+            .capabilities()
+            .reasoning_profile;
+        if !supported_profiles.contains(&profile) {
+            if thinking.enabled {
+                warn!(
+                    model = %model,
+                    provider,
+                    "thinking requested without current model-capability evidence; omitting provider-specific controls",
+                );
+            }
+            return;
+        }
+
         match self {
             Self::OpenAiReasoningEffort => {
                 if thinking.enabled {
@@ -184,18 +215,6 @@ impl ThinkingInjector {
                     } else {
                         body["thinking"] = json!({ "type": "disabled" });
                     }
-                } else if is_kimi_k25_model(model) {
-                    if thinking.enabled {
-                        body["thinking"] = json!({ "type": "enabled" });
-                        if thinking.preserve_across_turns {
-                            warn!(
-                                model = %model,
-                                "Kimi K2.5 does not support preserved thinking; omitting thinking.keep",
-                            );
-                        }
-                    } else {
-                        body["thinking"] = json!({ "type": "disabled" });
-                    }
                 } else if thinking.enabled && has_explicit_kimi_thinking_option(thinking) {
                     warn!(
                         model = %model,
@@ -209,10 +228,10 @@ impl ThinkingInjector {
 }
 
 fn is_openai_reasoning_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    ["o1", "o3", "o4", "gpt-5"]
-        .iter()
-        .any(|family| is_model_family(&model, family))
+    super::resolve_model("openai", model)
+        .capabilities()
+        .reasoning_profile
+        == ReasoningProfile::OpenAiEffort
 }
 
 fn openai_reasoning_effort(effort: Option<&str>) -> &'static str {
@@ -241,41 +260,38 @@ fn zai_reasoning_effort(effort: Option<&str>) -> &'static str {
     }
 }
 
-const fn is_zai_reasoning_effort_model(model: &str) -> bool {
-    model.eq_ignore_ascii_case("glm-5.2")
+fn is_zai_reasoning_effort_model(model: &str) -> bool {
+    super::resolve_model("zai", model)
+        .capabilities()
+        .reasoning_profile
+        == ReasoningProfile::GlmThinkingWithEffort
 }
 
-const fn is_minimax_m3_model(model: &str) -> bool {
-    model.eq_ignore_ascii_case("MiniMax-M3")
+fn is_minimax_m3_model(model: &str) -> bool {
+    super::resolve_model("minimax", model)
+        .capabilities()
+        .reasoning_profile
+        == ReasoningProfile::MiniMaxAdaptive
 }
 
 fn is_kimi_k27_code_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model == "kimi-k2.7-code" || model == "kimi-k2.7-code-highspeed"
+    super::resolve_model("kimi", model)
+        .capabilities()
+        .reasoning_profile
+        == ReasoningProfile::KimiAlways
 }
 
-const fn is_kimi_k26_model(model: &str) -> bool {
-    model.eq_ignore_ascii_case("kimi-k2.6")
-}
-
-const fn is_kimi_k25_model(model: &str) -> bool {
-    model.eq_ignore_ascii_case("kimi-k2.5")
+fn is_kimi_k26_model(model: &str) -> bool {
+    super::resolve_model("kimi", model)
+        .capabilities()
+        .reasoning_profile
+        == ReasoningProfile::KimiToggle
 }
 
 const fn has_explicit_kimi_thinking_option(thinking: &ThinkingConfig) -> bool {
     thinking.budget_tokens.is_some()
         || thinking.reasoning_effort.is_some()
         || thinking.preserve_across_turns
-}
-
-fn is_model_family(model: &str, family: &str) -> bool {
-    if model == family {
-        return true;
-    }
-
-    model
-        .strip_prefix(family)
-        .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('.'))
 }
 
 /// Shared `OpenAI`-compatible adapter parameterized on the provider's
@@ -511,8 +527,8 @@ mod tests {
     #[test]
     fn openai_reasoning_effort_set_for_reasoning_model() {
         let injector = ThinkingInjector::OpenAiReasoningEffort;
-        let mut body = serde_json::to_value(req("o3-mini")).unwrap();
-        injector.inject(&mut body, &thinking_on(), "o3-mini");
+        let mut body = serde_json::to_value(req("gpt-5.6-sol")).unwrap();
+        injector.inject(&mut body, &thinking_on(), "gpt-5.6-sol");
         assert_eq!(body["reasoning_effort"], "medium");
     }
 
@@ -520,8 +536,8 @@ mod tests {
     fn openai_reasoning_effort_honours_configured_level() {
         let mut t = thinking_on();
         t.reasoning_effort = Some("high".to_string());
-        let mut body = serde_json::to_value(req("o1-preview")).unwrap();
-        ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &t, "o1-preview");
+        let mut body = serde_json::to_value(req("gpt-5.6-terra")).unwrap();
+        ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &t, "gpt-5.6-terra");
         assert_eq!(body["reasoning_effort"], "high");
     }
 
@@ -550,13 +566,13 @@ mod tests {
     }
 
     #[test]
-    fn openai_reasoning_effort_set_for_gpt5_model_family() {
-        for model in ["gpt-5", "gpt-5.5", "gpt-5.3-codex", "gpt-5.1-codex-max"] {
+    fn openai_reasoning_effort_set_for_exact_catalog_models() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"] {
             let mut body = serde_json::to_value(req(model)).unwrap();
             ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &thinking_on(), model);
             assert_eq!(
                 body["reasoning_effort"], "medium",
-                "{model} should receive reasoning_effort"
+                "{model} has current capability evidence"
             );
         }
     }
@@ -577,8 +593,8 @@ mod tests {
 
     #[test]
     fn openai_reasoning_effort_absent_when_disabled() {
-        let mut body = serde_json::to_value(req("o3-mini")).unwrap();
-        ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &thinking_off(), "o3-mini");
+        let mut body = serde_json::to_value(req("gpt-5.6-sol")).unwrap();
+        ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &thinking_off(), "gpt-5.6-sol");
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -604,26 +620,26 @@ mod tests {
 
     #[test]
     fn qwen_thinking_always_writes_explicit_bool() {
-        let mut on = serde_json::to_value(req("qwq-32b")).unwrap();
-        ThinkingInjector::QwenEnableThinking.inject(&mut on, &thinking_on(), "qwq-32b");
+        let mut on = serde_json::to_value(req("qwen3.7-plus")).unwrap();
+        ThinkingInjector::QwenEnableThinking.inject(&mut on, &thinking_on(), "qwen3.7-plus");
         assert_eq!(on["enable_thinking"], true);
 
-        let mut off = serde_json::to_value(req("qwq-32b")).unwrap();
-        ThinkingInjector::QwenEnableThinking.inject(&mut off, &thinking_off(), "qwq-32b");
+        let mut off = serde_json::to_value(req("qwen3.7-plus")).unwrap();
+        ThinkingInjector::QwenEnableThinking.inject(&mut off, &thinking_off(), "qwen3.7-plus");
         // Qwen prior behaviour: explicit false when disabled.
         assert_eq!(off["enable_thinking"], false);
     }
 
     #[test]
     fn glm_thinking_encodes_enabled_disabled_object() {
-        let mut on = serde_json::to_value(req("glm-4.7")).unwrap();
-        ThinkingInjector::GlmThinking.inject(&mut on, &thinking_on(), "glm-4.7");
+        let mut on = serde_json::to_value(req("glm-5-turbo")).unwrap();
+        ThinkingInjector::GlmThinking.inject(&mut on, &thinking_on(), "glm-5-turbo");
         assert_eq!(on["thinking"]["type"], "enabled");
         // No preserve flag by default.
         assert!(on["thinking"].get("clear_thinking").is_none());
 
-        let mut off = serde_json::to_value(req("glm-4.7")).unwrap();
-        ThinkingInjector::GlmThinking.inject(&mut off, &thinking_off(), "glm-4.7");
+        let mut off = serde_json::to_value(req("glm-5-turbo")).unwrap();
+        ThinkingInjector::GlmThinking.inject(&mut off, &thinking_off(), "glm-5-turbo");
         assert_eq!(off["thinking"]["type"], "disabled");
     }
 
@@ -631,8 +647,8 @@ mod tests {
     fn glm_thinking_preserve_emits_clear_thinking_false() {
         let mut t = thinking_on();
         t.preserve_across_turns = true;
-        let mut body = serde_json::to_value(req("glm-4.7")).unwrap();
-        ThinkingInjector::GlmThinking.inject(&mut body, &t, "glm-4.7");
+        let mut body = serde_json::to_value(req("glm-5-turbo")).unwrap();
+        ThinkingInjector::GlmThinking.inject(&mut body, &t, "glm-5-turbo");
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["clear_thinking"], false);
         assert!(body.get("clear_thinking").is_none());
@@ -708,13 +724,12 @@ mod tests {
     }
 
     #[test]
-    fn kimi_k25_does_not_emit_preserved_thinking_keep() {
+    fn stale_kimi_k25_name_does_not_enable_thinking_controls() {
         let mut preserve = thinking_on();
         preserve.preserve_across_turns = true;
         let mut body = serde_json::to_value(req("kimi-k2.5")).unwrap();
         ThinkingInjector::KimiThinking.inject(&mut body, &preserve, "kimi-k2.5");
-        assert_eq!(body["thinking"], json!({"type": "enabled"}));
-        assert!(body["thinking"].get("keep").is_none());
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]

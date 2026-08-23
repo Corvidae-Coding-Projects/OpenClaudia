@@ -307,7 +307,12 @@ fn build_distillation_call(
         .distillation_model
         .as_deref()
         .or(provider.model.as_deref())
-        .unwrap_or_else(|| default_distillation_model_for_provider(provider_name));
+        .or_else(|| default_distillation_model_for_provider(provider_name))
+        .ok_or_else(|| {
+            format!(
+                "distillation provider '{provider_name}' has no configured or built-in default model"
+            )
+        })?;
     let adapter = get_adapter(provider_name).map_err(|e| e.to_string())?;
     let endpoint = pipeline::resolve_endpoint(provider_name, model, &provider.base_url, None)
         .map_err(|e| e.to_string())?;
@@ -434,14 +439,14 @@ async fn execute_distillation_call(call: DistillationCall) -> Result<String, Str
     Ok(text)
 }
 
-fn default_distillation_model_for_provider(provider: &str) -> &'static str {
+fn default_distillation_model_for_provider(provider: &str) -> Option<&'static str> {
     match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => "claude-haiku-4-5",
-        "openai" | "local" | "lmstudio" | "localai" | "text-generation-webui" => "gpt-5.4-mini",
-        "google" | "gemini" => "gemini-3.5-flash",
-        "deepseek" => "deepseek-v4-flash",
-        "qwen" | "alibaba" => "qwen3.6-flash",
-        "zai" | "glm" | "zhipu" => "glm-5-turbo",
+        "anthropic" => Some("claude-haiku-4-5"),
+        "openai" => Some("gpt-5.6-luna"),
+        "google" | "gemini" => Some("gemini-3.7-flash"),
+        "deepseek" => Some("deepseek-v4-flash"),
+        "qwen" | "alibaba" => Some("qwen3.6-flash"),
+        "zai" | "glm" | "zhipu" => Some("glm-5-turbo"),
         other => default_model_for_target(other),
     }
 }

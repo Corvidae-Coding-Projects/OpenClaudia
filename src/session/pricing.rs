@@ -1389,16 +1389,26 @@ mod tests {
     }
 
     #[test]
-    fn google_static_catalog_models_resolve_pricing() {
-        let missing = crate::providers::GOOGLE_MODELS
+    fn google_catalog_marks_models_without_attributable_pricing_unknown() {
+        let unpriced = crate::providers::GOOGLE_MODELS
             .iter()
             .copied()
             .filter(|model| get_pricing(model).is_none())
             .collect::<Vec<_>>();
-        assert!(
-            missing.is_empty(),
-            "PRICING_TABLE is missing Google catalog model(s): {missing:?}"
-        );
+        assert_eq!(unpriced, ["gemini-3.7-flash", "gemini-3.6-flash"]);
+
+        let catalog = crate::providers::emergency_fallback_catalog("google");
+        for model in unpriced {
+            assert_eq!(
+                catalog
+                    .find(model)
+                    .expect("fallback model")
+                    .capabilities
+                    .pricing,
+                crate::providers::ModelPricingState::Unknown,
+                "missing attributable prices must stay explicitly unknown"
+            );
+        }
     }
 
     #[test]

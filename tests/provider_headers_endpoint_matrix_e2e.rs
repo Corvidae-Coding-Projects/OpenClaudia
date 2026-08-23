@@ -268,8 +268,9 @@ fn ollama_supports_model_listing() {
     let adapter = get_adapter("ollama").expect("ollama");
     assert!(
         adapter.supports_model_listing(),
-        "Ollama MUST support /v1/models"
+        "Ollama MUST support native /api/tags discovery"
     );
+    assert_eq!(adapter.models_endpoint(), "/api/tags");
 }
 
 #[test]
@@ -301,25 +302,23 @@ fn kimi_supports_model_listing() {
 }
 
 #[test]
-fn anthropic_does_not_support_model_listing() {
-    // PINS DOC: Anthropic doesn't expose a /v1/models endpoint.
+fn anthropic_supports_native_model_listing() {
     let adapter = get_adapter("anthropic").expect("anthropic");
     assert!(
-        !adapter.supports_model_listing(),
-        "Anthropic MUST NOT advertise model listing"
+        adapter.supports_model_listing(),
+        "Anthropic MUST advertise native model listing"
     );
+    assert_eq!(adapter.models_endpoint(), "/v1/models?limit=1000");
 }
 
 #[test]
-fn google_does_not_support_openai_style_model_listing() {
-    // PINS DOC: Google has its own list-models endpoint, NOT the
-    // OpenAI-compatible /v1/models. The adapter declares no support
-    // so fetch_models doesn't attempt it via that path.
+fn google_supports_native_model_listing() {
     let adapter = get_adapter("google").expect("google");
     assert!(
-        !adapter.supports_model_listing(),
-        "Google MUST NOT advertise OpenAI-style model listing"
+        adapter.supports_model_listing(),
+        "Google MUST advertise native model listing"
     );
+    assert_eq!(adapter.models_endpoint(), "/v1beta/models?pageSize=1000");
 }
 
 #[test]

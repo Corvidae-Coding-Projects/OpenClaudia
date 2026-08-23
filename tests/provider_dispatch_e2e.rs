@@ -205,16 +205,13 @@ fn whitespace_only_provider_name_errors() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn anthropic_does_not_advertise_model_listing() {
-    // Anthropic doesn't expose a public /v1/models endpoint for
-    // chat models; the adapter MUST report false so the proxy
-    // surfaces ProviderError::Unsupported instead of issuing a
-    // pointless HTTP call.
+fn anthropic_advertises_native_model_listing() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
     assert!(
-        !adapter.supports_model_listing(),
-        "anthropic adapter must NOT advertise model listing"
+        adapter.supports_model_listing(),
+        "anthropic adapter must advertise its native model catalog"
     );
+    assert_eq!(adapter.models_endpoint(), "/v1/models?limit=1000");
 }
 
 #[test]
@@ -254,16 +251,18 @@ fn qwen_zai_do_not_advertise_model_listing() {
 }
 
 #[test]
-fn models_endpoint_mentions_models_for_listing_capable_adapters() {
-    // Only adapters that advertise model listing need a
-    // sensible endpoint. We check both names that DO
-    // support it — each endpoint must mention `models`.
-    for provider in &["openai", "deepseek", "kimi", "minimax", "ollama"] {
+fn listing_capable_adapters_expose_their_native_endpoint() {
+    for (provider, expected) in [
+        ("openai", "/v1/models"),
+        ("deepseek", "/models"),
+        ("kimi", "/v1/models"),
+        ("minimax", "/v1/models"),
+        ("ollama", "/api/tags"),
+        ("anthropic", "/v1/models?limit=1000"),
+        ("google", "/v1beta/models?pageSize=1000"),
+    ] {
         let adapter = get_adapter(provider).expect("adapter");
-        let endpoint = adapter.models_endpoint();
-        assert!(
-            endpoint.contains("models"),
-            "{provider}: models endpoint must mention 'models'; got {endpoint:?}"
-        );
+        assert!(adapter.supports_model_listing(), "{provider}");
+        assert_eq!(adapter.models_endpoint(), expected, "{provider}");
     }
 }

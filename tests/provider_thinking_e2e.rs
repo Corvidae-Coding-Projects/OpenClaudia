@@ -15,8 +15,8 @@
 //!     plus `thinking.clear_thinking: false` when
 //!     `preserve_across_turns=true`, and `GLM-5.2`
 //!     `reasoning_effort`.
-//!   - **Kimi**: `kimi-k2.6`/`kimi-k2.5` use Kimi's documented
-//!     `thinking` object; K2.7 code models omit it because thinking is
+//!   - **Kimi**: `kimi-k2.6` uses Kimi's documented `thinking` object;
+//!     K2.7 code models omit it because thinking is
 //!     always on and disabled thinking is rejected upstream.
 //!   - **`MiniMax-M3`**: `thinking: {type: "adaptive"|"disabled"}`.
 //!
@@ -81,28 +81,25 @@ const fn disabled_thinking() -> ThinkingConfig {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn openai_thinking_injects_reasoning_effort_for_o1_model() {
+fn stale_openai_o1_name_does_not_enable_reasoning_controls() {
     let adapter = get_adapter("openai").expect("openai adapter");
     let req = minimal_request("o1-preview");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_thinking(Some("high")))
         .expect("transform");
-    assert_eq!(
-        body["reasoning_effort"], "high",
-        "o1 model with thinking enabled MUST set reasoning_effort; got {body}"
-    );
+    assert!(body.get("reasoning_effort").is_none());
 }
 
 #[test]
 fn openai_thinking_defaults_reasoning_effort_to_medium() {
     let adapter = get_adapter("openai").expect("openai adapter");
-    let req = minimal_request("o3-mini");
+    let req = minimal_request("gpt-5.6-sol");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_thinking(None))
         .expect("transform");
     assert_eq!(
         body["reasoning_effort"], "medium",
-        "o3 model with no effort set MUST default to 'medium'; got {body}"
+        "a current OpenAI reasoning model must default to medium; got {body}"
     );
 }
 
@@ -120,16 +117,13 @@ fn openai_thinking_injects_reasoning_effort_for_gpt5_model() {
 }
 
 #[test]
-fn openai_thinking_injects_reasoning_effort_for_gpt5_codex_model() {
+fn unlisted_openai_codex_name_does_not_enable_reasoning_controls() {
     let adapter = get_adapter("openai").expect("openai adapter");
     let req = minimal_request("gpt-5.3-codex");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_thinking(Some("high")))
         .expect("transform");
-    assert_eq!(
-        body["reasoning_effort"], "high",
-        "GPT-5 Codex model with thinking enabled MUST set reasoning_effort; got {body}"
-    );
+    assert!(body.get("reasoning_effort").is_none());
 }
 
 #[test]
@@ -172,7 +166,7 @@ fn openai_thinking_ignored_for_non_reasoning_model() {
 #[test]
 fn openai_thinking_disabled_writes_no_reasoning_field() {
     let adapter = get_adapter("openai").expect("openai adapter");
-    let req = minimal_request("o1-preview");
+    let req = minimal_request("gpt-5.6-sol");
     let body = adapter
         .transform_request_with_thinking(&req, &disabled_thinking())
         .expect("transform");
@@ -241,7 +235,7 @@ fn deepseek_thinking_disabled_writes_disabled_thinking_object() {
 #[test]
 fn qwen_thinking_enabled_writes_enable_thinking_true() {
     let adapter = get_adapter("qwen").expect("qwen adapter");
-    let req = minimal_request("qwq-32b");
+    let req = minimal_request("qwen3.7-plus");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_thinking(None))
         .expect("transform");
@@ -254,7 +248,7 @@ fn qwen_thinking_enabled_writes_enable_thinking_true() {
 #[test]
 fn qwen_thinking_disabled_writes_enable_thinking_false() {
     let adapter = get_adapter("qwen").expect("qwen adapter");
-    let req = minimal_request("qwq-32b");
+    let req = minimal_request("qwen3.7-plus");
     let body = adapter
         .transform_request_with_thinking(&req, &disabled_thinking())
         .expect("transform");
@@ -272,7 +266,7 @@ fn qwen_thinking_disabled_writes_enable_thinking_false() {
 #[test]
 fn zai_thinking_enabled_writes_thinking_object_enabled() {
     let adapter = get_adapter("zai").expect("zai adapter");
-    let req = minimal_request("glm-4-32b");
+    let req = minimal_request("glm-5-turbo");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_thinking(None))
         .expect("transform");
@@ -292,7 +286,7 @@ fn zai_thinking_enabled_writes_thinking_object_enabled() {
 #[test]
 fn zai_thinking_disabled_writes_thinking_object_disabled() {
     let adapter = get_adapter("zai").expect("zai adapter");
-    let req = minimal_request("glm-4-32b");
+    let req = minimal_request("glm-5-turbo");
     let body = adapter
         .transform_request_with_thinking(&req, &disabled_thinking())
         .expect("transform");
@@ -306,7 +300,7 @@ fn zai_thinking_disabled_writes_thinking_object_disabled() {
 #[test]
 fn zai_preserve_across_turns_emits_clear_thinking_false() {
     let adapter = get_adapter("zai").expect("zai adapter");
-    let req = minimal_request("glm-4-32b");
+    let req = minimal_request("glm-5-turbo");
     let thinking = ThinkingConfig {
         enabled: true,
         budget_tokens: None,
@@ -361,7 +355,7 @@ fn zai_non_glm52_does_not_emit_reasoning_effort() {
 #[test]
 fn anthropic_thinking_injects_budget_tokens() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
-    let req = minimal_request("claude-3-5-sonnet-20241022");
+    let req = minimal_request("claude-sonnet-4-6");
     let thinking = ThinkingConfig {
         enabled: true,
         budget_tokens: Some(8000),
@@ -391,36 +385,30 @@ fn anthropic_thinking_injects_budget_tokens() {
 
 #[test]
 fn each_provider_uses_a_distinct_thinking_field() {
-    // Drive all 4 OpenAI-compat providers with the same enabled
-    // thinking config + a generic model name. Each must produce
-    // a body with a provider-specific signature.
     let thinking = enabled_thinking(Some("low"));
-    let req = minimal_request("a-model");
 
     let openai = get_adapter("openai")
         .unwrap()
-        .transform_request_with_thinking(&req, &thinking)
+        .transform_request_with_thinking(&minimal_request("gpt-5.6-sol"), &thinking)
         .unwrap();
-    // a-model is not in the reasoning family so openai injects nothing - that's
-    // the documented behaviour pinned in Section A.
-    assert!(openai.get("reasoning_effort").is_none());
+    assert_eq!(openai["reasoning_effort"], "low");
 
     let deepseek = get_adapter("deepseek")
         .unwrap()
-        .transform_request_with_thinking(&req, &thinking)
+        .transform_request_with_thinking(&minimal_request("deepseek-v4-pro"), &thinking)
         .unwrap();
     assert_eq!(deepseek["thinking"]["type"], "enabled");
     assert_eq!(deepseek["reasoning_effort"], "high");
 
     let qwen = get_adapter("qwen")
         .unwrap()
-        .transform_request_with_thinking(&req, &thinking)
+        .transform_request_with_thinking(&minimal_request("qwen3.7-plus"), &thinking)
         .unwrap();
     assert_eq!(qwen["enable_thinking"], true);
 
     let zai = get_adapter("zai")
         .unwrap()
-        .transform_request_with_thinking(&req, &thinking)
+        .transform_request_with_thinking(&minimal_request("glm-5-turbo"), &thinking)
         .unwrap();
     assert_eq!(zai["thinking"]["type"], "enabled");
 
@@ -490,7 +478,7 @@ fn kimi_k26_thinking_supports_enabled_disabled_and_preserve() {
 }
 
 #[test]
-fn kimi_k25_thinking_does_not_emit_unsupported_keep() {
+fn stale_kimi_k25_name_does_not_enable_thinking_controls() {
     let adapter = get_adapter("kimi").expect("kimi adapter");
     let req = minimal_request("kimi-k2.5");
     let body = adapter
@@ -505,8 +493,7 @@ fn kimi_k25_thinking_does_not_emit_unsupported_keep() {
             },
         )
         .expect("transform");
-    assert_eq!(body["thinking"], json!({"type": "enabled"}));
-    assert!(body["thinking"].get("keep").is_none());
+    assert!(body.get("thinking").is_none());
 }
 
 #[test]

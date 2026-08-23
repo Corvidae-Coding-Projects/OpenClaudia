@@ -161,41 +161,44 @@ transcripts.
 
 ## Supported Models
 
-These are the built-in fallback entries shown by the model picker when a
-provider cannot list models dynamically. They are not an allowlist or a claim
-that every upstream endpoint currently serves every identifier.
+Model pickers discover the account-scoped provider catalog at runtime and
+cache it for six hours. The short lists below are the dated emergency selector
+fallbacks used when discovery is unavailable; they are neither an allowlist nor
+a claim of account access. Optional request features and context limits are
+enabled only from fresh provider metadata or an exact entry in that dated
+fallback. Unknown local/custom targets require an explicitly configured model.
 
 ### Anthropic
 
-- `claude-fable-5`, `claude-mythos-5`, `claude-mythos-preview`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, `claude-haiku-4-5`, `claude-sonnet-4-5-20250929`, `claude-sonnet-4-5`, `claude-opus-4-5-20251101`, `claude-opus-4-5`, `claude-opus-4-1-20250805`
+- `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`, `claude-fable-5`, `claude-mythos-5`
 
 ### OpenAI
 
-- `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.5-2026-04-23`, `gpt-5.5-pro-2026-04-23`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-2026-03-05`, `gpt-5.4-pro-2026-03-05`, `gpt-5.4-mini`, `gpt-5.4-mini-2026-03-17`, `gpt-5.4-nano`, `gpt-5.4-nano-2026-03-17`, `gpt-5.3-codex`, `gpt-5.3-chat-latest`, `gpt-5.2`, `gpt-5.2-pro`, `gpt-5.2-2025-12-11`, `gpt-5.2-pro-2025-12-11`, `gpt-5.2-codex`, `gpt-5.2-chat-latest`, `gpt-5.1`, `gpt-5.1-2025-11-13`, `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`, `gpt-5.1-chat-latest`, `gpt-5`, `gpt-5-pro`, `gpt-5-2025-08-07`, `gpt-5-pro-2025-10-06`, `gpt-5-codex`, `gpt-5-chat-latest`, `gpt-5-chat-latest-2025-08-07`, `gpt-5-mini`, `gpt-5-mini-2025-08-07`, `gpt-5-nano`, `gpt-5-nano-2025-08-07`, `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4.1-2025-04-14`, `gpt-4.1-mini-2025-04-14`, `gpt-4.1-nano-2025-04-14`, `o3-pro`, `o3-pro-2025-06-10`, `o3`, `o3-2025-04-16`, `o3-mini`, `o3-mini-2025-01-31`, `o4-mini`, `o4-mini-2025-04-16`, `o1-pro`, `o1-pro-2025-03-19`, `o1`, `o1-2024-12-17`, `o1-mini`, `o1-mini-2024-09-12`, `o1-preview`, `chat-latest`, `gpt-4o-search-preview`, `gpt-4o-mini`, `gpt-4o-mini-2024-07-18`, `gpt-4o-mini-search-preview`, `gpt-4o`, `gpt-4o-2024-11-20`, `gpt-4o-2024-08-06`, `gpt-4.5-preview`, `gpt-4-turbo`, `gpt-4-turbo-2024-04-09`, `gpt-4-turbo-preview`, `gpt-4`, `gpt-4-0613`, `gpt-3.5-turbo`, `gpt-3.5-turbo-0125`, `codex-mini-latest`
+- `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`
 
 ### Google Gemini
 
-- `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-pro-preview-customtools`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`
+- `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`
 
 ### DeepSeek
 
-- `deepseek-v4-pro`, `deepseek-v4-flash`, `deepseek-chat`, `deepseek-reasoner`
+- `deepseek-v4-pro`, `deepseek-v4-flash`
 
 ### Qwen
 
-- `qwen3.7-max`, `qwen3.7-max-2026-06-08`, `qwen3.7-max-2026-05-20`, `qwen3.7-max-2026-05-17`, `qwen3.7-max-preview`, `qwen3.6-max-preview`, `qwen3-max`, `qwen3-max-2026-01-23`, `qwen3-max-2025-09-23`, `qwen3-max-preview`, `qwen-max`, `qwen3.7-plus`, `qwen3.7-plus-2026-05-26`, `qwen3.6-plus`, `qwen3.6-plus-2026-04-02`, `qwen3.5-plus`, `qwen3.5-plus-2026-04-20`, `qwen3.5-plus-2026-02-15`, `qwen-plus`, `qwen-plus-latest`, `qwen-plus-2025-12-01`, `qwen-plus-2025-09-11`, `qwen-plus-2025-07-28`, `qwen-plus-2025-07-14`, `qwen-plus-2025-04-28`, `qwen-plus-2025-01-25`, `qwen-plus-2025-01-12`, `qwen-plus-2024-12-20`, `qwen3.6-flash`, `qwen3.6-flash-2026-04-16`, `qwen3.5-flash`, `qwen3.5-flash-2026-02-23`, `qwen-flash`, `qwen-flash-2025-07-28`, `qwen-flash-character`, `qwen-turbo`, `qwen-long`, `qwen-long-latest`, `qwen-long-2025-01-25`, `qwen-mt-plus`, `qwen-mt-turbo`, `qwen-mt-flash`, `qwen-mt-lite`, `qwen-plus-character`, `qwen-plus-character-ja`, `qwen3.6-35b-a3b`, `qwen3.5-397b-a17b`, `qwen3.5-122b-a10b`, `qwen3.5-27b`, `qwen3.5-35b-a3b`, `qwen3-next-80b-a3b-thinking`, `qwen3-next-80b-a3b-instruct`, `qwen3-235b-a22b`, `qwen3-235b-a22b-thinking-2507`, `qwen3-235b-a22b-instruct-2507`, `qwen3-32b`, `qwen3-30b-a3b`, `qwen3-30b-a3b-thinking-2507`, `qwen3-30b-a3b-instruct-2507`, `qwen3-14b`, `qwen3-8b`, `qwq-plus`, `qvq-max`, `qvq-max-2025-08-28`, `qvq-plus`, `qvq-plus-2025-08-27`, `qwen3-coder-plus`, `qwen3-coder-plus-2025-09-23`, `qwen3-coder-plus-2025-07-22`, `qwen3-coder-flash`, `qwen3-coder-flash-2025-07-28`, `qwen3-coder-next`, `qwen3-coder-480b-a35b-instruct`, `qwen3-coder-30b-a3b-instruct`, `qwen2.5-omni-7b`, `qwen3.5-omni-plus`, `qwen3.5-omni-flash`, `qwen3-omni-flash`, `qwen3-omni-flash-2025-10-22`, `qwen-omni-turbo`, `qwen3-vl-plus`, `qwen3-vl-plus-2026-01-25`, `qwen3-vl-flash`, `qwen3-vl-flash-2026-01-25`, `qwen-vl-plus`, `qwen-vl-max`, `qwen-vl-ocr`, `qwen-vl-ocr-latest`, `qwen-vl-ocr-2025-07-14`
+- `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-flash`
 
 ### Z.AI (GLM)
 
-- `glm-5.2`, `glm-5.1`, `glm-5-turbo`, `glm-5`, `glm-4.7`, `glm-4.7-flashx`, `glm-4.7-flash`, `glm-4.6`, `glm-4.5`, `glm-4.5-air`, `glm-4.5-x`, `glm-4.5-airx`, `glm-4.5-flash`, `glm-4-32b-0414-128k`, `glm-5v-turbo`, `glm-4.6v`, `autoglm-phone-multilingual`, `glm-4.6v-flash`, `glm-4.6v-flashx`, `glm-4.5v`
+- `glm-5.2`, `glm-5-turbo`
 
 ### Kimi
 
-- `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k2.6`, `kimi-k2.5`, `moonshot-v1-128k`, `moonshot-v1-32k`, `moonshot-v1-8k`, `moonshot-v1-128k-vision-preview`, `moonshot-v1-32k-vision-preview`, `moonshot-v1-8k-vision-preview`
+- `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k2.6`
 
 ### MiniMax
 
-- `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`, `MiniMax-M2.5`, `MiniMax-M2.5-highspeed`, `MiniMax-M2.1`, `MiniMax-M2.1-highspeed`, `MiniMax-M2`, `M2-her`
+- `MiniMax-M3`, `MiniMax-M2.7-highspeed`
 
 ## Behavioral Modes
 

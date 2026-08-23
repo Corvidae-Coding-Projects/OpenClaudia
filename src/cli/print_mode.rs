@@ -439,7 +439,8 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         options.model_override,
         provider.model.clone(),
         &config.proxy.target,
-    );
+    )
+    .map_err(anyhow::Error::msg)?;
     let adapter = openclaudia::providers::get_adapter(&config.proxy.target)?;
     let chat_request = build_print_chat_request(adapter, &model, options.prompt, &print_run);
     enforce_print_request_policy(&config, &chat_request)?;

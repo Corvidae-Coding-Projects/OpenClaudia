@@ -528,7 +528,10 @@ async fn resolve_provider_switch(
     let model = provider
         .model
         .clone()
-        .unwrap_or_else(|| crate::providers::default_model_for_target(&target).to_string());
+        .or_else(|| crate::providers::default_model_for_target(&target).map(str::to_string))
+        .ok_or_else(|| {
+            format!("Provider '{target}' has no configured model; set providers.{target}.model")
+        })?;
     let extra_headers = provider.headers.clone();
     let wire_api = if auth.codex_responses_auth.is_some() {
         crate::pipeline::WireApi::OpenAiResponses
@@ -2884,7 +2887,14 @@ impl App {
         }
 
         let model = if args.eq_ignore_ascii_case("default") {
-            crate::providers::default_model_for_target(&self.provider).to_string()
+            let Some(default) = crate::providers::default_model_for_target(&self.provider) else {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Provider '{}' has no built-in default; choose an installed model explicitly.",
+                    self.provider
+                )));
+                return true;
+            };
+            default.to_string()
         } else {
             args.to_string()
         };
@@ -5536,13 +5546,13 @@ mod tests {
 
     #[test]
     fn tui_model_list_uses_static_provider_catalog() {
-        let mut app = App::new("claude-opus-4-7", "anthropic");
+        let mut app = App::new("claude-opus-4-8", "anthropic");
 
         assert!(app.handle_slash_model("/model list"));
 
         let content = last_display_content(&app);
         assert!(content.contains("Available models for anthropic"));
-        assert!(content.contains("claude-opus-4-7 <- current"));
+        assert!(content.contains("claude-opus-4-8 <- current"));
         assert!(content.contains("not limited to this fallback list"));
     }
 
@@ -5587,7 +5597,7 @@ mod tests {
 
         assert_eq!(
             app.model,
-            crate::providers::default_model_for_target("anthropic")
+            crate::providers::default_model_for_target("anthropic").expect("known default")
         );
         assert_eq!(app.chat_session.model, app.model);
     }

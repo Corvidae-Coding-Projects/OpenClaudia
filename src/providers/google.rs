@@ -1399,13 +1399,23 @@ impl GoogleAdapter {
     ) -> Result<Value, ProviderError> {
         let mut body = Self::transform_request_draft(request)?;
         if let Some(thinking) = thinking.filter(|thinking| thinking.enabled) {
-            let budget = thinking.effective_budget(8192).min(32768);
-            if body.get("generationConfig").is_none() {
-                body["generationConfig"] = json!({});
+            let profile = super::resolve_model("google", &request.model)
+                .capabilities()
+                .reasoning_profile;
+            if profile == super::ReasoningProfile::GeminiThinking {
+                let budget = thinking.effective_budget(8192).min(32768);
+                if body.get("generationConfig").is_none() {
+                    body["generationConfig"] = json!({});
+                }
+                body["generationConfig"]["thinkingConfig"] = json!({
+                    "thinkingBudget": budget
+                });
+            } else {
+                tracing::warn!(
+                    model = %request.model,
+                    "thinking requested without current Gemini model-capability evidence; omitting thinkingConfig",
+                );
             }
-            body["generationConfig"]["thinkingConfig"] = json!({
-                "thinkingBudget": budget
-            });
         }
         Ok(body)
     }
@@ -1641,6 +1651,18 @@ impl ProviderAdapter for GoogleAdapter {
         );
         headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
         headers
+    }
+
+    fn supports_model_listing(&self) -> bool {
+        true
+    }
+
+    fn model_catalog_format(&self) -> Option<super::ModelCatalogFormat> {
+        Some(super::ModelCatalogFormat::Gemini)
+    }
+
+    fn models_endpoint(&self) -> &'static str {
+        "/v1beta/models?pageSize=1000"
     }
 
     /// Gemini native shape: `candidates[0].content.parts[].text`. Text

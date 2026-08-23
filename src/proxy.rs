@@ -446,19 +446,7 @@ fn model_list_json(data: Vec<Value>) -> Value {
 }
 
 fn static_model_list_json_for_provider(provider: &str) -> Value {
-    let catalog_provider = providers::canonical_static_catalog_provider(provider);
-    let data: Vec<Value> = providers::static_models_for_provider(catalog_provider)
-        .iter()
-        .map(|id| {
-            serde_json::json!({
-                "id": *id,
-                "object": "model",
-                "owned_by": catalog_provider,
-            })
-        })
-        .collect();
-
-    model_list_json(data)
+    catalog_model_list_json(providers::emergency_fallback_catalog(provider))
 }
 
 #[cfg(test)]
@@ -466,38 +454,59 @@ fn static_model_list_json() -> Value {
     let data: Vec<Value> = providers::STATIC_MODEL_CATALOG_PROVIDERS
         .iter()
         .flat_map(|provider| {
-            providers::static_models_for_provider(provider)
-                .iter()
-                .map(move |id| {
-                    serde_json::json!({
-                        "id": *id,
-                        "object": "model",
-                        "owned_by": *provider,
-                    })
-                })
+            providers::emergency_fallback_catalog(provider)
+                .models
+                .into_iter()
+                .map(move |entry| catalog_model_json(provider, entry, None))
         })
         .collect();
 
     model_list_json(data)
 }
 
-fn upstream_model_list_json(fallback_owner: &str, models: Vec<providers::ModelInfo>) -> Value {
-    let data: Vec<Value> = models
-        .into_iter()
-        .map(|model| {
-            let mut value = serde_json::json!({
-                "id": model.id,
-                "object": "model",
-                "owned_by": model.owned_by.as_deref().unwrap_or(fallback_owner),
-            });
-            if let Some(created) = model.created {
-                value["created"] = serde_json::json!(created);
-            }
-            value
-        })
-        .collect();
+fn catalog_model_json(
+    fallback_owner: &str,
+    model: providers::ModelCatalogEntry,
+    provenance: Option<&providers::ModelCatalogProvenance>,
+) -> Value {
+    let selectable = model.access != providers::ModelAccessState::Unavailable
+        && model.lifecycle != providers::ModelLifecycle::Retired;
+    let mut value = serde_json::json!({
+        "id": model.canonical_id,
+        "object": "model",
+        "owned_by": model.owned_by.as_deref().unwrap_or(fallback_owner),
+        "openclaudia": {
+            "aliases": model.aliases,
+            "access": model.access,
+            "lifecycle": model.lifecycle,
+            "selectable": selectable,
+            "capabilities": model.capabilities,
+            "provenance": provenance,
+        }
+    });
+    if let Some(created) = model.created {
+        value["created"] = serde_json::json!(created);
+    }
+    if let Some(retirement_date) = model.retirement_date {
+        value["openclaudia"]["retirement_date"] = serde_json::json!(retirement_date);
+    }
+    value
+}
 
-    model_list_json(data)
+fn catalog_model_list_json(snapshot: providers::ModelCatalogSnapshot) -> Value {
+    let provider = snapshot.provider.clone();
+    let provenance = snapshot.provenance;
+    let data: Vec<Value> = snapshot
+        .models
+        .into_iter()
+        .map(|model| catalog_model_json(&provider, model, Some(&provenance)))
+        .collect();
+    let mut body = model_list_json(data);
+    body["openclaudia"] = serde_json::json!({
+        "complete": snapshot.complete,
+        "provenance": provenance,
+    });
+    body
 }
 
 async fn model_list_json_for_state(state: &ProxyState) -> Value {
@@ -518,7 +527,7 @@ async fn model_list_json_for_state(state: &ProxyState) -> Value {
     if adapter.supports_model_listing() {
         if let Some(provider_config) = state.config.active_provider() {
             let extra_headers = provider_config.headers.clone();
-            match providers::fetch_models_with_headers(
+            match providers::discover_model_catalog_with_headers(
                 &provider_config.base_url,
                 provider_config.api_key.as_ref(),
                 &extra_headers,
@@ -526,8 +535,8 @@ async fn model_list_json_for_state(state: &ProxyState) -> Value {
             )
             .await
             {
-                Ok(models) if !models.is_empty() => {
-                    return upstream_model_list_json(adapter.name(), models);
+                Ok(snapshot) if !snapshot.models.is_empty() => {
+                    return catalog_model_list_json(snapshot);
                 }
                 Ok(_) => {
                     debug!(
@@ -1435,6 +1444,67 @@ fn enforce_model_policy(
         .map_err(|error| proxy_policy_error(&error))
 }
 
+fn enforce_model_catalog_contract(
+    provider_name: &str,
+    request: &ChatCompletionRequest,
+) -> Result<(), ProxyError> {
+    let resolved = providers::resolve_model(provider_name, &request.model);
+    let access = resolved.access();
+    if access == providers::ModelAccessState::Unavailable {
+        return Err(ProxyError::InvalidBody(format!(
+            "model '{}' is unavailable for provider '{provider_name}' according to the current model catalog",
+            request.model
+        )));
+    }
+    let Some(entry) = resolved.entry else {
+        // Unknown models remain selectable: many provider list APIs expose
+        // access without feature metadata, and custom endpoints are expected.
+        return Ok(());
+    };
+    if entry.lifecycle == providers::ModelLifecycle::Retired {
+        return Err(ProxyError::InvalidBody(format!(
+            "model '{}' is unavailable for provider '{provider_name}' according to the current model catalog",
+            request.model
+        )));
+    }
+    if entry.capabilities.chat == providers::ModelSupport::Unsupported {
+        return Err(ProxyError::InvalidBody(format!(
+            "model '{}' does not support chat completions",
+            request.model
+        )));
+    }
+    if request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+        && entry.capabilities.tools == providers::ModelSupport::Unsupported
+    {
+        return Err(ProxyError::InvalidBody(format!(
+            "model '{}' does not support tools",
+            request.model
+        )));
+    }
+    if request.stream == Some(true)
+        && entry.capabilities.streaming == providers::ModelSupport::Unsupported
+    {
+        return Err(ProxyError::InvalidBody(format!(
+            "model '{}' does not support streaming",
+            request.model
+        )));
+    }
+    if let (Some(requested), Some(maximum)) =
+        (request.max_tokens, entry.capabilities.max_output_tokens)
+    {
+        if u64::from(requested) > maximum {
+            return Err(ProxyError::InvalidBody(format!(
+                "model '{}' supports at most {maximum} output tokens, but {requested} were requested",
+                request.model
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn enforce_token_policy(
     state: &ProxyState,
     request: &ChatCompletionRequest,
@@ -1472,6 +1542,7 @@ async fn proxy_chat_completions(
     enforce_model_policy(&state, &request)?;
 
     let (provider_name, provider, api_key) = resolve_provider(&state, &headers, &request.model)?;
+    enforce_model_catalog_contract(&provider_name, &request)?;
 
     bump_session_request_count(&state).await;
 
@@ -3205,15 +3276,17 @@ mod tests {
             .collect();
 
         assert!(
-            ids.contains("claude-opus-4-7"),
-            "proxy /v1/models must include claude-opus-4-7"
+            ids.contains("claude-opus-4-8"),
+            "proxy /v1/models must include the current Anthropic fallback"
         );
 
         for provider in providers::STATIC_MODEL_CATALOG_PROVIDERS {
             for model in providers::static_models_for_provider(provider) {
                 assert!(
-                    ids.contains(model),
-                    "proxy /v1/models missing {model} from {provider} static catalog"
+                    providers::emergency_fallback_catalog(provider)
+                        .find(model)
+                        .is_some(),
+                    "selector fallback {model} is not an ID or alias in {provider} catalog"
                 );
             }
         }
@@ -3225,8 +3298,8 @@ mod tests {
         let ids = model_ids(&response);
 
         assert!(
-            ids.contains(&"qwen3-coder-flash".to_string()),
-            "Qwen fallback list must include current Qwen coder flash"
+            ids.contains(&"qwen3.7-plus".to_string()),
+            "Qwen fallback list must include its current default"
         );
         assert!(
             !ids.contains(&"gpt-5.5".to_string()),
@@ -3249,6 +3322,7 @@ mod tests {
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "object": "list",
+                "has_more": true,
                 "data": [
                     {"id": "live-openai-a", "owned_by": "upstream", "created": 1},
                     {"id": "live-openai-b"}
@@ -3270,10 +3344,15 @@ mod tests {
         assert_eq!(response["data"][0]["owned_by"], "upstream");
         assert_eq!(response["data"][0]["created"], 1);
         assert_eq!(response["data"][1]["owned_by"], "openai");
+        assert_eq!(response["data"][0]["openclaudia"]["access"], "available");
+        assert_eq!(
+            response["openclaudia"]["provenance"]["source"],
+            "provider_api"
+        );
     }
 
     #[tokio::test]
-    async fn model_list_falls_back_to_active_static_catalog_when_listing_unsupported() {
+    async fn model_list_falls_back_to_dated_catalog_when_discovery_fails() {
         let mut config = minimal_config("anthropic");
         config.providers.insert(
             "anthropic".to_string(),
@@ -3285,8 +3364,8 @@ mod tests {
         let ids = model_ids(&response);
 
         assert!(
-            ids.contains(&"claude-opus-4-7".to_string()),
-            "Anthropic fallback list must include Claude Opus 4.7"
+            ids.contains(&"claude-opus-4-8".to_string()),
+            "Anthropic fallback list must include its current default"
         );
         assert!(
             !ids.contains(&"gpt-5.5".to_string()),
@@ -3297,6 +3376,10 @@ mod tests {
             .expect("model list data")
             .iter()
             .all(|item| item["owned_by"] == "anthropic"));
+        assert_eq!(
+            response["openclaudia"]["provenance"]["source"],
+            "emergency_fallback"
+        );
     }
 
     #[tokio::test]
@@ -3850,6 +3933,28 @@ mod tests {
             err.to_string().contains("not-allowed"),
             "denial should name the rejected model"
         );
+    }
+
+    #[test]
+    fn model_catalog_contract_rejects_retired_model_and_known_output_overflow() {
+        let retired = test_chat_request("deepseek-chat", Some(64));
+        let err = enforce_model_catalog_contract("deepseek", &retired)
+            .expect_err("retired fallback model must be rejected");
+        assert!(matches!(err, ProxyError::InvalidBody(_)));
+
+        let oversized = test_chat_request("gpt-5.6-sol", Some(128_001));
+        let err = enforce_model_catalog_contract("openai", &oversized)
+            .expect_err("known output overflow must be rejected");
+        assert!(err.to_string().contains("at most 128000"));
+    }
+
+    #[test]
+    fn model_catalog_contract_allows_unknown_models_and_known_limits() {
+        let unknown = test_chat_request("operator-installed-model", Some(64));
+        enforce_model_catalog_contract("ollama", &unknown).expect("unknown capability is allowed");
+
+        let known = test_chat_request("gpt-5.6-sol", Some(128_000));
+        enforce_model_catalog_contract("openai", &known).expect("known limit is allowed");
     }
 
     #[tokio::test]
