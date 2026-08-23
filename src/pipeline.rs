@@ -17,7 +17,9 @@ use crate::proxy::{self, normalize_base_url};
 use crate::services::policy::{PolicyEnforcer, PolicyError};
 use crate::session::TokenUsage;
 use crate::tools::{self, AnthropicToolAccumulator, ToolCall, ToolCallAccumulator};
-use crate::tui::events::{ApiRetryKind, AppEvent, PermissionResponse};
+use crate::tui::events::{
+    ApiRetryKind, AppEvent, PermissionResponse, PlanModeReply, PlanModeRequest,
+};
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::Value;
@@ -4303,11 +4305,14 @@ async fn execute_tool_calls_for_tui(
         match tool_result {
             None => break, // channel broken
             Some(mut result) => {
-                if resolve_tui_follow_up(&mut result, tx).await.is_err() {
+                let Ok(approved_plan_context) = resolve_tui_follow_up(&mut result, tx).await else {
                     break;
-                }
+                };
                 observe_tool_result(&run_context, session_id, &result);
                 results.push(result.openai_message());
+                if let Some(context) = approved_plan_context {
+                    results.push(context);
+                }
             }
         }
     }
@@ -4376,16 +4381,24 @@ fn observe_tool_result(
 async fn resolve_tui_follow_up(
     result: &mut tools::ToolResult,
     tx: &mpsc::Sender<AppEvent>,
-) -> Result<(), ()> {
+) -> Result<Option<Value>, ()> {
     let follow_up = result.follow_up().clone();
-    let tools::ToolFollowUp::UserQuestion { questions, .. } = follow_up else {
-        if result.follow_up().is_pending() {
-            let message = "This typed follow-up is not supported by the full-screen TUI";
-            *result = result
-                .cancel_follow_up(message.to_string(), message.to_string())
-                .expect("pending follow-up can be cancelled");
+    let questions = match follow_up {
+        tools::ToolFollowUp::None => return Ok(None),
+        tools::ToolFollowUp::UserQuestion { questions, .. } => questions,
+        tools::ToolFollowUp::EnterPlanMode { .. } => {
+            return resolve_tui_plan_follow_up(result, PlanModeRequest::Enter, tx).await;
         }
-        return Ok(());
+        tools::ToolFollowUp::ExitPlanMode {
+            allowed_prompts, ..
+        } => {
+            return resolve_tui_plan_follow_up(
+                result,
+                PlanModeRequest::Exit { allowed_prompts },
+                tx,
+            )
+            .await;
+        }
     };
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -4413,7 +4426,46 @@ async fn resolve_tui_follow_up(
     *result = result
         .resolve_follow_up(answers, response)
         .expect("typed user question has one pending follow-up");
-    Ok(())
+    Ok(None)
+}
+
+async fn resolve_tui_plan_follow_up(
+    result: &mut tools::ToolResult,
+    request: PlanModeRequest,
+    tx: &mpsc::Sender<AppEvent>,
+) -> Result<Option<Value>, ()> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(AppEvent::PlanModeRequest {
+            request,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Err(());
+    }
+    let reply = reply_rx.await.unwrap_or_else(|_| PlanModeReply::Cancelled {
+        message: "Plan-mode request cancelled because the TUI closed".to_string(),
+    });
+    let context_message = match reply {
+        PlanModeReply::Completed {
+            message,
+            response,
+            context_message,
+        } => {
+            *result = result
+                .resolve_follow_up(message, response)
+                .expect("typed plan follow-up has one pending host action");
+            context_message
+        }
+        PlanModeReply::Cancelled { message } => {
+            *result = result
+                .cancel_follow_up(message.clone(), message)
+                .expect("typed plan follow-up has one pending host action");
+            None
+        }
+    };
+    Ok(context_message)
 }
 
 /// Build the assistant message with tool calls for appending to conversation history.
@@ -4540,6 +4592,132 @@ mod tests {
 
     fn test_run() -> Arc<tools::ToolRunContext> {
         Arc::clone(tools::security::test_run_context())
+    }
+
+    #[tokio::test]
+    async fn tui_plan_follow_up_uses_typed_host_reply_and_returns_approved_context() {
+        let tool_call = ToolCall {
+            id: "plan-enter".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "enter_plan_mode".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let result = tools::ToolResult::bind(
+            &tool_call,
+            "enter_plan_mode",
+            tools::ToolHandlerResult::success_text("Plan mode entry requested".to_string())
+                .with_follow_up(tools::ToolFollowUp::EnterPlanMode {
+                    state: tools::ToolFollowUpState::Pending,
+                }),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resolver = tokio::spawn(async move {
+            let mut result = result;
+            let context = resolve_tui_follow_up(&mut result, &tx)
+                .await
+                .expect("TUI channel");
+            (result, context)
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => break event,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("resolver disconnected before sending plan request")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("typed plan request");
+        let AppEvent::PlanModeRequest { request, reply } = event else {
+            panic!("expected typed plan request");
+        };
+        assert_eq!(request, PlanModeRequest::Enter);
+        let context = serde_json::json!({
+            "role": "system",
+            "content": "approved context"
+        });
+        reply
+            .send(PlanModeReply::Completed {
+                message: "entered".to_string(),
+                response: serde_json::json!({"entered": true}),
+                context_message: Some(context.clone()),
+            })
+            .expect("resolver still waiting");
+
+        let (result, returned_context) = resolver.await.expect("resolver task");
+        assert_eq!(returned_context, Some(context));
+        assert!(matches!(
+            result.follow_up(),
+            tools::ToolFollowUp::EnterPlanMode {
+                state: tools::ToolFollowUpState::Resolved { response }
+            } if response["entered"] == true
+        ));
+    }
+
+    #[tokio::test]
+    async fn tui_plan_follow_up_cancellation_is_reported_as_cancelled_tool_state() {
+        let tool_call = ToolCall {
+            id: "plan-exit".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "exit_plan_mode".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let result = tools::ToolResult::bind(
+            &tool_call,
+            "exit_plan_mode",
+            tools::ToolHandlerResult::success_text("Plan mode exit requested".to_string())
+                .with_follow_up(tools::ToolFollowUp::ExitPlanMode {
+                    allowed_prompts: Vec::new(),
+                    state: tools::ToolFollowUpState::Pending,
+                }),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resolver = tokio::spawn(async move {
+            let mut result = result;
+            let context = resolve_tui_follow_up(&mut result, &tx)
+                .await
+                .expect("TUI channel");
+            (result, context)
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => break event,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("resolver disconnected before sending plan request")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("typed plan request");
+        let AppEvent::PlanModeRequest { reply, .. } = event else {
+            panic!("expected typed plan request");
+        };
+        reply
+            .send(PlanModeReply::Cancelled {
+                message: "user cancelled".to_string(),
+            })
+            .expect("resolver still waiting");
+
+        let (result, context) = resolver.await.expect("resolver task");
+        assert_eq!(context, None);
+        assert!(matches!(
+            result.follow_up(),
+            tools::ToolFollowUp::ExitPlanMode {
+                state: tools::ToolFollowUpState::Cancelled { reason },
+                ..
+            } if reason == "user cancelled"
+        ));
     }
 
     #[test]

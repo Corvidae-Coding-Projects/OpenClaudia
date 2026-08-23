@@ -26,7 +26,7 @@ use crate::cli::repl::keybindings::{display_keybindings, execute_key_action, key
 use crate::cli::repl::permissions::execute_shell_command_with_permission;
 use crate::cli::repl::plan_mode::{
     check_plan_mode_restriction, handle_enter_plan_mode, handle_exit_plan_mode,
-    process_tool_follow_up, restore_runtime_after_plan,
+    process_tool_follow_up,
 };
 use crate::cli::repl::session_io::{
     estimate_session_tokens, export_chat_session, save_session_to_short_term_memory,
@@ -1288,21 +1288,15 @@ impl ChatRepl {
             return;
         }
 
-        let (message, approved) = handle_exit_plan_mode(
+        let (message, _, context) = handle_exit_plan_mode(
             &self.run_context,
             &self.chat_session,
             &self.task_manager,
             &[],
+            self.coordinator,
         );
-        if approved {
-            if let Err(error) =
-                restore_runtime_after_plan(&self.run_context, &self.chat_session, self.coordinator)
-            {
-                eprintln!(
-                    "Plan was approved, but runtime capabilities could not be restored: {error}"
-                );
-                return;
-            }
+        if let Some(context) = context {
+            self.chat_session.push_message(context);
         }
         println!("{message}");
     }
@@ -2461,7 +2455,7 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         result: &tools::ToolResult,
     ) -> serde_json::Value {
-        let final_result = process_tool_follow_up(
+        let (final_result, approved_plan_context) = process_tool_follow_up(
             &self.run_context,
             &self.chat_session,
             &self.task_manager,
@@ -2490,6 +2484,13 @@ impl ChatRepl {
             tool_call,
             &final_result,
         );
+        if let Some(context) = approved_plan_context {
+            push_chat_session_message_and_persist(
+                &mut self.chat_session,
+                context,
+                "approved plan context",
+            );
+        }
 
         let response = serde_json::json!({
             "functionResponse": {
@@ -3063,7 +3064,7 @@ impl ChatRepl {
         };
         let result = self.run_tool_with_audit(tool_call, memory_db, authorization);
 
-        let final_result = process_tool_follow_up(
+        let (final_result, approved_plan_context) = process_tool_follow_up(
             &self.run_context,
             &self.chat_session,
             &self.task_manager,
@@ -3104,6 +3105,13 @@ impl ChatRepl {
             tool_call,
             &final_result,
         );
+        if let Some(context) = approved_plan_context {
+            push_chat_session_message_and_persist(
+                &mut self.chat_session,
+                context,
+                "approved plan context",
+            );
+        }
     }
 
     /// If `tool_call` is blocked by plan mode, push the error tool
@@ -3751,7 +3759,7 @@ impl ChatRepl {
         };
         let result = self.run_openai_tool_unaudited(tool_call, memory_db, authorization);
 
-        let final_result = process_tool_follow_up(
+        let (final_result, approved_plan_context) = process_tool_follow_up(
             &self.run_context,
             &self.chat_session,
             &self.task_manager,
@@ -3787,6 +3795,13 @@ impl ChatRepl {
             tool_call,
             &final_result,
         );
+        if let Some(context) = approved_plan_context {
+            push_chat_session_message_and_persist(
+                &mut self.chat_session,
+                context,
+                "approved plan context",
+            );
+        }
     }
 
     /// `OpenAI`-loop variant of `run_tool_with_audit` without duplicate audit

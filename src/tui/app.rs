@@ -5,7 +5,10 @@
 //! Provides a scrollable message view, text input area, status bar,
 //! and streaming response display wired to the real API pipeline.
 
-use super::events::{ApiRetryKind, AppEvent, EventHandler, ProviderSwitch, SpawnTarget};
+use super::events::{
+    ApiRetryKind, AppEvent, EventHandler, PlanModeReply, PlanModeRequest, ProviderSwitch,
+    SpawnTarget,
+};
 use super::input::TextInput;
 use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
 use super::{DIM, GOLD, PURPLE, SPINNER_FRAMES};
@@ -375,6 +378,14 @@ struct PendingUserQuestion {
     /// Ctrl+C) surfaces a structured "cancelled" payload to the
     /// model rather than hanging the agent indefinitely.
     reply: tokio::sync::oneshot::Sender<String>,
+}
+
+/// Exact plan proposal awaiting an explicit full-screen TUI decision.
+struct PendingPlanApproval {
+    prepared: crate::session::PreparedPlanApproval,
+    allowed_prompts: Vec<crate::tools::ToolAllowedPrompt>,
+    scroll_offset: u16,
+    reply: tokio::sync::oneshot::Sender<PlanModeReply>,
 }
 
 /// Dispatch table for the TUI's no-argument slash commands (crosslink #259).
@@ -852,6 +863,9 @@ pub struct App {
     /// modal completes the question set and sends back the answers
     /// JSON. While `Some`, key dispatch routes to the modal walker.
     pending_user_question: Option<PendingUserQuestion>,
+    /// Active digest-bound plan approval modal. This is distinct from direct
+    /// `/mode` cancellation and exists only for a typed model follow-up.
+    pending_plan_approval: Option<PendingPlanApproval>,
     /// Hook engine for running lifecycle hooks.
     pub hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     /// Session-scoped enterprise policy enforcer for tool caps.
@@ -962,6 +976,7 @@ impl App {
             service_registry: crate::services::ServiceRegistry::analytics_disabled(),
             pending_permission: None,
             pending_user_question: None,
+            pending_plan_approval: None,
             hook_engine: None,
             policy_enforcer,
             task_mgr: std::sync::Arc::new(std::sync::Mutex::new(task_manager)),
@@ -1741,6 +1756,9 @@ impl App {
                     reply,
                 });
             }
+            Ok(AppEvent::PlanModeRequest { request, reply }) => {
+                self.handle_plan_mode_request(request, reply);
+            }
             Ok(AppEvent::ShellDone {
                 target,
                 stdout,
@@ -1997,8 +2015,11 @@ impl App {
     const fn current_key_mode(&self) -> KeyMode {
         if self.overlay.is_some() {
             KeyMode::Modal
-        } else if self.pending_permission.is_some() || self.pending_user_question.is_some() {
-            // Permission prompt + ask_user_question modal both win over
+        } else if self.pending_permission.is_some()
+            || self.pending_user_question.is_some()
+            || self.pending_plan_approval.is_some()
+        {
+            // Interactive permission, question, and plan decisions win over
             // the streaming check — they arrive mid-turn while
             // `is_waiting == true`, and the user MUST be able to type
             // y/n/a/d (permission) or numeric option indices
@@ -2036,6 +2057,7 @@ impl App {
             || self.is_waiting
             || self.pending_permission.is_some()
             || self.pending_user_question.is_some()
+            || self.pending_plan_approval.is_some()
         {
             return;
         }
@@ -2064,6 +2086,14 @@ impl App {
             self.messages.add(DisplayMessage::system(
                 "ask_user_question cancelled".to_string(),
             ));
+            return;
+        }
+        if let Some(plan) = self.pending_plan_approval.take() {
+            let message = "Plan approval cancelled by user".to_string();
+            let _ = plan.reply.send(PlanModeReply::Cancelled {
+                message: message.clone(),
+            });
+            self.messages.add(DisplayMessage::system(message));
             return;
         }
         // If an overlay is open, close it instead of quitting — matches
@@ -2119,8 +2149,8 @@ impl App {
         }
     }
 
-    /// Normal-mode keystrokes: interactive editing. Permission-prompt
-    /// and `ask_user_question` walking are sub-states because the
+    /// Normal-mode keystrokes: interactive editing. Permission, question,
+    /// and plan-decision walking are sub-states because the
     /// prompt / modal overlays the input line without taking the App
     /// into modal-overlay state.
     fn handle_key_normal(&mut self, key: crossterm::event::KeyEvent) {
@@ -2130,6 +2160,10 @@ impl App {
         }
         if self.pending_user_question.is_some() {
             self.handle_user_question_key(key);
+            return;
+        }
+        if self.pending_plan_approval.is_some() {
+            self.handle_plan_approval_key(key);
             return;
         }
         self.handle_editing_key(key);
@@ -2164,6 +2198,126 @@ impl App {
                     DisplayMessage::system(content)
                 });
                 let _ = perm.reply.send(resp);
+            }
+        }
+    }
+
+    /// Dispatch keystrokes for a digest-bound plan approval modal.
+    fn handle_plan_approval_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => self.finish_plan_approval(true),
+            KeyCode::Char('n' | 'N') => self.finish_plan_approval(false),
+            KeyCode::Esc => {
+                if let Some(plan) = self.pending_plan_approval.take() {
+                    let message = "Plan approval cancelled by user".to_string();
+                    let _ = plan.reply.send(PlanModeReply::Cancelled {
+                        message: message.clone(),
+                    });
+                    self.messages.add(DisplayMessage::system(message));
+                }
+            }
+            KeyCode::Up => {
+                if let Some(plan) = self.pending_plan_approval.as_mut() {
+                    plan.scroll_offset = plan.scroll_offset.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(plan) = self.pending_plan_approval.as_mut() {
+                    plan.scroll_offset = plan.scroll_offset.saturating_add(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(plan) = self.pending_plan_approval.as_mut() {
+                    plan.scroll_offset = plan.scroll_offset.saturating_sub(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(plan) = self.pending_plan_approval.as_mut() {
+                    plan.scroll_offset = plan.scroll_offset.saturating_add(10);
+                }
+            }
+            KeyCode::Home => {
+                if let Some(plan) = self.pending_plan_approval.as_mut() {
+                    plan.scroll_offset = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(plan) = self.pending_plan_approval.as_mut() {
+                    plan.scroll_offset = u16::try_from(
+                        plan.prepared
+                            .plan_content()
+                            .lines()
+                            .count()
+                            .saturating_sub(1),
+                    )
+                    .unwrap_or(u16::MAX);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_plan_approval(&mut self, approved: bool) {
+        let Some(plan) = self.pending_plan_approval.take() else {
+            return;
+        };
+        if !approved {
+            let message = "Plan rejected by user; remaining in plan mode".to_string();
+            self.messages.add(DisplayMessage::system(message.clone()));
+            let _ = plan.reply.send(PlanModeReply::Completed {
+                message: message.clone(),
+                response: serde_json::json!({"message": message, "approved": false}),
+                context_message: None,
+            });
+            return;
+        }
+
+        let result = self.tool_run_context().and_then(|run| {
+            crate::session::commit_interactive_plan_approval(
+                &run,
+                &self.chat_session,
+                self.task_mgr.as_ref(),
+                &plan.prepared,
+                &plan.allowed_prompts,
+                crate::modes::RuntimeMode::Behavioral(self.chat_session.behavior_mode()),
+            )
+        });
+        match result {
+            Ok(receipt) => {
+                self.mode = tui_mode_for_agent(self.chat_session.agent_mode());
+                let message = format!(
+                    "Plan approved as digest {} and task {}; build capabilities restored",
+                    receipt.plan_digest, receipt.task_id
+                );
+                self.messages.add(DisplayMessage::system(message.clone()));
+                let response = serde_json::json!({
+                    "message": message,
+                    "approved": true,
+                    "plan_digest": receipt.plan_digest,
+                    "canonical_task_id": receipt.task_id,
+                    "canonical_task_graph_generation": receipt.task_graph_generation,
+                    "runtime_mode_generation": receipt.runtime_mode_generation
+                });
+                let _ = plan.reply.send(PlanModeReply::Completed {
+                    message,
+                    response,
+                    context_message: Some(receipt.context_message),
+                });
+            }
+            Err(error) => {
+                let message = format!(
+                    "Plan approval could not be committed: {error}; remaining in plan mode"
+                );
+                self.messages.add(DisplayMessage::error(message.clone()));
+                let _ = plan.reply.send(PlanModeReply::Completed {
+                    message: message.clone(),
+                    response: serde_json::json!({
+                        "message": message,
+                        "approved": false,
+                        "error": true
+                    }),
+                    context_message: None,
+                });
             }
         }
     }
@@ -2672,6 +2826,78 @@ impl App {
         )));
     }
 
+    fn handle_plan_mode_request(
+        &mut self,
+        request: PlanModeRequest,
+        reply: tokio::sync::oneshot::Sender<PlanModeReply>,
+    ) {
+        if self.pending_permission.is_some()
+            || self.pending_user_question.is_some()
+            || self.pending_plan_approval.is_some()
+        {
+            let _ = reply.send(PlanModeReply::Cancelled {
+                message: "Another TUI decision is already pending".to_string(),
+            });
+            return;
+        }
+        let run = match self.tool_run_context() {
+            Ok(run) => run,
+            Err(error) => {
+                let message = format!("Plan-mode request has no valid run capability: {error}");
+                self.messages.add(DisplayMessage::error(message.clone()));
+                let _ = reply.send(PlanModeReply::Cancelled { message });
+                return;
+            }
+        };
+        match request {
+            PlanModeRequest::Enter => {
+                match crate::session::install_interactive_plan_mode(&run, &self.chat_session) {
+                    Ok(plan_file) => {
+                        self.mode = tui_mode_for_agent(self.chat_session.agent_mode());
+                        let message =
+                            format!("Plan mode activated; write only to {}", plan_file.display());
+                        self.messages.add(DisplayMessage::system(message.clone()));
+                        let _ = reply.send(PlanModeReply::Completed {
+                            message: message.clone(),
+                            response: serde_json::json!({
+                                "message": message,
+                                "entered": true,
+                                "plan_file": plan_file
+                            }),
+                            context_message: None,
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!("Could not enter plan mode: {error}");
+                        self.messages.add(DisplayMessage::error(message.clone()));
+                        let _ = reply.send(PlanModeReply::Cancelled { message });
+                    }
+                }
+            }
+            PlanModeRequest::Exit { allowed_prompts } => {
+                match crate::session::prepare_interactive_plan_approval(&run, &self.chat_session) {
+                    Ok(prepared) => {
+                        self.messages.add(DisplayMessage::system(format!(
+                            "Review plan digest {} and approve or reject it",
+                            prepared.plan_digest()
+                        )));
+                        self.pending_plan_approval = Some(PendingPlanApproval {
+                            prepared,
+                            allowed_prompts,
+                            scroll_offset: 0,
+                            reply,
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!("Could not prepare plan approval: {error}");
+                        self.messages.add(DisplayMessage::error(message.clone()));
+                        let _ = reply.send(PlanModeReply::Cancelled { message });
+                    }
+                }
+            }
+        }
+    }
+
     /// Table-handler entry point for `/mode`.
     fn slash_mode(&mut self) {
         let run = match self.run_context.as_ref() {
@@ -2683,7 +2909,8 @@ impl App {
                 return;
             }
         };
-        if self.chat_session.agent_mode() == AgentMode::Plan {
+        let cancelled_plan = self.chat_session.agent_mode() == AgentMode::Plan;
+        if cancelled_plan {
             let restored = self.chat_session.inspect_state(|state| {
                 state
                     .conversation
@@ -2712,11 +2939,16 @@ impl App {
             return;
         }
         self.mode = tui_mode_for_agent(self.chat_session.agent_mode());
-        self.messages.add(DisplayMessage::system(format!(
-            "Mode: {} — {}",
-            self.chat_session.agent_mode(),
-            self.chat_session.mode_description()
-        )));
+        let message = if cancelled_plan {
+            "Plan mode cancelled by direct user action; no plan was approved".to_string()
+        } else {
+            format!(
+                "Mode: {} — {}",
+                self.chat_session.agent_mode(),
+                self.chat_session.mode_description()
+            )
+        };
+        self.messages.add(DisplayMessage::system(message));
     }
 
     /// Table-handler entry point for `/skill` / `/skills` (no-arg list form).
@@ -3703,6 +3935,9 @@ impl App {
         // ── ask_user_question modal ──
         self.draw_user_question_overlay(frame);
 
+        // ── typed plan approval modal ──
+        self.draw_plan_approval_overlay(frame);
+
         // ── Modal overlay (rendered last so it floats above everything) ──
         // Use `Clear` to blank the underlying region; both overlays paint
         // their own background via the border-block's default bg.
@@ -3835,6 +4070,39 @@ impl App {
             )
             .style(Style::default().bg(Color::Black));
         frame.render_widget(dialog, dialog_area);
+    }
+
+    /// Render the exact digest-bound plan proposal awaiting approval.
+    fn draw_plan_approval_overlay(&self, frame: &mut Frame) {
+        let Some(ref plan) = self.pending_plan_approval else {
+            return;
+        };
+        let area = super::components::centered_rect(88, 82, frame.area());
+        frame.render_widget(ratatui::widgets::Clear, area);
+        let mut body = format!(
+            "Digest: {}\n\n{}",
+            plan.prepared.plan_digest(),
+            plan.prepared.plan_content()
+        );
+        if !plan.allowed_prompts.is_empty() {
+            body.push_str("\n\nProposed allowed operations:\n");
+            for prompt in &plan.allowed_prompts {
+                use std::fmt::Write as _;
+                let _ = writeln!(body, "- {}: {}", prompt.tool, prompt.prompt);
+            }
+        }
+        let dialog = Paragraph::new(body)
+            .block(
+                Block::default()
+                    .title(" Plan Approval · [y] approve · [n] reject · Esc cancel · ↑/↓ scroll ")
+                    .title_style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GOLD)),
+            )
+            .style(Style::default().bg(Color::Black))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((plan.scroll_offset, 0));
+        frame.render_widget(dialog, area);
     }
 
     /// Render the welcome box — two-column bordered widget matching the old inline UI.
@@ -4447,6 +4715,9 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         }
         super::events::AppEvent::UserQuestion { questions, .. } => {
             format!("UserQuestion(n={})", questions.len())
+        }
+        super::events::AppEvent::PlanModeRequest { request, .. } => {
+            format!("PlanModeRequest({request:?})")
         }
         super::events::AppEvent::Key(_) => "Key".to_string(),
         super::events::AppEvent::Paste(text) => {
@@ -5415,13 +5686,14 @@ mod tests {
         format_api_retry_message, format_review_command_output, format_stream_timeout_message,
         git_bin, handle_turn_result, list_sessions, lookup_tui_slash, read_tui_session_file,
         resolve_provider_switch_auth, save_session, write_orphan_recovery_file, ApiClient, App,
-        AppEvent, EffortLevel, MessageKind, ProviderSwitch, SpawnTarget, TurnContext,
+        AppEvent, EffortLevel, MessageKind, Mode, ProviderSwitch, SpawnTarget, TurnContext,
         TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
     };
     use super::{compile_file_ref_regex, expand_file_refs};
     use crate::slash_commands::all_tui_commands;
     use crate::state::Session;
-    use crate::tui::events::ApiRetryKind;
+    use crate::tui::events::{ApiRetryKind, PlanModeReply, PlanModeRequest};
+    use crossterm::event::{KeyCode, KeyModifiers};
     use std::io::Write as _;
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
@@ -5500,6 +5772,167 @@ mod tests {
         let restored = app.tool_run_context().expect("run").runtime_mode();
         assert_eq!(restored.class, crate::modes::RuntimeModeClass::Standard);
         assert!(restored.generation > plan.generation);
+        assert!(app
+            .chat_session
+            .inspect_state(|state| state.conversation.approved_plan.is_none()));
+        assert!(app
+            .messages
+            .messages
+            .iter()
+            .any(|message| message.content.contains("no plan was approved")));
+    }
+
+    fn plan_follow_up_test_app() -> (tempfile::TempDir, App) {
+        let project = tempfile::tempdir().expect("TUI plan root");
+        let mut app = App::new("test-model", "test-provider");
+        let session_id = crate::state::SessionId::from_raw(app.chat_session.id())
+            .expect("session id must be UUID-shaped");
+        let run = crate::tools::ToolRunContext::builder(session_id, project.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("tui-plan-follow-up-test")
+            .build()
+            .expect("plan run");
+        app.task_mgr = Arc::new(Mutex::new(
+            crate::session::TaskManager::for_run(&run).expect("task manager"),
+        ));
+        app.run_context = Ok(run);
+        (project, app)
+    }
+
+    fn enter_plan_through_typed_request(app: &mut App) -> PlanModeReply {
+        let (reply, mut response) = tokio::sync::oneshot::channel();
+        app.handle_plan_mode_request(PlanModeRequest::Enter, reply);
+        response.try_recv().expect("plan entry reply")
+    }
+
+    #[test]
+    fn typed_tui_plan_follow_up_enters_and_approves_the_displayed_plan() {
+        let (_project, mut app) = plan_follow_up_test_app();
+        assert!(matches!(
+            enter_plan_through_typed_request(&mut app),
+            PlanModeReply::Completed { response, .. }
+                if response["entered"] == true
+        ));
+        let run = app.tool_run_context().expect("run");
+        std::fs::write(run.agent_plan_file(), "# Implement the feature\n").expect("write plan");
+
+        let (reply, mut response) = tokio::sync::oneshot::channel();
+        app.handle_plan_mode_request(
+            PlanModeRequest::Exit {
+                allowed_prompts: vec![crate::tools::ToolAllowedPrompt {
+                    tool: "bash".to_string(),
+                    prompt: "cargo test".to_string(),
+                }],
+            },
+            reply,
+        );
+        assert!(app.pending_plan_approval.is_some());
+
+        // Plan decisions arrive while the model turn is still waiting. The
+        // modal must therefore win over streaming key handling.
+        app.is_waiting = true;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        ));
+
+        let reply = response.try_recv().expect("plan approval reply");
+        let PlanModeReply::Completed {
+            response,
+            context_message: Some(context),
+            ..
+        } = reply
+        else {
+            panic!("expected completed approval reply");
+        };
+        assert_eq!(response["approved"], true);
+        assert_eq!(
+            context["metadata"]["approved_plan_digest"],
+            response["plan_digest"]
+        );
+        assert_eq!(
+            app.chat_session.agent_mode(),
+            crate::state::AgentMode::Build
+        );
+        assert_eq!(app.mode, Mode::Build);
+        assert_eq!(
+            app.tool_run_context().expect("run").runtime_mode().class,
+            crate::modes::RuntimeModeClass::Standard
+        );
+        assert_eq!(
+            app.chat_session
+                .inspect_state(|state| state.conversation.approved_plan.clone()),
+            Some("# Implement the feature\n".to_string())
+        );
+    }
+
+    #[test]
+    fn typed_tui_plan_reject_cancel_and_stale_decisions_stay_in_plan_mode() {
+        let (_project, mut app) = plan_follow_up_test_app();
+        let _ = enter_plan_through_typed_request(&mut app);
+        let run = app.tool_run_context().expect("run");
+        std::fs::write(run.agent_plan_file(), "# First proposal\n").expect("write plan");
+
+        let (reject, mut rejected) = tokio::sync::oneshot::channel();
+        app.handle_plan_mode_request(
+            PlanModeRequest::Exit {
+                allowed_prompts: Vec::new(),
+            },
+            reject,
+        );
+        app.handle_plan_approval_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            rejected.try_recv().expect("rejection reply"),
+            PlanModeReply::Completed { response, .. } if response["approved"] == false
+        ));
+
+        let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+        app.handle_plan_mode_request(
+            PlanModeRequest::Exit {
+                allowed_prompts: Vec::new(),
+            },
+            cancel,
+        );
+        app.handle_plan_approval_key(crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            cancelled.try_recv().expect("cancellation reply"),
+            PlanModeReply::Cancelled { .. }
+        ));
+
+        let (stale, mut stale_reply) = tokio::sync::oneshot::channel();
+        app.handle_plan_mode_request(
+            PlanModeRequest::Exit {
+                allowed_prompts: Vec::new(),
+            },
+            stale,
+        );
+        std::fs::write(run.agent_plan_file(), "# Changed after display\n").expect("change plan");
+        app.finish_plan_approval(true);
+        assert!(matches!(
+            stale_reply.try_recv().expect("stale reply"),
+            PlanModeReply::Completed { response, .. }
+                if response["approved"] == false && response["error"] == true
+        ));
+        assert_eq!(app.chat_session.agent_mode(), crate::state::AgentMode::Plan);
+        assert_eq!(
+            app.tool_run_context().expect("run").runtime_mode().class,
+            crate::modes::RuntimeModeClass::Plan
+        );
+        assert!(app
+            .chat_session
+            .inspect_state(|state| state.conversation.approved_plan.is_none()));
     }
 
     #[test]

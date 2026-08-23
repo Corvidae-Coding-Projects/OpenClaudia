@@ -1,62 +1,9 @@
 use super::input::{handle_user_questions, run_external_editor};
-use super::{AgentMode, Session};
+use super::Session;
 use openclaudia::tools;
-use sha2::{Digest as _, Sha256};
 
-struct ApprovedPlanBinding {
-    task_id: String,
-    generation: u64,
-    digest: String,
-}
-
-fn approved_plan_digest(plan_content: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = Sha256::digest(plan_content.as_bytes());
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
-fn bind_approved_plan(
-    chat_session: &Session,
-    task_manager: &std::sync::Mutex<openclaudia::session::TaskManager>,
-    plan_content: &str,
-) -> Result<ApprovedPlanBinding, String> {
-    let digest = approved_plan_digest(plan_content);
-    let plan_id = format!("plan-{}", chat_session.id());
-    let mut manager = task_manager
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let task_id = manager
-        .reconcile_approved_plan(&plan_id, digest.clone())?
-        .id
-        .clone();
-    Ok(ApprovedPlanBinding {
-        task_id,
-        generation: manager.generation().get(),
-        digest,
-    })
-}
-
-/// Restore the agent mode captured at plan-mode entry (crosslink #618).
-///
-/// Returns the snapshotted `previous_mode` decoded from
-/// [`openclaudia::session::PlanModeState::previous_mode`], falling back to
-/// `Build` when:
-/// * the session entered plan mode before the #618 field existed, or
-/// * the snapshot token is unrecognised (forwards-compat: an older binary
-///   reading a session saved by a newer one).
-///
-/// The fallback matches the pre-#618 behaviour so the worst case is a
-/// graceful degradation, never a panic or a wrong mode flip.
-fn restore_previous_mode(plan_state: Option<&openclaudia::session::PlanModeState>) -> AgentMode {
-    plan_state
-        .and_then(|s| s.previous_mode.as_deref())
-        .map_or(AgentMode::Build, AgentMode::from_token)
-}
+#[cfg(test)]
+use openclaudia::state::AgentMode;
 
 fn plan_mode_allowed_tools_display() -> String {
     openclaudia::session::PLAN_MODE_ALLOWED_TOOLS.join(", ")
@@ -93,7 +40,8 @@ fn handle_plan_edit(
     task_manager: &std::sync::Mutex<openclaudia::session::TaskManager>,
     plan_state: &openclaudia::session::PlanModeState,
     allowed_prompts: &[tools::ToolAllowedPrompt],
-) -> (String, bool) {
+    coordinator: bool,
+) -> (String, bool, Option<serde_json::Value>) {
     use std::io::{self, Write};
     let configured = run.environment_grants().with_value("EDITOR", |editor| {
         run_external_editor(run, editor, &plan_state.plan_file)
@@ -116,7 +64,11 @@ fn handle_plan_edit(
             ) {
                 Ok((_, content)) => content,
                 Err(error) => {
-                    return (format!("Failed to read the edited plan: {error}"), false);
+                    return (
+                        format!("Failed to read the edited plan: {error}"),
+                        false,
+                        None,
+                    );
                 }
             };
             println!("\n\x1b[1;36m## Edited Plan\x1b[0m\n");
@@ -126,62 +78,46 @@ fn handle_plan_edit(
             io::stdout().flush().ok();
             let mut input2 = String::new();
             if io::stdin().read_line(&mut input2).is_err() {
-                return ("Failed to read user input.".to_string(), false);
+                return ("Failed to read user input.".to_string(), false, None);
             }
             if input2.trim().to_lowercase().starts_with('y') {
-                let binding = match bind_approved_plan(chat_session, task_manager, &edited_content)
-                {
-                    Ok(binding) => binding,
+                let prepared = match openclaudia::session::prepare_interactive_plan_approval(
+                    run,
+                    chat_session,
+                ) {
+                    Ok(prepared) => prepared,
                     Err(error) => {
                         return (
                             format!(
-                                "Plan approval could not be committed to the canonical task graph: {error}. Still in plan mode."
+                                "Edited plan could not be prepared for approval: {error}. Still in plan mode."
                             ),
                             false,
+                            None,
                         );
                     }
                 };
-                let restored = chat_session.inspect_state(|state| {
-                    restore_previous_mode(state.conversation.plan_mode.as_ref())
-                });
-                chat_session.set_agent_mode(restored);
-                println!("\n\x1b[1;32m>> Plan Approved - Returning to Build Mode\x1b[0m\n");
-                chat_session.update_state(|state, events| {
-                    state.conversation.plan_mode = None;
-                    state.conversation.approved_plan = Some(edited_content.clone());
-                    state.conversation.messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": format!(
-                            "[Approved Implementation Plan (edited by user)]\n\
-                             The user has edited and approved the following plan. Execute it step by step.\n\n{}\n\n{}",
-                            edited_content,
-                            if allowed_prompts.is_empty() { String::new() }
-                            else { format!("Allowed operations:\n{}", allowed_prompts.iter().map(|p| format!("- {}: {}", p.tool, p.prompt)).collect::<Vec<_>>().join("\n")) }
-                        ),
-                        "metadata": {
-                            "openclaudia_context_source": "user_approved_plan",
-                            "canonical_task_id": binding.task_id,
-                            "canonical_task_graph_generation": binding.generation,
-                            "approved_plan_digest": binding.digest
-                        }
-                    }));
-                    events.push(openclaudia::state::StateEvent::MessageAppended {
-                        role: "system".to_string(),
-                    });
-                });
-                ("Plan edited and approved by user. Full tool access restored. Proceed with implementation according to the edited plan.".to_string(), true)
+                approve_plan(
+                    run,
+                    chat_session,
+                    task_manager,
+                    &prepared,
+                    allowed_prompts,
+                    coordinator,
+                )
             } else {
                 println!("\n\x1b[1;31m>> Plan Rejected - Staying in Plan Mode\x1b[0m\n");
                 (
                     "Edited plan rejected by user. Still in plan mode. Revise and try again."
                         .to_string(),
                     false,
+                    None,
                 )
             }
         }
         Ok(_) => (
             "Editor exited with error. Plan unchanged. Still in plan mode.".to_string(),
             false,
+            None,
         ),
         Err(e) => {
             let safe = run.environment_grants().sanitize_diagnostic(&e);
@@ -189,108 +125,87 @@ fn handle_plan_edit(
             (
                 "Failed to open editor. Still in plan mode.".to_string(),
                 false,
+                None,
             )
         }
     }
 }
 
 fn approve_plan(
+    run: &tools::ToolRunContext,
     chat_session: &Session,
     task_manager: &std::sync::Mutex<openclaudia::session::TaskManager>,
-    plan_content: &str,
+    prepared: &openclaudia::session::PreparedPlanApproval,
     allowed_prompts: &[tools::ToolAllowedPrompt],
-) -> (String, bool) {
-    let binding = match bind_approved_plan(chat_session, task_manager, plan_content) {
-        Ok(binding) => binding,
+    coordinator: bool,
+) -> (String, bool, Option<serde_json::Value>) {
+    let restore_mode = if coordinator {
+        openclaudia::modes::RuntimeMode::Coordinator
+    } else {
+        openclaudia::modes::RuntimeMode::Behavioral(chat_session.behavior_mode())
+    };
+    let receipt = match openclaudia::session::commit_interactive_plan_approval(
+        run,
+        chat_session,
+        task_manager,
+        prepared,
+        allowed_prompts,
+        restore_mode,
+    ) {
+        Ok(receipt) => receipt,
         Err(error) => {
             return (
-                format!(
-                    "Plan approval could not be committed to the canonical task graph: {error}. Still in plan mode."
-                ),
+                format!("Plan approval could not be committed: {error}. Still in plan mode."),
                 false,
+                None,
             );
         }
     };
-    let restored = chat_session
-        .inspect_state(|state| restore_previous_mode(state.conversation.plan_mode.as_ref()));
-    chat_session.set_agent_mode(restored);
     println!(
-        "\n\x1b[1;32m>> Plan Approved - Returning to Build Mode\x1b[0m\n\
+        "\n\x1b[1;32m>> Plan Approved - Exiting Plan Mode\x1b[0m\n\
          \x1b[90mFull tool access restored. Plan injected as context.\x1b[0m\n"
     );
-    chat_session.update_state(|state, events| {
-        state.conversation.plan_mode = None;
-        state.conversation.approved_plan = Some(plan_content.to_string());
-        state.conversation.messages.push(serde_json::json!({
-            "role": "system",
-            "content": format!(
-                "[Approved Implementation Plan]\n\
-                 The user has approved the following plan. Execute it step by step.\n\n{}\n\n{}",
-                plan_content,
-                if allowed_prompts.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "Allowed operations:\n{}",
-                        allowed_prompts
-                            .iter()
-                            .map(|prompt| format!("- {}: {}", prompt.tool, prompt.prompt))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    )
-                }
-            ),
-            "metadata": {
-                "openclaudia_context_source": "user_approved_plan",
-                "canonical_task_id": binding.task_id,
-                "canonical_task_graph_generation": binding.generation,
-                "approved_plan_digest": binding.digest
-            }
-        }));
-        events.push(openclaudia::state::StateEvent::MessageAppended {
-            role: "system".to_string(),
-        });
-    });
     (
-        "Plan approved by user. Full tool access restored. Proceed with implementation according to the plan.".to_string(),
+        format!(
+            "Plan approved by user as digest {} and task {}. Full tool access restored. Proceed with implementation according to the plan.",
+            receipt.plan_digest, receipt.task_id
+        ),
         true,
+        Some(receipt.context_message),
     )
 }
 
 /// Handle exiting plan mode. Reads plan file, shows to user for approval.
-/// Returns (`result_text`, `should_exit_plan_mode`).
+/// Returns (`result_text`, `should_exit_plan_mode`, `approved_plan_context`).
 pub fn handle_exit_plan_mode(
     run: &tools::ToolRunContext,
     chat_session: &Session,
     task_manager: &std::sync::Mutex<openclaudia::session::TaskManager>,
     allowed_prompts: &[tools::ToolAllowedPrompt],
-) -> (String, bool) {
+    coordinator: bool,
+) -> (String, bool, Option<serde_json::Value>) {
     use std::io::{self, Write};
 
     let plan_mode = chat_session.inspect_state(|state| state.conversation.plan_mode.clone());
     let plan_state = match &plan_mode {
         Some(state) if state.active => state.clone(),
         _ => {
-            return ("Not currently in plan mode.".to_string(), false);
+            return ("Not currently in plan mode.".to_string(), false, None);
         }
     };
 
-    let plan_content = match tools::read_capability_text_attachment(
-        run,
-        &plan_state.plan_file.to_string_lossy(),
-    ) {
-        Ok((_, content)) => content,
+    let prepared = match openclaudia::session::prepare_interactive_plan_approval(run, chat_session)
+    {
+        Ok(prepared) => prepared,
         Err(error) => {
             return (
-                format!(
-                    "Failed to read plan file {}: {}",
-                    plan_state.plan_file.display(),
-                    error
-                ),
+                format!("Failed to prepare the plan for approval: {error}"),
                 false,
+                None,
             );
         }
     };
+    let plan_content = prepared.plan_content();
 
     println!("\n\x1b[1;36m{}\x1b[0m", "=".repeat(60));
     println!("\x1b[1;36m## Implementation Plan\x1b[0m\n");
@@ -301,12 +216,19 @@ pub fn handle_exit_plan_mode(
 
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {
-        return ("Failed to read user input.".to_string(), false);
+        return ("Failed to read user input.".to_string(), false, None);
     }
     let input = input.trim().to_lowercase();
 
     match input.as_str() {
-        "y" | "yes" => approve_plan(chat_session, task_manager, &plan_content, allowed_prompts),
+        "y" | "yes" => approve_plan(
+            run,
+            chat_session,
+            task_manager,
+            &prepared,
+            allowed_prompts,
+            coordinator,
+        ),
         "n" | "no" => {
             println!(
                 "\n\x1b[1;31m>> Plan Rejected - Staying in Plan Mode\x1b[0m\n\
@@ -316,6 +238,7 @@ pub fn handle_exit_plan_mode(
             (
                 "Plan rejected by user. You are still in plan mode. Please revise the plan based on user feedback and call exit_plan_mode again when ready.".to_string(),
                 false,
+                None,
             )
         }
         "edit" | "e" => handle_plan_edit(
@@ -324,6 +247,7 @@ pub fn handle_exit_plan_mode(
             task_manager,
             &plan_state,
             allowed_prompts,
+            coordinator,
         ),
         _ => {
             println!("\x1b[90mUnrecognized input. Staying in plan mode.\x1b[0m");
@@ -331,26 +255,10 @@ pub fn handle_exit_plan_mode(
                 "Unrecognized response. Still in plan mode. Call exit_plan_mode again when ready."
                     .to_string(),
                 false,
+                None,
             )
         }
     }
-}
-
-/// Restore the runtime capability profile after an approved plan.
-///
-/// Session state is committed by [`handle_exit_plan_mode`] first; this keeps
-/// the runtime authority and persisted behavioral/coordinator mode aligned.
-pub fn restore_runtime_after_plan(
-    run: &tools::ToolRunContext,
-    chat_session: &Session,
-    coordinator: bool,
-) -> Result<(), String> {
-    let mode = if coordinator {
-        openclaudia::modes::RuntimeMode::Coordinator
-    } else {
-        openclaudia::modes::RuntimeMode::Behavioral(chat_session.behavior_mode())
-    };
-    run.transition_runtime_mode(mode).map(|_| ())
 }
 
 /// Check if a tool call is blocked by plan mode and return an error message if so.
@@ -418,16 +326,19 @@ const fn json_value_type_name(value: &serde_json::Value) -> &'static str {
 }
 
 /// Process a trusted typed follow-up and retain its resolved state in the
-/// result passed to provider continuation. Ordinary text is never inspected.
+/// result passed to provider continuation. Approved-plan context is returned
+/// separately so callers append it after the resolving tool result. Ordinary
+/// text is never inspected.
 pub fn process_tool_follow_up(
     run: &tools::ToolRunContext,
     chat_session: &Session,
     task_manager: &std::sync::Mutex<openclaudia::session::TaskManager>,
     result: &tools::ToolResult,
     coordinator: bool,
-) -> tools::ToolResult {
+) -> (tools::ToolResult, Option<serde_json::Value>) {
+    let mut trailing_context = None;
     let (content, response) = match result.follow_up() {
-        tools::ToolFollowUp::None => return result.clone(),
+        tools::ToolFollowUp::None => return (result.clone(), None),
         tools::ToolFollowUp::UserQuestion { questions, .. } => {
             let widget_questions: Vec<serde_json::Value> = questions
                 .iter()
@@ -445,30 +356,26 @@ pub fn process_tool_follow_up(
         tools::ToolFollowUp::ExitPlanMode {
             allowed_prompts, ..
         } => {
-            let (message, approved) =
-                handle_exit_plan_mode(run, chat_session, task_manager, allowed_prompts);
-            if approved {
-                if let Err(error) = restore_runtime_after_plan(run, chat_session, coordinator) {
-                    let message = format!(
-                        "Plan was approved, but restoring runtime capabilities failed: {error}"
-                    );
-                    return result
-                        .resolve_follow_up(
-                            message.clone(),
-                            serde_json::json!({"message": message, "approved": false}),
-                        )
-                        .expect("trusted pending follow-up must resolve exactly once");
-                }
-            }
+            let (message, approved, context) = handle_exit_plan_mode(
+                run,
+                chat_session,
+                task_manager,
+                allowed_prompts,
+                coordinator,
+            );
+            trailing_context = context;
             (
                 message.clone(),
                 serde_json::json!({"message": message, "approved": approved}),
             )
         }
     };
-    result
-        .resolve_follow_up(content, response)
-        .expect("trusted pending follow-up must resolve exactly once")
+    (
+        result
+            .resolve_follow_up(content, response)
+            .expect("trusted pending follow-up must resolve exactly once"),
+        trailing_context,
+    )
 }
 
 #[cfg(test)]
@@ -632,19 +539,32 @@ mod tests {
         let manager = std::sync::Mutex::new(
             openclaudia::session::TaskManager::for_run(&run).expect("task manager"),
         );
-        let first =
-            bind_approved_plan(&session, &manager, "secret prose step one").expect("first binding");
-        let repeated = bind_approved_plan(&session, &manager, "secret prose step one")
-            .expect("repeat binding");
-        assert_eq!(repeated.task_id, first.task_id);
-        assert_eq!(repeated.generation, first.generation);
-        assert_eq!(repeated.digest, first.digest);
+        let approve = |content: &str| {
+            handle_enter_plan_mode(&run, &session);
+            std::fs::write(run.agent_plan_file(), content).expect("write plan");
+            let prepared = openclaudia::session::prepare_interactive_plan_approval(&run, &session)
+                .expect("prepare approval");
+            openclaudia::session::commit_interactive_plan_approval(
+                &run,
+                &session,
+                &manager,
+                &prepared,
+                &[],
+                openclaudia::modes::RuntimeMode::Behavioral(session.behavior_mode()),
+            )
+            .expect("commit approval")
+        };
 
-        let revised = bind_approved_plan(&session, &manager, "secret prose step two")
-            .expect("revised binding");
+        let first = approve("secret prose step one");
+        let repeated = approve("secret prose step one");
+        assert_eq!(repeated.task_id, first.task_id);
+        assert_eq!(repeated.task_graph_generation, first.task_graph_generation);
+        assert_eq!(repeated.plan_digest, first.plan_digest);
+
+        let revised = approve("secret prose step two");
         assert_eq!(revised.task_id, first.task_id);
-        assert!(revised.generation > first.generation);
-        assert_ne!(revised.digest, first.digest);
+        assert!(revised.task_graph_generation > first.task_graph_generation);
+        assert_ne!(revised.plan_digest, first.plan_digest);
         let manager = manager
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -654,51 +574,59 @@ mod tests {
             openclaudia::task_graph::TaskSource::Plan {
                 observed_version,
                 ..
-            } if observed_version == &revised.digest
+            } if observed_version == &revised.plan_digest
         ));
         assert!(!task.description.contains("secret prose"));
         assert!(!task.subject.contains("secret prose"));
         drop(manager);
+        assert!(
+            session.messages_snapshot().is_empty(),
+            "the frontend must append approved context after its tool result"
+        );
     }
 
-    /// #618 fix: when `previous_mode` is `None` the restore falls back to
-    /// `Build` — pre-#618 sessions (saved without the field) keep working.
+    /// The shared approval transaction, now used by both frontends, retains
+    /// the pre-plan behavioral mode rather than always falling back to Build.
     #[test]
-    fn restore_previous_mode_defaults_to_build_when_none_618() {
-        let state = make_plan_state(None);
-        assert_eq!(restore_previous_mode(Some(&state)), AgentMode::Build);
-    }
-
-    /// #618 fix: a snapshot of "refactor" restores to `AgentMode::Refactor`
-    /// — the literal `enter (Refactor) -> exit -> Refactor` assertion the
-    /// issue asks for.
-    #[test]
-    fn restore_previous_mode_round_trips_refactor_618() {
-        let state = make_plan_state(Some("refactor"));
-        assert_eq!(restore_previous_mode(Some(&state)), AgentMode::Refactor);
-    }
-
-    /// #618 fix: every non-Plan `AgentMode` round-trips through the snapshot
-    /// — token form is the single source of truth and decoupled from the
-    /// session-module enum.
-    #[test]
-    fn restore_previous_mode_round_trips_all_non_plan_modes_618() {
+    fn shared_approval_restores_all_non_plan_agent_modes_618() {
         for mode in [AgentMode::Build, AgentMode::Extend, AgentMode::Refactor] {
-            let state = make_plan_state(Some(mode.as_token()));
+            let project = tempfile::tempdir().expect("plan project");
+            let session = Session::new("model", "provider");
+            session.set_agent_mode(mode);
+            let session_id = openclaudia::state::SessionId::from_raw(session.id())
+                .expect("session id must be UUID-shaped");
+            let run = tools::ToolRunContext::builder(session_id, project.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(tools::WorkspaceAccess::ReadWrite)
+                .process(false)
+                .network(false)
+                .secrets(false)
+                .provider("plan-test")
+                .build()
+                .expect("plan run");
+            let manager = std::sync::Mutex::new(
+                openclaudia::session::TaskManager::for_run(&run).expect("task manager"),
+            );
+            handle_enter_plan_mode(&run, &session);
+            std::fs::write(run.agent_plan_file(), "# approved\n").expect("write plan");
+            let prepared = openclaudia::session::prepare_interactive_plan_approval(&run, &session)
+                .expect("prepare approval");
+            openclaudia::session::commit_interactive_plan_approval(
+                &run,
+                &session,
+                &manager,
+                &prepared,
+                &[],
+                openclaudia::modes::RuntimeMode::Behavioral(session.behavior_mode()),
+            )
+            .expect("commit approval");
             assert_eq!(
-                restore_previous_mode(Some(&state)),
+                session.agent_mode(),
                 mode,
-                "mode {mode:?} must survive the snapshot round-trip"
+                "mode {mode:?} must survive a shared approval transaction"
             );
         }
-    }
-
-    /// #618 fix: forward-compat — an unknown token decodes to `Build`
-    /// instead of panicking, so an older binary reading a newer session
-    /// degrades gracefully.
-    #[test]
-    fn restore_previous_mode_unknown_token_falls_back_to_build_618() {
-        let state = make_plan_state(Some("some_future_mode"));
-        assert_eq!(restore_previous_mode(Some(&state)), AgentMode::Build);
     }
 }

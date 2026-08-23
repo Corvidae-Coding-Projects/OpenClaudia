@@ -10,7 +10,7 @@ pub mod slash;
 pub mod vim;
 
 use anyhow::Context;
-pub use openclaudia::state::{AgentMode, Session};
+pub use openclaudia::state::Session;
 use std::fs;
 use std::path::{Path, PathBuf};
 

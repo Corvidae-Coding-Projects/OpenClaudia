@@ -24,10 +24,11 @@ pub use pricing::{
     PRICING_CATALOG_GENERATION,
 };
 pub use state::{
-    get_session_context, install_interactive_plan_mode, is_tool_allowed_in_plan_mode,
-    is_tool_allowed_in_plan_mode_with_policy, AllowedPrompt, PlanModePolicy, PlanModeState,
-    TokenUsage, TurnMetrics, UsageExtras, MCP_TOOL_PREFIX, PLAN_MODE_ALLOWED_TOOLS,
-    PLUGIN_TOOL_PREFIX,
+    commit_interactive_plan_approval, get_session_context, install_interactive_plan_mode,
+    is_tool_allowed_in_plan_mode, is_tool_allowed_in_plan_mode_with_policy,
+    prepare_interactive_plan_approval, AllowedPrompt, ApprovedPlanReceipt, PlanModePolicy,
+    PlanModeState, PreparedPlanApproval, TokenUsage, TurnMetrics, UsageExtras, MCP_TOOL_PREFIX,
+    PLAN_MODE_ALLOWED_TOOLS, PLUGIN_TOOL_PREFIX,
 };
 pub use task::{Task, TaskManager, TaskStatus, TaskUpdateParams, TaskUpdateStatus};
 

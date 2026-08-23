@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -322,6 +323,209 @@ pub fn install_interactive_plan_mode(
     Ok(plan_file)
 }
 
+/// Exact plan bytes displayed to a user before an approval decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPlanApproval {
+    plan_content: String,
+    plan_digest: String,
+    plan_realpath: PathBuf,
+    previous_mode: Option<String>,
+    runtime_mode_generation: u64,
+}
+
+impl PreparedPlanApproval {
+    /// Plan text the frontend must display for approval.
+    #[must_use]
+    pub fn plan_content(&self) -> &str {
+        &self.plan_content
+    }
+
+    /// SHA-256 digest of the exact displayed bytes.
+    #[must_use]
+    pub fn plan_digest(&self) -> &str {
+        &self.plan_digest
+    }
+
+    /// Runtime mode generation under which the proposal was prepared.
+    #[must_use]
+    pub const fn runtime_mode_generation(&self) -> u64 {
+        self.runtime_mode_generation
+    }
+}
+
+/// Durable task-graph binding created by an approved plan transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedPlanReceipt {
+    /// Stable task representing this plan lifecycle.
+    pub task_id: String,
+    /// Canonical task-graph generation containing the binding.
+    pub task_graph_generation: u64,
+    /// Digest of the exact approved plan bytes.
+    pub plan_digest: String,
+    /// Runtime capability generation restored after approval.
+    pub runtime_mode_generation: u64,
+    /// Exact approved-plan context message to append after the resolving tool
+    /// result. Frontends own transcript ordering at that protocol boundary.
+    pub context_message: serde_json::Value,
+}
+
+fn approved_plan_digest(plan_content: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = Sha256::digest(plan_content.as_bytes());
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn restored_plan_agent_mode(previous_mode: Option<&str>) -> crate::state::AgentMode {
+    previous_mode.map_or(
+        crate::state::AgentMode::Build,
+        crate::state::AgentMode::from_token,
+    )
+}
+
+/// Read and bind the exact plan bytes a frontend will present to the user.
+///
+/// # Errors
+///
+/// Returns an error unless the session and run are in the same active plan
+/// generation and the pinned plan artifact can be read through the run.
+pub fn prepare_interactive_plan_approval(
+    run: &crate::tools::ToolRunContext,
+    chat_session: &crate::state::Session,
+) -> Result<PreparedPlanApproval, String> {
+    let runtime_mode = run.runtime_mode();
+    if runtime_mode.class != crate::modes::RuntimeModeClass::Plan {
+        return Err("runtime capability is not in plan mode".to_string());
+    }
+    let plan_state = chat_session
+        .inspect_state(|state| state.conversation.plan_mode.clone())
+        .filter(|state| state.active)
+        .ok_or_else(|| "session is not in active plan mode".to_string())?;
+    if plan_state.plan_realpath != run.agent_plan_file() {
+        return Err("active plan artifact belongs to a different run capability".to_string());
+    }
+    let (_, plan_content) = crate::tools::read_capability_text_attachment(
+        run,
+        &plan_state.plan_realpath.to_string_lossy(),
+    )
+    .map_err(|error| format!("failed to read the pinned plan artifact: {error}"))?;
+    Ok(PreparedPlanApproval {
+        plan_digest: approved_plan_digest(&plan_content),
+        plan_content,
+        plan_realpath: plan_state.plan_realpath,
+        previous_mode: plan_state.previous_mode,
+        runtime_mode_generation: runtime_mode.generation,
+    })
+}
+
+/// Commit a user decision for exactly one prepared plan artifact.
+///
+/// The plan is re-read before publication. A changed plan, replaced session
+/// state, or changed runtime generation leaves plan mode active and grants no
+/// wider capability. The canonical task binding is published before runtime
+/// capabilities are restored; session state is then updated in one closure.
+///
+/// # Errors
+///
+/// Returns an error on stale plan bytes/state, task-graph publication failure,
+/// or an invalid runtime restoration profile.
+pub fn commit_interactive_plan_approval(
+    run: &crate::tools::ToolRunContext,
+    chat_session: &crate::state::Session,
+    task_manager: &std::sync::Mutex<crate::session::TaskManager>,
+    prepared: &PreparedPlanApproval,
+    allowed_prompts: &[crate::tools::ToolAllowedPrompt],
+    restore_mode: crate::modes::RuntimeMode,
+) -> Result<ApprovedPlanReceipt, String> {
+    let runtime_mode = run.runtime_mode();
+    if runtime_mode.class != crate::modes::RuntimeModeClass::Plan
+        || runtime_mode.generation != prepared.runtime_mode_generation
+    {
+        return Err("plan approval is stale for the current runtime mode generation".to_string());
+    }
+    let current_plan_state = chat_session
+        .inspect_state(|state| state.conversation.plan_mode.clone())
+        .filter(|state| state.active)
+        .ok_or_else(|| "session is no longer in active plan mode".to_string())?;
+    if current_plan_state.plan_realpath != prepared.plan_realpath
+        || current_plan_state.previous_mode != prepared.previous_mode
+    {
+        return Err("plan approval is stale for the current session plan state".to_string());
+    }
+    let (_, current_content) = crate::tools::read_capability_text_attachment(
+        run,
+        &prepared.plan_realpath.to_string_lossy(),
+    )
+    .map_err(|error| format!("failed to re-read the pinned plan artifact: {error}"))?;
+    if approved_plan_digest(&current_content) != prepared.plan_digest
+        || current_content != prepared.plan_content
+    {
+        return Err("plan artifact changed after it was displayed for approval".to_string());
+    }
+
+    // Validate before publishing the durable task binding. The subsequent
+    // transition can then fail only if the u64 generation space is exhausted.
+    crate::modes::RuntimeModeAuthority::new(restore_mode.clone())?;
+    let plan_id = format!("plan-{}", chat_session.id());
+    let mut manager = task_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let task_id = manager
+        .reconcile_approved_plan(&plan_id, prepared.plan_digest.clone())?
+        .id
+        .clone();
+    let task_graph_generation = manager.generation().get();
+    drop(manager);
+
+    let restored_runtime = run.transition_runtime_mode(restore_mode)?;
+    let restored_agent_mode = restored_plan_agent_mode(prepared.previous_mode.as_deref());
+    let allowed_operations = if allowed_prompts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Allowed operations:\n{}",
+            allowed_prompts
+                .iter()
+                .map(|prompt| format!("- {}: {}", prompt.tool, prompt.prompt))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let plan_content = prepared.plan_content.clone();
+    let plan_digest = prepared.plan_digest.clone();
+    let context_message = serde_json::json!({
+        "role": "system",
+        "content": format!(
+            "[Approved Implementation Plan]\nThe user has approved the following plan. Execute it step by step.\n\n{}\n\n{}",
+            plan_content,
+            allowed_operations
+        ),
+        "metadata": {
+            "openclaudia_context_source": "user_approved_plan",
+            "canonical_task_id": task_id,
+            "canonical_task_graph_generation": task_graph_generation,
+            "approved_plan_digest": plan_digest
+        }
+    });
+    chat_session.update_state(|state, _| {
+        state.modes.agent_mode = restored_agent_mode;
+        state.conversation.plan_mode = None;
+        state.conversation.approved_plan = Some(plan_content.clone());
+    });
+
+    Ok(ApprovedPlanReceipt {
+        task_id,
+        task_graph_generation,
+        plan_digest: prepared.plan_digest.clone(),
+        runtime_mode_generation: restored_runtime.generation,
+        context_message,
+    })
+}
+
 /// An allowed prompt constraint for plan mode exit
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllowedPrompt {
@@ -538,6 +742,25 @@ mod plan_mode_tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn plan_agent_mode_restore_preserves_known_modes_and_defaults_unknown_tokens() {
+        for mode in [
+            crate::state::AgentMode::Build,
+            crate::state::AgentMode::Extend,
+            crate::state::AgentMode::Refactor,
+        ] {
+            assert_eq!(restored_plan_agent_mode(Some(mode.as_token())), mode);
+        }
+        assert_eq!(
+            restored_plan_agent_mode(None),
+            crate::state::AgentMode::Build
+        );
+        assert_eq!(
+            restored_plan_agent_mode(Some("some_future_mode")),
+            crate::state::AgentMode::Build
+        );
+    }
 
     /// Entry refuses when the plan file does not exist (#334).
     #[test]

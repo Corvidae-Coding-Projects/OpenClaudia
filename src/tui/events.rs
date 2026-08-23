@@ -17,6 +17,32 @@ pub enum PermissionResponse {
     AlwaysDeny,
 }
 
+/// Trusted plan lifecycle action requested by a typed tool follow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanModeRequest {
+    /// Enter the canonical pinned-plan runtime state.
+    Enter,
+    /// Present the exact plan artifact for an explicit user decision.
+    Exit {
+        allowed_prompts: Vec<crate::tools::ToolAllowedPrompt>,
+    },
+}
+
+/// Terminal TUI response to a typed plan lifecycle request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanModeReply {
+    /// The host action completed, including an explicit rejection.
+    Completed {
+        message: String,
+        response: serde_json::Value,
+        /// Approved-plan context to splice into the in-flight provider
+        /// history. `None` for entry and rejection outcomes.
+        context_message: Option<serde_json::Value>,
+    },
+    /// The modal or host transition was cancelled before completion.
+    Cancelled { message: String },
+}
+
 /// Which slash-command branch dispatched a backgrounded shell call, so the
 /// UI thread knows how to render the resulting [`AppEvent::ShellDone`].
 ///
@@ -154,6 +180,13 @@ pub enum AppEvent {
     UserQuestion {
         questions: Vec<serde_json::Value>,
         reply: tokio::sync::oneshot::Sender<String>,
+    },
+    /// A typed plan-mode handler needs the TUI-owned session and runtime
+    /// authority to complete its host transition. The pipeline awaits the
+    /// reply without blocking the event loop.
+    PlanModeRequest {
+        request: PlanModeRequest,
+        reply: tokio::sync::oneshot::Sender<PlanModeReply>,
     },
     /// A subprocess dispatched via `App::spawn_shell` has finished.
     /// The UI thread renders this according to [`SpawnTarget`].
