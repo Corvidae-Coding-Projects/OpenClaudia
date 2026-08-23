@@ -1,6 +1,6 @@
 {
   "next_display_id": 1114,
-  "next_comment_id": 1348,
+  "next_comment_id": 1349,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1638,10 +1638,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T10:55:42.266057457Z",
-      "updated_at": "2026-08-23T10:55:46.281128371Z",
+      "updated_at": "2026-08-23T12:57:36.188599808Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "144f2b3b-b4bb-4082-9505-31b764e98bad": {
+          "display_id": 1348,
+          "author": "6Vw9",
+          "content": "[action] Starting #1113 as a bounded generated-evidence refresh: locate the canonical registry/matrix generators and executable receipts, regenerate from current code/tests, and change only stale projections supported by evidence. No hand-promotion or new feature redesign.",
+          "created_at": "2026-08-23T12:57:36.185955169Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1YBzA6tCYBI2PZUtE+Aj21we80aRQ41DKv2ZV4zM/ficmkGokWYcimtNNVk53Pw49IWOmcR577vEXQmM86BuDA=="
+        }
+      }
     },
     "0527b748-873c-4cb7-a688-ffb7edd1b677": {
       "uuid": "0527b748-873c-4cb7-a688-ffb7edd1b677",
@@ -35781,11 +35792,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1213,
       "timestamp": "2026-08-23T12:57:31.464825066Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1214,
+      "timestamp": "2026-08-23T12:57:36.188599808Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T12:57:31.464825066Z",
+    "timestamp": "2026-08-23T12:57:36.188599808Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1213
+    "agent_seq": 1214
   }
 }
