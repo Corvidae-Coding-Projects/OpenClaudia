@@ -643,6 +643,8 @@ fn derive_mcp_stdio_run(
         .process_owner(parent.process_owner())
         .actor_role(crate::runtime::ActorRole::Worker)
         .provider("mcp-stdio")
+        .budget_limits(parent.runtime().descriptor().budget.limits.clone())
+        .parent_budget(parent.budget().clone())
         .build()
         .map_err(|error| {
             McpError::Transport(format!("Cannot bind MCP stdio capabilities: {error}"))

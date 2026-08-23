@@ -1,11 +1,9 @@
 //! Token-budget stop conditions (crosslink #590, CC parity with
 //! `query/tokenBudget.ts`).
 //!
-//! This module owns the declarative schema and the predicate that maps
-//! cumulative token spend onto a typed [`StopReason`]. The pipeline turn
-//! loop is the consumer — it accumulates per-turn deltas into a
-//! session-scoped counter and calls [`StopConditionsConfig::is_met`]
-//! after every assistant response.
+//! This module retains the declarative compatibility schema and its pure
+//! predicate. Production startup projects configured caps into the canonical
+//! atomic run budget before any provider call.
 //!
 //! The schema is intentionally narrow in this first pass: only token-budget
 //! limits are wired. CC's `query/tokenBudget.ts` additionally tracks

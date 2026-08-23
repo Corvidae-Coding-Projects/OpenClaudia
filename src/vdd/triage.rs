@@ -323,6 +323,7 @@ fn deterministic_finding_id(
 /// Inputs needed by the triage pipeline. Bundled into a struct so the
 /// `triage_findings` API stays under the `too_many_arguments` lint threshold.
 pub struct TriageContext<'a> {
+    pub run: &'a crate::tools::ToolRunContext,
     pub client: &'a Client,
     pub config: &'a VddConfig,
     pub app_config: &'a AppConfig,
@@ -554,6 +555,7 @@ async fn verify_findings(
 
     // Route through the builder's provider, not the adversary's
     let (response_text, tokens) = send_to_builder_for_verification(
+        ctx.run,
         ctx.client,
         ctx.config,
         ctx.app_config,
@@ -851,6 +853,7 @@ mod tests {
             description: "String concatenation vulnerability in users table".to_string(),
         }];
         let ctx = TriageContext {
+            run: crate::tools::security::test_run_context(),
             client: &client,
             config: &config,
             app_config: &app_config,
@@ -893,6 +896,7 @@ mod tests {
             description: "SQL injection in template renderer".to_string(),
         }];
         let ctx = TriageContext {
+            run: crate::tools::security::test_run_context(),
             client: &client,
             config: &config,
             app_config: &app_config,
@@ -938,6 +942,7 @@ mod tests {
             description: "SQL injection at first call site".to_string(),
         }];
         let ctx = TriageContext {
+            run: crate::tools::security::test_run_context(),
             client: &client,
             config: &config,
             app_config: &app_config,
@@ -988,6 +993,7 @@ mod tests {
                 .to_string(),
         }];
         let ctx = TriageContext {
+            run: crate::tools::security::test_run_context(),
             client: &client,
             config: &config,
             app_config: &app_config,
@@ -1034,6 +1040,7 @@ mod tests {
             description: "Possible panic in helper if input is malformed (re-reported)".to_string(),
         }];
         let ctx = TriageContext {
+            run: crate::tools::security::test_run_context(),
             client: &client,
             config: &config,
             app_config: &app_config,
@@ -1069,6 +1076,7 @@ mod tests {
 
         // Layer 2 catches this common Rust pattern before AI verification
         let ctx = TriageContext {
+            run: crate::tools::security::test_run_context(),
             client: &client,
             config: &config,
             app_config: &app_config,
@@ -1105,6 +1113,7 @@ mod tests {
         // AI verification will fail (no provider configured) but should
         // warn the user and keep the finding as Genuine (safe fallback).
         let ctx = TriageContext {
+            run: crate::tools::security::test_run_context(),
             client: &client,
             config: &config,
             app_config: &app_config,

@@ -1373,7 +1373,13 @@ async fn transform_and_forward(
     api_key: Option<&ApiKey>,
     request: &ChatCompletionRequest,
     is_stream: bool,
-) -> Result<UpstreamResponse, ProxyError> {
+) -> Result<
+    (
+        UpstreamResponse,
+        crate::provider_budget::ProviderBudgetReservation,
+    ),
+    ProxyError,
+> {
     // Crosslink #433: get_adapter now returns Result<&'static dyn …>; an
     // unknown provider name surfaces as a 400 instead of a silent OpenAI
     // fallback. The error string already lists the supported set so the
@@ -1387,7 +1393,18 @@ async fn transform_and_forward(
 
     inject_stream_options_if_needed(&mut transformed_request, is_stream, provider_name);
 
-    forward_to_provider_raw_reqwest(
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        &state.run_context,
+        provider_name,
+        &request.model,
+        &mut transformed_request,
+        u64::from(state.config.session.token_tracking.max_output_tokens),
+    )
+    .map_err(|error| {
+        ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
+    })?;
+
+    let upstream = forward_to_provider_raw_reqwest(
         &state.client,
         provider,
         provider_name,
@@ -1396,7 +1413,8 @@ async fn transform_and_forward(
         is_stream,
         adapter_headers(adapter, api_key),
     )
-    .await
+    .await?;
+    Ok((upstream, provider_budget))
 }
 
 /// Record an upstream-reported token usage tally against the active session
@@ -1573,7 +1591,7 @@ async fn proxy_chat_completions(
     }
 
     let is_stream = request.stream.unwrap_or(false);
-    let raw_response = transform_and_forward(
+    let (raw_response, provider_budget) = transform_and_forward(
         &state,
         provider,
         &provider_name,
@@ -1588,11 +1606,23 @@ async fn proxy_chat_completions(
     let max_bytes = state.config.proxy.max_response_bytes;
     if is_stream {
         let response = convert_response(raw_response, max_bytes).await?;
+        provider_budget.finish_unknown().map_err(|error| {
+            ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
+        })?;
         complete_loop_iteration(&state).await;
         Ok(response)
     } else {
         let (response_value, usage) =
             convert_response_with_usage(raw_response, max_bytes, &provider_name).await?;
+        if let Some(usage) = usage.as_ref() {
+            provider_budget.reconcile(usage).map_err(|error| {
+                ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
+            })?;
+        } else {
+            provider_budget.finish_unknown().map_err(|error| {
+                ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
+            })?;
+        }
         if let Some(usage) = usage {
             if token_tracking_enabled {
                 record_actual_usage_for_session(&state, usage).await;
@@ -1758,13 +1788,14 @@ async fn proxy_completions(
     headers: HeaderMap,
     body: String,
 ) -> Result<Response, ProxyError> {
-    let request: Value =
+    let mut request: Value =
         serde_json::from_str(&body).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
 
     let model = request["model"]
         .as_str()
-        .unwrap_or("gpt-3.5-turbo-instruct");
-    let provider_name = determine_provider(model, &state.config);
+        .unwrap_or("gpt-3.5-turbo-instruct")
+        .to_string();
+    let provider_name = determine_provider(&model, &state.config);
     let provider = state
         .config
         .get_provider(&provider_name)
@@ -1777,6 +1808,16 @@ async fn proxy_completions(
 
     let is_stream = request["stream"].as_bool().unwrap_or(false);
     let max_bytes = state.config.proxy.max_response_bytes;
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        &state.run_context,
+        &provider_name,
+        &model,
+        &mut request,
+        u64::from(state.config.session.token_tracking.max_output_tokens),
+    )
+    .map_err(|error| {
+        ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
+    })?;
     let raw = forward_to_provider(
         &state.client,
         provider,
@@ -1789,6 +1830,9 @@ async fn proxy_completions(
     .await?;
 
     let response = convert_response(raw, max_bytes).await?;
+    provider_budget.finish_unknown().map_err(|error| {
+        ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
+    })?;
     complete_loop_iteration(&state).await;
     Ok(response)
 }
@@ -1876,14 +1920,10 @@ async fn send_oauth_anthropic_messages(
     client: &Client,
     provider: &ProviderConfig,
     session: &crate::oauth::OAuthSession,
-    request: &mut Value,
+    request: &Value,
     max_bytes: usize,
 ) -> Result<Response, ProxyError> {
     info!("[/v1/messages] Using OAuth session: {}", session.id);
-
-    // CRITICAL co-requisites of every OAuth-authenticated request.
-    crate::claude_credentials::inject_oauth_prefix_only(request);
-    crate::claude_credentials::strip_cache_control_ttl(request);
 
     let url = format!("{}/v1/messages", normalize_base_url(&provider.base_url));
     crate::provider_transport::validate_endpoint("anthropic", &url)?;
@@ -1954,22 +1994,39 @@ async fn proxy_anthropic_messages(
         .ok_or_else(|| ProxyError::ProviderNotConfigured("anthropic".to_string()))?;
 
     let max_bytes = state.config.proxy.max_response_bytes;
-    let response = match resolve_anthropic_auth(&headers, &state.oauth_store, provider)? {
+    let auth = resolve_anthropic_auth(&headers, &state.oauth_store, provider)?;
+    if matches!(auth, AnthropicAuth::Oauth(_)) {
+        crate::claude_credentials::inject_oauth_prefix_only(&mut request);
+        crate::claude_credentials::strip_cache_control_ttl(&mut request);
+    }
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("anthropic-messages")
+        .to_string();
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        &state.run_context,
+        "anthropic",
+        &model,
+        &mut request,
+        u64::from(state.config.session.token_tracking.max_output_tokens),
+    )
+    .map_err(|error| {
+        ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
+    })?;
+    let response = match auth {
         AnthropicAuth::Oauth(session) => {
-            send_oauth_anthropic_messages(
-                &state.client,
-                provider,
-                &session,
-                &mut request,
-                max_bytes,
-            )
-            .await
+            send_oauth_anthropic_messages(&state.client, provider, &session, &request, max_bytes)
+                .await
         }
         AnthropicAuth::ApiKey(api_key) => {
             send_api_key_anthropic_messages(&state.client, provider, &api_key, &request, max_bytes)
                 .await
         }
     }?;
+    provider_budget.finish_unknown().map_err(|error| {
+        ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
+    })?;
     complete_loop_iteration(&state).await;
     Ok(response)
 }
@@ -1993,6 +2050,7 @@ async fn proxy_passthrough(
         .uri()
         .path_and_query()
         .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
+    let request_path = request.uri().path().to_string();
     let method = request.method().clone();
     let provider = state
         .config
@@ -2012,9 +2070,37 @@ async fn proxy_passthrough(
     crate::provider_transport::validate_endpoint(&state.config.proxy.target, &url)?;
     debug!("Passthrough request");
 
-    let body = axum::body::to_bytes(request.into_body(), state.config.proxy.max_response_bytes)
+    let mut body = axum::body::to_bytes(request.into_body(), state.config.proxy.max_response_bytes)
         .await
         .map_err(|error| ProxyError::InvalidBody(format!("passthrough body rejected: {error}")))?;
+    // Responses is intentionally routed through passthrough so its opaque
+    // continuation items survive unchanged. It is still model work, so bind
+    // it to the same run budget and mutate only its output cap.
+    let provider_budget = if method == reqwest::Method::POST && request_path == "/v1/responses" {
+        let mut request_json = serde_json::from_slice::<Value>(&body)
+            .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
+        let model = request_json
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("openai-responses")
+            .to_string();
+        let reservation = crate::provider_budget::reserve_provider_call(
+            &state.run_context,
+            &state.config.proxy.target,
+            &model,
+            &mut request_json,
+            u64::from(state.config.session.token_tracking.max_output_tokens),
+        )
+        .map_err(|error| {
+            ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
+        })?;
+        body = serde_json::to_vec(&request_json)
+            .map_err(|error| ProxyError::InvalidBody(error.to_string()))?
+            .into();
+        Some(reservation)
+    } else {
+        None
+    };
     let mut req_builder = state.client.request(method, &url).body(body);
 
     for (key, value) in &headers {
@@ -2044,14 +2130,20 @@ async fn proxy_passthrough(
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
 
     let response = crate::provider_transport::send(req_builder).await?;
-    convert_response(
+    let response = convert_response(
         UpstreamResponse {
             response,
             request_headers: provider_headers,
         },
         state.config.proxy.max_response_bytes,
     )
-    .await
+    .await?;
+    if let Some(provider_budget) = provider_budget {
+        provider_budget.finish_unknown().map_err(|error| {
+            ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
+        })?;
+    }
+    Ok(response)
 }
 
 /// Determine which provider to use based on model name.
@@ -2539,6 +2631,12 @@ async fn build_proxy_state_with_loop_control(
         .network(true)
         .secrets(true)
         .provider(config.proxy.target.clone())
+        .budget_limits(
+            config
+                .session
+                .run_budget
+                .limits_for_session(&config.session),
+        )
         .build()
         .map_err(|error| anyhow::anyhow!("Cannot create proxy run capabilities: {error}"))?;
     let session_manager = Arc::new(RwLock::new(session_manager_value));
@@ -3401,10 +3499,12 @@ mod tests {
                 }
             ]
         });
+        let mut forwarded_body = request_body.clone();
+        forwarded_body["max_output_tokens"] = serde_json::json!(crate::DEFAULT_MAX_TOKENS);
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .and(query_param("include", "reasoning.encrypted_content"))
-            .and(body_json(request_body.clone()))
+            .and(body_json(forwarded_body))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "resp_proxy",
                 "status": "completed"

@@ -11,6 +11,7 @@ use crate::file_types::extensions_from_tool_input;
 use crate::hooks::{HookEngine, HookError, HookEvent, HookInput};
 use crate::memory::MemoryDb;
 use crate::permissions::{AuthorizationResult, ExecutionPermit, PermissionManager};
+use crate::runtime::BudgetAmounts;
 use crate::services::policy::{PolicyEnforcer, ToolExecutionPolicy};
 use crate::session::TaskManager;
 use crate::tools::{self, ToolCall, ToolFailureCode, ToolResult, ToolRetryability};
@@ -201,6 +202,7 @@ impl ToolExecutor {
     /// Tool failures are returned inside [`ToolResult::is_error`], matching the
     /// historical dispatcher contract.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // Policy, budget admission, dispatch, and settlement are one auditable boundary.
     pub fn execute(request: ToolExecutorRequest<'_>) -> ToolResult {
         let ToolExecutorRequest {
             run_context,
@@ -302,14 +304,33 @@ impl ToolExecutor {
             );
         }
 
-        tools::execute_tool_after_authorization(
+        let budget_reservation = match run_context.budget().reserve(BudgetAmounts {
+            tool_calls: 1,
+            concurrent_calls: 1,
+            ..BudgetAmounts::default()
+        }) {
+            Ok(reservation) => Some(reservation),
+            Err(crate::runtime::BudgetError::Cancelled { .. })
+                if handler_reports_cancellation(&tool_call.function.name) =>
+            {
+                None
+            }
+            Err(error) => return budget_denied_tool_result(tool_call, &error),
+        };
+        let result = tools::execute_tool_after_authorization(
             run_context,
             tool_call,
             memory_db,
             app_config,
             task_mgr,
             Some(&consumed_authorization),
-        )
+        );
+        if let Some(budget_reservation) = budget_reservation {
+            if let Err(error) = budget_reservation.commit() {
+                return budget_accounting_failure(tool_call, &error);
+            }
+        }
+        result
     }
 
     /// Execute one dynamically registered MCP tool through the same catalog,
@@ -362,6 +383,14 @@ impl ToolExecutor {
             Ok(preflight) => preflight,
             Err(result) => return *result,
         };
+        let budget_reservation = match run_context.budget().reserve(BudgetAmounts {
+            tool_calls: 1,
+            concurrent_calls: 1,
+            ..BudgetAmounts::default()
+        }) {
+            Ok(reservation) => reservation,
+            Err(error) => return budget_denied_tool_result(tool_call, &error),
+        };
         let remotely_dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dispatch_evidence = std::sync::Arc::clone(&remotely_dispatched);
         let outcome = manager
@@ -387,7 +416,12 @@ impl ToolExecutor {
             ),
         };
         let result = ToolResult::bind(tool_call, &tool_call.function.name, handler_result);
-        tools::attach_automatic_learning(run_context, memory_db, app_config, None, result)
+        let result =
+            tools::attach_automatic_learning(run_context, memory_db, app_config, None, result);
+        if let Err(error) = budget_reservation.commit() {
+            return budget_accounting_failure(tool_call, &error);
+        }
+        result
     }
 
     /// Convert a missing run binding into a typed unavailable result without
@@ -396,6 +430,34 @@ impl ToolExecutor {
     pub fn execute_unbound(tool_call: &ToolCall) -> ToolResult {
         tools::execute_tool_without_context(tool_call)
     }
+}
+
+fn handler_reports_cancellation(tool_name: &str) -> bool {
+    matches!(tool_name, "memory_export" | "memory_import")
+}
+
+fn budget_denied_tool_result(
+    tool_call: &ToolCall,
+    error: &crate::runtime::BudgetError,
+) -> ToolResult {
+    ToolResult::failure(
+        tool_call,
+        ToolFailureCode::PolicyDenied,
+        format!("Run budget denied tool dispatch: {error}"),
+        ToolRetryability::Never,
+    )
+}
+
+fn budget_accounting_failure(
+    tool_call: &ToolCall,
+    error: &crate::runtime::BudgetError,
+) -> ToolResult {
+    ToolResult::failure(
+        tool_call,
+        ToolFailureCode::Internal,
+        format!("Tool completed, but run budget accounting failed: {error}"),
+        ToolRetryability::Never,
+    )
 }
 
 struct McpPreflightRequest<'a> {
@@ -629,6 +691,26 @@ mod tests {
         }
     }
 
+    fn one_tool_run() -> std::sync::Arc<crate::tools::ToolRunContext> {
+        let root = tempfile::tempdir().expect("root").keep();
+        crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &root)
+            .working_directory(&root)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("test")
+            .budget_limits(crate::runtime::BudgetLimits {
+                tool_calls: 1,
+                ..crate::runtime::BudgetLimits::default()
+            })
+            .build()
+            .expect("run")
+    }
+
     #[test]
     fn tool_executor_enforces_policy_before_dispatch() {
         let mut caps = ToolCaps::new();
@@ -823,5 +905,42 @@ mod tests {
                     && failure.retryability == ToolRetryability::Never
         ));
         assert!(result.content().contains("expected a JSON object"));
+    }
+
+    #[test]
+    fn tool_executor_reserves_the_shared_run_budget_before_dispatch() {
+        let run = one_tool_run();
+        let manager = PermissionManager::unrestricted_for_run(&run);
+        let first = bash_call("printf first");
+        let first_result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: &run,
+            tool_call: &first,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &manager,
+            authorization: None,
+            session_id: None,
+            policy_enforcer: None,
+        });
+        assert!(!first_result.is_error(), "{}", first_result.content());
+
+        let second = bash_call("printf second-should-not-run");
+        let second_result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: &run,
+            tool_call: &second,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &manager,
+            authorization: None,
+            session_id: None,
+            policy_enforcer: None,
+        });
+        assert!(second_result.is_error());
+        assert!(second_result
+            .content()
+            .contains("Run budget denied tool dispatch"));
+        assert!(!second_result.content().contains("second-should-not-run"));
     }
 }

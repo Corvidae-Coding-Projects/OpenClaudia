@@ -162,6 +162,19 @@ providers:
 #           command: python .openclaudia/hooks/validate-write.py
 session:
   timeout_minutes: 30
+  run_budget:
+    input_tokens: 1000000
+    output_tokens: 1000000
+    total_tokens: 1500000
+    turns: 1000
+    provider_calls: 1000
+    tool_calls: 10000
+    elapsed_millis: 86400000
+    retries: 100
+    concurrent_calls: 64
+    child_runs: 64
+    cost_microusd: 1000000000
+    trace_bytes: 67108864
   persist_path: .openclaudia/session
 
 # Legacy line REPL keybindings (`openclaudia --tui-mode`)

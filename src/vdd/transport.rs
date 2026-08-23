@@ -170,21 +170,30 @@ fn responses_usage_from_json(json: &Value) -> TokenUsage {
     let Some(usage) = json.get("usage") else {
         return TokenUsage::default();
     };
+    let raw_input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_write_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     TokenUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens: raw_input_tokens
+            .saturating_sub(cache_read_tokens)
+            .saturating_sub(cache_write_tokens),
         output_tokens: usage
             .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        cache_read_tokens: usage
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cache_write_tokens: 0,
+        cache_read_tokens,
+        cache_write_tokens,
     }
 }
 
@@ -271,7 +280,9 @@ fn validate_vdd_chat_terminal(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Keep the bounded VDD request and its budget settlement in one transaction.
 async fn send_to_codex_responses(
+    run: &crate::tools::ToolRunContext,
     client: &Client,
     auth: &crate::codex_credentials::CodexResponsesAuth,
     request: &ChatCompletionRequest,
@@ -290,6 +301,16 @@ async fn send_to_codex_responses(
         obj.remove("parallel_tool_calls");
         obj.remove("include");
     }
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        run,
+        "openai",
+        &request.model,
+        &mut body,
+        u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+    )
+    .map_err(|error| {
+        VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
+    })?;
 
     let endpoint = format!(
         "{}/responses",
@@ -348,24 +369,33 @@ async fn send_to_codex_responses(
     );
     let raw_text = String::from_utf8_lossy(&raw);
 
-    if raw_text
+    let result = if raw_text
         .lines()
         .any(|line| line.trim_start().starts_with("data:"))
     {
-        return responses_text_from_sse(&raw_text);
+        responses_text_from_sse(&raw_text)
+    } else {
+        let json = serde_json::from_slice::<Value>(&raw)
+            .map_err(|e| VddError::AdversaryRequestFailed(format!("responses JSON decode: {e}")))?;
+        crate::pipeline::validate_openai_responses_terminal_json(&json).map_err(|error| {
+            VddError::AdversaryRequestFailed(format!("responses terminal validation: {error}"))
+        })?;
+        let text = responses_text_from_json(&json).unwrap_or_default();
+        if text.trim().is_empty() {
+            return Err(VddError::AdversaryRequestFailed(
+                "Responses verifier completed without assistant content".to_string(),
+            ));
+        }
+        Ok((text, responses_usage_from_json(&json)))
+    };
+    if let Ok((_, usage)) = &result {
+        provider_budget.reconcile(usage).map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Provider budget reconciliation failed: {error}"
+            ))
+        })?;
     }
-    let json = serde_json::from_slice::<Value>(&raw)
-        .map_err(|e| VddError::AdversaryRequestFailed(format!("responses JSON decode: {e}")))?;
-    crate::pipeline::validate_openai_responses_terminal_json(&json).map_err(|error| {
-        VddError::AdversaryRequestFailed(format!("responses terminal validation: {error}"))
-    })?;
-    let text = responses_text_from_json(&json).unwrap_or_default();
-    if text.trim().is_empty() {
-        return Err(VddError::AdversaryRequestFailed(
-            "Responses verifier completed without assistant content".to_string(),
-        ));
-    }
-    Ok((text, responses_usage_from_json(&json)))
+    result
 }
 
 fn adversary_headers_and_endpoint(
@@ -425,7 +455,9 @@ fn adversary_headers_and_endpoint(
 /// body read in `tokio::time::timeout` so a hung adversary cannot block the
 /// VDD loop indefinitely. The timeout is configurable via
 /// `vdd.adversary.request_timeout_seconds` (default 120 s).
+#[allow(clippy::too_many_lines)] // Keep the bounded VDD request and its budget settlement in one transaction.
 pub async fn send_to_adversary(
+    run: &crate::tools::ToolRunContext,
     client: &Client,
     config: &VddConfig,
     app_config: &AppConfig,
@@ -453,7 +485,7 @@ pub async fn send_to_adversary(
                 config.adversary.provider
             )));
         }
-        return send_to_codex_responses(client, auth, request, timeout, timeout_secs).await;
+        return send_to_codex_responses(run, client, auth, request, timeout, timeout_secs).await;
     }
 
     // Crosslink #433: a typo in `config.adversary.provider` now surfaces
@@ -474,6 +506,16 @@ pub async fn send_to_adversary(
     )?;
 
     let provider_name = config.adversary.provider.clone();
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        run,
+        &provider_name,
+        &request.model,
+        &mut transformed,
+        u64::from(config.adversary.max_tokens),
+    )
+    .map_err(|error| {
+        VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
+    })?;
 
     let response = tokio::time::timeout_at(
         deadline,
@@ -527,6 +569,9 @@ pub async fn send_to_adversary(
     let tokens = adapter
         .extract_token_usage(&response_json)
         .unwrap_or_default();
+    provider_budget.reconcile(&tokens).map_err(|error| {
+        VddError::AdversaryRequestFailed(format!("Provider budget reconciliation failed: {error}"))
+    })?;
 
     // Always log at INFO level for debugging, truncated
     info!(
@@ -554,7 +599,9 @@ pub async fn send_to_adversary(
 /// badly. The timeout reuses the adversary's configured value for
 /// simplicity — they're the same upper bound on how long any single
 /// HTTP round-trip in the loop is allowed to take.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Existing transport boundary plus the shared run authority.
 pub async fn send_to_builder(
+    run: &crate::tools::ToolRunContext,
     client: &Client,
     config: &VddConfig,
     app_config: &AppConfig,
@@ -583,7 +630,7 @@ pub async fn send_to_builder(
             )));
         }
         let (text, tokens) =
-            send_to_codex_responses(client, auth, request, timeout, timeout_secs).await?;
+            send_to_codex_responses(run, client, auth, request, timeout, timeout_secs).await?;
         return Ok((
             text.clone(),
             serde_json::json!({ "output_text": text }),
@@ -624,6 +671,16 @@ pub async fn send_to_builder(
     };
 
     let pname = provider_name.to_string();
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        run,
+        provider_name,
+        &request.model,
+        &mut transformed,
+        u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+    )
+    .map_err(|error| {
+        VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
+    })?;
 
     let response = tokio::time::timeout_at(
         deadline,
@@ -670,6 +727,9 @@ pub async fn send_to_builder(
     let tokens = adapter
         .extract_token_usage(&response_json)
         .unwrap_or_default();
+    provider_budget.reconcile(&tokens).map_err(|error| {
+        VddError::BuilderRevisionFailed(format!("Provider budget reconciliation failed: {error}"))
+    })?;
 
     Ok((text, response_json, tokens))
 }
@@ -677,7 +737,9 @@ pub async fn send_to_builder(
 /// Send a verification request through the builder's provider.
 /// Reuses the same HTTP plumbing as `send_to_builder` but with a
 /// simpler interface (no revision response needed).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Existing transport boundary plus the shared run authority.
 pub async fn send_to_builder_for_verification(
+    run: &crate::tools::ToolRunContext,
     client: &Client,
     config: &VddConfig,
     app_config: &AppConfig,
@@ -704,7 +766,7 @@ pub async fn send_to_builder_for_verification(
                 "Codex Responses auth can only be used with OpenAI verifier, got '{provider_name}'"
             )));
         }
-        return send_to_codex_responses(client, auth, request, timeout, timeout_secs).await;
+        return send_to_codex_responses(run, client, auth, request, timeout, timeout_secs).await;
     }
 
     let adapter = get_adapter(provider_name).map_err(|e| VddError::ConfigError(e.to_string()))?;
@@ -741,6 +803,18 @@ pub async fn send_to_builder_for_verification(
     };
 
     let pname = provider_name.to_string();
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        run,
+        provider_name,
+        &request.model,
+        &mut transformed,
+        u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+    )
+    .map_err(|error| {
+        VddError::AdversaryRequestFailed(format!(
+            "Run budget denied verifier provider call: {error}"
+        ))
+    })?;
 
     let response = tokio::time::timeout_at(
         deadline,
@@ -789,6 +863,9 @@ pub async fn send_to_builder_for_verification(
     let tokens = adapter
         .extract_token_usage(&response_json)
         .unwrap_or_default();
+    provider_budget.reconcile(&tokens).map_err(|error| {
+        VddError::AdversaryRequestFailed(format!("Verifier budget reconciliation failed: {error}"))
+    })?;
 
     Ok((text, tokens))
 }
@@ -842,6 +919,24 @@ mod tests {
         );
         let error = responses_text_from_sse(raw).expect_err("refusal must fail");
         assert!(error.to_string().contains("refused"), "{error}");
+    }
+
+    #[test]
+    fn responses_usage_keeps_cache_buckets_disjoint() {
+        let usage = responses_usage_from_json(&serde_json::json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "input_tokens_details": {
+                    "cached_tokens": 30,
+                    "cache_write_tokens": 20
+                }
+            }
+        }));
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.cache_read_tokens, 30);
+        assert_eq!(usage.cache_write_tokens, 20);
     }
 
     fn app_cfg_with_provider(provider: &str, base_url: &str) -> AppConfig {
@@ -986,10 +1081,17 @@ mod tests {
         let req = dummy_request();
 
         // Run the call and advance virtual time past the 1s budget.
-        let handle =
-            tokio::spawn(
-                async move { send_to_adversary(&client, &cfg, &app_cfg, &req, None).await },
-            );
+        let handle = tokio::spawn(async move {
+            send_to_adversary(
+                crate::tools::security::test_run_context(),
+                &client,
+                &cfg,
+                &app_cfg,
+                &req,
+                None,
+            )
+            .await
+        });
         // Drive paused-time forward past the configured timeout.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let result = handle.await.expect("join task");

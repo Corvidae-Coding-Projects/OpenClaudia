@@ -858,7 +858,16 @@ impl HookEngine {
         input_json: &str,
         timeout_secs: u64,
     ) -> Result<(HookOutput, i32), HookError> {
-        match hook {
+        let budget = run
+            .budget()
+            .reserve(crate::runtime::BudgetAmounts {
+                concurrent_calls: 1,
+                ..crate::runtime::BudgetAmounts::default()
+            })
+            .map_err(|error| {
+                HookError::CommandFailed(format!("Run budget denied hook dispatch: {error}"))
+            })?;
+        let result = match hook {
             Hook::Command { command, shell, .. } => {
                 self.run_command_hook(
                     run,
@@ -892,7 +901,11 @@ impl HookEngine {
                 self.run_model_hook(prompt, model, provider.as_deref(), timeout_secs)
                     .await
             }
-        }
+        };
+        budget.commit().map_err(|error| {
+            HookError::CommandFailed(format!("Hook budget reconciliation failed: {error}"))
+        })?;
+        result
     }
 
     /// Build a [`Command`] for direct-spawn mode (no shell).

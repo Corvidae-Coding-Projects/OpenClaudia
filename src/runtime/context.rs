@@ -232,6 +232,9 @@ pub struct CapabilityBinding {
 pub struct BudgetLimits {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Combined input plus output token spend.
+    #[serde(default = "default_total_token_limit")]
+    pub total_tokens: u64,
     pub turns: u64,
     pub provider_calls: u64,
     pub tool_calls: u64,
@@ -241,6 +244,29 @@ pub struct BudgetLimits {
     pub child_runs: u64,
     pub cost_microusd: u64,
     pub trace_bytes: u64,
+}
+
+impl Default for BudgetLimits {
+    fn default() -> Self {
+        Self {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            total_tokens: default_total_token_limit(),
+            turns: 1_000,
+            provider_calls: 1_000,
+            tool_calls: 10_000,
+            elapsed_millis: 86_400_000,
+            retries: 100,
+            concurrent_calls: 64,
+            child_runs: 64,
+            cost_microusd: 1_000_000_000,
+            trace_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+const fn default_total_token_limit() -> u64 {
+    1_500_000
 }
 
 /// Budget identity, policy generation, and limits bound to a run.

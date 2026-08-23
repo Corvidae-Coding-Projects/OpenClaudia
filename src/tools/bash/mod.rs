@@ -284,6 +284,13 @@ impl BackgroundShellManager {
             crate::tools::effect::ToolEffect::Destructive,
         )?
         .ok_or_else(|| "background shell did not receive a mutation reservation".to_string())?;
+        let background_budget = run
+            .budget()
+            .reserve(crate::runtime::BudgetAmounts {
+                concurrent_calls: 1,
+                ..crate::runtime::BudgetAmounts::default()
+            })
+            .map_err(|error| format!("Run budget denied background process: {error}"))?;
 
         #[cfg(windows)]
         let child = {
@@ -429,6 +436,13 @@ impl BackgroundShellManager {
                     run_for_ledger.run_id,
                     run_for_ledger.capability_generation,
                 );
+                if let Err(error) = background_budget.commit() {
+                    tracing::error!(
+                        shell_id = wait_shell_id,
+                        %error,
+                        "Failed to release background process budget"
+                    );
+                }
             }
             Err(error) => {
                 tracing::error!(
@@ -437,6 +451,7 @@ impl BackgroundShellManager {
                     "Background shell wait failed; retaining mutation reservation fail-closed"
                 );
                 std::mem::forget(background_freshness);
+                std::mem::forget(background_budget);
             }
         });
 

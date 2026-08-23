@@ -98,6 +98,8 @@ pub struct ToolRunContextBuilder {
     process_owner: String,
     actor_role: ActorRole,
     provider: String,
+    budget_limits: Option<BudgetLimits>,
+    parent_budget: Option<crate::runtime::RunBudgetAuthority>,
 }
 
 impl ToolRunContextBuilder {
@@ -122,6 +124,8 @@ impl ToolRunContextBuilder {
             process_owner,
             actor_role: ActorRole::Frontend,
             provider: "local".to_string(),
+            budget_limits: None,
+            parent_budget: None,
         }
     }
 
@@ -282,6 +286,20 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Bind explicit immutable limits to this run generation.
+    #[must_use]
+    pub const fn budget_limits(mut self, limits: BudgetLimits) -> Self {
+        self.budget_limits = Some(limits);
+        self
+    }
+
+    /// Attach a derived run to its parent's live hierarchical budget.
+    #[must_use]
+    pub(crate) fn parent_budget(mut self, parent: crate::runtime::RunBudgetAuthority) -> Self {
+        self.parent_budget = Some(parent);
+        self
+    }
+
     /// Construct and validate the complete immutable run capability.
     ///
     /// # Errors
@@ -413,6 +431,8 @@ impl ToolRunContext {
             process_owner,
             actor_role,
             provider,
+            budget_limits,
+            parent_budget,
         } = builder;
         let workspace_access = workspace_access.ok_or_else(|| {
             "Run construction requires an explicit workspace access capability".to_string()
@@ -640,7 +660,7 @@ impl ToolRunContext {
                 manifest_digest,
                 grants,
             },
-            budget: default_run_budget(generation)?,
+            budget: run_budget(generation, budget_limits.unwrap_or_default())?,
             provider_continuation: ProviderContinuation::Fresh {
                 provider: ProviderId::new(provider).map_err(|error| error.to_string())?,
             },
@@ -652,10 +672,17 @@ impl ToolRunContext {
             },
         })
         .map_err(|error| error.to_string())?;
-        let runtime = Arc::new(
+        let runtime = Arc::new(if let Some(parent_budget) = parent_budget.as_ref() {
+            RunContext::new_child(
+                descriptor,
+                cancellation.root(),
+                Arc::new(TracingTraceSink),
+                parent_budget,
+            )?
+        } else {
             RunContext::new(descriptor, cancellation.root(), Arc::new(TracingTraceSink))
-                .map_err(|error| error.to_string())?,
-        );
+                .map_err(|error| error.to_string())?
+        });
 
         let context = Self {
             runtime,
@@ -691,6 +718,12 @@ impl ToolRunContext {
     #[must_use]
     pub const fn runtime(&self) -> &Arc<RunContext> {
         &self.runtime
+    }
+
+    /// Atomic hierarchical budget authority carried by this run.
+    #[must_use]
+    pub fn budget(&self) -> &crate::runtime::RunBudgetAuthority {
+        self.runtime.budget()
     }
 
     /// Stable identity of this exact run generation.
@@ -949,6 +982,8 @@ impl ToolRunContext {
             .process_owner(process_owner)
             .actor_role(ActorRole::Frontend)
             .provider(provider)
+            .budget_limits(self.runtime.descriptor().budget.limits.clone())
+            .parent_budget(self.runtime.budget().clone())
             .build()
     }
 
@@ -1297,24 +1332,12 @@ fn default_executable_search_path() -> OsString {
     }
 }
 
-fn default_run_budget(generation: CapabilityGeneration) -> Result<RunBudget, String> {
+fn run_budget(generation: CapabilityGeneration, limits: BudgetLimits) -> Result<RunBudget, String> {
     Ok(RunBudget {
         id: BudgetId::new(),
         generation: BudgetGeneration::new(generation.get())
             .ok_or_else(|| "budget generation must be non-zero".to_string())?,
-        limits: BudgetLimits {
-            input_tokens: 1_000_000,
-            output_tokens: 1_000_000,
-            turns: 1_000,
-            provider_calls: 1_000,
-            tool_calls: 10_000,
-            elapsed_millis: 86_400_000,
-            retries: 100,
-            concurrent_calls: 64,
-            child_runs: 64,
-            cost_microusd: 1_000_000_000,
-            trace_bytes: 64 * 1024 * 1024,
-        },
+        limits,
     })
 }
 

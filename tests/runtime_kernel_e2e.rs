@@ -38,6 +38,7 @@ const fn budget_with_trace_bytes(trace_bytes: u64) -> RunBudget {
         limits: BudgetLimits {
             input_tokens: 32_000,
             output_tokens: 8_000,
+            total_tokens: 40_000,
             turns: 8,
             provider_calls: 8,
             tool_calls: 16,

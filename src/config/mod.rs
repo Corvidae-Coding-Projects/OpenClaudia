@@ -51,7 +51,7 @@ pub use provider::{
     ProviderConfig, ThinkingConfig,
 };
 pub use proxy::ProxyConfig;
-pub use session::{SessionConfig, TokenTrackingConfig};
+pub use session::{RunBudgetConfig, SessionConfig, TokenTrackingConfig};
 pub use stop_conditions::{StopConditionsConfig, StopReason, TokenTotals};
 pub use vdd::{
     VddAdversaryConfig, VddConfig, VddMode, VddStaticAnalysis, VddThresholds, VddTracking,

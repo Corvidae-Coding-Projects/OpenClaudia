@@ -924,6 +924,12 @@ impl AcpServer {
                 .network(true)
                 .secrets(true)
                 .provider(config.proxy.target.clone())
+                .budget_limits(
+                    config
+                        .session
+                        .run_budget
+                        .limits_for_session(&config.session),
+                )
                 .build()?;
         let host_home = launch_capabilities
             .host_home()
@@ -1840,6 +1846,22 @@ impl AcpServer {
                 }
             };
 
+            let provider_budget = match crate::provider_budget::reserve_provider_call(
+                run,
+                &self.config.proxy.target,
+                &self.model,
+                &mut transformed,
+                u64::from(self.config.session.token_tracking.max_output_tokens),
+            ) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Run budget denied provider call: {error}"),
+                    );
+                }
+            };
+
             let req = match headers.apply(client.post(&endpoint).json(&transformed)) {
                 Ok(request) => request,
                 Err(error) => {
@@ -1955,6 +1977,13 @@ impl AcpServer {
                     None,
                 )
             };
+
+            if let Err(error) = provider_budget.finish_unknown() {
+                return self.fail_prompt_with_update(
+                    acp_session_id,
+                    &format!("Provider budget reconciliation failed: {error}"),
+                );
+            }
 
             match stream_result {
                 StreamResult::EndTurn { content } => {

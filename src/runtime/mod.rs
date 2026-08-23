@@ -7,6 +7,7 @@
 //! handles (S-019), provider-native continuation (S-044), atomic budget
 //! reservations (S-051), persistence (S-031/S-037), and frontend migration.
 
+mod budget;
 mod cancellation;
 mod context;
 mod event;
@@ -16,6 +17,10 @@ mod provider_state;
 mod reference;
 mod trace;
 
+pub use budget::{
+    BudgetAmounts, BudgetDimension, BudgetError, BudgetReceipt, BudgetReservation, BudgetSnapshot,
+    BudgetUsageCertainty, RunBudgetAuthority,
+};
 pub use cancellation::{
     CancellationHandle, CancellationReason, CancellationReceipt, CancellationTree,
 };

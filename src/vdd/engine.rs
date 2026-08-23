@@ -77,6 +77,7 @@ impl<'a> BuilderProvider<'a> {
 /// `run_iteration` can take a single argument without tripping the
 /// `too_many_arguments` lint.
 struct IterationContext<'a> {
+    run: &'a crate::tools::ToolRunContext,
     builder_text: &'a str,
     original_task: &'a str,
     static_results: &'a [StaticAnalysisResult],
@@ -180,6 +181,7 @@ impl VddEngine {
         );
 
         let (adversary_text, tokens_used) = send_to_adversary(
+            run,
             &self.client,
             &self.config,
             &self.app_config,
@@ -191,6 +193,7 @@ impl VddEngine {
         // Parse and triage findings (AI verifier uses builder's provider)
         let mut findings = parse_findings(&adversary_text, 1);
         let triage_ctx = TriageContext {
+            run,
             client: &self.client,
             config: &self.config,
             app_config: &self.app_config,
@@ -371,6 +374,7 @@ impl VddEngine {
             let static_results = self.run_static_analysis(run).await;
 
             let iteration_ctx = IterationContext {
+                run,
                 builder_text: &current_builder_text,
                 original_task: &original_task,
                 static_results: &static_results,
@@ -410,6 +414,7 @@ impl VddEngine {
             }
             match self
                 .revise_builder_response(
+                    run,
                     original_request,
                     &findings,
                     iteration,
@@ -489,6 +494,7 @@ impl VddEngine {
     /// * `Err(_)` — unrecoverable error.
     async fn revise_builder_response(
         &self,
+        run: &crate::tools::ToolRunContext,
         original_request: &ChatCompletionRequest,
         findings: &[Finding],
         iteration: u32,
@@ -504,6 +510,7 @@ impl VddEngine {
             build_revision_request(original_request, &genuine_findings, iteration);
 
         match send_to_builder(
+            run,
             &self.client,
             &self.config,
             &self.app_config,
@@ -567,6 +574,7 @@ impl VddEngine {
             ctx.iteration,
         );
         let (adversary_text, adversary_tokens) = send_to_adversary(
+            ctx.run,
             &self.client,
             &self.config,
             &self.app_config,
@@ -578,6 +586,7 @@ impl VddEngine {
         // Step 2: Parse and triage findings (including AI verification)
         let mut findings = parse_findings(&adversary_text, ctx.iteration);
         let triage_ctx = TriageContext {
+            run: ctx.run,
             client: &self.client,
             config: &self.config,
             app_config: &self.app_config,

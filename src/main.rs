@@ -987,7 +987,16 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     let policy_enforcer = std::sync::Arc::new(openclaudia::services::policy::PolicyEnforcer::new(
         config.policy.clone(),
     ));
-    let mut app = tui::app::App::new_with_policy(model, &config.proxy.target, policy_enforcer);
+    let budget_limits = config
+        .session
+        .run_budget
+        .limits_for_session(&config.session);
+    let mut app = tui::app::App::new_with_policy_and_budget(
+        model,
+        &config.proxy.target,
+        policy_enforcer,
+        budget_limits,
+    );
     app.hook_engine = Some(hook_engine);
     app.vdd_engine =
         init_vdd_engine_if_enabled_with_auth(config, vdd_adversary_auth).map(std::sync::Arc::new);

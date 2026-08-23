@@ -13,6 +13,7 @@ use super::event::{
 };
 use super::ids::{CallId, CancellationId, RunId};
 use super::trace::{TraceSink, TraceSinkError};
+use super::RunBudgetAuthority;
 
 /// Concrete non-serializable handles paired with an immutable descriptor.
 ///
@@ -21,6 +22,7 @@ use super::trace::{TraceSink, TraceSinkError};
 pub struct RunContext {
     descriptor: RunDescriptor,
     cancellation: CancellationHandle,
+    budget: RunBudgetAuthority,
     trace: Arc<dyn TraceSink>,
 }
 
@@ -42,9 +44,41 @@ impl RunContext {
         {
             return Err(RunContextError::CancellationRootMismatch);
         }
+        let budget = RunBudgetAuthority::root(descriptor.budget.clone(), cancellation.clone());
         Ok(Self {
             descriptor,
             cancellation,
+            budget,
+            trace,
+        })
+    }
+
+    /// Construct a derived run whose live budget remains bounded by the
+    /// supplied parent authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when ordinary run bindings are invalid or the child
+    /// budget widens/exhausts its parent policy.
+    pub fn new_child(
+        descriptor: RunDescriptor,
+        cancellation: CancellationHandle,
+        trace: Arc<dyn TraceSink>,
+        parent_budget: &RunBudgetAuthority,
+    ) -> Result<Self, String> {
+        descriptor.validate().map_err(|error| error.to_string())?;
+        if cancellation.id() != cancellation.root_id()
+            || descriptor.cancellation_root != cancellation.root_id()
+        {
+            return Err(RunContextError::CancellationRootMismatch.to_string());
+        }
+        let budget = parent_budget
+            .child(descriptor.budget.clone(), cancellation.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            descriptor,
+            cancellation,
+            budget,
             trace,
         })
     }
@@ -59,6 +93,12 @@ impl RunContext {
     #[must_use]
     pub fn cancellation(&self) -> CancellationHandle {
         self.cancellation.clone()
+    }
+
+    /// Live atomic budget authority for this exact run generation.
+    #[must_use]
+    pub const fn budget(&self) -> &RunBudgetAuthority {
+        &self.budget
     }
 }
 

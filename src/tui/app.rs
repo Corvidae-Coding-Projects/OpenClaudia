@@ -727,6 +727,7 @@ impl Default for ApiClient {
 fn build_startup_session_run_context(
     session: &Session,
     provider: &str,
+    budget_limits: crate::runtime::BudgetLimits,
 ) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
     let identity = session.inspect_state(|state| state.identity.clone());
     crate::tools::ToolRunContext::builder(identity.session_id, identity.project_root)
@@ -737,6 +738,7 @@ fn build_startup_session_run_context(
         .network(true)
         .secrets(true)
         .provider(provider)
+        .budget_limits(budget_limits)
         .build()
 }
 
@@ -896,10 +898,25 @@ impl App {
         provider: &str,
         policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     ) -> Self {
+        Self::new_with_policy_and_budget(
+            model,
+            provider,
+            policy_enforcer,
+            crate::runtime::BudgetLimits::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_policy_and_budget(
+        model: &str,
+        provider: &str,
+        policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
+        budget_limits: crate::runtime::BudgetLimits,
+    ) -> Self {
         let chat_session = Session::new(model, provider);
         let transcript_subscriber =
             crate::transcript::TranscriptStateSubscriber::new(chat_session.state_store());
-        let run_context = build_startup_session_run_context(&chat_session, provider);
+        let run_context = build_startup_session_run_context(&chat_session, provider, budget_limits);
         let task_manager = run_context
             .as_ref()
             .ok()

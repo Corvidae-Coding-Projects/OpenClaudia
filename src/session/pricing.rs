@@ -54,8 +54,12 @@
 //! `cost-tracker.ts:291-302`).
 
 use super::state::{TokenUsage, UsageExtras};
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use thiserror::Error;
+
+/// Version of the built-in pricing catalog used by fixed-point budget receipts.
+pub const PRICING_CATALOG_GENERATION: u32 = 1;
 
 /// Fast-mode input rate for Claude Opus 4.6 / 4.7 per million tokens
 /// (`COST_TIER_30_150`) — see #642.
@@ -92,6 +96,31 @@ pub enum PricingError {
     /// the caller can log or surface it verbatim to the user.
     #[error("no pricing entry matches model `{0}`")]
     UnknownModel(String),
+}
+
+/// Failure to represent a provider charge in the run's fixed-point ledger.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum FixedCostError {
+    #[error("pricing rate is not a finite non-negative fixed-point value")]
+    InvalidRate,
+    #[error("provider cost exceeds the fixed-point accounting range")]
+    Overflow,
+}
+
+/// Exact source used to calculate a fixed-point provider charge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingProvenance {
+    Catalog { prefix: String, generation: u32 },
+    ConservativeCatalogCeiling { generation: u32 },
+}
+
+/// Checked micro-USD cost paired with its model-pricing provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixedCostEstimate {
+    pub microusd: u64,
+    pub provenance: PricingProvenance,
 }
 
 /// TTL bucket for Anthropic prompt-cache write pricing.
@@ -855,15 +884,146 @@ fn mark_unknown_model_cost() {
 /// display) does not pollute the session-level inaccuracy signal.
 #[must_use]
 pub fn get_pricing(model: &str) -> Option<ModelPricing> {
-    let key = model.to_lowercase();
-    let hit = PRICING_TABLE
-        .iter()
-        .find(|(prefix, _)| key.starts_with(prefix))
-        .map(|(_, pricing)| *pricing);
+    let hit = pricing_entry(model).map(|(_, pricing)| pricing);
     if hit.is_none() {
         tracing::warn!(model = %model, "unknown pricing for model");
     }
     hit
+}
+
+fn pricing_entry(model: &str) -> Option<(&'static str, ModelPricing)> {
+    let key = model.to_lowercase();
+    PRICING_TABLE
+        .iter()
+        .find(|(prefix, _)| key.starts_with(prefix))
+        .map(|(prefix, pricing)| (*prefix, *pricing))
+}
+
+/// Calculate a checked fixed-point provider charge.
+///
+/// Known models use their exact catalog row. Unknown models use the maximum
+/// input/output rates present in that same catalog, so an unpriced call never
+/// turns into free budget allowance.
+///
+/// # Errors
+///
+/// Returns an error when rates or the resulting micro-USD amount cannot be
+/// represented without saturation.
+pub fn calculate_budget_cost_microusd(
+    model: &str,
+    usage: &TokenUsage,
+) -> Result<FixedCostEstimate, FixedCostError> {
+    let Some((prefix, pricing)) = pricing_entry(model) else {
+        tracing::warn!(
+            target: "openclaudia::analytics",
+            event = "unknown_model_budget_cost",
+            model,
+            "unknown model charged at the conservative catalog ceiling"
+        );
+        return conservative_budget_cost_microusd(usage);
+    };
+    let input_rate = pricing.effective_input_per_million_for_usage(usage, false);
+    let output_rate = pricing.effective_output_per_million_for_usage(usage, false);
+    let cost = checked_cost_sum(&[
+        (usage.input_tokens, input_rate),
+        (usage.output_tokens, output_rate),
+        (
+            usage.cache_read_tokens,
+            input_rate * pricing.cache_read_multiplier,
+        ),
+        (
+            usage.cache_write_tokens,
+            input_rate * pricing.cache_write_multiplier(CacheWriteTtl::FiveMinutes),
+        ),
+    ])?;
+    Ok(FixedCostEstimate {
+        microusd: cost,
+        provenance: PricingProvenance::Catalog {
+            prefix: prefix.to_string(),
+            generation: PRICING_CATALOG_GENERATION,
+        },
+    })
+}
+
+/// Price a reservation at the most expensive rates in the built-in catalog.
+///
+/// This is deliberately an upper bound used before a provider call. Exact
+/// known usage is reconciled against the matched model row afterward.
+///
+/// # Errors
+///
+/// Returns an error when the resulting amount cannot be represented.
+pub fn conservative_budget_cost_microusd(
+    usage: &TokenUsage,
+) -> Result<FixedCostEstimate, FixedCostError> {
+    let (input_rate, output_rate) = conservative_catalog_rates();
+    let input_tokens = usage
+        .input_tokens
+        .checked_add(usage.cache_read_tokens)
+        .and_then(|value| value.checked_add(usage.cache_write_tokens))
+        .ok_or(FixedCostError::Overflow)?;
+    let cost = checked_cost_sum(&[
+        (input_tokens, input_rate),
+        (usage.output_tokens, output_rate),
+    ])?;
+    Ok(FixedCostEstimate {
+        microusd: cost,
+        provenance: PricingProvenance::ConservativeCatalogCeiling {
+            generation: PRICING_CATALOG_GENERATION,
+        },
+    })
+}
+
+fn conservative_catalog_rates() -> (f64, f64) {
+    let mut input = 0.0_f64;
+    let mut output = 0.0_f64;
+    for (_, pricing) in PRICING_TABLE {
+        let base_input = pricing
+            .input_per_million
+            .max(pricing.fast_mode_input_per_million.unwrap_or(0.0))
+            .max(pricing.long_context_input_per_million.unwrap_or(0.0));
+        let cache_multiplier = pricing
+            .cache_read_multiplier
+            .max(pricing.cache_write_5m_multiplier)
+            .max(pricing.cache_write_1hr_multiplier)
+            .max(1.0);
+        input = input.max(base_input * cache_multiplier);
+        output = output
+            .max(pricing.output_per_million)
+            .max(pricing.fast_mode_output_per_million.unwrap_or(0.0))
+            .max(pricing.long_context_output_per_million.unwrap_or(0.0));
+    }
+    (input, output)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)] // Rates are validated, rounded, and range-checked before entering the integer ledger.
+fn checked_cost_sum(charges: &[(u64, f64)]) -> Result<u64, FixedCostError> {
+    let mut total = 0_u128;
+    for &(tokens, dollars_per_million) in charges {
+        if !dollars_per_million.is_finite() || dollars_per_million < 0.0 {
+            return Err(FixedCostError::InvalidRate);
+        }
+        let scaled = (dollars_per_million * 1_000_000.0).round();
+        if scaled > u128::MAX as f64 {
+            return Err(FixedCostError::InvalidRate);
+        }
+        let rate_microusd_per_million = scaled as u128;
+        let numerator = u128::from(tokens)
+            .checked_mul(rate_microusd_per_million)
+            .ok_or(FixedCostError::Overflow)?;
+        let component = numerator
+            .checked_add(999_999)
+            .ok_or(FixedCostError::Overflow)?
+            / 1_000_000;
+        total = total
+            .checked_add(component)
+            .ok_or(FixedCostError::Overflow)?;
+    }
+    u64::try_from(total).map_err(|_| FixedCostError::Overflow)
 }
 
 /// Calculate the cost for given token usage and model.
@@ -2004,5 +2164,52 @@ mod tests {
         let extras: UsageExtras = serde_json::from_str(r#"{"web_search_requests":42}"#)
             .expect("legacy extras deserialize");
         assert_eq!(extras, UsageExtras::ZERO);
+    }
+
+    #[test]
+    fn fixed_point_budget_cost_is_exact_and_never_free_for_unknown_models() {
+        let known = calculate_budget_cost_microusd(
+            "claude-3-haiku-20240307",
+            &TokenUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 100_000,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        )
+        .expect("known fixed cost");
+        assert_eq!(known.microusd, 375_000);
+        assert!(matches!(
+            known.provenance,
+            PricingProvenance::Catalog { .. }
+        ));
+
+        let unknown = calculate_budget_cost_microusd(
+            "unpriced-local-model",
+            &TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        )
+        .expect("conservative fixed cost");
+        assert!(unknown.microusd > 0);
+        assert!(matches!(
+            unknown.provenance,
+            PricingProvenance::ConservativeCatalogCeiling { .. }
+        ));
+    }
+
+    #[test]
+    fn extreme_fixed_point_cost_fails_instead_of_saturating() {
+        let error = conservative_budget_cost_microusd(&TokenUsage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        })
+        .expect_err("unrepresentable cost must fail");
+        assert_eq!(error, FixedCostError::Overflow);
     }
 }

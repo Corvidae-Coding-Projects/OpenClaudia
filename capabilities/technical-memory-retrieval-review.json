@@ -1,7 +1,7 @@
 {
-  "evaluation_digest": "sha256:da47b2f27e1fe1e35e461bcb717b152a99a35bfe5460a1e805d4aa5a96def8c7",
+  "evaluation_digest": "sha256:984c295618ff7fae0ec6d142d66eb269c826471ff73db658456fb946a4e35e7d",
   "evaluation_generator_id": "s105-evaluation-runner",
-  "held_out_corpus_digest": "sha256:153ce08ab7c3ec0886142993e6c0f13961a1ed8b2e1fe6d704f5055355eda62b",
+  "held_out_corpus_digest": "sha256:cf43a06de9d4dec17fac90a4d1f2cd1f55b12e61880059b95bd81e22b0fd6373",
   "limitations": [
     "Independent corpus and evaluation review has not yet been performed; runtime promotion must fail closed to the lexical baseline."
   ],
@@ -11,6 +11,6 @@
   "reviewer_id": "unassigned-independent-reviewer",
   "reviewer_model_id": "unassigned",
   "schema_version": 1,
-  "tuning_corpus_digest": "sha256:29e2d1c9c052362de2cc9b3fed4e38b781d030e37974084c4db692df04c6e773",
+  "tuning_corpus_digest": "sha256:cd7c9c842e08c26d9326050f985f2ea3380587f0a10e1b95f0b4607ccb17ce3c",
   "verdict": "rejected"
 }

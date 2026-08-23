@@ -1676,7 +1676,9 @@ fn emit_api_retry(
 /// [`AppEvent::OverloadFallback`] with an advisory model hint so the
 /// orchestrator can suggest or automatically switch to a lighter
 /// sibling. See crosslink #598.
+#[allow(clippy::too_many_lines)] // Retry admission, diagnostics, and terminal response ownership form one transaction.
 async fn send_with_retry(
+    run: &tools::ToolRunContext,
     client: &reqwest::Client,
     endpoint: &str,
     headers: &crate::secrets::SensitiveHeaders,
@@ -1689,6 +1691,10 @@ async fn send_with_retry(
         let req = headers
             .apply(client.post(endpoint).json(request_body))
             .map_err(|error| error.to_string())?;
+        if attempt > 0 {
+            crate::provider_budget::record_provider_retry(run)
+                .map_err(|error| format!("Run budget denied provider retry: {error}"))?;
+        }
 
         let resp = match provider_transport::send_until(req, deadline).await {
             Ok(r) => r,
@@ -1823,6 +1829,7 @@ fn trace_run_turn_request(endpoint: &str, request_body: &Value) {
 /// # Errors
 ///
 /// Returns `Err` if the HTTP request itself fails (network error, etc.).
+#[allow(clippy::too_many_lines)] // One provider turn owns reservation, transport, response handling, and settlement.
 pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     let RunTurnParams {
         run_context,
@@ -1844,15 +1851,36 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         session_id,
         tx,
     } = p;
-    trace_run_turn_request(endpoint, request_body);
+    let mut request_body = request_body.clone();
+    let configured_max_output = app_config.as_ref().map_or(0, |config| {
+        u64::from(config.session.token_tracking.max_output_tokens)
+    });
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        &run_context,
+        provider,
+        model_identity,
+        &mut request_body,
+        configured_max_output,
+    )
+    .map_err(|error| format!("Run budget denied provider call: {error}"))?;
+    trace_run_turn_request(endpoint, &request_body);
 
-    let response = send_with_retry(client, endpoint, headers, request_body, &tx).await?;
+    let response =
+        match send_with_retry(&run_context, client, endpoint, headers, &request_body, &tx).await {
+            Ok(response) => response,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    format!("{error}; budget reconciliation failed: {budget_error}")
+                })?;
+                return Err(error);
+            }
+        };
 
-    if matches!(
+    let result = if matches!(
         provider.trim().to_ascii_lowercase().as_str(),
         "google" | "gemini" | "ollama"
     ) {
-        return handle_provider_native_json_response(
+        handle_provider_native_json_response(
             run_context,
             response,
             provider,
@@ -1870,11 +1898,9 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             headers,
             &tx,
         )
-        .await;
-    }
-
-    if request_body.get("input").is_some() && request_body.get("messages").is_none() {
-        return stream_responses_sse_response(SseStreamParams {
+        .await
+    } else if request_body.get("input").is_some() && request_body.get("messages").is_none() {
+        stream_responses_sse_response(SseStreamParams {
             run_context,
             response,
             headers,
@@ -1892,28 +1918,42 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             session_id,
             tx: &tx,
         })
-        .await;
+        .await
+    } else {
+        stream_sse_response(SseStreamParams {
+            run_context,
+            response,
+            headers,
+            provider,
+            model_identity,
+            provider_native_state,
+            assistant_message_ordinal,
+            memory_db,
+            app_config,
+            permission_mgr,
+            transient_allowed_tool_rules,
+            hook_engine,
+            policy_enforcer,
+            task_mgr,
+            session_id,
+            tx: &tx,
+        })
+        .await
+    };
+    match result {
+        Ok(turn) => {
+            provider_budget
+                .reconcile(&turn.usage)
+                .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
+            Ok(turn)
+        }
+        Err(error) => {
+            provider_budget.finish_unknown().map_err(|budget_error| {
+                format!("{error}; budget reconciliation failed: {budget_error}")
+            })?;
+            Err(error)
+        }
     }
-
-    stream_sse_response(SseStreamParams {
-        run_context,
-        response,
-        headers,
-        provider,
-        model_identity,
-        provider_native_state,
-        assistant_message_ordinal,
-        memory_db,
-        app_config,
-        permission_mgr,
-        transient_allowed_tool_rules,
-        hook_engine,
-        policy_enforcer,
-        task_mgr,
-        session_id,
-        tx: &tx,
-    })
-    .await
 }
 
 /// Outcome of classifying the top-level `finishReason` from a Gemini
@@ -2795,7 +2835,7 @@ impl ResponsesStreamCapture {
 
 fn parse_responses_usage(response: &Value) -> Option<TokenUsage> {
     let usage = response.get("usage")?;
-    let input_tokens = usage
+    let raw_input_tokens = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -2808,14 +2848,27 @@ fn parse_responses_usage(response: &Value) -> Option<TokenUsage> {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 {
+    let cache_write_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if raw_input_tokens == 0
+        && output_tokens == 0
+        && cache_read_tokens == 0
+        && cache_write_tokens == 0
+    {
         return None;
     }
     Some(TokenUsage {
-        input_tokens,
+        // Responses reports cache reads/writes as a breakdown of its inclusive
+        // input total. Keep TokenUsage's buckets disjoint for cost accounting.
+        input_tokens: raw_input_tokens
+            .saturating_sub(cache_read_tokens)
+            .saturating_sub(cache_write_tokens),
         output_tokens,
         cache_read_tokens,
-        cache_write_tokens: 0,
+        cache_write_tokens,
     })
 }
 
@@ -6009,7 +6062,10 @@ memory:
                 "usage": {
                     "input_tokens": 12,
                     "output_tokens": 7,
-                    "input_tokens_details": {"cached_tokens": 5}
+                    "input_tokens_details": {
+                        "cached_tokens": 5,
+                        "cache_write_tokens": 2
+                    }
                 }
             }
         });
@@ -6021,9 +6077,10 @@ memory:
             } => {
                 assert_eq!(response_id, "resp_abc");
                 assert_eq!(output_items, Some(vec![tool_event["item"].clone()]));
-                assert_eq!(usage.input_tokens, 12);
+                assert_eq!(usage.input_tokens, 5);
                 assert_eq!(usage.output_tokens, 7);
                 assert_eq!(usage.cache_read_tokens, 5);
+                assert_eq!(usage.cache_write_tokens, 2);
             }
             _ => panic!("expected completed event"),
         }

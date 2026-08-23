@@ -565,6 +565,12 @@ impl ChatRepl {
                 .network(true)
                 .secrets(true)
                 .provider(config.proxy.target.clone())
+                .budget_limits(
+                    config
+                        .session
+                        .run_budget
+                        .limits_for_session(&config.session),
+                )
                 .build()
                 .map_err(anyhow::Error::msg)?;
         let memory_db = Some(init_memory_with_banner(&run_context, &config)?);
@@ -1560,13 +1566,27 @@ impl ChatRepl {
         )
     }
 
+    fn reserve_provider_call(
+        &self,
+        request: &mut serde_json::Value,
+    ) -> Result<openclaudia::provider_budget::ProviderBudgetReservation, String> {
+        openclaudia::provider_budget::reserve_provider_call(
+            &self.run_context,
+            &self.config.proxy.target,
+            &self.model,
+            request,
+            u64::from(self.config.session.token_tracking.max_output_tokens),
+        )
+        .map_err(|error| format!("Run budget denied provider call: {error}"))
+    }
+
     /// Send the initial turn request and dispatch the response to the
     /// provider-specific handler. Returns `true` when streaming
     /// keybindings asked the REPL to exit.
     async fn send_and_process_turn(
         &mut self,
         transport: TurnTransport<'_>,
-        request_body: serde_json::Value,
+        mut request_body: serde_json::Value,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
     ) -> bool {
@@ -1579,6 +1599,16 @@ impl ChatRepl {
         );
         spinner.set_message("Connecting...");
         spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+
+        let _provider_budget = match self.reserve_provider_call(&mut request_body) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                spinner.finish_and_clear();
+                eprintln!("\n{error}\n");
+                self.record_failed_turn(&error);
+                return false;
+            }
+        };
 
         let req = match transport
             .headers
@@ -1880,9 +1910,17 @@ impl ChatRepl {
         request: &serde_json::Value,
         transport: TurnTransport<'_>,
     ) -> Option<serde_json::Value> {
+        let mut request = request.clone();
+        let _provider_budget = match self.reserve_provider_call(&mut request) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                eprintln!("\n{error}");
+                return None;
+            }
+        };
         let request = match transport
             .headers
-            .apply(self.client.post(transport.endpoint).json(request))
+            .apply(self.client.post(transport.endpoint).json(&request))
         {
             Ok(request) => request,
             Err(error) => {
@@ -2971,12 +3009,14 @@ impl ChatRepl {
     /// provider terminal state before the caller continues.
     async fn send_anthropic_followup(
         &self,
-        followup_req: serde_json::Value,
+        mut followup_req: serde_json::Value,
         transport: TurnTransport<'_>,
         anthropic_accumulator: &mut tools::AnthropicToolAccumulator,
         full_content: &mut String,
     ) -> Result<(), String> {
         use futures::StreamExt;
+
+        let _provider_budget = self.reserve_provider_call(&mut followup_req)?;
 
         let req = match transport
             .headers
@@ -3309,13 +3349,15 @@ impl ChatRepl {
     #[allow(clippy::too_many_lines)]
     async fn stream_openai_followup(
         &self,
-        request_body: serde_json::Value,
+        mut request_body: serde_json::Value,
         transport: TurnTransport<'_>,
         tool_accumulator: &mut tools::ToolCallAccumulator,
         current_content: &mut String,
         current_reasoning_content: &mut String,
     ) -> Result<(), String> {
         use futures::StreamExt;
+
+        let _provider_budget = self.reserve_provider_call(&mut request_body)?;
 
         let req = transport
             .headers

@@ -440,6 +440,7 @@ fn prepare_print_transport(
 ///
 /// Returns an error when configuration/auth cannot be resolved, the provider
 /// rejects the request, or the response stream cannot be decoded.
+#[allow(clippy::too_many_lines)] // One-shot mode owns setup, budgeted transport, and terminal output.
 pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     crate::chdir_to_git_root();
 
@@ -462,6 +463,12 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     .network(true)
     .secrets(true)
     .provider(config.proxy.target.clone())
+    .budget_limits(
+        config
+            .session
+            .run_budget
+            .limits_for_session(&config.session),
+    )
     .build()
     .map_err(anyhow::Error::msg)?;
     let provider = config.active_provider().ok_or_else(|| {
@@ -500,12 +507,20 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         auth: &chat_auth,
     })?;
     let PreparedPrintTransport {
-        request_body,
+        mut request_body,
         endpoint,
         headers,
         wire_api,
         responses_assistant_ordinal,
     } = prepared;
+    let provider_budget = openclaudia::provider_budget::reserve_provider_call(
+        &print_run,
+        &config.proxy.target,
+        &model,
+        &mut request_body,
+        u64::from(config.session.token_tracking.max_output_tokens),
+    )
+    .map_err(|error| anyhow::anyhow!("Run budget denied provider call: {error}"))?;
 
     let client = openclaudia::provider_transport::shared_client()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -521,7 +536,7 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         anyhow::bail!("API error {}: {diagnostic}", status.as_u16());
     }
 
-    if wire_api.is_responses() {
+    let result = if wire_api.is_responses() {
         print_responses_stream(
             response,
             &headers,
@@ -535,7 +550,11 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         print_json_response(response, adapter).await
     } else {
         print_sse_response(response, &config.proxy.target).await
-    }
+    };
+    provider_budget
+        .finish_unknown()
+        .map_err(|error| anyhow::anyhow!("Provider budget reconciliation failed: {error}"))?;
+    result
 }
 
 #[cfg(test)]

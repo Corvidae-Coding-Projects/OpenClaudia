@@ -1961,6 +1961,8 @@ async fn run_subagent_inner(
         .process_owner(&agent_id)
         .actor_role(crate::runtime::ActorRole::Worker)
         .provider(app_config.proxy.target.clone())
+        .budget_limits(parent_run.runtime().descriptor().budget.limits.clone())
+        .parent_budget(parent_run.budget().clone())
         .build()
     {
         Ok(run) => run,
@@ -2387,6 +2389,7 @@ async fn run_subagent_inner(
                 unreachable!("Responses wire selection requires Codex auth");
             };
             match make_openai_responses_api_call(
+                &subagent_run,
                 client,
                 &app_config.proxy.target,
                 &model,
@@ -2429,6 +2432,7 @@ async fn run_subagent_inner(
                 .as_ref()
                 .expect("native JSON request uses the canonical wire builder");
             match make_provider_native_json_api_call(
+                &subagent_run,
                 client,
                 &app_config.proxy.target,
                 &model,
@@ -2468,6 +2472,7 @@ async fn run_subagent_inner(
             }
         } else {
             let response = match make_api_call(
+                &subagent_run,
                 client,
                 &app_config.proxy.target,
                 &base_url,
@@ -3124,6 +3129,7 @@ fn subagent_assistant_text(message: &Value) -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn make_openai_responses_api_call(
+    run: &crate::tools::ToolRunContext,
     client: &Client,
     provider: &str,
     model: &str,
@@ -3135,6 +3141,7 @@ async fn make_openai_responses_api_call(
     assistant_message_ordinal: u64,
 ) -> Result<crate::pipeline::OpenAiResponsesDecodedTurn, String> {
     make_openai_responses_api_call_impl(
+        run,
         client,
         provider,
         model,
@@ -3151,6 +3158,7 @@ async fn make_openai_responses_api_call(
 
 #[allow(clippy::too_many_arguments)]
 async fn make_openai_responses_api_call_impl(
+    run: &crate::tools::ToolRunContext,
     client: &Client,
     provider: &str,
     model: &str,
@@ -3183,8 +3191,17 @@ async fn make_openai_responses_api_call_impl(
     if let Some(extra_headers) = extra_headers {
         headers.extend(extra_headers);
     }
+    let mut request_body = request_body.clone();
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        run,
+        provider,
+        model,
+        &mut request_body,
+        u64::from(SUBAGENT_MAX_TOKENS),
+    )
+    .map_err(|error| format!("Run budget denied provider call: {error}"))?;
     let request = headers
-        .apply(client.post(endpoint).json(request_body))
+        .apply(client.post(endpoint).json(&request_body))
         .map_err(|error| format!("Responses header error: {error}"))?;
     let response = crate::provider_transport::send(request)
         .await
@@ -3217,11 +3234,15 @@ async fn make_openai_responses_api_call_impl(
         decoded.terminal_outcome,
         decoded.tool_calls.len(),
     )?;
+    provider_budget
+        .reconcile(&decoded.usage)
+        .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
     Ok(decoded)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn make_provider_native_json_api_call(
+    run: &crate::tools::ToolRunContext,
     client: &Client,
     provider: &str,
     model: &str,
@@ -3242,8 +3263,17 @@ async fn make_provider_native_json_api_call(
         extra_headers.unwrap_or(&empty_headers),
     )
     .map_err(|error| format!("Provider header error: {error}"))?;
+    let mut request_body = request_body.clone();
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        run,
+        provider,
+        model,
+        &mut request_body,
+        u64::from(SUBAGENT_MAX_TOKENS),
+    )
+    .map_err(|error| format!("Run budget denied provider call: {error}"))?;
     let request = headers
-        .apply(client.post(endpoint).json(request_body))
+        .apply(client.post(endpoint).json(&request_body))
         .map_err(|error| format!("Provider header error: {error}"))?;
     let response = crate::provider_transport::send(request)
         .await
@@ -3276,6 +3306,9 @@ async fn make_provider_native_json_api_call(
         decoded.terminal_outcome,
         decoded.tool_calls.len(),
     )?;
+    provider_budget
+        .reconcile(&decoded.usage)
+        .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
     Ok(decoded)
 }
 
@@ -3294,6 +3327,7 @@ async fn make_provider_native_json_api_call(
 /// the auth header is omitted rather than sent empty. See crosslink
 /// #256.
 async fn make_api_call(
+    run: &crate::tools::ToolRunContext,
     client: &Client,
     provider: &str,
     base_url: &str,
@@ -3311,9 +3345,17 @@ async fn make_api_call(
     // Transform via the canonical adapter — handles every provider's
     // wire format, including Anthropic prompt-cache `cache_control`
     // headers, Google `generationConfig`, Ollama `options`, etc.
-    let body = adapter
+    let mut body = adapter
         .transform_request(&typed_request)
         .map_err(|e| format!("Adapter transform_request failed: {e}"))?;
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        run,
+        provider,
+        &typed_request.model,
+        &mut body,
+        u64::from(SUBAGENT_MAX_TOKENS),
+    )
+    .map_err(|error| format!("Run budget denied provider call: {error}"))?;
 
     // Endpoint path is adapter-owned (Google's path embeds the model
     // name, Ollama uses /api/chat, Anthropic uses /v1/messages, etc.).
@@ -3376,7 +3418,42 @@ async fn make_api_call(
         .transform_response(json, false)
         .map_err(|e| format!("Adapter transform_response failed: {e}"))?;
     crate::pipeline::validate_chat_completion_terminal(&transformed)?;
+    let usage = normalized_response_usage(&transformed);
+    provider_budget
+        .reconcile(&usage)
+        .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
     Ok(transformed)
+}
+
+fn normalized_response_usage(response: &Value) -> crate::session::TokenUsage {
+    let usage = response.get("usage").unwrap_or(&Value::Null);
+    let raw_input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_write_tokens = usage
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .or_else(|| usage.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    crate::session::TokenUsage {
+        input_tokens: raw_input_tokens
+            .saturating_sub(cache_read_tokens)
+            .saturating_sub(cache_write_tokens),
+        output_tokens: usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read_tokens,
+        cache_write_tokens,
+    }
 }
 
 /// Parse the response to extract the assistant message
@@ -4452,6 +4529,20 @@ mod tests {
         app_config
     }
 
+    #[test]
+    fn normalized_usage_does_not_double_count_cached_input() {
+        let usage = normalized_response_usage(&serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 30}
+            }
+        }));
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.cache_read_tokens, 30);
+    }
+
     #[tokio::test]
     async fn subagent_provider_failure_redacts_seeded_api_key() {
         use wiremock::matchers::{method, path};
@@ -4476,6 +4567,7 @@ mod tests {
         });
 
         let error = make_api_call(
+            test_run(),
             &reqwest::Client::new(),
             "local",
             &server.uri(),
@@ -5865,6 +5957,7 @@ memory:
             "model": "gpt-test",
             "store": false,
             "stream": true,
+            "max_output_tokens": SUBAGENT_MAX_TOKENS,
             "input": [{"role":"user","content":"inspect"}]
         });
         Mock::given(method("POST"))
@@ -5891,6 +5984,7 @@ memory:
         };
 
         let decoded = make_openai_responses_api_call_impl(
+            test_run(),
             &Client::new(),
             "openai",
             "gpt-test",
