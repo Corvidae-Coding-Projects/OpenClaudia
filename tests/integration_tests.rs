@@ -2360,7 +2360,7 @@ mod subagent_tools {
 mod token_tracking {
     use openclaudia::compaction::{
         estimate_message_tokens, estimate_request_tokens, estimate_tokens, get_context_window,
-        CompactionConfig, ContextCompactor,
+        CompactionConfig, ContextCompactor, RequestTokenMeasurement,
     };
     use openclaudia::config::{SessionConfig, TokenTrackingConfig};
     use openclaudia::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
@@ -2874,7 +2874,7 @@ mod token_tracking {
         let compactor = ContextCompactor::new(CompactionConfig::default());
 
         // Without hint, should use estimator
-        let analysis = compactor.analyze_with_hint(&request, None);
+        let analysis = compactor.analyze_with_measurement(&request, None);
         let estimated = estimate_request_tokens(&request);
         assert_eq!(analysis.current_tokens, estimated);
         assert!(!analysis.needs_compaction);
@@ -2891,7 +2891,10 @@ mod token_tracking {
         let compactor = ContextCompactor::new(CompactionConfig::default());
 
         // With hint, should use the provided value
-        let analysis = compactor.analyze_with_hint(&request, Some(50000));
+        let analysis = compactor.analyze_with_measurement(
+            &request,
+            Some(RequestTokenMeasurement::for_request(&request, 50_000)),
+        );
         assert_eq!(analysis.current_tokens, 50000);
     }
 
@@ -2920,10 +2923,13 @@ mod token_tracking {
         let compactor = ContextCompactor::new(config);
 
         // Without hint: estimation might not trigger compaction
-        let _analysis_no_hint = compactor.analyze_with_hint(&request, None);
+        let _analysis_no_hint = compactor.analyze_with_measurement(&request, None);
 
         // With large hint: should definitely trigger compaction
-        let analysis_with_hint = compactor.analyze_with_hint(&request, Some(4500));
+        let analysis_with_hint = compactor.analyze_with_measurement(
+            &request,
+            Some(RequestTokenMeasurement::for_request(&request, 4_500)),
+        );
         assert!(
             analysis_with_hint.needs_compaction,
             "4500 tokens should exceed 80% of 5000"
@@ -2953,9 +2959,9 @@ mod token_tracking {
 
         let compactor = ContextCompactor::new(config);
 
-        // compact_with_hint with None behaves like compact
+        // No provider measurement behaves like compact.
         let result = compactor
-            .compact_with_hint(
+            .compact_with_measurement(
                 &mut request,
                 None,
                 crate::support::shared_run_context(),

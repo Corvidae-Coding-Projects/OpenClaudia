@@ -177,7 +177,11 @@ pub fn advance_openai_responses_state(
     assistant_ordinal: u64,
     output: &OpenAiResponsesTurnOutput,
 ) -> Result<ProviderNativeState, ProviderError> {
-    let mut items = if let Some(previous) = previous {
+    let compacted = output
+        .output_items
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction"));
+    let previous_items = if let Some(previous) = previous {
         previous
             .validate_binding(provider, model, ProviderWireProtocol::OpenAiResponses)
             .map_err(provider_error)?;
@@ -190,7 +194,16 @@ pub fn advance_openai_responses_state(
         Vec::new()
     };
 
-    validate_next_turn_identity(&items, output.response_id(), assistant_ordinal)?;
+    validate_next_turn_identity(&previous_items, output.response_id(), assistant_ordinal)?;
+    // An opaque compaction item supersedes all earlier provider-owned output
+    // items. Portable user messages remain in the canonical transcript and
+    // are selected during replay; retaining old native turns here would undo
+    // the provider's token reduction.
+    let mut items = if compacted {
+        Vec::new()
+    } else {
+        previous_items
+    };
 
     items.push(
         ProviderNativeItem::new(
@@ -229,12 +242,12 @@ pub fn advance_openai_responses_state(
     }
 
     let generation = match previous {
+        None => 1,
         Some(state) => state
             .generation()
             .get()
             .checked_add(1)
             .ok_or_else(|| provider_error("Responses continuation generation exhausted"))?,
-        None => 1,
     };
     let generation = ContinuationGeneration::new(generation)
         .ok_or_else(|| provider_error("Responses continuation generation exhausted"))?;
@@ -366,11 +379,19 @@ fn validate_replay_groups(
             }
         }
     }
-    let turn_count = u64::try_from(groups.len())
+    let retained_turn_count = u64::try_from(groups.len())
         .map_err(|_| provider_error("Responses continuation turn count overflow"))?;
-    if turn_count != generation {
+    let begins_with_compaction = groups.first_key_value().is_some_and(|(_, group)| {
+        group
+            .items
+            .iter()
+            .any(|(facet, _)| *facet == ProviderStateFacet::Compaction)
+    });
+    if retained_turn_count > generation
+        || (retained_turn_count < generation && !begins_with_compaction)
+    {
         return Err(provider_error(format!(
-            "Responses continuation generation {generation} does not match its {turn_count} retained turns"
+            "Responses continuation generation {generation} does not match its {retained_turn_count} retained turns"
         )));
     }
     Ok(())
@@ -446,6 +467,9 @@ fn parse_replay_groups(
     Ok(groups)
 }
 
+// Ordered replay is one validation state machine; splitting boundary selection
+// from ordinal consumption would duplicate mutable maps and weaken reviewability.
+#[allow(clippy::too_many_lines)]
 fn apply_responses_state(
     request: &mut Value,
     state: &ProviderNativeState,
@@ -516,8 +540,29 @@ fn apply_responses_state(
     }
 
     let mut groups = parse_replay_groups(state)?;
+    let compaction_ordinals = groups
+        .iter()
+        .filter(|(_, group)| {
+            group
+                .items
+                .iter()
+                .any(|(facet, _)| *facet == ProviderStateFacet::Compaction)
+        })
+        .map(|(ordinal, _)| *ordinal)
+        .collect::<Vec<_>>();
+    if compaction_ordinals.len() > 1 {
+        return Err(provider_error(
+            "Responses continuation contains multiple active compaction boundaries",
+        ));
+    }
+    let compaction_ordinal = compaction_ordinals.first().copied();
     let mut replayed = Vec::new();
     for (ordinal, role) in roles {
+        if compaction_ordinal.is_some_and(|boundary| ordinal < boundary) {
+            portable_by_ordinal.remove(&ordinal);
+            groups.remove(&ordinal);
+            continue;
+        }
         if let Some(group) = groups.remove(&ordinal) {
             if role != "assistant" {
                 return Err(provider_error(format!(

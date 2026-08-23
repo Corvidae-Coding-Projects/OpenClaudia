@@ -1179,9 +1179,13 @@ async fn fire_vdd_hook_event(
 }
 
 /// Build a model-specific compactor, apply session hints, and compact the
-/// request context if needed. Logs results and fires hooks. Non-fatal: errors
-/// are logged at warn and do not abort the request.
-async fn compact_request_context(request: &mut ChatCompletionRequest, state: &ProxyState) {
+/// request context if needed. A partial/cannot-fit outcome is a typed request
+/// failure; forwarding an oversized request would only defer the same failure
+/// to a provider with worse diagnostics.
+async fn compact_request_context(
+    request: &mut ChatCompletionRequest,
+    state: &ProxyState,
+) -> Result<(), ProxyError> {
     // Single-pass construction — no temporary clones of CompactionConfig.
     // Adding a new override field is enforced at compile time via the
     // destructuring in `CompactionConfig::apply_overrides` (crosslink #489).
@@ -1189,21 +1193,10 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
         ContextCompactor::for_model_with_overrides(&request.model, &state.compactor_overrides),
     );
 
-    let actual_token_hint: Option<usize> = {
-        let sm = state.session_manager.read().await;
-        sm.get_session().and_then(|session| {
-            session
-                .turn_metrics
-                .last()
-                .and_then(|tm| tm.actual_usage.as_ref())
-                .map(|u| usize::try_from(u.input_tokens).unwrap_or(usize::MAX))
-        })
-    };
-
     match compactor
         .auto_compact(
             request,
-            actual_token_hint,
+            None,
             Some(&state.hook_engine),
             &state.run_context,
             None,
@@ -1211,7 +1204,9 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
         )
         .await
     {
-        Ok(Some(result)) if result.compacted => {
+        Ok(Some(result))
+            if result.disposition == crate::compaction::CompactionDisposition::Committed =>
+        {
             let summary_len = result.summary.as_ref().map_or(0, std::string::String::len);
             info!(
                 original = result.original_tokens,
@@ -1230,14 +1225,33 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
                 )
                 .await;
         }
+        Ok(Some(result))
+            if result.disposition == crate::compaction::CompactionDisposition::Partial =>
+        {
+            return Err(ProxyError::InvalidBody(format!(
+                "Context checkpoint reduced input from {} to {} tokens but target {} still cannot fit",
+                result.original_tokens, result.new_tokens, result.target_tokens
+            )));
+        }
+        Ok(Some(result))
+            if result.disposition == crate::compaction::CompactionDisposition::CannotFit =>
+        {
+            return Err(ProxyError::InvalidBody(format!(
+                "Context cannot fit target {} tokens without dropping required causal state",
+                result.target_tokens
+            )));
+        }
         Ok(Some(_) | None) => {}
         Err(crate::compaction::CompactionError::HookBlocked(reason)) => {
-            warn!(reason = %reason, "Compaction blocked by hook");
+            return Err(ProxyError::HookBlocked(reason));
         }
         Err(crate::compaction::CompactionError::Failed(reason)) => {
-            warn!(reason = %reason, "Compaction failed");
+            return Err(ProxyError::InvalidBody(format!(
+                "Context checkpoint failed: {reason}"
+            )));
         }
     }
+    Ok(())
 }
 
 async fn complete_loop_iteration(state: &ProxyState) {
@@ -1571,11 +1585,10 @@ async fn proxy_chat_completions(
 
     bump_session_request_count(&state).await;
 
-    // Compact first: compaction emits legacy system-role boundary/summary
-    // records for transcript compatibility. The typed preparation step must
-    // run afterwards so model-authored summary text is demoted to bounded
-    // session reference data before provider dispatch.
-    compact_request_context(&mut request, &state).await;
+    // Compact first into one cited, non-authoritative assistant checkpoint.
+    // The client retains the exact transcript archive; only this provider
+    // projection is replaced.
+    compact_request_context(&mut request, &state).await?;
     // Prepare request: run hooks, project typed context, plugins, VDD, and
     // every system-role value left by the client or compactor. This
     // transparent proxy does not own a local tool-result/model-follow-up loop,
@@ -3305,7 +3318,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summary_crosses_proxy_as_session_reference() {
+    fn causal_checkpoint_crosses_proxy_as_assistant_evidence() {
         let mut request = test_chat_request("test-model", None);
         request.messages = vec![
             crate::compaction::build_compact_boundary_message(100, 4, Vec::new(), None),
@@ -3330,16 +3343,22 @@ mod tests {
         ];
 
         let items = take_system_context_items(&mut request);
-        assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|item| {
-            item.source() == crate::context::ContextSource::Reference(ReferenceSource::Session)
-                && item.authority() == crate::context::ContextAuthority::Reference
-        }));
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].authority(),
+            crate::context::ContextAuthority::UserInstruction
+        );
+        assert_eq!(request.messages.len(), 2);
+        assert!(crate::compaction::is_compact_boundary_message(
+            &request.messages[0]
+        ));
         let projection = ContextProjector::project(items, ContextBudget::default());
-        assert!(!projection
+        assert!(projection
             .combined_system()
             .contains("MODEL_SUMMARY_SENTINEL"));
-        assert!(projection.reference.contains("MODEL_SUMMARY_SENTINEL"));
+        assert!(!projection
+            .combined_system()
+            .contains(crate::compaction::COMPACT_BOUNDARY_MARKER));
     }
 
     fn model_ids(response: &Value) -> Vec<String> {

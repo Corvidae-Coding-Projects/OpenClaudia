@@ -869,6 +869,13 @@ fn build_openai_responses_request_draft_with_tools(
         "stream": true,
         "store": false,
         "include": ["reasoning.encrypted_content"],
+        // Responses owns its opaque compaction continuation. Trigger before
+        // the model ceiling so the returned `compaction` item can be replayed
+        // losslessly on the next stateless request.
+        "context_management": [{
+            "type": "compaction",
+            "compact_threshold": crate::compaction::get_context_window(model).saturating_mul(4) / 5
+        }],
         "_openclaudia_responses_history": history
     });
     if !tools.is_empty() {
@@ -5618,6 +5625,11 @@ memory:
         assert!(req.get("max_output_tokens").is_none());
         assert_eq!(req["stream"], true);
         assert_eq!(req["store"], false);
+        assert_eq!(req["context_management"][0]["type"], "compaction");
+        assert_eq!(
+            req["context_management"][0]["compact_threshold"],
+            crate::compaction::get_context_window("gpt-5.5").saturating_mul(4) / 5
+        );
         assert_eq!(req["reasoning"]["effort"], "high");
         assert_eq!(req["input"][0]["type"], "message");
         assert_eq!(req["input"][0]["role"], "user");
@@ -5727,7 +5739,7 @@ memory:
     }
 
     #[test]
-    fn responses_state_replays_exact_multi_turn_items_without_flattening() {
+    fn responses_compaction_retires_superseded_native_and_portable_input() {
         let first_output = first_responses_test_output();
         let first_state = crate::providers::advance_openai_responses_state(
             "openai",
@@ -5746,6 +5758,7 @@ memory:
             &second_output,
         )
         .expect("second continuation state");
+        assert_eq!(second_state.generation().get(), 2);
         let serialized = serde_json::to_string(&second_state).expect("serialize native state");
         let resumed: ProviderNativeState =
             serde_json::from_str(&serialized).expect("resume native state");
@@ -5786,25 +5799,16 @@ memory:
         assert!(request.get("previous_response_id").is_none());
         assert!(request.get("_openclaudia_responses_history").is_none());
         let input = request["input"].as_array().expect("Responses input");
-        assert_eq!(input.len(), 8);
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[1], first_output.output_items()[0]);
-        assert_eq!(input[2]["phase"], "commentary");
-        assert_eq!(
-            input[2]["_openclaudia_message_ordinal"],
-            "provider-owned-field"
-        );
-        assert_eq!(input[3], first_output.output_items()[2]);
-        assert_eq!(input[4]["type"], "function_call_output");
-        assert_eq!(input[5], second_output.output_items()[0]);
-        assert_eq!(input[6]["phase"], "final_answer");
-        assert_eq!(input[7]["role"], "user");
-        assert!(input.iter().enumerate().all(|(index, item)| {
-            index == 2 || item.get("_openclaudia_message_ordinal").is_none()
-        }));
-        assert!(serialized.contains("resp_first"));
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0], second_output.output_items()[0]);
+        assert_eq!(input[1]["phase"], "final_answer");
+        assert_eq!(input[2]["role"], "user");
+        assert!(input
+            .iter()
+            .all(|item| item.get("_openclaudia_message_ordinal").is_none()));
+        assert!(!serialized.contains("resp_first"));
         assert!(serialized.contains("resp_second"));
-        assert!(serialized.contains("encrypted-native-reasoning"));
+        assert!(!serialized.contains("encrypted-native-reasoning"));
         assert!(serialized.contains("encrypted-native-compaction"));
     }
 

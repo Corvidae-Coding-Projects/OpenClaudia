@@ -3875,6 +3875,7 @@ struct InitialTurnRequest<'a> {
     effort_level: EffortLevel,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
+    hook_engine: Option<&'a crate::hooks::HookEngine>,
     mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
 }
@@ -4543,6 +4544,7 @@ async fn run_agentic_loop(
             claude_code_token: ctx.claude_code_token,
             prompt_blocks: ctx.prompt_blocks,
             provider_native_state: provider_native_state.as_ref(),
+            hook_engine: ctx.hook_engine.as_deref(),
             mcp_manager: ctx.mcp_manager,
         })
         .await
@@ -4723,6 +4725,7 @@ async fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<Prepar
         claude_code_token: p.claude_code_token,
         prompt_blocks: p.prompt_blocks,
         provider_native_state: p.provider_native_state,
+        hook_engine: p.hook_engine,
         mcp_manager: p.mcp_manager,
     })
     .await
@@ -4752,9 +4755,13 @@ struct LiveMcpRequest<'a> {
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
+    hook_engine: Option<&'a crate::hooks::HookEngine>,
     mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
 }
 
+// Catalog publication, causal projection, and wire construction are one
+// transaction: no intermediate catalog or message view may escape.
+#[allow(clippy::too_many_lines)]
 async fn build_request_with_live_mcp(
     request: LiveMcpRequest<'_>,
 ) -> Result<serde_json::Value, String> {
@@ -4788,16 +4795,87 @@ async fn build_request_with_live_mcp(
     } else {
         Vec::new()
     };
-    crate::pipeline::build_request_for_wire_for_run_with_additional_and_state(
+    let catalog = crate::tools::get_progressive_tool_definitions_with_additional(
         request.run,
+        request.messages,
+        true,
+        &definitions,
+    )?;
+    let typed_messages = request
+        .messages
+        .iter()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<crate::proxy::ChatMessage>, _>>()
+        .map_err(|error| format!("Invalid context message before compaction: {error}"))?;
+    let mut compactable = crate::proxy::ChatCompletionRequest {
+        model: request.model.to_string(),
+        messages: typed_messages,
+        temperature: None,
+        max_tokens: Some(4_096),
+        stream: Some(true),
+        tools: Some(catalog.definitions.clone()),
+        tool_choice: None,
+        extra: std::collections::HashMap::new(),
+    };
+    let compactor = crate::services::AutoCompactor::auto(
+        crate::compaction::ContextCompactor::for_model(request.model),
+    );
+    let needs_compaction = compactor.should_compact(&compactable, None);
+    match crate::compaction::provider_state_compaction_disposition(
+        request.wire_api.is_responses(),
+        needs_compaction,
+        request.provider_native_state,
+    ) {
+        crate::compaction::ProviderStateCompactionDisposition::ProviderManaged => {}
+        crate::compaction::ProviderStateCompactionDisposition::BlocksPortableCheckpoint => {
+            return Err(
+                "Context needs compaction, but the provider-native continuation is bound to the exact message history and this protocol has no native compaction contract"
+                    .to_string(),
+            );
+        }
+        crate::compaction::ProviderStateCompactionDisposition::Absent
+        | crate::compaction::ProviderStateCompactionDisposition::Preserved => {
+            if let Some(result) = compactor
+                .auto_compact(
+                    &mut compactable,
+                    None,
+                    request.hook_engine,
+                    request.run,
+                    Some(request.run.session_id()),
+                    None,
+                )
+                .await
+                .map_err(|error| format!("Context checkpoint failed: {error}"))?
+            {
+                if matches!(
+                    result.disposition,
+                    crate::compaction::CompactionDisposition::Partial
+                        | crate::compaction::CompactionDisposition::CannotFit
+                ) {
+                    return Err(format!(
+                        "Context cannot fit after checkpoint: {} tokens remain for target {}",
+                        result.new_tokens, result.target_tokens
+                    ));
+                }
+            }
+        }
+    }
+    let projected_messages = compactable
+        .messages
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Cannot encode compacted context: {error}"))?;
+    crate::pipeline::build_request_for_wire_with_exact_tools_and_state(
         request.wire_api,
         request.provider,
         request.model,
-        request.messages,
+        &projected_messages,
         request.effort_level,
         request.claude_code_token,
         request.prompt_blocks,
-        &definitions,
+        &catalog.definitions,
         request.provider_native_state,
     )
 }
@@ -4822,6 +4900,7 @@ async fn run_api_turn_async(mut p: ApiTurnParams) {
         effort_level: p.effort_level,
         claude_code_token: p.claude_code_token.as_ref(),
         prompt_blocks: p.prompt_blocks.as_ref(),
+        hook_engine: p.hook_engine.as_deref(),
         mcp_manager: p.mcp_manager.as_ref(),
         tx: &p.tx,
     })

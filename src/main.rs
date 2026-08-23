@@ -35,9 +35,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // `cmd_chat` god-function decomposition (crosslink #262). The bulk
 // of the REPL lives in `cli::chat_repl` now.
 use cli::display::tips::get_random_tip;
-use cli::repl::session_io::{
-    compact_chat_session, estimate_session_tokens, save_session_to_short_term_memory,
-};
+use cli::repl::session_io::save_session_to_short_term_memory;
 use cli::repl::{get_history_path, list_chat_sessions, Session};
 
 /// Absolute, PATH-independent location of `git` for startup repository probes.
@@ -1237,33 +1235,6 @@ fn read_multiline_continuation(input: &mut String, rl: &mut rustyline::DefaultEd
             }
             Err(_) => break,
         }
-    }
-}
-
-/// Check whether the session has grown close to the model's context
-/// window and auto-compact or warn accordingly.
-///
-/// Invariants preserved from the inline version:
-/// - Skips entirely when the session has 6 or fewer messages (the
-///   compaction heuristic needs a minimum message count).
-/// - `should_compact` implies compaction runs AND the message pops to
-///   log the before/after counts.
-/// - `should_warn` (without compact) prints a hint about `/compact`.
-///
-/// Extracted from `cmd_chat` per crosslink #262.
-fn maybe_auto_compact(chat_session: &mut Session, model: &str) {
-    if chat_session.inspect_state(|state| state.conversation.messages.len()) <= 6 {
-        return;
-    }
-    let est = estimate_session_tokens(chat_session);
-    let (should_warn, should_compact, pct) =
-        openclaudia::compaction::check_context_budget(est, model);
-    if should_compact {
-        eprintln!("\x1b[33m⚠ Context at {pct:.0}% — auto-compacting...\x1b[0m");
-        let (before, after) = compact_chat_session(chat_session);
-        eprintln!("\x1b[32m✓ Compacted: {before} → {after} messages\x1b[0m");
-    } else if should_warn {
-        eprintln!("\x1b[33m⚠ Context at {pct:.0}% — use /compact to free space\x1b[0m");
     }
 }
 
@@ -3378,26 +3349,6 @@ mod tests {
                 .as_ref()
                 .map(|selection| selection.text.as_str()),
             Some("selected source")
-        );
-    }
-
-    #[test]
-    fn maybe_auto_compact_is_noop_for_small_sessions() {
-        // Under the 6-message short-circuit, auto-compact must not touch
-        // the session. Build the smallest possible canonical session with an
-        // empty message history.
-        let mut session = Session::new_with_behavior_mode(
-            "claude-sonnet-4-6",
-            "anthropic",
-            openclaudia::modes::BehaviorMode::default(),
-        );
-        let before_len = session.inspect_state(|state| state.conversation.messages.len());
-        // Any model name is fine — the short-circuit fires before the
-        // model lookup.
-        maybe_auto_compact(&mut session, "claude-sonnet-4-6");
-        assert_eq!(
-            session.inspect_state(|state| state.conversation.messages.len()),
-            before_len
         );
     }
 }

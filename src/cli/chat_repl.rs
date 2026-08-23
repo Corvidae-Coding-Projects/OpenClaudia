@@ -26,8 +26,7 @@ use crate::cli::repl::keybindings::{display_keybindings, execute_key_action, key
 use crate::cli::repl::permissions::execute_shell_command_with_permission;
 use crate::cli::repl::plan_mode::{check_plan_mode_restriction, process_tool_follow_up};
 use crate::cli::repl::session_io::{
-    compact_chat_session_with_instructions, estimate_session_tokens, export_chat_session,
-    save_session_to_short_term_memory,
+    estimate_session_tokens, export_chat_session, save_session_to_short_term_memory,
 };
 use crate::cli::repl::slash::{
     handle_activity_command, handle_memory_command, handle_slash_command_for_runtime,
@@ -40,10 +39,9 @@ use crate::{
     build_chat_endpoint_and_headers, build_hook_engine, chdir_to_git_root,
     check_tool_permission_interactive, finalize_chat, init_memory_with_banner,
     init_permission_manager, init_plugin_manager, init_rustyline_with_history,
-    init_vdd_engine_if_enabled, maybe_auto_compact, maybe_resume_session,
-    parse_initial_behavior_mode, read_multiline_continuation, render_welcome_or_fallback,
-    resolve_chat_auth, resolve_model_name, run_vdd_review, ChatAuth, ChatAuthSelectionMode,
-    ToolPermissionResult,
+    init_vdd_engine_if_enabled, maybe_resume_session, parse_initial_behavior_mode,
+    read_multiline_continuation, render_welcome_or_fallback, resolve_chat_auth, resolve_model_name,
+    run_vdd_review, ChatAuth, ChatAuthSelectionMode, ToolPermissionResult,
 };
 
 use eventsource_stream::Eventsource;
@@ -232,7 +230,16 @@ pub struct ChatRepl {
     transient_allowed_tool_rules: Vec<PermissionRule>,
     transient_model_restore: Option<String>,
     transient_effort_override: Option<EffortLevel>,
+    pending_manual_compaction: Option<PendingManualCompaction>,
     plugin_manager: plugins::PluginManager,
+}
+
+/// A `/compact` request is applied to the next provider projection. The exact
+/// session transcript remains the durable archive and is never replaced by a
+/// lossy local summary.
+#[derive(Debug, Clone)]
+struct PendingManualCompaction {
+    instructions: Option<String>,
 }
 
 /// Slash-command dispatch outcome — tells `process_line` whether to
@@ -612,6 +619,7 @@ impl ChatRepl {
             transient_allowed_tool_rules: Vec::new(),
             transient_model_restore: None,
             transient_effort_override: None,
+            pending_manual_compaction: None,
             plugin_manager,
         })
     }
@@ -778,7 +786,7 @@ impl ChatRepl {
 
         let prompt_blocks = self.build_prompt_blocks_for_turn();
         let request_state = self.chat_session.messages_snapshot();
-        let request_messages = match request_messages_with_cli_grounding(
+        let grounded_messages = match request_messages_with_cli_grounding(
             &self.run_context,
             &self.chat_session.id(),
             self.current_task_obs,
@@ -792,6 +800,28 @@ impl ChatRepl {
                 return Ok(Some(false));
             }
         };
+        let manual_compaction = self.pending_manual_compaction.take();
+        let (request_messages, compaction_result) = match self
+            .project_request_messages(grounded_messages, manual_compaction.as_ref())
+            .await
+        {
+            Ok(projected) => projected,
+            Err(err) => {
+                self.pending_manual_compaction = manual_compaction;
+                self.clear_transient_prompt_options();
+                tracing::error!(error = %err, "Failed to build causal context checkpoint");
+                eprintln!("\n\x1b[31mContext checkpoint failed: {err}\x1b[0m");
+                return Ok(Some(false));
+            }
+        };
+        if manual_compaction.is_some() {
+            if let Some(result) = compaction_result {
+                println!(
+                    "\nCausal checkpoint ready: ~{} tokens -> ~{} tokens; exact transcript retained.\n",
+                    result.original_tokens, result.new_tokens
+                );
+            }
+        }
         if let Err(err) = check_provider_request_policy(
             &self.run_context,
             &self.policy_enforcer,
@@ -854,7 +884,6 @@ impl ChatRepl {
 
         self.clear_transient_prompt_options();
         save_session_to_short_term_memory(&self.chat_session, memory_db);
-        maybe_auto_compact(&mut self.chat_session, &self.model);
         Ok(if exit { Some(true) } else { None })
     }
 
@@ -951,15 +980,16 @@ impl ChatRepl {
                 SlashOutcome::Continue
             }
             SlashCommandResult::Compact { instructions } => {
-                let (before, after) = compact_chat_session_with_instructions(
-                    &mut self.chat_session,
-                    instructions.as_deref(),
-                );
-                if before != after {
-                    println!("\nCompacted: ~{before} tokens -> ~{after} tokens\n");
-                    if let Err(e) = save_chat_session(&self.chat_session) {
-                        tracing::warn!("Failed to save compacted session: {}", e);
-                    }
+                if self.chat_session.message_count() <= 6 {
+                    println!(
+                        "\nSession too short to compact ({} messages).\n",
+                        self.chat_session.message_count()
+                    );
+                } else {
+                    self.pending_manual_compaction = Some(PendingManualCompaction { instructions });
+                    println!(
+                        "\nCausal compaction queued for the next provider request; the exact transcript will be retained.\n"
+                    );
                 }
                 SlashOutcome::Continue
             }
@@ -1441,6 +1471,103 @@ impl ChatRepl {
         Ok(messages)
     }
 
+    /// Build the provider-facing projection without mutating the exact session
+    /// transcript. Automatic compaction uses the model budget; `/compact`
+    /// explicitly requests a smaller causal projection for the next turn.
+    async fn project_request_messages(
+        &self,
+        messages: Vec<serde_json::Value>,
+        manual: Option<&PendingManualCompaction>,
+    ) -> Result<
+        (
+            Vec<serde_json::Value>,
+            Option<openclaudia::compaction::CompactionResult>,
+        ),
+        String,
+    > {
+        let mut request = openclaudia::pipeline::build_chat_completion_request_for_run(
+            &self.run_context,
+            &self.model,
+            &messages,
+        )?;
+        let mut config = openclaudia::compaction::CompactionConfig::for_model(&self.model);
+        if let Some(manual) = manual {
+            config.summary_prompt = manual.instructions.clone();
+        }
+        let compactor = openclaudia::compaction::ContextCompactor::new(config);
+        let provider_native_state = self.chat_session.provider_native_state_snapshot();
+        let needs_compaction = manual.is_some() || compactor.needs_compaction(&request, None);
+        if openclaudia::compaction::provider_state_compaction_disposition(
+            false,
+            needs_compaction,
+            provider_native_state.as_ref(),
+        )
+            == openclaudia::compaction::ProviderStateCompactionDisposition::BlocksPortableCheckpoint
+        {
+            return Err(
+                "provider-native continuation is bound to the exact message history and this protocol has no native compaction contract"
+                    .to_string(),
+            );
+        }
+        let result = if manual.is_some() {
+            Some(
+                compactor
+                    .force_compact(
+                        &mut request,
+                        Some(&self.hook_engine),
+                        &self.run_context,
+                        Some(&self.chat_session.id()),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            openclaudia::services::AutoCompactor::auto(compactor)
+                .auto_compact(
+                    &mut request,
+                    None,
+                    Some(&self.hook_engine),
+                    &self.run_context,
+                    Some(&self.chat_session.id()),
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+        };
+
+        if let Some(result) = &result {
+            let unacceptable = matches!(
+                result.disposition,
+                openclaudia::compaction::CompactionDisposition::CannotFit
+                    | openclaudia::compaction::CompactionDisposition::Partial
+            );
+            if unacceptable {
+                return Err(format!(
+                    "{} tokens remain after causal checkpoint for target {}",
+                    result.new_tokens, result.target_tokens
+                ));
+            }
+            if result.compacted {
+                tracing::info!(
+                    original_tokens = result.original_tokens,
+                    projected_tokens = result.new_tokens,
+                    messages_summarized = result.messages_summarized,
+                    manual = manual.is_some(),
+                    "Built causal context checkpoint for legacy REPL request"
+                );
+            }
+        }
+
+        let projected = request
+            .messages
+            .iter()
+            .cloned()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot encode projected context: {error}"))?;
+        Ok((projected, result))
+    }
+
     fn followup_request_policy_allows(&self, context: &'static str) -> bool {
         let request_messages = match self.request_messages_with_grounding() {
             Ok(messages) => messages,
@@ -1797,7 +1924,7 @@ impl ChatRepl {
             if !self.followup_request_policy_allows("native JSON follow-up") {
                 return;
             }
-            let request = match self.build_native_json_followup_request() {
+            let request = match self.build_native_json_followup_request().await {
                 Ok(request) => request,
                 Err(error) => {
                     self.record_failed_turn(&format!("provider follow-up build failed: {error}"));
@@ -1886,8 +2013,9 @@ impl ChatRepl {
         Ok(())
     }
 
-    fn build_native_json_followup_request(&self) -> Result<serde_json::Value, String> {
-        let messages = self.request_messages_with_grounding()?;
+    async fn build_native_json_followup_request(&self) -> Result<serde_json::Value, String> {
+        let grounded = self.request_messages_with_grounding()?;
+        let (messages, _) = self.project_request_messages(grounded, None).await?;
         let prompt_blocks = self.build_prompt_blocks_for_turn();
         let effort = self
             .transient_effort_override
@@ -2694,7 +2822,7 @@ impl ChatRepl {
             self.dispatch_anthropic_tool_batch(&tool_calls, anthropic_accumulator, memory_db)
                 .await;
 
-            let followup_req = match self.build_anthropic_followup(prompt_blocks) {
+            let followup_req = match self.build_anthropic_followup(prompt_blocks).await {
                 Ok(req) => req,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build Anthropic follow-up request");
@@ -2975,11 +3103,12 @@ impl ChatRepl {
 
     /// Build the next Anthropic follow-up request body reusing the
     /// cached prompt blocks.
-    fn build_anthropic_followup(
+    async fn build_anthropic_followup(
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let catalog_messages = self.request_messages_with_grounding()?;
+        let grounded = self.request_messages_with_grounding()?;
+        let (catalog_messages, _) = self.project_request_messages(grounded, None).await?;
         let request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
         let anthropic_messages =
             convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
@@ -3132,7 +3261,7 @@ impl ChatRepl {
                 .await;
 
             println!("\n\x1b[90mContinuing with tool results...\x1b[0m\n");
-            let request_body = match self.build_openai_followup_request(prompt_blocks) {
+            let request_body = match self.build_openai_followup_request(prompt_blocks).await {
                 Ok(req) => req,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build OpenAI follow-up request");
@@ -3306,11 +3435,12 @@ impl ChatRepl {
 
     /// Build the OpenAI-compatible follow-up request body (handles both
     /// the Anthropic direct branch and the generic `OpenAI` shape).
-    fn build_openai_followup_request(
+    async fn build_openai_followup_request(
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let catalog_messages = self.request_messages_with_grounding()?;
+        let grounded = self.request_messages_with_grounding()?;
+        let (catalog_messages, _) = self.project_request_messages(grounded, None).await?;
         let request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
         let openai_tools =
             tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?

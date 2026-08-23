@@ -34,7 +34,9 @@
 
 use std::sync::Arc;
 
-use crate::compaction::{CompactionError, CompactionResult, ContextCompactor};
+use crate::compaction::{
+    CompactionError, CompactionResult, ContextCompactor, RequestTokenMeasurement,
+};
 use crate::hooks::HookEngine;
 use crate::memory::MemoryDb;
 use crate::proxy::ChatCompletionRequest;
@@ -89,16 +91,14 @@ impl AutoCompactor {
     pub fn should_compact(
         &self,
         request: &ChatCompletionRequest,
-        actual_input_tokens: Option<usize>,
+        measurement: Option<RequestTokenMeasurement>,
     ) -> bool {
         match self.policy {
-            AutoCompactPolicy::Auto => self
-                .compactor
-                .needs_compaction(request, actual_input_tokens),
+            AutoCompactPolicy::Auto => self.compactor.needs_compaction(request, measurement),
             AutoCompactPolicy::AlwaysOverBudget => {
                 let analysis = self
                     .compactor
-                    .analyze_with_hint(request, actual_input_tokens);
+                    .analyze_with_measurement(request, measurement);
                 analysis.current_tokens >= analysis.max_tokens
             }
         }
@@ -113,23 +113,23 @@ impl AutoCompactor {
     pub async fn auto_compact(
         &self,
         request: &mut ChatCompletionRequest,
-        actual_input_tokens: Option<usize>,
+        measurement: Option<RequestTokenMeasurement>,
         hook_engine: Option<&HookEngine>,
         run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<Option<CompactionResult>, CompactionError> {
-        if !self.should_compact(request, actual_input_tokens) {
+        if !self.should_compact(request, measurement) {
             return Ok(None);
         }
         let result = self
             .compactor
-            .compact_with_hint(
+            .compact_with_measurement(
                 request,
                 hook_engine,
                 run_context,
                 session_id,
-                actual_input_tokens,
+                measurement,
                 memory_db,
             )
             .await?;

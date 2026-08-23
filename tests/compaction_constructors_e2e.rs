@@ -12,7 +12,9 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::compaction::{CompactionConfig, CompactionOverrides, ContextCompactor};
+use openclaudia::compaction::{
+    CompactionConfig, CompactionOverrides, ContextCompactor, RequestTokenMeasurement,
+};
 use openclaudia::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
 use std::collections::HashMap;
 
@@ -34,6 +36,10 @@ fn empty_req() -> ChatCompletionRequest {
         tool_choice: None,
         extra: HashMap::new(),
     }
+}
+
+fn measured(request: &ChatCompletionRequest, tokens: usize) -> RequestTokenMeasurement {
+    RequestTokenMeasurement::for_request(request, tokens)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -67,8 +73,8 @@ fn new_compactor_is_clone() {
     let c2 = c1.clone();
     // PINS CLONE: both independent compactors yield same analysis.
     let req = empty_req();
-    let a1 = c1.analyze_with_hint(&req, Some(100));
-    let a2 = c2.analyze_with_hint(&req, Some(100));
+    let a1 = c1.analyze_with_measurement(&req, Some(measured(&req, 100)));
+    let a2 = c2.analyze_with_measurement(&req, Some(measured(&req, 100)));
     assert_eq!(a1.needs_compaction, a2.needs_compaction);
 }
 
@@ -83,7 +89,7 @@ fn for_model_anthropic_claude_uses_200k_context() {
     // hint against 200k cap should NOT trigger compaction.
     let compactor = ContextCompactor::for_model("claude-sonnet");
     let req = empty_req();
-    let analysis = compactor.analyze_with_hint(&req, Some(100_000));
+    let analysis = compactor.analyze_with_measurement(&req, Some(measured(&req, 100_000)));
     let _ = analysis;
 }
 
@@ -92,21 +98,21 @@ fn for_model_with_gpt_4o_uses_128k_context() {
     let compactor = ContextCompactor::for_model("gpt-4o");
     let req = empty_req();
     // 100k hint against 128k window — under threshold, no compact.
-    let _ = compactor.analyze_with_hint(&req, Some(100_000));
+    let _ = compactor.analyze_with_measurement(&req, Some(measured(&req, 100_000)));
 }
 
 #[test]
 fn for_model_with_unknown_model_uses_default_context() {
     let compactor = ContextCompactor::for_model("totally-unknown-xyz");
     let req = empty_req();
-    let _ = compactor.analyze_with_hint(&req, Some(50_000));
+    let _ = compactor.analyze_with_measurement(&req, Some(measured(&req, 50_000)));
 }
 
 #[test]
 fn for_model_with_empty_model_string_uses_default() {
     let compactor = ContextCompactor::for_model("");
     let req = empty_req();
-    let _ = compactor.analyze_with_hint(&req, Some(50_000));
+    let _ = compactor.analyze_with_measurement(&req, Some(measured(&req, 50_000)));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -244,8 +250,8 @@ fn for_model_with_overrides_with_default_overrides_matches_for_model() {
         &CompactionOverrides::default(),
     );
     let req = empty_req();
-    let a = bare.analyze_with_hint(&req, Some(1000));
-    let b = merged.analyze_with_hint(&req, Some(1000));
+    let a = bare.analyze_with_measurement(&req, Some(measured(&req, 1000)));
+    let b = merged.analyze_with_measurement(&req, Some(measured(&req, 1000)));
     // Both should produce same compact-needed verdict.
     assert_eq!(a.needs_compaction, b.needs_compaction);
     assert_eq!(a.current_tokens, b.current_tokens);
@@ -263,7 +269,7 @@ fn for_model_with_overrides_max_context_overrides_model_window() {
     };
     let compactor = ContextCompactor::for_model_with_overrides("claude-sonnet", &overrides);
     let req = empty_req();
-    let analysis = compactor.analyze_with_hint(&req, Some(100));
+    let analysis = compactor.analyze_with_measurement(&req, Some(measured(&req, 100)));
     // 100 tokens >> 10-token max → should compact.
     assert!(
         analysis.needs_compaction,
@@ -281,8 +287,10 @@ fn for_model_with_overrides_is_clone() {
     let req = empty_req();
     // PINS CLONE: independent compactors produce same analysis.
     assert_eq!(
-        c.analyze_with_hint(&req, Some(100)).current_tokens,
-        c2.analyze_with_hint(&req, Some(100)).current_tokens
+        c.analyze_with_measurement(&req, Some(measured(&req, 100)))
+            .current_tokens,
+        c2.analyze_with_measurement(&req, Some(measured(&req, 100)))
+            .current_tokens
     );
 }
 
@@ -295,8 +303,8 @@ fn for_model_called_twice_yields_equivalent_compactors() {
     let c1 = ContextCompactor::for_model("claude-opus");
     let c2 = ContextCompactor::for_model("claude-opus");
     let req = empty_req();
-    let a1 = c1.analyze_with_hint(&req, Some(50_000));
-    let a2 = c2.analyze_with_hint(&req, Some(50_000));
+    let a1 = c1.analyze_with_measurement(&req, Some(measured(&req, 50_000)));
+    let a2 = c2.analyze_with_measurement(&req, Some(measured(&req, 50_000)));
     assert_eq!(a1.needs_compaction, a2.needs_compaction);
     assert_eq!(a1.current_tokens, a2.current_tokens);
 }

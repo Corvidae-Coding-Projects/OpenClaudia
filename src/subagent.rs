@@ -2243,13 +2243,13 @@ async fn run_subagent_inner(
                 };
             }
         };
-        let request_body = json!({
+        let mut request_body = json!({
             "model": model,
             "messages": prepared_request_messages.clone(),
             "tools": progressive_tools.clone(),
             "max_tokens": SUBAGENT_MAX_TOKENS
         });
-        let typed_request = match build_chat_completion_request(&request_body) {
+        let mut typed_request = match build_chat_completion_request(&request_body) {
             Ok(request) => request,
             Err(e) => {
                 BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
@@ -2270,6 +2270,97 @@ async fn run_subagent_inner(
                 };
             }
         };
+        let compactor = crate::services::AutoCompactor::auto(
+            crate::compaction::ContextCompactor::for_model(&model),
+        );
+        let needs_compaction = compactor.should_compact(&typed_request, None);
+        let compaction_error = match crate::compaction::provider_state_compaction_disposition(
+            wire_api.is_responses(),
+            needs_compaction,
+            provider_native_state.as_ref(),
+        ) {
+            crate::compaction::ProviderStateCompactionDisposition::ProviderManaged => None,
+            crate::compaction::ProviderStateCompactionDisposition::BlocksPortableCheckpoint => {
+                Some("Context needs compaction, but the provider-native continuation is bound to the exact message history and this protocol has no native compaction contract".to_string())
+            }
+            crate::compaction::ProviderStateCompactionDisposition::Absent
+            | crate::compaction::ProviderStateCompactionDisposition::Preserved => {
+                match compactor
+                    .auto_compact(
+                        &mut typed_request,
+                        None,
+                        None,
+                        &subagent_run,
+                        Some(&agent_id),
+                        memory_db.clone(),
+                    )
+                    .await
+                {
+                    Ok(Some(result))
+                        if matches!(
+                            result.disposition,
+                            crate::compaction::CompactionDisposition::Partial
+                                | crate::compaction::CompactionDisposition::CannotFit
+                        ) =>
+                    {
+                        Some(format!(
+                            "Context cannot fit after checkpoint: {} tokens remain for target {}",
+                            result.new_tokens, result.target_tokens
+                        ))
+                    }
+                    Ok(Some(_) | None) => None,
+                    Err(error) => Some(format!("Context checkpoint failed: {error}")),
+                }
+            }
+        };
+        if let Some(message) = compaction_error {
+            BACKGROUND_AGENTS.fail(parent_run, &agent_id, message.clone());
+            store_transcript_with_state(
+                parent_run,
+                &agent_id,
+                messages,
+                provider_native_state,
+                config.agent_type,
+            );
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: message,
+                turns_used: turns,
+                is_background: config.run_in_background,
+                worktree: worktree.clone(),
+            };
+        }
+        let projected_request_messages = typed_request
+            .messages
+            .iter()
+            .cloned()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "Failed to encode compacted subagent context");
+                Vec::new()
+            });
+        if projected_request_messages.is_empty() && !typed_request.messages.is_empty() {
+            let message = "Failed to encode compacted subagent context".to_string();
+            BACKGROUND_AGENTS.fail(parent_run, &agent_id, message.clone());
+            store_transcript_with_state(
+                parent_run,
+                &agent_id,
+                messages,
+                provider_native_state,
+                config.agent_type,
+            );
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: message,
+                turns_used: turns,
+                is_background: config.run_in_background,
+                worktree: worktree.clone(),
+            };
+        }
+        request_body["messages"] = Value::Array(projected_request_messages.clone());
         if let Err(e) = check_provider_request_policy(app_config, &typed_request) {
             let message = format!("Blocked by policy: {e}");
             BACKGROUND_AGENTS.fail(parent_run, &agent_id, message.clone());
@@ -2321,7 +2412,7 @@ async fn run_subagent_inner(
                 wire_api,
                 &app_config.proxy.target,
                 &model,
-                &prepared_request_messages,
+                &projected_request_messages,
                 app_config
                     .active_provider()
                     .and_then(|provider| provider.thinking.reasoning_effort.as_deref())

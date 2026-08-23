@@ -1704,7 +1704,7 @@ impl AcpServer {
                 };
 
             // Build a ChatCompletionRequest for the adapter
-            let chat_request = crate::proxy::ChatCompletionRequest {
+            let mut chat_request = crate::proxy::ChatCompletionRequest {
                 model: self.model.clone(),
                 messages: all_messages,
                 temperature: None,
@@ -1714,6 +1714,60 @@ impl AcpServer {
                 tool_choice: None,
                 extra: std::collections::HashMap::new(),
             };
+            let compactor = crate::services::AutoCompactor::auto(
+                crate::compaction::ContextCompactor::for_model(&chat_request.model),
+            );
+            let needs_compaction = compactor.should_compact(&chat_request, None);
+            match crate::compaction::provider_state_compaction_disposition(
+                wire_api.is_responses(),
+                needs_compaction,
+                self.provider_native_state.as_ref(),
+            ) {
+                crate::compaction::ProviderStateCompactionDisposition::ProviderManaged => {}
+                crate::compaction::ProviderStateCompactionDisposition::BlocksPortableCheckpoint => {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        "Context needs compaction, but the provider-native continuation is bound to the exact message history and this protocol has no native compaction contract",
+                    );
+                }
+                crate::compaction::ProviderStateCompactionDisposition::Absent
+                | crate::compaction::ProviderStateCompactionDisposition::Preserved => {
+                    match compactor
+                        .auto_compact(
+                            &mut chat_request,
+                            None,
+                            Some(&self.hook_engine),
+                            run,
+                            Some(oc_session_id),
+                            Some(Arc::clone(&self.memory_db)),
+                        )
+                        .await
+                    {
+                        Ok(Some(result))
+                            if matches!(
+                                result.disposition,
+                                crate::compaction::CompactionDisposition::Partial
+                                    | crate::compaction::CompactionDisposition::CannotFit
+                            ) =>
+                        {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!(
+                                    "Context cannot fit after checkpoint: {} tokens remain for target {}",
+                                    result.new_tokens, result.target_tokens
+                                ),
+                            );
+                        }
+                        Ok(Some(_) | None) => {}
+                        Err(error) => {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!("Context checkpoint failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
             if let Err(e) = self.check_provider_request_policy(&chat_request) {
                 return self
                     .fail_prompt_with_update(acp_session_id, &format!("Blocked by policy: {e}"));
