@@ -1,6 +1,6 @@
 {
   "next_display_id": 1119,
-  "next_comment_id": 1387,
+  "next_comment_id": 1388,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28221,7 +28221,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:33:45.737689540Z",
-      "updated_at": "2026-08-23T16:22:02.243928054Z",
+      "updated_at": "2026-08-23T16:22:06.821160750Z",
       "labels": [
         "remediation"
       ],
@@ -28252,6 +28252,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl5DLWis512J78IkmJ0GMl7/LvmKc75ugRnW3TOYwgv6qlH8u4CzVjZdbeSQpF36xQuKKvcoUv7DhhcJdL1ndDg=="
+        },
+        "746dadaf-7720-43c2-a7de-e4576cbdc1f6": {
+          "display_id": 1387,
+          "author": "6Vw9",
+          "content": "Delivered signed commit a87f44da (feat(sandbox): enforce least-privilege process profiles). Verification: Rust 1.98.0 full locked workspace all-target/all-feature suite passed serialized; strict Clippy, fmt, diff check, native check, Windows GNU all-target/all-feature check, sandbox units 14/14, hook policy 18/18, sandbox escape 11/11. S-108/#1118 retains the structural writable-projection remainder; S-071/S-072 retain browser broker/process conformance.",
+          "created_at": "2026-08-23T16:22:06.818718689Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/Ggfkm8Kl3wm5yy0tU73dYWo//TiodszU5IShCWG/F+AgR9GqAzcJoup1fNCJOCQDEK9xKtB46HaLrBF93C5Aw=="
         },
         "b2fe5d95-371b-4c81-818c-e75d6b01f93c": {
           "display_id": 1383,
@@ -36575,11 +36584,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1280,
       "timestamp": "2026-08-23T16:22:02.243928054Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1281,
+      "timestamp": "2026-08-23T16:22:06.821160750Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T16:22:02.243928054Z",
+    "timestamp": "2026-08-23T16:22:06.821160750Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1280
+    "agent_seq": 1281
   }
 }
