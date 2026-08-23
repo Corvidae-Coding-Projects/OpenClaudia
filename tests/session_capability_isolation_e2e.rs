@@ -611,8 +611,14 @@ fn retiring_one_run_cancels_only_its_owned_lifecycle_resources() {
         &call("bash_output", json!({"shell_id": shell_id(&spawned_a)})),
     );
     assert!(
-        retired_output.is_error(),
-        "retired run retained its shell: {retired_output:?}"
+        !retired_output.is_error(),
+        "retired run lost its terminal job record: {retired_output:?}"
+    );
+    assert!(
+        retired_output
+            .content()
+            .contains("Status: cancelled (run ended)"),
+        "retired run did not record cancellation: {retired_output:?}"
     );
     let live_output = execute_tool(
         &run_b,

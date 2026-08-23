@@ -272,10 +272,15 @@ fn bash_output_schema_allows_no_shell_id_list_mode() {
         shell_id_description.contains("Omit"),
         "bash_output shell_id description must document no-arg list mode; got {shell_id_description:?}"
     );
+    let cursor = def
+        .pointer("/function/parameters/properties/cursor")
+        .expect("bash_output cursor schema");
+    assert_eq!(cursor["type"], "integer");
+    assert_eq!(cursor["minimum"], 0);
 }
 
 #[test]
-fn bash_schema_advertises_the_enforced_foreground_timeout_contract() {
+fn bash_schema_advertises_the_enforced_command_timeout_contract() {
     let definition = registry()
         .get("bash")
         .expect("bash registered")
@@ -291,10 +296,7 @@ fn bash_schema_advertises_the_enforced_foreground_timeout_contract() {
         .as_str()
         .expect("bash timeout description");
     assert!(description.contains("default 300000"), "{description}");
-    assert!(
-        description.contains("Not valid with run_in_background"),
-        "{description}"
-    );
+    assert!(description.contains("Background commands"), "{description}");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

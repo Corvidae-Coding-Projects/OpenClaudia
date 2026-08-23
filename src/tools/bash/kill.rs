@@ -549,13 +549,10 @@ mod tests {
         );
     }
 
-    /// B2-kill-d: killing the same `shell_id` twice — second call must return
-    /// `is_error=true` ("not found"), because the entry is removed on first kill.
-    ///
-    /// OC source: mod.rs:236 — `shells.remove(shell_id)` evicts the entry.
+    /// B2-kill-d: killing the same retained job twice is idempotent.
     #[test]
     #[cfg(unix)]
-    fn b2_kill_same_shell_twice_second_is_not_found() {
+    fn b2_kill_same_shell_twice_is_idempotent() {
         let shell_id = super::super::BACKGROUND_SHELLS
             .spawn(test_run(), "sleep 30")
             .expect("b2_kill_twice: spawn must succeed");
@@ -573,13 +570,10 @@ mod tests {
         assert!(!first_err, "b2_kill_twice: first kill must succeed");
 
         let (msg2, second_err) = execute_kill_shell(test_run(), &make_args(&shell_id));
+        assert!(!second_err, "b2_kill_twice: second kill must be idempotent");
         assert!(
-            second_err,
-            "b2_kill_twice: second kill must be is_error=true (entry removed)"
-        );
-        assert!(
-            msg2.contains("not found"),
-            "b2_kill_twice: second kill must say 'not found'; got: {msg2}"
+            msg2.contains("terminated"),
+            "b2_kill_twice: second kill must confirm terminal state; got: {msg2}"
         );
     }
 }

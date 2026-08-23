@@ -76,11 +76,7 @@ fn run_for_owner(owner: &str) -> std::sync::Arc<ToolRunContext> {
 
 /// B1a — background spawn returns a non-error result that contains "ID:"
 ///
-/// OC `shell_id` is an 8-char UUID prefix (mod.rs:57).
-/// CC uses a longer `backgroundTaskId` (BashTool.tsx:614); format differs.
-///
-/// GAP: CC output is file-based (`OUTPUT_FILE_TAG`); OC is in-process ring
-/// buffers — no disk file is written. Ref crosslink #583 (stall watchdog).
+/// OC uses a full UUID so concurrent and recovered jobs keep stable identity.
 #[test]
 #[cfg(unix)]
 fn b1a_background_spawn_returns_shell_id() {
@@ -97,21 +93,21 @@ fn b1a_background_spawn_returns_shell_id() {
         "B1a: background spawn must succeed; got: {}",
         result.content()
     );
-    // OC message: "Background shell started with ID: <8chars>\nUse bash_output..."
+    // OC message: "Background shell started with ID: <uuid>\nUse bash_output..."
     assert!(
         result.content().contains("ID:"),
         "B1a: response must contain 'ID:'; got: {}",
         result.content()
     );
-    // Shell ID is exactly 8 hex chars (UUID prefix stripped at mod.rs:57)
     if let Some(id_start) = result.content().find("ID: ").map(|i| i + 4) {
         let rest = &result.content()[id_start..];
         let id_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let shell_id = &rest[..id_end];
         assert_eq!(
-            shell_id.len(),
-            8,
-            "B1a: shell_id must be 8 chars; got '{shell_id}'"
+            uuid::Uuid::parse_str(shell_id)
+                .expect("B1a: shell_id must be a full UUID")
+                .to_string(),
+            shell_id
         );
     }
 }
@@ -439,9 +435,10 @@ fn b2e_kill_shells_for_agent_terminates_only_matching_agent_shells() {
         &alpha_run,
         &make_tool_call("bash_output", &json!({ "shell_id": alpha_shell })),
     );
+    assert!(!alpha_poll.is_error());
     assert!(
-        alpha_poll.is_error(),
-        "B2e: killed alpha shell must be removed from lookup; got: {}",
+        alpha_poll.content().contains("Status: cancelled"),
+        "B2e: killed alpha shell must retain its cancellation record; got: {}",
         alpha_poll.content()
     );
 

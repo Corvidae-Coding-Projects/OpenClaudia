@@ -135,6 +135,13 @@ pub struct ToolRunContextBuilder {
     parent_budget: Option<crate::runtime::RunBudgetAuthority>,
     runtime_mode: crate::modes::RuntimeMode,
     behavior_scope_targets: crate::modes::BehaviorScopeTargets,
+    background_job_storage: BackgroundJobStorage,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BackgroundJobStorage {
+    Durable,
+    Ephemeral,
 }
 
 impl ToolRunContextBuilder {
@@ -163,6 +170,11 @@ impl ToolRunContextBuilder {
             parent_budget: None,
             runtime_mode: crate::modes::RuntimeMode::default(),
             behavior_scope_targets: crate::modes::BehaviorScopeTargets::workspace_root(),
+            background_job_storage: if cfg!(test) {
+                BackgroundJobStorage::Ephemeral
+            } else {
+                BackgroundJobStorage::Durable
+            },
         }
     }
 
@@ -351,6 +363,20 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Keep durable background-job artifacts inside this run's private scratch
+    /// root. This is intended for hermetic tests and embedded ephemeral runs;
+    /// normal frontends retain the default user-state-backed restart record.
+    #[must_use]
+    pub const fn ephemeral_background_jobs(mut self) -> Self {
+        self.background_job_storage = BackgroundJobStorage::Ephemeral;
+        self
+    }
+
+    const fn background_job_storage(mut self, storage: BackgroundJobStorage) -> Self {
+        self.background_job_storage = storage;
+        self
+    }
+
     /// Construct and validate the complete immutable run capability.
     ///
     /// # Errors
@@ -373,6 +399,7 @@ pub struct ToolRunContext {
     project_root: PathBuf,
     working_directory: PathBuf,
     private_temp: PrivateTempDir,
+    background_job_storage: BackgroundJobStorage,
     read_only_roots: Vec<PathBuf>,
     read_write_roots: Vec<PathBuf>,
     denied_paths: Vec<PathBuf>,
@@ -489,6 +516,7 @@ impl ToolRunContext {
             parent_budget,
             runtime_mode,
             behavior_scope_targets,
+            background_job_storage,
         } = builder;
         let workspace_access = workspace_access.ok_or_else(|| {
             "Run construction requires an explicit workspace access capability".to_string()
@@ -754,6 +782,7 @@ impl ToolRunContext {
             project_root,
             working_directory,
             private_temp,
+            background_job_storage,
             read_only_roots: canonical_read_only,
             read_write_roots: canonical_read_write,
             denied_paths,
@@ -1170,6 +1199,18 @@ impl ToolRunContext {
         self.private_temp.path()
     }
 
+    pub(crate) fn background_job_storage_root(&self) -> Result<PathBuf, String> {
+        match self.background_job_storage {
+            BackgroundJobStorage::Ephemeral => Ok(self.private_temp.path().join("background-jobs")),
+            BackgroundJobStorage::Durable => dirs::data_local_dir()
+                .or_else(dirs::data_dir)
+                .map(|root| root.join("openclaudia").join("background-jobs"))
+                .ok_or_else(|| {
+                    "Cannot resolve a host user-data directory for background-job state".to_string()
+                }),
+        }
+    }
+
     /// Derive a new frontend session from this run's immutable authority.
     ///
     /// The requested project and working directory must already be contained
@@ -1254,6 +1295,7 @@ impl ToolRunContext {
             .parent_budget(self.runtime.budget().clone())
             .runtime_mode(runtime_mode.mode)
             .behavior_scope_targets(runtime_mode.scope_targets)
+            .background_job_storage(self.background_job_storage)
             .build()
     }
 

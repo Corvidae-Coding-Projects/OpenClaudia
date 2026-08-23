@@ -1,3 +1,4 @@
+mod job;
 mod kill;
 mod output;
 mod path_lint;
@@ -16,10 +17,11 @@ pub use policy::{apply_env_scrub, dangerous_shell_construct, is_sensitive_env, v
 
 use crate::tools::args::{ToolArgError, ToolArgs as _, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
+use job::{BackgroundJobState, JobCore, JobOutputStream, JobRead, JobSummary};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -32,7 +34,6 @@ use uuid::Uuid;
 /// Maximum number of background shells allowed before refusing new ones
 const MAX_BACKGROUND_SHELLS: usize = 50;
 const LEDGER_COMMAND_OUTPUT_MAX_BYTES: usize = 100_000;
-const BACKGROUND_OUTPUT_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
 const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 300_000;
 const MAX_FOREGROUND_TIMEOUT_MS: u64 = 600_000;
 
@@ -60,228 +61,198 @@ fn recover_mutex_lock<'a, T>(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_output_reader<R>(
-    stream: R,
-    buffer: Arc<Mutex<Vec<String>>>,
-    output_limit: Arc<OutputLimit>,
-    ledger_buffer: Arc<Mutex<String>>,
+    mut stream: R,
+    core: Arc<Mutex<JobCore>>,
+    output_stream: JobOutputStream,
     done: Arc<AtomicBool>,
-    op: &'static str,
-    resource: &'static str,
-    shell_id: String,
-) where
+    errors: std::sync::mpsc::Sender<String>,
+    job_id: String,
+) -> Result<thread::JoinHandle<()>, String>
+where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || {
-        let reader = BufReader::new(stream);
-        for line in reader.lines().map_while(Result::ok) {
-            append_ledger_output_line(&ledger_buffer, &line, op, "ledger_buffer", &shell_id);
-            let retained = output_limit.reserve(line.len().saturating_add(1));
-            if retained > 0 {
-                let retained_line = safe_truncate(&line, retained.min(line.len())).to_string();
-                recover_mutex_lock(&buffer, op, resource, Some(&shell_id)).push(retained_line);
+    thread::Builder::new()
+        .name(format!("background-output-{job_id}"))
+        .spawn(move || {
+            let mut chunk = [0_u8; 16 * 1024];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let result =
+                            recover_mutex_lock(&core, "output_reader", "job_core", Some(&job_id))
+                                .append_output(output_stream, &chunk[..count]);
+                        if let Err(error) = result {
+                            let _ = errors.send(error);
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = errors.send(format!("background output read failed: {error}"));
+                        break;
+                    }
+                }
             }
-            if retained < line.len().saturating_add(1)
-                && !output_limit.marker.swap(true, Ordering::SeqCst)
-            {
-                recover_mutex_lock(&buffer, op, resource, Some(&shell_id))
-                    .push("[output truncated at 1 MiB]".to_string());
-            }
-        }
-        done.store(true, Ordering::SeqCst);
-    });
+            done.store(true, Ordering::SeqCst);
+        })
+        .map_err(|error| format!("Cannot start background output reader: {error}"))
 }
 
-struct OutputLimit {
-    bytes: std::sync::atomic::AtomicUsize,
-    marker: AtomicBool,
-}
-
-impl OutputLimit {
-    const fn new() -> Self {
-        Self {
-            bytes: std::sync::atomic::AtomicUsize::new(0),
-            marker: AtomicBool::new(false),
-        }
-    }
-
-    fn reserve(&self, requested: usize) -> usize {
-        let mut current = self.bytes.load(Ordering::SeqCst);
-        loop {
-            let remaining = BACKGROUND_OUTPUT_MAX_BYTES_PER_STREAM.saturating_sub(current);
-            let granted = requested.min(remaining);
-            match self.bytes.compare_exchange(
-                current,
-                current.saturating_add(granted),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return granted,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-}
-
-fn append_ledger_output_line(
-    buffer: &Arc<Mutex<String>>,
-    line: &str,
-    op: &'static str,
-    resource: &'static str,
-    shell_id: &str,
-) {
-    let mut buffer = recover_mutex_lock(buffer, op, resource, Some(shell_id));
-    if buffer.len() >= LEDGER_COMMAND_OUTPUT_MAX_BYTES {
-        return;
-    }
-    let mut chunk = String::with_capacity(line.len() + usize::from(!buffer.is_empty()));
-    if !buffer.is_empty() {
-        chunk.push('\n');
-    }
-    chunk.push_str(line);
-    let remaining = LEDGER_COMMAND_OUTPUT_MAX_BYTES - buffer.len();
-    buffer.push_str(safe_truncate(&chunk, remaining));
-}
-
-/// Background shell process with captured output
-struct BackgroundShell {
-    stdout_buffer: Arc<Mutex<Vec<String>>>,
-    stderr_buffer: Arc<Mutex<Vec<String>>>,
-    command: String,
-    /// Exact immutable run generation that created this shell.
-    owner_run: String,
-    /// Stable session identity used only by trusted lifecycle cleanup.
-    owner_session: String,
-    /// Human/model-facing owner label (session or subagent id).
-    owner_label: String,
-    /// Liveness signal — true once the wait thread has reaped the child.
-    ///
-    /// # Fix for crosslink #674
-    ///
-    /// Pre-fix this flag was also flipped by the stdout reader on EOF,
-    /// racing with the wait thread. A caller could observe
-    /// `is_running=false` together with `exit_code=None` because the
-    /// reader signalled "done" before the wait thread populated the
-    /// exit status. Post-fix only the wait thread writes this flag and
-    /// it implies `exit_status` has been populated under `SeqCst`.
-    finished: Arc<AtomicBool>,
+struct BackgroundJobControl {
+    cancellation: crate::runtime::CancellationHandle,
+    requested_state: Arc<Mutex<Option<BackgroundJobState>>>,
     stdout_done: Arc<AtomicBool>,
     stderr_done: Arc<AtomicBool>,
-    /// Distinct from `finished`: set by the wait thread immediately
-    /// after writing `exit_status`. Consulted by `get_output` so that
-    /// (`is_running=false`, `exit_code=None`) is unreachable.
     reaped: Arc<AtomicBool>,
-    exit_status: Arc<Mutex<Option<i32>>>,
-    /// PID of the spawned process, used to send SIGTERM on kill
-    pid: u32,
-    /// Whether output has been drained at least once via `get_output`.
-    ///
-    /// # Fix for crosslink #351
-    ///
-    /// Set inside `get_output` on the actual drain operation, regardless of
-    /// whether the process has finished. The previous implementation only set
-    /// it when `is_finished` was observed true at poll time, which raced with
-    /// the wait-thread:
-    ///
-    /// - Drain BEFORE the wait-thread flips `finished=true`: flag was never
-    ///   set even though output was drained — GC permanently retained the
-    ///   slot.
-    /// - One-shot drain after finish: still set the flag (this path worked
-    ///   pre-fix and is preserved).
-    ///
-    /// Setting the flag on drain eliminates the happens-before requirement
-    /// between `finished` and `output_retrieved_after_finish`; GC additionally
-    /// waits for both output readers to hit EOF and for their buffers to be
-    /// empty, so a poll that happens before the child's final stdout/stderr
-    /// is delivered cannot make that output collectable.
-    output_retrieved_after_finish: AtomicBool,
 }
 
-/// Manager for background shell processes
+struct BackgroundShell {
+    core: Arc<Mutex<JobCore>>,
+    control: Option<BackgroundJobControl>,
+}
+
+impl BackgroundShell {
+    fn recovered(core: JobCore) -> Self {
+        Self {
+            core: Arc::new(Mutex::new(core)),
+            control: None,
+        }
+    }
+
+    fn summary(&self) -> JobSummary {
+        recover_mutex_lock(&self.core, "summary", "job_core", None).summary()
+    }
+
+    fn owner_run(&self) -> String {
+        recover_mutex_lock(&self.core, "owner", "job_core", None)
+            .owner_run()
+            .to_string()
+    }
+
+    fn owner_session(&self) -> String {
+        recover_mutex_lock(&self.core, "owner", "job_core", None)
+            .owner_session()
+            .to_string()
+    }
+
+    fn owner_label(&self) -> String {
+        recover_mutex_lock(&self.core, "owner", "job_core", None)
+            .owner_label()
+            .to_string()
+    }
+
+    fn state(&self) -> BackgroundJobState {
+        recover_mutex_lock(&self.core, "state", "job_core", None)
+            .state()
+            .clone()
+    }
+
+    fn pid(&self) -> Option<u32> {
+        recover_mutex_lock(&self.core, "pid", "job_core", None).pid()
+    }
+}
+
+/// Manager for generation-bound background shell jobs.
 pub struct BackgroundShellManager {
-    shells: Mutex<HashMap<String, BackgroundShell>>,
+    shells: Mutex<HashMap<String, Arc<BackgroundShell>>>,
+    hydrated_sessions: Mutex<HashSet<String>>,
 }
 
 impl BackgroundShellManager {
     fn new() -> Self {
         Self {
             shells: Mutex::new(HashMap::new()),
+            hydrated_sessions: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Spawn a new background shell and return its ID.
-    ///
-    /// Enforces [`validate_command`] (length cap + denylist) and applies
-    /// the env allowlist via [`apply_env_scrub`] before spawn so that only
-    /// only values explicitly bound to the immutable run capability flow into
-    /// the child. See crosslink #257, #730, and S-019.
-    #[allow(clippy::too_many_lines)] // spawn keeps the atomic reserve/spawn/insert sequence together
-    pub(crate) fn spawn(
+    fn hydrate(&self, run: &crate::tools::security::ToolRunContext) -> Result<(), String> {
+        let session_id = run.session_id().to_string();
+        let mut hydrated = recover_mutex_lock(
+            &self.hydrated_sessions,
+            "hydrate",
+            "hydrated_sessions",
+            None,
+        );
+        if hydrated.contains(&session_id) {
+            return Ok(());
+        }
+        let recovered = job::recover_jobs(run)?;
+        let mut shells = recover_mutex_lock(&self.shells, "hydrate", "shells", None);
+        for core in recovered {
+            let id = core.summary().id;
+            shells
+                .entry(id)
+                .or_insert_with(|| Arc::new(BackgroundShell::recovered(core)));
+        }
+        drop(shells);
+        hydrated.insert(session_id);
+        drop(hydrated);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn spawn(
         &self,
         run: &crate::tools::security::ToolRunContext,
         command: &str,
     ) -> Result<String, String> {
+        self.spawn_with_timeout(
+            run,
+            command,
+            std::time::Duration::from_millis(DEFAULT_FOREGROUND_TIMEOUT_MS),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // Admission, spawn, persistence, and supervisor registration are atomic.
+    pub(crate) fn spawn_with_timeout(
+        &self,
+        run: &crate::tools::security::ToolRunContext,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
         validate_command(command)?;
         run.require(crate::tools::security::ToolResource::Process)
             .map_err(|error| error.to_string())?;
-
-        let shell_id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
-        let owner_run = run.run_id().to_string();
-        let owner_session = run.session_id().to_string();
-        let owner_label = run.process_owner().to_string();
-        let cwd = run.working_directory().to_path_buf();
-
-        // ── Crosslink #672 fix: atomic check+reserve ──────────────────────────
-        //
-        // Pre-fix the `cmd.spawn()` call happened BEFORE any capacity guard,
-        // so a flood of concurrent `run_in_background=true` callers could each
-        // fork a child before any of them lost the cap check. The cap then
-        // only suppressed *tracking*, leaking orphan OS processes.
-        //
-        // Fix: hold the manager's `shells` lock across the entire critical
-        // section — GC sweep, capacity check, spawn, and insert — so the
-        // check and the spawn are atomic with respect to other spawners.
-        // The lock is contended only by other spawn/list/kill calls, and
-        // `Command::spawn` is a fast `fork+exec` syscall, so holding it
-        // for the duration is acceptable for the cap=50 workload.
-        let mut shells = recover_mutex_lock(&self.shells, "spawn", "shells", None);
-
-        // GC sweep: remove finished shells whose output has been retrieved at
-        // least once and whose reader threads have fully drained their pipes.
-        // A first poll can happen before a quick child emits its final output;
-        // without the reader-done + empty-buffer checks, a concurrent spawn can
-        // collect that shell before the caller has a chance to read the line.
-        shells.retain(|_id, s| {
-            let is_finished = s.finished.load(Ordering::SeqCst);
-            let output_retrieved = s.output_retrieved_after_finish.load(Ordering::SeqCst);
-            if !is_finished || !output_retrieved {
-                return true;
-            }
-            let stdout_done = s.stdout_done.load(Ordering::SeqCst);
-            let stderr_done = s.stderr_done.load(Ordering::SeqCst);
-            if !stdout_done || !stderr_done {
-                return true;
-            }
-            let stdout_empty =
-                recover_mutex_lock(&s.stdout_buffer, "spawn_gc", "stdout_buffer", None).is_empty();
-            let stderr_empty =
-                recover_mutex_lock(&s.stderr_buffer, "spawn_gc", "stderr_buffer", None).is_empty();
-            !(stdout_empty && stderr_empty)
-        });
-
-        if shells.len() >= MAX_BACKGROUND_SHELLS {
-            return Err(format!(
-                "Maximum background shell limit ({MAX_BACKGROUND_SHELLS}) reached. \
-                 Kill or wait for existing shells to finish."
-            ));
+        self.hydrate(run)?;
+        let remaining = run
+            .budget()
+            .remaining_time()
+            .map_err(|error| format!("Run budget denied background process: {error}"))?;
+        let timeout = timeout.min(remaining);
+        if timeout.is_zero() {
+            return Err("Run budget has no remaining time for a background process".to_string());
         }
 
-        // The canonical dispatch reservation ends when `bash` returns its
-        // shell id, but the child can keep mutating the workspace afterward.
-        // Hold a second run-scoped mutation token until the wait thread reaps
-        // the process so quality gates cannot publish during that interval.
-        let mut background_freshness = crate::evidence_freshness::reserve_mutation(
+        let mut shells = recover_mutex_lock(&self.shells, "spawn", "shells", None);
+        let active = shells
+            .values()
+            .filter(|shell| shell.state().is_running())
+            .count();
+        if active >= MAX_BACKGROUND_SHELLS {
+            return Err(format!(
+                "Maximum active background shell limit ({MAX_BACKGROUND_SHELLS}) reached. Kill or wait for existing shells to finish."
+            ));
+        }
+        if shells.len() > 200 {
+            let mut terminal = shells
+                .iter()
+                .filter_map(|(id, shell)| {
+                    let summary = shell.summary();
+                    summary
+                        .state
+                        .is_terminal()
+                        .then_some((summary.created_unix_ms, id.clone()))
+                })
+                .collect::<Vec<_>>();
+            terminal.sort_unstable();
+            for (_, id) in terminal.into_iter().take(shells.len().saturating_sub(200)) {
+                shells.remove(&id);
+            }
+        }
+
+        let background_freshness = crate::evidence_freshness::reserve_mutation(
             run,
             crate::tools::effect::ToolEffect::Destructive,
         )?
@@ -294,6 +265,11 @@ impl BackgroundShellManager {
             })
             .map_err(|error| format!("Run budget denied background process: {error}"))?;
 
+        let shell_id = Uuid::new_v4().to_string();
+        let core = Arc::new(Mutex::new(JobCore::create(
+            run, &shell_id, command, timeout,
+        )?));
+        let cwd = run.working_directory().to_path_buf();
         #[cfg(windows)]
         let child = {
             let bash = find_git_bash(run).unwrap_or(bash_bin(run)?);
@@ -301,322 +277,198 @@ impl BackgroundShellManager {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             cmd.spawn()
         };
-
         #[cfg(not(windows))]
         let child = {
             let bash = bash_bin(run)?;
             let mut cmd = sandbox::sandboxed_bash_command(run, &bash, command, &cwd)?;
             cmd.stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .process_group(0); // Put child in its own process group for clean kill
+                .process_group(0);
             cmd.spawn()
         };
-
-        let mut child = child.map_err(|e| format!("Failed to spawn background shell: {e}"))?;
-
-        // Capture PID before moving the child handle into the wait thread
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                let detail = format!("Failed to spawn background shell: {error}");
+                let _ = recover_mutex_lock(&core, "spawn", "job_core", Some(&shell_id)).set_state(
+                    BackgroundJobState::DeliveryFailed {
+                        error: detail.clone(),
+                    },
+                );
+                shells.insert(
+                    shell_id.clone(),
+                    Arc::new(BackgroundShell {
+                        core,
+                        control: None,
+                    }),
+                );
+                return Err(format!("{detail}; background job id: {shell_id}"));
+            }
+        };
         let pid = child.id();
+        let mark_running =
+            recover_mutex_lock(&core, "spawn", "job_core", Some(&shell_id)).mark_running(pid);
+        if let Err(error) = mark_running {
+            terminate_sandbox_process_tree(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
 
-        let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
-        let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
-        let stdout_ledger_buffer = Arc::new(Mutex::new(String::new()));
-        let stderr_ledger_buffer = Arc::new(Mutex::new(String::new()));
-        let stdout_output_limit = Arc::new(OutputLimit::new());
-        let stderr_output_limit = Arc::new(OutputLimit::new());
-        let finished = Arc::new(AtomicBool::new(false));
         let stdout_done = Arc::new(AtomicBool::new(false));
         let stderr_done = Arc::new(AtomicBool::new(false));
         let reaped = Arc::new(AtomicBool::new(false));
-        let exit_status = Arc::new(Mutex::new(None));
-
-        // ── Crosslink #674 fix: only the wait thread sets `finished` ──────
-        //
-        // Pre-fix BOTH the stdout reader and the wait thread set
-        // `finished=true`. The stdout reader could fire on EOF BEFORE the
-        // wait thread reaped the child, producing the impossible state
-        // (is_running=false, exit_code=None). Post-fix: the stdout reader
-        // no longer touches `finished`; it is the sole responsibility of
-        // the wait thread, which sets `exit_status` first and `reaped`
-        // second under release/acquire ordering. `get_output` consults
-        // `reaped` so a caller never observes a finished shell without an
-        // exit code.
-        if let Some(stdout) = child.stdout.take() {
+        let (errors_tx, errors_rx) = std::sync::mpsc::channel();
+        let stdout_missing = child.stdout.is_none();
+        let stderr_missing = child.stderr.is_none();
+        let stdout_reader = child.stdout.take().map(|stdout| {
             spawn_output_reader(
                 stdout,
-                Arc::clone(&stdout_buffer),
-                stdout_output_limit,
-                Arc::clone(&stdout_ledger_buffer),
+                Arc::clone(&core),
+                JobOutputStream::Stdout,
                 Arc::clone(&stdout_done),
-                "stdout_reader",
-                "stdout_buffer",
+                errors_tx.clone(),
                 shell_id.clone(),
-            );
-        } else {
-            stdout_done.store(true, Ordering::SeqCst);
-        }
-
-        // Spawn thread to read stderr
-        if let Some(stderr) = child.stderr.take() {
+            )
+        });
+        let stderr_reader = child.stderr.take().map(|stderr| {
             spawn_output_reader(
                 stderr,
-                Arc::clone(&stderr_buffer),
-                stderr_output_limit,
-                Arc::clone(&stderr_ledger_buffer),
+                Arc::clone(&core),
+                JobOutputStream::Stderr,
                 Arc::clone(&stderr_done),
-                "stderr_reader",
-                "stderr_buffer",
+                errors_tx,
                 shell_id.clone(),
-            );
-        } else {
+            )
+        });
+        let mut reader_handles = Vec::new();
+        for reader in [stdout_reader, stderr_reader].into_iter().flatten() {
+            match reader {
+                Ok(handle) => reader_handles.push(handle),
+                Err(error) => {
+                    terminate_sandbox_process_tree(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    for handle in reader_handles {
+                        let _ = handle.join();
+                    }
+                    let _ = recover_mutex_lock(&core, "spawn", "job_core", Some(&shell_id))
+                        .set_state(BackgroundJobState::DeliveryFailed {
+                            error: error.clone(),
+                        });
+                    return Err(error);
+                }
+            }
+        }
+        if stdout_missing {
+            stdout_done.store(true, Ordering::SeqCst);
+        }
+        if stderr_missing {
             stderr_done.store(true, Ordering::SeqCst);
         }
 
-        // Spawn thread to wait for process and capture exit status
-        let exit_status_clone = Arc::clone(&exit_status);
-        let finished_clone = Arc::clone(&finished);
-        let reaped_clone = Arc::clone(&reaped);
-        let stdout_done_for_ledger = Arc::clone(&stdout_done);
-        let stderr_done_for_ledger = Arc::clone(&stderr_done);
-        let stdout_ledger_for_wait = Arc::clone(&stdout_ledger_buffer);
-        let stderr_ledger_for_wait = Arc::clone(&stderr_ledger_buffer);
-        let owner_for_ledger = owner_label.clone();
-        let run_for_ledger = crate::ledger::RunBinding::from_run(run);
-        let cwd_for_ledger = cwd;
-        let command_for_ledger = command.to_string();
-        let mut child_for_wait = child;
-        let wait_shell_id = shell_id.clone();
-        thread::spawn(move || match child_for_wait.wait() {
-            Ok(status) => {
-                let exit_code = status.code().unwrap_or(-1);
-                *recover_mutex_lock(
-                    &exit_status_clone,
-                    "wait",
-                    "exit_status",
-                    Some(&wait_shell_id),
-                ) = status.code();
-                // Order matters: set `reaped` AFTER `exit_status` so
-                // `get_output` cannot observe `reaped=true` with
-                // `exit_status=None`.
-                reaped_clone.store(true, Ordering::SeqCst);
-                finished_clone.store(true, Ordering::SeqCst);
-                wait_for_output_readers(
-                    &stdout_done_for_ledger,
-                    &stderr_done_for_ledger,
-                    &wait_shell_id,
-                );
-                let stdout = recover_mutex_lock(
-                    &stdout_ledger_for_wait,
-                    "wait_ledger",
-                    "stdout_ledger_buffer",
-                    Some(&wait_shell_id),
-                )
-                .clone();
-                let stderr = recover_mutex_lock(
-                    &stderr_ledger_for_wait,
-                    "wait_ledger",
-                    "stderr_ledger_buffer",
-                    Some(&wait_shell_id),
-                )
-                .clone();
-                record_command_observation_for_session(
-                    &run_for_ledger,
-                    &owner_for_ledger,
-                    &cwd_for_ledger,
-                    &command_for_ledger,
-                    exit_code,
-                    &stdout,
-                    &stderr,
-                );
-                if let Err(error) = background_freshness.commit() {
-                    tracing::error!(
-                        shell_id = wait_shell_id,
-                        %error,
-                        "Failed to advance freshness after background shell completion"
-                    );
-                }
-                crate::ledger::invalidate_verification_receipts_for_binding(
-                    run_for_ledger.run_id,
-                    run_for_ledger.capability_generation,
-                );
-                if let Err(error) = background_budget.commit() {
-                    tracing::error!(
-                        shell_id = wait_shell_id,
-                        %error,
-                        "Failed to release background process budget"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::error!(
-                    shell_id = wait_shell_id,
-                    %error,
-                    "Background shell wait failed; retaining mutation reservation fail-closed"
-                );
-                std::mem::forget(background_freshness);
-                std::mem::forget(background_budget);
-            }
+        let cancellation = run.runtime().cancellation().child();
+        let requested_state = Arc::new(Mutex::new(None));
+        let shell = Arc::new(BackgroundShell {
+            core: Arc::clone(&core),
+            control: Some(BackgroundJobControl {
+                cancellation: cancellation.clone(),
+                requested_state: Arc::clone(&requested_state),
+                stdout_done: Arc::clone(&stdout_done),
+                stderr_done: Arc::clone(&stderr_done),
+                reaped: Arc::clone(&reaped),
+            }),
         });
-
-        let shell = BackgroundShell {
-            stdout_buffer,
-            stderr_buffer,
-            command: command.to_string(),
-            owner_run,
-            owner_session,
-            owner_label,
-            finished,
-            stdout_done,
-            stderr_done,
-            reaped,
-            exit_status,
-            pid,
-            output_retrieved_after_finish: AtomicBool::new(false),
-        };
-
         shells.insert(shell_id.clone(), shell);
         drop(shells);
+
+        let run_for_ledger = crate::ledger::RunBinding::from_run(run);
+        let owner_for_ledger = run.process_owner().to_string();
+        let command_for_ledger = command.to_string();
+        let supervisor_id = shell_id.clone();
+        thread::spawn(move || {
+            supervise_background_job(
+                child,
+                pid,
+                timeout,
+                &cancellation,
+                &requested_state,
+                &stdout_done,
+                &stderr_done,
+                &reaped,
+                &errors_rx,
+                reader_handles,
+                &core,
+                &run_for_ledger,
+                &owner_for_ledger,
+                &cwd,
+                &command_for_ledger,
+                &supervisor_id,
+                background_freshness,
+                background_budget,
+            );
+        });
 
         Ok(shell_id)
     }
 
-    /// Get output from a background shell (returns new output since last call)
-    #[allow(clippy::significant_drop_tightening)] // shells lock must be held while accessing shell
-    pub(crate) fn get_output(
+    fn get_output(
         &self,
         run: &crate::tools::security::ToolRunContext,
         shell_id: &str,
-    ) -> Result<(String, bool, Option<i32>), String> {
-        let caller = run.run_id().to_string();
-        // Crosslink #678: the shells map holds an entry-per-shell HashMap with
-        // no cross-field invariant — every recoverable state is fully
-        // represented inside an individual BackgroundShell, and HashMap
-        // insert/get/remove are atomic. A poisoned mutex therefore reflects
-        // a panic in unrelated code paths, not a corrupted shells-map
-        // structure. We recover the inner state but loudly log so operators
-        // see the poison event in audit logs rather than treating it as
-        // invisible silent absorption.
+        cursor: Option<u64>,
+    ) -> Result<JobRead, String> {
+        self.hydrate(run)?;
         let shells = recover_mutex_lock(&self.shells, "get_output", "shells", Some(shell_id));
         let shell = shells
             .get(shell_id)
+            .cloned()
             .ok_or_else(|| format!("Shell '{shell_id}' not found"))?;
-        if shell.owner_run != caller {
+        drop(shells);
+        let caller = run.run_id().to_string();
+        let mut core = recover_mutex_lock(&shell.core, "get_output", "job_core", Some(shell_id));
+        let resumed_lost = matches!(core.state(), BackgroundJobState::Lost { .. })
+            && core.owner_session() == run.session_id()
+            && core.owner_label() == run.process_owner()
+            && core.workspace_root() == run.project_root().to_string_lossy();
+        if core.owner_run() != caller && !resumed_lost {
             tracing::warn!(
                 target: "openclaudia::bash",
                 event = "cross_session_shell_access_denied",
                 caller,
                 shell_id,
-                "Denied background shell output access outside the owning session"
+                "Denied background shell output access outside the owning run"
             );
-            // Deliberately do not reveal whether a guessed identifier exists.
             return Err(format!("Shell '{shell_id}' not found"));
         }
-
-        let mut output = String::new();
-
-        // Swap buffers atomically — take all lines, leave empty vec.
-        // This minimizes lock hold time and prevents data loss from
-        // concurrent writer threads.
-        let stdout_lines: Vec<String> = std::mem::take(&mut *recover_mutex_lock(
-            &shell.stdout_buffer,
-            "get_output",
-            "stdout_buffer",
-            Some(shell_id),
-        ));
-
-        let stderr_lines: Vec<String> = std::mem::take(&mut *recover_mutex_lock(
-            &shell.stderr_buffer,
-            "get_output",
-            "stderr_buffer",
-            Some(shell_id),
-        ));
-
-        // Join outside the lock
-        if !stdout_lines.is_empty() {
-            output.push_str(&stdout_lines.join("\n"));
-        }
-        if !stderr_lines.is_empty() {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str("stderr:\n");
-            output.push_str(&stderr_lines.join("\n"));
-        }
-
-        // Crosslink #351 fix: mark the slot as drained on EVERY get_output
-        // call, regardless of whether `finished` has been set yet by the
-        // wait-thread. The previous code gated the store on
-        // `is_finished == true`, racing with the wait-thread: a caller that
-        // drained just before `finished` was set would never mark the slot
-        // as drained, leaving the GC sweep unable to reclaim it.
-        //
-        // Drain is the GC-relevant event: once a caller has had the chance
-        // to read the buffers, the slot is collectable as soon as the
-        // process is also finished. SeqCst on this store + matching loads
-        // in `spawn`'s GC sweep gives the happens-before edge that was
-        // missing before.
-        shell
-            .output_retrieved_after_finish
-            .store(true, Ordering::SeqCst);
-
-        // Crosslink #674 fix: derive `is_running` from `reaped` (set by the
-        // wait thread after writing `exit_status`), not from `finished` —
-        // which the stdout reader could previously flip on EOF before the
-        // exit code was available. This guarantees a caller that observes
-        // `is_running=false` will also see `exit_code=Some(_)` whenever the
-        // process actually produced a code (i.e. wasn't killed in a way that
-        // returned `None`).
-        let is_reaped = shell.reaped.load(Ordering::SeqCst);
-        let exit_code = *recover_mutex_lock(
-            &shell.exit_status,
-            "get_output",
-            "exit_status",
-            Some(shell_id),
-        );
-        let is_running = !is_reaped;
-
-        Ok((output, is_running, exit_code))
+        core.read(cursor)
     }
 
-    /// Kill a background shell by terminating the OS process and its process group.
-    ///
-    /// Force-stops the owned sandbox tree, then waits for the existing waiter
-    /// and output-reader threads to publish reap/drain completion.
     pub(crate) fn kill(
         &self,
         run: &crate::tools::security::ToolRunContext,
         shell_id: &str,
     ) -> Result<String, String> {
-        // Crosslink #678: see get_output for poison-recovery rationale. The
-        // log carries shell_id so the audit trail names the specific call
-        // that observed poisoning.
-        let mut shells = recover_mutex_lock(&self.shells, "kill", "shells", Some(shell_id));
-
-        let caller = run.run_id().to_string();
-        if shells
+        self.hydrate(run)?;
+        let shells = recover_mutex_lock(&self.shells, "kill", "shells", Some(shell_id));
+        let shell = shells
             .get(shell_id)
-            .is_some_and(|shell| shell.owner_run != caller)
-        {
-            tracing::warn!(
-                target: "openclaudia::bash",
-                event = "cross_session_shell_kill_denied",
-                caller,
-                shell_id,
-                "Denied background shell termination outside the owning session"
-            );
+            .cloned()
+            .ok_or_else(|| format!("Shell '{shell_id}' not found"))?;
+        drop(shells);
+        if shell.owner_run() != run.run_id().to_string() {
             return Err(format!("Shell '{shell_id}' not found"));
         }
-
-        let shell = shells.remove(shell_id);
-        drop(shells);
-        if let Some(shell) = shell {
-            stop_background_shell(&shell);
-            Ok(format!(
-                "Shell '{}' terminated (command: {}, pid: {})",
-                shell_id, shell.command, shell.pid
-            ))
-        } else {
-            Err(format!("Shell '{shell_id}' not found"))
-        }
+        stop_background_shell(&shell, BackgroundJobState::Killed);
+        Ok(format!(
+            "Shell '{}' terminated (command: {}, pid: {}, state: {})",
+            shell_id,
+            shell.summary().command,
+            shell
+                .pid()
+                .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+            shell.state().label()
+        ))
     }
 
     fn kill_matching(
@@ -624,32 +476,23 @@ impl BackgroundShellManager {
         operation: &'static str,
         owner_label: &str,
         predicate: impl Fn(&BackgroundShell) -> bool,
+        state: &BackgroundJobState,
     ) -> String {
-        let mut shells = recover_mutex_lock(&self.shells, operation, "shells", None);
-        let shell_ids: Vec<String> = shells
+        let shells = recover_mutex_lock(&self.shells, operation, "shells", None);
+        let matches = shells
             .iter()
-            .filter(|(_, shell)| predicate(shell))
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        if shell_ids.is_empty() {
+            .filter(|(_, shell)| shell.state().is_running() && predicate(shell))
+            .map(|(id, shell)| (id.clone(), Arc::clone(shell)))
+            .collect::<Vec<_>>();
+        drop(shells);
+        if matches.is_empty() {
             return format!("No background shells found for agent '{owner_label}'.");
         }
-
-        let mut removed = Vec::with_capacity(shell_ids.len());
-        for shell_id in shell_ids {
-            if let Some(shell) = shells.remove(&shell_id) {
-                removed.push((shell_id, shell));
-            }
+        let mut killed_ids = Vec::with_capacity(matches.len());
+        for (id, shell) in matches {
+            stop_background_shell(&shell, state.clone());
+            killed_ids.push(id);
         }
-        drop(shells);
-
-        let mut killed_ids = Vec::with_capacity(removed.len());
-        for (shell_id, shell) in removed {
-            stop_background_shell(&shell);
-            killed_ids.push(shell_id);
-        }
-
         format!(
             "Terminated {} background shell(s) for agent '{}': {}",
             killed_ids.len(),
@@ -658,69 +501,92 @@ impl BackgroundShellManager {
         )
     }
 
-    /// Kill every shell owned by this exact run generation.
     pub(crate) fn kill_for_run(&self, run: &crate::tools::security::ToolRunContext) -> String {
+        let _ = self.hydrate(run);
         let owner_run = run.run_id().to_string();
-        self.kill_matching("kill_for_run", run.process_owner(), |shell| {
-            shell.owner_run == owner_run
-        })
+        self.kill_matching(
+            "kill_for_run",
+            run.process_owner(),
+            |shell| shell.owner_run() == owner_run,
+            &BackgroundJobState::Cancelled {
+                reason: "run ended".to_string(),
+            },
+        )
     }
 
-    /// Trusted subagent-lifecycle cleanup by stable owner label, constrained to
-    /// the owning session so an identical label in another concurrent session
-    /// cannot terminate its processes.
     pub(crate) fn kill_for_process_owner(
         &self,
         owner: &crate::tools::ToolRunContext,
         owner_label: &str,
     ) -> String {
+        let _ = self.hydrate(owner);
         let owner_session = owner.session_id();
-        self.kill_matching("kill_for_process_owner", owner_label, |shell| {
-            shell.owner_session == owner_session && shell.owner_label == owner_label
-        })
+        self.kill_matching(
+            "kill_for_process_owner",
+            owner_label,
+            |shell| shell.owner_session() == owner_session && shell.owner_label() == owner_label,
+            &BackgroundJobState::Cancelled {
+                reason: "process owner ended".to_string(),
+            },
+        )
     }
 
-    /// Trusted session-lifecycle cleanup across run generations.
     fn kill_for_session(&self, session_id: &str) -> String {
-        self.kill_matching("kill_for_session", session_id, |shell| {
-            shell.owner_session == session_id
-        })
+        self.kill_matching(
+            "kill_for_session",
+            session_id,
+            |shell| shell.owner_session() == session_id,
+            &BackgroundJobState::Cancelled {
+                reason: "session ended".to_string(),
+            },
+        )
     }
 
-    /// List all background shells
+    fn summaries(&self, run: &crate::tools::security::ToolRunContext) -> Vec<JobSummary> {
+        let _ = self.hydrate(run);
+        let caller = run.run_id().to_string();
+        let session = run.session_id();
+        let workspace = run.project_root().to_string_lossy();
+        let mut summaries = {
+            let shells = recover_mutex_lock(&self.shells, "summaries", "shells", None);
+            shells
+                .values()
+                .filter_map(|shell| {
+                    let core = recover_mutex_lock(&shell.core, "summaries", "job_core", None);
+                    (core.owner_run() == caller
+                        || (matches!(core.state(), BackgroundJobState::Lost { .. })
+                            && core.owner_session() == session
+                            && core.owner_label() == run.process_owner()
+                            && core.workspace_root() == workspace))
+                        .then(|| core.summary())
+                })
+                .collect::<Vec<_>>()
+        };
+        summaries.sort_by_key(|summary| summary.created_unix_ms);
+        summaries
+    }
+
     pub(crate) fn list(
         &self,
         run: &crate::tools::security::ToolRunContext,
     ) -> Vec<(String, String, bool)> {
-        let caller = run.run_id().to_string();
-        // Crosslink #678: see get_output for poison-recovery rationale.
-        let shells = recover_mutex_lock(&self.shells, "list", "shells", None);
-        shells
-            .iter()
-            .filter(|(_, shell)| shell.owner_run == caller)
-            .map(|(id, shell)| {
-                (
-                    id.clone(),
-                    shell.command.clone(),
-                    !shell.finished.load(Ordering::SeqCst),
-                )
-            })
+        self.summaries(run)
+            .into_iter()
+            .map(|summary| (summary.id, summary.command, summary.state.is_running()))
             .collect()
     }
 
-    /// Active process ids owned by one exact run generation.
     pub(crate) fn active_ids_for_run(
         &self,
         run: &crate::tools::security::ToolRunContext,
     ) -> Vec<String> {
+        let _ = self.hydrate(run);
         let caller = run.run_id().to_string();
         let mut ids = {
             let shells = recover_mutex_lock(&self.shells, "active_ids_for_run", "shells", None);
             shells
                 .iter()
-                .filter(|(_, shell)| {
-                    shell.owner_run == caller && !shell.finished.load(Ordering::SeqCst)
-                })
+                .filter(|(_, shell)| shell.owner_run() == caller && shell.state().is_running())
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>()
         };
@@ -729,9 +595,160 @@ impl BackgroundShellManager {
     }
 }
 
-/// Terminate every background job owned by a session during trusted lifecycle
-/// cleanup. This bypasses the agent-facing identifier argument, but remains
-/// scoped to the exact immutable session id supplied by `SessionManager`.
+#[allow(clippy::too_many_arguments)]
+fn supervise_background_job(
+    mut child: std::process::Child,
+    pid: u32,
+    timeout: std::time::Duration,
+    cancellation: &crate::runtime::CancellationHandle,
+    requested_state: &Arc<Mutex<Option<BackgroundJobState>>>,
+    stdout_done: &Arc<AtomicBool>,
+    stderr_done: &Arc<AtomicBool>,
+    reaped: &Arc<AtomicBool>,
+    errors: &std::sync::mpsc::Receiver<String>,
+    readers: Vec<thread::JoinHandle<()>>,
+    core: &Arc<Mutex<JobCore>>,
+    run_for_ledger: &crate::ledger::RunBinding,
+    owner_for_ledger: &str,
+    cwd: &Path,
+    command: &str,
+    job_id: &str,
+    mut background_freshness: crate::evidence_freshness::MutationReservation,
+    background_budget: crate::runtime::BudgetReservation,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut root_status = None;
+    let terminal_state = loop {
+        if let Ok(error) = errors.try_recv() {
+            terminate_sandbox_process_tree(pid);
+            let _ = child.kill();
+            break BackgroundJobState::DeliveryFailed { error };
+        }
+        if let Some(receipt) = cancellation.receipt() {
+            terminate_sandbox_process_tree(pid);
+            let _ = child.kill();
+            let requested = recover_mutex_lock(
+                requested_state,
+                "supervise",
+                "requested_state",
+                Some(job_id),
+            )
+            .take();
+            break requested.unwrap_or_else(|| BackgroundJobState::Cancelled {
+                reason: format!("{:?}", receipt.reason),
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            *recover_mutex_lock(
+                requested_state,
+                "supervise",
+                "requested_state",
+                Some(job_id),
+            ) = Some(BackgroundJobState::TimedOut);
+            let _receipt = cancellation.cancel(crate::runtime::CancellationReason::Deadline);
+            terminate_sandbox_process_tree(pid);
+            let _ = child.kill();
+            break BackgroundJobState::TimedOut;
+        }
+        if root_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => root_status = Some(status),
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_sandbox_process_tree(pid);
+                    let _ = child.kill();
+                    break BackgroundJobState::DeliveryFailed {
+                        error: format!("background process wait failed: {error}"),
+                    };
+                }
+            }
+        }
+        if let Some(status) = root_status
+            .as_ref()
+            .filter(|_| stdout_done.load(Ordering::SeqCst) && stderr_done.load(Ordering::SeqCst))
+        {
+            break BackgroundJobState::Exited {
+                exit_code: status.code().unwrap_or(-1),
+            };
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    if root_status.is_none() {
+        root_status = child.wait().ok();
+    }
+    reaped.store(true, Ordering::SeqCst);
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let mut core = recover_mutex_lock(core, "supervise", "job_core", Some(job_id));
+    if let Err(error) = core.set_state(terminal_state) {
+        tracing::error!(job_id, %error, "Failed to persist terminal background-job state");
+    }
+    let stdout = core.ledger_output(JobOutputStream::Stdout, LEDGER_COMMAND_OUTPUT_MAX_BYTES);
+    let stderr = core.ledger_output(JobOutputStream::Stderr, LEDGER_COMMAND_OUTPUT_MAX_BYTES);
+    let exit_code = core.state().exit_code().or_else(|| {
+        root_status
+            .as_ref()
+            .map(|status| status.code().unwrap_or(-1))
+    });
+    drop(core);
+    record_command_observation_for_session(
+        run_for_ledger,
+        owner_for_ledger,
+        cwd,
+        command,
+        exit_code.unwrap_or(-1),
+        &stdout,
+        &stderr,
+    );
+    if let Err(error) = background_freshness.commit() {
+        tracing::error!(job_id, %error, "Failed to advance freshness after background job");
+    }
+    crate::ledger::invalidate_verification_receipts_for_binding(
+        run_for_ledger.run_id,
+        run_for_ledger.capability_generation,
+    );
+    if let Err(error) = background_budget.commit() {
+        tracing::error!(job_id, %error, "Failed to release background process budget");
+    }
+}
+
+fn stop_background_shell(shell: &BackgroundShell, requested: BackgroundJobState) {
+    if !shell.state().is_running() {
+        return;
+    }
+    let Some(control) = shell.control.as_ref() else {
+        return;
+    };
+    *recover_mutex_lock(&control.requested_state, "stop", "requested_state", None) =
+        Some(requested);
+    let _receipt = control
+        .cancellation
+        .cancel(crate::runtime::CancellationReason::User);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if control.reaped.load(Ordering::SeqCst)
+            && control.stdout_done.load(Ordering::SeqCst)
+            && control.stderr_done.load(Ordering::SeqCst)
+            && shell.state().is_terminal()
+        {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if let Some(pid) = shell.pid() {
+        terminate_sandbox_process_tree(pid);
+    }
+    tracing::warn!(
+        target: "openclaudia::bash",
+        event = "background_job_reap_delayed",
+        pid = shell.pid().unwrap_or_default(),
+        "Background job did not publish terminal reap/drain completion within cleanup deadline"
+    );
+}
+
+/// Terminate every background job owned by a session during trusted lifecycle cleanup.
 pub fn terminate_session_background_jobs(session_id: &str) {
     let result = BACKGROUND_SHELLS.kill_for_session(session_id);
     tracing::info!(
@@ -743,47 +760,7 @@ pub fn terminate_session_background_jobs(session_id: &str) {
     );
 }
 
-fn wait_for_output_readers(stdout_done: &AtomicBool, stderr_done: &AtomicBool, shell_id: &str) {
-    while !stdout_done.load(Ordering::SeqCst) || !stderr_done.load(Ordering::SeqCst) {
-        tracing::trace!(
-            target: "openclaudia::bash",
-            shell_id,
-            "waiting for background shell output readers before ledger observation"
-        );
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-fn stop_background_shell(shell: &BackgroundShell) {
-    // A root shell can already be reaped while a descendant still owns one of
-    // its pipes. In that state `finished` is true but the sandbox is not gone.
-    // Force the owned tree whenever either reader has not reached EOF, then
-    // wait briefly for the existing waiter/reader threads to publish reality.
-    if !shell.finished.load(Ordering::SeqCst)
-        || !shell.stdout_done.load(Ordering::SeqCst)
-        || !shell.stderr_done.load(Ordering::SeqCst)
-    {
-        terminate_sandbox_process_tree(shell.pid);
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if shell.reaped.load(Ordering::SeqCst)
-            && shell.stdout_done.load(Ordering::SeqCst)
-            && shell.stderr_done.load(Ordering::SeqCst)
-        {
-            return;
-        }
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
-    tracing::warn!(
-        target: "openclaudia::bash",
-        event = "background_shell_reap_delayed",
-        pid = shell.pid,
-        "Background shell did not publish reap and pipe-drain completion within cleanup deadline"
-    );
-}
-
-/// Global background shell manager
+/// Global background shell manager.
 pub static BACKGROUND_SHELLS: std::sync::LazyLock<BackgroundShellManager> =
     std::sync::LazyLock::new(BackgroundShellManager::new);
 
@@ -930,11 +907,6 @@ pub fn try_execute_bash(
     }
 
     if run_in_background {
-        if args.contains_key("timeout") {
-            return Err(ToolError::InvalidInput(
-                "The 'timeout' argument applies only to foreground bash commands".to_string(),
-            ));
-        }
         let arguments = Value::Object(
             args.iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -945,7 +917,7 @@ pub fn try_execute_bash(
             .map_err(ToolError::Other)?;
         // Spawn background shell and return shell_id.
         let shell_id = BACKGROUND_SHELLS
-            .spawn(run, command)
+            .spawn_with_timeout(run, command, std::time::Duration::from_millis(timeout_ms))
             .map_err(ToolError::Other)?;
         return Ok(ToolOutput::text(format!(
             "Background shell started with ID: {shell_id}\nUse bash_output with this shell_id to retrieve output."
@@ -1276,8 +1248,8 @@ mod tests {
     fn windows_git_bash_lookup_uses_rust_resolver() {
         let source = include_str!("mod.rs");
         let cfg_test = source
-            .find("#[cfg(test)]")
-            .expect("test marker must be present");
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("test module marker must be present");
         let production = &source[..cfg_test];
 
         assert!(
@@ -1301,8 +1273,8 @@ mod tests {
 
         let source = include_str!("mod.rs");
         let cfg_test = source
-            .find("#[cfg(test)]")
-            .expect("test marker must be present");
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("test module marker must be present");
         let production = &source[..cfg_test];
 
         assert!(
@@ -1318,17 +1290,18 @@ mod tests {
     // B1 — background spawn: shell_id format and manager state
     // Spec: crosslink #526 §B1 | OC source: mod.rs:49-169
 
-    /// B1-mod-a: spawn returns an 8-char `shell_id` (UUID prefix, mod.rs:57).
+    /// B1-mod-a: spawn returns an untruncated UUID `shell_id`.
     #[test]
-    fn b1_spawn_returns_8_char_shell_id() {
+    fn b1_spawn_returns_full_uuid_shell_id() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn(test_run(), "echo b1_mod_a")
             .expect("b1_spawn_8char: spawn must succeed");
         assert_eq!(
-            id.len(),
-            8,
-            "b1_spawn_8char: shell_id must be 8 chars; got '{id}'"
+            Uuid::parse_str(&id)
+                .expect("full UUID shell id")
+                .to_string(),
+            id
         );
         let _ = BACKGROUND_SHELLS.kill(test_run(), &id);
     }
@@ -1397,16 +1370,22 @@ mod tests {
             });
 
         let cleanup = BACKGROUND_SHELLS.kill_for_process_owner(&run_a, "shared-agent-label");
-        let a_is_gone = BACKGROUND_SHELLS.get_output(&run_a, &shell_a).is_err();
-        let b_is_present = BACKGROUND_SHELLS.get_output(&run_b, &shell_b).is_ok();
+        let a_state = BACKGROUND_SHELLS
+            .get_output(&run_a, &shell_a, Some(0))
+            .expect("session A job record remains readable")
+            .state;
+        let b_state = BACKGROUND_SHELLS
+            .get_output(&run_b, &shell_b, Some(0))
+            .expect("session B job remains readable")
+            .state;
         let cleanup_b = BACKGROUND_SHELLS.kill(&run_b, &shell_b);
 
         assert!(cleanup_b.is_ok(), "session B cleanup failed: {cleanup_b:?}");
         assert!(cleanup.contains(&shell_a), "{cleanup}");
         assert!(!cleanup.contains(&shell_b), "{cleanup}");
-        assert!(a_is_gone);
+        assert!(matches!(a_state, BackgroundJobState::Cancelled { .. }));
         assert!(
-            b_is_present,
+            b_state.is_running(),
             "session A cleanup must not terminate session B's same-label shell"
         );
     }
@@ -1464,12 +1443,10 @@ mod tests {
         );
     }
 
-    /// B2-mod-b: kill on a running shell returns Ok and removes it from the map.
-    ///
-    /// OC source: mod.rs:236-245 — `shells.remove(shell_id)`.
+    /// B2-mod-b: kill on a running shell reaps it and retains its terminal record.
     #[test]
     #[cfg(unix)]
-    fn b2_kill_running_shell_removes_entry() {
+    fn b2_kill_running_shell_reaps_and_retains_record() {
         let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn(test_run(), "sleep 30")
@@ -1483,7 +1460,11 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let contains = shells.contains_key(&id);
-            pid = shells.get(&id).expect("tracked shell").pid;
+            pid = shells
+                .get(&id)
+                .expect("tracked shell")
+                .pid()
+                .expect("running shell pid");
             drop(shells);
             assert!(contains, "b2_kill_running: must be in map before kill");
         }
@@ -1499,19 +1480,10 @@ mod tests {
             "killed background sandbox pid {pid} must be reaped"
         );
 
-        // Entry must be removed after kill
-        {
-            let shells = BACKGROUND_SHELLS
-                .shells
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let contains = shells.contains_key(&id);
-            drop(shells);
-            assert!(
-                !contains,
-                "b2_kill_running: entry must be removed after kill"
-            );
-        }
+        let read = BACKGROUND_SHELLS
+            .get_output(test_run(), &id, Some(0))
+            .expect("killed job record remains readable");
+        assert_eq!(read.state, BackgroundJobState::Killed);
     }
 
     /// B2-mod-c: kill message format — "Shell 'id' terminated (command: ..., pid: ...)".
@@ -1578,7 +1550,7 @@ mod tests {
     #[test]
     fn b3_get_output_unknown_id_returns_err_no_panic() {
         let _l = bg_lock();
-        let result = BACKGROUND_SHELLS.get_output(test_run(), "ffffffff");
+        let result = BACKGROUND_SHELLS.get_output(test_run(), "ffffffff", None);
         assert!(result.is_err(), "b3_get_output_unknown: must return Err");
         let msg = result.unwrap_err();
         assert!(
@@ -1600,11 +1572,11 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let result = BACKGROUND_SHELLS.get_output(test_run(), &id);
+        let result = BACKGROUND_SHELLS.get_output(test_run(), &id, None);
         assert!(result.is_ok(), "b3_get_output_running: must return Ok");
-        let (_output, is_running, _exit_code) = result.unwrap();
+        let read = result.unwrap();
         assert!(
-            is_running,
+            read.state.is_running(),
             "b3_get_output_running: is_running must be true for a live shell"
         );
         // Clean up
@@ -1625,15 +1597,15 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(400));
 
-        let result = BACKGROUND_SHELLS.get_output(test_run(), &id);
+        let result = BACKGROUND_SHELLS.get_output(test_run(), &id, None);
         assert!(result.is_ok(), "b3_get_output_finished: must return Ok");
-        let (_output, is_running, exit_code) = result.unwrap();
+        let read = result.unwrap();
         assert!(
-            !is_running,
+            !read.state.is_running(),
             "b3_get_output_finished: is_running must be false for a finished shell"
         );
         assert_eq!(
-            exit_code,
+            read.state.exit_code(),
             Some(0),
             "b3_get_output_finished: exit_code must be Some(0)"
         );
@@ -1728,139 +1700,206 @@ mod tests {
         );
     }
 
-    // ── Crosslink #351 — output-drain GC flag race ────────────────────────────
-    //
-    // Pre-fix, `output_retrieved_after_finish` was stored only when
-    // `get_output` observed `finished == true`. That gated the store on a
-    // racing atomic from the wait-thread:
-    //   (1) drain-before-finish: caller drains while process still runs; flag
-    //       never set even though output was retrieved → GC never collects.
-    //   (2) drain-after-finish with no later poll: caller drains right as the
-    //       wait-thread sets finished; flag set, fine.
-    //
-    // Post-fix: every `get_output` call marks the slot as drained.
+    // ── Crosslink #351 — durable cursor output ────────────────────────────────
 
-    /// Helper: read the GC flag directly from the manager's shell entry.
-    fn read_drained_flag(shell_id: &str) -> bool {
-        let shells = BACKGROUND_SHELLS
+    fn job_text(read: &JobRead) -> String {
+        read.events
+            .iter()
+            .map(|event| event.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compatibility_poll_advances_but_explicit_cursor_replays() {
+        let _l = bg_lock();
+        let id = BACKGROUND_SHELLS
+            .spawn(test_run(), "printf cursor_sentinel")
+            .expect("cursor job must spawn");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let first = BACKGROUND_SHELLS
+            .get_output(test_run(), &id, None)
+            .expect("first incremental read");
+        assert!(job_text(&first).contains("cursor_sentinel"));
+
+        let second = BACKGROUND_SHELLS
+            .get_output(test_run(), &id, None)
+            .expect("second incremental read");
+        assert!(second.events.is_empty());
+
+        let replay = BACKGROUND_SHELLS
+            .get_output(test_run(), &id, Some(0))
+            .expect("explicit replay");
+        assert!(job_text(&replay).contains("cursor_sentinel"));
+        assert_eq!(replay.next_cursor, first.next_cursor);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unpolled_terminal_job_remains_readable() {
+        let _l = bg_lock();
+        let id = BACKGROUND_SHELLS
+            .spawn(test_run(), "printf retained_sentinel")
+            .expect("retained job must spawn");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        assert!(BACKGROUND_SHELLS
+            .list(test_run())
+            .iter()
+            .any(|(listed, _, running)| listed == &id && !running));
+        let read = BACKGROUND_SHELLS
+            .get_output(test_run(), &id, Some(0))
+            .expect("unpolled terminal output remains readable");
+        assert!(job_text(&read).contains("retained_sentinel"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn newline_free_output_is_bounded_and_job_finishes() {
+        let _l = bg_lock();
+        let manager = BackgroundShellManager::new();
+        let id = manager
+            .spawn_with_timeout(
+                test_run(),
+                "head -c 3145728 /dev/zero | tr '\\0' x",
+                std::time::Duration::from_secs(30),
+            )
+            .expect("large newline-free output job must spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let read = loop {
+            let read = manager
+                .get_output(test_run(), &id, Some(0))
+                .expect("large-output job remains readable");
+            if read.state.is_terminal() {
+                break read;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "newline-free output job did not finish within its deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        assert_eq!(read.state.exit_code(), Some(0));
+        let mut retained = 0_usize;
+        let mut page = read;
+        loop {
+            retained = retained.saturating_add(
+                page.events
+                    .iter()
+                    .map(|event| event.byte_len)
+                    .sum::<usize>(),
+            );
+            if !page.has_more {
+                break;
+            }
+            page = manager
+                .get_output(test_run(), &id, Some(page.next_cursor))
+                .expect("read next bounded output page");
+        }
+        assert_eq!(retained, job::MAX_JOB_OUTPUT_BYTES);
+        assert!(page.stdout_truncated);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn background_timeout_publishes_terminal_state_and_reaps_root() {
+        let _l = bg_lock();
+        let manager = BackgroundShellManager::new();
+        let id = manager
+            .spawn_with_timeout(
+                test_run(),
+                "sleep 30",
+                std::time::Duration::from_millis(100),
+            )
+            .expect("timed background job must spawn");
+        let pid = manager
             .shells
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        shells
-            .get(shell_id)
-            .is_some_and(|s| s.output_retrieved_after_finish.load(Ordering::SeqCst))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .and_then(|shell| shell.pid())
+            .expect("timed job pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let read = loop {
+            let read = manager
+                .get_output(test_run(), &id, Some(0))
+                .expect("timed job remains readable");
+            if read.state.is_terminal() {
+                break read;
+            }
+            assert!(std::time::Instant::now() < deadline, "timeout did not fire");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(read.state, BackgroundJobState::TimedOut);
+        #[cfg(target_os = "linux")]
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
-    /// `#351-a`: drain-before-finish marks the GC flag.
-    ///
-    /// Spawn a long-running process, poll `get_output` while it is still alive
-    /// (`is_running=true`), and assert the flag flips. Pre-fix this would
-    /// stay false because the `if is_finished` gate skipped the store.
     #[test]
-    #[cfg(unix)]
-    fn fix351_drain_before_finish_marks_retrieved() {
-        let _l = bg_lock();
-        let id = BACKGROUND_SHELLS
-            .spawn(test_run(), "sleep 5")
-            .expect("fix351-a: spawn must succeed");
+    fn restart_reconciles_running_record_to_lost_without_pid_reattachment() {
+        let root = tempfile::tempdir().expect("restart test root");
+        let session_id = crate::state::SessionId::new();
+        let run = crate::tools::ToolRunContext::builder(session_id.clone(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .process_owner("restart-test")
+            .provider("restart-test")
+            .ephemeral_background_jobs()
+            .build()
+            .expect("restart test run");
+        let id = Uuid::new_v4().to_string();
+        let mut abandoned =
+            JobCore::create(&run, &id, "sleep 30", std::time::Duration::from_secs(30))
+                .expect("persist starting record");
+        abandoned
+            .mark_running(424_242)
+            .expect("persist running record");
+        abandoned
+            .append_output(JobOutputStream::Stdout, b"before-restart")
+            .expect("persist pre-restart output");
+        drop(abandoned);
 
-        // Allow reader threads to start, but the process is still alive.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-
+        let restarted = BackgroundShellManager::new();
+        let read = restarted
+            .get_output(&run, &id, Some(0))
+            .expect("recovered job must remain readable");
+        assert!(matches!(read.state, BackgroundJobState::Lost { .. }));
+        assert!(job_text(&read).contains("before-restart"));
+        let shell = restarted
+            .shells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .cloned()
+            .expect("recovered job registered");
         assert!(
-            !read_drained_flag(&id),
-            "fix351-a: flag must be false before any get_output call"
+            shell.control.is_none(),
+            "recovery must not attach to a saved PID"
         );
 
-        let (_, is_running, _) = BACKGROUND_SHELLS
-            .get_output(test_run(), &id)
-            .expect("fix351-a: get_output must succeed");
+        let other_owner = crate::tools::ToolRunContext::builder(session_id, root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .process_owner("other-restart-owner")
+            .provider("restart-test")
+            .ephemeral_background_jobs()
+            .build()
+            .expect("other-owner restart run");
         assert!(
-            is_running,
-            "fix351-a: process must still be running for this test to \
-             exercise the race"
+            restarted.get_output(&other_owner, &id, Some(0)).is_err(),
+            "a recovered record must remain scoped to its stable process owner"
         );
-
-        assert!(
-            read_drained_flag(&id),
-            "fix351-a: drain on a running shell must mark the GC flag \
-             (pre-fix this would be false because finished=false)"
-        );
-
-        // Clean up the long-running child.
-        let _ = BACKGROUND_SHELLS.kill(test_run(), &id);
-    }
-
-    /// `#351-b`: drain-after-finish marks the GC flag.
-    ///
-    /// Backwards-compatibility check: the post-fix code must still set the
-    /// flag when the process has already finished by the time `get_output`
-    /// is called. This was the only path that worked pre-fix.
-    #[test]
-    #[cfg(unix)]
-    fn fix351_drain_after_finish_marks_retrieved() {
-        let _l = bg_lock();
-        let id = BACKGROUND_SHELLS
-            .spawn(test_run(), "echo fix351_b_done")
-            .expect("fix351-b: spawn must succeed");
-
-        // Let the short-lived process finish and the wait-thread flip
-        // `finished`.
-        std::thread::sleep(std::time::Duration::from_millis(400));
-
-        let (_, is_running, _) = BACKGROUND_SHELLS
-            .get_output(test_run(), &id)
-            .expect("fix351-b: get_output must succeed");
-        assert!(
-            !is_running,
-            "fix351-b: process must be finished by the time of the poll"
-        );
-
-        assert!(
-            read_drained_flag(&id),
-            "fix351-b: drain after finish must mark the GC flag"
-        );
-    }
-
-    /// `#351-c`: never-drained shells stay unretrieved.
-    ///
-    /// Spawn a shell, wait for it to finish, but never call `get_output`.
-    /// The flag must remain false so the GC sweep is forbidden from
-    /// reclaiming a slot whose output the caller has never had a chance to
-    /// read.
-    #[test]
-    #[cfg(unix)]
-    fn fix351_never_drained_stays_unretrieved() {
-        let _l = bg_lock();
-        let id = BACKGROUND_SHELLS
-            .spawn(test_run(), "echo fix351_c_done")
-            .expect("fix351-c: spawn must succeed");
-
-        // Wait long enough for the wait-thread to set finished=true.
-        std::thread::sleep(std::time::Duration::from_millis(400));
-
-        // No `get_output` call on this id — only a list() check to ensure
-        // finished is observable without going through the drain path.
-        let listed = BACKGROUND_SHELLS.list(test_run());
-        let entry = listed
-            .iter()
-            .find(|(listed_id, _, _)| listed_id == &id)
-            .expect("fix351-c: shell must still be present (not yet GC'd)");
-        let is_running = entry.2;
-        assert!(
-            !is_running,
-            "fix351-c: process must be finished before flag assertion"
-        );
-
-        assert!(
-            !read_drained_flag(&id),
-            "fix351-c: a shell that has never been drained must NOT be \
-             marked retrieved, even when finished — GC must not collect it"
-        );
-
-        // Clean up: a single drain marks the flag and makes the slot
-        // eligible for the next GC sweep.
-        let _ = BACKGROUND_SHELLS.get_output(test_run(), &id);
     }
 
     // ── Crosslink #672 — TOCTOU spawn race ────────────────────────────────────
@@ -1915,9 +1954,10 @@ mod tests {
             let bar_c = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 bar_c.wait();
-                // Short-lived but non-instant so successful spawns stay in
-                // the map long enough for racers to observe contention.
-                mgr_c.spawn(test_run(), "sleep 2")
+                // Keep every admitted process active through the serialized
+                // persistence/spawn section so this measures the active-job
+                // cap rather than normal slot reuse after early exits.
+                mgr_c.spawn(test_run(), "sleep 30")
             }));
         }
 
@@ -1978,14 +2018,26 @@ mod tests {
         // Let all spawners go and immediately start observing the map.
         barrier.wait();
 
-        // Poll the map size during the race window — it must never exceed cap.
+        // Poll active job count during the race window. Terminal records are
+        // intentionally retained for output replay and do not consume slots.
         let mut max_seen = 0usize;
         for _ in 0..200 {
-            let size = mgr
-                .shells
-                .lock()
-                .map_or_else(|e| e.into_inner().len(), |s| s.len());
-            max_seen = max_seen.max(size);
+            let active = mgr.shells.lock().map_or_else(
+                |error| {
+                    error
+                        .into_inner()
+                        .values()
+                        .filter(|shell| shell.state().is_running())
+                        .count()
+                },
+                |shells| {
+                    shells
+                        .values()
+                        .filter(|shell| shell.state().is_running())
+                        .count()
+                },
+            );
+            max_seen = max_seen.max(active);
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
 
@@ -2001,7 +2053,7 @@ mod tests {
 
         assert!(
             max_seen <= MAX_BACKGROUND_SHELLS,
-            "fix672-b: observed map size {max_seen} exceeded cap {MAX_BACKGROUND_SHELLS} \
+            "fix672-b: observed active count {max_seen} exceeded cap {MAX_BACKGROUND_SHELLS} \
              during concurrent spawn — TOCTOU race regressed"
         );
     }
@@ -2063,8 +2115,8 @@ mod tests {
             let mut violations: Vec<String> = Vec::new();
             for _ in 0..200 {
                 for id in &ids_poll {
-                    if let Ok((_, is_running, exit_code)) = mgr_poll.get_output(test_run(), id) {
-                        if !is_running && exit_code.is_none() {
+                    if let Ok(read) = mgr_poll.get_output(test_run(), id, Some(0)) {
+                        if !read.state.is_running() && read.state.exit_code().is_none() {
                             violations.push(id.clone());
                         }
                     }
@@ -2117,18 +2169,19 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(600));
 
         for (id, expected) in &ids {
-            let (_, is_running, exit_code) = mgr
-                .get_output(test_run(), id)
+            let read = mgr
+                .get_output(test_run(), id, Some(0))
                 .expect("fix674-b: get_output must succeed");
             assert!(
-                !is_running,
+                !read.state.is_running(),
                 "fix674-b: shell {id} must be settled after 600ms"
             );
             assert_eq!(
-                exit_code,
+                read.state.exit_code(),
                 Some(*expected),
                 "fix674-b: settled shell {id} must have exit_code Some({expected}); \
-                 got {exit_code:?} — finished/exit_status race regressed"
+                 got {:?} — finished/exit_status race regressed",
+                read.state.exit_code()
             );
         }
     }

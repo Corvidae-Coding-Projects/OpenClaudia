@@ -462,7 +462,13 @@ fn output_polling_is_not_mislabeled_as_read_only() {
     assert_eq!(poll.operation.as_deref(), Some("poll"));
     assert_eq!(poll.target, "sh-1");
 
+    let replay = resolve_for_call("bash_output", &json!({"shell_id": "sh-1", "cursor": 0}))
+        .expect("cursor replay classifies");
+    assert_eq!(replay.effect, ToolEffect::ReadOnly);
+    assert_eq!(replay.operation.as_deref(), Some("replay"));
+
     assert!(resolve_for_call("bash_output", &json!({"shell_id": 1})).is_err());
+    assert!(resolve_for_call("bash_output", &json!({"cursor": 0})).is_err());
 }
 
 #[test]

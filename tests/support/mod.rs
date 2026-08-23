@@ -44,6 +44,7 @@ pub fn test_run_context(root: &Path) -> Arc<ToolRunContext> {
         .network(true)
         .secrets(true)
         .provider("test")
+        .ephemeral_background_jobs()
         .build()
         .expect("test workspace must produce a run capability")
 }
@@ -74,6 +75,7 @@ pub fn host_toolchain_run_context(root: &Path) -> Arc<ToolRunContext> {
         .network(false)
         .secrets(false)
         .provider("host-toolchain-test")
+        .ephemeral_background_jobs()
         .build()
         .expect("host toolchain test run must produce an explicit capability")
 }

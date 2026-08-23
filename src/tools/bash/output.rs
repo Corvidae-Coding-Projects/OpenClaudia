@@ -1,3 +1,4 @@
+use super::job::{JobOutputStream, JobRead};
 use super::BACKGROUND_SHELLS;
 use crate::tools::args::ToolArgError;
 use crate::tools::safe_truncate;
@@ -7,24 +8,29 @@ use std::fmt::Write as _;
 
 /// Classify one `bash_output` call before authorization.
 ///
-/// Listing background shells is observational. Polling a concrete shell is
-/// not: `get_output` drains its stdout/stderr buffers and marks the slot as
-/// retrieved so it can be garbage-collected. That is a session-local mutation,
-/// even though the tool's user-facing purpose is to read output.
+/// Listing background shells and replaying from an explicit cursor are
+/// observational. Omitting the cursor advances the job's compatibility cursor,
+/// which is a session-local mutation.
 pub fn classify_bash_output(args: &Value) -> Result<crate::tools::effect::TypedEffect, String> {
     use crate::tools::effect::{ToolEffect, TypedEffect};
 
     match args.get("shell_id") {
-        None | Some(Value::Null) => Ok(TypedEffect::new(
-            ToolEffect::ReadOnly,
-            "list",
-            "bash_output",
-        )),
-        Some(Value::String(shell_id)) if !shell_id.is_empty() => Ok(TypedEffect::new(
-            ToolEffect::SessionMutation,
-            "poll",
-            shell_id,
-        )),
+        None | Some(Value::Null) if args.get("cursor").is_none_or(Value::is_null) => Ok(
+            TypedEffect::new(ToolEffect::ReadOnly, "list", "bash_output"),
+        ),
+        None | Some(Value::Null) => Err("'cursor' requires a 'shell_id'".to_string()),
+        Some(Value::String(shell_id)) if !shell_id.is_empty() => match args.get("cursor") {
+            None | Some(Value::Null) => Ok(TypedEffect::new(
+                ToolEffect::SessionMutation,
+                "poll",
+                shell_id,
+            )),
+            Some(Value::Number(cursor)) if cursor.as_u64().is_some() => {
+                Ok(TypedEffect::new(ToolEffect::ReadOnly, "replay", shell_id))
+            }
+            Some(Value::Number(_)) => Err("'cursor' must be a non-negative integer".to_string()),
+            Some(_) => Err("'cursor' must be an integer".to_string()),
+        },
         Some(Value::String(_)) => Err("'shell_id' must be a non-empty string".to_string()),
         Some(_) => Err("'shell_id' must be a string".to_string()),
     }
@@ -38,7 +44,38 @@ pub fn bash_output_operations() -> Vec<(&'static str, crate::tools::effect::Tool
     vec![
         ("list", ToolEffect::ReadOnly),
         ("poll", ToolEffect::SessionMutation),
+        ("replay", ToolEffect::ReadOnly),
     ]
+}
+
+fn render_job_read(read: JobRead) -> String {
+    let mut result = format!(
+        "Status: {}\nCursor: {}\nHas more: {}",
+        read.state.label(),
+        read.next_cursor,
+        read.has_more
+    );
+    if read.events.is_empty() {
+        result.push_str("\n(no new output)");
+    } else {
+        result.push_str("\n\n");
+        for event in read.events {
+            match event.stream {
+                JobOutputStream::Stdout => result.push_str(&event.text),
+                JobOutputStream::Stderr => {
+                    result.push_str("[stderr] ");
+                    result.push_str(&event.text);
+                }
+            }
+        }
+    }
+    if read.stdout_truncated {
+        result.push_str("\n[stdout truncated at background-job output limit]");
+    }
+    if read.stderr_truncated {
+        result.push_str("\n[stderr truncated at background-job output limit]");
+    }
+    result
 }
 
 /// Retrieve output from a background shell
@@ -49,19 +86,23 @@ pub fn execute_bash_output(
     // If no shell_id provided, list all background shells
     let shell_id = match args.get("shell_id") {
         None => {
-            let shells = BACKGROUND_SHELLS.list(run);
+            let shells = BACKGROUND_SHELLS.summaries(run);
             if shells.is_empty() {
                 return ("No background shells running.".to_string(), false);
             }
             let mut result = format!("Background shells ({}):\n", shells.len());
-            for (id, command, is_running) in shells {
-                let status = if is_running { "running" } else { "finished" };
-                let cmd_preview = if command.len() > 50 {
-                    format!("{}...", safe_truncate(&command, 50))
+            for shell in shells {
+                let cmd_preview = if shell.command.len() > 50 {
+                    format!("{}...", safe_truncate(&shell.command, 50))
                 } else {
-                    command
+                    shell.command
                 };
-                let _ = writeln!(result, "  {id} [{status}]: {cmd_preview}");
+                let _ = writeln!(
+                    result,
+                    "  {} [{}]: {cmd_preview}",
+                    shell.id,
+                    shell.state.label()
+                );
             }
             return (result, false);
         }
@@ -75,25 +116,28 @@ pub fn execute_bash_output(
         }
     };
 
-    match BACKGROUND_SHELLS.get_output(run, shell_id) {
-        Ok((output, is_running, exit_code)) => {
-            let status = if is_running {
-                "running".to_string()
-            } else {
-                exit_code.map_or_else(
-                    || "finished".to_string(),
-                    |code| format!("finished (exit code: {code})"),
+    let cursor = match args.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(cursor) => Some(cursor),
+            None => {
+                return (
+                    "Invalid 'cursor' argument: expected a non-negative integer".to_string(),
+                    true,
                 )
-            };
-
-            let result = if output.is_empty() {
-                format!("Status: {status}\n(no new output)")
-            } else {
-                format!("Status: {status}\n\n{output}")
-            };
-
-            (result, false)
+            }
+        },
+        Some(_) => {
+            return ToolArgError::WrongType {
+                key: "cursor",
+                expected: "integer",
+            }
+            .into_tool_error();
         }
+    };
+
+    match BACKGROUND_SHELLS.get_output(run, shell_id, cursor) {
+        Ok(read) => (render_job_read(read), false),
         Err(e) => (e, true),
     }
 }

@@ -105,7 +105,7 @@
         "observation": "The process generation receipt is recorded during supervised cleanup.",
         "guidance": "Use process evidence only for the process runtime that emitted it.",
         "applicability": {"paths": ["src/tools/bash/mod.rs"], "components": ["process-runtime"], "tags": ["operate"]},
-        "citations": [{"kind": "source_file", "locator": "src/tools/bash/mod.rs", "source_version": "worktree:s040", "digest": "sha256:58ec6a38d4b21d2ff3d0ec83b615e80ca21f8f9d03e04601e092f6b437cb45b1"}],
+        "citations": [{"kind": "source_file", "locator": "src/tools/bash/mod.rs", "source_version": "worktree:s041", "digest": "sha256:300ac7a4c9f5129ecbbccd4a02e8d2efb730f45b7592881ba99241708a20e317"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -213,7 +213,7 @@
         "observation": "Writer cleanup can leave a descendant process behind.",
         "guidance": "Supervise the process group and reap every child.",
         "applicability": {"paths": ["src/tools/bash/mod.rs"], "components": ["process-runtime"], "tags": ["operate"]},
-        "citations": [{"kind": "test", "locator": "tests/bash_background_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:499da374ce23f79fbe5411ae61cee5303455b2fbc8224feb69f3b6fca80bc893"}],
+        "citations": [{"kind": "test", "locator": "tests/bash_background_e2e.rs", "source_version": "worktree:s041", "digest": "sha256:79a96744947ff169593aab982b11c398590663ea9b89c04631e6b2051e7d98b9"}],
         "confidence": "reproduced",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}

@@ -382,7 +382,7 @@ impl ToolHandler for BashHandler {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 600_000,
-                            "description": "Foreground command timeout in milliseconds (default 300000, maximum 600000). Not valid with run_in_background."
+                            "description": "Command timeout in milliseconds (default 300000, maximum 600000). Background commands are terminated and recorded as timed out when this deadline expires."
                         }
                     },
                     "required": ["command"]
@@ -425,13 +425,19 @@ impl ToolHandler for BashOutputHandler {
             "type": "function",
             "function": {
                 "name": "bash_output",
-                "description": "Retrieve output from a background shell. Returns new output since last check, along with status (running/finished) and exit code if finished.",
+                "description": "Retrieve bounded, ordered output and typed status from a background shell. Omit cursor for incremental polling or provide a cursor to replay output without advancing the job's default cursor.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "shell_id": {
                             "type": "string",
                             "description": "The shell ID returned from a bash command with run_in_background=true. Omit this field to list all background shells."
+                        },
+                        "cursor": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional output cursor returned by a prior call. Providing it replays from that position without advancing the default incremental cursor."
                         }
                     }
                 }

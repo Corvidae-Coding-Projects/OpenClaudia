@@ -75,10 +75,33 @@ fn bash_bg(command: &str) -> (String, bool) {
     (r.content().to_string(), r.is_error())
 }
 
+fn bash_bg_with_timeout(command: &str, timeout_ms: u64) -> (String, bool) {
+    let r = execute_with_exact_approval(&call(
+        "bash",
+        &json!({
+            "command": command,
+            "run_in_background": true,
+            "timeout": timeout_ms
+        }),
+    ));
+    (r.content().to_string(), r.is_error())
+}
+
 fn bash_output(shell_id: &str) -> (String, bool) {
     let r = execute_tool(
         support::shared_run_context(),
         &call("bash_output", &json!({"shell_id": shell_id})),
+    );
+    (r.content().to_string(), r.is_error())
+}
+
+fn bash_output_from(shell_id: &str, cursor: u64) -> (String, bool) {
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call(
+            "bash_output",
+            &json!({"shell_id": shell_id, "cursor": cursor}),
+        ),
     );
     (r.content().to_string(), r.is_error())
 }
@@ -165,6 +188,21 @@ fn background_shell_runs_to_completion_and_reports_finished() {
     assert!(
         final_content.contains("done"),
         "stdout must be captured; got {final_content:?}"
+    );
+}
+
+#[test]
+fn background_shell_honours_its_timeout() {
+    let (spawn_msg, is_err) = bash_bg_with_timeout("sleep 30", 100);
+    assert!(!is_err, "timed background spawn must succeed: {spawn_msg}");
+    let shell_id = extract_shell_id(&spawn_msg);
+
+    let final_content = poll_until(&shell_id, Duration::from_secs(3), |content| {
+        content.contains("Status: timed out")
+    });
+    assert!(
+        final_content.contains("Status: timed out"),
+        "background deadline must publish a timed-out state; got {final_content:?}"
     );
 }
 
@@ -317,5 +355,22 @@ fn bash_output_two_calls_each_return_incremental_drain() {
     }
     // Cleanup the long-runner.
     let _ = kill_shell(&shell_id);
+}
+
+#[test]
+fn explicit_cursor_replays_output_without_consuming_it() {
+    let (spawn_msg, is_err) = bash_bg("printf replay-marker");
+    assert!(!is_err, "replay job must spawn: {spawn_msg}");
+    let shell_id = extract_shell_id(&spawn_msg);
+    let completed = poll_until(&shell_id, Duration::from_secs(3), |content| {
+        content.contains("replay-marker") && content.contains("finished")
+    });
+    assert!(completed.contains("replay-marker"));
+
+    let (first, first_error) = bash_output_from(&shell_id, 0);
+    let (second, second_error) = bash_output_from(&shell_id, 0);
+    assert!(!first_error && !second_error);
+    assert!(first.contains("replay-marker"));
+    assert!(second.contains("replay-marker"));
 }
 mod support;
