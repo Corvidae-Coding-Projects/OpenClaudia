@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1120,
+  "next_display_id": 1121,
   "next_comment_id": 1405,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -533,6 +533,7 @@
     "82f93069-d1a1-4519-b36f-e7d1ad37def2": 130,
     "830b294d-7ae6-4a28-a214-85b18a2db586": 196,
     "833ea48d-3593-4f4c-b2ac-83afa12876ea": 518,
+    "83518f41-4c05-4b69-9c84-eb73a294cb25": 1120,
     "83912b7f-f456-455b-ae95-547340005f4e": 652,
     "83e6ba72-a657-44eb-a218-af616f0b92c3": 277,
     "84cb2741-7111-4f7d-a759-a85d8e48fd7f": 800,
@@ -16219,6 +16220,18 @@
       "labels": [
         "claude-code-parity,tools"
       ]
+    },
+    "83518f41-4c05-4b69-9c84-eb73a294cb25": {
+      "uuid": "83518f41-4c05-4b69-9c84-eb73a294cb25",
+      "display_id": 1120,
+      "title": "S-015: Finish skills as scoped capabilities",
+      "description": "Implement docs/remediation-slices/015-skills-trust-and-capabilities.md under parent #1071. Bound and deterministically cache skill discovery by trusted scope, path identity, digest, schema, and workspace generation; treat skill instructions as untrusted reviewed context; compile declared tool/hook/file/network needs into explicit run capabilities; preserve operational skills across frontends. Rust exactly 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo, wiring rather than removal, production-likely behavior over speculative edge cases.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T20:55:04.838797192Z",
+      "updated_at": "2026-08-23T20:55:04.838797192Z"
     },
     "83912b7f-f456-455b-ae95-547340005f4e": {
       "uuid": "83912b7f-f456-455b-ae95-547340005f4e",
@@ -36909,11 +36922,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1310,
       "timestamp": "2026-08-23T20:53:38.239100089Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1311,
+      "timestamp": "2026-08-23T20:55:04.838797192Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T20:53:38.239100089Z",
+    "timestamp": "2026-08-23T20:55:04.838797192Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1310
+    "agent_seq": 1311
   }
 }
