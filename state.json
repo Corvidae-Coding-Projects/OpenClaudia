@@ -1,6 +1,6 @@
 {
   "next_display_id": 1120,
-  "next_comment_id": 1393,
+  "next_comment_id": 1394,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19891,7 +19891,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T16:24:26.863403747Z",
-      "updated_at": "2026-08-23T16:49:06.198146113Z",
+      "updated_at": "2026-08-23T17:04:02.535746531Z",
       "labels": [
         "remediation"
       ],
@@ -19925,6 +19925,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAR7nVI5cXsKTBnAZhQY4HeXp18TOBS6RsylWCLGKUALhaOH5thgJfFDZ42X4sdw8kpN/97L9m9xtyQgsaTpEnCA=="
+        },
+        "daa31152-1807-41ec-aaea-8192d01cee50": {
+          "display_id": 1393,
+          "author": "6Vw9",
+          "content": "[result] 9fc9f45e feat(shell): route direct actions through process capability. CLI and TUI !command now share the typed run-owned Process action, S-042 Shell sandbox, hard policy, budget/freshness/ledger accounting, bounded sync/async supervision, cancellation cleanup, and terminal/partial-output delivery; the unchecked CLI executor and generic TUI bypass are gone. Rust 1.98 verification: focused direct-shell production tests 10/10; focused frontend/ledger/retrieval tests passed; strict locked all-target/all-feature Clippy and fmt passed; clean locked workspace/all-target/all-feature native suite passed (library 2,886 passed/1 ignored, binary 223 passed, every integration/example target passed); Windows GNU all-target/all-feature check passed with only existing #1099 warnings and no S-043 warning. Technical-memory artifact bindings and deliberately rejected review were refreshed and validated. Signed by dollspace-gay ED25519 SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A. S-088 still owns artifact-bound alternate-model VDD; parent #1071 remains open.",
+          "created_at": "2026-08-23T17:04:02.532898019Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAx/xQNbFDfXa8qu9SsghmRDRt8WqHr2lqRiD160JQnPHeOO2oHX1iRxJUP7TxeH15mZ2SfsderxiZvZB/sxSKDw=="
         },
         "db1c259b-b12f-48e0-871b-1c88bad3b0cf": {
           "display_id": 1389,
@@ -36706,11 +36715,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1291,
       "timestamp": "2026-08-23T16:49:06.198146113Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1292,
+      "timestamp": "2026-08-23T17:04:02.535746531Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T16:49:06.198146113Z",
+    "timestamp": "2026-08-23T17:04:02.535746531Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1291
+    "agent_seq": 1292
   }
 }
