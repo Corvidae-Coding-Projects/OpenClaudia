@@ -1,6 +1,6 @@
 {
   "next_display_id": 1107,
-  "next_comment_id": 1292,
+  "next_comment_id": 1293,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24687,7 +24687,18 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T05:49:30.736961057Z",
-      "updated_at": "2026-08-23T05:49:30.736961057Z"
+      "updated_at": "2026-08-23T05:50:40.165169470Z",
+      "comments": {
+        "6677f445-dc81-4368-bcb0-6050e9f66f54": {
+          "display_id": 1292,
+          "author": "6Vw9",
+          "content": "Repair only the stale generated evidence contract: bind the changed S-048 remediation source digest, regenerate evaluation artifacts through the public builder, preserve the existing independent rejected review verdict, and verify the bundled-corpora evidence test.",
+          "created_at": "2026-08-23T05:50:40.162892404Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATyocpGeIZqBgJtmK0Owaq792JyKWj5dWsRTJf+20sLCmGV4EUKS++hJj0XDGkXxPX8HNw8FUX8qyG8g5Up58BQ=="
+        }
+      }
     },
     "db977c88-77d7-4638-ab3a-112f6ecfe4b7": {
       "uuid": "db977c88-77d7-4638-ab3a-112f6ecfe4b7",
@@ -34623,11 +34634,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1111,
       "timestamp": "2026-08-23T05:50:20.635935897Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1112,
+      "timestamp": "2026-08-23T05:50:40.165169470Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T05:50:20.635935897Z",
+    "timestamp": "2026-08-23T05:50:40.165169470Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1111
+    "agent_seq": 1112
   }
 }
