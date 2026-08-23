@@ -1,6 +1,6 @@
 {
   "next_display_id": 1113,
-  "next_comment_id": 1328,
+  "next_comment_id": 1329,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14637,7 +14637,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:43.428627970Z",
-      "updated_at": "2026-08-23T10:49:31.843142477Z",
+      "updated_at": "2026-08-23T10:50:07.579188025Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
@@ -14660,6 +14660,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQsnwcFRShgAdMZoaBJeFhzJtukgwRJmaOdjGE/VEkSPN12jtGo9ufBUKK02BWc6KyPNJ0s+vRQ5rx3Yu4I8NDg=="
+        },
+        "5444aaa3-3084-4cb0-b6b7-6c430574d353": {
+          "display_id": 1328,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 5738f231 feat(tui): complete typed plan mode follow-ups. Added typed TUI plan entry/exit handshake, digest-and-generation-bound approval modal, shared session/run/task commit transaction, explicit reject/cancel/stale behavior, direct /mode cancellation distinction, and provider-safe tool-result/context ordering. Rust 1.98 fmt, strict Clippy, focused tests, and full workspace/all-target/all-feature serialized tests passed.",
+          "created_at": "2026-08-23T10:50:07.576653239Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2ik/h+c2FXzF25qRi5HYw6NBojGgQs+TgsvQ4oQfhBRzPcRArzExqIwehpNmz+89nKJ3eHHq4i9sx6AH7XzRAA=="
         },
         "7acf20c8-f42e-4c26-ad27-00cc60c4d3a3": {
           "display_id": 1326,
@@ -35414,11 +35423,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1181,
       "timestamp": "2026-08-23T10:49:31.843142477Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1182,
+      "timestamp": "2026-08-23T10:50:07.579188025Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T10:49:31.843142477Z",
+    "timestamp": "2026-08-23T10:50:07.579188025Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1181
+    "agent_seq": 1182
   }
 }
