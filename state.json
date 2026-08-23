@@ -1,6 +1,6 @@
 {
   "next_display_id": 1114,
-  "next_comment_id": 1335,
+  "next_comment_id": 1336,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1448,7 +1448,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:38.668193082Z",
-      "updated_at": "2026-08-23T11:47:35.063442113Z",
+      "updated_at": "2026-08-23T11:59:06.592524733Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
@@ -1462,6 +1462,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5WMnc4Cz8RfouVdpttSN/ia/szyM3lwv6lC/AGOHW4LO6oSJKrLv3H/BmXpKJK1if5eTHPgk88ZYySWBdKe0Bg=="
+        },
+        "5704821d-6d35-4090-ada9-55474760932b": {
+          "display_id": 1335,
+          "author": "6Vw9",
+          "content": "Full regression found default implicit adjacent mode denying the run's own private session-temp capability. Corrected semantics so implicit adjacent preserves the already-bounded run capabilities, while explicit adjacent and all narrow modes remain target-restricted. Focused scope tests 7/7 and session filesystem capability tests 2/2 pass.",
+          "created_at": "2026-08-23T11:59:06.588849366Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7KxFSAN7DiT8rDVp3cGHuGlmgWI3EKOYhC6dmSsFcs2dXOUKbQx6jGZkCl/7UY7wILPZiCMv+9MMapnn/qgpCw=="
         },
         "934c6f01-6eeb-4b2d-9d5b-9d2a0b2be35a": {
           "display_id": 1333,
@@ -35565,11 +35574,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1194,
       "timestamp": "2026-08-23T11:47:35.063442113Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1195,
+      "timestamp": "2026-08-23T11:59:06.592524733Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T11:47:35.063442113Z",
+    "timestamp": "2026-08-23T11:59:06.592524733Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1194
+    "agent_seq": 1195
   }
 }
