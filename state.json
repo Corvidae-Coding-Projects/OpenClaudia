@@ -1,6 +1,6 @@
 {
   "next_display_id": 1108,
-  "next_comment_id": 1299,
+  "next_comment_id": 1300,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7344,10 +7344,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T05:55:19.436743818Z",
-      "updated_at": "2026-08-23T05:55:23.568290293Z",
+      "updated_at": "2026-08-23T06:01:48.516904205Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "8215f679-97ca-4994-955c-13f31cf61000": {
+          "display_id": 1299,
+          "author": "6Vw9",
+          "content": "Preferred design: bind a live RunBudgetAuthority to every ToolRunContext/RunContext. The authority owns one mutex-protected hierarchical ledger, cancellation-aware elapsed deadlines, child scopes, and RAII call reservations; each reservation atomically checks all ancestors before charging turns/provider calls/tool calls/retries/input/output/fixed-point cost and leasing concurrency, then reconciles exact usage or retains the conservative reservation when usage is unknown. Production top-level runs derive limits from typed session config; resumed/frontend/subagent/MCP children share and narrow the same ledger. Provider helpers clamp output before dispatch and retain model/provider/price-manifest provenance; ToolExecutor, hooks, MCP, subprocesses, VDD, and child admission consume the same run handle. Alternative rejected: frontend-local post-response StopConditions counters cannot prevent overshoot or concurrent races and would preserve semantic drift. Exclusions: do not activate the dormant scheduler, redesign process supervision, or absorb S-057/S-066/S-084; wire current production paths without removing intended capabilities.",
+          "created_at": "2026-08-23T06:01:48.514333682Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPRmFrA7PlrHAnNAJb0W23vNxXTY968MF3AeDVsiBVqrFStnAU+MruEjl6tkkNGUraJ4sryaKf7X2kOYdn2iiBA=="
+        }
+      }
     },
     "3d00c6f8-7f19-4182-8735-3fd145e801c7": {
       "uuid": "3d00c6f8-7f19-4182-8735-3fd145e801c7",
@@ -34772,11 +34783,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1125,
       "timestamp": "2026-08-23T05:55:28.724551414Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1126,
+      "timestamp": "2026-08-23T06:01:48.516904205Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T05:55:28.724551414Z",
+    "timestamp": "2026-08-23T06:01:48.516904205Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1125
+    "agent_seq": 1126
   }
 }
