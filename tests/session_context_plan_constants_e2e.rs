@@ -117,25 +117,19 @@ fn get_session_context_starts_with_header_marker() {
 
 #[test]
 fn plan_mode_allowed_tools_includes_documented_read_only_tools() {
-    // Read-only inspection tools that plan mode permits.
-    // (Authoring discovery: catalog includes read_file/list_files/grep/web_*
-    // plus task/crosslink/bash_output/todo_read — but NOT glob.)
-    for tool in &["read_file", "list_files", "grep", "web_fetch"] {
+    // Common local inspection tools shown in plan-mode help.
+    for tool in &["read_file", "list_files", "glob", "grep"] {
         assert!(
             PLAN_MODE_ALLOWED_TOOLS.contains(tool),
             "{tool:?} MUST be in PLAN_MODE_ALLOWED_TOOLS"
         );
     }
-    assert_eq!(
-        PLAN_MODE_ALLOWED_TOOLS.contains(&"web_search"),
-        cfg!(feature = "browser"),
-        "web_search is plan-mode safe only when browser-backed search is compiled"
-    );
-    assert_eq!(
-        PLAN_MODE_ALLOWED_TOOLS.contains(&"web_browser"),
-        cfg!(feature = "browser"),
-        "web_browser is plan-mode safe only when the browser feature is compiled"
-    );
+    for tool in &["web_fetch", "web_search", "web_browser"] {
+        assert!(
+            !PLAN_MODE_ALLOWED_TOOLS.contains(tool),
+            "network tool {tool:?} MUST NOT be advertised in plan mode"
+        );
+    }
 }
 
 #[test]

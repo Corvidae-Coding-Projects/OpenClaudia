@@ -4180,6 +4180,26 @@ async fn execute_tool_calls_for_tui(
             },
         };
 
+        if let Err(reason) = run_context.admit_runtime_mode_tool(tool_name, &tool_args) {
+            let result = tools::ToolResult::failure(
+                tool_call,
+                tools::ToolFailureCode::PolicyDenied,
+                reason,
+                tools::ToolRetryability::Never,
+            );
+            send_event_or_break!(
+                tx,
+                AppEvent::ToolDone {
+                    name: tool_name.clone(),
+                    success: false,
+                    content: result.content().to_string(),
+                }
+            );
+            observe_tool_result(&run_context, session_id, &result);
+            results.push(result.openai_message());
+            continue;
+        }
+
         if let Err(err) = crate::services::tool_executor::ToolExecutor::check_policy_before_prompt(
             policy_enforcer.as_deref(),
             session_id,

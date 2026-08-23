@@ -100,6 +100,7 @@ pub struct ToolRunContextBuilder {
     provider: String,
     budget_limits: Option<BudgetLimits>,
     parent_budget: Option<crate::runtime::RunBudgetAuthority>,
+    runtime_mode: crate::modes::RuntimeMode,
 }
 
 impl ToolRunContextBuilder {
@@ -126,6 +127,7 @@ impl ToolRunContextBuilder {
             provider: "local".to_string(),
             budget_limits: None,
             parent_budget: None,
+            runtime_mode: crate::modes::RuntimeMode::default(),
         }
     }
 
@@ -300,6 +302,13 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Bind the initial host-enforced behavioral capability profile.
+    #[must_use]
+    pub fn runtime_mode(mut self, mode: crate::modes::RuntimeMode) -> Self {
+        self.runtime_mode = mode;
+        self
+    }
+
     /// Construct and validate the complete immutable run capability.
     ///
     /// # Errors
@@ -316,6 +325,7 @@ impl ToolRunContextBuilder {
 pub struct ToolRunContext {
     runtime: Arc<RunContext>,
     generation: CapabilityGeneration,
+    runtime_mode: crate::modes::RuntimeModeAuthority,
     tool_catalog: super::catalog::RunToolCatalog,
     project_root: PathBuf,
     working_directory: PathBuf,
@@ -344,6 +354,7 @@ impl std::fmt::Debug for ToolRunContext {
             .debug_struct("ToolRunContext")
             .field("run_id", &self.run_id())
             .field("generation", &self.generation)
+            .field("runtime_mode", &self.runtime_mode.snapshot())
             .field("session_id", &self.session_id())
             .field("project_root", &self.project_root)
             .field("working_directory", &self.working_directory)
@@ -433,7 +444,9 @@ impl ToolRunContext {
             provider,
             budget_limits,
             parent_budget,
+            runtime_mode,
         } = builder;
+        let runtime_mode = crate::modes::RuntimeModeAuthority::new(runtime_mode)?;
         let workspace_access = workspace_access.ok_or_else(|| {
             "Run construction requires an explicit workspace access capability".to_string()
         })?;
@@ -687,6 +700,7 @@ impl ToolRunContext {
         let context = Self {
             runtime,
             generation,
+            runtime_mode,
             tool_catalog: super::catalog::RunToolCatalog::default(),
             project_root,
             working_directory,
@@ -746,6 +760,67 @@ impl ToolRunContext {
     #[must_use]
     pub const fn tool_catalog(&self) -> &super::catalog::RunToolCatalog {
         &self.tool_catalog
+    }
+
+    /// Current immutable mode capability generation.
+    #[must_use]
+    pub fn runtime_mode(&self) -> crate::modes::RuntimeModeSnapshot {
+        self.runtime_mode.snapshot()
+    }
+
+    /// Atomically validate and install a new mode capability generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a conflicting mode or exhausted generation.
+    pub fn transition_runtime_mode(
+        &self,
+        mode: crate::modes::RuntimeMode,
+    ) -> Result<crate::modes::RuntimeModeSnapshot, String> {
+        self.runtime_mode.transition(mode)
+    }
+
+    /// Enforce the active mode against a concrete classified tool call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call is malformed, unclassified, or denied
+    /// by the current runtime mode.
+    pub fn admit_runtime_mode_tool(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(), String> {
+        // Standard mode is deliberately transparent: the existing effect,
+        // policy, permission, and argument gates retain their established
+        // ordering. Restricted modes need early resolution because the mode
+        // ceiling itself depends on the concrete effect.
+        if self.runtime_mode().class == crate::modes::RuntimeModeClass::Standard {
+            return Ok(());
+        }
+        let resolved = super::effect::resolve_for_call(tool_name, arguments)
+            .map_err(|error| error.reason())?;
+        self.admit_runtime_mode_resolved(tool_name, resolved.effect, arguments)
+    }
+
+    /// Re-check mode authority at the final effect reservation boundary.
+    pub(crate) fn admit_runtime_mode_resolved(
+        &self,
+        tool_name: &str,
+        effect: super::effect::ToolEffect,
+        arguments: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.runtime_mode
+            .admit_tool(tool_name, effect, arguments, &self.agent_plan_file)
+    }
+
+    /// Gate effectful frontend shortcuts that bypass the model tool dispatcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current runtime mode denies direct effects.
+    pub fn admit_runtime_mode_direct_operation(&self, operation: &str) -> Result<(), String> {
+        self.runtime_mode.admit_direct_operation(operation)
     }
 
     /// Session identifier that owns these capabilities.
@@ -984,6 +1059,7 @@ impl ToolRunContext {
             .provider(provider)
             .budget_limits(self.runtime.descriptor().budget.limits.clone())
             .parent_budget(self.runtime.budget().clone())
+            .runtime_mode(self.runtime_mode().mode)
             .build()
     }
 

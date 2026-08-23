@@ -2644,6 +2644,9 @@ async fn build_proxy_state_with_loop_control(
         .network(true)
         .secrets(true)
         .provider(config.proxy.target.clone())
+        .runtime_mode(crate::modes::RuntimeMode::Behavioral(
+            crate::modes::BehaviorMode::default(),
+        ))
         .budget_limits(
             config
                 .session

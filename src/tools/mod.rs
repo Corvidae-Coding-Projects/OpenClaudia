@@ -390,6 +390,15 @@ pub(crate) fn reserve_dynamic_tool_effect(
                 ToolRetryability::Never,
             ))
         })?;
+    run.admit_runtime_mode_resolved(&tool_call.function.name, resolved.effect, &arguments)
+        .map_err(|reason| {
+            Box::new(ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                reason,
+                ToolRetryability::Never,
+            ))
+        })?;
     run.require(ToolResource::Mcp).map_err(|error| {
         Box::new(ToolResult::failure(
             tool_call,
@@ -437,6 +446,22 @@ fn dispatch_registered_with_permit(
             );
         }
     };
+    let arguments = Value::Object(
+        args.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    if let Err(reason) =
+        ctx.run
+            .admit_runtime_mode_resolved(&tool_call.function.name, resolved.effect, &arguments)
+    {
+        return ToolResult::failure(
+            tool_call,
+            ToolFailureCode::PolicyDenied,
+            reason,
+            ToolRetryability::Never,
+        );
+    }
     let mut guardrail_reservation = match crate::guardrails::reserve_tool_effect(ctx.run, &resolved)
     {
         Ok(reservation) => reservation,

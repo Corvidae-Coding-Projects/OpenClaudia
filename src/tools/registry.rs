@@ -2440,11 +2440,7 @@ impl ToolHandler for CronListHandler {
 
 // ── plan_mode ────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "browser")]
-const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, task_get, task_list, memory_search, memory_list, memory_learning_status, memory_conflicts, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
-
-#[cfg(not(feature = "browser"))]
-const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, bash_output, todo_read, task_get, task_list, memory_search, memory_list, memory_learning_status, memory_conflicts, memory_source_status, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. Browser-backed web_search and web_browser are unavailable in this build. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to host-enforced plan mode. Common available tools are read_file, grounding_context, list_files, glob, grep, tool_search, ask_user_question, memory_search, memory_list, memory_learning_status, memory_conflicts, and memory_source_status; other local observation tools may be admitted from their mandatory effect declarations. write_file may write only to the plan file. Shell, Git, network, task/todo, Crosslink, worktree, MCP, and subagent operations are denied even if ordinary permissions would approve them.";
 
 struct EnterPlanModeHandler;
 impl ToolHandler for EnterPlanModeHandler {

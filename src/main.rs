@@ -842,6 +842,7 @@ async fn prepare_tui_startup(options: &TuiStartupOptions) -> anyhow::Result<Prep
 async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
     chdir_to_git_root();
 
+    let behavior_mode_explicit = options.mode_arg.is_some();
     let behavior_mode =
         parse_initial_behavior_mode(options.mode_arg.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -933,7 +934,7 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         claude_code_token,
         builder_vdd_auth,
         vdd_adversary_auth,
-        behavior_mode: &behavior_mode,
+        behavior_mode_override: behavior_mode_explicit.then_some(&behavior_mode),
         resume: options.resume,
         session_id: options.session_id.as_deref(),
         dangerously_skip_permissions: options.dangerously_skip_permissions,
@@ -954,10 +955,21 @@ struct TuiLaunchOptions<'a> {
     claude_code_token: Option<openclaudia::secrets::OAuthToken>,
     builder_vdd_auth: openclaudia::vdd::VddProviderAuth,
     vdd_adversary_auth: Option<openclaudia::vdd::VddProviderAuth>,
-    behavior_mode: &'a openclaudia::modes::BehaviorMode,
+    behavior_mode_override: Option<&'a openclaudia::modes::BehaviorMode>,
     resume: bool,
     session_id: Option<&'a str>,
     dangerously_skip_permissions: bool,
+}
+
+fn apply_tui_behavior_override(
+    app: &mut tui::app::App,
+    behavior_mode: Option<&openclaudia::modes::BehaviorMode>,
+) -> anyhow::Result<()> {
+    if let Some(behavior_mode) = behavior_mode {
+        app.apply_behavior_mode(behavior_mode.clone())
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
 }
 
 async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
@@ -973,7 +985,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         claude_code_token,
         builder_vdd_auth,
         vdd_adversary_auth,
-        behavior_mode,
+        behavior_mode_override,
         resume,
         session_id,
         dangerously_skip_permissions,
@@ -1001,6 +1013,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     app.vdd_builder_auth = builder_vdd_auth;
     app.app_config = Some(std::sync::Arc::new(config.clone()));
     app.apply_startup_resume(resume, session_id);
+    apply_tui_behavior_override(&mut app, behavior_mode_override)?;
     app.bind_durable_task_graph().map_err(anyhow::Error::msg)?;
     let endpoint = if app.model == model {
         endpoint
@@ -1033,7 +1046,8 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         dangerously_skip_permissions,
         &run_context,
     )));
-    let tui_prompt_blocks = prompt::build_prompt_context_for_run(behavior_mode, &run_context);
+    let tui_prompt_blocks =
+        prompt::build_prompt_context_for_run(&app.behavior_mode(), &run_context);
     app.set_api_config(
         endpoint,
         headers,

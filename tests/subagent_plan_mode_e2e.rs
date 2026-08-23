@@ -39,6 +39,7 @@ use openclaudia::session::{
 use openclaudia::tools::{
     execute_tool, FunctionCall, ToolCall, ToolFollowUp, ToolRunContext, WorkspaceAccess,
 };
+use openclaudia::{modes::RuntimeMode, modes::RuntimeModeAuthority, tools::effect};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -108,17 +109,13 @@ fn mutation_tools_are_refused_in_plan_mode() {
 }
 
 #[test]
-fn every_documented_allowlist_entry_is_admitted() {
-    // Counter-test: every tool in the documented allowlist constant
-    // MUST be admitted by the predicate. Catches a regression where
-    // someone tightens the predicate without updating the const (or
-    // vice versa).
-    let plan_path = PathBuf::from("/dev/null");
+fn every_documented_observation_is_visible_in_plan_profile() {
+    let authority = RuntimeModeAuthority::new(RuntimeMode::Plan).expect("plan profile");
     for tool in PLAN_MODE_ALLOWED_TOOLS {
-        let allowed = is_tool_allowed_in_plan_mode(tool, &plan_path, &json!({}));
+        let (_, spec) = effect::lookup(tool).expect("documented tool must be classified");
         assert!(
-            allowed,
-            "tool {tool:?} appears in PLAN_MODE_ALLOWED_TOOLS but the predicate refuses it"
+            authority.definition_denial(tool, spec.effect).is_none(),
+            "tool {tool:?} must be visible in the compiled plan profile"
         );
     }
 }

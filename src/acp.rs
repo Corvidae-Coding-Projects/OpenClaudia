@@ -468,6 +468,26 @@ fn parse_acp_tool_arguments(
         .map_err(acp_arg_error)
 }
 
+fn canonical_acp_mode_input(tool_name: &str, args: &HashMap<String, Value>) -> Value {
+    let mut canonical = args
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let alias = match tool_name {
+        "read_file" | "write_file" | "edit_file" => Some(("file_path", "path")),
+        "bash_output" | "kill_shell" => Some(("terminal_id", "shell_id")),
+        _ => None,
+    };
+    if let Some((wire_key, canonical_key)) = alias {
+        if !canonical.contains_key(canonical_key) {
+            if let Some(value) = canonical.get(wire_key).cloned() {
+                canonical.insert(canonical_key.to_string(), value);
+            }
+        }
+    }
+    Value::Object(canonical)
+}
+
 fn parse_acp_bool_arg(
     args: &HashMap<String, Value>,
     key: &'static str,
@@ -795,6 +815,13 @@ impl AcpServer {
             &self.launch_root,
             &self.config.proxy.target,
         )?;
+        let runtime_mode = match self.current_session_mode() {
+            SessionMode::Initializer => crate::modes::RuntimeMode::Initializer,
+            SessionMode::Coding => {
+                crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default())
+            }
+        };
+        run.transition_runtime_mode(runtime_mode)?;
         crate::guardrails::configure(&run, &self.config.guardrails)
             .map_err(|error| format!("Cannot configure ACP guardrails: {error}"))?;
         Ok(run)
@@ -843,19 +870,27 @@ impl AcpServer {
     }
 
     fn apply_acp_mode_value(&mut self, mode: &str) -> Result<SessionMode, String> {
-        match mode {
-            "initializer" => Ok(self
-                .session_manager
-                .set_current_mode(SessionMode::Initializer)
-                .mode),
-            "coding" => Ok(self
-                .session_manager
-                .set_current_mode(SessionMode::Coding)
-                .mode),
+        let (session_mode, runtime_mode) = match mode {
+            "initializer" => (
+                SessionMode::Initializer,
+                crate::modes::RuntimeMode::Initializer,
+            ),
+            "coding" => (
+                SessionMode::Coding,
+                crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default()),
+            ),
             _ => Err(format!(
                 "Invalid value for mode: {mode}. Supported values: initializer, coding"
-            )),
+            ))?,
+        };
+        if let Some(run) = self
+            .active_conversation_acp_session_id
+            .as_deref()
+            .and_then(|session_id| self.run_contexts.get(session_id))
+        {
+            run.transition_runtime_mode(runtime_mode)?;
         }
+        Ok(self.session_manager.set_current_mode(session_mode).mode)
     }
 
     fn apply_acp_model_value(&mut self, model: &str) -> Result<(), String> {
@@ -2425,6 +2460,15 @@ impl AcpServer {
             Ok(parsed) => parsed,
             Err(failure) => return bind_acp_failure(&tool_call, failure),
         };
+        let mode_input = canonical_acp_mode_input(tool_name, &args);
+        if let Err(reason) = run.admit_runtime_mode_tool(tool_name, &mode_input) {
+            return ToolResult::failure(
+                &tool_call,
+                ToolFailureCode::PolicyDenied,
+                reason,
+                ToolRetryability::Never,
+            );
+        }
 
         // ── Enterprise policy gate ─────────────────────────────────────
         let tool_policy = crate::services::policy::ToolExecutionPolicy::new(
@@ -6344,13 +6388,25 @@ blast_radius:
         let (mut server, mut rx, _tmp) = test_server();
 
         server.handle_session_new(Some(json!(1)), Value::Null);
-        let _ = next_response(&mut rx);
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("ACP session id")
+            .to_string();
         let session_id = server
             .session_manager
             .get_session()
             .expect("session/new should create session")
             .id
             .clone();
+        assert_eq!(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("initializer run")
+                .runtime_mode()
+                .class,
+            crate::modes::RuntimeModeClass::ReadOnly
+        );
 
         server.handle_session_set_mode(Some(json!(2)), &json!({"mode": "coding"}));
         let response = next_response(&mut rx);
@@ -6363,6 +6419,14 @@ blast_radius:
             .expect("session should remain active");
         assert_eq!(session.id, session_id);
         assert_eq!(session.mode, SessionMode::Coding);
+        assert_eq!(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("coding run")
+                .runtime_mode()
+                .class,
+            crate::modes::RuntimeModeClass::Standard
+        );
 
         server.handle_session_set_mode(Some(json!(3)), &json!({"mode": "initializer"}));
         let response = next_response(&mut rx);
@@ -6376,6 +6440,14 @@ blast_radius:
         assert_eq!(session.id, session_id);
         assert_eq!(session.mode, SessionMode::Initializer);
         assert!(session.parent_session_id.is_none());
+        assert_eq!(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("restored initializer run")
+                .runtime_mode()
+                .class,
+            crate::modes::RuntimeModeClass::ReadOnly
+        );
     }
 
     #[test]

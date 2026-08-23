@@ -209,8 +209,9 @@ impl RunToolCatalog {
         messages: &[Value],
         definitions: &[Value],
     ) -> Result<ToolCatalogSnapshot, String> {
-        let (entries, unavailable) = build_catalog_entries(run, definitions)?;
-        let generation = catalog_generation(run, &entries, &unavailable)?;
+        let runtime_mode = run.runtime_mode();
+        let (entries, unavailable) = build_catalog_entries(run, &runtime_mode, definitions)?;
+        let generation = catalog_generation(run, &runtime_mode, &entries, &unavailable)?;
         let mut state = self
             .state
             .lock()
@@ -513,6 +514,7 @@ fn plan_selection(
 
 fn build_catalog_entries(
     run: &ToolRunContext,
+    runtime_mode: &crate::modes::RuntimeModeSnapshot,
     definitions: &[Value],
 ) -> Result<(CatalogEntries, UnavailableEntries), String> {
     if definitions.len() > MAX_CATALOG_TOOLS {
@@ -556,26 +558,16 @@ fn build_catalog_entries(
             } else {
                 "no mandatory effect classification owns this tool".to_string()
             };
-            unavailable.insert(
-                name.to_string(),
-                UnavailableEntry {
-                    reason,
-                    source_digest,
-                    order,
-                },
-            );
+            record_unavailable(&mut unavailable, name, reason, source_digest, order);
             continue;
         };
+        if let Some(reason) = runtime_mode.definition_denial(name, effect.effect) {
+            record_unavailable(&mut unavailable, name, reason, source_digest, order);
+            continue;
+        }
         let unavailable_reason = unavailable_reason(run, name, source, &empty_args);
         if let Some(reason) = unavailable_reason {
-            unavailable.insert(
-                name.to_string(),
-                UnavailableEntry {
-                    reason,
-                    source_digest,
-                    order,
-                },
-            );
+            record_unavailable(&mut unavailable, name, reason, source_digest, order);
             continue;
         }
 
@@ -615,6 +607,23 @@ fn build_catalog_entries(
         entries.insert(name.to_string(), entry);
     }
     Ok((entries, unavailable))
+}
+
+fn record_unavailable(
+    unavailable: &mut UnavailableEntries,
+    name: &str,
+    reason: String,
+    source_digest: ContentDigest,
+    order: usize,
+) {
+    unavailable.insert(
+        name.to_string(),
+        UnavailableEntry {
+            reason,
+            source_digest,
+            order,
+        },
+    );
 }
 
 fn unavailable_reason(
@@ -801,12 +810,15 @@ fn strip_untrusted_schema_annotations(schema: &mut Value) {
 
 fn catalog_generation(
     run: &ToolRunContext,
+    runtime_mode: &crate::modes::RuntimeModeSnapshot,
     entries: &CatalogEntries,
     unavailable: &UnavailableEntries,
 ) -> Result<ContentDigest, String> {
     let payload = json!({
         "contract": "openclaudia.tool-catalog.v1",
         "capability_generation": run.generation().get(),
+        "runtime_mode_generation": runtime_mode.generation,
+        "runtime_mode": runtime_mode.display_name(),
         "entries": entries.values().map(|entry| json!({
             "name": entry.name,
             "schema_digest": entry.schema_digest,
@@ -1441,6 +1453,43 @@ mod tests {
             .expect_err("unavailable process tool must not activate");
         assert_eq!(failure.code, ToolFailureCode::Unavailable);
         assert!(failure.message.contains("Process"), "{failure:#?}");
+    }
+
+    #[test]
+    fn mode_transition_rotates_catalog_and_hides_denied_tools() {
+        let root = tempfile::tempdir().expect("catalog root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let definitions = full_definitions();
+        let standard = run
+            .tool_catalog()
+            .snapshot(&run, &[], &definitions)
+            .expect("standard snapshot");
+
+        run.transition_runtime_mode(crate::modes::RuntimeMode::Behavioral(
+            crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Explore),
+        ))
+        .expect("explore transition");
+        let explore = run
+            .tool_catalog()
+            .snapshot(&run, &[], &definitions)
+            .expect("explore snapshot");
+
+        assert_ne!(standard.generation, explore.generation);
+        assert!(explore.active_names.iter().any(|name| name == "read_file"));
+        for denied in ["bash", "write_file", "web_fetch", "task", "todo_read"] {
+            assert!(!explore.active_names.iter().any(|name| name == denied));
+            let arguments = HashMap::from([
+                ("query".to_string(), json!(format!("select:{denied}"))),
+                (
+                    "catalog_generation".to_string(),
+                    json!(explore.generation.to_string()),
+                ),
+            ]);
+            assert!(
+                run.tool_catalog().activate(&run, &arguments).is_err(),
+                "explore catalog must not activate {denied}"
+            );
+        }
     }
 
     #[test]

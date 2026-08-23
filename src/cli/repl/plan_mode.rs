@@ -64,53 +64,10 @@ fn plan_mode_allowed_tools_display() -> String {
 
 /// Handle entering plan mode. Creates plan file and sets up state.
 pub fn handle_enter_plan_mode(run: &tools::ToolRunContext, chat_session: &Session) -> String {
-    if let Err(error) = run.require(tools::ToolResource::WorkspaceWrite) {
-        return format!("Failed to enter plan mode: {error}");
-    }
-    let session_id = chat_session.id();
-    let plan_file = run.agent_plan_file().to_path_buf();
-
-    if !plan_file.exists() {
-        let header = format!(
-            "# Implementation Plan\n\nSession: {}\nCreated: {}\n\n## Plan\n\n",
-            session_id,
-            chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
-        );
-        match tools::create_capability_text_file(run, &plan_file.to_string_lossy(), &header) {
-            Ok(_) => {}
-            Err(error) => return format!("Failed to create plan file: {error}"),
-        }
-    }
-
-    // Pin a TOCTOU-safe identity for the plan file (crosslink #334).
-    // PlanModeState::enter performs symlink-metadata + File::open +
-    // FD-based metadata + canonicalize, then stores the canonical
-    // realpath. If any step fails we refuse to enter plan mode --
-    // falling back to a weaker check is the exact bypass #334 closes.
-    //
-    // Crosslink #618: capture the current `AgentMode` so that
-    // `exit_plan_mode` can restore it instead of unconditionally
-    // flipping back to `Build`. Plan-mode itself is not a meaningful
-    // "previous" mode to restore to (it would be a no-op), so we only
-    // record non-Plan modes.
-    let current_mode = chat_session.agent_mode();
-    let previous_mode = if current_mode == AgentMode::Plan {
-        None
-    } else {
-        Some(current_mode.as_token().to_string())
+    let plan_file = match openclaudia::session::install_interactive_plan_mode(run, chat_session) {
+        Ok(plan_file) => plan_file,
+        Err(error) => return format!("Failed to enter plan mode: {error}"),
     };
-    let plan_state = match openclaudia::session::PlanModeState::enter_with_previous_mode(
-        plan_file.clone(),
-        previous_mode,
-    ) {
-        Ok(state) => state,
-        Err(e) => {
-            return format!("Failed to enter plan mode (plan file identity pin failed): {e}");
-        }
-    };
-
-    chat_session.update_state(|state, _| state.conversation.plan_mode = Some(plan_state));
-    chat_session.set_agent_mode(AgentMode::Plan);
 
     println!(
         "\n\x1b[1;33m>> Entered Plan Mode\x1b[0m\n\
@@ -379,6 +336,23 @@ pub fn handle_exit_plan_mode(
     }
 }
 
+/// Restore the runtime capability profile after an approved plan.
+///
+/// Session state is committed by [`handle_exit_plan_mode`] first; this keeps
+/// the runtime authority and persisted behavioral/coordinator mode aligned.
+pub fn restore_runtime_after_plan(
+    run: &tools::ToolRunContext,
+    chat_session: &Session,
+    coordinator: bool,
+) -> Result<(), String> {
+    let mode = if coordinator {
+        openclaudia::modes::RuntimeMode::Coordinator
+    } else {
+        openclaudia::modes::RuntimeMode::Behavioral(chat_session.behavior_mode())
+    };
+    run.transition_runtime_mode(mode).map(|_| ())
+}
+
 /// Check if a tool call is blocked by plan mode and return an error message if so.
 pub fn check_plan_mode_restriction(
     chat_session: &Session,
@@ -450,6 +424,7 @@ pub fn process_tool_follow_up(
     chat_session: &Session,
     task_manager: &std::sync::Mutex<openclaudia::session::TaskManager>,
     result: &tools::ToolResult,
+    coordinator: bool,
 ) -> tools::ToolResult {
     let (content, response) = match result.follow_up() {
         tools::ToolFollowUp::None => return result.clone(),
@@ -472,6 +447,19 @@ pub fn process_tool_follow_up(
         } => {
             let (message, approved) =
                 handle_exit_plan_mode(run, chat_session, task_manager, allowed_prompts);
+            if approved {
+                if let Err(error) = restore_runtime_after_plan(run, chat_session, coordinator) {
+                    let message = format!(
+                        "Plan was approved, but restoring runtime capabilities failed: {error}"
+                    );
+                    return result
+                        .resolve_follow_up(
+                            message.clone(),
+                            serde_json::json!({"message": message, "approved": false}),
+                        )
+                        .expect("trusted pending follow-up must resolve exactly once");
+                }
+            }
             (
                 message.clone(),
                 serde_json::json!({"message": message, "approved": approved}),
@@ -511,6 +499,10 @@ mod tests {
 
         let result = handle_enter_plan_mode(&run, &session);
         assert!(result.contains("Plan mode activated"), "{result}");
+        assert_eq!(
+            run.runtime_mode().class,
+            openclaudia::modes::RuntimeModeClass::Plan
+        );
         assert!(run.agent_plan_file().is_file());
         assert!(run.permits_write(run.agent_plan_file()));
         assert!(run.is_denied_path(&project.path().join(".openclaudia/config.yaml")));
@@ -519,6 +511,20 @@ mod tests {
             .inspect_state(|state| state.conversation.plan_mode.clone())
             .expect("plan state");
         assert_eq!(stored.plan_realpath, run.agent_plan_file());
+
+        let second = handle_enter_plan_mode(&run, &session);
+        assert!(second.contains("Plan mode activated"), "{second}");
+        assert_eq!(
+            session.inspect_state(|state| {
+                state
+                    .conversation
+                    .plan_mode
+                    .as_ref()
+                    .and_then(|plan| plan.previous_mode.clone())
+            }),
+            Some(AgentMode::Build.as_token().to_string()),
+            "idempotent re-entry must retain the original mode"
+        );
     }
 
     fn make_plan_state(prev: Option<&str>) -> PlanModeState {
@@ -569,9 +575,19 @@ mod tests {
     #[test]
     fn check_plan_mode_restriction_still_allows_read_only_object_args() {
         let session = chat_session_in_plan_mode();
+        let path = session.inspect_state(|state| {
+            state
+                .conversation
+                .plan_mode
+                .as_ref()
+                .expect("plan mode")
+                .plan_realpath
+                .clone()
+        });
+        let args = serde_json::json!({"path": path}).to_string();
 
         assert_eq!(
-            check_plan_mode_restriction(&session, "read_file", "{}"),
+            check_plan_mode_restriction(&session, "read_file", &args),
             None
         );
     }
@@ -588,16 +604,8 @@ mod tests {
                 "plan-mode denial must mention allowed tool {tool:?}; got {msg:?}"
             );
         }
-        assert_eq!(
-            msg.contains("web_search"),
-            cfg!(feature = "browser"),
-            "plan-mode denial must match browser-feature web_search availability"
-        );
-        assert_eq!(
-            msg.contains("web_browser"),
-            cfg!(feature = "browser"),
-            "plan-mode denial must match browser-feature web_browser availability"
-        );
+        assert!(!msg.contains("web_search"));
+        assert!(!msg.contains("web_browser"));
         assert!(
             msg.contains("write_file ONLY"),
             "plan-mode denial must keep the plan-file write exception visible: {msg:?}"

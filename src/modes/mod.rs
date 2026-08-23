@@ -18,7 +18,9 @@ pub mod fragments;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr;
+use std::sync::RwLock;
 
 // =========================================================================
 // Axis enums
@@ -496,6 +498,322 @@ impl BehaviorMode {
 
         sections.join("\n\n")
     }
+}
+
+// =========================================================================
+// Runtime capability profiles
+// =========================================================================
+
+/// Host-enforced mode requested for one agent run.
+///
+/// Behavioral prompts remain useful explanations, but this value is the
+/// authority consulted at tool admission. `Plan` is distinct from a generic
+/// read-only mode because it may update the one host-pinned plan file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeMode {
+    /// Normal behavior, including the read-only and director modifiers.
+    Behavioral(BehaviorMode),
+    /// Plan workflow: observe the codebase and update only the pinned plan.
+    Plan,
+    /// ACP context-gathering mode. Unlike `Plan`, it cannot write a plan file.
+    Initializer,
+    /// Explicit planner/orchestrator posture selected by a frontend flag.
+    Coordinator,
+}
+
+impl Default for RuntimeMode {
+    fn default() -> Self {
+        Self::Behavioral(BehaviorMode::default())
+    }
+}
+
+/// Effective capability class produced from a validated [`RuntimeMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeModeClass {
+    /// Host permissions and guardrails decide which tools may run.
+    Standard,
+    /// Local observation and explicit user questions only.
+    ReadOnly,
+    /// Read-only analysis plus the exact pinned plan-file workflow.
+    Plan,
+    /// Observation plus the three subagent lifecycle tools.
+    Coordinator,
+}
+
+/// Immutable public view of the mode authority installed in a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeModeSnapshot {
+    /// Monotonic generation changed by every successful transition.
+    pub generation: u64,
+    /// Validated frontend request that produced the profile.
+    pub mode: RuntimeMode,
+    /// Enforced capability class.
+    pub class: RuntimeModeClass,
+}
+
+impl RuntimeModeSnapshot {
+    /// Stable label for diagnostics and typed denial messages.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        match &self.mode {
+            RuntimeMode::Behavioral(mode) => mode.display_name(),
+            RuntimeMode::Plan => "plan".to_string(),
+            RuntimeMode::Initializer => "initializer".to_string(),
+            RuntimeMode::Coordinator => "coordinator".to_string(),
+        }
+    }
+
+    /// Whether this profile may create or control child runs.
+    #[must_use]
+    pub const fn allows_child_runs(&self) -> bool {
+        matches!(
+            self.class,
+            RuntimeModeClass::Standard | RuntimeModeClass::Coordinator
+        )
+    }
+
+    /// Approval policy exposed for status and audit output.
+    #[must_use]
+    pub const fn approval_semantics(&self) -> &'static str {
+        "host-policy-with-non-bypassable-mode-ceiling"
+    }
+
+    /// Budget policy exposed for status and audit output.
+    #[must_use]
+    pub const fn budget_semantics(&self) -> &'static str {
+        if self.allows_child_runs() {
+            "inherit-run-budget"
+        } else {
+            "inherit-run-budget; child-runs-denied"
+        }
+    }
+
+    /// Explain why a model-visible definition is outside this exact profile.
+    #[must_use]
+    pub fn definition_denial(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+    ) -> Option<String> {
+        if profile_allows_definition(self, tool_name, effect) {
+            None
+        } else {
+            Some(format!(
+                "runtime mode '{}' generation {} does not grant this tool",
+                self.display_name(),
+                self.generation
+            ))
+        }
+    }
+}
+
+/// Atomic mode authority owned by one exact run.
+#[derive(Debug)]
+pub struct RuntimeModeAuthority {
+    state: RwLock<RuntimeModeSnapshot>,
+}
+
+impl RuntimeModeAuthority {
+    /// Validate and install an initial generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested mode contains conflicting
+    /// capability modifiers.
+    pub fn new(mode: RuntimeMode) -> Result<Self, String> {
+        let class = validate_runtime_mode(&mode)?;
+        Ok(Self {
+            state: RwLock::new(RuntimeModeSnapshot {
+                generation: 1,
+                mode,
+                class,
+            }),
+        })
+    }
+
+    /// Read one internally consistent mode generation.
+    #[must_use]
+    pub fn snapshot(&self) -> RuntimeModeSnapshot {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Validate first, then atomically replace the whole effective profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for conflicting modifiers or generation exhaustion.
+    pub fn transition(&self, mode: RuntimeMode) -> Result<RuntimeModeSnapshot, String> {
+        let class = validate_runtime_mode(&mode)?;
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "runtime mode generation exhausted".to_string())?;
+        *state = RuntimeModeSnapshot {
+            generation,
+            mode,
+            class,
+        };
+        Ok(state.clone())
+    }
+
+    /// Enforce the current profile for one fully classified invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed explanation when the active profile denies the call.
+    pub fn admit_tool(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+        arguments: &serde_json::Value,
+        plan_file: &Path,
+    ) -> Result<(), String> {
+        let snapshot = self.snapshot();
+        if profile_allows_call(&snapshot, tool_name, effect, arguments, plan_file) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime mode '{}' generation {} denies tool '{}' ({})",
+                snapshot.display_name(),
+                snapshot.generation,
+                tool_name,
+                effect.as_str()
+            ))
+        }
+    }
+
+    /// Explain why a definition must not be shown to the model in this mode.
+    #[must_use]
+    pub fn definition_denial(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+    ) -> Option<String> {
+        self.snapshot().definition_denial(tool_name, effect)
+    }
+
+    /// Deny effectful frontend shortcuts that do not pass through a tool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed explanation unless the active mode permits ordinary
+    /// direct frontend operations.
+    pub fn admit_direct_operation(&self, operation: &str) -> Result<(), String> {
+        let snapshot = self.snapshot();
+        if snapshot.class == RuntimeModeClass::Standard {
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime mode '{}' generation {} denies direct operation '{}'",
+                snapshot.display_name(),
+                snapshot.generation,
+                operation
+            ))
+        }
+    }
+}
+
+fn validate_runtime_mode(mode: &RuntimeMode) -> Result<RuntimeModeClass, String> {
+    let RuntimeMode::Behavioral(behavior) = mode else {
+        return Ok(match mode {
+            RuntimeMode::Plan => RuntimeModeClass::Plan,
+            RuntimeMode::Initializer => RuntimeModeClass::ReadOnly,
+            RuntimeMode::Coordinator => RuntimeModeClass::Coordinator,
+            RuntimeMode::Behavioral(_) => unreachable!(),
+        });
+    };
+    let readonly = behavior.modifiers.contains(&Modifier::Readonly);
+    let director = behavior.modifiers.contains(&Modifier::Director);
+    if readonly && director {
+        return Err(
+            "behavioral mode cannot combine readonly and director capabilities".to_string(),
+        );
+    }
+    Ok(if readonly {
+        RuntimeModeClass::ReadOnly
+    } else if director {
+        RuntimeModeClass::Coordinator
+    } else {
+        RuntimeModeClass::Standard
+    })
+}
+
+fn profile_allows_definition(
+    snapshot: &RuntimeModeSnapshot,
+    tool_name: &str,
+    effect: crate::tools::effect::ToolEffect,
+) -> bool {
+    match snapshot.class {
+        RuntimeModeClass::Standard => true,
+        RuntimeModeClass::Plan => {
+            tool_name == "write_file"
+                || tool_name == "enter_plan_mode"
+                || tool_name == "exit_plan_mode"
+                || observation_tool_allowed(tool_name, effect)
+        }
+        RuntimeModeClass::ReadOnly => observation_tool_allowed(tool_name, effect),
+        RuntimeModeClass::Coordinator => {
+            matches!(tool_name, "task" | "agent_output" | "task_stop")
+                || observation_tool_allowed(tool_name, effect)
+        }
+    }
+}
+
+fn profile_allows_call(
+    snapshot: &RuntimeModeSnapshot,
+    tool_name: &str,
+    effect: crate::tools::effect::ToolEffect,
+    arguments: &serde_json::Value,
+    plan_file: &Path,
+) -> bool {
+    if snapshot.class == RuntimeModeClass::Plan {
+        return crate::session::is_tool_allowed_in_plan_mode(tool_name, plan_file, arguments);
+    }
+    profile_allows_definition(snapshot, tool_name, effect)
+}
+
+pub(crate) fn observation_tool_allowed(
+    tool_name: &str,
+    effect: crate::tools::effect::ToolEffect,
+) -> bool {
+    if tool_name == "ask_user_question" || tool_name == "tool_search" {
+        return true;
+    }
+    if prohibited_observation_family(tool_name) {
+        return false;
+    }
+    effect == crate::tools::effect::ToolEffect::ReadOnly
+}
+
+fn prohibited_observation_family(tool_name: &str) -> bool {
+    tool_name == "crosslink"
+        || tool_name == "task"
+        || tool_name == "agent_output"
+        || tool_name == "task_stop"
+        || tool_name.starts_with("task_")
+        || tool_name.starts_with("todo_")
+        || tool_name == "bash"
+        || tool_name == "bash_output"
+        || tool_name == "kill_shell"
+        || tool_name == "kill_shells_for_agent"
+        || tool_name == "enter_worktree"
+        || tool_name == "exit_worktree"
+        || tool_name == "list_worktrees"
+        || tool_name == "web_fetch"
+        || tool_name == "web_search"
+        || tool_name == "web_browser"
+        || tool_name == "list_mcp_resources"
+        || tool_name == "read_mcp_resource"
+        || tool_name == "lsp"
+        || tool_name.starts_with("mcp__")
+        || tool_name.starts_with("plugin__")
 }
 
 /// List all available preset names with their descriptions.
@@ -1101,5 +1419,93 @@ mod tests {
             desc.contains("unrestricted"),
             "description missing scope: {desc}"
         );
+    }
+
+    #[test]
+    fn runtime_profiles_enforce_real_mode_boundaries() {
+        use crate::tools::effect::ToolEffect;
+
+        let plan_dir = tempfile::tempdir().expect("plan dir");
+        let plan_file = plan_dir.path().join("plan.md");
+        std::fs::write(&plan_file, "# Plan\n").expect("plan file");
+        let plan_file = std::fs::canonicalize(plan_file).expect("canonical plan");
+        let empty = serde_json::json!({});
+
+        let authority = RuntimeModeAuthority::new(RuntimeMode::Behavioral(
+            BehaviorMode::from_preset(Preset::Explore),
+        ))
+        .expect("explore profile");
+        assert_eq!(authority.snapshot().class, RuntimeModeClass::ReadOnly);
+        assert!(authority
+            .admit_tool("read_file", ToolEffect::ReadOnly, &empty, &plan_file)
+            .is_ok());
+        for (tool, effect) in [
+            ("write_file", ToolEffect::WorkspaceMutation),
+            ("web_fetch", ToolEffect::NetworkRead),
+            ("task_get", ToolEffect::ReadOnly),
+            ("todo_read", ToolEffect::ReadOnly),
+            ("crosslink", ToolEffect::ReadOnly),
+        ] {
+            assert!(
+                authority
+                    .admit_tool(tool, effect, &empty, &plan_file)
+                    .is_err(),
+                "explore mode must deny {tool}"
+            );
+        }
+
+        let coordinator =
+            RuntimeModeAuthority::new(RuntimeMode::Coordinator).expect("coordinator profile");
+        assert!(coordinator
+            .admit_tool("task", ToolEffect::Destructive, &empty, &plan_file)
+            .is_ok());
+        assert!(coordinator
+            .admit_tool("bash", ToolEffect::Destructive, &empty, &plan_file)
+            .is_err());
+    }
+
+    #[test]
+    fn plan_profile_only_writes_the_pinned_plan_and_transitions_atomically() {
+        use crate::tools::effect::ToolEffect;
+
+        let plan_dir = tempfile::tempdir().expect("plan dir");
+        let plan_file = plan_dir.path().join("plan.md");
+        std::fs::write(&plan_file, "# Plan\n").expect("plan file");
+        let plan_file = std::fs::canonicalize(plan_file).expect("canonical plan");
+        let authority = RuntimeModeAuthority::new(RuntimeMode::default()).expect("default mode");
+        let next = authority.transition(RuntimeMode::Plan).expect("enter plan");
+        assert_eq!(next.generation, 2);
+        assert_eq!(next.class, RuntimeModeClass::Plan);
+
+        let plan_args = serde_json::json!({"path": plan_file});
+        assert!(authority
+            .admit_tool(
+                "write_file",
+                ToolEffect::WorkspaceMutation,
+                &plan_args,
+                &plan_file,
+            )
+            .is_ok());
+        let other_args = serde_json::json!({"path": plan_dir.path().join("other.md")});
+        assert!(authority
+            .admit_tool(
+                "write_file",
+                ToolEffect::WorkspaceMutation,
+                &other_args,
+                &plan_file,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn conflicting_runtime_modifiers_fail_validation_without_transition() {
+        let mode = BehaviorMode {
+            modifiers: vec![Modifier::Readonly, Modifier::Director],
+            ..BehaviorMode::default()
+        };
+        let authority = RuntimeModeAuthority::new(RuntimeMode::default()).expect("default mode");
+        let before = authority.snapshot();
+        assert!(authority.transition(RuntimeMode::Behavioral(mode)).is_err());
+        assert_eq!(authority.snapshot(), before);
     }
 }

@@ -233,12 +233,24 @@ impl ToolExecutor {
             );
         }
 
+        let arguments =
+            match Self::parse_arguments(&tool_call.function.name, &tool_call.function.arguments) {
+                Ok(arguments) => arguments,
+                Err(reason) => {
+                    return ToolResult::failure(
+                        tool_call,
+                        ToolFailureCode::InvalidArguments,
+                        reason,
+                        ToolRetryability::Never,
+                    )
+                }
+            };
         if let Err(reason) =
-            Self::parse_arguments(&tool_call.function.name, &tool_call.function.arguments)
+            run_context.admit_runtime_mode_tool(&tool_call.function.name, &arguments)
         {
             return ToolResult::failure(
                 tool_call,
-                ToolFailureCode::InvalidArguments,
+                ToolFailureCode::PolicyDenied,
                 reason,
                 ToolRetryability::Never,
             );
@@ -520,6 +532,17 @@ fn prepare_mcp_dispatch(
         unreachable!("parse_arguments only returns JSON objects");
     };
     let argument_map: HashMap<String, Value> = argument_object.clone().into_iter().collect();
+    request
+        .run_context
+        .admit_runtime_mode_tool(&request.tool_call.function.name, &arguments)
+        .map_err(|reason| {
+            Box::new(ToolResult::failure(
+                request.tool_call,
+                ToolFailureCode::PolicyDenied,
+                reason,
+                ToolRetryability::Never,
+            ))
+        })?;
 
     let tool_policy = ToolExecutionPolicy::new(request.policy_enforcer, request.session_id);
     tool_policy
@@ -737,6 +760,38 @@ mod tests {
         assert!(result.is_error());
         assert!(result.content().contains("Blocked by policy"));
         assert!(!result.content().contains("tool-executor-should-not-run"));
+    }
+
+    #[test]
+    fn runtime_mode_denial_cannot_be_widened_by_unrestricted_permissions() {
+        let run = one_tool_run();
+        run.transition_runtime_mode(crate::modes::RuntimeMode::Behavioral(
+            crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Explore),
+        ))
+        .expect("install explore mode");
+        let call = bash_call("printf runtime-mode-should-not-run");
+        let permission_manager = PermissionManager::unrestricted();
+
+        let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: &run,
+            tool_call: &call,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &permission_manager,
+            authorization: None,
+            session_id: Some("readonly-session"),
+            policy_enforcer: None,
+        });
+
+        assert!(result.is_error());
+        assert!(matches!(
+            result.outcome(),
+            crate::tools::ToolOutcome::Error { failure }
+                if failure.code == ToolFailureCode::PolicyDenied
+        ));
+        assert!(result.content().contains("denies tool 'bash'"));
+        assert!(!result.content().contains("runtime-mode-should-not-run"));
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::file_error::{self, FileError};
-use crate::state::Session;
+use crate::state::{AgentMode, Session};
 
 const INPUT_PROMPT_WIDTH: u16 = 2;
 const MIN_INPUT_HEIGHT: u16 = 3;
@@ -738,8 +738,17 @@ fn build_startup_session_run_context(
         .network(true)
         .secrets(true)
         .provider(provider)
+        .runtime_mode(runtime_mode_for_tui_session(session))
         .budget_limits(budget_limits)
         .build()
+}
+
+fn runtime_mode_for_tui_session(session: &Session) -> crate::modes::RuntimeMode {
+    if session.agent_mode() == AgentMode::Plan {
+        crate::modes::RuntimeMode::Plan
+    } else {
+        crate::modes::RuntimeMode::Behavioral(session.behavior_mode())
+    }
 }
 
 fn derive_session_run_context(
@@ -767,12 +776,14 @@ fn derive_session_run_context(
             parent.project_root().display()
         ));
     }
-    parent.derive_frontend_session(
+    let run = parent.derive_frontend_session(
         identity.session_id,
         &project_root,
         &identity.cwd,
         active_provider,
-    )
+    )?;
+    run.transition_runtime_mode(runtime_mode_for_tui_session(session))?;
+    Ok(run)
 }
 
 struct TuiMcpRuntime {
@@ -969,6 +980,34 @@ impl App {
         let manager = crate::session::TaskManager::open_for_run(&run)?;
         self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(manager));
         Ok(())
+    }
+
+    /// Atomically apply a behavioral mode to runtime authority and session
+    /// persistence. An active plan remains the effective hard ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested behavioral mode conflicts with the
+    /// currently enforceable runtime profile.
+    pub fn apply_behavior_mode(
+        &mut self,
+        behavior_mode: crate::modes::BehaviorMode,
+    ) -> Result<(), String> {
+        let runtime_mode = if self.chat_session.agent_mode() == AgentMode::Plan {
+            crate::modes::RuntimeMode::Plan
+        } else {
+            crate::modes::RuntimeMode::Behavioral(behavior_mode.clone())
+        };
+        self.tool_run_context()?
+            .transition_runtime_mode(runtime_mode)?;
+        self.chat_session.set_behavior_mode(behavior_mode);
+        Ok(())
+    }
+
+    /// Persisted behavioral mode currently projected into prompts.
+    #[must_use]
+    pub fn behavior_mode(&self) -> crate::modes::BehaviorMode {
+        self.chat_session.behavior_mode()
     }
 
     /// Open the help-cheatsheet overlay. Subsequent keystrokes go to
@@ -2635,7 +2674,43 @@ impl App {
 
     /// Table-handler entry point for `/mode`.
     fn slash_mode(&mut self) {
-        self.chat_session.toggle_mode();
+        let run = match self.run_context.as_ref() {
+            Ok(run) => run,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Could not change mode: {error}"
+                )));
+                return;
+            }
+        };
+        if self.chat_session.agent_mode() == AgentMode::Plan {
+            let restored = self.chat_session.inspect_state(|state| {
+                state
+                    .conversation
+                    .plan_mode
+                    .as_ref()
+                    .and_then(|plan| plan.previous_mode.as_deref())
+                    .map_or(AgentMode::Build, AgentMode::from_token)
+            });
+            if let Err(error) = run.transition_runtime_mode(crate::modes::RuntimeMode::Behavioral(
+                self.chat_session.behavior_mode(),
+            )) {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Could not exit plan mode: {error}"
+                )));
+                return;
+            }
+            self.chat_session
+                .update_state(|state, _| state.conversation.plan_mode = None);
+            self.chat_session.set_agent_mode(restored);
+        } else if let Err(error) =
+            crate::session::install_interactive_plan_mode(run, &self.chat_session)
+        {
+            self.messages.add(DisplayMessage::error(format!(
+                "Could not enter plan mode: {error}"
+            )));
+            return;
+        }
         self.mode = tui_mode_for_agent(self.chat_session.agent_mode());
         self.messages.add(DisplayMessage::system(format!(
             "Mode: {} — {}",
@@ -3051,6 +3126,19 @@ impl App {
 
     /// Handle the `/review` slash command (shows truncated `git diff HEAD`).
     fn handle_slash_review(&mut self) {
+        let run = match self.run_context.as_ref() {
+            Ok(run) => run,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Review unavailable: {error}"
+                )));
+                return;
+            }
+        };
+        if let Err(error) = run.admit_runtime_mode_direct_operation("review Git diff") {
+            self.messages.add(DisplayMessage::error(error));
+            return;
+        }
         let content = match git_command().and_then(|mut cmd| {
             cmd.args(["diff", "HEAD"])
                 .output()
@@ -3065,14 +3153,17 @@ impl App {
     /// Handle the `/init` slash command (create config if absent).
     fn handle_slash_init(&mut self) {
         let content = match self.run_context.as_deref() {
-            Ok(run) => match crate::tools::initialize_project_for_run(run) {
-                Ok(crate::tools::ProjectInitOutcome::Created) => {
-                    "Initialized OpenClaudia configuration in .openclaudia/".to_string()
-                }
-                Ok(crate::tools::ProjectInitOutcome::AlreadyExists) => {
-                    "Config already exists. Use /doctor to check it.".to_string()
-                }
-                Err(error) => format!("Init failed: {error}"),
+            Ok(run) => match run.admit_runtime_mode_direct_operation("initialize project") {
+                Err(error) => error,
+                Ok(()) => match crate::tools::initialize_project_for_run(run) {
+                    Ok(crate::tools::ProjectInitOutcome::Created) => {
+                        "Initialized OpenClaudia configuration in .openclaudia/".to_string()
+                    }
+                    Ok(crate::tools::ProjectInitOutcome::AlreadyExists) => {
+                        "Config already exists. Use /doctor to check it.".to_string()
+                    }
+                    Err(error) => format!("Init failed: {error}"),
+                },
             },
             Err(error) => format!("Init failed: no valid run capability: {error}"),
         };
@@ -3282,6 +3373,18 @@ impl App {
                     target,
                     stdout: String::new(),
                     stderr: error.to_string(),
+                    exit_code: None,
+                });
+            }
+            return None;
+        }
+        if let Err(error) = run_context.admit_runtime_mode_direct_operation(&format!("{target:?}"))
+        {
+            if let Some(tx) = tx {
+                let _ = tx.send(AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: error,
                     exit_code: None,
                 });
             }
@@ -5351,6 +5454,69 @@ mod tests {
     }
 
     #[test]
+    fn tui_mode_changes_update_runtime_authority_before_session_state() {
+        let project = tempfile::tempdir().expect("TUI plan root");
+        let mut app = App::new("test-model", "test-provider");
+        let session_id = crate::state::SessionId::from_raw(app.chat_session.id())
+            .expect("session id must be UUID-shaped");
+        app.run_context = crate::tools::ToolRunContext::builder(session_id, project.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("tui-plan-test")
+            .build();
+        let initial_generation = app
+            .tool_run_context()
+            .expect("run")
+            .runtime_mode()
+            .generation;
+
+        app.slash_mode();
+        assert_eq!(app.chat_session.agent_mode(), crate::state::AgentMode::Plan);
+        assert!(app
+            .chat_session
+            .inspect_state(|state| state.conversation.plan_mode.is_some()));
+        assert!(app
+            .tool_run_context()
+            .expect("run")
+            .agent_plan_file()
+            .is_file());
+        let plan = app.tool_run_context().expect("run").runtime_mode();
+        assert_eq!(plan.class, crate::modes::RuntimeModeClass::Plan);
+        assert!(plan.generation > initial_generation);
+
+        app.slash_mode();
+        assert_eq!(
+            app.chat_session.agent_mode(),
+            crate::state::AgentMode::Build
+        );
+        assert!(app
+            .chat_session
+            .inspect_state(|state| state.conversation.plan_mode.is_none()));
+        let restored = app.tool_run_context().expect("run").runtime_mode();
+        assert_eq!(restored.class, crate::modes::RuntimeModeClass::Standard);
+        assert!(restored.generation > plan.generation);
+    }
+
+    #[test]
+    fn tui_behavior_mode_rejects_conflicts_without_mutating_session() {
+        let mut app = App::new("test-model", "test-provider");
+        let before = app.behavior_mode();
+        let mut invalid = before.clone();
+        invalid.modifiers = vec![
+            crate::modes::Modifier::Readonly,
+            crate::modes::Modifier::Director,
+        ];
+
+        assert!(app.apply_behavior_mode(invalid).is_err());
+        assert_eq!(app.behavior_mode(), before);
+    }
+
+    #[test]
     fn context_reference_append_preserves_the_provider_history_prefix() {
         let mut messages = vec![
             serde_json::json!({"role": "user", "content": "original task"}),
@@ -6618,6 +6784,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restricted_mode_blocks_tui_shell_shortcuts_before_spawn() {
+        let mut app = App::new("test-model", "test-provider");
+        app.apply_behavior_mode(crate::modes::BehaviorMode::from_preset(
+            crate::modes::Preset::Explore,
+        ))
+        .expect("explore mode");
+        let rx = wire_app(&mut app);
+
+        let join = app.spawn_shell(vec!["echo", "must-not-run"], SpawnTarget::Diff);
+        assert!(join.is_none());
+        let (_, stdout, stderr, exit_code) =
+            recv_shell_done(&rx, Duration::from_millis(100)).expect("mode denial event");
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("denies direct operation"), "{stderr}");
+        assert_eq!(exit_code, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_shell_returns_immediately_and_runs_in_background() {
         // The helper must not block the calling (event-loop) thread. We
         // ask it to launch `sleep 0.4` and measure that the *call itself*
@@ -6995,7 +7179,11 @@ mod tests {
             .with_timezone(&chrono::Utc);
         older.push_message(serde_json::json!({"role": "user", "content": "older"}));
 
-        let mut newer = Session::new("new-model", "initial-provider");
+        let mut newer = Session::new_with_behavior_mode(
+            "new-model",
+            "initial-provider",
+            crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Explore),
+        );
         newer.set_id(NEWER_ID.to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
@@ -7023,6 +7211,13 @@ mod tests {
         assert_eq!(app.model, "new-model");
         assert_eq!(app.provider, "initial-provider");
         assert_eq!(app.chat_session.messages_snapshot()[0]["content"], "newer");
+        assert_eq!(
+            app.tool_run_context()
+                .expect("resumed run")
+                .runtime_mode()
+                .class,
+            crate::modes::RuntimeModeClass::ReadOnly
+        );
         assert!(matches!(
             state_events.try_recv(),
             Some(crate::state::StateEvent::SessionSwitched {

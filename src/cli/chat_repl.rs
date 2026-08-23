@@ -24,7 +24,10 @@ use crate::cli::display::tool_result::display_tool_result;
 use crate::cli::repl::input::expand_file_references;
 use crate::cli::repl::keybindings::{display_keybindings, execute_key_action, key_event_to_string};
 use crate::cli::repl::permissions::execute_shell_command_with_permission;
-use crate::cli::repl::plan_mode::{check_plan_mode_restriction, process_tool_follow_up};
+use crate::cli::repl::plan_mode::{
+    check_plan_mode_restriction, handle_enter_plan_mode, handle_exit_plan_mode,
+    process_tool_follow_up, restore_runtime_after_plan,
+};
 use crate::cli::repl::session_io::{
     estimate_session_tokens, export_chat_session, save_session_to_short_term_memory,
 };
@@ -267,6 +270,7 @@ fn derive_repl_session_run(
     parent: &tools::ToolRunContext,
     session: &Session,
     configured_provider: &str,
+    coordinator: bool,
 ) -> Result<std::sync::Arc<tools::ToolRunContext>, String> {
     if canonical_provider_name(&session.provider) != canonical_provider_name(configured_provider) {
         return Err(format!(
@@ -288,12 +292,14 @@ fn derive_repl_session_run(
             parent.project_root().display()
         ));
     }
-    parent.derive_frontend_session(
+    let run = parent.derive_frontend_session(
         identity.session_id,
         &project_root,
         &identity.cwd,
         configured_provider,
-    )
+    )?;
+    run.transition_runtime_mode(runtime_mode_for_repl_session(session, coordinator))?;
+    Ok(run)
 }
 
 fn fresh_repl_session_in_run(current: &Session, model: &str, provider: &str) -> Session {
@@ -480,6 +486,49 @@ async fn resolve_repl_chat_auth(
     Ok(auth)
 }
 
+fn runtime_mode_for_repl_session(
+    session: &Session,
+    coordinator: bool,
+) -> openclaudia::modes::RuntimeMode {
+    if session.agent_mode() == openclaudia::state::AgentMode::Plan {
+        openclaudia::modes::RuntimeMode::Plan
+    } else if coordinator {
+        openclaudia::modes::RuntimeMode::Coordinator
+    } else {
+        openclaudia::modes::RuntimeMode::Behavioral(session.behavior_mode())
+    }
+}
+
+fn effectful_slash_operation(input: &str) -> Option<&'static str> {
+    let command_line = input.trim().strip_prefix('/')?;
+    let mut parts = command_line.split_whitespace();
+    let command = parts.next()?.to_ascii_lowercase();
+    if command.contains(':') {
+        return Some("plugin command");
+    }
+    match command.as_str() {
+        "export" => Some("export conversation"),
+        "editor" | "edit" | "e" => Some("external editor"),
+        "copy" | "yank" | "y" => Some("system clipboard write"),
+        "init" => Some("initialize project"),
+        "review" => Some("review Git changes"),
+        "mcp" => Some("MCP management"),
+        "plugin" | "plugins" => Some("plugin management"),
+        "commit" | "commit-push-pr" => Some("Git mutation"),
+        "login" => Some("credential login"),
+        "add-dir" => Some("session scope change"),
+        "branch" => Some("conversation branch write"),
+        "memory" | "mem"
+            if parts
+                .next()
+                .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case("reset")) =>
+        {
+            Some("technical-memory reset")
+        }
+        _ => None,
+    }
+}
+
 impl ChatRepl {
     /// Resolve config + auth + provider + session and return a fully
     /// initialized REPL. Setup failures return an error after printing the
@@ -563,6 +612,7 @@ impl ChatRepl {
         );
         let vdd_engine: Option<vdd::VddEngine> = init_vdd_engine_if_enabled(&config);
         let identity = chat_session.inspect_state(|state| state.identity.clone());
+        let runtime_mode = runtime_mode_for_repl_session(&chat_session, args.coordinator);
         let run_context =
             tools::ToolRunContext::builder(identity.session_id, identity.project_root)
                 .working_directory(identity.cwd)
@@ -572,6 +622,7 @@ impl ChatRepl {
                 .network(true)
                 .secrets(true)
                 .provider(config.proxy.target.clone())
+                .runtime_mode(runtime_mode)
                 .budget_limits(
                     config
                         .session
@@ -744,6 +795,14 @@ impl ChatRepl {
                     self.clear_transient_prompt_options();
                     return Ok(Some(false));
                 }
+                if let Err(error) = self
+                    .run_context
+                    .admit_runtime_mode_direct_operation("shell escape")
+                {
+                    eprintln!("{error}");
+                    self.clear_transient_prompt_options();
+                    return Ok(Some(false));
+                }
                 if let Some(execution) = execute_shell_command_with_permission(
                     &self.run_context,
                     cmd,
@@ -913,6 +972,15 @@ impl ChatRepl {
         input: &mut String,
         memory_db: Option<&memory::MemoryDb>,
     ) -> SlashOutcome {
+        if let Some(operation) = effectful_slash_operation(input) {
+            if let Err(error) = self
+                .run_context
+                .admit_runtime_mode_direct_operation(operation)
+            {
+                eprintln!("{error}");
+                return SlashOutcome::Continue;
+            }
+        }
         let doctor_runtime = input.trim().eq_ignore_ascii_case("/doctor").then(|| {
             let manager = openclaudia::mcp::registered_manager(&self.run_context);
             let mut snapshot = openclaudia::doctor::DoctorRuntimeSnapshot::from_run_with_mcp(
@@ -998,8 +1066,12 @@ impl ChatRepl {
     }
 
     fn apply_session_transition(&mut self, loaded: &Session) -> Result<(), String> {
-        let next_run =
-            derive_repl_session_run(&self.run_context, loaded, &self.config.proxy.target)?;
+        let next_run = derive_repl_session_run(
+            &self.run_context,
+            loaded,
+            &self.config.proxy.target,
+            self.coordinator,
+        )?;
         let next_audit = openclaudia::session::AuditLogger::new(&loaded.id())
             .map_err(|error| format!("cannot initialize session audit log: {error}"))?;
         let permission_bypass = self.chat_session.permission_bypass_enabled();
@@ -1159,12 +1231,7 @@ impl ChatRepl {
             }
             SlashCommandResult::Status => self.print_status(),
             SlashCommandResult::ToggleMode => {
-                self.chat_session.toggle_mode();
-                println!(
-                    "\nSwitched to {} mode: {}\n",
-                    self.chat_session.agent_mode().display(),
-                    self.chat_session.mode_description()
-                );
+                self.toggle_plan_mode();
             }
             SlashCommandResult::Keybindings => display_keybindings(&self.config.keybindings),
             SlashCommandResult::Memory(args) => {
@@ -1192,6 +1259,18 @@ impl ChatRepl {
                 apply_fast_mode_result(&mut self.model, &mut self.chat_session, &effort, model);
             }
             SlashCommandResult::SetBehaviorMode(new_mode) => {
+                let runtime_mode =
+                    if self.chat_session.agent_mode() == openclaudia::state::AgentMode::Plan {
+                        openclaudia::modes::RuntimeMode::Plan
+                    } else if self.coordinator {
+                        openclaudia::modes::RuntimeMode::Coordinator
+                    } else {
+                        openclaudia::modes::RuntimeMode::Behavioral(new_mode.clone())
+                    };
+                if let Err(error) = self.run_context.transition_runtime_mode(runtime_mode) {
+                    eprintln!("Could not change behavioral mode: {error}");
+                    return SlashOutcome::Continue;
+                }
                 self.chat_session.set_behavior_mode(new_mode);
             }
             // BranchSession plus the five already-handled-in-head variants
@@ -1200,6 +1279,32 @@ impl ChatRepl {
             _ => {}
         }
         SlashOutcome::Continue
+    }
+
+    fn toggle_plan_mode(&self) {
+        if self.chat_session.agent_mode() != openclaudia::state::AgentMode::Plan {
+            let message = handle_enter_plan_mode(&self.run_context, &self.chat_session);
+            println!("{message}");
+            return;
+        }
+
+        let (message, approved) = handle_exit_plan_mode(
+            &self.run_context,
+            &self.chat_session,
+            &self.task_manager,
+            &[],
+        );
+        if approved {
+            if let Err(error) =
+                restore_runtime_after_plan(&self.run_context, &self.chat_session, self.coordinator)
+            {
+                eprintln!(
+                    "Plan was approved, but runtime capabilities could not be restored: {error}"
+                );
+                return;
+            }
+        }
+        println!("{message}");
     }
 
     /// Push an `EditorInput` payload (possibly with `@file` references) as
@@ -1319,6 +1424,14 @@ impl ChatRepl {
             self.chat_session.agent_mode().display(),
             self.chat_session.mode_description()
         );
+        let runtime_mode = self.run_context.runtime_mode();
+        println!(
+            "  Capability: {} generation {}",
+            runtime_mode.display_name(),
+            runtime_mode.generation
+        );
+        println!("  Approval:   {}", runtime_mode.approval_semantics());
+        println!("  Budget:     {}", runtime_mode.budget_semantics());
         println!("  Messages:   {msg_count}");
         println!("  Est tokens: ~{tokens}");
         if let Some(pricing) = session::get_pricing(&self.chat_session.model) {
@@ -2248,6 +2361,20 @@ impl ChatRepl {
                 return Err(gemini_tool_error_response(tool_call, &msg));
             }
         };
+        if let Err(reason) = self
+            .run_context
+            .admit_runtime_mode_tool(&tool_call.function.name, &tool_args_val)
+        {
+            push_observed_cli_tool_result_message(
+                &self.run_context,
+                &mut self.chat_session,
+                tool_call,
+                &tool_call.id,
+                &reason,
+                true,
+            );
+            return Err(gemini_tool_error_response(tool_call, &reason));
+        }
         if let Some(result) = self
             .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
             .await
@@ -2339,6 +2466,7 @@ impl ChatRepl {
             &self.chat_session,
             &self.task_manager,
             result,
+            self.coordinator,
         );
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
@@ -2940,6 +3068,7 @@ impl ChatRepl {
             &self.chat_session,
             &self.task_manager,
             &result,
+            self.coordinator,
         );
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
@@ -3023,6 +3152,20 @@ impl ChatRepl {
                 return None;
             }
         };
+        if let Err(reason) = self
+            .run_context
+            .admit_runtime_mode_tool(&tool_call.function.name, &tool_args_val)
+        {
+            push_observed_cli_tool_result_message(
+                &self.run_context,
+                &mut self.chat_session,
+                tool_call,
+                &tool_call.id,
+                &reason,
+                true,
+            );
+            return None;
+        }
         if let Some(result) = self
             .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
             .await
@@ -3613,6 +3756,7 @@ impl ChatRepl {
             &self.chat_session,
             &self.task_manager,
             &result,
+            self.coordinator,
         );
         let final_content = final_result.content();
         let final_is_error = final_result.is_error();
@@ -3787,12 +3931,7 @@ impl ChatRepl {
                 true
             }
             SlashCommandResult::ToggleMode => {
-                self.chat_session.toggle_mode();
-                println!(
-                    "\nSwitched to {} mode: {}\n",
-                    self.chat_session.agent_mode().display(),
-                    self.chat_session.mode_description()
-                );
+                self.toggle_plan_mode();
                 false
             }
             SlashCommandResult::Status => {
@@ -4118,6 +4257,37 @@ mod tests {
         .expect("isolated chat REPL test run")
     }
 
+    #[test]
+    fn restricted_modes_identify_effectful_local_shortcuts_before_dispatch() {
+        for input in [
+            "/export",
+            "/editor",
+            "/init",
+            "/review",
+            "/mcp help",
+            "/plugin list",
+            "/commit",
+            "/commit-push-pr",
+            "/login",
+            "/add-dir ../other",
+            "/branch checkpoint",
+            "/memory reset confirm",
+            "/example-plugin:command",
+        ] {
+            assert!(
+                effectful_slash_operation(input).is_some(),
+                "effectful shortcut must be mode-gated: {input}"
+            );
+        }
+        for input in ["/status", "/doctor", "/find mode", "/memory list", "/skill"] {
+            assert_eq!(
+                effectful_slash_operation(input),
+                None,
+                "observational shortcut should remain available: {input}"
+            );
+        }
+    }
+
     fn test_session_at(root: &std::path::Path, provider: &str) -> Session {
         let session = Session::new("test-model", provider);
         session.update_state(|state, _| {
@@ -4149,19 +4319,26 @@ mod tests {
         .build()
         .expect("parent REPL run");
         let loaded = test_session_at(root.path(), "anthropic");
+        loaded.set_behavior_mode(openclaudia::modes::BehaviorMode::from_preset(
+            openclaudia::modes::Preset::Explore,
+        ));
 
-        let derived = derive_repl_session_run(&parent, &loaded, "anthropic")
+        let derived = derive_repl_session_run(&parent, &loaded, "anthropic", false)
             .expect("same-project session must derive");
         assert_eq!(derived.session_id(), loaded.id());
         assert_eq!(derived.project_root(), parent.project_root());
         assert_ne!(derived.run_id(), parent.run_id());
+        assert_eq!(
+            derived.runtime_mode().class,
+            openclaudia::modes::RuntimeModeClass::ReadOnly
+        );
 
         let foreign_session = test_session_at(foreign.path(), "anthropic");
-        let foreign_error = derive_repl_session_run(&parent, &foreign_session, "anthropic")
+        let foreign_error = derive_repl_session_run(&parent, &foreign_session, "anthropic", false)
             .expect_err("foreign project must not widen launch authority");
         assert!(foreign_error.contains("differs from the authorized launch project"));
 
-        let provider_error = derive_repl_session_run(&parent, &loaded, "openai")
+        let provider_error = derive_repl_session_run(&parent, &loaded, "openai", false)
             .expect_err("foreign provider must not retain a mismatched transport");
         assert!(provider_error.contains("differs from the active provider"));
     }
