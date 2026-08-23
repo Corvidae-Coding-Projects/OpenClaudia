@@ -1,6 +1,6 @@
 {
   "next_display_id": 1107,
-  "next_comment_id": 1291,
+  "next_comment_id": 1292,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22196,7 +22196,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T04:54:39.590578744Z",
-      "updated_at": "2026-08-23T04:59:36.539174974Z",
+      "updated_at": "2026-08-23T05:50:08.572217335Z",
       "labels": [
         "remediation"
       ],
@@ -22209,6 +22209,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmkuDussuZ//dvxFDf0l1mic4Ko5rv4G7cDee0b/n1hQNOt1HNYhZBhn6ktyK4QT6jnLdm/gtTKq05QOy5ax1CQ=="
+        },
+        "9db94bf3-37c7-4e77-8468-b3299026509c": {
+          "display_id": 1291,
+          "author": "6Vw9",
+          "content": "result: 684a812 fix(runtime): make provider terminal outcomes truthful. Added shared provider terminal classification and protocol-complete stream validation; rejected truncation, refusal, filtering, incomplete tools, and failed/cancelled loops across TUI, REPL, print, ACP, child-agent, and VDD paths. Verification: Rust 1.98 cargo fmt --check; cargo check --all-features --all-targets; cargo clippy --all-features --all-targets -- -D warnings; full cargo test --all-features -- --test-threads=1 (exit 0); focused terminal/accumulator/ACP/VDD tests; git diff --check; added-lines security/unfinished-code scan.",
+          "created_at": "2026-08-23T05:50:08.569489622Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8956Epf6XxAmtlcueWJIAZVC3erEqQnMhpQjes7aEIDnkqxt/aejGx5plOjhjiOuHrk/d3P72LaIZNjLhfabDg=="
         },
         "e300e824-9eb6-4e17-bbb8-86fed1e9afe2": {
           "display_id": 1288,
@@ -34600,11 +34609,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1109,
       "timestamp": "2026-08-23T05:49:30.736961057Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1110,
+      "timestamp": "2026-08-23T05:50:08.572217335Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T05:49:30.736961057Z",
+    "timestamp": "2026-08-23T05:50:08.572217335Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1109
+    "agent_seq": 1110
   }
 }
