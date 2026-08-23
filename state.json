@@ -1,6 +1,6 @@
 {
   "next_display_id": 1102,
-  "next_comment_id": 1258,
+  "next_comment_id": 1259,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15667,7 +15667,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T22:04:35.596607994Z",
-      "updated_at": "2026-08-23T00:25:50.728926723Z",
+      "updated_at": "2026-08-23T00:26:30.854805667Z",
       "comments": {
         "0add13a1-6ec0-4ca3-af31-5660633fe077": {
           "display_id": 1257,
@@ -15713,6 +15713,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOb2e+i+9IW/64pT3EjgrD3o6o6jtL6OB95SQDxGnCPlAlBAhgE8mcNgnhLxs2b5f1UPW5MdV7yyPKZ6iZpM+Dw=="
+        },
+        "a07ccdd6-9a36-4fcd-8151-144a0fa969ea": {
+          "display_id": 1258,
+          "author": "6Vw9",
+          "content": "Delivered 9960dbf (feat(openai): preserve Responses continuation). Exact store:false Responses output now round-trips across the shared pipeline, TUI, ACP, print, child-run, session, and bounded proxy seams; replay fails closed on structural/identity/facet/generation drift, session updates are atomic, and orphan recovery is private. Rust 1.98 strict Clippy, full all-target/all-feature tests, Windows GNU check, fuzz gates, repository policy/hygiene, locked metadata, and root/fuzz cargo-deny passed. Residual causal compaction, protected reasoning, scoped terminal outcomes, durable ACP multi-session state, and proxy ownership remain assigned to their documented slices.",
+          "created_at": "2026-08-23T00:26:30.851984709Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAnnSMS+KpzyfnGPGrhwNN+MCDl2Bf5TFPINBq2aRi/4fTgB3gS2DOr7mFd/vh30+yDuv8/x46JmDd/Qf0gwNGDw=="
         },
         "a2b57106-1e01-40f4-aae6-1077516519c2": {
           "display_id": 1253,
@@ -33926,11 +33935,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1052,
       "timestamp": "2026-08-23T00:25:50.728926723Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1053,
+      "timestamp": "2026-08-23T00:26:30.854805667Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T00:25:50.728926723Z",
+    "timestamp": "2026-08-23T00:26:30.854805667Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1052
+    "agent_seq": 1053
   }
 }
