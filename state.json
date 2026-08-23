@@ -25692,12 +25692,13 @@
       "display_id": 1101,
       "title": "Exclude Crosslink runtime state from verification artifact snapshots",
       "description": "The ProjectSourceTreeV3 freshness snapshot traverses ignored .crosslink runtime state, including issues.db and local keys. Crosslink hooks can mutate issues.db during a quality-gate snapshot, causing nondeterministic InvalidEvidenceProvenance failures; reading local control-plane secrets/state also lies outside source verification. Explicitly exclude ignored Crosslink runtime paths while retaining tracked hook-config.json and bundled rules, add adversarial tests, and preserve fail-closed detection for source mutations.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T23:44:49.419688674Z",
-      "updated_at": "2026-08-23T00:25:29.023202533Z",
+      "updated_at": "2026-08-23T00:25:33.124924706Z",
+      "closed_at": "2026-08-23T00:25:33.124923325Z",
       "comments": {
         "61dab9dd-34ad-4296-8cac-fd799fb75b23": {
           "display_id": 1255,
@@ -33905,11 +33906,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1049,
       "timestamp": "2026-08-23T00:25:29.023202533Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1050,
+      "timestamp": "2026-08-23T00:25:33.124924706Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T00:25:29.023202533Z",
+    "timestamp": "2026-08-23T00:25:33.124924706Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1049
+    "agent_seq": 1050
   }
 }
