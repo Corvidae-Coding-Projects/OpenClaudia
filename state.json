@@ -1,6 +1,6 @@
 {
   "next_display_id": 1114,
-  "next_comment_id": 1339,
+  "next_comment_id": 1340,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1444,7 +1444,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:38.668193082Z",
-      "updated_at": "2026-08-23T12:15:26.530490875Z",
+      "updated_at": "2026-08-23T12:15:44.012516728Z",
       "closed_at": "2026-08-23T12:15:26.530489357Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
@@ -1477,6 +1477,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7KxFSAN7DiT8rDVp3cGHuGlmgWI3EKOYhC6dmSsFcs2dXOUKbQx6jGZkCl/7UY7wILPZiCMv+9MMapnn/qgpCw=="
+        },
+        "6e390aac-828a-40ac-af87-07a5e146f99a": {
+          "display_id": 1339,
+          "author": "6Vw9",
+          "content": "Delivered generation-bound approved path/tool targets across CLI, legacy REPL, TUI startup/resume, persisted sessions, plan restore, derived frontend runs, and subagents. Explicit adjacent/narrow scopes now enforce canonical targets while implicit adjacent preserves existing run capabilities; acceptance and regression coverage pass on Rust 1.98.",
+          "created_at": "2026-08-23T12:15:44.009992286Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAaoGSKCZTKBywVEtIL1jiKwcOi/ZLlhuqmn6WTBJrL1VOko5p5AHfBHc5s9v84+soXnROXjdgndm4AMZCPV8SDw=="
         },
         "934c6f01-6eeb-4b2d-9d5b-9d2a0b2be35a": {
           "display_id": 1333,
@@ -35628,11 +35637,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1200,
       "timestamp": "2026-08-23T12:15:31.019620303Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1201,
+      "timestamp": "2026-08-23T12:15:44.012516728Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T12:15:31.019620303Z",
+    "timestamp": "2026-08-23T12:15:44.012516728Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1200
+    "agent_seq": 1201
   }
 }
