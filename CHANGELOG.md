@@ -172,6 +172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Complete typed plan-mode follow-ups in the full-screen TUI (#1111)
 - S-014: Make behavioral modes enforce capabilities (#1109)
 - S-057: Replace lossy compaction with causal checkpoints (#1108)
 - S-051: Unify token, turn, cost, retry, and concurrency budgets (#1107)
