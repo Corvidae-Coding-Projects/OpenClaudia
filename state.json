@@ -16777,12 +16777,13 @@
       "display_id": 1104,
       "title": "S-048: Centralize hardened provider HTTP transport",
       "description": "Implement docs/remediation-slices/048-hardened-provider-http-transport.md. Give every provider and auth request one bounded, cancellable, redacting HTTP policy: TLS/proxy provenance, redirects, phased and total deadlines, bounded retries only when safe, body/stream limits, normalized status/errors, and credential stripping. Cover real provider/auth call paths and deterministic slow/oversized/retry/redirect/cancellation/secret-echo fixtures without expanding into S-050 terminal outcomes.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T03:46:31.098891631Z",
-      "updated_at": "2026-08-23T04:51:46.556941938Z",
+      "updated_at": "2026-08-23T04:52:12.754444388Z",
+      "closed_at": "2026-08-23T04:52:12.754442742Z",
       "labels": [
         "remediation"
       ],
@@ -34468,11 +34469,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1098,
       "timestamp": "2026-08-23T04:52:08.411490084Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1099,
+      "timestamp": "2026-08-23T04:52:12.754444388Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T04:52:08.411490084Z",
+    "timestamp": "2026-08-23T04:52:12.754444388Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1098
+    "agent_seq": 1099
   }
 }
