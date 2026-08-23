@@ -1,6 +1,6 @@
 {
   "next_display_id": 1116,
-  "next_comment_id": 1368,
+  "next_comment_id": 1369,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17247,10 +17247,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T14:22:39.418758535Z",
-      "updated_at": "2026-08-23T14:22:43.727449960Z",
+      "updated_at": "2026-08-23T14:23:03.547300860Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "c669129b-268d-4eab-8c94-9b2696374d7e": {
+          "display_id": 1368,
+          "author": "6Vw9",
+          "content": "Build S-041 around one practical job record and supervisor: full UUID identity bound to exact run/session/workspace/capability/budget generations; bounded byte-chunk stdout/stderr events in one ordered stream; cursor replay without destructive reads; finite deadline plus run cancellation; typed terminal state and confirmed tree reap; atomically persisted bounded records with running records reconciled to lost after restart and never reattached by PID. Preserve current bash/bash_output/kill_shell UX where compatible and add cursor/status fields rather than redesigning unrelated frontends.",
+          "created_at": "2026-08-23T14:23:03.544929594Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFX06IanKAfcd3yKSDfuRqtw8OE4CAr8KvoXXR2rurRCIdMLOHI02K7gUZUo7lfKvWC4Wnn92Kf1vLpBqWTgNDw=="
+        }
+      }
     },
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": {
       "uuid": "8e4a5961-7f8d-4650-81ff-7ea7d29be200",
@@ -36183,11 +36194,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1247,
       "timestamp": "2026-08-23T14:22:49.158824039Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1248,
+      "timestamp": "2026-08-23T14:23:03.547300860Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T14:22:49.158824039Z",
+    "timestamp": "2026-08-23T14:23:03.547300860Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1247
+    "agent_seq": 1248
   }
 }
