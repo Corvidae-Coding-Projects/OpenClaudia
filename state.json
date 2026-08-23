@@ -1,6 +1,6 @@
 {
   "next_display_id": 1113,
-  "next_comment_id": 1323,
+  "next_comment_id": 1324,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8079,7 +8079,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-23T10:09:46.212581802Z",
+      "updated_at": "2026-08-23T10:10:47.746185915Z",
       "labels": [
         "remediation"
       ],
@@ -8392,6 +8392,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAw40CRyaAIM4uYwUnRnCnCluiysma+Bx+ernHK8iCwjh5E0/+VKRclqY0hcBciuqwk8rffLEUfE91cw7sBFqYCQ=="
+        },
+        "bd8515ce-12e0-4177-b706-8f41e1b18cad": {
+          "display_id": 1323,
+          "author": "6Vw9",
+          "content": "Completed and closed S-014/#1109. Signed commits: 6dc02af1 runtime capability profiles and 000c06a9 exact generated changelog. Rust 1.98 fmt, strict Clippy, full workspace/all-target/all-feature serialized tests passed. cargo clean reclaimed 52.5 GiB; swap reset. Parent #1071 remains open. Follow-ups: #1110 scoped targets, #1111 TUI typed plan follow-ups, #1112 in-flight effect revocation.",
+          "created_at": "2026-08-23T10:10:47.743560482Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA4pE3y/dxUBQOAt9sdieADwnryVaHdQIYRNTLdA8n5yanevWIyQSqBJWsQxdTPsQk2pMlQlKWl7r4wqe7EtBZAw=="
         },
         "bedb5681-9581-43b5-ae49-73d5efd92ac5": {
           "display_id": 1139,
@@ -35333,11 +35342,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1175,
       "timestamp": "2026-08-23T10:10:43.319786923Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1176,
+      "timestamp": "2026-08-23T10:10:47.746185915Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T10:10:43.319786923Z",
+    "timestamp": "2026-08-23T10:10:47.746185915Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1175
+    "agent_seq": 1176
   }
 }
