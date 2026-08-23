@@ -1,6 +1,6 @@
 {
   "next_display_id": 1120,
-  "next_comment_id": 1397,
+  "next_comment_id": 1398,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24865,10 +24865,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:59:50.703902730Z",
-      "updated_at": "2026-08-23T16:12:30.707612431Z",
+      "updated_at": "2026-08-23T17:21:21.683410162Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "f5aa70e1-86b4-4d00-a092-d90f28a0342e": {
+          "display_id": 1397,
+          "author": "6Vw9",
+          "content": "[plan] Replace writable project binds with a run-owned baseline/candidate transaction on the project filesystem. Bubblewrap receives only the candidate descriptor. Track changed top-level entries, reject protected/denied/symlink-escape changes, compare the exact host generation to the stable baseline, and publish with descriptor-relative atomic rename plus a durable recovery record; nonzero/timeout/cancel/error rolls back. Carry the prepared transaction through the shared supervisor, background jobs, hooks/Git, and checkpoint long-lived MCP stdio after each request. Keep read-only profiles and S-073 worktree apply out of scope. Verify real Linux ordinary edits, absent control paths, conflicts, rollback/cancellation, and representative hook/Git/MCP workflows with Rust 1.98 and serialized Cargo.",
+          "created_at": "2026-08-23T17:21:21.680948341Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAG41BYZzKrmvVIUIltXANdq1AwyN7nYdrNtvQNX/aeX7WihX0U8V8gOinv8aUTpx6pDHIYLpwPiH7rAiEBs98AQ=="
+        }
+      }
     },
     "cf799d41-a385-469d-9c2e-d9fcc088ddb0": {
       "uuid": "cf799d41-a385-469d-9c2e-d9fcc088ddb0",
@@ -36779,11 +36790,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1299,
       "timestamp": "2026-08-23T17:07:37.882557664Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1300,
+      "timestamp": "2026-08-23T17:21:21.683410162Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T17:07:37.882557664Z",
+    "timestamp": "2026-08-23T17:21:21.683410162Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1299
+    "agent_seq": 1300
   }
 }
