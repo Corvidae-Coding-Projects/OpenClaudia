@@ -1,6 +1,6 @@
 {
   "next_display_id": 1118,
-  "next_comment_id": 1382,
+  "next_comment_id": 1383,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28205,7 +28205,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:33:45.737689540Z",
-      "updated_at": "2026-08-23T15:41:47.291881398Z",
+      "updated_at": "2026-08-23T15:59:30.511015114Z",
       "labels": [
         "remediation"
       ],
@@ -28227,6 +28227,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl5DLWis512J78IkmJ0GMl7/LvmKc75ugRnW3TOYwgv6qlH8u4CzVjZdbeSQpF36xQuKKvcoUv7DhhcJdL1ndDg=="
+        },
+        "ee6c2a5a-63f2-42a7-8552-812559d6a0e2": {
+          "display_id": 1382,
+          "author": "6Vw9",
+          "content": "Implementation now has one central typed profile matrix. Parser/header-helper/browser profiles are scratch-only; LSP/static-analysis/quality profiles see project read-only with Cargo/Python output redirected to run scratch; hooks/MCP/Git see only project plus scratch; shell alone retains all run-bound roots. Non-shell profiles exclude credential-shaped general environment, explicit env overlays are restricted, document children cannot fork, MCP drops unrelated parent roots/secrets, and effective mount/env/network/device/child grants are traced without values. Targeted runtime and integration tests pass. The remaining F-049 problem is architectural: absent reserved names cannot be subtracted from an otherwise writable bind mount without an overlay/broker; it must be handled by transactional workspace projection rather than a misleading path check.",
+          "created_at": "2026-08-23T15:59:30.506763189Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+nSy5dClrd+dHPQKeTOY9p9O2x0Vwy3QiVW8C84SpqD28PxJP47u9CkqcQR0KhrQGX7rCa7+SqOqv9yG/WLaCg=="
         }
       }
     },
@@ -36474,11 +36483,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1272,
       "timestamp": "2026-08-23T15:41:47.291881398Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1273,
+      "timestamp": "2026-08-23T15:59:30.511015114Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:41:47.291881398Z",
+    "timestamp": "2026-08-23T15:59:30.511015114Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1272
+    "agent_seq": 1273
   }
 }
