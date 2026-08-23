@@ -173,6 +173,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-041: Own background process lifetime and output (#1115)
 - S-040: Supervise foreground process I/O (#1114)
 - Reap sandbox processes left by bash background tests (#1067)
 - Refresh capability evidence after dormant-feature promotions (#1113)
