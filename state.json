@@ -10516,12 +10516,13 @@
       "display_id": 1102,
       "title": "S-046: Repair Gemini and Ollama tool history",
       "description": "Implement docs/remediation-slices/046-gemini-ollama-tool-history.md on top of S-044. Preserve provider-native call/result identity, arguments, ordering, parallel/batched semantics, and resume for Gemini and Ollama across every production consumer. Reject malformed, missing, duplicated, or reordered protocol history instead of flattening or dropping it. Do not remove provider capabilities or claim adjacent model-catalog, reasoning-privacy, terminal-outcome, or transport slices complete.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T00:29:40.630208184Z",
-      "updated_at": "2026-08-23T02:14:58.254939116Z",
+      "updated_at": "2026-08-23T02:15:07.411310808Z",
+      "closed_at": "2026-08-23T02:15:07.411309199Z",
       "labels": [
         "remediation"
       ],
@@ -34096,11 +34097,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1066,
       "timestamp": "2026-08-23T02:14:58.254939116Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1067,
+      "timestamp": "2026-08-23T02:15:07.411310808Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T02:14:58.254939116Z",
+    "timestamp": "2026-08-23T02:15:07.411310808Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1066
+    "agent_seq": 1067
   }
 }
