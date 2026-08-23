@@ -1,6 +1,6 @@
 {
   "next_display_id": 1117,
-  "next_comment_id": 1376,
+  "next_comment_id": 1377,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17244,7 +17244,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T14:22:39.418758535Z",
-      "updated_at": "2026-08-23T15:28:54.835045342Z",
+      "updated_at": "2026-08-23T15:31:42.048891332Z",
       "closed_at": "2026-08-23T15:28:30.752497802Z",
       "labels": [
         "remediation"
@@ -17258,6 +17258,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFPLBengPdy+SmxkklFQpzXzhzHrjGfjehkfi7UsQ5/Gz0MZ5EowMoOICzBhNfrml0578MJfQId5KkMrUnHCHBg=="
+        },
+        "1baec7b3-3a55-4926-b150-3fdf55825d62": {
+          "display_id": 1376,
+          "author": "6Vw9",
+          "content": "Follow-up storage maintenance is tracked separately as #1116: per-record and working-set bounds are delivered here; #1116 will apply a race-safe aggregate retention policy to validated terminal artifact directories without changing S-041 process ownership.",
+          "created_at": "2026-08-23T15:31:42.045949822Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmNqDIv6ZGo2NievbwXn5yqstS6ZMdAXlaaiyZmHl/2MHH5MHBZqPmdL96YAhKzEkSXLlTK+FdyAqwN3dDHAHBg=="
         },
         "3ee00081-9283-49ba-ae6c-fff418a65489": {
           "display_id": 1370,
@@ -36340,11 +36349,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1261,
       "timestamp": "2026-08-23T15:31:19.034933585Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1262,
+      "timestamp": "2026-08-23T15:31:42.048891332Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:31:19.034933585Z",
+    "timestamp": "2026-08-23T15:31:42.048891332Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1261
+    "agent_seq": 1262
   }
 }
