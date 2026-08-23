@@ -1615,7 +1615,15 @@ impl AcpServer {
                     .fail_prompt_with_update(acp_session_id, &format!("Provider error: {e}"));
             }
         };
-        let client = reqwest::Client::new();
+        let client = match crate::provider_transport::shared_client() {
+            Ok(client) => client,
+            Err(error) => {
+                return self.fail_prompt_with_update(
+                    acp_session_id,
+                    &format!("Provider transport initialization failed: {error}"),
+                );
+            }
+        };
         let wire_api = if self.codex_responses_auth.is_some() {
             crate::pipeline::WireApi::OpenAiResponses
         } else {
@@ -1844,7 +1852,7 @@ impl AcpServer {
 
             // Send request
             debug!(iteration, "Sending provider request");
-            let response = match req.send().await {
+            let response = match crate::provider_transport::send(req).await {
                 Ok(r) => r,
                 Err(e) => {
                     return self
@@ -1906,7 +1914,12 @@ impl AcpServer {
                 let (stream_result, state) = acp_responses_stream_result(decoded);
                 (stream_result, Some(state))
             } else if uses_native_json {
-                let native_json = match response.json::<Value>().await {
+                let native_json = match crate::provider_transport::read_json_capped::<Value>(
+                    response,
+                    crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+                )
+                .await
+                {
                     Ok(response) => response,
                     Err(error) => {
                         return self.fail_prompt_with_update(
@@ -2090,7 +2103,10 @@ impl AcpServer {
     ) -> StreamResult {
         use futures::StreamExt;
 
-        let mut stream = response.bytes_stream();
+        let mut stream = crate::provider_transport::bounded_byte_stream(
+            response,
+            crate::provider_transport::MAX_STREAM_RESPONSE_BYTES,
+        );
         let mut buffer = String::new();
         let mut full_content = String::new();
         let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();

@@ -125,6 +125,9 @@ pub enum ProxyError {
     #[error("Request error: {0}")]
     RequestError(#[from] reqwest::Error),
 
+    #[error("Provider transport error: {0}")]
+    ProviderTransport(#[from] crate::provider_transport::ProviderTransportError),
+
     #[error("Invalid request body: {0}")]
     InvalidBody(String),
 
@@ -142,7 +145,9 @@ impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
             Self::NoApiKey(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
-            Self::RequestError(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            Self::RequestError(_) | Self::ProviderTransport(_) => {
+                (StatusCode::BAD_GATEWAY, self.to_string())
+            }
             Self::HookBlocked(_) | Self::PolicyDenied(_) => {
                 (StatusCode::FORBIDDEN, self.to_string())
             }
@@ -527,7 +532,8 @@ async fn model_list_json_for_state(state: &ProxyState) -> Value {
     if adapter.supports_model_listing() {
         if let Some(provider_config) = state.config.active_provider() {
             let extra_headers = provider_config.headers.clone();
-            match providers::discover_model_catalog_with_headers(
+            match providers::discover_model_catalog_for_provider_with_headers(
+                target,
                 &provider_config.base_url,
                 provider_config.api_key.as_ref(),
                 &extra_headers,
@@ -1384,6 +1390,7 @@ async fn transform_and_forward(
     forward_to_provider_raw_reqwest(
         &state.client,
         provider,
+        provider_name,
         &adapter.chat_endpoint(&request.model),
         &transformed_request,
         is_stream,
@@ -1879,6 +1886,7 @@ async fn send_oauth_anthropic_messages(
     crate::claude_credentials::strip_cache_control_ttl(request);
 
     let url = format!("{}/v1/messages", normalize_base_url(&provider.base_url));
+    crate::provider_transport::validate_endpoint("anthropic", &url)?;
     let headers =
         crate::providers::AnthropicAdapter::oauth_headers(&session.credentials.access_token);
     let mut merged = headers;
@@ -1886,7 +1894,7 @@ async fn send_oauth_anthropic_messages(
     let builder = merged
         .apply(client.post(&url).json(request))
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
-    let response = builder.send().await?;
+    let response = crate::provider_transport::send(builder).await?;
     convert_response(
         UpstreamResponse {
             response,
@@ -2001,6 +2009,7 @@ async fn proxy_passthrough(
         normalize_base_url(&provider.base_url),
         path_and_query
     );
+    crate::provider_transport::validate_endpoint(&state.config.proxy.target, &url)?;
     debug!("Passthrough request");
 
     let body = axum::body::to_bytes(request.into_body(), state.config.proxy.max_response_bytes)
@@ -2034,7 +2043,7 @@ async fn proxy_passthrough(
         .apply(req_builder)
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
 
-    let response = req_builder.send().await?;
+    let response = crate::provider_transport::send(req_builder).await?;
     convert_response(
         UpstreamResponse {
             response,
@@ -2126,30 +2135,16 @@ fn extract_api_key(headers: &HeaderMap) -> Result<Option<ApiKey>, ProxyError> {
 /// Read a [`reqwest::Response`] body up to `max_bytes`, returning the
 /// accumulated data as a `Vec<u8>`.
 ///
-/// Returns [`ProxyError::InvalidBody`] if the stream exceeds the limit or
-/// any chunk yields an I/O error, preventing memory-exhaustion `DoS` from
-/// hostile or buggy upstreams.
+/// Returns a typed [`ProxyError::ProviderTransport`] failure if the stream
+/// exceeds the limit or any chunk yields an I/O error, preventing
+/// memory-exhaustion `DoS` from hostile or buggy upstreams.
 async fn read_body_capped(
     response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ProxyError> {
-    use futures::StreamExt as _;
-
-    let mut stream = response.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| ProxyError::InvalidBody(format!("upstream body read error: {e}")))?;
-        if buf.len() + chunk.len() > max_bytes {
-            return Err(ProxyError::InvalidBody(format!(
-                "upstream response exceeded {max_bytes}-byte limit"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-
-    Ok(buf)
+    crate::provider_transport::read_body_capped(response, max_bytes)
+        .await
+        .map_err(ProxyError::ProviderTransport)
 }
 
 /// Convert a non-streaming chat-completion response to `OpenAI` shape, also
@@ -2383,6 +2378,7 @@ async fn forward_to_provider<T: Serialize + Sync>(
     is_stream: bool,
 ) -> Result<UpstreamResponse, ProxyError> {
     let url = format!("{}{}", normalize_base_url(&provider.base_url), path);
+    crate::provider_transport::validate_endpoint(provider_name, &url)?;
     debug!(stream = is_stream, "Forwarding to provider");
 
     let req = client.post(&url).json(body);
@@ -2403,7 +2399,7 @@ async fn forward_to_provider<T: Serialize + Sync>(
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
 
     Ok(UpstreamResponse {
-        response: req.send().await?,
+        response: crate::provider_transport::send(req).await?,
         request_headers: headers,
     })
 }
@@ -2413,12 +2409,14 @@ async fn forward_to_provider<T: Serialize + Sync>(
 async fn forward_to_provider_raw_reqwest(
     client: &Client,
     provider: &ProviderConfig,
+    provider_name: &str,
     path: &str,
     body: &Value,
     is_stream: bool,
     custom_headers: crate::secrets::SensitiveHeaders,
 ) -> Result<UpstreamResponse, ProxyError> {
     let url = format!("{}{}", normalize_base_url(&provider.base_url), path);
+    crate::provider_transport::validate_endpoint(provider_name, &url)?;
     debug!(stream = is_stream, "Forwarding to provider (raw/reqwest)");
 
     let mut headers = custom_headers;
@@ -2428,7 +2426,7 @@ async fn forward_to_provider_raw_reqwest(
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
 
     Ok(UpstreamResponse {
-        response: req.send().await?,
+        response: crate::provider_transport::send(req).await?,
         request_headers: headers,
     })
 }
@@ -2510,9 +2508,8 @@ async fn build_proxy_state_with_loop_control(
     config: AppConfig,
     loop_control: Option<Arc<LoopControl>>,
 ) -> anyhow::Result<ProxyState> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_mins(5))
-        .build()?;
+    let client = crate::provider_transport::shared_client()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
     // Compose host hooks above exact, explicitly approved compatibility imports.
     let merged_hooks = load_effective_hooks(config.hooks.clone());
@@ -3331,10 +3328,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = minimal_config("openai");
+        let mut config = minimal_config("local");
         config
             .providers
-            .insert("openai".to_string(), test_provider_config(server.uri()));
+            .insert("local".to_string(), test_provider_config(server.uri()));
         let state = test_proxy_state(config);
 
         let response = model_list_json_for_state(&state).await;
@@ -3416,10 +3413,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = minimal_config("openai");
+        let mut config = minimal_config("local");
         config
             .providers
-            .insert("openai".to_string(), test_provider_config(server.uri()));
+            .insert("local".to_string(), test_provider_config(server.uri()));
         let state = test_proxy_state(config);
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -3951,7 +3948,7 @@ mod tests {
     #[test]
     fn model_catalog_contract_allows_unknown_models_and_known_limits() {
         let unknown = test_chat_request("operator-installed-model", Some(64));
-        enforce_model_catalog_contract("ollama", &unknown).expect("unknown capability is allowed");
+        enforce_model_catalog_contract("qwen", &unknown).expect("unknown capability is allowed");
 
         let known = test_chat_request("gpt-5.6-sol", Some(128_000));
         enforce_model_catalog_contract("openai", &known).expect("known limit is allowed");
@@ -4125,14 +4122,14 @@ mod tests {
     /// Spec — `read_body_capped` rejects a body that exceeds `max_bytes`.
     ///
     /// A hostile upstream streaming more than the configured limit must receive
-    /// a `ProxyError::InvalidBody` rather than silently exhausting allocator
-    /// memory (memory-DoS vector closed by #304 / crosslink #352).
+    /// a typed transport error rather than silently exhausting allocator memory
+    /// (memory-DoS vector closed by #304 / crosslink #352).
     #[tokio::test]
     async fn read_body_capped_rejects_oversize_body() {
         use tokio::io::AsyncWriteExt as _;
 
         // Spin up a minimal HTTP/1.1 server that returns a 6-byte body,
-        // then cap the read at 4 bytes. The helper must return InvalidBody.
+        // then cap the read at 4 bytes. The helper must retain the exact limit.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -4150,17 +4147,14 @@ mod tests {
         let err = read_body_capped(response, 4).await.unwrap_err();
 
         match err {
-            ProxyError::InvalidBody(msg) => {
-                assert!(
-                    msg.contains("exceeded") || msg.contains("limit"),
-                    "error message must describe the size limit, got: {msg}"
-                );
-            }
-            other => panic!("expected InvalidBody, got: {other:?}"),
+            ProxyError::ProviderTransport(
+                crate::provider_transport::ProviderTransportError::ResponseTooLarge { limit },
+            ) => assert_eq!(limit, 4),
+            other => panic!("expected typed response-size failure, got: {other:?}"),
         }
     }
 
-    /// Spec — `read_body_capped` surfaces async I/O errors as `InvalidBody`.
+    /// Spec — `read_body_capped` surfaces async I/O errors as transport failures.
     ///
     /// When an upstream closes the connection mid-stream, the error must reach
     /// the caller rather than being swallowed into an empty buffer that feeds
@@ -4197,8 +4191,13 @@ mod tests {
             "a truncated upstream body must surface as an error, not empty Ok"
         );
         assert!(
-            matches!(result.unwrap_err(), ProxyError::InvalidBody(_)),
-            "truncated body error must be InvalidBody variant"
+            matches!(
+                result.unwrap_err(),
+                ProxyError::ProviderTransport(
+                    crate::provider_transport::ProviderTransportError::Body(_)
+                )
+            ),
+            "truncated body error must retain the typed body-read failure"
         );
     }
 

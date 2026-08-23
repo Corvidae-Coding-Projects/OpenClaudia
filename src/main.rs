@@ -1394,9 +1394,9 @@ fn open_workspace_memory_db(
 /// banner. Returns `None` when disabled — `cmd_chat` passes that
 /// through to every review call site so VDD is a no-op.
 ///
-/// Uses a 120-second reqwest timeout (the per-request timeout added
-/// in crosslink #496 applies inside the engine itself — this is the
-/// outer transport timeout). Extracted from `cmd_chat` per #262.
+/// VDD applies its configured per-call deadline inside the engine while the
+/// shared provider client supplies the canonical TLS, redirect, connect/read,
+/// and absolute transport policy. Extracted from `cmd_chat` per #262.
 fn init_vdd_engine_if_enabled(config: &config::AppConfig) -> Option<vdd::VddEngine> {
     init_vdd_engine_if_enabled_with_auth(config, None)
 }
@@ -1408,10 +1408,7 @@ fn init_vdd_engine_if_enabled_with_auth(
     if !config.vdd.enabled {
         return None;
     }
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_mins(2))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let http_client = openclaudia::provider_transport::shared_client_required();
     println!(
         "\x1b[33m🔍 VDD enabled ({} mode) - adversary: {}\x1b[0m",
         config.vdd.mode, config.vdd.adversary.provider

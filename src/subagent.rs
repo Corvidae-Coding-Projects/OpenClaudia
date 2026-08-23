@@ -3134,14 +3134,49 @@ async fn make_openai_responses_api_call(
     provider_native_state: Option<&crate::runtime::ProviderNativeState>,
     assistant_message_ordinal: u64,
 ) -> Result<crate::pipeline::OpenAiResponsesDecodedTurn, String> {
-    let endpoint = crate::pipeline::resolve_endpoint_for_wire(
-        crate::pipeline::WireApi::OpenAiResponses,
+    make_openai_responses_api_call_impl(
+        client,
         provider,
         model,
         base_url,
-        None,
+        auth,
+        extra_headers,
+        request_body,
+        provider_native_state,
+        assistant_message_ordinal,
+        true,
     )
-    .map_err(|error| format!("Responses endpoint error: {error}"))?;
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn make_openai_responses_api_call_impl(
+    client: &Client,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    auth: &crate::codex_credentials::CodexResponsesAuth,
+    extra_headers: Option<&crate::secrets::SensitiveHeaders>,
+    request_body: &Value,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
+    validate_endpoint: bool,
+) -> Result<crate::pipeline::OpenAiResponsesDecodedTurn, String> {
+    if !validate_endpoint && !cfg!(test) {
+        return Err("Responses endpoint validation cannot be disabled in production".to_string());
+    }
+    let endpoint = if validate_endpoint {
+        crate::pipeline::resolve_endpoint_for_wire(
+            crate::pipeline::WireApi::OpenAiResponses,
+            provider,
+            model,
+            base_url,
+            None,
+        )
+        .map_err(|error| format!("Responses endpoint error: {error}"))?
+    } else {
+        format!("{}/responses", crate::proxy::normalize_base_url(base_url))
+    };
     let mut headers = auth
         .headers()
         .map_err(|error| format!("Responses header error: {error}"))?;
@@ -3151,8 +3186,7 @@ async fn make_openai_responses_api_call(
     let request = headers
         .apply(client.post(endpoint).json(request_body))
         .map_err(|error| format!("Responses header error: {error}"))?;
-    let response = request
-        .send()
+    let response = crate::provider_transport::send(request)
         .await
         .map_err(|error| format!("Responses request failed: {error}"))?;
     if !response.status().is_success() {
@@ -3206,8 +3240,7 @@ async fn make_provider_native_json_api_call(
     let request = headers
         .apply(client.post(endpoint).json(request_body))
         .map_err(|error| format!("Provider header error: {error}"))?;
-    let response = request
-        .send()
+    let response = crate::provider_transport::send(request)
         .await
         .map_err(|error| format!("Provider request failed: {error}"))?;
     if !response.status().is_success() {
@@ -3220,10 +3253,12 @@ async fn make_provider_native_json_api_call(
             headers.sanitize_diagnostic(&body)
         ));
     }
-    let response = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Provider JSON error: {error}"))?;
+    let response = crate::provider_transport::read_json_capped::<Value>(
+        response,
+        crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|error| format!("Provider JSON error: {error}"))?;
     crate::pipeline::decode_provider_native_json_turn(
         provider,
         model,
@@ -3284,6 +3319,8 @@ async fn make_api_call(
         "{normalized_base}{}",
         adapter.chat_endpoint(&typed_request.model)
     );
+    crate::provider_transport::validate_endpoint(provider, &endpoint)
+        .map_err(|error| error.to_string())?;
 
     // Headers come from the adapter when an api_key is present. We
     // ensure a content-type header is set in all cases so providers
@@ -3300,8 +3337,7 @@ async fn make_api_call(
         .apply(client.post(&endpoint).json(&body))
         .map_err(|error| format!("invalid provider headers: {error}"))?;
 
-    let response = req
-        .send()
+    let response = crate::provider_transport::send(req)
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
 
@@ -3316,10 +3352,12 @@ async fn make_api_call(
         ));
     }
 
-    let json: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {e}"))?;
+    let json: Value = crate::provider_transport::read_json_capped(
+        response,
+        crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|e| format!("Failed to parse response: {e}"))?;
 
     // Translate provider-native response back to OpenAI chat shape so
     // `parse_response` (which expects `choices[0].message`) keeps
@@ -3548,7 +3586,15 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
     };
 
     // Create HTTP client
-    let client = Client::new();
+    let client = match crate::provider_transport::shared_client() {
+        Ok(client) => client,
+        Err(error) => {
+            return no_task_effect((
+                format!("Provider transport initialization failed: {error}"),
+                true,
+            ));
+        }
+    };
 
     if run_in_background {
         // Register the agent and spawn the task.
@@ -4419,7 +4465,7 @@ mod tests {
 
         let error = make_api_call(
             &reqwest::Client::new(),
-            "openai",
+            "local",
             &server.uri(),
             Some(&key),
             &request,
@@ -5831,7 +5877,7 @@ memory:
             mode: crate::codex_credentials::CodexAuthMode::ChatgptAuthTokens,
         };
 
-        let decoded = make_openai_responses_api_call(
+        let decoded = make_openai_responses_api_call_impl(
             &Client::new(),
             "openai",
             "gpt-test",
@@ -5841,6 +5887,7 @@ memory:
             &request_body,
             None,
             1,
+            false,
         )
         .await
         .expect("Responses child turn");

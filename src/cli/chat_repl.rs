@@ -522,7 +522,8 @@ impl ChatRepl {
         let Some(adapter) = resolve_repl_adapter(&config.proxy.target) else {
             anyhow::bail!("unknown provider target '{}'", config.proxy.target);
         };
-        let client = reqwest::Client::new();
+        let client = openclaudia::provider_transport::shared_client()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let hook_engine = build_hook_engine(&config);
         let (rl, history_path) = init_rustyline_with_history()?;
 
@@ -1592,7 +1593,7 @@ impl ChatRepl {
             }
         };
 
-        match req.send().await {
+        match openclaudia::provider_transport::send(req).await {
             Ok(response) => {
                 spinner.finish_and_clear();
                 if !response.status().is_success() {
@@ -1789,8 +1790,12 @@ impl ChatRepl {
         response: reqwest::Response,
         headers: &openclaudia::secrets::SensitiveHeaders,
     ) -> Option<serde_json::Value> {
-        let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
-        match serde_json::from_str::<serde_json::Value>(&body) {
+        match openclaudia::provider_transport::read_json_capped::<serde_json::Value>(
+            response,
+            openclaudia::provider_transport::MAX_JSON_RESPONSE_BYTES,
+        )
+        .await
+        {
             Ok(value) => Some(value),
             Err(error) => {
                 let diagnostic = headers.sanitize_diagnostic(&error.to_string());
@@ -1871,10 +1876,14 @@ impl ChatRepl {
                 return None;
             }
         };
-        match request.send().await {
+        match openclaudia::provider_transport::send(request).await {
             Ok(response) if response.status().is_success() => {
-                let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
-                serde_json::from_str(&body).map_or_else(
+                openclaudia::provider_transport::read_json_capped::<serde_json::Value>(
+                    response,
+                    openclaudia::provider_transport::MAX_JSON_RESPONSE_BYTES,
+                )
+                .await
+                .map_or_else(
                     |error| {
                         eprintln!(
                             "\nFailed to parse provider follow-up response: {}",
@@ -2217,6 +2226,12 @@ impl ChatRepl {
             )
             .await;
 
+        if let Some(error) = stream_result.transport_failure.as_deref() {
+            self.record_failed_turn(error);
+            eprintln!("\nProvider stream failed: {error}");
+            return false;
+        }
+
         let mut full_content = stream_result.full_content;
         let reasoning_content = stream_result.reasoning_content;
         let cancelled = stream_result.cancelled;
@@ -2373,8 +2388,13 @@ impl ChatRepl {
 
         let mut full_content = String::new();
         let mut reasoning_content = String::new();
-        let mut stream = response.bytes_stream().eventsource();
+        let mut stream = openclaudia::provider_transport::bounded_byte_stream(
+            response,
+            openclaudia::provider_transport::MAX_STREAM_RESPONSE_BYTES,
+        )
+        .eventsource();
         let mut cancelled = false;
+        let mut transport_failure = None;
         let mut pending_action: Option<SlashCommandResult> = None;
 
         let mut in_thinking_block = false;
@@ -2391,18 +2411,22 @@ impl ChatRepl {
                 Ok(Some(Ok(sse))) => sse,
                 Ok(Some(Err(e))) => {
                     eprintln!("\nStream error: {e}");
+                    transport_failure = Some(e.to_string());
                     break;
                 }
                 Ok(None) => break,
                 Err(_) => {
                     Self::handle_stream_timeout(&full_content);
+                    transport_failure = Some(format!(
+                        "Provider stream timed out after {} seconds",
+                        proxy::SSE_STREAM_TIMEOUT_SECS
+                    ));
                     break;
                 }
             };
             if sse.data == "[DONE]" {
                 break;
             }
-
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse.data) {
                 let mut ctx = SseFrameCtx {
                     full_content: &mut full_content,
@@ -2426,6 +2450,7 @@ impl ChatRepl {
             reasoning_content,
             cancelled,
             pending_action,
+            transport_failure,
         }
     }
 
@@ -2913,9 +2938,13 @@ impl ChatRepl {
                 return false;
             }
         };
-        match req.send().await {
+        match openclaudia::provider_transport::send(req).await {
             Ok(response) if response.status().is_success() => {
-                let mut stream = response.bytes_stream().eventsource();
+                let mut stream = openclaudia::provider_transport::bounded_byte_stream(
+                    response,
+                    openclaudia::provider_transport::MAX_STREAM_RESPONSE_BYTES,
+                )
+                .eventsource();
                 let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
                 loop {
                     let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
@@ -3208,13 +3237,17 @@ impl ChatRepl {
         else {
             return;
         };
-        let Ok(response) = req.send().await else {
+        let Ok(response) = openclaudia::provider_transport::send(req).await else {
             return;
         };
         if !response.status().is_success() {
             return;
         }
-        let mut stream = response.bytes_stream().eventsource();
+        let mut stream = openclaudia::provider_transport::bounded_byte_stream(
+            response,
+            openclaudia::provider_transport::MAX_STREAM_RESPONSE_BYTES,
+        )
+        .eventsource();
         let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
         let mut anthropic_accumulator = tools::AnthropicToolAccumulator::new();
         let mut in_thinking_block = false;
@@ -3530,6 +3563,7 @@ struct InitialStreamResult {
     reasoning_content: String,
     cancelled: bool,
     pending_action: Option<SlashCommandResult>,
+    transport_failure: Option<String>,
 }
 
 // ── Free helpers (no `self`) used by ChatRepl methods ──

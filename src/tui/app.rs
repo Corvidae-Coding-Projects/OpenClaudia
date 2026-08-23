@@ -701,14 +701,14 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
-    /// Construct an [`ApiClient`] with a fresh `reqwest::Client` and the
-    /// remaining fields defaulted (empty endpoint / headers, no token, no
+    /// Construct an [`ApiClient`] on the process-shared provider client with
+    /// the remaining fields defaulted (empty endpoint / headers, no token, no
     /// prompt-block split). The pipeline-bootstrap path fills these in via
     /// [`App::set_api_config`].
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::provider_transport::shared_client_required(),
             endpoint: String::new(),
             headers: crate::secrets::SensitiveHeaders::new(),
             wire_api: crate::pipeline::WireApi::ChatCompletions,
@@ -2827,7 +2827,8 @@ impl App {
             "Fetching models for {provider} from the configured /models endpoint..."
         )));
         handle.spawn(async move {
-            let event = match crate::providers::fetch_models_with_headers(
+            let event = match crate::providers::fetch_models_for_provider_with_headers(
+                &provider,
                 &provider_config.base_url,
                 provider_config.api_key.as_ref(),
                 &extra_headers,
@@ -5448,9 +5449,8 @@ mod tests {
 
     // ── ApiClient extraction (crosslink #253) ───────────────────────────
 
-    /// `ApiClient::new` initialises with empty transport state — no
-    /// endpoint, no headers, no token, no prompt blocks. The `reqwest::Client`
-    /// is a real fresh client.
+    /// `ApiClient::new` initialises with empty request state — no endpoint,
+    /// headers, token, or prompt blocks — on the shared provider transport.
     #[test]
     fn api_client_new_starts_empty() {
         let api = ApiClient::new();

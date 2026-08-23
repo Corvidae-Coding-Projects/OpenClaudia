@@ -141,7 +141,7 @@
         "observation": "The current contract binds state and redirect authority before token exchange.",
         "guidance": "Use the current authenticated contract when changing flow code.",
         "applicability": {"paths": ["src/oauth.rs"], "components": ["oauth"], "tags": ["verify"]},
-        "citations": [{"kind": "source_file", "locator": "src/oauth.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:4ebe3395bdbb1c962f948cf8086baa434ece1cb8fab314c60bea7ed0b12b91f7"}],
+        "citations": [{"kind": "source_file", "locator": "src/oauth.rs", "source_version": "worktree:s048", "digest": "sha256:da5ba7125f44c4f88b5a5c3a5a197ecc0efbbc0757c6184b693aa7b789d2b5bc"}],
         "confidence": "verified_by_test",
         "sensitivity": "confidential",
         "retention": {"policy": "indefinite"}
@@ -177,7 +177,7 @@
         "observation": "Doctor diagnostics must not acquire a migration lock or repair persistent state.",
         "guidance": "Keep health inspection read-only and separate from the migration runner.",
         "applicability": {"paths": ["src/main.rs"], "components": ["doctor"], "tags": ["doctor", "lock", "migration"]},
-        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s064", "digest": "sha256:83b7c2905e502068198c05fb7c5fb02ef29a568a070e76d3fbc780f410e71022"}],
+        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s048", "digest": "sha256:defd64644ebe6c7e8d029795d427db54d1188e0e3af4c2e2541a17047fbd0139"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}

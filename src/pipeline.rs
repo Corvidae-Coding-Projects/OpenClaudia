@@ -8,6 +8,7 @@ use crate::memory::MemoryDb;
 use crate::permissions::{
     ApprovalProvenance, AuthorizationResult, ExecutionPermit, PermissionManager, PermissionRule,
 };
+use crate::provider_transport::{self, RequestReplaySafety};
 use crate::providers::{
     apply_anthropic_adaptive_thinking, convert_messages_to_anthropic_checked,
     convert_tool_definitions_to_anthropic_checked, get_adapter, ReasoningProfile,
@@ -1104,19 +1105,21 @@ pub fn resolve_endpoint_for_wire(
     base_url: &str,
     claude_code_token: Option<&crate::secrets::OAuthToken>,
 ) -> Result<String, crate::providers::ProviderError> {
-    if wire_api == WireApi::OpenAiResponses {
-        return Ok(format!("{}/responses", normalize_base_url(base_url)));
-    }
-    if claude_code_token.is_some() {
-        Ok(crate::claude_credentials::get_oauth_endpoint(model))
+    let endpoint = if wire_api == WireApi::OpenAiResponses {
+        format!("{}/responses", normalize_base_url(base_url))
+    } else if claude_code_token.is_some() {
+        crate::claude_credentials::get_oauth_endpoint(model)
     } else {
         let adapter = get_adapter(provider)?;
-        Ok(format!(
+        format!(
             "{}{}",
             normalize_base_url(base_url),
             adapter.chat_endpoint(model)
-        ))
-    }
+        )
+    };
+    provider_transport::validate_endpoint(provider, &endpoint)
+        .map_err(|error| crate::providers::ProviderError::RequestFailed(error.to_string()))?;
+    Ok(endpoint)
 }
 
 /// Build the headers needed for the API request.
@@ -1190,11 +1193,10 @@ pub struct RunTurnParams<'a> {
 
 /// Maximum retry attempts for transient API errors.
 ///
-/// Matches CC's `withRetry.ts::DEFAULT_MAX_RETRIES` (10). Per crosslink
-/// #592 — was previously 3, which gave up too quickly on rate-limit
-/// surges that 10 attempts of jittered exponential backoff would have
-/// ridden out.
-pub const MAX_API_RETRIES: u32 = 10;
+/// Preserves the established ten-retry compatibility ceiling. S-048 adds a
+/// shared monotonic retry window, so immediate/short provider recovery keeps
+/// working while long backoff sequences terminate within a wall-clock budget.
+pub const MAX_API_RETRIES: u32 = provider_transport::MAX_PROVIDER_ATTEMPTS - 1;
 
 /// HTTP status codes that warrant a retry. Matches CC's
 /// `withRetry.ts` transient-status set:
@@ -1205,84 +1207,20 @@ pub const MAX_API_RETRIES: u32 = 10;
 ///   * 529 — Anthropic-specific "service overloaded"
 #[must_use]
 pub const fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
+    let Ok(status) = reqwest::StatusCode::from_u16(status) else {
+        return false;
+    };
+    provider_transport::should_retry_status(status, RequestReplaySafety::Idempotent)
 }
 
 /// Transport-layer errors that warrant a retry.
 ///
-/// `ConnectionReset` and `BrokenPipe` are the canonical "TCP/TLS
-/// dropped under us" signals every long-lived streaming client sees;
-/// both are transient. Per crosslink #597.
+/// The broad compatibility classifier is retained for idempotent operations.
+/// Model POSTs use the stricter admission-only policy inside
+/// [`send_with_retry`] so ambiguous mid-request disconnects are not replayed.
 #[must_use]
 pub fn is_transient_transport_error(err: &reqwest::Error) -> bool {
-    use std::io;
-    // Walk the source chain looking for an io::Error whose kind is
-    // ConnectionReset or BrokenPipe. reqwest doesn't surface these
-    // structurally so source-chain inspection is the supported path.
-    let mut cur: &dyn std::error::Error = err;
-    loop {
-        if let Some(ioerr) = cur.downcast_ref::<io::Error>() {
-            if matches!(
-                ioerr.kind(),
-                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-            ) {
-                return true;
-            }
-        }
-        match cur.source() {
-            Some(next) => cur = next,
-            None => return false,
-        }
-    }
-}
-
-/// Exponential backoff (base = `2^(attempt+1)` seconds) with ±25% jitter,
-/// per crosslink #596 — when many clients hit the same 429 they must not
-/// all retry in lockstep and re-collide. Returns a wait in seconds.
-///
-/// The jitter is deterministic on a thread-local RNG path (we use
-/// `std::time::Instant::now()` nanos as the jitter source so unit tests
-/// observe non-equal sleeps without needing a `rand` dependency).
-fn backoff_with_jitter(attempt: u32) -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let base = 2u64.saturating_pow(attempt + 1);
-    // Jitter range is ±25% of base, minimum ±1 so attempt=0 still
-    // produces some spread between concurrent retriers.
-    let max_jitter = std::cmp::max(base / 4, 1);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()));
-    let jitter = nanos % (max_jitter * 2 + 1); // 0..=2*max_jitter
-                                               // Apply jitter as an unsigned offset around the base. Adding
-                                               // `jitter` then subtracting `max_jitter` keeps everything unsigned
-                                               // and saturates at 1 (we never want a 0-second sleep on a stuck
-                                               // transient).
-    let raw = base.saturating_add(jitter).saturating_sub(max_jitter);
-    raw.max(1)
-}
-
-fn retry_jitter_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()))
-}
-
-const fn retry_after_with_jitter_from(
-    retry_after_secs: u64,
-    jitter_seed: u64,
-) -> std::time::Duration {
-    let base_ms = retry_after_secs.saturating_mul(1_000);
-    if base_ms == 0 {
-        return std::time::Duration::ZERO;
-    }
-    let max_jitter_ms = base_ms / 4;
-    let jitter_ms = jitter_seed % (max_jitter_ms + 1);
-    std::time::Duration::from_millis(base_ms.saturating_add(jitter_ms))
-}
-
-fn retry_after_with_jitter(retry_after_secs: u64) -> std::time::Duration {
-    retry_after_with_jitter_from(retry_after_secs, retry_jitter_seed())
+    provider_transport::should_retry_error(err, RequestReplaySafety::Idempotent)
 }
 
 /// Map a model name to a lighter sibling that's suitable as a fallback when
@@ -1328,6 +1266,24 @@ pub fn overload_fallback_for(model: &str) -> &'static str {
     ""
 }
 
+/// Emit retry metadata without mixing it into model-authored stream content.
+fn emit_api_retry(
+    tx: &mpsc::Sender<AppEvent>,
+    kind: ApiRetryKind,
+    attempt: u32,
+    wait: std::time::Duration,
+    status: Option<u16>,
+) {
+    let delay_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+    let _ = tx.send(AppEvent::ApiRetry {
+        kind,
+        attempt,
+        max_attempts: MAX_API_RETRIES + 1,
+        delay_ms,
+        status,
+    });
+}
+
 /// Drive the API request through up to `MAX_API_RETRIES` attempts,
 /// classifying transient transport errors and retryable HTTP statuses
 /// per crosslink #595/#596/#597. Each retry emits a structured
@@ -1348,50 +1304,59 @@ async fn send_with_retry(
     request_body: &Value,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<reqwest::Response, String> {
+    let deadline = tokio::time::Instant::now() + provider_transport::RETRY_WINDOW;
     let mut response = None;
     for attempt in 0..=MAX_API_RETRIES {
         let req = headers
             .apply(client.post(endpoint).json(request_body))
             .map_err(|error| error.to_string())?;
 
-        let resp = match req.send().await {
+        let resp = match provider_transport::send_until(req, deadline).await {
             Ok(r) => r,
-            Err(e) if attempt < MAX_API_RETRIES && is_transient_transport_error(&e) => {
-                let wait_secs = backoff_with_jitter(attempt);
+            Err(error)
+                if attempt < MAX_API_RETRIES
+                    && error.retryable(RequestReplaySafety::AdmissionOnly) =>
+            {
+                let wait = provider_transport::retry_delay(attempt, None);
                 tracing::warn!(
                     target: "openclaudia::retry",
                     event = "api_retry",
                     kind = "transport",
                     attempt = attempt + 1,
                     max_attempts = MAX_API_RETRIES + 1,
-                    wait_secs,
-                    error = %e,
+                    wait_ms = wait.as_millis(),
+                    error = %error,
                     "transient transport error, retrying"
                 );
-                let _ = tx.send(AppEvent::ApiRetry {
-                    kind: ApiRetryKind::Transport,
-                    attempt: attempt + 1,
-                    max_attempts: MAX_API_RETRIES + 1,
-                    delay_ms: wait_secs.saturating_mul(1_000),
-                    status: None,
-                });
-                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                emit_api_retry(tx, ApiRetryKind::Transport, attempt + 1, wait, None);
+                if tokio::time::Instant::now() + wait >= deadline {
+                    return Err(
+                        "provider retry window exhausted before the next attempt".to_string()
+                    );
+                }
+                tokio::time::sleep(wait).await;
                 continue;
             }
-            Err(e) => return Err(format!("Request failed: {e}")),
+            Err(error) => {
+                return Err(format!(
+                    "Request failed: {}",
+                    headers.sanitize_diagnostic(&error.to_string())
+                ));
+            }
         };
         let status = resp.status().as_u16();
 
-        if is_retryable_status(status) && attempt < MAX_API_RETRIES {
-            let wait = resp
+        if provider_transport::should_retry_status(
+            resp.status(),
+            RequestReplaySafety::AdmissionOnly,
+        ) && attempt < MAX_API_RETRIES
+        {
+            let retry_after = resp
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .map_or_else(
-                    || std::time::Duration::from_secs(backoff_with_jitter(attempt)),
-                    retry_after_with_jitter,
-                );
+                .map(str::to_string);
+            let wait = provider_transport::retry_delay(attempt, retry_after.as_deref());
             tracing::warn!(
                 target: "openclaudia::retry",
                 event = "api_retry",
@@ -1402,14 +1367,10 @@ async fn send_with_retry(
                 wait_ms = wait.as_millis(),
                 "transient API status, retrying"
             );
-            let delay_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-            let _ = tx.send(AppEvent::ApiRetry {
-                kind: ApiRetryKind::Status,
-                attempt: attempt + 1,
-                max_attempts: MAX_API_RETRIES + 1,
-                delay_ms,
-                status: Some(status),
-            });
+            emit_api_retry(tx, ApiRetryKind::Status, attempt + 1, wait, Some(status));
+            if tokio::time::Instant::now() + wait >= deadline {
+                return Err("provider retry window exhausted before the next attempt".to_string());
+            }
             tokio::time::sleep(wait).await;
             continue;
         }
@@ -1863,9 +1824,10 @@ async fn handle_provider_native_json_response(
     headers: &crate::secrets::SensitiveHeaders,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
-    let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
-    let native_json: Value = serde_json::from_str(&body)
-        .map_err(|error| format!("Failed to parse {provider} JSON response: {error}"))?;
+    let native_json: Value =
+        provider_transport::read_json_capped(response, provider_transport::MAX_JSON_RESPONSE_BYTES)
+            .await
+            .map_err(|error| format!("Failed to parse {provider} JSON response: {error}"))?;
     let decoded = decode_provider_native_json_turn(
         provider,
         model_identity,
@@ -2044,7 +2006,11 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         session_id,
         tx,
     } = p;
-    let mut stream = response.bytes_stream().eventsource();
+    let mut stream = provider_transport::bounded_byte_stream(
+        response,
+        provider_transport::MAX_STREAM_RESPONSE_BYTES,
+    )
+    .eventsource();
     let mut full_content = String::new();
     let mut reasoning_content = String::new();
     let mut tool_accumulator = ToolCallAccumulator::new();
@@ -2058,13 +2024,17 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
-                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}").into()));
-                break;
+                let message = format!("Stream error: {e}");
+                send_event!(tx, AppEvent::ApiError(message.clone().into()));
+                return Err(message);
             }
             Ok(None) => break,
             Err(_) => {
                 handle_sse_timeout(last_data_time.elapsed().as_secs(), full_content.len(), tx)?;
-                break;
+                return Err(format!(
+                    "Provider stream timed out after {} seconds",
+                    proxy::SSE_STREAM_TIMEOUT_SECS
+                ));
             }
         };
 
@@ -2072,7 +2042,6 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         if sse.data == "[DONE]" {
             break;
         }
-
         if let Ok(json) = serde_json::from_str::<Value>(&sse.data) {
             // Extract usage BEFORE the accumulator (both can process the same event)
             if let Some(usage) = proxy::extract_usage_from_sse_event(&json) {
@@ -2711,7 +2680,11 @@ pub async fn decode_openai_responses_stream(
         provider_native_state,
         assistant_message_ordinal,
     } = p;
-    let mut stream = response.bytes_stream().eventsource();
+    let mut stream = provider_transport::bounded_byte_stream(
+        response,
+        provider_transport::MAX_STREAM_RESPONSE_BYTES,
+    )
+    .eventsource();
     let mut full_content = String::new();
     let mut reasoning_content = String::new();
     let mut capture = ResponsesStreamCapture::default();
@@ -2739,7 +2712,6 @@ pub async fn decode_openai_responses_stream(
         if sse.data == "[DONE]" {
             break;
         }
-
         let json = serde_json::from_str::<Value>(&sse.data)
             .map_err(|err| format!("Failed to parse Responses SSE event: {err}"))?;
         let action = process_responses_sse_event(&json)
@@ -6909,77 +6881,27 @@ memory:
         }
     }
 
-    /// #596: jitter spread must be non-zero so concurrent retriers don't
-    /// land on identical waits. Sample a window of attempts and assert
-    /// at least two of them differ.
+    /// S-048: retry delays and total attempts are explicitly bounded.
     #[test]
-    fn issue_596_backoff_jitter_produces_non_constant_output() {
-        let mut seen = std::collections::HashSet::new();
-        // 200 samples at attempt=3 → base=16 → jitter ±4 → 9..=24 range.
-        // With a healthy nanos source the set should have at least 3
-        // distinct values long before we exhaust the loop.
-        for _ in 0..200 {
-            seen.insert(backoff_with_jitter(3));
-            if seen.len() >= 3 {
-                break;
-            }
-        }
-        assert!(
-            seen.len() >= 2,
-            "backoff_with_jitter must produce >=2 distinct waits across 200 samples, saw {seen:?}"
-        );
-    }
-
-    /// #596: backoff is always at least 1 second even at attempt=0
-    /// (saturating arithmetic must never yield 0 sleep — that would
-    /// spin-burn the CPU on a stuck transient).
-    #[test]
-    fn issue_596_backoff_floor_is_one_second() {
-        for _ in 0..50 {
-            let wait = backoff_with_jitter(0);
-            assert!(wait >= 1, "wait must be >=1, got {wait}");
-        }
-    }
-
-    #[test]
-    fn issue_596_retry_after_zero_keeps_zero_delay() {
-        assert_eq!(
-            retry_after_with_jitter_from(0, u64::MAX),
-            std::time::Duration::ZERO,
-            "Retry-After: 0 must stay zero so deterministic tests and immediate retry semantics hold"
-        );
-    }
-
-    #[test]
-    fn issue_596_retry_after_jitter_is_additive_and_bounded() {
-        let base = std::time::Duration::from_secs(4);
-        let max = std::time::Duration::from_secs(5);
-
-        let no_jitter = retry_after_with_jitter_from(4, 0);
-        let max_jitter = retry_after_with_jitter_from(4, 1_000);
-
-        assert_eq!(no_jitter, base);
-        assert_eq!(max_jitter, max);
-        for seed in [1, 42, 999, 1_001, u64::MAX] {
-            let wait = retry_after_with_jitter_from(4, seed);
-            assert!(
-                (base..=max).contains(&wait),
-                "Retry-After jitter must stay within 0-25%; seed={seed}, wait={wait:?}"
-            );
-        }
-    }
-
-    /// #592: `max_retries` cap is the CC-parity value (10). Pins via the
-    /// constant being public-via-classifier; if the loop's `MAX_RETRIES`
-    /// drifts, future test failures will name the value.
-    #[test]
-    fn issue_592_retry_classifier_and_helper_are_publicly_accessible() {
-        // These are exercise tests for the public surface of #595-#597.
-        // The actual MAX_RETRIES const lives inside run_turn but the
-        // helpers must be callable from elsewhere so they're testable
-        // and reusable across seams.
+    fn provider_retry_policy_is_bounded() {
         assert!(is_retryable_status(429));
-        let _ = backoff_with_jitter(0);
+        assert_eq!(MAX_API_RETRIES, 10);
+        assert_eq!(
+            provider_transport::retry_delay(0, Some("0")),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            provider_transport::retry_delay(20, Some("999999")),
+            provider_transport::MAX_RETRY_DELAY
+        );
+        assert!(provider_transport::should_retry_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            RequestReplaySafety::AdmissionOnly
+        ));
+        assert!(!provider_transport::should_retry_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            RequestReplaySafety::AdmissionOnly
+        ));
     }
 
     // ── crosslink #598 — overload fallback hint ──────────────────────────────

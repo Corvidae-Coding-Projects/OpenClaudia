@@ -723,7 +723,14 @@ pub async fn fetch_models(
     api_key: Option<&ApiKey>,
     adapter: &dyn ProviderAdapter,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
-    fetch_models_with_headers(base_url, api_key, &SensitiveHeaders::new(), adapter).await
+    fetch_models_for_provider_with_headers(
+        adapter.name(),
+        base_url,
+        api_key,
+        &SensitiveHeaders::new(),
+        adapter,
+    )
+    .await
 }
 
 /// Fetch available models with optional operator-supplied headers.
@@ -740,8 +747,43 @@ pub async fn fetch_models_with_headers(
     extra_headers: &SensitiveHeaders,
     adapter: &dyn ProviderAdapter,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
-    let snapshot =
-        discover_model_catalog_with_headers(base_url, api_key, extra_headers, adapter).await?;
+    fetch_models_for_provider_with_headers(
+        adapter.name(),
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+    )
+    .await
+}
+
+/// Fetch available models while retaining the configured provider identity.
+///
+/// OpenAI-compatible local targets share the `openai` adapter, but their
+/// configured names carry the security policy that permits loopback/LAN model
+/// servers. Product call sites should use this function when that identity is
+/// available; the compatibility helpers above remain suitable for canonical
+/// remote providers.
+///
+/// # Errors
+///
+/// Returns a [`ProviderError`] if the endpoint is disallowed, listing is
+/// unsupported, the request fails, or the response is malformed.
+pub async fn fetch_models_for_provider_with_headers(
+    provider_name: &str,
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let snapshot = discover_model_catalog_for_provider_with_headers(
+        provider_name,
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+    )
+    .await?;
     Ok(snapshot
         .models
         .into_iter()
@@ -765,6 +807,48 @@ pub async fn discover_model_catalog_with_headers(
     extra_headers: &SensitiveHeaders,
     adapter: &dyn ProviderAdapter,
 ) -> Result<ModelCatalogSnapshot, ProviderError> {
+    discover_model_catalog_for_provider_with_headers(
+        adapter.name(),
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+    )
+    .await
+}
+
+/// Discover models using the configured provider name for endpoint policy.
+///
+/// # Errors
+///
+/// Returns a [`ProviderError`] if the endpoint is disallowed, listing is
+/// unsupported, the request fails, or the response is malformed.
+pub async fn discover_model_catalog_for_provider_with_headers(
+    provider_name: &str,
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+) -> Result<ModelCatalogSnapshot, ProviderError> {
+    discover_model_catalog_impl(
+        provider_name,
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+        true,
+    )
+    .await
+}
+
+async fn discover_model_catalog_impl(
+    provider_name: &str,
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+    validate_endpoint: bool,
+) -> Result<ModelCatalogSnapshot, ProviderError> {
     if !adapter.supports_model_listing() {
         return Err(ProviderError::Unsupported(format!(
             "Provider '{}' does not support model listing",
@@ -778,7 +862,8 @@ pub async fn discover_model_catalog_with_headers(
         ))
     })?;
 
-    let client = reqwest::Client::new();
+    let client = crate::provider_transport::shared_client()
+        .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
 
     // Single source of truth for base-URL normalisation (crosslink #493 —
     // this used to be a hand-inlined three-line trim that drifted from
@@ -786,6 +871,10 @@ pub async fn discover_model_catalog_with_headers(
     // `/v1beta` for Gemini, now only needs to land in one place).
     let normalized_base = crate::proxy::normalize_base_url(base_url);
     let url = format!("{}{}", normalized_base, adapter.models_endpoint());
+    if validate_endpoint {
+        crate::provider_transport::validate_endpoint(provider_name, &url)
+            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+    }
     let now_unix = chrono::Utc::now().timestamp();
     if let Some(snapshot) = cached_model_catalog(adapter.name(), &url, now_unix) {
         return Ok(snapshot);
@@ -803,8 +892,7 @@ pub async fn discover_model_catalog_with_headers(
         .apply(client.get(&url))
         .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
 
-    let response = request
-        .send()
+    let response = crate::provider_transport::send(request)
         .await
         .map_err(|e| ProviderError::RequestFailed(format!("Failed to fetch models: {e}")))?;
 
@@ -815,15 +903,45 @@ pub async fn discover_model_catalog_with_headers(
         )));
     }
 
-    let body: Value = response.json().await.map_err(|e| {
-        ProviderError::InvalidResponse(format!("Failed to parse models response: {e}"))
-    })?;
+    let body: Value = crate::provider_transport::read_json_capped(
+        response,
+        crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|e| ProviderError::InvalidResponse(format!("Failed to parse models response: {e}")))?;
 
     let snapshot =
         model_catalog::parse_discovered_catalog(adapter.name(), &url, format, &body, now_unix)
             .map_err(ProviderError::InvalidResponse)?;
     model_catalog::cache_discovered_catalog(&url, snapshot.clone());
     Ok(snapshot)
+}
+
+#[cfg(test)]
+async fn fetch_models_with_headers_for_test(
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let snapshot = discover_model_catalog_impl(
+        adapter.name(),
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+        false,
+    )
+    .await?;
+    Ok(snapshot
+        .models
+        .into_iter()
+        .map(|model| ModelInfo {
+            id: model.canonical_id,
+            owned_by: model.owned_by,
+            created: model.created,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1480,7 +1598,7 @@ mod tests {
         headers
             .insert_literal("X-Custom-Route", "test-value".to_string())
             .expect("valid custom header");
-        let models = fetch_models_with_headers(
+        let models = fetch_models_with_headers_for_test(
             &format!("http://{addr}/api/v1"),
             Some(&key),
             &headers,
@@ -1531,9 +1649,10 @@ mod tests {
         });
 
         let key = ApiKey::try_from_string("model-list-key".to_string()).expect("valid key");
-        let models = fetch_models(
+        let models = fetch_models_with_headers_for_test(
             &format!("http://{addr}"),
             Some(&key),
+            &SensitiveHeaders::new(),
             &ApiKeyHeaderModelAdapter,
         )
         .await
@@ -1566,11 +1685,13 @@ mod tests {
             .await;
 
         let key = ApiKey::try_from_string("google-model-key".to_string()).expect("valid key");
-        let snapshot = discover_model_catalog_with_headers(
+        let snapshot = discover_model_catalog_impl(
+            "google",
             &server.uri(),
             Some(&key),
             &SensitiveHeaders::new(),
             &GOOGLE,
+            false,
         )
         .await
         .expect("Gemini model discovery");
@@ -1605,11 +1726,13 @@ mod tests {
             .await;
 
         let key = ApiKey::try_from_string("anthropic-model-key".to_string()).expect("valid key");
-        let snapshot = discover_model_catalog_with_headers(
+        let snapshot = discover_model_catalog_impl(
+            "anthropic",
             &server.uri(),
             Some(&key),
             &SensitiveHeaders::new(),
             &ANTHROPIC,
+            false,
         )
         .await
         .expect("Anthropic model discovery");

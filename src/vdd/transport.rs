@@ -2,7 +2,7 @@
 
 use reqwest::Client;
 use serde_json::Value;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use zeroize::Zeroizing;
 
 use crate::config::{AppConfig, ProviderConfig, VddConfig};
@@ -65,6 +65,7 @@ impl VddProviderAuth {
 /// are handled in the adapter, not here.
 pub async fn forward_request(
     client: &Client,
+    provider_name: &str,
     provider: &ProviderConfig,
     endpoint: &str,
     body: &Value,
@@ -85,10 +86,8 @@ pub async fn forward_request(
         format!("{base_url}{endpoint}")
     };
 
-    // Validate the constructed URL before sending the request
-    if let Err(e) = reqwest::Url::parse(&url) {
-        warn!("VDD: Invalid provider URL: {e}");
-    }
+    crate::provider_transport::validate_endpoint(provider_name, &url)
+        .map_err(|error| error.to_string())?;
 
     debug!("VDD: Sending verifier request");
 
@@ -97,7 +96,9 @@ pub async fn forward_request(
         .apply(client.post(&url).json(body))
         .map_err(|error| format!("invalid provider headers: {error}"))?;
 
-    let response = req.send().await.map_err(|error| error.to_string())?;
+    let response = crate::provider_transport::send(req)
+        .await
+        .map_err(|error| error.to_string())?;
     if response.status().is_success() {
         return Ok(response);
     }
@@ -244,6 +245,7 @@ async fn send_to_codex_responses(
     timeout: std::time::Duration,
     timeout_secs: u64,
 ) -> Result<(String, TokenUsage), VddError> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let messages = chat_messages_as_values(request)?;
     let mut body =
         crate::pipeline::build_openai_responses_request(&request.model, &messages, "medium")
@@ -260,6 +262,8 @@ async fn send_to_codex_responses(
         "{}/responses",
         crate::proxy::normalize_base_url(crate::codex_credentials::CODEX_CHATGPT_BASE_URL)
     );
+    crate::provider_transport::validate_endpoint("openai", &endpoint)
+        .map_err(|error| VddError::AdversaryRequestFailed(error.to_string()))?;
     let headers = auth
         .headers()
         .map_err(|error| VddError::AdversaryRequestFailed(error.to_string()))?;
@@ -267,17 +271,20 @@ async fn send_to_codex_responses(
         .apply(client.post(endpoint).json(&body))
         .map_err(|error| VddError::AdversaryRequestFailed(error.to_string()))?;
 
-    let response = tokio::time::timeout(timeout, req.send())
-        .await
-        .map_err(|_| VddError::Timeout {
-            provider: "openai".to_string(),
-            elapsed_secs: timeout_secs,
-        })?
-        .map_err(|e| VddError::AdversaryRequestFailed(format!("responses request: {e}")))?;
+    let response = tokio::time::timeout_at(
+        deadline,
+        crate::provider_transport::send_until(req, deadline),
+    )
+    .await
+    .map_err(|_| VddError::Timeout {
+        provider: "openai".to_string(),
+        elapsed_secs: timeout_secs,
+    })?
+    .map_err(|e| VddError::AdversaryRequestFailed(format!("responses request: {e}")))?;
     let status = response.status();
 
     if !status.is_success() {
-        let raw = tokio::time::timeout(timeout, read_bounded_failure_body(response))
+        let raw = tokio::time::timeout_at(deadline, read_bounded_failure_body(response))
             .await
             .map_err(|_| VddError::Timeout {
                 provider: "openai".to_string(),
@@ -292,22 +299,29 @@ async fn send_to_codex_responses(
     }
 
     let raw = zeroize::Zeroizing::new(
-        tokio::time::timeout(timeout, response.text())
-            .await
-            .map_err(|_| VddError::Timeout {
-                provider: "openai".to_string(),
-                elapsed_secs: timeout_secs,
-            })?
-            .map_err(|e| VddError::AdversaryRequestFailed(format!("responses body: {e}")))?,
+        tokio::time::timeout_at(
+            deadline,
+            crate::provider_transport::read_body_capped(
+                response,
+                crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+            ),
+        )
+        .await
+        .map_err(|_| VddError::Timeout {
+            provider: "openai".to_string(),
+            elapsed_secs: timeout_secs,
+        })?
+        .map_err(|e| VddError::AdversaryRequestFailed(format!("responses body: {e}")))?,
     );
+    let raw_text = String::from_utf8_lossy(&raw);
 
-    if raw
+    if raw_text
         .lines()
         .any(|line| line.trim_start().starts_with("data:"))
     {
-        return responses_text_from_sse(&raw);
+        return responses_text_from_sse(&raw_text);
     }
-    let json = serde_json::from_str::<Value>(&raw)
+    let json = serde_json::from_slice::<Value>(&raw)
         .map_err(|e| VddError::AdversaryRequestFailed(format!("responses JSON decode: {e}")))?;
     Ok((
         responses_text_from_json(&json).unwrap_or_default(),
@@ -391,6 +405,7 @@ pub async fn send_to_adversary(
 
     let timeout_secs = config.adversary.request_timeout_seconds;
     let timeout = std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     if let Some(VddProviderAuth::CodexResponses(auth)) = runtime_auth {
         if !config.adversary.provider.eq_ignore_ascii_case("openai") {
@@ -419,11 +434,18 @@ pub async fn send_to_adversary(
         runtime_auth,
     )?;
 
-    let provider_name = adapter.name().to_string();
+    let provider_name = config.adversary.provider.clone();
 
-    let response = tokio::time::timeout(
-        timeout,
-        forward_request(client, provider_config, &endpoint, &transformed, headers),
+    let response = tokio::time::timeout_at(
+        deadline,
+        forward_request(
+            client,
+            &config.adversary.provider,
+            provider_config,
+            &endpoint,
+            &transformed,
+            headers,
+        ),
     )
     .await
     .map_err(|_| VddError::Timeout {
@@ -432,15 +454,21 @@ pub async fn send_to_adversary(
     })?
     .map_err(VddError::AdversaryRequestFailed)?;
 
-    // Same timeout wraps the body-read to prevent a slow-drip
-    // payload from exceeding the total budget.
-    let response_json: Value = tokio::time::timeout(timeout, response.json())
-        .await
-        .map_err(|_| VddError::Timeout {
-            provider: provider_name.clone(),
-            elapsed_secs: timeout_secs,
-        })?
-        .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
+    // The body consumes the remainder of the same deadline rather than
+    // receiving a fresh timeout window after response headers arrive.
+    let response_json: Value = tokio::time::timeout_at(
+        deadline,
+        crate::provider_transport::read_json_capped(
+            response,
+            crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+        ),
+    )
+    .await
+    .map_err(|_| VddError::Timeout {
+        provider: provider_name.clone(),
+        elapsed_secs: timeout_secs,
+    })?
+    .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
 
     // Crosslink #479: route extraction through the ProviderAdapter trait
     // so provider-specific response shapes (Gemini, Ollama, Anthropic) are
@@ -500,6 +528,7 @@ pub async fn send_to_builder(
     let adapter = get_adapter(provider_name).map_err(|e| VddError::ConfigError(e.to_string()))?;
     let timeout_secs = config.adversary.request_timeout_seconds;
     let timeout = std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     if let Some(VddProviderAuth::CodexResponses(auth)) = runtime_auth {
         if !provider_name.eq_ignore_ascii_case("openai") {
@@ -550,9 +579,16 @@ pub async fn send_to_builder(
 
     let pname = provider_name.to_string();
 
-    let response = tokio::time::timeout(
-        timeout,
-        forward_request(client, provider_config, &endpoint, &transformed, headers),
+    let response = tokio::time::timeout_at(
+        deadline,
+        forward_request(
+            client,
+            provider_name,
+            provider_config,
+            &endpoint,
+            &transformed,
+            headers,
+        ),
     )
     .await
     .map_err(|_| VddError::Timeout {
@@ -561,13 +597,19 @@ pub async fn send_to_builder(
     })?
     .map_err(VddError::BuilderRevisionFailed)?;
 
-    let response_json: Value = tokio::time::timeout(timeout, response.json())
-        .await
-        .map_err(|_| VddError::Timeout {
-            provider: pname,
-            elapsed_secs: timeout_secs,
-        })?
-        .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
+    let response_json: Value = tokio::time::timeout_at(
+        deadline,
+        crate::provider_transport::read_json_capped(
+            response,
+            crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+        ),
+    )
+    .await
+    .map_err(|_| VddError::Timeout {
+        provider: pname,
+        elapsed_secs: timeout_secs,
+    })?
+    .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
 
     // Crosslink #479: trait dispatch instead of hardcoded shape matching.
     let text = adapter
@@ -602,6 +644,7 @@ pub async fn send_to_builder_for_verification(
     // Crosslink #433: explicit error for an unknown verifier provider name.
     let timeout_secs = config.adversary.request_timeout_seconds;
     let timeout = std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
 
     if let Some(VddProviderAuth::CodexResponses(auth)) = runtime_auth {
         if !provider_name.eq_ignore_ascii_case("openai") {
@@ -647,9 +690,16 @@ pub async fn send_to_builder_for_verification(
 
     let pname = provider_name.to_string();
 
-    let response = tokio::time::timeout(
-        timeout,
-        forward_request(client, provider_config, &endpoint, &transformed, headers),
+    let response = tokio::time::timeout_at(
+        deadline,
+        forward_request(
+            client,
+            provider_name,
+            provider_config,
+            &endpoint,
+            &transformed,
+            headers,
+        ),
     )
     .await
     .map_err(|_| VddError::Timeout {
@@ -658,13 +708,19 @@ pub async fn send_to_builder_for_verification(
     })?
     .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier request: {e}")))?;
 
-    let response_json: Value = tokio::time::timeout(timeout, response.json())
-        .await
-        .map_err(|_| VddError::Timeout {
-            provider: pname,
-            elapsed_secs: timeout_secs,
-        })?
-        .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier response: {e}")))?;
+    let response_json: Value = tokio::time::timeout_at(
+        deadline,
+        crate::provider_transport::read_json_capped(
+            response,
+            crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+        ),
+    )
+    .await
+    .map_err(|_| VddError::Timeout {
+        provider: pname,
+        elapsed_secs: timeout_secs,
+    })?
+    .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier response: {e}")))?;
 
     // Crosslink #479: trait dispatch instead of hardcoded shape matching.
     let text = adapter
@@ -777,6 +833,7 @@ mod tests {
 
         let error = forward_request(
             &Client::new(),
+            "local",
             &provider,
             "/v1/chat/completions",
             &serde_json::json!({}),
@@ -796,8 +853,8 @@ mod tests {
     // ── Crosslink #496: VDD HTTP timeout ──────────────────────────────────
     //
     // A slow / hung adversary upstream cannot block the VDD loop
-    // indefinitely. `send_to_adversary` wraps both the HTTP send and the
-    // body-read in `tokio::time::timeout`; on expiry it returns
+    // indefinitely. `send_to_adversary` gives the HTTP send and body read one
+    // shared monotonic deadline; on expiry it returns
     // `VddError::Timeout { provider, elapsed_secs }`.
 
     /// The configured timeout value is propagated from
@@ -824,10 +881,18 @@ mod tests {
     /// variant) — not `AdversaryRequestFailed`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn send_to_adversary_surfaces_timeout_variant_on_hang() {
-        let cfg = cfg_with_timeout(1);
-        // Use a domain that resolves but won't accept connections in 1s.
-        // `192.0.2.1` is RFC 5737 test-net, guaranteed unrouted.
-        let app_cfg = app_cfg_with_provider("openai", "http://192.0.2.1:81");
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut cfg = cfg_with_timeout(1);
+        cfg.adversary.provider = "local".to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let app_cfg = app_cfg_with_provider("local", &server.uri());
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .build()
@@ -848,7 +913,7 @@ mod tests {
                 provider,
                 elapsed_secs,
             }) => {
-                assert_eq!(provider, "openai");
+                assert_eq!(provider, "local");
                 assert_eq!(elapsed_secs, 1);
             }
             Err(other) => panic!("expected VddError::Timeout, got {other:?}"),

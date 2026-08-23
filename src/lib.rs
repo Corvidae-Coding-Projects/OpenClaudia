@@ -46,6 +46,7 @@ pub mod persistence;
 pub mod pipeline;
 pub mod plugins;
 pub mod prompt;
+pub mod provider_transport;
 pub mod providers;
 pub mod proxy;
 pub mod runtime;

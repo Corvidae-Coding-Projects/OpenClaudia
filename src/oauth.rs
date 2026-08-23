@@ -992,15 +992,14 @@ impl OAuthClient {
     ///
     /// # Errors
     ///
-    /// Returns a [`reqwest::Error`] if the underlying TLS backend fails to
-    /// initialise. Without the `Claude Code/1.0` User-Agent the Anthropic
-    /// OAuth endpoint rejects all token exchanges, so a builder failure must
-    /// be surfaced rather than silently falling back to a plain client.
-    pub fn new() -> Result<Self, reqwest::Error> {
-        let http = reqwest::Client::builder()
-            .user_agent("Claude Code/1.0")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+    /// Returns a sanitized transport error if the canonical TLS client cannot
+    /// initialize or the fixed OAuth endpoints fail validation. Without the
+    /// `Claude Code/1.0` User-Agent the Anthropic OAuth endpoint rejects all
+    /// token exchanges, so initialization must fail explicitly.
+    pub fn new() -> Result<Self, crate::provider_transport::ProviderTransportError> {
+        crate::provider_transport::validate_endpoint("anthropic", TOKEN_ENDPOINT)?;
+        crate::provider_transport::validate_endpoint("anthropic", API_KEY_ENDPOINT)?;
+        let http = crate::provider_transport::client_with_user_agent("Claude Code/1.0")?;
         Ok(Self { http })
     }
 
@@ -1111,8 +1110,7 @@ impl OAuthClient {
     ) -> Result<TokenExchangeResponse> {
         debug!("Sending token request to {}", TOKEN_ENDPOINT);
 
-        let response = request
-            .send()
+        let response = crate::provider_transport::send(request)
             .await
             .context("Failed to send token request")?;
 
@@ -1126,17 +1124,15 @@ impl OAuthClient {
             anyhow::bail!("Token exchange failed ({status}): {safe}");
         }
 
-        let body = Zeroizing::new(
-            response
-                .text()
-                .await
-                .context("Failed to read token response")?,
-        );
-
         debug!("Token response received");
 
         let token_response: TokenExchangeResponse =
-            serde_json::from_str(&body).context("Failed to parse token response")?;
+            crate::provider_transport::read_sensitive_json_capped(
+                response,
+                crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+            )
+            .await
+            .context("Failed to parse token response")?;
 
         // Validate token type is Bearer
         validate_oauth_token_type(&token_response.token_type)?;
@@ -1174,9 +1170,8 @@ impl OAuthClient {
         // Claude Code sends null body with just Authorization header
         let mut headers = crate::secrets::SensitiveHeaders::new();
         headers.insert_header_bearer(reqwest::header::AUTHORIZATION, access_token.secret());
-        let response = headers
-            .apply(self.http.post(API_KEY_ENDPOINT))?
-            .send()
+        let request = headers.apply(self.http.post(API_KEY_ENDPOINT))?;
+        let response = crate::provider_transport::send(request)
             .await
             .context("Failed to send API key creation request")?;
 
@@ -1190,15 +1185,12 @@ impl OAuthClient {
             anyhow::bail!("API key creation failed ({status}): {safe}");
         }
 
-        let body = Zeroizing::new(
-            response
-                .text()
-                .await
-                .context("Failed to read API key response")?,
-        );
-
-        let key_response: ApiKeyResponse =
-            serde_json::from_str(&body).context("Failed to parse API key response")?;
+        let key_response: ApiKeyResponse = crate::provider_transport::read_sensitive_json_capped(
+            response,
+            crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+        )
+        .await
+        .context("Failed to parse API key response")?;
 
         info!("Successfully created API key from OAuth token");
         Ok(key_response.raw_key)

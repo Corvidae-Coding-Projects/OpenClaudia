@@ -57,6 +57,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Async utilities
+bytes = "1"
 eventsource-stream = "0.2.3"
 futures = "0.3"
 async-trait = "0.1"

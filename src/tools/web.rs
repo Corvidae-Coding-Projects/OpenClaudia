@@ -396,7 +396,7 @@ fn build_distillation_request(
 }
 
 async fn execute_distillation_call(call: DistillationCall) -> Result<String, String> {
-    let client = web::shared_http_client()?;
+    let client = crate::provider_transport::shared_client().map_err(|error| error.to_string())?;
     let request = call
         .headers
         .apply(
@@ -407,22 +407,28 @@ async fn execute_distillation_call(call: DistillationCall) -> Result<String, Str
         )
         .map_err(|error| format!("distillation headers are invalid: {error}"))?;
 
-    let response = request
-        .send()
+    let response = crate::provider_transport::send(request)
         .await
         .map_err(|e| format!("distillation request failed: {e}"))?;
     let status = response.status();
-    let body =
-        zeroize::Zeroizing::new(web::read_bounded_text(response, web::MAX_WEB_FETCH_BYTES).await?);
+    let body = zeroize::Zeroizing::new(
+        crate::provider_transport::read_body_capped(
+            response,
+            crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+        )
+        .await
+        .map_err(|error| format!("distillation response failed: {error}"))?,
+    );
     if !status.is_success() {
-        let body = call.headers.sanitize_diagnostic(&body);
+        let body_text = String::from_utf8_lossy(&body);
+        let body = call.headers.sanitize_diagnostic(&body_text);
         return Err(format!(
             "distillation provider '{}' returned HTTP {status}: {body}",
             call.provider
         ));
     }
 
-    let json = serde_json::from_str::<Value>(&body)
+    let json = serde_json::from_slice::<Value>(&body)
         .map_err(|e| format!("distillation provider returned invalid JSON: {e}"))?;
     let normalized = call
         .adapter
@@ -714,7 +720,7 @@ mod tests {
     fn distillation_test_config(base_url: &str) -> AppConfig {
         let mut providers = HashMap::new();
         providers.insert(
-            "openai".to_string(),
+            "local".to_string(),
             ProviderConfig {
                 api_key: Some(
                     ApiKey::try_from_string("sk-test-distillation".to_string())
@@ -729,7 +735,7 @@ mod tests {
 
         AppConfig {
             proxy: ProxyConfig {
-                target: "openai".to_string(),
+                target: "local".to_string(),
                 ..ProxyConfig::default()
             },
             providers,
@@ -743,7 +749,7 @@ mod tests {
             web_fetch: WebFetchConfig {
                 distillation_enabled: true,
                 max_distillation_bytes: 64,
-                distillation_provider: Some("openai".to_string()),
+                distillation_provider: Some("local".to_string()),
                 distillation_model: Some("gpt-distill-test".to_string()),
                 ..WebFetchConfig::default()
             },

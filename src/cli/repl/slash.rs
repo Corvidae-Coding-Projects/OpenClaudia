@@ -1077,7 +1077,9 @@ pub fn slash_model(
             openclaudia::providers::get_adapter(provider),
         ) {
             if let Some(provider_config) = config.get_provider(provider) {
-                if let Some(dynamic) = fetch_dynamic_models_for_slash(provider_config, adapter) {
+                if let Some(dynamic) =
+                    fetch_dynamic_models_for_slash(provider, provider_config, adapter)
+                {
                     println!("\n  Dynamic models (from API):");
                     for m in &dynamic {
                         let marker = if m == current_model {
@@ -1110,6 +1112,7 @@ pub fn slash_model(
 }
 
 fn fetch_dynamic_models_for_slash(
+    provider: &str,
     provider_config: &openclaudia::config::ProviderConfig,
     adapter: &dyn openclaudia::providers::ProviderAdapter,
 ) -> Option<Vec<String>> {
@@ -1122,6 +1125,7 @@ fn fetch_dynamic_models_for_slash(
         .build()
         .ok()?
         .block_on(super::models::fetch_dynamic_models(
+            provider,
             provider_config,
             adapter,
         ))

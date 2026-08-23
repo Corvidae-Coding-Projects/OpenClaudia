@@ -294,7 +294,7 @@ async fn call_token_refresh_api(
         scope: &'a str,
     }
 
-    let client = reqwest::Client::new();
+    let client = crate::provider_transport::shared_client().map_err(|error| error.to_string())?;
     let request = refresh_token.expose(|refresh_raw| {
         client.post(TOKEN_URL).json(&TokenRefreshRequest {
             grant_type: "refresh_token",
@@ -303,8 +303,9 @@ async fn call_token_refresh_api(
             scope: scopes,
         })
     });
-    let response = request
-        .send()
+    crate::provider_transport::validate_endpoint("anthropic", TOKEN_URL)
+        .map_err(|error| error.to_string())?;
+    let response = crate::provider_transport::send(request)
         .await
         .map_err(|e| format!("Token refresh request failed: {e}"))?;
 
@@ -319,10 +320,12 @@ async fn call_token_refresh_api(
         return Err(format!("Token refresh failed ({status}): {safe}"));
     }
 
-    response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse refresh response: {e}"))
+    crate::provider_transport::read_sensitive_json_capped(
+        response,
+        crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|e| format!("Failed to parse refresh response: {e}"))
 }
 
 #[derive(Deserialize)]

@@ -207,7 +207,11 @@ async fn print_json_response(
     response: reqwest::Response,
     adapter: &dyn ProviderAdapter,
 ) -> anyhow::Result<()> {
-    let body = response.json::<serde_json::Value>().await?;
+    let body = openclaudia::provider_transport::read_json_capped::<serde_json::Value>(
+        response,
+        openclaudia::provider_transport::MAX_JSON_RESPONSE_BYTES,
+    )
+    .await?;
     let text = adapter.extract_response_text(&body).ok_or_else(|| {
         anyhow::anyhow!("provider response did not contain printable assistant text")
     })?;
@@ -216,7 +220,11 @@ async fn print_json_response(
 }
 
 async fn print_sse_response(response: reqwest::Response) -> anyhow::Result<()> {
-    let mut stream = response.bytes_stream().eventsource();
+    let mut stream = openclaudia::provider_transport::bounded_byte_stream(
+        response,
+        openclaudia::provider_transport::MAX_STREAM_RESPONSE_BYTES,
+    )
+    .eventsource();
     let mut state = PrintSseState::new();
     let mut emitted_text = false;
 
@@ -460,10 +468,11 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         responses_assistant_ordinal,
     } = prepared;
 
-    let client = reqwest::Client::new();
+    let client = openclaudia::provider_transport::shared_client()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let request = headers.apply(client.post(endpoint).json(&request_body))?;
 
-    let response = request.send().await?;
+    let response = openclaudia::provider_transport::send(request).await?;
     if !response.status().is_success() {
         let status = response.status();
         let body = openclaudia::secrets::read_bounded_diagnostic_body(response)
