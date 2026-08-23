@@ -49,8 +49,9 @@ pub use anthropic::{
 pub use api_key::{ApiKey, ApiKeyError, MAX_API_KEY_LEN, REDACTED_PLACEHOLDER};
 pub use deepseek::DeepSeekAdapter;
 pub use google::{
-    convert_tools_to_gemini, convert_tools_to_gemini_functions, extract_gemini_text_content,
-    GoogleAdapter,
+    advance_gemini_generate_content_state, convert_tools_to_gemini,
+    convert_tools_to_gemini_functions, extract_gemini_text_content,
+    GeminiGenerateContentTurnOutput, GoogleAdapter,
 };
 pub use kimi::KimiAdapter;
 pub use minimax::MiniMaxAdapter;
@@ -59,7 +60,7 @@ pub use model_catalog::{
     DEEPSEEK_MODELS, GOOGLE_MODELS, KIMI_MODELS, MINIMAX_MODELS, OPENAI_MODELS, QWEN_MODELS,
     STATIC_MODEL_CATALOG_PROVIDERS, ZAI_MODELS,
 };
-pub use ollama::OllamaAdapter;
+pub use ollama::{advance_ollama_chat_state, OllamaAdapter, OllamaChatTurnOutput};
 pub(crate) use openai::finalize_responses_request;
 pub use openai::{advance_openai_responses_state, OpenAIAdapter, OpenAiResponsesTurnOutput};
 pub use qwen::QwenAdapter;
@@ -368,12 +369,38 @@ static OPENAI_RESPONSES_STATE_CONTRACT: ProviderStateContract = ProviderStateCon
     server_continuation: ProviderStateSupport::EvidenceOnly,
     terminal_state: ProviderStateSupport::EvidenceOnly,
 };
-static GEMINI_GENERATE_CONTENT_STATE_CONTRACT: ProviderStateContract =
-    retained_evidence_contract(ProviderWireProtocol::GeminiGenerateContent);
+static GEMINI_GENERATE_CONTENT_STATE_CONTRACT: ProviderStateContract = ProviderStateContract {
+    protocol: ProviderWireProtocol::GeminiGenerateContent,
+    native_message: ProviderStateSupport::RoundTrip,
+    tool_calls: ProviderStateSupport::RoundTrip,
+    parallel_tool_calls: ProviderStateSupport::RoundTrip,
+    // Thought signatures remain opaque inside their exact native content
+    // parts. They are replayed but never projected into portable messages.
+    reasoning: ProviderStateSupport::RoundTrip,
+    refusal: ProviderStateSupport::EvidenceOnly,
+    usage: ProviderStateSupport::EvidenceOnly,
+    cache_metadata: ProviderStateSupport::EvidenceOnly,
+    compaction: COMPACTION_PENDING,
+    server_continuation: SERVER_CONTINUATION_PENDING,
+    terminal_state: ProviderStateSupport::EvidenceOnly,
+};
 static GEMINI_INTERACTIONS_STATE_CONTRACT: ProviderStateContract =
     retained_evidence_contract(ProviderWireProtocol::GeminiInteractions);
-static OLLAMA_STATE_CONTRACT: ProviderStateContract =
-    retained_evidence_contract(ProviderWireProtocol::OllamaChat);
+static OLLAMA_STATE_CONTRACT: ProviderStateContract = ProviderStateContract {
+    protocol: ProviderWireProtocol::OllamaChat,
+    native_message: ProviderStateSupport::RoundTrip,
+    tool_calls: ProviderStateSupport::RoundTrip,
+    parallel_tool_calls: ProviderStateSupport::RoundTrip,
+    // Ollama's `thinking` field is retained only in the exact native message;
+    // S-049 owns its eventual display/privacy projection.
+    reasoning: ProviderStateSupport::RoundTrip,
+    refusal: ProviderStateSupport::EvidenceOnly,
+    usage: ProviderStateSupport::EvidenceOnly,
+    cache_metadata: ProviderStateSupport::EvidenceOnly,
+    compaction: COMPACTION_PENDING,
+    server_continuation: SERVER_CONTINUATION_PENDING,
+    terminal_state: ProviderStateSupport::EvidenceOnly,
+};
 
 fn unsupported_state_protocol(adapter: &str, protocol: ProviderWireProtocol) -> ProviderError {
     ProviderError::Unsupported(format!(
@@ -916,21 +943,57 @@ mod tests {
                 ProviderStateFacet::Compaction,
                 ProviderStateFacet::ServerContinuation,
             ] {
-                let error = contract
-                    .validate_state(&native_state_for(
-                        provider,
-                        protocol,
-                        facet,
-                        ProviderNativeItemPurpose::Continuation,
-                    ))
-                    .expect_err("unwired continuation facet must be explicit");
-                assert!(
-                    matches!(
-                        error,
-                        crate::runtime::ProviderStateContractError::UnsupportedFacet { .. }
-                    ),
-                    "provider {provider}, facet {facet:?}: {error}"
+                let state = native_state_for(
+                    provider,
+                    protocol,
+                    facet,
+                    ProviderNativeItemPurpose::Continuation,
                 );
+                let support = contract.support(facet);
+                let should_round_trip = matches!(*provider, "google" | "gemini" | "ollama")
+                    && matches!(
+                        facet,
+                        ProviderStateFacet::NativeMessage
+                            | ProviderStateFacet::ToolCalls
+                            | ProviderStateFacet::ParallelToolCalls
+                            | ProviderStateFacet::Reasoning
+                    );
+                assert_eq!(
+                    matches!(support, ProviderStateSupport::RoundTrip),
+                    should_round_trip,
+                    "provider {provider}, facet {facet:?} has the wrong continuation contract"
+                );
+                match support {
+                    ProviderStateSupport::RoundTrip => {
+                        contract.validate_state(&state).unwrap_or_else(|error| {
+                            panic!("provider {provider} must round-trip {facet:?}: {error}")
+                        });
+                    }
+                    ProviderStateSupport::EvidenceOnly => {
+                        let error = contract
+                            .validate_state(&state)
+                            .expect_err("evidence-only facets cannot be continuation input");
+                        assert!(
+                            matches!(
+                                error,
+                                crate::runtime::ProviderStateContractError::EvidenceOnlyContinuation { .. }
+                            ),
+                            "provider {provider}, facet {facet:?}: {error}"
+                        );
+                    }
+                    ProviderStateSupport::Unsupported(_) => {
+                        let error = contract
+                            .validate_state(&state)
+                            .expect_err("unwired continuation facet must be explicit");
+                        assert!(
+                            matches!(
+                                error,
+                                crate::runtime::ProviderStateContractError::UnsupportedFacet { .. }
+                            ),
+                            "provider {provider}, facet {facet:?}: {error}"
+                        );
+                    }
+                }
             }
         }
         assert_eq!(

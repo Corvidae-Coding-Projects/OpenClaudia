@@ -1703,15 +1703,25 @@ impl AcpServer {
                     .fail_prompt_with_update(acp_session_id, &format!("Blocked by policy: {e}"));
             }
 
-            // Transform through the canonical wire builder. Responses uses the
-            // exact ACP capability-filtered catalog and native continuation;
-            // Chat Completions retains the established adapter path.
+            // Transform stateful protocols through the canonical wire builder
+            // so exact native continuation is applied before the body leaves
+            // the process. Other Chat Completions providers retain their
+            // streaming adapter path.
             let thinking = self
                 .config
                 .active_provider()
                 .map(|p| p.thinking.clone())
                 .unwrap_or_default();
-            let mut transformed = if wire_api.is_responses() {
+            let uses_native_json = matches!(
+                self.config
+                    .proxy
+                    .target
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "google" | "gemini" | "ollama"
+            );
+            let mut transformed = if wire_api.is_responses() || uses_native_json {
                 let message_values = match chat_request
                     .messages
                     .iter()
@@ -1865,10 +1875,8 @@ impl AcpServer {
                 return "error".to_string();
             }
 
-            // Decode the provider response. Responses terminal validation and
-            // continuation advancement are shared with every other frontend;
-            // ACP retains its existing multi-provider stream parser for Chat
-            // Completions protocols.
+            // Decode stateful protocols through their canonical terminal
+            // validators before ACP dispatches any projected tool call.
             let (stream_result, next_provider_native_state) = if wire_api.is_responses() {
                 let decoded = match crate::pipeline::decode_openai_responses_stream(
                     crate::pipeline::OpenAiResponsesStreamParams {
@@ -1894,6 +1902,36 @@ impl AcpServer {
                     }
                 };
                 let (stream_result, state) = acp_responses_stream_result(decoded);
+                (stream_result, Some(state))
+            } else if uses_native_json {
+                let native_json = match response.json::<Value>().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider JSON error: {error}"),
+                        );
+                    }
+                };
+                let decoded = match crate::pipeline::decode_provider_native_json_turn(
+                    &self.config.proxy.target,
+                    &self.model,
+                    &native_json,
+                    self.provider_native_state.as_ref(),
+                    assistant_message_ordinal,
+                ) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!(
+                                "Provider response error: {}",
+                                headers.sanitize_diagnostic(&error)
+                            ),
+                        );
+                    }
+                };
+                let (stream_result, state) = acp_native_json_stream_result(decoded);
                 (stream_result, Some(state))
             } else {
                 (
@@ -3251,6 +3289,31 @@ fn acp_responses_stream_result(
     (result, decoded.provider_native_state)
 }
 
+fn acp_native_json_stream_result(
+    decoded: crate::pipeline::ProviderNativeJsonDecodedTurn,
+) -> (StreamResult, crate::runtime::ProviderNativeState) {
+    let tool_calls = decoded
+        .tool_calls
+        .into_iter()
+        .map(|call| AccumulatedToolCall {
+            id: call.id,
+            name: call.function.name,
+            arguments: call.function.arguments,
+        })
+        .collect::<Vec<_>>();
+    let result = if tool_calls.is_empty() {
+        StreamResult::EndTurn {
+            content: decoded.content,
+        }
+    } else {
+        StreamResult::ToolCalls {
+            content: decoded.content,
+            tool_calls,
+        }
+    };
+    (result, decoded.provider_native_state)
+}
+
 fn decode_acp_messages(messages: &[Value]) -> Result<Vec<crate::proxy::ChatMessage>, String> {
     messages
         .iter()
@@ -4167,7 +4230,8 @@ mod tool_definition_tests {
 #[cfg(test)]
 mod stream_tool_call_tests {
     use super::{
-        acp_responses_stream_result, finish_acp_stream, AccumulatedToolCall, StreamResult,
+        acp_native_json_stream_result, acp_responses_stream_result, finish_acp_stream,
+        AccumulatedToolCall, StreamResult,
     };
     use serde_json::json;
 
@@ -4278,6 +4342,47 @@ mod stream_tool_call_tests {
                 assert_eq!(tool_calls[0].arguments, r#"{"command":"pwd"}"#);
             }
             other => panic!("expected Responses tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_json_turn_keeps_state_and_exact_tool_identity_for_acp_followup() {
+        let response = json!({
+            "model": "qwen3",
+            "message": {
+                "role": "assistant",
+                "content": "checking",
+                "thinking": "private",
+                "tool_calls": [{
+                    "function": {
+                        "index": 6,
+                        "name": "bash",
+                        "arguments": {"command": "pwd"}
+                    }
+                }]
+            },
+            "done": true
+        });
+        let decoded = crate::pipeline::decode_provider_native_json_turn(
+            "ollama", "qwen3", &response, None, 1,
+        )
+        .expect("Ollama turn decodes before ACP dispatch");
+        let expected_state = decoded.provider_native_state.clone();
+
+        let (result, retained) = acp_native_json_stream_result(decoded);
+        assert_eq!(retained, expected_state);
+        match result {
+            StreamResult::ToolCalls {
+                content,
+                tool_calls,
+            } => {
+                assert_eq!(content, "checking");
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "call_ollama_1_0");
+                assert_eq!(tool_calls[0].name, "bash");
+                assert_eq!(tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+            }
+            other => panic!("expected Ollama tool call, got {other:?}"),
         }
     }
 }

@@ -11,7 +11,7 @@ use crate::permissions::{
 use crate::providers::{
     anthropic_rejects_manual_thinking, apply_anthropic_adaptive_thinking,
     convert_messages_to_anthropic_checked, convert_tool_definitions_to_anthropic_checked,
-    convert_tools_to_gemini_functions, extract_gemini_text_content, get_adapter,
+    get_adapter,
 };
 use crate::proxy::{self, normalize_base_url};
 use crate::services::policy::{PolicyEnforcer, PolicyError};
@@ -65,7 +65,8 @@ pub struct TurnResult {
     /// reports one. `None` for normal stop on streams that do not propagate
     /// a distinct termination cause through this layer.
     ///
-    /// Values currently emitted by [`handle_google_response`] (crosslink #788):
+    /// Values currently emitted by [`decode_provider_native_json_turn`]
+    /// (crosslink #788):
     /// - `Some("safety_blocked")` — Gemini set `finishReason` to `SAFETY`,
     ///   `RECITATION`, or `BLOCKLIST`. Text may be empty; callers should
     ///   surface a user-visible error rather than treating this as a normal
@@ -589,7 +590,15 @@ fn build_adapter_request(
     effort_level: &str,
     tool_definitions: &Value,
 ) -> Result<Value, String> {
-    let request = build_chat_completion_request_with_tools(model, messages, tool_definitions)?;
+    let mut request = build_chat_completion_request_with_tools(model, messages, tool_definitions)?;
+    if provider.trim().eq_ignore_ascii_case("ollama") {
+        // The canonical agent loops consume one complete JSON response. Keep
+        // Ollama's NDJSON streaming protocol out of this path until the
+        // bounded transport slice owns a native stream state machine.
+        request.stream = Some(false);
+        return crate::providers::OllamaAdapter::transform_request_draft(&request)
+            .map_err(|error| error.to_string());
+    }
     let adapter = get_adapter(provider).map_err(|e| e.to_string())?;
     let body = thinking_config_for_pipeline_effort(provider, effort_level).map_or_else(
         || adapter.transform_request(&request),
@@ -617,62 +626,28 @@ fn build_google_request_with_tools(
     effort_level: &str,
     openai_tools: &Value,
 ) -> Result<Value, String> {
-    let tools_vec = openai_tools
-        .as_array()
-        .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?;
-    let functions = convert_tools_to_gemini_functions(tools_vec).map_err(|e| e.to_string())?;
-
-    let mut contents = Vec::new();
-    let mut system_parts: Vec<String> = Vec::new();
-    for (msg_index, msg) in messages.iter().enumerate() {
-        let role = msg.get("role").and_then(Value::as_str).ok_or_else(|| {
-            format!("Google message at index {msg_index} missing string 'role': {msg}")
-        })?;
-        let text = msg.get("content").and_then(Value::as_str).ok_or_else(|| {
-            format!("Google message at index {msg_index} missing string 'content': {msg}")
-        })?;
-        if role == "system" {
-            if !text.is_empty() {
-                system_parts.push(text.to_string());
-            }
-            continue;
-        }
-        let gemini_role = match role {
-            "assistant" => "model",
-            "user" | "tool" => "user",
-            _ => {
+    for (message_index, message) in messages.iter().enumerate() {
+        if let Some(role) = message.get("role").and_then(Value::as_str) {
+            if !matches!(role, "system" | "user" | "assistant" | "tool") {
                 return Err(format!(
-                    "Google message at index {msg_index} has unsupported role '{role}': {msg}"
+                    "Google message at index {message_index} has unsupported role {role:?}"
                 ));
             }
-        };
-        contents.push(serde_json::json!({
-            "role": gemini_role,
-            "parts": [{"text": text}]
-        }));
+        }
     }
-
-    // Gemini takes `thinkingConfig.thinkingBudget` inside
-    // generationConfig. When effort is high/max we hand it the Claude
-    // Code ULTRATHINK constant, clamped to Gemini's documented ceiling.
-    let mut generation_config = serde_json::json!({"maxOutputTokens": 4096});
-    if matches!(effort_level, "high" | "max") {
-        const GEMINI_THINKING_CAP: u32 = 32_768;
-        let budget = crate::thinking::anthropic_thinking_budget(Some(effort_level))
-            .unwrap_or(crate::thinking::ULTRATHINK_BUDGET_TOKENS)
-            .min(GEMINI_THINKING_CAP);
-        generation_config["thinkingConfig"] = serde_json::json!({"thinkingBudget": budget});
+    let mut request = build_chat_completion_request_with_tools("gemini", messages, openai_tools)?;
+    request.max_tokens = Some(4096);
+    let mut thinking = thinking_config_for_pipeline_effort("google", effort_level);
+    if let Some(thinking) = thinking.as_mut() {
+        // Preserve the established Gemini high/max budget (including the
+        // MAX_THINKING_TOKENS override) while using the canonical adapter.
+        thinking.budget_tokens = crate::thinking::anthropic_thinking_budget(Some(effort_level));
     }
-    let mut req = serde_json::json!({
-        "contents": contents,
-        "generationConfig": generation_config,
-        "tools": [{"functionDeclarations": functions}]
-    });
-    let system_text = (!system_parts.is_empty()).then(|| system_parts.join("\n\n"));
-    if let Some(sys) = system_text {
-        req["systemInstruction"] = serde_json::json!({"parts": [{"text": sys}]});
-    }
-    Ok(req)
+    crate::providers::GoogleAdapter::transform_request_draft_with_thinking(
+        &request,
+        thinking.as_ref(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Build the appropriate request body for the given provider.
@@ -1015,6 +990,18 @@ fn build_request_for_wire_with_tools(
     }
     if wire_api == WireApi::OpenAiResponses {
         crate::providers::finalize_responses_request(&mut body)?;
+    } else {
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "google" | "gemini" => {
+                crate::providers::GoogleAdapter::finalize_request(&mut body)
+                    .map_err(|error| error.to_string())?;
+            }
+            "ollama" => {
+                crate::providers::OllamaAdapter::finalize_request(&mut body)
+                    .map_err(|error| error.to_string())?;
+            }
+            _ => {}
+        }
     }
     Ok(body)
 }
@@ -1503,10 +1490,16 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
 
     let response = send_with_retry(client, endpoint, headers, request_body, &tx).await?;
 
-    if provider == "google" {
-        return handle_google_response(
+    if matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "google" | "gemini" | "ollama"
+    ) {
+        return handle_provider_native_json_response(
             run_context,
             response,
+            provider,
+            provider_native_state,
+            assistant_message_ordinal,
             memory_db,
             app_config,
             permission_mgr,
@@ -1651,6 +1644,7 @@ pub fn classify_google_finish_reason(
     }
 }
 
+#[cfg(test)]
 fn google_response_parts(gemini_json: &Value) -> Result<&[Value], String> {
     let candidate = gemini_json
         .get("candidates")
@@ -1665,62 +1659,17 @@ fn google_response_parts(gemini_json: &Value) -> Result<&[Value], String> {
         .ok_or_else(|| format!("Gemini candidate missing content.parts array: {candidate}"))
 }
 
+#[cfg(test)]
 fn extract_google_text(parts: &[Value]) -> Result<String, String> {
-    extract_gemini_text_content(parts).map_err(|e| e.to_string())
-}
-
-/// Extract structured tool calls from Gemini `content.parts`.
-fn extract_google_tool_calls_from_parts(parts: &[Value]) -> Result<Vec<ToolCall>, String> {
-    let mut calls = Vec::new();
-
-    for part in parts {
-        let Some(fc) = part.get("functionCall") else {
-            continue;
-        };
-
-        if !fc.is_object() {
-            return Err(format!("Gemini functionCall must be an object: {fc}"));
-        }
-
-        let name = fc
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| format!("Gemini functionCall missing non-empty string 'name': {fc}"))?
-            .to_string();
-
-        let args = fc
-            .get("args")
-            .ok_or_else(|| format!("Gemini functionCall missing object 'args': {fc}"))?;
-
-        if !args.is_object() {
-            return Err(format!(
-                "Gemini functionCall has non-object 'args': expected JSON object, got {}",
-                json_value_type_name(args)
-            ));
-        }
-
-        let args = serde_json::to_string(args).map_err(|e| {
-            format!("Gemini functionCall has unserializable 'args': {e}; functionCall: {fc}")
-        })?;
-
-        calls.push(ToolCall {
-            id: format!("call_{}", uuid::Uuid::new_v4()),
-            call_type: "function".to_string(),
-            function: tools::FunctionCall {
-                name,
-                arguments: args,
-            },
-        });
-    }
-
-    Ok(calls)
+    crate::providers::extract_gemini_text_content(parts).map_err(|e| e.to_string())
 }
 
 /// Extract structured tool calls from a Gemini non-streaming response.
 #[cfg(test)]
 fn extract_google_tool_calls(gemini_json: &Value) -> Result<Vec<ToolCall>, String> {
-    extract_google_tool_calls_from_parts(google_response_parts(gemini_json)?)
+    crate::providers::GeminiGenerateContentTurnOutput::new(gemini_json)
+        .and_then(|output| output.tool_calls(0))
+        .map_err(|error| error.to_string())
 }
 
 const fn json_value_type_name(value: &Value) -> &'static str {
@@ -1748,11 +1697,142 @@ fn extract_google_usage(gemini_json: &Value) -> (u64, u64) {
     (input, output)
 }
 
-/// Handle a non-streaming Google Gemini response.
+/// A completed native-JSON provider turn before frontend-owned effects run.
+///
+/// This deliberately omits `Debug`: the exact native state may include
+/// provider-private reasoning material.
+pub struct ProviderNativeJsonDecodedTurn {
+    pub content: String,
+    pub reasoning_content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: TokenUsage,
+    pub finish_reason: Option<String>,
+    pub provider_native_state: crate::runtime::ProviderNativeState,
+}
+
+/// Decode and advance one complete Gemini `GenerateContent` or Ollama Chat JSON
+/// response before any frontend dispatches its projected tool calls.
+///
+/// # Errors
+///
+/// Returns an error for upstream error envelopes, malformed/incomplete native
+/// output, unsupported provider identity, or invalid continuation advancement.
+pub fn decode_provider_native_json_turn(
+    provider: &str,
+    model_identity: &str,
+    response: &Value,
+    previous_state: Option<&crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
+) -> Result<ProviderNativeJsonDecodedTurn, String> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "google" | "gemini" => {
+            if let Some(error) = response.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                    .ok_or_else(|| "Gemini API error is missing a message".to_string())?;
+                let code = error.get("code").and_then(Value::as_u64).unwrap_or(0);
+                return Err(format!("Gemini API error ({code}): {message}"));
+            }
+            let output = crate::providers::GeminiGenerateContentTurnOutput::new(response)
+                .map_err(|error| error.to_string())?;
+            let content = output.text().map_err(|error| error.to_string())?;
+            let tool_calls = output
+                .tool_calls(assistant_message_ordinal)
+                .map_err(|error| error.to_string())?;
+            let provider_native_state = crate::providers::advance_gemini_generate_content_state(
+                provider,
+                model_identity,
+                previous_state,
+                assistant_message_ordinal,
+                &output,
+            )
+            .map_err(|error| error.to_string())?;
+            let classification = classify_google_finish_reason(response, content.len());
+            let (input_tokens, output_tokens) = extract_google_usage(response);
+            Ok(ProviderNativeJsonDecodedTurn {
+                content,
+                reasoning_content: None,
+                tool_calls,
+                usage: TokenUsage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                finish_reason: classification.finish_reason,
+                provider_native_state,
+            })
+        }
+        "ollama" => {
+            if let Some(error) = response.get("error") {
+                let message = error
+                    .as_str()
+                    .or_else(|| error.get("message").and_then(Value::as_str))
+                    .filter(|message| !message.is_empty())
+                    .ok_or_else(|| "Ollama API error is missing a message".to_string())?;
+                return Err(format!("Ollama API error: {message}"));
+            }
+            let output = crate::providers::OllamaChatTurnOutput::new(response)
+                .map_err(|error| error.to_string())?;
+            let tool_calls = output
+                .tool_calls(assistant_message_ordinal)
+                .map_err(|error| error.to_string())?;
+            let provider_native_state = crate::providers::advance_ollama_chat_state(
+                provider,
+                model_identity,
+                previous_state,
+                assistant_message_ordinal,
+                &output,
+            )
+            .map_err(|error| error.to_string())?;
+            let finish_reason = if tool_calls.is_empty() {
+                Some(
+                    response
+                        .get("done_reason")
+                        .and_then(Value::as_str)
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or("stop")
+                        .to_string(),
+                )
+            } else {
+                Some("tool_calls".to_string())
+            };
+            Ok(ProviderNativeJsonDecodedTurn {
+                content: output.text().to_string(),
+                reasoning_content: None,
+                tool_calls,
+                usage: TokenUsage {
+                    input_tokens: response
+                        .get("prompt_eval_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    output_tokens: response
+                        .get("eval_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                finish_reason,
+                provider_native_state,
+            })
+        }
+        other => Err(format!(
+            "provider {other:?} does not use the canonical native JSON decoder"
+        )),
+    }
+}
+
+/// Handle a non-streaming provider-native JSON response.
 #[allow(clippy::too_many_arguments)]
-async fn handle_google_response(
+async fn handle_provider_native_json_response(
     run_context: Arc<tools::ToolRunContext>,
     response: reqwest::Response,
+    provider: &str,
+    previous_state: Option<&crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
     permission_mgr: Option<Arc<PermissionManager>>,
@@ -1766,53 +1846,42 @@ async fn handle_google_response(
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
     let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
-    let gemini_json: Value =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
+    let native_json: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("Failed to parse {provider} JSON response: {error}"))?;
+    let decoded = decode_provider_native_json_turn(
+        provider,
+        model_identity,
+        &native_json,
+        previous_state,
+        assistant_message_ordinal,
+    )
+    .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
 
-    // Check for Gemini error responses
-    if let Some(error) = gemini_json.get("error") {
-        let msg = error
-            .get("message")
-            .and_then(Value::as_str)
-            .filter(|message| !message.is_empty())
-            .ok_or_else(|| {
-                headers
-                    .sanitize_diagnostic(&format!(
-                        "Gemini API error missing non-empty string 'message': {error}"
-                    ))
-                    .to_string()
-            })?;
-        let code = error
-            .get("code")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        return Err(format!(
-            "Gemini API error ({code}): {}",
-            headers.sanitize_diagnostic(msg)
-        ));
+    if matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "google" | "gemini"
+    ) {
+        if let Some(message) =
+            classify_google_finish_reason(&native_json, decoded.content.len()).user_error
+        {
+            send_event!(
+                tx,
+                AppEvent::ApiError(headers.sanitize_diagnostic(&message))
+            );
+        }
+    }
+    if !decoded.content.is_empty() {
+        send_event!(tx, AppEvent::StreamText(decoded.content.clone()));
     }
 
-    let parts = google_response_parts(&gemini_json)
-        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
-    let text = extract_google_text(parts)
-        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
-
-    // #788: surface Gemini SAFETY / RECITATION / BLOCKLIST blocks via the pure helper.
-    let GoogleFinishClassification {
+    let ProviderNativeJsonDecodedTurn {
+        content,
+        reasoning_content,
+        tool_calls,
+        usage,
         finish_reason,
-        user_error,
-    } = classify_google_finish_reason(&gemini_json, text.len());
-    if let Some(msg) = user_error {
-        send_event!(tx, AppEvent::ApiError(headers.sanitize_diagnostic(&msg)));
-    }
-
-    if !text.is_empty() {
-        send_event!(tx, AppEvent::StreamText(text.clone()));
-    }
-
-    let tool_calls = extract_google_tool_calls_from_parts(parts)
-        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
-    let (input_tokens, output_tokens) = extract_google_usage(&gemini_json);
+        provider_native_state,
+    } = decoded;
 
     // Execute tool calls if any
     let (tool_results, needs_followup) = execute_tool_calls_for_tui(
@@ -1832,19 +1901,14 @@ async fn handle_google_response(
     .await;
 
     Ok(TurnResult {
-        content: text,
-        reasoning_content: None,
+        content,
+        reasoning_content,
         tool_calls,
         tool_results,
-        usage: TokenUsage {
-            input_tokens,
-            output_tokens,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        },
+        usage,
         needs_followup,
         finish_reason,
-        provider_native_state: None,
+        provider_native_state: Some(provider_native_state),
     })
 }
 
@@ -4796,6 +4860,154 @@ memory:
     }
 
     #[test]
+    fn native_json_decoder_advances_bound_state_and_rejects_incomplete_ollama() {
+        let gemini_response = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "gemini-native-call",
+                            "name": "bash",
+                            "args": {"command": "pwd"}
+                        },
+                        "thoughtSignature": "opaque-signature"
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 7
+            }
+        });
+        let gemini =
+            decode_provider_native_json_turn("gemini", "gemini-3.5-pro", &gemini_response, None, 1)
+                .expect("Gemini native response decodes");
+        assert_eq!(gemini.tool_calls[0].id, "gemini-native-call");
+        assert_eq!(gemini.usage.input_tokens, 11);
+        assert_eq!(gemini.usage.output_tokens, 7);
+        assert_eq!(
+            gemini.provider_native_state.protocol(),
+            ProviderWireProtocol::GeminiGenerateContent
+        );
+        gemini
+            .provider_native_state
+            .validate_binding(
+                "gemini",
+                "gemini-3.5-pro",
+                ProviderWireProtocol::GeminiGenerateContent,
+            )
+            .expect("decoded state retains exact request identity");
+
+        let incomplete_ollama = serde_json::json!({
+            "model": "qwen3",
+            "message": {"role": "assistant", "content": "partial"},
+            "done": false
+        });
+        let error =
+            decode_provider_native_json_turn("ollama", "qwen3", &incomplete_ollama, None, 1)
+                .err()
+                .expect("incomplete Ollama output cannot advance continuation");
+        assert!(error.contains("incomplete response"), "{error}");
+    }
+
+    #[test]
+    fn canonical_native_json_builder_replays_exact_state_without_private_metadata() {
+        let exact_content = serde_json::json!({
+            "role": "model",
+            "parts": [{
+                "functionCall": {
+                    "id": "gemini-native-call",
+                    "name": "bash",
+                    "args": {"command": "pwd"}
+                },
+                "thoughtSignature": "opaque-signature"
+            }]
+        });
+        let gemini_response = serde_json::json!({
+            "candidates": [{"content": exact_content, "finishReason": "STOP"}]
+        });
+        let decoded =
+            decode_provider_native_json_turn("google", "gemini-3.5-pro", &gemini_response, None, 1)
+                .expect("Gemini native response decodes");
+        let gemini_messages = vec![
+            serde_json::json!({"role": "user", "content": "where am I"}),
+            build_assistant_message_with_tools("", None, &decoded.tool_calls, "google"),
+            serde_json::json!({
+                "role": "tool",
+                "name": "bash",
+                "tool_call_id": "gemini-native-call",
+                "content": "{\"cwd\":\"/workspace\"}"
+            }),
+        ];
+        let gemini_request = build_request_for_wire_with_tools(
+            WireApi::ChatCompletions,
+            "google",
+            "gemini-3.5-pro",
+            &gemini_messages,
+            "medium",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&decoded.provider_native_state),
+        )
+        .expect("canonical Gemini request replays state");
+        assert_eq!(gemini_request["contents"][1], exact_content);
+        assert!(gemini_request
+            .get("_openclaudia_gemini_portable_history")
+            .is_none());
+
+        let exact_message = serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "thinking": "private reasoning",
+            "tool_calls": [{
+                "function": {
+                    "index": 12,
+                    "name": "read",
+                    "arguments": {"path": "Cargo.toml"}
+                }
+            }]
+        });
+        let ollama_response = serde_json::json!({
+            "model": "qwen3",
+            "message": exact_message,
+            "done": true
+        });
+        let decoded =
+            decode_provider_native_json_turn("ollama", "qwen3", &ollama_response, None, 1)
+                .expect("Ollama native response decodes");
+        let ollama_messages = vec![
+            serde_json::json!({"role": "user", "content": "read the manifest"}),
+            build_assistant_message_with_tools("", None, &decoded.tool_calls, "ollama"),
+            serde_json::json!({
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": decoded.tool_calls[0].id,
+                "content": "manifest"
+            }),
+        ];
+        let ollama_request = build_request_for_wire_with_tools(
+            WireApi::ChatCompletions,
+            "ollama",
+            "qwen3",
+            &ollama_messages,
+            "medium",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&decoded.provider_native_state),
+        )
+        .expect("canonical Ollama request replays state");
+        assert_eq!(ollama_request["messages"][1], exact_message);
+        assert_eq!(ollama_request["stream"], false);
+        assert!(ollama_request
+            .get("_openclaudia_ollama_portable_history")
+            .is_none());
+    }
+
+    #[test]
     fn test_build_openai_request() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
         let req = build_openai_request("gpt-4", &messages, "medium");
@@ -5544,7 +5756,10 @@ memory:
 
         let ollama = build_request("ollama", "llama3", &messages, "medium", None, None)
             .expect("ollama request should build");
-        assert_eq!(ollama["stream"], true);
+        assert_eq!(
+            ollama["stream"], false,
+            "canonical Ollama agent loops require one terminal JSON response"
+        );
         assert!(ollama["options"]["num_predict"].is_number());
         assert!(
             ollama.get("max_tokens").is_none(),
@@ -5824,13 +6039,13 @@ memory:
         let missing_role = vec![serde_json::json!({"content": "hi"})];
         let err = build_google_request(&missing_role, "medium")
             .expect_err("missing message role must fail");
-        assert!(err.contains("'role'"), "{err}");
+        assert!(err.contains("role"), "{err}");
         assert!(err.contains("index 0"), "{err}");
 
         let missing_content = vec![serde_json::json!({"role": "user"})];
         let err = build_google_request(&missing_content, "medium")
             .expect_err("missing message content must fail");
-        assert!(err.contains("'content'"), "{err}");
+        assert!(err.contains("content"), "{err}");
         assert!(err.contains("index 0"), "{err}");
 
         let unsupported_role = vec![serde_json::json!({"role": "developer", "content": "hi"})];

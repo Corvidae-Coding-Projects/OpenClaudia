@@ -2310,7 +2310,11 @@ async fn run_subagent_inner(
                     };
                 }
             };
-        let provider_request_body = if wire_api.is_responses() {
+        let uses_native_json = matches!(
+            app_config.proxy.target.trim().to_ascii_lowercase().as_str(),
+            "google" | "gemini" | "ollama"
+        );
+        let provider_request_body = if wire_api.is_responses() || uses_native_json {
             match crate::pipeline::build_request_for_wire_with_exact_tools_and_state(
                 wire_api,
                 &app_config.proxy.target,
@@ -2326,23 +2330,25 @@ async fn run_subagent_inner(
                 provider_native_state.as_ref(),
             ) {
                 Ok(mut request) => {
-                    if let Err(error) = apply_subagent_responses_output_limit(&mut request) {
-                        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
-                        store_transcript_with_state(
-                            parent_run,
-                            &agent_id,
-                            messages,
-                            provider_native_state,
-                            config.agent_type,
-                        );
-                        return SubagentResult {
-                            agent_id,
-                            success: false,
-                            output: error,
-                            turns_used: turns,
-                            is_background: config.run_in_background,
-                            worktree: worktree.clone(),
-                        };
+                    if wire_api.is_responses() {
+                        if let Err(error) = apply_subagent_responses_output_limit(&mut request) {
+                            BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                            store_transcript_with_state(
+                                parent_run,
+                                &agent_id,
+                                messages,
+                                provider_native_state,
+                                config.agent_type,
+                            );
+                            return SubagentResult {
+                                agent_id,
+                                success: false,
+                                output: error,
+                                turns_used: turns,
+                                is_background: config.run_in_background,
+                                worktree: worktree.clone(),
+                            };
+                        }
                     }
                     Some(request)
                 }
@@ -2358,7 +2364,7 @@ async fn run_subagent_inner(
                     return SubagentResult {
                         agent_id,
                         success: false,
-                        output: format!("Responses request error: {error}"),
+                        output: format!("Provider request error: {error}"),
                         turns_used: turns,
                         is_background: config.run_in_background,
                         worktree: worktree.clone(),
@@ -2373,102 +2379,146 @@ async fn run_subagent_inner(
         // ProviderAdapter trait (canonical implementation in
         // `src/providers/`) handles request/response transformation for
         // every supported provider. See crosslink #407.
-        let (mut assistant_message, next_provider_native_state) =
-            if let Some(request) = provider_request_body.as_ref() {
-                let Some(auth) = codex_responses_auth.as_ref() else {
-                    unreachable!("Responses wire selection requires Codex auth");
-                };
-                match make_openai_responses_api_call(
-                    client,
-                    &app_config.proxy.target,
-                    &model,
-                    crate::codex_credentials::CODEX_CHATGPT_BASE_URL,
-                    auth,
-                    app_config
-                        .active_provider()
-                        .map(|provider| &provider.headers),
-                    request,
-                    provider_native_state.as_ref(),
-                    assistant_message_ordinal,
-                )
-                .await
-                {
-                    Ok(decoded) => {
-                        let assistant = responses_subagent_assistant_message(&decoded);
-                        (assistant, Some(decoded.provider_native_state))
-                    }
-                    Err(error) => {
-                        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
-                        store_transcript_with_state(
-                            parent_run,
-                            &agent_id,
-                            messages,
-                            provider_native_state,
-                            config.agent_type,
-                        );
-                        return SubagentResult {
-                            agent_id,
-                            success: false,
-                            output: error,
-                            turns_used: turns,
-                            is_background: config.run_in_background,
-                            worktree: worktree.clone(),
-                        };
-                    }
-                }
-            } else {
-                let response = match make_api_call(
-                    client,
-                    &app_config.proxy.target,
-                    &base_url,
-                    api_key.as_ref(),
-                    &request_body,
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
-                        store_transcript_with_state(
-                            parent_run,
-                            &agent_id,
-                            messages,
-                            provider_native_state,
-                            config.agent_type,
-                        );
-                        return SubagentResult {
-                            agent_id,
-                            success: false,
-                            output: error,
-                            turns_used: turns,
-                            is_background: config.run_in_background,
-                            worktree: worktree.clone(),
-                        };
-                    }
-                };
-                let assistant = match parse_response(&response) {
-                    Ok(message) => message,
-                    Err(error) => {
-                        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
-                        store_transcript_with_state(
-                            parent_run,
-                            &agent_id,
-                            messages,
-                            provider_native_state,
-                            config.agent_type,
-                        );
-                        return SubagentResult {
-                            agent_id,
-                            success: false,
-                            output: error,
-                            turns_used: turns,
-                            is_background: config.run_in_background,
-                            worktree: worktree.clone(),
-                        };
-                    }
-                };
-                (assistant, None)
+        let (mut assistant_message, next_provider_native_state) = if wire_api.is_responses() {
+            let request = provider_request_body
+                .as_ref()
+                .expect("Responses request uses the canonical wire builder");
+            let Some(auth) = codex_responses_auth.as_ref() else {
+                unreachable!("Responses wire selection requires Codex auth");
             };
+            match make_openai_responses_api_call(
+                client,
+                &app_config.proxy.target,
+                &model,
+                crate::codex_credentials::CODEX_CHATGPT_BASE_URL,
+                auth,
+                app_config
+                    .active_provider()
+                    .map(|provider| &provider.headers),
+                request,
+                provider_native_state.as_ref(),
+                assistant_message_ordinal,
+            )
+            .await
+            {
+                Ok(decoded) => {
+                    let assistant = responses_subagent_assistant_message(&decoded);
+                    (assistant, Some(decoded.provider_native_state))
+                }
+                Err(error) => {
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                    store_transcript_with_state(
+                        parent_run,
+                        &agent_id,
+                        messages,
+                        provider_native_state,
+                        config.agent_type,
+                    );
+                    return SubagentResult {
+                        agent_id,
+                        success: false,
+                        output: error,
+                        turns_used: turns,
+                        is_background: config.run_in_background,
+                        worktree: worktree.clone(),
+                    };
+                }
+            }
+        } else if uses_native_json {
+            let request = provider_request_body
+                .as_ref()
+                .expect("native JSON request uses the canonical wire builder");
+            match make_provider_native_json_api_call(
+                client,
+                &app_config.proxy.target,
+                &model,
+                &base_url,
+                api_key.as_ref(),
+                app_config
+                    .active_provider()
+                    .map(|provider| &provider.headers),
+                request,
+                provider_native_state.as_ref(),
+                assistant_message_ordinal,
+            )
+            .await
+            {
+                Ok(decoded) => {
+                    let assistant = native_json_subagent_assistant_message(&decoded);
+                    (assistant, Some(decoded.provider_native_state))
+                }
+                Err(error) => {
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                    store_transcript_with_state(
+                        parent_run,
+                        &agent_id,
+                        messages,
+                        provider_native_state,
+                        config.agent_type,
+                    );
+                    return SubagentResult {
+                        agent_id,
+                        success: false,
+                        output: error,
+                        turns_used: turns,
+                        is_background: config.run_in_background,
+                        worktree: worktree.clone(),
+                    };
+                }
+            }
+        } else {
+            let response = match make_api_call(
+                client,
+                &app_config.proxy.target,
+                &base_url,
+                api_key.as_ref(),
+                &request_body,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                    store_transcript_with_state(
+                        parent_run,
+                        &agent_id,
+                        messages,
+                        provider_native_state,
+                        config.agent_type,
+                    );
+                    return SubagentResult {
+                        agent_id,
+                        success: false,
+                        output: error,
+                        turns_used: turns,
+                        is_background: config.run_in_background,
+                        worktree: worktree.clone(),
+                    };
+                }
+            };
+            let assistant = match parse_response(&response) {
+                Ok(message) => message,
+                Err(error) => {
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                    store_transcript_with_state(
+                        parent_run,
+                        &agent_id,
+                        messages,
+                        provider_native_state,
+                        config.agent_type,
+                    );
+                    return SubagentResult {
+                        agent_id,
+                        success: false,
+                        output: error,
+                        turns_used: turns,
+                        is_background: config.run_in_background,
+                        worktree: worktree.clone(),
+                    };
+                }
+            };
+            (assistant, None)
+        };
 
         // Text belongs to this exact provider turn. Never carry a tool-bearing
         // preamble forward as the final answer for a later empty response.
@@ -3017,6 +3067,34 @@ fn responses_subagent_assistant_message(
     })
 }
 
+fn native_json_subagent_assistant_message(
+    decoded: &crate::pipeline::ProviderNativeJsonDecodedTurn,
+) -> Value {
+    let tool_calls = decoded
+        .tool_calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "role": "assistant",
+        "content": if decoded.content.is_empty() && !tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(decoded.content.clone())
+        },
+        "tool_calls": tool_calls,
+    })
+}
+
 fn apply_subagent_responses_output_limit(request: &mut Value) -> Result<(), String> {
     request
         .as_object_mut()
@@ -3101,6 +3179,59 @@ async fn make_openai_responses_api_call(
         |_, _| Ok(()),
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn make_provider_native_json_api_call(
+    client: &Client,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: Option<&crate::providers::ApiKey>,
+    extra_headers: Option<&crate::secrets::SensitiveHeaders>,
+    request_body: &Value,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
+) -> Result<crate::pipeline::ProviderNativeJsonDecodedTurn, String> {
+    let endpoint = crate::pipeline::resolve_endpoint(provider, model, base_url, None)
+        .map_err(|error| format!("Provider endpoint error: {error}"))?;
+    let empty_headers = crate::secrets::SensitiveHeaders::new();
+    let headers = crate::pipeline::resolve_headers(
+        provider,
+        api_key,
+        None,
+        extra_headers.unwrap_or(&empty_headers),
+    )
+    .map_err(|error| format!("Provider header error: {error}"))?;
+    let request = headers
+        .apply(client.post(endpoint).json(request_body))
+        .map_err(|error| format!("Provider header error: {error}"))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Provider request failed: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = crate::secrets::read_bounded_diagnostic_body(response)
+            .await
+            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+        return Err(format!(
+            "Provider API error ({status}): {}",
+            headers.sanitize_diagnostic(&body)
+        ));
+    }
+    let response = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Provider JSON error: {error}"))?;
+    crate::pipeline::decode_provider_native_json_turn(
+        provider,
+        model,
+        &response,
+        provider_native_state,
+        assistant_message_ordinal,
+    )
+    .map_err(|error| headers.sanitize_diagnostic(&error).to_string())
 }
 
 /// Make an API call to the LLM provider.
@@ -5565,6 +5696,44 @@ memory:
             message["tool_calls"][0]["function"]["arguments"],
             r#"{"path":"src/lib.rs"}"#
         );
+    }
+
+    #[test]
+    fn native_json_child_projection_preserves_exact_tool_call_identity() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "gemini-child-call",
+                            "name": "read_file",
+                            "args": {"path": "src/lib.rs"}
+                        },
+                        "thoughtSignature": "opaque-child-signature"
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let decoded = crate::pipeline::decode_provider_native_json_turn(
+            "google",
+            "gemini-3.5-pro",
+            &response,
+            None,
+            1,
+        )
+        .expect("Gemini child turn decodes before tool dispatch");
+
+        let message = native_json_subagent_assistant_message(&decoded);
+        assert!(message["content"].is_null());
+        assert_eq!(message["tool_calls"][0]["id"], "gemini-child-call");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"src/lib.rs"}"#
+        );
+        assert_eq!(decoded.provider_native_state.generation().get(), 1);
     }
 
     #[test]

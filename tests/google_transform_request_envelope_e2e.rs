@@ -177,9 +177,10 @@ fn google_transform_keeps_user_role_as_user() {
 
 #[test]
 fn google_transform_unknown_role_defaults_to_user() {
-    // PINS DOC: any non-assistant role maps to "user".
+    // PINS DOC: an unknown non-protocol role maps to "user". The recognized
+    // "tool" role is validated separately as correlated tool history.
     let adapter = get_adapter("google").unwrap();
-    let request = req("m", vec![msg("tool", "result")]);
+    let request = req("m", vec![msg("observer", "result")]);
     let body = adapter.transform_request(&request).expect("ok");
     let contents = body["contents"].as_array().expect("array");
     assert_eq!(contents[0]["role"], "user");

@@ -49,7 +49,6 @@ use crate::{
 use eventsource_stream::Eventsource;
 use openclaudia::providers::{
     convert_messages_to_anthropic_checked, convert_tool_definitions_to_anthropic_checked,
-    convert_tools_to_gemini_functions, extract_gemini_text_content,
 };
 use openclaudia::state::EffortLevel;
 use openclaudia::tools::safe_truncate;
@@ -304,15 +303,6 @@ fn fresh_repl_session_in_run(current: &Session, model: &str, provider: &str) -> 
     fresh
 }
 
-/// Mutable state threaded through the Gemini agentic tool loop.
-/// Bundling these together keeps `run_gemini_tool_loop` under clippy's
-/// `too_many_arguments` threshold without resorting to a suppression.
-struct GeminiLoopState {
-    full_content: String,
-    tool_calls: Vec<tools::ToolCall>,
-    contents: Vec<serde_json::Value>,
-}
-
 /// Mutable state carried through the OpenAI-compatible tool loop.
 struct OpenAiLoopState {
     current_content: String,
@@ -375,14 +365,6 @@ fn request_messages_with_cli_grounding(
         task_obs,
         session_messages,
     )
-}
-
-fn cli_grounding_system_content(
-    run: &tools::ToolRunContext,
-    session_id: &str,
-    task_obs: openclaudia::ledger::ObsId,
-) -> Option<String> {
-    openclaudia::grounded_loop::session_grounding_system_content(run, session_id, task_obs)
 }
 
 fn validate_and_render_cli_agentic_final_response(
@@ -1491,12 +1473,6 @@ impl ChatRepl {
         Ok(())
     }
 
-    fn current_grounding_system_content(&self) -> Option<String> {
-        self.current_task_obs.and_then(|task_obs| {
-            cli_grounding_system_content(&self.run_context, &self.chat_session.id(), task_obs)
-        })
-    }
-
     fn policy_denied_tool_result(&self, tool_call: &tools::ToolCall) -> Option<tools::ToolResult> {
         let session_id = self.chat_session.id();
         let tool_policy = openclaudia::services::policy::ToolExecutionPolicy::new(
@@ -1623,8 +1599,16 @@ impl ChatRepl {
                         .await;
                     return false;
                 }
-                if self.config.proxy.target == "google" {
-                    self.process_google_response(response, &request_body, transport, memory_db)
+                if matches!(
+                    self.config
+                        .proxy
+                        .target
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "google" | "gemini" | "ollama"
+                ) {
+                    self.process_native_json_response(response, transport, memory_db)
                         .await;
                     false
                 } else {
@@ -1670,183 +1654,281 @@ impl ChatRepl {
         }
     }
 
-    /// Google Gemini path: non-streaming JSON response + native
-    /// `functionCall` / `functionResponse` tool loop.
-    async fn process_google_response(
+    /// Gemini `GenerateContent` and Ollama Chat both return one complete native
+    /// JSON turn. Decode them through the shared continuation state machine and
+    /// commit each assistant projection before executing any projected tool.
+    async fn process_native_json_response(
         &mut self,
         response: reqwest::Response,
-        request_body: &serde_json::Value,
         transport: TurnTransport<'_>,
         memory_db: Option<&memory::MemoryDb>,
     ) {
         println!();
-        let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
-        let Some(gemini_json) = self.parse_gemini_initial_body(&body, transport.headers) else {
+        let Some(mut native_json) = self
+            .parse_native_json_body(response, transport.headers)
+            .await
+        else {
             return;
         };
+        let max_iterations = self.config.session.max_turns;
+        let mut tool_rounds = 0_u32;
+        let mut usage = openclaudia::session::TokenUsage::default();
 
-        let (full_content, tool_calls) =
-            match Self::emit_gemini_initial_text_and_calls(&gemini_json) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    let diagnostic = transport.headers.sanitize_diagnostic(&e);
-                    eprintln!("\nInvalid Gemini response: {diagnostic}");
-                    self.record_failed_turn(&format!("invalid Gemini response: {diagnostic}"));
+        loop {
+            let assistant_ordinal = match openclaudia::pipeline::next_assistant_message_ordinal(
+                &self.chat_session.messages_snapshot(),
+            ) {
+                Ok(ordinal) => ordinal,
+                Err(error) => {
+                    self.record_failed_turn(&error);
+                    eprintln!("\nProvider state error: {error}");
                     return;
                 }
             };
-        let (input_tokens, output_tokens) = gemini_extract_usage_tokens(&gemini_json);
+            let previous_state = self.chat_session.provider_native_state_snapshot();
+            let decoded = match openclaudia::pipeline::decode_provider_native_json_turn(
+                &self.config.proxy.target,
+                &self.model,
+                &native_json,
+                previous_state.as_ref(),
+                assistant_ordinal,
+            ) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    let diagnostic = transport.headers.sanitize_diagnostic(&error);
+                    self.record_failed_turn(&format!("invalid provider response: {diagnostic}"));
+                    eprintln!("\nInvalid provider response: {diagnostic}");
+                    return;
+                }
+            };
+            usage.accumulate(&decoded.usage);
+            self.audit_native_json_response(&decoded);
 
-        if let Err(e) = self.audit_logger.log(
+            let openclaudia::pipeline::ProviderNativeJsonDecodedTurn {
+                content,
+                reasoning_content: _,
+                tool_calls,
+                usage: _,
+                finish_reason: _,
+                provider_native_state,
+            } = decoded;
+            if tool_calls.is_empty() {
+                self.finalize_native_json_response(&content, &usage, provider_native_state)
+                    .await;
+                return;
+            }
+            if max_iterations > 0 && tool_rounds >= max_iterations {
+                let _ = emit_max_turns_event(
+                    &self.chat_session.id(),
+                    &format!("{}_native_json", self.config.proxy.target),
+                    max_iterations,
+                    tool_rounds,
+                );
+                eprintln!(
+                    "\n\x1b[33m⚠ Reached max_turns limit ({max_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
+                );
+                return;
+            }
+            if let Err(error) = self.install_native_json_assistant_turn(
+                &content,
+                &tool_calls,
+                provider_native_state,
+                "native JSON tool-call assistant turn",
+            ) {
+                self.record_failed_turn(&error);
+                eprintln!("\nProvider state error: {error}");
+                return;
+            }
+
+            let _provider_results = self.gemini_execute_tools(&tool_calls, memory_db).await;
+            tool_rounds = tool_rounds.saturating_add(1);
+            println!(
+                "\n\x1b[90m(Sending {} tool result{} to {}...)\x1b[0m",
+                tool_calls.len(),
+                if tool_calls.len() == 1 { "" } else { "s" },
+                self.config.proxy.target
+            );
+            if !self.followup_request_policy_allows("native JSON follow-up") {
+                return;
+            }
+            let request = match self.build_native_json_followup_request() {
+                Ok(request) => request,
+                Err(error) => {
+                    self.record_failed_turn(&format!("provider follow-up build failed: {error}"));
+                    eprintln!("\nProvider follow-up build failed: {error}");
+                    return;
+                }
+            };
+            let Some(response) = self.send_native_json_followup(&request, transport).await else {
+                return;
+            };
+            native_json = response;
+        }
+    }
+
+    fn audit_native_json_response(
+        &mut self,
+        decoded: &openclaudia::pipeline::ProviderNativeJsonDecodedTurn,
+    ) {
+        if let Err(error) = self.audit_logger.log(
             "model_response",
             &serde_json::json!({
                 "model": &self.model,
-                "content_length": full_content.len(),
-                "tool_calls": tool_calls.len(),
+                "content_length": decoded.content.len(),
+                "tool_calls": decoded.tool_calls.len(),
                 "cancelled": false,
             }),
         ) {
-            tracing::warn!("Audit log failed for model_response: {e}");
+            tracing::warn!("Audit log failed for model_response: {error}");
         }
-
-        let contents: Vec<serde_json::Value> = serde_json::from_value(
-            request_body
-                .get("contents")
-                .cloned()
-                .unwrap_or(serde_json::json!([])),
-        )
-        .unwrap_or_default();
-
-        let mut state = GeminiLoopState {
-            full_content,
-            tool_calls,
-            contents,
-        };
-        self.run_gemini_tool_loop(&mut state, request_body, transport, memory_db)
-            .await;
-
-        self.finalize_gemini_response(&state.full_content, input_tokens, output_tokens)
-            .await;
     }
 
-    /// Parse the Gemini HTTP body to JSON, or print an error and record
-    /// a failed-turn marker on failure.
-    fn parse_gemini_initial_body(
+    async fn parse_native_json_body(
         &mut self,
-        body: &str,
+        response: reqwest::Response,
         headers: &openclaudia::secrets::SensitiveHeaders,
     ) -> Option<serde_json::Value> {
-        match serde_json::from_str::<serde_json::Value>(body) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("\nFailed to parse Gemini response: {e}");
-                eprintln!("Response body: {}", headers.sanitize_diagnostic(body));
-                self.record_failed_turn(&format!("failed to parse Gemini response: {e}"));
+        let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let diagnostic = headers.sanitize_diagnostic(&error.to_string());
+                self.record_failed_turn(&format!("failed to parse provider JSON: {diagnostic}"));
+                eprintln!("\nFailed to parse provider response: {diagnostic}");
                 None
             }
         }
     }
 
-    /// Return the assembled Gemini `(full_content, tool_calls)` pair.
-    /// Terminal text stays buffered until the final evidence gate runs.
-    fn emit_gemini_initial_text_and_calls(
-        gemini_json: &serde_json::Value,
-    ) -> Result<(String, Vec<tools::ToolCall>), String> {
-        let mut full_content = String::new();
-        let text = gemini_extract_text(gemini_json)?;
-        let tool_calls = gemini_extract_tool_calls(gemini_json)?;
-        if !text.is_empty() {
-            full_content.push_str(&text);
+    fn install_native_json_assistant_turn(
+        &mut self,
+        content: &str,
+        tool_calls: &[tools::ToolCall],
+        provider_native_state: openclaudia::runtime::ProviderNativeState,
+        reason: &str,
+    ) -> Result<(), String> {
+        let tool_calls = tool_calls
+            .iter()
+            .map(|call| {
+                serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut messages = self.chat_session.messages_snapshot();
+        let mut assistant = serde_json::json!({
+            "role": "assistant",
+            "content": content,
+        });
+        if !tool_calls.is_empty() {
+            assistant["tool_calls"] = serde_json::Value::Array(tool_calls);
         }
-        Ok((full_content, tool_calls))
+        messages.push(assistant);
+        self.chat_session
+            .replace_messages_and_provider_native_state(messages, Some(provider_native_state))
+            .map_err(|error| error.to_string())?;
+        persist_chat_session_update(&mut self.chat_session, reason);
+        Ok(())
     }
 
-    /// Drive the Gemini agentic tool loop until no tool calls remain or
-    /// the `max_turns` ceiling is reached. Mutates `state` in place.
-    async fn run_gemini_tool_loop(
-        &mut self,
-        state: &mut GeminiLoopState,
-        request_body: &serde_json::Value,
+    fn build_native_json_followup_request(&self) -> Result<serde_json::Value, String> {
+        let messages = self.request_messages_with_grounding()?;
+        let prompt_blocks = self.build_prompt_blocks_for_turn();
+        let effort = self
+            .transient_effort_override
+            .unwrap_or_else(|| self.chat_session.effort_level());
+        let provider_native_state = self.chat_session.provider_native_state_snapshot();
+        openclaudia::pipeline::build_request_for_run_with_state(
+            &self.run_context,
+            &self.config.proxy.target,
+            &self.model,
+            &messages,
+            effort.as_str(),
+            self.claude_code_token.as_ref(),
+            Some(&prompt_blocks),
+            provider_native_state.as_ref(),
+        )
+    }
+
+    async fn send_native_json_followup(
+        &self,
+        request: &serde_json::Value,
         transport: TurnTransport<'_>,
-        memory_db: Option<&memory::MemoryDb>,
-    ) {
-        let max_iterations = self.config.session.max_turns;
-        let mut iteration: u32 = 0;
-        while !state.tool_calls.is_empty() && (max_iterations == 0 || iteration < max_iterations) {
-            iteration += 1;
-            self.gemini_record_model_turn(
-                &state.full_content,
-                &state.tool_calls,
-                &mut state.contents,
-            );
-            let function_responses = self
-                .gemini_execute_tools(&state.tool_calls, memory_db)
-                .await;
-            state.contents.push(serde_json::json!({
-                "role": "user",
-                "parts": function_responses
-            }));
-            println!(
-                "\n\x1b[90m(Sending {} tool result{} to Gemini...)\x1b[0m",
-                state.tool_calls.len(),
-                if state.tool_calls.len() == 1 { "" } else { "s" }
-            );
-            if !self.followup_request_policy_allows("gemini follow-up") {
-                break;
+    ) -> Option<serde_json::Value> {
+        let request = match transport
+            .headers
+            .apply(self.client.post(transport.endpoint).json(request))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("\nProvider header error: {error}");
+                return None;
             }
-            match self
-                .gemini_send_followup(&state.contents, request_body, transport)
-                .await
-            {
-                Some((next_text, next_calls)) => {
-                    state.full_content = next_text;
-                    state.tool_calls = next_calls;
-                }
-                None => break,
+        };
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let body = zeroize::Zeroizing::new(response.text().await.unwrap_or_default());
+                serde_json::from_str(&body).map_or_else(
+                    |error| {
+                        eprintln!(
+                            "\nFailed to parse provider follow-up response: {}",
+                            transport.headers.sanitize_diagnostic(&error.to_string())
+                        );
+                        None
+                    },
+                    Some,
+                )
             }
-        }
-        // #601 — Gemini path previously bailed silently when the
-        // `max_turns` ceiling was reached. Emit a structured
-        // `error_max_turns` result event so SDK/MCP consumers see a
-        // typed signal, matching CC's QueryEngine.ts:851-873 behaviour.
-        if max_iterations > 0 && iteration >= max_iterations && !state.tool_calls.is_empty() {
-            let _ = emit_max_turns_event(
-                &self.chat_session.id(),
-                "google_gemini",
-                max_iterations,
-                iteration,
-            );
-            eprintln!(
-                "\n\x1b[33m⚠ Reached max_turns limit ({max_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
-            );
+            Ok(response) => {
+                let status = response.status();
+                let body = openclaudia::secrets::read_bounded_diagnostic_body(response)
+                    .await
+                    .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+                eprintln!(
+                    "\nProvider follow-up failed: {status} {}",
+                    transport.headers.sanitize_diagnostic(&body)
+                );
+                None
+            }
+            Err(error) => {
+                eprintln!("\nProvider follow-up error: {error}");
+                None
+            }
         }
     }
 
-    /// Persist the final Gemini message, run VDD review, draw the status
-    /// bar, and emit the trailing newline.
-    async fn finalize_gemini_response(
+    async fn finalize_native_json_response(
         &mut self,
-        full_content: &str,
-        input_tokens: u64,
-        output_tokens: u64,
+        content: &str,
+        usage: &openclaudia::session::TokenUsage,
+        provider_native_state: openclaudia::runtime::ProviderNativeState,
     ) {
-        let rendered_content = if full_content.trim().is_empty() {
+        let rendered_content = if content.trim().is_empty() {
             String::new()
         } else {
-            let Some(rendered) = self.render_final_response(full_content.trim(), false) else {
+            let Some(rendered_content) = self.render_final_response(content.trim(), false) else {
                 return;
             };
-            println!("{rendered}");
-            push_chat_session_message_and_persist(
-                &mut self.chat_session,
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": rendered
-                }),
-                "gemini final assistant response",
-            );
-            rendered
+            rendered_content
         };
+        if let Err(error) = self.install_native_json_assistant_turn(
+            &rendered_content,
+            &[],
+            provider_native_state,
+            "native JSON final assistant response",
+        ) {
+            self.record_failed_turn(&error);
+            eprintln!("\nProvider state error: {error}");
+            return;
+        }
+        if !rendered_content.is_empty() {
+            println!("{rendered_content}");
+        }
 
         if let Some(ref engine) = self.vdd_engine {
             let original = self.chat_session.messages_snapshot();
@@ -1861,89 +1943,41 @@ impl ChatRepl {
             )
             .await;
             if messages != original {
-                self.chat_session.replace_messages(messages);
-                persist_chat_session_update(&mut self.chat_session, "gemini VDD context injection");
+                let native_state = self.chat_session.provider_native_state_snapshot();
+                match self
+                    .chat_session
+                    .replace_messages_and_provider_native_state(messages, native_state)
+                {
+                    Ok(()) => persist_chat_session_update(
+                        &mut self.chat_session,
+                        "native JSON VDD context injection",
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "refused non-causal VDD transcript mutation"
+                    ),
+                }
             }
         }
 
         let tokens = estimate_session_tokens(&self.chat_session) + rendered_content.len() / 4;
-        // `draw_status_bar` accepts `Option<f64>` and elides the cost
-        // segment when None; an unknown model therefore renders as a
-        // blank cost rather than $0.00.
-        let cost = session::calculate_cost(
-            &self.model,
-            &openclaudia::session::TokenUsage {
-                input_tokens: input_tokens.max(tokens as u64),
-                output_tokens: output_tokens.max(rendered_content.len() as u64 / 4),
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-        )
-        .ok();
+        let billed_usage = openclaudia::session::TokenUsage {
+            input_tokens: usage.input_tokens.max(tokens as u64),
+            output_tokens: usage.output_tokens.max(rendered_content.len() as u64 / 4),
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+        };
+        let cost = session::calculate_cost(&self.model, &billed_usage).ok();
         let duration = chrono::Utc::now().signed_duration_since(self.chat_session.created_at);
-        let dur_str = format!("{}m", duration.num_minutes());
+        let duration = format!("{}m", duration.num_minutes());
         tui::draw_status_bar(
             &self.model,
             tokens,
             cost,
             self.chat_session.agent_mode().display(),
-            &dur_str,
+            &duration,
         );
         println!();
-    }
-
-    /// Record the model's tool-call turn into both `gemini_contents`
-    /// (native format) and the canonical session conversation (`OpenAI` format).
-    fn gemini_record_model_turn(
-        &mut self,
-        full_content: &str,
-        gemini_tool_calls: &[tools::ToolCall],
-        gemini_contents: &mut Vec<serde_json::Value>,
-    ) {
-        let model_parts: Vec<serde_json::Value> = {
-            let mut parts = Vec::new();
-            if !full_content.is_empty() {
-                parts.push(serde_json::json!({"text": full_content}));
-            }
-            for tc in gemini_tool_calls {
-                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                parts.push(serde_json::json!({
-                    "functionCall": {
-                        "name": tc.function.name,
-                        "args": args
-                    }
-                }));
-            }
-            parts
-        };
-        gemini_contents.push(serde_json::json!({
-            "role": "model",
-            "parts": model_parts
-        }));
-
-        let tool_calls_json: Vec<serde_json::Value> = gemini_tool_calls
-            .iter()
-            .map(|tc| {
-                serde_json::json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }
-                })
-            })
-            .collect();
-        push_chat_session_message_and_persist(
-            &mut self.chat_session,
-            serde_json::json!({
-                "role": "assistant",
-                "content": serde_json::Value::String(full_content.to_string()),
-                "tool_calls": tool_calls_json
-            }),
-            "gemini tool-call assistant turn",
-        );
     }
 
     /// Execute each tool call from a Gemini turn and produce the
@@ -2147,122 +2181,6 @@ impl ChatRepl {
             }
         });
         response
-    }
-
-    fn gemini_followup_functions(&self) -> Result<Vec<serde_json::Value>, String> {
-        let catalog_messages = self.request_messages_with_grounding()?;
-        let openai_tools =
-            tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
-                .definitions_value();
-        let tools_vec = openai_tools
-            .as_array()
-            .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?;
-        convert_tools_to_gemini_functions(tools_vec).map_err(|error| error.to_string())
-    }
-
-    /// Send the next Gemini turn with tool results. Returns the new
-    /// (text, `tool_calls`) on success, `None` on transport / parse error.
-    async fn gemini_send_followup(
-        &self,
-        gemini_contents: &[serde_json::Value],
-        request_body: &serde_json::Value,
-        transport: TurnTransport<'_>,
-    ) -> Option<(String, Vec<tools::ToolCall>)> {
-        let functions = match self.gemini_followup_functions() {
-            Ok(functions) => functions,
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    "failed to build progressive Gemini follow-up tools"
-                );
-                return None;
-            }
-        };
-
-        let mut grounded_contents = gemini_contents.to_vec();
-        if let Some(grounding) = self.current_grounding_system_content() {
-            let projection = openclaudia::context::ContextProjector::project(
-                vec![openclaudia::context::ContextItem::reference(
-                    "reality.grounding",
-                    openclaudia::context::ReferenceSource::Reality,
-                    "reality-ledger:current-task",
-                    grounding,
-                    openclaudia::context::ContextFreshness::Turn,
-                    800,
-                )],
-                openclaudia::context::ContextBudget::default(),
-            );
-            grounded_contents.push(serde_json::json!({
-                "role": "user",
-                "parts": [{"text": projection.reference}]
-            }));
-        }
-        let mut followup_req = serde_json::json!({
-            "contents": grounded_contents,
-            "generationConfig": {"maxOutputTokens": 4096},
-            "tools": [{"functionDeclarations": functions}]
-        });
-        if let Some(sys) = request_body.get("systemInstruction") {
-            followup_req["systemInstruction"] = sys.clone();
-        }
-        if let Err(error) = self.apply_provider_native_state_to_followup(&mut followup_req) {
-            tracing::error!(error = %error, "failed to apply provider-native Gemini state");
-            return None;
-        }
-
-        let req = match transport
-            .headers
-            .apply(self.client.post(transport.endpoint).json(&followup_req))
-        {
-            Ok(request) => request,
-            Err(error) => {
-                eprintln!("\nProvider header error: {error}");
-                return None;
-            }
-        };
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let resp_body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
-                let Ok(resp_json) = serde_json::from_str::<serde_json::Value>(&resp_body) else {
-                    eprintln!("\nFailed to parse Gemini follow-up response");
-                    return None;
-                };
-                let text = match gemini_extract_text(&resp_json) {
-                    Ok(text) => text,
-                    Err(e) => {
-                        eprintln!(
-                            "\nInvalid Gemini follow-up response: {}",
-                            transport.headers.sanitize_diagnostic(&e)
-                        );
-                        return None;
-                    }
-                };
-                let calls = match gemini_extract_tool_calls(&resp_json) {
-                    Ok(calls) => calls,
-                    Err(e) => {
-                        eprintln!(
-                            "\nInvalid Gemini follow-up tool call response: {}",
-                            transport.headers.sanitize_diagnostic(&e)
-                        );
-                        return None;
-                    }
-                };
-                Some((text, calls))
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let err_body = openclaudia::secrets::read_bounded_diagnostic_body(resp)
-                    .await
-                    .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
-                let diagnostic = transport.headers.sanitize_diagnostic(&err_body);
-                eprintln!("\nGemini follow-up failed: {status} {diagnostic}");
-                None
-            }
-            Err(e) => {
-                eprintln!("\nGemini follow-up error: {e}");
-                None
-            }
-        }
     }
 
     /// Anthropic / `OpenAI` SSE streaming path. Returns `true` when a
@@ -3738,6 +3656,7 @@ fn all_signatures_seen(
         .all(|tc| executed.contains(&tool_call_signature(tc)))
 }
 
+#[cfg(test)]
 fn gemini_response_parts(json: &serde_json::Value) -> Result<&[serde_json::Value], String> {
     let candidate = json
         .get("candidates")
@@ -3752,84 +3671,17 @@ fn gemini_response_parts(json: &serde_json::Value) -> Result<&[serde_json::Value
         .ok_or_else(|| format!("Gemini candidate missing content.parts array: {candidate}"))
 }
 
+#[cfg(test)]
 fn gemini_extract_text(json: &serde_json::Value) -> Result<String, String> {
     let parts = gemini_response_parts(json)?;
-    extract_gemini_text_content(parts).map_err(|e| e.to_string())
+    openclaudia::providers::extract_gemini_text_content(parts).map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 fn gemini_extract_tool_calls(json: &serde_json::Value) -> Result<Vec<tools::ToolCall>, String> {
-    let parts = gemini_response_parts(json)?;
-
-    let mut calls = Vec::new();
-
-    for part in parts {
-        let Some(fc) = part.get("functionCall") else {
-            continue;
-        };
-
-        if !fc.is_object() {
-            return Err(format!("Gemini functionCall must be an object: {fc}"));
-        }
-
-        let name = fc
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| format!("Gemini functionCall missing non-empty string 'name': {fc}"))?
-            .to_string();
-
-        let args = fc
-            .get("args")
-            .ok_or_else(|| format!("Gemini functionCall missing object 'args': {fc}"))?;
-
-        if !args.is_object() {
-            return Err(format!(
-                "Gemini functionCall has non-object 'args': expected JSON object, got {}",
-                gemini_args_type_name(args)
-            ));
-        }
-
-        let args = serde_json::to_string(args).map_err(|e| {
-            format!("Gemini functionCall has unserializable 'args': {e}; functionCall: {fc}")
-        })?;
-
-        calls.push(tools::ToolCall {
-            id: format!("call_{}", uuid::Uuid::new_v4()),
-            call_type: "function".to_string(),
-            function: tools::FunctionCall {
-                name,
-                arguments: args,
-            },
-        });
-    }
-
-    Ok(calls)
-}
-
-const fn gemini_args_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
-/// Pull `(promptTokenCount, candidatesTokenCount)` out of a Gemini
-/// response's `usageMetadata` block. Missing fields default to zero.
-fn gemini_extract_usage_tokens(json: &serde_json::Value) -> (u64, u64) {
-    let usage = json.get("usageMetadata");
-    let input = usage
-        .and_then(|u| u.get("promptTokenCount"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let output = usage
-        .and_then(|u| u.get("candidatesTokenCount"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    (input, output)
+    openclaudia::providers::GeminiGenerateContentTurnOutput::new(json)
+        .and_then(|output| output.tool_calls(0))
+        .map_err(|error| error.to_string())
 }
 
 /// Emit a structured `error_max_turns` event when the agentic loop's
