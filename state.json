@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1107,
+  "next_display_id": 1108,
   "next_comment_id": 1299,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -245,6 +245,7 @@
     "3c303dc7-f87a-49a9-b45d-87f2132da140": 487,
     "3c788b33-8135-40ac-81e8-dcaa055cc672": 134,
     "3c7a7927-5a52-4234-8940-a20ff90918d9": 328,
+    "3ce0144f-77d7-4257-acd1-281a343f47af": 1107,
     "3d00c6f8-7f19-4182-8735-3fd145e801c7": 930,
     "3d4d9e2a-0b90-4075-b1a4-c05e2d9699ee": 716,
     "3db5b16b-38b1-4343-8090-a3606a0e4e43": 140,
@@ -7328,6 +7329,18 @@
       "created_at": "2026-04-18T00:33:07.235521192Z",
       "updated_at": "2026-05-19T13:13:51.170668714Z",
       "closed_at": "2026-05-19T13:13:51.170668714Z"
+    },
+    "3ce0144f-77d7-4257-acd1-281a343f47af": {
+      "uuid": "3ce0144f-77d7-4257-acd1-281a343f47af",
+      "display_id": 1107,
+      "title": "S-051: Unify token, turn, cost, retry, and concurrency budgets",
+      "description": "Implement docs/remediation-slices/051-token-turn-and-cost-budgets.md. Define one cancellation-aware hierarchical budget authority for input/output tokens, turns, cost, elapsed time, retries, tool/model/process concurrency, and child runs; reserve atomically before work, cap provider output, and reconcile exact or unknown usage after truthful terminal outcomes. Wire every production frontend, worker, VDD, hook, MCP call, process, and background task without expanding into unrelated later slices. Use Rust 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo, and test threads=1.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T05:55:19.436743818Z",
+      "updated_at": "2026-08-23T05:55:19.436743818Z"
     },
     "3d00c6f8-7f19-4182-8735-3fd145e801c7": {
       "uuid": "3d00c6f8-7f19-4182-8735-3fd145e801c7",
@@ -34737,11 +34750,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1122,
       "timestamp": "2026-08-23T05:53:34.928296538Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1123,
+      "timestamp": "2026-08-23T05:55:19.436743818Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T05:53:34.928296538Z",
+    "timestamp": "2026-08-23T05:55:19.436743818Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1122
+    "agent_seq": 1123
   }
 }
