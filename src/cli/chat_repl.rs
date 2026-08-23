@@ -195,6 +195,7 @@ pub struct ChatReplArgs {
     pub coordinator: bool,
     pub dangerously_skip_permissions: bool,
     pub mode_arg: Option<String>,
+    pub scope_target_values: Vec<String>,
 }
 
 /// All mutable state for one chat session, plus the configuration the
@@ -298,7 +299,10 @@ fn derive_repl_session_run(
         &identity.cwd,
         configured_provider,
     )?;
-    run.transition_runtime_mode(runtime_mode_for_repl_session(session, coordinator))?;
+    run.transition_runtime_mode_scoped(
+        runtime_mode_for_repl_session(session, coordinator),
+        session.behavior_scope_targets(),
+    )?;
     Ok(run)
 }
 
@@ -545,6 +549,7 @@ impl ChatRepl {
             anyhow::bail!("legacy REPL setup failed: configuration unavailable");
         };
 
+        let behavior_mode_explicit = args.mode_arg.is_some();
         let initial_behavior_mode = match parse_initial_behavior_mode(args.mode_arg.as_deref()) {
             Ok(m) => m,
             Err(e) => {
@@ -586,9 +591,43 @@ impl ChatRepl {
         render_welcome_or_fallback(&config.proxy.target, &model);
         let _ = tui::setup_pinned_bar();
 
-        let mut chat_session =
-            Session::new_with_behavior_mode(&model, &config.proxy.target, initial_behavior_mode);
+        let mut chat_session = Session::new_with_behavior_mode(
+            &model,
+            &config.proxy.target,
+            initial_behavior_mode.clone(),
+        );
         maybe_resume_session(&mut chat_session, args.resume, args.session_id.as_deref());
+        if behavior_mode_explicit || !args.scope_target_values.is_empty() {
+            let identity = chat_session.inspect_state(|state| state.identity.clone());
+            let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot bind behavioral scope to project '{}': {error}",
+                    identity.project_root.display()
+                )
+            })?;
+            let working_directory = std::fs::canonicalize(&identity.cwd).map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot bind behavioral scope to working directory '{}': {error}",
+                    identity.cwd.display()
+                )
+            })?;
+            let targets = if args.scope_target_values.is_empty() {
+                chat_session.behavior_scope_targets()
+            } else {
+                openclaudia::modes::BehaviorScopeTargets::from_user_values(
+                    &project_root,
+                    &working_directory,
+                    &args.scope_target_values,
+                )
+                .map_err(anyhow::Error::msg)?
+            };
+            let behavior_mode = if behavior_mode_explicit {
+                initial_behavior_mode
+            } else {
+                chat_session.behavior_mode()
+            };
+            chat_session.set_behavior_mode_and_targets(behavior_mode, targets);
+        }
         // A dangerous bypass is a launch-scoped choice. Apply it after resume
         // so a saved session can neither enable nor disable the current CLI's
         // explicit posture.
@@ -623,6 +662,7 @@ impl ChatRepl {
                 .secrets(true)
                 .provider(config.proxy.target.clone())
                 .runtime_mode(runtime_mode)
+                .behavior_scope_targets(chat_session.behavior_scope_targets())
                 .budget_limits(
                     config
                         .session
@@ -1258,7 +1298,25 @@ impl ChatRepl {
             SlashCommandResult::FastMode { effort, model } => {
                 apply_fast_mode_result(&mut self.model, &mut self.chat_session, &effort, model);
             }
-            SlashCommandResult::SetBehaviorMode(new_mode) => {
+            SlashCommandResult::SetBehaviorMode {
+                mode: new_mode,
+                scope_target_values,
+            } => {
+                let targets = if scope_target_values.is_empty() {
+                    self.chat_session.behavior_scope_targets()
+                } else {
+                    match openclaudia::modes::BehaviorScopeTargets::from_user_values(
+                        self.run_context.project_root(),
+                        self.run_context.working_directory(),
+                        &scope_target_values,
+                    ) {
+                        Ok(targets) => targets,
+                        Err(error) => {
+                            eprintln!("Could not change behavioral scope: {error}");
+                            return SlashOutcome::Continue;
+                        }
+                    }
+                };
                 let runtime_mode =
                     if self.chat_session.agent_mode() == openclaudia::state::AgentMode::Plan {
                         openclaudia::modes::RuntimeMode::Plan
@@ -1267,11 +1325,15 @@ impl ChatRepl {
                     } else {
                         openclaudia::modes::RuntimeMode::Behavioral(new_mode.clone())
                     };
-                if let Err(error) = self.run_context.transition_runtime_mode(runtime_mode) {
+                if let Err(error) = self
+                    .run_context
+                    .transition_runtime_mode_scoped(runtime_mode, targets.clone())
+                {
                     eprintln!("Could not change behavioral mode: {error}");
                     return SlashOutcome::Continue;
                 }
-                self.chat_session.set_behavior_mode(new_mode);
+                self.chat_session
+                    .set_behavior_mode_and_targets(new_mode, targets);
             }
             // BranchSession plus the five already-handled-in-head variants
             // (Exit/Clear/LoadSession/Export/Compact) plus the catch-all
@@ -4334,9 +4396,16 @@ mod tests {
         .build()
         .expect("parent REPL run");
         let loaded = test_session_at(root.path(), "anthropic");
-        loaded.set_behavior_mode(openclaudia::modes::BehaviorMode::from_preset(
-            openclaudia::modes::Preset::Explore,
-        ));
+        let targets = openclaudia::modes::BehaviorScopeTargets::from_user_values(
+            root.path(),
+            root.path(),
+            &[".".to_string()],
+        )
+        .expect("explicit explore target");
+        loaded.set_behavior_mode_and_targets(
+            openclaudia::modes::BehaviorMode::from_preset(openclaudia::modes::Preset::Explore),
+            targets,
+        );
 
         let derived = derive_repl_session_run(&parent, &loaded, "anthropic", false)
             .expect("same-project session must derive");

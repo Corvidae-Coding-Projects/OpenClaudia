@@ -124,6 +124,10 @@ struct Cli {
     )]
     mode: Option<String>,
 
+    /// Approve one path or `tool:<name>` for adjacent/narrow behavioral scope
+    #[arg(long = "scope-target", value_name = "PATH|tool:NAME")]
+    scope_targets: Vec<String>,
+
     /// Send a single prompt and print the response to stdout
     #[arg(short = 'p', long, value_name = "PROMPT")]
     print: Option<String>,
@@ -488,15 +492,16 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None if cli.tui_mode => {
             // Legacy rustyline REPL (--tui-mode is now the escape hatch name, kept for compat)
-            Box::pin(cmd_chat(
-                cli.model,
-                cli.target,
-                cli.resume,
-                cli.session_id,
-                cli.coordinator,
-                cli.dangerously_skip_permissions,
-                cli.mode,
-            ))
+            Box::pin(cmd_chat(cli::chat_repl::ChatReplArgs {
+                model_override: cli.model,
+                target_override: cli.target,
+                resume: cli.resume,
+                session_id: cli.session_id,
+                coordinator: cli.coordinator,
+                dangerously_skip_permissions: cli.dangerously_skip_permissions,
+                mode_arg: cli.mode,
+                scope_target_values: cli.scope_targets,
+            }))
             .await
         }
         None => {
@@ -513,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
                 session_id: cli.session_id,
                 dangerously_skip_permissions: cli.dangerously_skip_permissions,
                 mode_arg: cli.mode,
+                scope_target_values: cli.scope_targets,
             })
             .await
         }
@@ -695,6 +701,9 @@ fn reject_ignored_root_flags_for_print(cli: &Cli) -> anyhow::Result<()> {
     if cli.mode.is_some() {
         anyhow::bail!("--mode cannot be used with --print");
     }
+    if !cli.scope_targets.is_empty() {
+        anyhow::bail!("--scope-target cannot be used with --print");
+    }
 
     Ok(())
 }
@@ -735,6 +744,9 @@ fn reject_ignored_root_flags_for_subcommand(cli: &Cli) -> anyhow::Result<()> {
     if cli.mode.is_some() {
         anyhow::bail!("--mode cannot be used with '{command_name}'");
     }
+    if !cli.scope_targets.is_empty() {
+        anyhow::bail!("--scope-target cannot be used with '{command_name}'");
+    }
 
     Ok(())
 }
@@ -768,6 +780,7 @@ struct TuiStartupOptions {
     session_id: Option<String>,
     dangerously_skip_permissions: bool,
     mode_arg: Option<String>,
+    scope_target_values: Vec<String>,
 }
 
 struct PreparedTuiStartup {
@@ -935,6 +948,7 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         builder_vdd_auth,
         vdd_adversary_auth,
         behavior_mode_override: behavior_mode_explicit.then_some(&behavior_mode),
+        scope_target_values: options.scope_target_values,
         resume: options.resume,
         session_id: options.session_id.as_deref(),
         dangerously_skip_permissions: options.dangerously_skip_permissions,
@@ -956,20 +970,53 @@ struct TuiLaunchOptions<'a> {
     builder_vdd_auth: openclaudia::vdd::VddProviderAuth,
     vdd_adversary_auth: Option<openclaudia::vdd::VddProviderAuth>,
     behavior_mode_override: Option<&'a openclaudia::modes::BehaviorMode>,
+    scope_target_values: Vec<String>,
     resume: bool,
     session_id: Option<&'a str>,
     dangerously_skip_permissions: bool,
 }
 
-fn apply_tui_behavior_override(
+fn apply_tui_launch_behavior(
     app: &mut tui::app::App,
+    resume: bool,
+    session_id: Option<&str>,
     behavior_mode: Option<&openclaudia::modes::BehaviorMode>,
+    scope_target_values: &[String],
 ) -> anyhow::Result<()> {
-    if let Some(behavior_mode) = behavior_mode {
-        app.apply_behavior_mode(behavior_mode.clone())
-            .map_err(anyhow::Error::msg)?;
-    }
-    Ok(())
+    app.apply_startup_resume_with_behavior(
+        resume,
+        session_id,
+        behavior_mode.cloned(),
+        scope_target_values,
+    )
+    .map_err(anyhow::Error::msg)
+}
+
+fn rebuild_resumed_tui_endpoint(
+    config: &config::AppConfig,
+    model: &str,
+    codex_responses_backend: bool,
+    wire_api: openclaudia::pipeline::WireApi,
+    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
+) -> anyhow::Result<String> {
+    let provider = config.active_provider().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot rebuild resumed TUI endpoint for missing provider '{}'",
+            config.proxy.target
+        )
+    })?;
+    let base_url = if codex_responses_backend {
+        openclaudia::codex_credentials::CODEX_CHATGPT_BASE_URL
+    } else {
+        &provider.base_url
+    };
+    Ok(openclaudia::pipeline::resolve_endpoint_for_wire(
+        wire_api,
+        &config.proxy.target,
+        model,
+        base_url,
+        claude_code_token,
+    )?)
 }
 
 async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
@@ -986,6 +1033,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         builder_vdd_auth,
         vdd_adversary_auth,
         behavior_mode_override,
+        scope_target_values,
         resume,
         session_id,
         dangerously_skip_permissions,
@@ -1012,28 +1060,22 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         init_vdd_engine_if_enabled_with_auth(config, vdd_adversary_auth).map(std::sync::Arc::new);
     app.vdd_builder_auth = builder_vdd_auth;
     app.app_config = Some(std::sync::Arc::new(config.clone()));
-    app.apply_startup_resume(resume, session_id);
-    apply_tui_behavior_override(&mut app, behavior_mode_override)?;
+    apply_tui_launch_behavior(
+        &mut app,
+        resume,
+        session_id,
+        behavior_mode_override,
+        &scope_target_values,
+    )?;
     app.bind_durable_task_graph().map_err(anyhow::Error::msg)?;
     let endpoint = if app.model == model {
         endpoint
     } else {
-        let provider = config.active_provider().ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot rebuild resumed TUI endpoint for missing provider '{}'",
-                config.proxy.target
-            )
-        })?;
-        let base_url = if codex_responses_backend {
-            openclaudia::codex_credentials::CODEX_CHATGPT_BASE_URL
-        } else {
-            &provider.base_url
-        };
-        openclaudia::pipeline::resolve_endpoint_for_wire(
-            wire_api,
-            &config.proxy.target,
+        rebuild_resumed_tui_endpoint(
+            config,
             &app.model,
-            base_url,
+            codex_responses_backend,
+            wire_api,
             claude_code_token.as_ref(),
         )?
     };
@@ -2545,30 +2587,13 @@ fn build_chat_endpoint_and_headers(
     (endpoint, headers)
 }
 
-async fn cmd_chat(
-    model_override: Option<String>,
-    target_override: Option<String>,
-    resume: bool,
-    session_id: Option<String>,
-    coordinator: bool,
-    dangerously_skip_permissions: bool,
-    mode_arg: Option<String>,
-) -> anyhow::Result<()> {
+async fn cmd_chat(args: cli::chat_repl::ChatReplArgs) -> anyhow::Result<()> {
     // The original \~2.4k-line `cmd_chat` body was decomposed into
     // `cli::chat_repl::ChatRepl` (crosslink #262) so each method fits
     // under the clippy::too_many_lines threshold. Behaviour is
     // preserved — see `src/cli/chat_repl.rs` for the loop body, slash
     // dispatcher, and provider-specific response handlers.
-    let repl = cli::chat_repl::ChatRepl::new(cli::chat_repl::ChatReplArgs {
-        model_override,
-        target_override,
-        resume,
-        session_id,
-        coordinator,
-        dangerously_skip_permissions,
-        mode_arg,
-    })
-    .await?;
+    let repl = cli::chat_repl::ChatRepl::new(args).await?;
     Box::pin(repl.run()).await
 }
 
@@ -2677,6 +2702,7 @@ mod tests {
             session_id: None,
             dangerously_skip_permissions: false,
             mode_arg: None,
+            scope_target_values: Vec::new(),
         }
     }
 
@@ -2866,6 +2892,7 @@ mod tests {
             dangerously_skip_permissions: false,
             tui_mode: false,
             mode: None,
+            scope_targets: Vec::new(),
             print: None,
         };
 
@@ -2885,10 +2912,28 @@ mod tests {
             dangerously_skip_permissions: false,
             tui_mode: false,
             mode: None,
+            scope_targets: Vec::new(),
             print: None,
         };
 
         assert!(!should_redirect_tui_logs(&cli));
+    }
+
+    #[test]
+    fn cli_accepts_repeatable_explicit_behavior_scope_targets() {
+        let cli = Cli::try_parse_from([
+            "openclaudia",
+            "--mode",
+            "safe",
+            "--scope-target",
+            "src/lib.rs",
+            "--scope-target",
+            "tool:bash",
+        ])
+        .expect("scoped behavioral CLI");
+
+        assert_eq!(cli.mode.as_deref(), Some("safe"));
+        assert_eq!(cli.scope_targets, ["src/lib.rs", "tool:bash"]);
     }
 
     #[test]

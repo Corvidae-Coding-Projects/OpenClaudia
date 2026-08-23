@@ -108,7 +108,10 @@ pub enum SlashCommandResult {
     /// Toggle agent mode (Build/Plan)
     ToggleMode,
     /// Switch behavioral mode to a preset or custom configuration
-    SetBehaviorMode(openclaudia::modes::BehaviorMode),
+    SetBehaviorMode {
+        mode: openclaudia::modes::BehaviorMode,
+        scope_target_values: Vec<String>,
+    },
     /// Show keybindings
     Keybindings,
     /// Rename session with new title
@@ -3156,6 +3159,7 @@ pub fn handle_mode_command(args: &str) -> SlashCommandResult {
         println!("    /mode create              Switch to create preset");
         println!("    /mode create +bold        Create preset with bold modifier");
         println!("    /mode safe +context-pacing  Safe preset with pacing");
+        println!("    /mode safe --target=src/lib.rs  Narrow mode with an explicit target");
         println!();
         return SlashCommandResult::Handled;
     }
@@ -3182,6 +3186,7 @@ pub fn handle_mode_command(args: &str) -> SlashCommandResult {
     };
 
     let mut mode = BehaviorMode::from_preset(preset);
+    let mut scope_target_values = Vec::new();
 
     // Parse remaining args for +modifiers
     for part in &parts[1..] {
@@ -3193,6 +3198,12 @@ pub fn handle_mode_command(args: &str) -> SlashCommandResult {
                     return SlashCommandResult::Handled;
                 }
             }
+        } else if let Some(target) = part.strip_prefix("--target=") {
+            if target.is_empty() {
+                eprintln!("\n--target requires a path or tool:<name>\n");
+                return SlashCommandResult::Handled;
+            }
+            scope_target_values.push(target.to_string());
         } else {
             eprintln!("\nUnexpected argument: \"{part}\". Use +modifier to add modifiers.\n");
             return SlashCommandResult::Handled;
@@ -3205,7 +3216,10 @@ pub fn handle_mode_command(args: &str) -> SlashCommandResult {
         mode
     );
 
-    SlashCommandResult::SetBehaviorMode(mode)
+    SlashCommandResult::SetBehaviorMode {
+        mode,
+        scope_target_values,
+    }
 }
 
 /// Parse `--agency=X --quality=Y --scope=Z` style overrides into a custom mode.
@@ -3214,6 +3228,7 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
 
     let mut mode = BehaviorMode::default();
     let mut had_error = false;
+    let mut scope_target_values = Vec::new();
 
     for part in parts {
         if let Some(val) = part
@@ -3249,6 +3264,13 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
                     had_error = true;
                 }
             }
+        } else if let Some(target) = part.strip_prefix("--target=") {
+            if target.is_empty() {
+                eprintln!("\n--target requires a path or tool:<name>\n");
+                had_error = true;
+            } else {
+                scope_target_values.push(target.to_string());
+            }
         } else if let Some(mod_name) = part.strip_prefix('+') {
             match mod_name.parse() {
                 Ok(m) => mode.add_modifier(m),
@@ -3269,7 +3291,10 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
 
     println!("\n\u{2713} Mode: \x1b[36mcustom\x1b[0m ({mode})\n");
 
-    SlashCommandResult::SetBehaviorMode(mode)
+    SlashCommandResult::SetBehaviorMode {
+        mode,
+        scope_target_values,
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -3295,11 +3320,11 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        gh_bin, git_bin, handle_slash_command, handle_slash_command_for_run, hook_status_lines,
-        parse_pinned_git_source, permission_status_lines, plugin_install_dir_for_name,
-        project_mcp_server_count_from_str, render_agents_listing, render_plugin_command_prompt,
-        repl_doctor_report, slash_plugin, PinnedGitSource, PinnedGitSourceError, PluginAction,
-        SlashCommandResult,
+        gh_bin, git_bin, handle_mode_command, handle_slash_command, handle_slash_command_for_run,
+        hook_status_lines, parse_pinned_git_source, permission_status_lines,
+        plugin_install_dir_for_name, project_mcp_server_count_from_str, render_agents_listing,
+        render_plugin_command_prompt, repl_doctor_report, slash_plugin, PinnedGitSource,
+        PinnedGitSourceError, PluginAction, SlashCommandResult,
     };
     use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, PermissionsConfig};
     use openclaudia::plugins::PluginCommand;
@@ -3816,6 +3841,25 @@ mod tests {
         assert!(
             matches!(result, Some(SlashCommandResult::SwitchModel(model)) if Some(model.as_str()) == openclaudia::providers::default_model_for_target("qwen")),
             "/model DEFAULT must reset using the provider default table"
+        );
+    }
+
+    #[test]
+    fn mode_command_preserves_explicit_scope_targets_for_runtime_binding() {
+        let result =
+            handle_mode_command("safe --target=src/lib.rs --target=tool:bash +context-pacing");
+        let SlashCommandResult::SetBehaviorMode {
+            mode,
+            scope_target_values,
+        } = result
+        else {
+            panic!("mode command must return a scoped behavioral transition");
+        };
+
+        assert_eq!(mode.scope, openclaudia::modes::Scope::Narrow);
+        assert_eq!(
+            scope_target_values,
+            ["src/lib.rs".to_string(), "tool:bash".to_string()]
         );
     }
 

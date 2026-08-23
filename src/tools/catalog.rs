@@ -1465,9 +1465,18 @@ mod tests {
             .snapshot(&run, &[], &definitions)
             .expect("standard snapshot");
 
-        run.transition_runtime_mode(crate::modes::RuntimeMode::Behavioral(
-            crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Explore),
-        ))
+        let targets = crate::modes::BehaviorScopeTargets::from_user_values(
+            run.project_root(),
+            run.working_directory(),
+            &[".".to_string()],
+        )
+        .expect("explicit explore target");
+        run.transition_runtime_mode_scoped(
+            crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::from_preset(
+                crate::modes::Preset::Explore,
+            )),
+            targets,
+        )
         .expect("explore transition");
         let explore = run
             .tool_catalog()

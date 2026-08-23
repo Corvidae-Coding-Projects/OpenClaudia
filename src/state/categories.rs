@@ -165,6 +165,10 @@ pub struct Conversation {
     /// Active behavioral mode (agency/quality/scope axes + modifiers).
     #[serde(default)]
     pub behavior_mode: crate::modes::BehaviorMode,
+    /// User/task-approved targets compiled into adjacent and narrow runtime
+    /// scope. Stored relative to the project and rebound on resume.
+    #[serde(default)]
+    pub behavior_scope_targets: crate::modes::BehaviorScopeTargets,
 }
 
 // ─── UI state ───────────────────────────────────────────────────────

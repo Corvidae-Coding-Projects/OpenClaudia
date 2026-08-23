@@ -390,7 +390,7 @@ pub(crate) fn reserve_dynamic_tool_effect(
                 ToolRetryability::Never,
             ))
         })?;
-    run.admit_runtime_mode_resolved(&tool_call.function.name, resolved.effect, &arguments)
+    run.admit_runtime_mode_resolved(&tool_call.function.name, &resolved, &arguments)
         .map_err(|reason| {
             Box::new(ToolResult::failure(
                 tool_call,
@@ -453,7 +453,7 @@ fn dispatch_registered_with_permit(
     );
     if let Err(reason) =
         ctx.run
-            .admit_runtime_mode_resolved(&tool_call.function.name, resolved.effect, &arguments)
+            .admit_runtime_mode_resolved(&tool_call.function.name, &resolved, &arguments)
     {
         return ToolResult::failure(
             tool_call,

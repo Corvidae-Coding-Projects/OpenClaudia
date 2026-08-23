@@ -17,8 +17,9 @@
 pub mod fragments;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::RwLock;
 
@@ -504,6 +505,271 @@ impl BehaviorMode {
 // Runtime capability profiles
 // =========================================================================
 
+const MAX_SCOPE_TARGETS: usize = 128;
+const MAX_SCOPE_TARGET_BYTES: usize = 4096;
+
+/// One user- or task-approved resource for a restricted behavioral scope.
+///
+/// Workspace targets are stored relative to the session project so a saved
+/// session can be rebound to the same logical resource in an isolated child
+/// worktree. Tool targets grant one exact wire-level tool surface; they are
+/// never inferred from task prose.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum BehaviorScopeTarget {
+    WorkspacePath(PathBuf),
+    Tool(String),
+}
+
+/// Persistable target intent used to compile adjacent and narrow scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorScopeTargets {
+    /// Distinguishes an explicit user/task grant from the compatibility grant
+    /// for the workspace selected at process launch.
+    explicit: bool,
+    targets: Vec<BehaviorScopeTarget>,
+}
+
+impl Default for BehaviorScopeTargets {
+    fn default() -> Self {
+        Self::workspace_root()
+    }
+}
+
+impl BehaviorScopeTargets {
+    /// Adjacent-mode compatibility target: the workspace the user launched.
+    #[must_use]
+    pub fn workspace_root() -> Self {
+        Self {
+            explicit: false,
+            targets: vec![BehaviorScopeTarget::WorkspacePath(PathBuf::from("."))],
+        }
+    }
+
+    /// Parse explicit CLI/UI target values against one session workspace.
+    ///
+    /// Values beginning with `tool:` approve one exact tool surface. All other
+    /// values (optionally prefixed with `path:`) name a workspace-relative or
+    /// workspace-contained absolute path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, excessive, malformed, or escaping targets.
+    pub fn from_user_values(
+        project_root: &Path,
+        working_directory: &Path,
+        values: &[String],
+    ) -> Result<Self, String> {
+        if values.is_empty() {
+            return Err("at least one explicit scope target is required".to_string());
+        }
+        if values.len() > MAX_SCOPE_TARGETS {
+            return Err(format!(
+                "at most {MAX_SCOPE_TARGETS} behavioral scope targets may be approved"
+            ));
+        }
+
+        let mut targets = BTreeSet::new();
+        for value in values {
+            let value = value.trim();
+            if value.is_empty() || value.len() > MAX_SCOPE_TARGET_BYTES {
+                return Err(format!(
+                    "scope targets must contain 1-{MAX_SCOPE_TARGET_BYTES} bytes"
+                ));
+            }
+            if let Some(tool) = value.strip_prefix("tool:") {
+                validate_scope_tool(tool)?;
+                targets.insert(BehaviorScopeTarget::Tool(tool.to_string()));
+                continue;
+            }
+
+            let path = value.strip_prefix("path:").unwrap_or(value);
+            let relative = normalize_scope_path(project_root, working_directory, path)?;
+            targets.insert(BehaviorScopeTarget::WorkspacePath(relative));
+        }
+
+        Ok(Self {
+            explicit: true,
+            targets: targets.into_iter().collect(),
+        })
+    }
+
+    #[must_use]
+    pub const fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    pub(crate) fn targets(&self) -> &[BehaviorScopeTarget] {
+        &self.targets
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.targets.len() > MAX_SCOPE_TARGETS {
+            return Err(format!(
+                "at most {MAX_SCOPE_TARGETS} behavioral scope targets may be approved"
+            ));
+        }
+        for target in &self.targets {
+            match target {
+                BehaviorScopeTarget::WorkspacePath(path) => validate_relative_scope_path(path)?,
+                BehaviorScopeTarget::Tool(tool) => validate_scope_tool(tool)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_scope_tool(tool: &str) -> Result<(), String> {
+    if tool.is_empty()
+        || tool.len() > 256
+        || !tool
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(format!(
+            "invalid scope tool '{tool}'; use 1-256 ASCII letters, digits, '_', '-' or '.'"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_scope_path(
+    project_root: &Path,
+    working_directory: &Path,
+    value: &str,
+) -> Result<PathBuf, String> {
+    let supplied = Path::new(value);
+    if supplied
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("scope target '{value}' contains parent traversal"));
+    }
+    let absolute = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        working_directory.join(supplied)
+    };
+    let relative = absolute.strip_prefix(project_root).map_err(|_| {
+        format!(
+            "scope target '{}' is outside project '{}'",
+            absolute.display(),
+            project_root.display()
+        )
+    })?;
+    let relative = if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative.to_path_buf()
+    };
+    validate_relative_scope_path(&relative)?;
+    Ok(relative)
+}
+
+fn validate_relative_scope_path(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err("workspace scope targets must be non-empty relative paths".to_string());
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!(
+            "workspace scope target '{}' is not lexically normalized",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundBehaviorScopeTargets {
+    paths: Vec<PathBuf>,
+    tools: BTreeSet<String>,
+}
+
+impl BoundBehaviorScopeTargets {
+    fn bind(project_root: &Path, targets: &BehaviorScopeTargets) -> Result<Self, String> {
+        targets.validate()?;
+        let mut paths = BTreeSet::new();
+        let mut tools = BTreeSet::new();
+        for target in targets.targets() {
+            match target {
+                BehaviorScopeTarget::WorkspacePath(relative) => {
+                    let absolute = canonicalize_scope_target(&project_root.join(relative))?;
+                    if !absolute.starts_with(project_root) {
+                        return Err(format!(
+                            "scope target '{}' resolves outside project '{}'",
+                            relative.display(),
+                            project_root.display()
+                        ));
+                    }
+                    paths.insert(absolute);
+                }
+                BehaviorScopeTarget::Tool(tool) => {
+                    tools.insert(tool.clone());
+                }
+            }
+        }
+        Ok(Self {
+            paths: paths.into_iter().collect(),
+            tools,
+        })
+    }
+
+    fn allows_path(&self, scope: Scope, project_root: &Path, path: &Path) -> bool {
+        self.paths.iter().any(|target| {
+            let boundary = if scope == Scope::Adjacent {
+                target
+                    .parent()
+                    .filter(|parent| parent.starts_with(project_root))
+                    .unwrap_or(target)
+            } else {
+                target.as_path()
+            };
+            path == boundary || path.starts_with(boundary)
+        })
+    }
+
+    fn allows_tool(&self, tool: &str) -> bool {
+        self.tools.contains(tool)
+    }
+}
+
+fn canonicalize_scope_target(path: &Path) -> Result<PathBuf, String> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    let canonical_ancestor = loop {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            break canonical;
+        }
+        let name = ancestor.file_name().ok_or_else(|| {
+            format!(
+                "cannot resolve any existing ancestor of scope target '{}'",
+                path.display()
+            )
+        })?;
+        suffix.push(name.to_os_string());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| format!("cannot resolve parent of scope target '{}'", path.display()))?;
+    };
+    let mut canonical = canonical_ancestor;
+    for component in suffix.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
 /// Host-enforced mode requested for one agent run.
 ///
 /// Behavioral prompts remain useful explanations, but this value is the
@@ -549,6 +815,9 @@ pub struct RuntimeModeSnapshot {
     pub mode: RuntimeMode,
     /// Enforced capability class.
     pub class: RuntimeModeClass,
+    /// Persistable target intent bound into this exact mode generation.
+    pub scope_targets: BehaviorScopeTargets,
+    bound_scope_targets: BoundBehaviorScopeTargets,
 }
 
 impl RuntimeModeSnapshot {
@@ -610,6 +879,7 @@ impl RuntimeModeSnapshot {
 /// Atomic mode authority owned by one exact run.
 #[derive(Debug)]
 pub struct RuntimeModeAuthority {
+    project_root: PathBuf,
     state: RwLock<RuntimeModeSnapshot>,
 }
 
@@ -621,12 +891,44 @@ impl RuntimeModeAuthority {
     /// Returns an error when the requested mode contains conflicting
     /// capability modifiers.
     pub fn new(mode: RuntimeMode) -> Result<Self, String> {
-        let class = validate_runtime_mode(&mode)?;
+        let scope_targets = BehaviorScopeTargets::workspace_root();
+        let project_root = PathBuf::from("/");
+        let bound_scope_targets = BoundBehaviorScopeTargets {
+            paths: vec![project_root.clone()],
+            tools: BTreeSet::new(),
+        };
+        Self::from_bound(mode, scope_targets, bound_scope_targets, project_root)
+    }
+
+    pub(crate) fn new_for_run(
+        mode: RuntimeMode,
+        scope_targets: BehaviorScopeTargets,
+        project_root: &Path,
+    ) -> Result<Self, String> {
+        let bound_scope_targets = BoundBehaviorScopeTargets::bind(project_root, &scope_targets)?;
+        Self::from_bound(
+            mode,
+            scope_targets,
+            bound_scope_targets,
+            project_root.to_path_buf(),
+        )
+    }
+
+    fn from_bound(
+        mode: RuntimeMode,
+        scope_targets: BehaviorScopeTargets,
+        bound_scope_targets: BoundBehaviorScopeTargets,
+        project_root: PathBuf,
+    ) -> Result<Self, String> {
+        let class = validate_runtime_mode(&mode, &scope_targets)?;
         Ok(Self {
+            project_root,
             state: RwLock::new(RuntimeModeSnapshot {
                 generation: 1,
                 mode,
                 class,
+                scope_targets,
+                bound_scope_targets,
             }),
         })
     }
@@ -646,7 +948,26 @@ impl RuntimeModeAuthority {
     ///
     /// Returns an error for conflicting modifiers or generation exhaustion.
     pub fn transition(&self, mode: RuntimeMode) -> Result<RuntimeModeSnapshot, String> {
-        let class = validate_runtime_mode(&mode)?;
+        let scope_targets = self.snapshot().scope_targets;
+        self.transition_scoped(mode, scope_targets)
+    }
+
+    /// Validate a transition against the current target generation without
+    /// mutating authority.
+    pub(crate) fn validate_transition(&self, mode: &RuntimeMode) -> Result<(), String> {
+        let scope_targets = self.snapshot().scope_targets;
+        validate_runtime_mode(mode, &scope_targets)?;
+        BoundBehaviorScopeTargets::bind(&self.project_root, &scope_targets).map(|_| ())
+    }
+
+    pub(crate) fn transition_scoped(
+        &self,
+        mode: RuntimeMode,
+        scope_targets: BehaviorScopeTargets,
+    ) -> Result<RuntimeModeSnapshot, String> {
+        let class = validate_runtime_mode(&mode, &scope_targets)?;
+        let bound_scope_targets =
+            BoundBehaviorScopeTargets::bind(&self.project_root, &scope_targets)?;
         let mut state = self
             .state
             .write()
@@ -659,6 +980,8 @@ impl RuntimeModeAuthority {
             generation,
             mode,
             class,
+            scope_targets,
+            bound_scope_targets,
         };
         Ok(state.clone())
     }
@@ -668,15 +991,24 @@ impl RuntimeModeAuthority {
     /// # Errors
     ///
     /// Returns a typed explanation when the active profile denies the call.
-    pub fn admit_tool(
+    pub fn admit_resolved_tool(
         &self,
         tool_name: &str,
-        effect: crate::tools::effect::ToolEffect,
+        resolved: &crate::tools::effect::ResolvedEffect,
+        canonical_path: Option<&Path>,
         arguments: &serde_json::Value,
         plan_file: &Path,
     ) -> Result<(), String> {
         let snapshot = self.snapshot();
-        if profile_allows_call(&snapshot, tool_name, effect, arguments, plan_file) {
+        if profile_allows_call(
+            &snapshot,
+            tool_name,
+            resolved,
+            canonical_path,
+            arguments,
+            plan_file,
+            &self.project_root,
+        ) {
             Ok(())
         } else {
             Err(format!(
@@ -684,9 +1016,35 @@ impl RuntimeModeAuthority {
                 snapshot.display_name(),
                 snapshot.generation,
                 tool_name,
-                effect.as_str()
+                resolved.effect.as_str()
             ))
         }
+    }
+
+    /// Check a definition-level effect without a concrete resource target.
+    ///
+    /// Production dispatch uses [`Self::admit_resolved_tool`]. This compatibility
+    /// surface remains useful to callers deciding whether a non-path tool class
+    /// is admitted at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a mode denial when the active profile does not grant the tool.
+    pub fn admit_tool(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+        arguments: &serde_json::Value,
+        plan_file: &Path,
+    ) -> Result<(), String> {
+        let resolved = crate::tools::effect::ResolvedEffect {
+            effect,
+            canonical: tool_name.to_string(),
+            target: tool_name.to_string(),
+            target_kind: crate::tools::effect::ToolTargetKind::Tool,
+            operation: None,
+        };
+        self.admit_resolved_tool(tool_name, &resolved, None, arguments, plan_file)
     }
 
     /// Explain why a definition must not be shown to the model in this mode.
@@ -720,7 +1078,11 @@ impl RuntimeModeAuthority {
     }
 }
 
-fn validate_runtime_mode(mode: &RuntimeMode) -> Result<RuntimeModeClass, String> {
+fn validate_runtime_mode(
+    mode: &RuntimeMode,
+    scope_targets: &BehaviorScopeTargets,
+) -> Result<RuntimeModeClass, String> {
+    scope_targets.validate()?;
     let RuntimeMode::Behavioral(behavior) = mode else {
         return Ok(match mode {
             RuntimeMode::Plan => RuntimeModeClass::Plan,
@@ -735,6 +1097,16 @@ fn validate_runtime_mode(mode: &RuntimeMode) -> Result<RuntimeModeClass, String>
         return Err(
             "behavioral mode cannot combine readonly and director capabilities".to_string(),
         );
+    }
+    if behavior.scope == Scope::Narrow && (!scope_targets.is_explicit() || scope_targets.is_empty())
+    {
+        return Err(
+            "narrow behavioral scope requires at least one explicit --scope-target; targets are never inferred from task prose"
+                .to_string(),
+        );
+    }
+    if behavior.scope == Scope::Adjacent && scope_targets.is_empty() {
+        return Err("adjacent behavioral scope requires an approved target set".to_string());
     }
     Ok(if readonly {
         RuntimeModeClass::ReadOnly
@@ -769,14 +1141,40 @@ fn profile_allows_definition(
 fn profile_allows_call(
     snapshot: &RuntimeModeSnapshot,
     tool_name: &str,
-    effect: crate::tools::effect::ToolEffect,
+    resolved: &crate::tools::effect::ResolvedEffect,
+    canonical_path: Option<&Path>,
     arguments: &serde_json::Value,
     plan_file: &Path,
+    project_root: &Path,
 ) -> bool {
     if snapshot.class == RuntimeModeClass::Plan {
         return crate::session::is_tool_allowed_in_plan_mode(tool_name, plan_file, arguments);
     }
-    profile_allows_definition(snapshot, tool_name, effect)
+    if !profile_allows_definition(snapshot, tool_name, resolved.effect) {
+        return false;
+    }
+    let RuntimeMode::Behavioral(behavior) = &snapshot.mode else {
+        return true;
+    };
+    if behavior.scope == Scope::Unrestricted {
+        return true;
+    }
+    if behavior.scope == Scope::Adjacent && !snapshot.scope_targets.is_explicit() {
+        return true;
+    }
+    match resolved.target_kind {
+        crate::tools::effect::ToolTargetKind::Path
+        | crate::tools::effect::ToolTargetKind::PathScope => canonical_path.is_some_and(|path| {
+            snapshot
+                .bound_scope_targets
+                .allows_path(behavior.scope, project_root, path)
+        }),
+        crate::tools::effect::ToolTargetKind::Tool
+        | crate::tools::effect::ToolTargetKind::Opaque => {
+            resolved.effect == crate::tools::effect::ToolEffect::ReadOnly
+                || snapshot.bound_scope_targets.allows_tool(tool_name)
+        }
+    }
 }
 
 pub(crate) fn observation_tool_allowed(
@@ -1431,9 +1829,17 @@ mod tests {
         let plan_file = std::fs::canonicalize(plan_file).expect("canonical plan");
         let empty = serde_json::json!({});
 
-        let authority = RuntimeModeAuthority::new(RuntimeMode::Behavioral(
-            BehaviorMode::from_preset(Preset::Explore),
-        ))
+        let targets = BehaviorScopeTargets::from_user_values(
+            plan_dir.path(),
+            plan_dir.path(),
+            &[".".to_string()],
+        )
+        .expect("explicit explore target");
+        let authority = RuntimeModeAuthority::new_for_run(
+            RuntimeMode::Behavioral(BehaviorMode::from_preset(Preset::Explore)),
+            targets,
+            plan_dir.path(),
+        )
         .expect("explore profile");
         assert_eq!(authority.snapshot().class, RuntimeModeClass::ReadOnly);
         assert!(authority

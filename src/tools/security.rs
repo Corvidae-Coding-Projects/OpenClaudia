@@ -101,6 +101,7 @@ pub struct ToolRunContextBuilder {
     budget_limits: Option<BudgetLimits>,
     parent_budget: Option<crate::runtime::RunBudgetAuthority>,
     runtime_mode: crate::modes::RuntimeMode,
+    behavior_scope_targets: crate::modes::BehaviorScopeTargets,
 }
 
 impl ToolRunContextBuilder {
@@ -128,6 +129,7 @@ impl ToolRunContextBuilder {
             budget_limits: None,
             parent_budget: None,
             runtime_mode: crate::modes::RuntimeMode::default(),
+            behavior_scope_targets: crate::modes::BehaviorScopeTargets::workspace_root(),
         }
     }
 
@@ -309,6 +311,13 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Bind persisted user/task-approved behavioral targets to this run.
+    #[must_use]
+    pub fn behavior_scope_targets(mut self, targets: crate::modes::BehaviorScopeTargets) -> Self {
+        self.behavior_scope_targets = targets;
+        self
+    }
+
     /// Construct and validate the complete immutable run capability.
     ///
     /// # Errors
@@ -445,8 +454,8 @@ impl ToolRunContext {
             budget_limits,
             parent_budget,
             runtime_mode,
+            behavior_scope_targets,
         } = builder;
-        let runtime_mode = crate::modes::RuntimeModeAuthority::new(runtime_mode)?;
         let workspace_access = workspace_access.ok_or_else(|| {
             "Run construction requires an explicit workspace access capability".to_string()
         })?;
@@ -484,6 +493,11 @@ impl ToolRunContext {
             };
         let project_root = canonical_directory(&project_root, "project root")?;
         let working_directory = canonical_directory(&working_directory, "working directory")?;
+        let runtime_mode = crate::modes::RuntimeModeAuthority::new_for_run(
+            runtime_mode,
+            behavior_scope_targets,
+            &project_root,
+        )?;
         let mut canonical_read_only = canonical_roots(&read_only_roots, "read-only")?;
         let mut canonical_read_write = canonical_roots(&read_write_roots, "read-write")?;
         if !path_is_within(&working_directory, &project_root)
@@ -780,6 +794,29 @@ impl ToolRunContext {
         self.runtime_mode.transition(mode)
     }
 
+    /// Atomically install a mode and its exact approved target set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation when the target set cannot be bound to
+    /// this run's project or the requested mode is ambiguous/conflicting.
+    pub fn transition_runtime_mode_scoped(
+        &self,
+        mode: crate::modes::RuntimeMode,
+        targets: crate::modes::BehaviorScopeTargets,
+    ) -> Result<crate::modes::RuntimeModeSnapshot, String> {
+        self.runtime_mode.transition_scoped(mode, targets)
+    }
+
+    /// Validate a prospective mode against this run's current target set
+    /// without changing the installed generation.
+    pub(crate) fn validate_runtime_mode_transition(
+        &self,
+        mode: &crate::modes::RuntimeMode,
+    ) -> Result<(), String> {
+        self.runtime_mode.validate_transition(mode)
+    }
+
     /// Enforce the active mode against a concrete classified tool call.
     ///
     /// # Errors
@@ -791,27 +828,44 @@ impl ToolRunContext {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<(), String> {
-        // Standard mode is deliberately transparent: the existing effect,
-        // policy, permission, and argument gates retain their established
-        // ordering. Restricted modes need early resolution because the mode
-        // ceiling itself depends on the concrete effect.
-        if self.runtime_mode().class == crate::modes::RuntimeModeClass::Standard {
+        let snapshot = self.runtime_mode();
+        if snapshot.class == crate::modes::RuntimeModeClass::Standard
+            && matches!(
+                &snapshot.mode,
+                crate::modes::RuntimeMode::Behavioral(mode)
+                    if mode.scope == crate::modes::Scope::Adjacent
+            )
+            && !snapshot.scope_targets.is_explicit()
+        {
             return Ok(());
         }
         let resolved = super::effect::resolve_for_call(tool_name, arguments)
             .map_err(|error| error.reason())?;
-        self.admit_runtime_mode_resolved(tool_name, resolved.effect, arguments)
+        self.admit_runtime_mode_resolved(tool_name, &resolved, arguments)
     }
 
     /// Re-check mode authority at the final effect reservation boundary.
     pub(crate) fn admit_runtime_mode_resolved(
         &self,
         tool_name: &str,
-        effect: super::effect::ToolEffect,
+        resolved: &super::effect::ResolvedEffect,
         arguments: &serde_json::Value,
     ) -> Result<(), String> {
-        self.runtime_mode
-            .admit_tool(tool_name, effect, arguments, &self.agent_plan_file)
+        let canonical_path = if matches!(
+            resolved.target_kind,
+            super::effect::ToolTargetKind::Path | super::effect::ToolTargetKind::PathScope
+        ) {
+            Some(super::resolve_capability_path(self, &resolved.target)?)
+        } else {
+            None
+        };
+        self.runtime_mode.admit_resolved_tool(
+            tool_name,
+            resolved,
+            canonical_path.as_deref(),
+            arguments,
+            &self.agent_plan_file,
+        )
     }
 
     /// Gate effectful frontend shortcuts that bypass the model tool dispatcher.
@@ -1040,6 +1094,7 @@ impl ToolRunContext {
             .cloned()
             .collect();
         let process_owner = session_id.as_str().to_string();
+        let runtime_mode = self.runtime_mode();
 
         Self::builder(session_id, &project_root)
             .working_directory(working_directory)
@@ -1059,7 +1114,8 @@ impl ToolRunContext {
             .provider(provider)
             .budget_limits(self.runtime.descriptor().budget.limits.clone())
             .parent_budget(self.runtime.budget().clone())
-            .runtime_mode(self.runtime_mode().mode)
+            .runtime_mode(runtime_mode.mode)
+            .behavior_scope_targets(runtime_mode.scope_targets)
             .build()
     }
 

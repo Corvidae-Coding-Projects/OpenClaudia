@@ -1945,6 +1945,12 @@ async fn run_subagent_inner(
                 .cloned(),
         );
     }
+    let parent_mode = parent_run.runtime_mode();
+    let child_runtime_mode = if parent_mode.class == crate::modes::RuntimeModeClass::Coordinator {
+        crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default())
+    } else {
+        parent_mode.mode.clone()
+    };
     let subagent_run = match crate::tools::ToolRunContext::builder(session_id, child_root)
         .working_directory(child_cwd)
         .read_only_roots(child_read_only_roots)
@@ -1963,6 +1969,8 @@ async fn run_subagent_inner(
         .provider(app_config.proxy.target.clone())
         .budget_limits(parent_run.runtime().descriptor().budget.limits.clone())
         .parent_budget(parent_run.budget().clone())
+        .runtime_mode(child_runtime_mode)
+        .behavior_scope_targets(parent_mode.scope_targets)
         .build()
     {
         Ok(run) => run,

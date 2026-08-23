@@ -750,6 +750,7 @@ fn build_startup_session_run_context(
         .secrets(true)
         .provider(provider)
         .runtime_mode(runtime_mode_for_tui_session(session))
+        .behavior_scope_targets(session.behavior_scope_targets())
         .budget_limits(budget_limits)
         .build()
 }
@@ -760,6 +761,30 @@ fn runtime_mode_for_tui_session(session: &Session) -> crate::modes::RuntimeMode 
     } else {
         crate::modes::RuntimeMode::Behavioral(session.behavior_mode())
     }
+}
+
+fn parse_behavior_scope_targets(
+    session: &Session,
+    values: &[String],
+) -> Result<Option<crate::modes::BehaviorScopeTargets>, String> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let identity = session.inspect_state(|state| state.identity.clone());
+    let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
+        format!(
+            "Cannot bind behavioral scope to project '{}': {error}",
+            identity.project_root.display()
+        )
+    })?;
+    let working_directory = std::fs::canonicalize(&identity.cwd).map_err(|error| {
+        format!(
+            "Cannot bind behavioral scope to working directory '{}': {error}",
+            identity.cwd.display()
+        )
+    })?;
+    crate::modes::BehaviorScopeTargets::from_user_values(&project_root, &working_directory, values)
+        .map(Some)
 }
 
 fn derive_session_run_context(
@@ -793,7 +818,10 @@ fn derive_session_run_context(
         &identity.cwd,
         active_provider,
     )?;
-    run.transition_runtime_mode(runtime_mode_for_tui_session(session))?;
+    run.transition_runtime_mode_scoped(
+        runtime_mode_for_tui_session(session),
+        session.behavior_scope_targets(),
+    )?;
     Ok(run)
 }
 
@@ -1008,14 +1036,31 @@ impl App {
         &mut self,
         behavior_mode: crate::modes::BehaviorMode,
     ) -> Result<(), String> {
+        let targets = self.chat_session.behavior_scope_targets();
+        self.apply_behavior_mode_and_targets(behavior_mode, targets)
+    }
+
+    /// Atomically apply behavioral mode and approved scope targets to runtime
+    /// authority before publishing them in resumable session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current run is unavailable or the requested
+    /// mode and target set cannot be bound to it.
+    pub fn apply_behavior_mode_and_targets(
+        &mut self,
+        behavior_mode: crate::modes::BehaviorMode,
+        targets: crate::modes::BehaviorScopeTargets,
+    ) -> Result<(), String> {
         let runtime_mode = if self.chat_session.agent_mode() == AgentMode::Plan {
             crate::modes::RuntimeMode::Plan
         } else {
             crate::modes::RuntimeMode::Behavioral(behavior_mode.clone())
         };
         self.tool_run_context()?
-            .transition_runtime_mode(runtime_mode)?;
-        self.chat_session.set_behavior_mode(behavior_mode);
+            .transition_runtime_mode_scoped(runtime_mode, targets.clone())?;
+        self.chat_session
+            .set_behavior_mode_and_targets(behavior_mode, targets);
         Ok(())
     }
 
@@ -1235,21 +1280,68 @@ impl App {
     /// `--resume`; otherwise `--resume` loads the most recently updated
     /// saved TUI session.
     pub fn apply_startup_resume(&mut self, resume: bool, session_id: Option<&str>) {
-        if let Some(id) = session_id {
-            self.resume_session_by_id(id);
-            return;
-        }
+        let _ = self.apply_startup_resume_with_behavior(resume, session_id, None, &[]);
+    }
 
-        if !resume {
-            return;
-        }
-
-        let Some(loaded) = list_sessions().into_iter().next() else {
-            self.messages
-                .add(DisplayMessage::system("No saved sessions to resume."));
-            return;
+    /// Apply startup resume and launch-time behavioral overrides as one scoped
+    /// session selection. Overrides are installed on the candidate session
+    /// before its run is derived, so a saved narrow mode can be resumed with a
+    /// newly supplied explicit target set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when target values are invalid or the selected session
+    /// cannot be rebound to the authorized launch run.
+    pub fn apply_startup_resume_with_behavior(
+        &mut self,
+        resume: bool,
+        session_id: Option<&str>,
+        behavior_mode: Option<crate::modes::BehaviorMode>,
+        scope_target_values: &[String],
+    ) -> Result<(), String> {
+        let mut selected = if let Some(id) = session_id {
+            let session = list_sessions()
+                .into_iter()
+                .find(|session| session.id().starts_with(id));
+            if session.is_none() {
+                self.messages.add(DisplayMessage::error(format!(
+                    "No session found with id prefix '{id}'.",
+                )));
+            }
+            session
+        } else if resume {
+            let session = list_sessions().into_iter().next();
+            if session.is_none() {
+                self.messages
+                    .add(DisplayMessage::system("No saved sessions to resume."));
+            }
+            session
+        } else {
+            None
         };
-        let _ = self.apply_loaded_session(&loaded);
+
+        if let Some(loaded) = selected.as_mut() {
+            let scope_targets = parse_behavior_scope_targets(loaded, scope_target_values)?;
+            if behavior_mode.is_some() || scope_targets.is_some() {
+                loaded.set_behavior_mode_and_targets(
+                    behavior_mode.unwrap_or_else(|| loaded.behavior_mode()),
+                    scope_targets.unwrap_or_else(|| loaded.behavior_scope_targets()),
+                );
+            }
+            if !self.apply_loaded_session(loaded) {
+                return Err("could not bind the selected startup session".to_string());
+            }
+            return Ok(());
+        }
+
+        let scope_targets = parse_behavior_scope_targets(&self.chat_session, scope_target_values)?;
+        if behavior_mode.is_some() || scope_targets.is_some() {
+            self.apply_behavior_mode_and_targets(
+                behavior_mode.unwrap_or_else(|| self.behavior_mode()),
+                scope_targets.unwrap_or_else(|| self.chat_session.behavior_scope_targets()),
+            )?;
+        }
+        Ok(())
     }
 
     /// Apply the current process's permission posture after any startup
@@ -7219,9 +7311,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restricted_mode_blocks_tui_shell_shortcuts_before_spawn() {
         let mut app = App::new("test-model", "test-provider");
-        app.apply_behavior_mode(crate::modes::BehaviorMode::from_preset(
-            crate::modes::Preset::Explore,
-        ))
+        let run = app.tool_run_context().expect("run");
+        let targets = crate::modes::BehaviorScopeTargets::from_user_values(
+            run.project_root(),
+            run.working_directory(),
+            &[".".to_string()],
+        )
+        .expect("explicit explore target");
+        app.apply_behavior_mode_and_targets(
+            crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Explore),
+            targets,
+        )
         .expect("explore mode");
         let rx = wire_app(&mut app);
 
@@ -7617,6 +7717,17 @@ mod tests {
             "initial-provider",
             crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Explore),
         );
+        let project_root = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical project root");
+        let explore_targets = crate::modes::BehaviorScopeTargets::from_user_values(
+            &project_root,
+            &project_root,
+            &[".".to_string()],
+        )
+        .expect("explicit explore target");
+        newer.set_behavior_mode_and_targets(newer.behavior_mode(), explore_targets);
         newer.set_id(NEWER_ID.to_string());
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
@@ -7659,6 +7770,51 @@ mod tests {
                 from_messages: 0,
             }) if from.as_str() == initial_id && to.as_str() == NEWER_ID
         ));
+    }
+
+    #[test]
+    fn startup_resume_can_bind_explicit_targets_before_deriving_a_narrow_run() {
+        const SESSION_ID: &str = "33333333-3333-4333-8333-333333333333";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
+        let project_root = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical project root");
+        let target_values = ["src/tui/app.rs".to_string()];
+        let targets = crate::modes::BehaviorScopeTargets::from_user_values(
+            &project_root,
+            &project_root,
+            &target_values,
+        )
+        .expect("explicit TUI target");
+
+        let saved = Session::new_with_behavior_mode(
+            "saved-model",
+            "initial-provider",
+            crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Safe),
+        );
+        saved.set_id(SESSION_ID.to_string());
+        save_session(&saved).expect("narrow session should save");
+
+        let mut app = App::new("initial-model", "initial-provider");
+        app.apply_startup_resume_with_behavior(true, None, None, &target_values)
+            .expect("startup target override should bind the resumed run");
+
+        assert_eq!(app.chat_session.id(), SESSION_ID);
+        assert_eq!(app.chat_session.behavior_scope_targets(), targets);
+        let snapshot = app
+            .tool_run_context()
+            .expect("resumed narrow run")
+            .runtime_mode();
+        assert!(matches!(
+            snapshot.mode,
+            crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode {
+                scope: crate::modes::Scope::Narrow,
+                ..
+            })
+        ));
+        assert_eq!(snapshot.scope_targets, targets);
     }
 
     #[test]

@@ -765,9 +765,18 @@ mod tests {
     #[test]
     fn runtime_mode_denial_cannot_be_widened_by_unrestricted_permissions() {
         let run = one_tool_run();
-        run.transition_runtime_mode(crate::modes::RuntimeMode::Behavioral(
-            crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Explore),
-        ))
+        let targets = crate::modes::BehaviorScopeTargets::from_user_values(
+            run.project_root(),
+            run.working_directory(),
+            &[".".to_string()],
+        )
+        .expect("explicit explore target");
+        run.transition_runtime_mode_scoped(
+            crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::from_preset(
+                crate::modes::Preset::Explore,
+            )),
+            targets,
+        )
         .expect("install explore mode");
         let call = bash_call("printf runtime-mode-should-not-run");
         let permission_manager = PermissionManager::unrestricted();
@@ -874,7 +883,11 @@ mod tests {
 
     #[test]
     fn tool_executor_rejects_permit_when_exact_arguments_change() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let run = test_run();
+        let dir = tempfile::Builder::new()
+            .prefix("permit-mismatch-")
+            .tempdir_in(run.project_root())
+            .expect("workspace tempdir");
         let approved_path = dir.path().join("approved.txt");
         let changed_path = dir.path().join("changed.txt");
         let approved = ToolCall {
@@ -911,7 +924,7 @@ mod tests {
             .expect("mint permit");
 
         let result = ToolExecutor::execute(ToolExecutorRequest {
-            run_context: test_run(),
+            run_context: run,
             tool_call: &changed,
             memory_db: None,
             app_config: None,

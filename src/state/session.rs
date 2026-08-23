@@ -424,9 +424,25 @@ impl Session {
             .inspect(|state| state.conversation.behavior_mode.clone())
     }
 
+    #[must_use]
+    pub fn behavior_scope_targets(&self) -> crate::modes::BehaviorScopeTargets {
+        self.state
+            .inspect(|state| state.conversation.behavior_scope_targets.clone())
+    }
+
     pub fn set_behavior_mode(&self, mode: crate::modes::BehaviorMode) {
+        let targets = self.behavior_scope_targets();
+        self.set_behavior_mode_and_targets(mode, targets);
+    }
+
+    pub fn set_behavior_mode_and_targets(
+        &self,
+        mode: crate::modes::BehaviorMode,
+        targets: crate::modes::BehaviorScopeTargets,
+    ) {
         self.state.update(|state, events| {
             state.conversation.behavior_mode = mode.clone();
+            state.conversation.behavior_scope_targets = targets;
             events.push(StateEvent::ModeChanged { new: mode });
         });
     }

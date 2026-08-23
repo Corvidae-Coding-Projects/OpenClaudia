@@ -469,7 +469,7 @@ pub fn commit_interactive_plan_approval(
 
     // Validate before publishing the durable task binding. The subsequent
     // transition can then fail only if the u64 generation space is exhausted.
-    crate::modes::RuntimeModeAuthority::new(restore_mode.clone())?;
+    run.validate_runtime_mode_transition(&restore_mode)?;
     let plan_id = format!("plan-{}", chat_session.id());
     let mut manager = task_manager
         .lock()
