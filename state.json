@@ -1,6 +1,6 @@
 {
   "next_display_id": 1114,
-  "next_comment_id": 1351,
+  "next_comment_id": 1352,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1638,11 +1638,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T10:55:42.266057457Z",
-      "updated_at": "2026-08-23T13:24:11.058855453Z",
+      "updated_at": "2026-08-23T13:24:34.814514910Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "0582f2c5-7d70-413c-a285-e4e4ec896382": {
+          "display_id": 1351,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit 069317169ebd44efdbc94ebaed58539b24431915 (Good ED25519 signature for dollspace-gay). Registry generation 4, truthful partial maturity projections, authenticated team technical-memory entrypoints, deterministic matrix generator, corpus/review rebinding, and closed-slice status records are included.",
+          "created_at": "2026-08-23T13:24:34.812013761Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAlUtAkoapYSa4OirnfMkrcvlgWPIrw3DhdHOCXFUYy+UjbJBnBMtkDc6BO5eOddnLVcND4hdQ+zaxDFYkDZahCw=="
+        },
         "144f2b3b-b4bb-4082-9505-31b764e98bad": {
           "display_id": 1348,
           "author": "6Vw9",
@@ -35825,11 +35834,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1216,
       "timestamp": "2026-08-23T13:24:11.058855453Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1217,
+      "timestamp": "2026-08-23T13:24:34.814514910Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T13:24:11.058855453Z",
+    "timestamp": "2026-08-23T13:24:34.814514910Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1216
+    "agent_seq": 1217
   }
 }
