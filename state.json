@@ -15378,12 +15378,13 @@
       "display_id": 1114,
       "title": "S-040: Supervise foreground process I/O",
       "description": "Implement docs/remediation-slices/040-supervised-foreground-process-io.md under parent #1071. Replace fragmented synchronous child handling with one run-owned bounded supervisor covering spawn, stdin, stdout/stderr drain, deadlines, cancellation, typed terminal outcomes, process-tree termination, and reap. Preserve real shell, hook, LSP, MCP, editor, quality-gate, and helper capabilities while moving only production-relevant consumers required by the slice. Resolve the observed descendant-held pipe timeout (#1020) and sandbox orphan (#1067) at their shared lifecycle cause; do not expand into hypothetical platform edge cases or unrelated process refactors. Use Rust 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo invocations, and --test-threads=1.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T13:28:40.687327778Z",
-      "updated_at": "2026-08-23T14:14:52.687222560Z",
+      "updated_at": "2026-08-23T14:15:26.474193615Z",
+      "closed_at": "2026-08-23T14:15:26.474190659Z",
       "labels": [
         "remediation"
       ],
@@ -36113,11 +36114,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1240,
       "timestamp": "2026-08-23T14:15:22.086226883Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1241,
+      "timestamp": "2026-08-23T14:15:26.474193615Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T14:15:22.086226883Z",
+    "timestamp": "2026-08-23T14:15:26.474193615Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1240
+    "agent_seq": 1241
   }
 }
