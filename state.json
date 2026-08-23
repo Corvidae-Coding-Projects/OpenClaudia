@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1102,
+  "next_display_id": 1103,
   "next_comment_id": 1262,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -362,6 +362,7 @@
     "5c4a255d-52f8-4fe9-91e1-fc69e9f9c356": 288,
     "5c607a42-f2f6-4b58-b575-b9e44ee85695": 256,
     "5c66503f-3c1a-4a1e-8165-e659b37df72e": 245,
+    "5c94296b-10ab-4c19-8573-aa4d7e5685ed": 1102,
     "5cabfc3b-d756-4c81-8b55-08fec79cd65d": 1007,
     "5cbba6c5-dcd3-4f6d-bb29-4608f462249f": 86,
     "5cd2a889-64bf-40f0-b355-8e0e7f138b2f": 69,
@@ -10505,6 +10506,18 @@
       "labels": [
         "bug"
       ]
+    },
+    "5c94296b-10ab-4c19-8573-aa4d7e5685ed": {
+      "uuid": "5c94296b-10ab-4c19-8573-aa4d7e5685ed",
+      "display_id": 1102,
+      "title": "S-046: Repair Gemini and Ollama tool history",
+      "description": "Implement docs/remediation-slices/046-gemini-ollama-tool-history.md on top of S-044. Preserve provider-native call/result identity, arguments, ordering, parallel/batched semantics, and resume for Gemini and Ollama across every production consumer. Reject malformed, missing, duplicated, or reordered protocol history instead of flattening or dropping it. Do not remove provider capabilities or claim adjacent model-catalog, reasoning-privacy, terminal-outcome, or transport slices complete.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T00:29:40.630208184Z",
+      "updated_at": "2026-08-23T00:29:40.630208184Z"
     },
     "5cabfc3b-d756-4c81-8b55-08fec79cd65d": {
       "uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
@@ -33989,11 +34002,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1058,
       "timestamp": "2026-08-23T00:27:48.314681540Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1059,
+      "timestamp": "2026-08-23T00:29:40.630208184Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T00:27:48.314681540Z",
+    "timestamp": "2026-08-23T00:29:40.630208184Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1058
+    "agent_seq": 1059
   }
 }
