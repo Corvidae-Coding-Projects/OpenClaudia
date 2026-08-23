@@ -17242,12 +17242,13 @@
       "display_id": 1115,
       "title": "S-041: Own background process lifetime and output",
       "description": "Implement docs/remediation-slices/041-owned-background-processes.md now that S-040 and S-051 are complete. Replace detached line readers and destructive global buffers with generation-bound supervised jobs: full collision-safe IDs, run/session/workspace/capability/budget identity, bounded chunk capture, ordered cursor-based replay, explicit running/exited/killed/timed_out/delivery_failed/lost states, cancellation/deadline enforcement, confirmed reap, bounded retention, and crash/restart reconciliation that never acts on a recovered PID. Preserve Bash background execution and existing lifecycle callers; do not expand into cgroup perfection, frontend redesign, or unrelated process services. Use Rust 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo, and --test-threads=1.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T14:22:39.418758535Z",
-      "updated_at": "2026-08-23T15:28:16.038559029Z",
+      "updated_at": "2026-08-23T15:28:30.752499142Z",
+      "closed_at": "2026-08-23T15:28:30.752497802Z",
       "labels": [
         "remediation"
       ],
@@ -36293,11 +36294,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1256,
       "timestamp": "2026-08-23T15:28:16.038559029Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1257,
+      "timestamp": "2026-08-23T15:28:30.752499142Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:28:16.038559029Z",
+    "timestamp": "2026-08-23T15:28:30.752499142Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1256
+    "agent_seq": 1257
   }
 }
