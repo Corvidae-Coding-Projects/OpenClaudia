@@ -1,6 +1,6 @@
 {
   "next_display_id": 1120,
-  "next_comment_id": 1401,
+  "next_comment_id": 1402,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24865,7 +24865,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:59:50.703902730Z",
-      "updated_at": "2026-08-23T20:51:38.563881229Z",
+      "updated_at": "2026-08-23T20:52:16.117596130Z",
       "labels": [
         "remediation"
       ],
@@ -24887,6 +24887,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAc64LuKurDsN/LANCa/Suer+a1Owy3OFD5bfePsUJxEzhKa2gMmAhe5/ovI87LzyIce6HJeppqsEyTiz1IkUKDA=="
+        },
+        "9f53b8a2-aa59-4e1e-96fb-a4130a3d796e": {
+          "display_id": 1401,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 6072f95b (feat(sandbox): transact writable workspace projection). It replaces writable host binds with descriptor-pinned baseline/candidate/backup transactions and validated atomic publication/rollback across foreground/background shell, hooks, Git/worktree, LSP, ACP, and checkpointed MCP; it also fixes background preparation capacity and MCP reaped-PID lifecycle races and masks nested Cargo caches. Verification: Rust 1.98 full locked native all-target/all-feature matrix passed (2,901/2,902 library tests plus every integration/example; one intentional ignore), strict Clippy/fmt passed, Windows GNU check passed with #1099-only warnings, fuzz check/Clippy/4 tests passed, technical-memory retrieval/evidence passed 4/4 and 9/9, repository policy 27/27 and hygiene verified, root/fuzz cargo-deny passed.",
+          "created_at": "2026-08-23T20:52:16.115035307Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8AYVCUAuWLhyzyqbroaFv9KeAVxWeyaCJ+8Sf/IkLBfsVY4oNR64X0xmJ1MHPjmPMH77thIuyI7mvXYyyP3oAA=="
         },
         "dbf4fe98-a8e9-4e65-8cea-9c6156147229": {
           "display_id": 1398,
@@ -36837,11 +36846,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1303,
       "timestamp": "2026-08-23T20:51:38.563881229Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1304,
+      "timestamp": "2026-08-23T20:52:16.117596130Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T20:51:38.563881229Z",
+    "timestamp": "2026-08-23T20:52:16.117596130Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1303
+    "agent_seq": 1304
   }
 }
