@@ -1,6 +1,6 @@
 {
   "next_display_id": 1103,
-  "next_comment_id": 1266,
+  "next_comment_id": 1267,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10521,11 +10521,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T00:29:40.630208184Z",
-      "updated_at": "2026-08-23T02:14:54.002718348Z",
+      "updated_at": "2026-08-23T02:14:58.254939116Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "2b6d0187-3d9d-475a-9e35-3a902deb6c21": {
+          "display_id": 1266,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit f8e9315. Exact Gemini/Ollama tool history is production-wired across pipeline, TUI/CLI, ACP, and child runs with deterministic malformed-history rejection and recorded Rust 1.98 verification evidence in the S-046 slice document.",
+          "created_at": "2026-08-23T02:14:58.252327313Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkKEWFcmsxAdXWRyEmWU5OOzlX68GBSyLRsyRAJdpxvKb+jMJZAO6JTIVCZrhvcqjXI4nJVTKML8S3C/V0jnUAg=="
+        },
         "4ea1fe67-f28f-4c47-b15b-858f6f2078ca": {
           "display_id": 1264,
           "author": "6Vw9",
@@ -34082,11 +34091,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1065,
       "timestamp": "2026-08-23T02:14:54.002718348Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1066,
+      "timestamp": "2026-08-23T02:14:58.254939116Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T02:14:54.002718348Z",
+    "timestamp": "2026-08-23T02:14:58.254939116Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1065
+    "agent_seq": 1066
   }
 }
