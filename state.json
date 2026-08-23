@@ -1,6 +1,6 @@
 {
   "next_display_id": 1118,
-  "next_comment_id": 1380,
+  "next_comment_id": 1381,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28205,10 +28205,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:33:45.737689540Z",
-      "updated_at": "2026-08-23T15:33:49.857132643Z",
+      "updated_at": "2026-08-23T15:41:43.015913920Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "01c5bfee-0dbb-40ed-a04e-9ae941fcf653": {
+          "display_id": 1380,
+          "author": "6Vw9",
+          "content": "[action] Selected S-042 practical boundary: enforce typed profile-level filesystem/environment authority on normal subprocesses, preserve intended shell/Git/MCP workflows, and test realistic isolation; avoid platform-theoretical redesign beyond normal application risks.",
+          "created_at": "2026-08-23T15:41:43.013229961Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQNX8PBUq180HlvgQzbkRSEzjcXcWtw1aAsvpeskaUbnxOKAcKu1stECXBGuVjEkMToMj6Jq764Cj7TIUwzQLAA=="
+        }
+      }
     },
     "f027c012-1642-4192-94cf-c953933d6243": {
       "uuid": "f027c012-1642-4192-94cf-c953933d6243",
@@ -36444,11 +36455,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1270,
       "timestamp": "2026-08-23T15:33:55.049681413Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1271,
+      "timestamp": "2026-08-23T15:41:43.015913920Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:33:55.049681413Z",
+    "timestamp": "2026-08-23T15:41:43.015913920Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1270
+    "agent_seq": 1271
   }
 }
