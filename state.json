@@ -1,6 +1,6 @@
 {
   "next_display_id": 1104,
-  "next_comment_id": 1275,
+  "next_comment_id": 1276,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23412,7 +23412,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T02:17:19.644312884Z",
-      "updated_at": "2026-08-23T03:37:36.119194365Z",
+      "updated_at": "2026-08-23T03:44:13.264229050Z",
       "labels": [
         "remediation"
       ],
@@ -23434,6 +23434,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1PUMJvC6S4T+FMF+nb8VaFFa2d+Go9PF9XWMZBebBLSBMRtr8I6pdycwvjsFUyHvfQe2kCZ7TA1tbvONeHXQBA=="
+        },
+        "7bc37d4b-64eb-4317-955e-ca482544b479": {
+          "display_id": 1275,
+          "author": "6Vw9",
+          "content": "[review] Pre-commit/QA review found and fixed two application-facing defects: OpenAI /fast had no current catalog candidate, and proxy enforcement returned before rejecting a model absent from a complete authenticated catalog. Added the current Luna fast candidate/test and moved unavailable-access rejection ahead of optional metadata handling. Incomplete or absent catalogs still preserve unknown custom models. Rust 1.98 focused catalog/proxy/fast/evidence tests, fmt, diff-check, and strict all-target/all-feature Clippy pass; the complete test matrix had already passed before these two localized fixes. Remote PR #66 checks are all green at the current pushed revision. No confirmed security or maintainability blocker remains in S-047; pagination stays in S-048, pricing attribution in S-051, and alternate-model VDD receipt in S-088.",
+          "created_at": "2026-08-23T03:44:13.261198047Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGc5unLl72fYe4E1YPiARalbMjvcbvJZlMEVQtDCEUy8VixroRhuKSAs+hHPdVMKr9dTBkgIClSeJ+ln1U/qICA=="
         },
         "d1a3cf16-4268-4bf4-bd65-d9da6ef2193b": {
           "display_id": 1272,
@@ -34262,11 +34271,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1081,
       "timestamp": "2026-08-23T03:37:53.343093423Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1082,
+      "timestamp": "2026-08-23T03:44:13.264229050Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T03:37:53.343093423Z",
+    "timestamp": "2026-08-23T03:44:13.264229050Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1081
+    "agent_seq": 1082
   }
 }
