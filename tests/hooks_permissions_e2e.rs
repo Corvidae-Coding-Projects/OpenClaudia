@@ -356,7 +356,13 @@ async fn multiple_hooks_in_same_slot_all_run() {
 
     let engine = HookEngine::new(cfg);
     let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
-    let _ = engine.run(HookEvent::SessionStart, &input).await;
+    let result = engine.run(HookEvent::SessionStart, &input).await;
+
+    assert!(
+        result.errors.is_empty(),
+        "both hook transactions must publish cleanly: {:?}",
+        result.errors
+    );
 
     assert!(
         marker_a.exists(),

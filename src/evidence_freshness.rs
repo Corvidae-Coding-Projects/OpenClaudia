@@ -53,10 +53,10 @@ pub struct FreshnessStamp {
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDependencyPolicy {
     /// Hash every regular file and symlink in the project except the root
-    /// `.git`, `target`, `.openclaudia/reality-ledgers`, and Crosslink's
-    /// `.crosslink/.cache` and `.crosslink/.hub-cache` subtrees. Those
-    /// exclusions are VCS metadata or runtime/build caches, not source inputs
-    /// asserted by the final gate.
+    /// `.git`, `target`, `OpenClaudia`'s reality-ledger and sandbox-transaction
+    /// state, and Crosslink's `.crosslink/.cache` and `.crosslink/.hub-cache`
+    /// subtrees. Those exclusions are VCS metadata or runtime/build caches,
+    /// not source inputs asserted by the final gate.
     ProjectSourceTreeV1,
     /// Extends [`Self::ProjectSourceTreeV1`] by excluding the repository-local
     /// `.worktrees` control subtree. Linked worktrees contain independent build
@@ -765,7 +765,7 @@ fn artifact_path_is_excluded(relative: &Path) -> bool {
         components.as_slice(),
         [first, second, ..]
             if *first == std::ffi::OsStr::new(".openclaudia")
-                && *second == std::ffi::OsStr::new("reality-ledgers")
+                && matches!(second.to_str(), Some("reality-ledgers" | "sandbox-transactions"))
     ) || matches!(
         components.as_slice(),
         [first, second, ..]
@@ -898,5 +898,21 @@ pub fn release_run(run: &ToolRunContext) {
             }
         }
         Err(error) => tracing::error!(%error, "failed to release evidence freshness state"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::artifact_path_is_excluded;
+    use std::path::Path;
+
+    #[test]
+    fn sandbox_transaction_state_is_not_verification_source_input() {
+        assert!(artifact_path_is_excluded(Path::new(
+            ".openclaudia/sandbox-transactions/generation/candidate/src/lib.rs"
+        )));
+        assert!(!artifact_path_is_excluded(Path::new(
+            ".openclaudia/config.yaml"
+        )));
     }
 }

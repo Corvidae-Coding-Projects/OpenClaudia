@@ -5,6 +5,7 @@ mod list;
 mod notebook;
 mod read;
 pub mod secure_fs;
+pub mod workspace_projection;
 mod write;
 
 pub use edit::execute_edit_file;

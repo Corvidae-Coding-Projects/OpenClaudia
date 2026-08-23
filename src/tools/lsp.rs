@@ -602,7 +602,7 @@ fn spawn_language_server(
     project_root: &Path,
 ) -> Result<Child, String> {
     let args: Vec<OsString> = server_args.iter().map(OsString::from).collect();
-    let mut cmd = crate::tools::sandboxed_process_command(
+    let prepared = crate::tools::sandboxed_process_command(
         run,
         crate::tools::SandboxProfile::LanguageServer,
         std::ffi::OsStr::new(server_cmd),
@@ -610,6 +610,13 @@ fn spawn_language_server(
         project_root,
     )
     .map_err(|error| format!("Failed to sandbox language server {server_cmd}: {error}"))?;
+    let (mut cmd, projection) = prepared.into_parts();
+    if projection.is_some() {
+        return Err(
+            "Language-server read-only profile unexpectedly received a writable projection"
+                .to_string(),
+        );
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

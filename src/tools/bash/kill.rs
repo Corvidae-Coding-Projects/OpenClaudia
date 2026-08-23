@@ -188,6 +188,123 @@ pub fn terminate_sandbox_process_tree(pid: u32) {
     }
 }
 
+/// RAII guard for a Linux sandbox process tree paused during host-side
+/// workspace reconciliation. Dropping the guard resumes every frozen PID.
+pub struct PausedSandboxProcessTree {
+    #[cfg(target_os = "linux")]
+    root: i32,
+    #[cfg(target_os = "linux")]
+    frozen: std::collections::HashSet<i32>,
+}
+
+impl Drop for PausedSandboxProcessTree {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            for pid in &self.frozen {
+                // SAFETY: every value is a positive PID discovered from the
+                // owned sandbox's procfs process tree.
+                unsafe {
+                    libc::kill(*pid, libc::SIGCONT);
+                }
+            }
+            // Also resume conventional process-group members that may not be
+            // represented as descendants of the wrapper.
+            unsafe {
+                libc::kill(-self.root, libc::SIGCONT);
+                libc::kill(self.root, libc::SIGCONT);
+            }
+        }
+    }
+}
+
+/// Freeze an owned sandbox wrapper and all of its current descendants.
+///
+/// The caller must keep the returned guard alive for the full reconciliation
+/// operation so the child cannot mutate its projected tree concurrently.
+pub fn pause_sandbox_process_tree(pid: u32) -> Result<PausedSandboxProcessTree, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::collections::{HashSet, VecDeque};
+        use std::time::Duration;
+
+        let root = i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| format!("Invalid sandbox process id {pid}"))?;
+        // Stop the wrapper first so it cannot create a namespace child while
+        // the descendant set is being frozen.
+        if unsafe { libc::kill(root, libc::SIGSTOP) } != 0 {
+            return Err(format!(
+                "Cannot pause sandbox process {pid}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // Cover conventional group children as well; a missing group is fine
+        // because descendant discovery below is authoritative for bwrap.
+        unsafe {
+            libc::kill(-root, libc::SIGSTOP);
+        }
+
+        let descendants = || {
+            let mut found = Vec::new();
+            let mut seen = HashSet::from([root]);
+            let mut queue = VecDeque::from([root]);
+            while let Some(parent) = queue.pop_front() {
+                let task_dir = format!("/proc/{parent}/task");
+                let Ok(tasks) = std::fs::read_dir(task_dir) else {
+                    continue;
+                };
+                for task in tasks.flatten() {
+                    let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+                        continue;
+                    };
+                    for child in children
+                        .split_whitespace()
+                        .filter_map(|value| value.parse::<i32>().ok())
+                    {
+                        if child > 0 && seen.insert(child) {
+                            found.push(child);
+                            queue.push_back(child);
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        let mut frozen = HashSet::from([root]);
+        let mut stable_rounds = 0_u8;
+        for _ in 0..32 {
+            let mut added = false;
+            for descendant in descendants() {
+                if frozen.insert(descendant) {
+                    unsafe {
+                        libc::kill(descendant, libc::SIGSTOP);
+                    }
+                    added = true;
+                }
+            }
+            if added {
+                stable_rounds = 0;
+            } else {
+                stable_rounds = stable_rounds.saturating_add(1);
+                if stable_rounds >= 2 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(PausedSandboxProcessTree { root, frozen })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Err("Writable sandbox process checkpoints are only supported on Linux".to_string())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn force_terminate_linux_process_tree(pid: u32) {
     use std::collections::{HashSet, VecDeque};

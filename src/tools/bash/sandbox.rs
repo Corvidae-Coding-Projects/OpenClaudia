@@ -344,7 +344,7 @@ pub(super) fn sandboxed_bash_command(
     bash: &Path,
     command: &str,
     cwd: &Path,
-) -> Result<Command, String> {
+) -> Result<crate::tools::command::PreparedProcessCommand, String> {
     sandboxed_process_command(
         run,
         SandboxProfile::Shell,
@@ -362,7 +362,7 @@ pub fn sandboxed_process_command(
     program: &OsStr,
     args: &[OsString],
     cwd: &Path,
-) -> Result<Command, String> {
+) -> Result<crate::tools::command::PreparedProcessCommand, String> {
     sandboxed_process_command_for_profile(run, profile, program, args, cwd, &[])
 }
 
@@ -375,7 +375,7 @@ pub fn sandboxed_process_command_with_env(
     args: &[OsString],
     cwd: &Path,
     environment: &[(OsString, OsString)],
-) -> Result<Command, String> {
+) -> Result<crate::tools::command::PreparedProcessCommand, String> {
     sandboxed_process_command_for_profile(run, profile, program, args, cwd, environment)
 }
 
@@ -386,7 +386,7 @@ pub fn sandboxed_hook_command(
     run: &crate::tools::security::ToolRunContext,
     source: &Command,
     cwd: &Path,
-) -> Result<Command, String> {
+) -> Result<crate::tools::command::PreparedProcessCommand, String> {
     let args: Vec<OsString> = source.get_args().map(OsString::from).collect();
     let environment = source
         .get_envs()
@@ -410,7 +410,7 @@ fn sandboxed_process_command_for_profile(
     args: &[OsString],
     cwd: &Path,
     explicit_environment: &[(OsString, OsString)],
-) -> Result<Command, String> {
+) -> Result<crate::tools::command::PreparedProcessCommand, String> {
     run.require(crate::tools::security::ToolResource::Process)
         .map_err(|error| error.to_string())?;
     validate_explicit_environment(profile, explicit_environment)?;
@@ -545,7 +545,7 @@ fn unsandboxed_process_command(
     args: &[OsString],
     cwd: &Path,
     explicit_environment: &[(OsString, OsString)],
-) -> Result<Command, String> {
+) -> Result<crate::tools::command::PreparedProcessCommand, String> {
     let policy = profile.policy();
     let cwd = if policy.workspace == WorkspaceMountPolicy::ScratchOnly {
         canonical_working_directory(run.private_temp_root())?
@@ -566,7 +566,7 @@ fn unsandboxed_process_command(
             .iter()
             .map(|(name, value)| (name, value)),
     );
-    Ok(cmd)
+    Ok(crate::tools::command::PreparedProcessCommand::host(cmd))
 }
 
 #[cfg(target_os = "linux")]
@@ -578,7 +578,7 @@ fn linux_bubblewrap_command(
     args: &[OsString],
     cwd: &Path,
     explicit_environment: &[(OsString, OsString)],
-) -> Result<Command, String> {
+) -> Result<crate::tools::command::PreparedProcessCommand, String> {
     let policy = profile.policy();
     let cwd = if policy.workspace == WorkspaceMountPolicy::ScratchOnly {
         canonical_working_directory(security.private_temp_root())?
@@ -610,6 +610,26 @@ fn linux_bubblewrap_command(
     }
     let sandbox_home =
         host_home.map_or_else(|| PathBuf::from("/home/openclaudia"), Path::to_path_buf);
+    let workspace_projection = if matches!(
+        policy.workspace,
+        WorkspaceMountPolicy::ProjectRunBound | WorkspaceMountPolicy::RunBound
+    ) {
+        // Validate the granted host tree before projecting it. Candidate files
+        // use independent workspace inodes, so inspecting only the candidate
+        // would hide a source inode that also has a hardlink outside the
+        // writable grant.
+        validate_writable_project_tree(project_root)?;
+        crate::tools::file::workspace_projection::WorkspaceProjection::prepare(
+            security,
+            matches!(profile, SandboxProfile::GitWorktree),
+        )?
+    } else {
+        None
+    };
+    let private_cargo_target = workspace_projection
+        .as_ref()
+        .filter(|projection| projection.uses_private_cargo_target())
+        .map(|_| security.private_temp_root().join("cargo-target"));
     let mut pinned_bind_roots = security.duplicate_linux_bind_roots()?;
     pinned_bind_roots.retain(|root| match policy.workspace {
         WorkspaceMountPolicy::ScratchOnly => root.path == security.private_temp_root(),
@@ -625,10 +645,16 @@ fn linux_bubblewrap_command(
             }
         }
     }
-    for writable_root in pinned_bind_roots
-        .iter()
-        .filter(|root| root.writable && root.path != security.private_temp_root())
-    {
+    if let Some(projection) = &workspace_projection {
+        for root in &mut pinned_bind_roots {
+            if root.path == project_root && root.writable {
+                root.directory = projection.duplicate_candidate_bind_fd()?;
+            }
+        }
+    }
+    for writable_root in pinned_bind_roots.iter().filter(|root| {
+        root.writable && root.path != security.private_temp_root() && root.path != project_root
+    }) {
         validate_writable_project_tree(&writable_root.path)?;
     }
     let effective_read_write_roots = pinned_bind_roots
@@ -660,6 +686,15 @@ fn linux_bubblewrap_command(
         child_processes = policy.permits_child_processes,
         "Compiled least-privilege subprocess profile"
     );
+    if let Some(projection) = &workspace_projection {
+        tracing::debug!(
+            target: "openclaudia::workspace_projection",
+            event = "workspace_projection_bound",
+            generation = projection.generation(),
+            profile = ?profile,
+            "Bound isolated writable candidate instead of the host project"
+        );
+    }
     let mut metadata_bind_fds = Vec::new();
     let mut cmd = Command::new(&backend.path);
     cmd.args(["--die-with-parent", "--new-session", "--unshare-all"]);
@@ -716,6 +751,14 @@ fn linux_bubblewrap_command(
         .arg(root.directory.as_raw_fd().to_string())
         .arg(&root.path);
     }
+    if let Some(cargo_target) = &private_cargo_target {
+        add_pinned_writable_directory_bind(
+            &mut cmd,
+            &mut metadata_bind_fds,
+            cargo_target,
+            &project_root.join("target"),
+        )?;
+    }
 
     // Repository metadata and harness control state are not ordinary project
     // output. A shell must not persist hooks/configuration that execute after
@@ -761,6 +804,9 @@ fn linux_bubblewrap_command(
                 hide_control_path(&mut cmd, denied_path);
             }
         }
+        if let Some(projection) = &workspace_projection {
+            hide_control_path(&mut cmd, projection.transaction_parent());
+        }
     }
 
     let safe_path = sandbox_path(
@@ -782,15 +828,10 @@ fn linux_bubblewrap_command(
         .arg(private_temp)
         .args(["--setenv", "CARGO_HOME"])
         .arg(&sandbox_cargo);
-    if matches!(
-        policy.workspace,
-        WorkspaceMountPolicy::ScratchOnly | WorkspaceMountPolicy::ProjectReadOnly
-    ) {
-        cmd.args(["--setenv", "CARGO_TARGET_DIR"])
-            .arg(private_temp.join("cargo-target"))
-            .args(["--setenv", "PYTHONPYCACHEPREFIX"])
-            .arg(private_temp.join("python-cache"));
-    }
+    cmd.args(["--setenv", "CARGO_TARGET_DIR"])
+        .arg(private_temp.join("cargo-target"))
+        .args(["--setenv", "PYTHONPYCACHEPREFIX"])
+        .arg(private_temp.join("python-cache"));
     cmd.args(["--setenv", "RUSTUP_HOME"])
         .arg(sandbox_home.join(".rustup"))
         .args(["--setenv", "PATH", &safe_path])
@@ -822,7 +863,10 @@ fn linux_bubblewrap_command(
         .chain(metadata_bind_fds)
         .collect();
     install_linux_process_hardening(&mut cmd, inherited_bind_fds, policy.permits_child_processes)?;
-    Ok(cmd)
+    Ok(crate::tools::command::PreparedProcessCommand::sandboxed(
+        cmd,
+        workspace_projection,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1628,6 +1672,55 @@ fn protect_repository_metadata(
 }
 
 #[cfg(target_os = "linux")]
+fn add_pinned_writable_directory_bind(
+    cmd: &mut Command,
+    inherited_bind_fds: &mut Vec<OwnedFd>,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    match fs::create_dir(source) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot create private Cargo target '{}': {error}",
+                source.display()
+            ));
+        }
+    }
+    fs::set_permissions(source, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        format!(
+            "Cannot secure private Cargo target '{}': {error}",
+            source.display()
+        )
+    })?;
+    let source_c = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| format!("Cargo target path contains NUL: '{}'", source.display()))?;
+    // SAFETY: source_c is NUL-terminated; O_NOFOLLOW and O_DIRECTORY reject
+    // replacement with a symbolic link or non-directory cache entry.
+    let opened = unsafe {
+        libc::open(
+            source_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if opened < 0 {
+        return Err(format!(
+            "Cannot pin private Cargo target '{}': {}",
+            source.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: open returned a fresh descriptor.
+    let pinned = unsafe { OwnedFd::from_raw_fd(opened) };
+    cmd.arg("--bind-fd")
+        .arg(pinned.as_raw_fd().to_string())
+        .arg(destination);
+    inherited_bind_fds.push(pinned);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn add_pinned_read_only_bind(
     cmd: &mut Command,
     inherited_bind_fds: &mut Vec<OwnedFd>,
@@ -1806,6 +1899,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn profile_mounts_and_environment_match_the_compiled_policy() {
         let project = tempfile::tempdir().expect("profile project");
+        std::fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("Cargo manifest fixture");
         let run =
             crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), project.path())
                 .read_only_roots(Vec::new())
@@ -1877,9 +1975,12 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert!(!args
+        assert!(args
             .windows(2)
             .any(|window| { window[0] == "--setenv" && window[1] == "CARGO_TARGET_DIR" }));
+        assert!(args.windows(3).any(|window| {
+            window[0] == "--bind-fd" && window[2] == project.path().join("target").to_string_lossy()
+        }));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use thiserror::Error;
@@ -344,12 +344,52 @@ pub struct StdioTransport {
     /// (the bounded-read borrow from fix #445 still compiles) as
     /// strict child mutexes of `request_lock`, deadlock-free.
     request_lock: Mutex<()>,
+    /// Writable project state remains isolated until one complete protocol
+    /// request reaches a terminal response and can publish atomically.
+    workspace_projection:
+        Mutex<Option<crate::tools::file::workspace_projection::WorkspaceProjection>>,
+    pid: u32,
+    /// Becomes true only after the owned child has been reaped. A transport
+    /// may remain alive in an `Arc` after `close`; remembering that lifecycle
+    /// transition prevents its eventual `Drop` from signalling a reused PID.
+    process_reaped: AtomicBool,
     /// Ring buffer holding the last `STDERR_BUFFER_CAP` bytes the server
     /// wrote to stderr (fix #445 point 1).
     stderr_buf: Arc<Mutex<Vec<u8>>>,
     /// Handle to the stderr drain task. Wrapped in `Arc` so the struct
     /// stays `Send + Sync`. The task auto-terminates on stderr EOF.
     _stderr_drain: Arc<JoinHandle<()>>,
+}
+
+struct InFlightStdioRequestGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl InFlightStdioRequestGuard {
+    const fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightStdioRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::tools::terminate_sandbox_process_tree(self.pid);
+        }
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        if !self.process_reaped.load(Ordering::Acquire) {
+            crate::tools::terminate_sandbox_process_tree(self.pid);
+        }
+    }
 }
 
 /// Spawn a background tokio task that drains `stderr` into a ring buffer.
@@ -439,7 +479,7 @@ impl StdioTransport {
         validate_protected_mcp_child_environment(run, env)?;
         let process_run = derive_mcp_stdio_run(run, env)?;
         let sandbox_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-        let command = crate::tools::sandboxed_process_command(
+        let prepared_command = crate::tools::sandboxed_process_command(
             &process_run,
             crate::tools::SandboxProfile::McpStdio,
             resolved_command.as_os_str(),
@@ -449,6 +489,7 @@ impl StdioTransport {
         .map_err(|error| {
             McpError::Transport(format!("MCP stdio sandbox is unavailable: {error}"))
         })?;
+        let (command, workspace_projection) = prepared_command.into_parts();
         info!(
             command = %resolved_command.display(),
             arg_count = args.len(),
@@ -461,17 +502,19 @@ impl StdioTransport {
         let mut cmd = Command::from(command);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd
             .spawn()
             .map_err(|e| McpError::Transport(format!("Failed to spawn process: {e}")))?;
-        let process_registration = crate::tools::command::ActiveSandboxProcess::register(
-            &process_run,
-            child.id().ok_or_else(|| {
-                McpError::Transport("Sandboxed MCP process has no process id".to_string())
-            })?,
-        );
+        let pid = child.id().ok_or_else(|| {
+            McpError::Transport("Sandboxed MCP process has no process id".to_string())
+        })?;
+        let process_registration =
+            crate::tools::command::ActiveSandboxProcess::register(&process_run, pid);
 
         // Take stdout from the child once and wrap in a persistent BufReader
         let stdout = child
@@ -498,6 +541,9 @@ impl StdioTransport {
             reader: Mutex::new(reader),
             request_id: AtomicU64::new(1),
             request_lock: Mutex::new(()), // Fix #732
+            workspace_projection: Mutex::new(workspace_projection),
+            pid,
+            process_reaped: AtomicBool::new(false),
             stderr_buf,
             _stderr_drain: Arc::new(drain),
         })
@@ -589,6 +635,161 @@ impl StdioTransport {
         }
 
         Ok(true)
+    }
+
+    async fn perform_request(&self, id: u64, request_line: &str) -> Result<Value, McpError> {
+        let mut child = self.child.lock().await;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(request_line.as_bytes())
+                .await
+                .map_err(|e| McpError::Transport(format!("Failed to write to stdin: {e}")))?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .map_err(|e| McpError::Transport(format!("Failed to write newline: {e}")))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|e| McpError::Transport(format!("Failed to flush stdin: {e}")))?;
+        } else {
+            return Err(McpError::Transport("Stdin not available".to_string()));
+        }
+
+        // stdin and stdout are independent descriptors. Releasing the child
+        // lock also lets close terminate a stuck server after request timeout.
+        drop(child);
+
+        let mut seen_messages = 0usize;
+        let response = loop {
+            if seen_messages >= MAX_STDIO_INTERMEDIATE_MESSAGES {
+                return Err(McpError::Protocol(format!(
+                    "MCP stdio response scan exceeded {MAX_STDIO_INTERMEDIATE_MESSAGES} messages \
+                     without seeing response id {id}"
+                )));
+            }
+            seen_messages += 1;
+
+            let line = zeroize::Zeroizing::new(self.read_stdout_line().await?);
+            let value: Value = match serde_json::from_str(&line) {
+                Ok(value) => value,
+                Err(e) => {
+                    let snippet = stderr_snippet(&self.stderr_buf).await;
+                    let raw = zeroize::Zeroizing::new(format!(
+                        "Failed to parse response: {e}{}",
+                        snippet.as_str()
+                    ));
+                    return Err(McpError::Protocol(
+                        self.run_context.sanitize_diagnostic(&raw).to_string(),
+                    ));
+                }
+            };
+
+            if self.handle_server_message(&value).await? {
+                continue;
+            }
+
+            let response: JsonRpcResponse = serde_json::from_value(value).map_err(|e| {
+                McpError::Protocol(format!("Failed to parse response envelope: {e}"))
+            })?;
+            break response;
+        };
+
+        if response.id != id {
+            return Err(McpError::ResponseIdMismatch {
+                expected: id,
+                got: response.id,
+            });
+        }
+
+        if let Some(error) = response.error {
+            let data_info = error
+                .data
+                .as_ref()
+                .map(|data| format!(" (data: {data})"))
+                .unwrap_or_default();
+            let raw = zeroize::Zeroizing::new(format!(
+                "RPC error {}: {}{}",
+                error.code, error.message, data_info
+            ));
+            return Err(McpError::Protocol(
+                self.run_context.sanitize_diagnostic(&raw).to_string(),
+            ));
+        }
+
+        Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    async fn checkpoint_workspace(&self, publish: bool) -> Result<(), McpError> {
+        let Some(mut projection) = self.workspace_projection.lock().await.take() else {
+            return Ok(());
+        };
+        let paused = match crate::tools::pause_sandbox_process_tree(self.pid) {
+            Ok(paused) => paused,
+            Err(error) => {
+                self.terminate_after_workspace_error().await;
+                drop(projection);
+                return Err(McpError::Transport(format!(
+                    "Cannot checkpoint MCP workspace: {error}"
+                )));
+            }
+        };
+
+        let checkpoint = tokio::task::spawn_blocking(move || {
+            let result = projection.checkpoint(publish);
+            (projection, result)
+        })
+        .await;
+
+        match checkpoint {
+            Ok((projection, Ok(receipt))) => {
+                tracing::debug!(
+                    target: "openclaudia::workspace_projection",
+                    generation = %receipt.generation,
+                    proposal_digest = %receipt.proposal_digest,
+                    reconciled_digest = ?receipt.reconciled_digest,
+                    changed_entries = receipt.changed_entries,
+                    published = receipt.published,
+                    "Settled MCP workspace request"
+                );
+                *self.workspace_projection.lock().await = Some(projection);
+                drop(paused);
+                Ok(())
+            }
+            Ok((projection, Err(error))) => {
+                self.terminate_after_workspace_error().await;
+                drop(paused);
+                let recovery = error.recovery_path().map(Path::to_path_buf);
+                drop(projection);
+                Err(McpError::Transport(recovery.map_or_else(
+                    || format!("MCP workspace reconciliation failed: {error}"),
+                    |path| {
+                        format!(
+                            "MCP workspace reconciliation failed: {error}; recovery state: '{}'",
+                            path.display()
+                        )
+                    },
+                )))
+            }
+            Err(error) => {
+                self.terminate_after_workspace_error().await;
+                drop(paused);
+                Err(McpError::Transport(format!(
+                    "MCP workspace reconciliation task failed: {error}"
+                )))
+            }
+        }
+    }
+
+    async fn terminate_after_workspace_error(&self) {
+        crate::tools::terminate_sandbox_process_tree(self.pid);
+        let mut child = self.child.lock().await;
+        let _ = child.kill().await;
+        if child.wait().await.is_ok() {
+            self.process_reaped.store(true, Ordering::Release);
+        }
+        drop(child);
     }
 }
 
@@ -885,112 +1086,45 @@ impl McpTransport for StdioTransport {
 
         debug!(method = %method, id = id, "Sending MCP request");
 
-        // Fix #732 — serialise the entire write+read transaction.
-        // Concurrent calls queue behind this guard so the server
-        // only ever has one outstanding request and cannot reorder
-        // replies. The leading underscore on `_request_guard`
-        // silences `unused_variables` without an `#[allow]`; the
-        // guard lives until the end of the scope, i.e. until the
-        // response has been parsed and the result is ready.
+        // Serialize the wire exchange and its workspace checkpoint. A second
+        // request must not observe or extend an uncommitted candidate.
         let _request_guard = self.request_lock.lock().await;
-
-        let mut child = self.child.lock().await;
-
-        // Write request to stdin
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(request_line.as_bytes())
-                .await
-                .map_err(|e| McpError::Transport(format!("Failed to write to stdin: {e}")))?;
-            stdin
-                .write_all(b"\n")
-                .await
-                .map_err(|e| McpError::Transport(format!("Failed to write newline: {e}")))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|e| McpError::Transport(format!("Failed to flush stdin: {e}")))?;
-        } else {
-            return Err(McpError::Transport("Stdin not available".to_string()));
-        }
-
-        // Release the child lock before reading. stdin and stdout are
-        // independent file descriptors and the reader has its own mutex.
-        drop(child);
-
-        let mut seen_messages = 0usize;
-        let response = loop {
-            if seen_messages >= MAX_STDIO_INTERMEDIATE_MESSAGES {
-                return Err(McpError::Protocol(format!(
-                    "MCP stdio response scan exceeded {MAX_STDIO_INTERMEDIATE_MESSAGES} messages \
-                     without seeing response id {id}"
-                )));
-            }
-            seen_messages += 1;
-
-            let line = zeroize::Zeroizing::new(self.read_stdout_line().await?);
-            let value: Value = match serde_json::from_str(&line) {
-                Ok(value) => value,
-                Err(e) => {
-                    let snippet = stderr_snippet(&self.stderr_buf).await;
-                    let raw = zeroize::Zeroizing::new(format!(
-                        "Failed to parse response: {e}{}",
-                        snippet.as_str()
-                    ));
-                    return Err(McpError::Protocol(
-                        self.run_context.sanitize_diagnostic(&raw).to_string(),
-                    ));
-                }
-            };
-
-            if self.handle_server_message(&value).await? {
-                continue;
-            }
-
-            let response: JsonRpcResponse = serde_json::from_value(value).map_err(|e| {
-                McpError::Protocol(format!("Failed to parse response envelope: {e}"))
-            })?;
-
-            break response;
-        };
-
-        if response.id != id {
-            // Fix #701 — dedicated variant replaces the previous
-            // stringly-typed Protocol(...) error so call sites and
-            // tests can match on the variant directly. Shared with
-            // HttpTransport for DRY across transports.
-            return Err(McpError::ResponseIdMismatch {
-                expected: id,
-                got: response.id,
-            });
-        }
-
-        if let Some(error) = response.error {
-            // Include error data in message if available
-            let data_info = error
-                .data
-                .as_ref()
-                .map(|d| format!(" (data: {d})"))
-                .unwrap_or_default();
-            let raw = zeroize::Zeroizing::new(format!(
-                "RPC error {}: {}{}",
-                error.code, error.message, data_info
-            ));
-            return Err(McpError::Protocol(
-                self.run_context.sanitize_diagnostic(&raw).to_string(),
-            ));
-        }
-
-        Ok(response.result.unwrap_or(Value::Null))
+        let mut in_flight = InFlightStdioRequestGuard::new(self.pid);
+        let result = self.perform_request(id, &request_line).await;
+        let checkpoint = self.checkpoint_workspace(result.is_ok()).await;
+        in_flight.disarm();
+        checkpoint?;
+        result
     }
 
     async fn close(&self) -> Result<(), McpError> {
-        self.child
-            .lock()
-            .await
-            .kill()
-            .await
-            .map_err(|e| McpError::Transport(format!("Failed to kill process: {e}")))?;
+        let _request_guard = self.request_lock.lock().await;
+        crate::tools::terminate_sandbox_process_tree(self.pid);
+        {
+            let mut child = self.child.lock().await;
+            let _ = child.kill().await;
+            child
+                .wait()
+                .await
+                .map_err(|e| McpError::Transport(format!("Failed to reap MCP process: {e}")))?;
+            self.process_reaped.store(true, Ordering::Release);
+            drop(child);
+        }
+        let projection = self.workspace_projection.lock().await.take();
+        if let Some(mut projection) = projection {
+            tokio::task::spawn_blocking(move || projection.settle(false))
+                .await
+                .map_err(|error| {
+                    McpError::Transport(format!(
+                        "MCP workspace rollback task failed during close: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    McpError::Transport(format!(
+                        "MCP workspace rollback failed during close: {error}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 }
@@ -3812,12 +3946,156 @@ mod tests {
     // drain a server writing more than ~64 KiB to stderr would deadlock
     // on `write(2)`. Both scenarios now complete deterministically.
 
+    fn stdio_test_run() -> &'static Arc<crate::tools::ToolRunContext> {
+        static RUN: std::sync::OnceLock<Arc<crate::tools::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-workspaces")
+                .join(format!("mcp-stdio-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("isolated MCP stdio fixture root");
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &root)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .provider("mcp-stdio-fixture")
+                .build()
+                .expect("MCP stdio fixture run")
+        })
+    }
+
     fn spawn_sh(script: &str) -> Result<StdioTransport, McpError> {
-        StdioTransport::spawn(test_run(), "sh", &["-c", script])
+        StdioTransport::spawn(stdio_test_run(), "sh", &["-c", script])
     }
 
     fn spawn_python(script: &str) -> Result<StdioTransport, McpError> {
-        StdioTransport::spawn(test_run(), "python3", &["-u", "-c", script])
+        StdioTransport::spawn(stdio_test_run(), "python3", &["-u", "-c", script])
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writable_stdio_checkpoints_each_request() {
+        let root = tempfile::tempdir_in(".").expect("writable MCP fixture root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let script = r#"
+import json
+import pathlib
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    if method == "write":
+        pathlib.Path("mcp-output").write_text("committed", encoding="utf-8")
+        response = {"jsonrpc":"2.0","id":request["id"],"result":{"written":True}}
+    elif method == "fail":
+        pathlib.Path("mcp-output").write_text("must-roll-back", encoding="utf-8")
+        pathlib.Path("failed-output").write_text("must-roll-back", encoding="utf-8")
+        response = {"jsonrpc":"2.0","id":request["id"],"error":{"code":-32000,"message":"fixture failure"}}
+    else:
+        value = pathlib.Path("mcp-output").read_text(encoding="utf-8")
+        response = {"jsonrpc":"2.0","id":request["id"],"result":{"value":value}}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+        let transport =
+            StdioTransport::spawn(&run, "python3", &["-u", "-c", script]).expect("spawn MCP");
+
+        transport
+            .request("write", None)
+            .await
+            .expect("successful MCP write");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("mcp-output")).expect("published MCP output"),
+            "committed"
+        );
+
+        let error = transport
+            .request("fail", None)
+            .await
+            .expect_err("failed MCP request");
+        assert!(error.to_string().contains("fixture failure"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("mcp-output")).expect("preserved checkpoint"),
+            "committed"
+        );
+        assert!(!root.path().join("failed-output").exists());
+
+        let result = transport
+            .request("read", None)
+            .await
+            .expect("server continues after rollback");
+        assert_eq!(result["value"], "committed");
+        transport.close().await.expect("close MCP transport");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(target_os = "linux")]
+    async fn cancelling_writable_stdio_request_kills_server_without_publishing() {
+        let root = tempfile::tempdir_in(".").expect("cancelled MCP fixture root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let script = r#"
+import json
+import pathlib
+import sys
+import time
+
+for line in sys.stdin:
+    json.loads(line)
+    pathlib.Path("cancelled-output").write_text("must-not-publish", encoding="utf-8")
+    sys.stderr.write("candidate-written\n")
+    sys.stderr.flush()
+    time.sleep(30)
+"#;
+        let transport = Arc::new(
+            StdioTransport::spawn(&run, "python3", &["-u", "-c", script]).expect("spawn MCP"),
+        );
+        let pid = transport.pid;
+        let request_transport = Arc::clone(&transport);
+        let request = tokio::spawn(async move { request_transport.request("write", None).await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let stderr = transport.stderr_buf_handle().lock().await.clone();
+            if String::from_utf8_lossy(&stderr).contains("candidate-written") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fixture server did not reach its mutation barrier"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        request.abort();
+        assert!(request
+            .await
+            .expect_err("request task must cancel")
+            .is_cancelled());
+        let process_can_run = || {
+            std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+                !status
+                    .lines()
+                    .any(|line| line.starts_with("State:") && line.contains('Z'))
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while process_can_run() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !process_can_run(),
+            "cancelled writable MCP server remained runnable"
+        );
+        assert!(!root.path().join("cancelled-output").exists());
+        transport.close().await.expect("close cancelled transport");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "closing the cancelled transport did not reap its root process"
+        );
     }
 
     /// Fix #445 point 1: a server that writes >64 KiB to stderr does NOT
@@ -5522,7 +5800,7 @@ sys.stdout.flush()
     async fn fix732_concurrent_out_of_order_server_replies_correlate() {
         let transport = Arc::new(
             StdioTransport::spawn(
-                test_run(),
+                stdio_test_run(),
                 "bash",
                 &[
                     "-c",

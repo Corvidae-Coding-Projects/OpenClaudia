@@ -117,13 +117,13 @@ the validator requires exact sorted receipt coverage. The artifacts and their
 SHA-256 digests are:
 
 - tuning corpus:
-  `3f329f9a881ee249915385a5d16ef7b41043c392d9577a35f4b8c28663270992`;
+  `4e8cf9baa5250f4234202aa435c7c4021e3c100cfb5602201c30fe207d9816ab`;
 - held-out corpus:
   `cb35d6f11af8fb1c281b4d97fa7ce5be1344b1a37f414389bf43d884df8cfe32`;
 - evaluation:
-  `be09cd2ecfca754c26f66b21cbb7acb98ca9ef48b8f704d870c6c22348536b13`;
+  `56a06c70fce3abc216c7964ec826aea2cc0785ec2d0dd8f4e29d79940ce0266b`;
 - deliberately rejected review:
-  `da8ca79cad665f034ffb81a015952d15f371df257dc187d2cc2db853e95911b5`.
+  `db61de2456ae699016988e8d41baa19f07220c9041c07723b9c15dc06b6a758a`.
 
 S-052 subsequently changed the still-cited `src/main.rs` while preserving the
 tested migration-doctor contract. S-055 later removed only the unrelated legacy
@@ -134,15 +134,17 @@ deliberately rejected review was rebound to the new exact artifacts. Canonical
 `worktree:sNNN` labels allow later slices to do the same without falsely
 retaining a historical Git generation.
 
-S-043 subsequently routed direct user shell actions through the shared Bash
-process capability and changed the still-cited `src/tools/bash/mod.rs`. Its
-source citation is therefore rebound to `worktree:s043`; the checked-in
-generator rebuilt the evaluation and the deliberately rejected review remains
-rejected while binding the new exact corpus and evaluation digests above.
+S-108 subsequently made writable process workspaces transactional and changed
+the still-cited `src/tools/bash/mod.rs`. Its source citation is therefore
+rebound to `worktree:s108` and digest
+`sha256:b2c24912b50c85b7ba2ac9cedcfd48e6f230d23ce3381340cd0910219308da58`;
+the checked-in generator rebuilt the evaluation and the deliberately rejected
+review remains rejected while binding the new exact corpus and evaluation
+digests above.
 
-The SHA-256 digest of the sorted `sha256sum` manifest for the 15 changed
+The SHA-256 digest of the sorted `sha256sum` manifest for the 24 changed
 non-slice artifacts is
-`fd2dbddf86f24f5e91ae7adbb1dcb7c34f76e56c79bd047a53953b45d40f6604`.
+`8adc4a735d9b0fa38b2ce327a8ab35f02dc5bbb2c74117694eac1548201e5e9d`.
 
 All Rust commands used Rust 1.98.0 and `CARGO_BUILD_JOBS=4`; every test command
 used `--test-threads=1`.

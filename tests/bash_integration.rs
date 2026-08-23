@@ -238,19 +238,26 @@ fn b1e_bash_output_finished_shell_reports_finished() {
     assert!(!spawn.is_error(), "B1e: spawn must succeed");
     let shell_id = extract_shell_id(spawn.content());
 
-    // Wait for the command to finish
-    std::thread::sleep(std::time::Duration::from_millis(400));
-
-    let poll = execute_tool(
-        support::shared_run_context(),
-        &make_tool_call("bash_output", &json!({ "shell_id": shell_id })),
-    );
-    assert!(!poll.is_error(), "B1e: poll of finished shell must succeed");
-    assert!(
-        poll.content().contains("finished"),
-        "B1e: finished shell must report 'finished'; got: {}",
-        poll.content()
-    );
+    // A writable background job remains nonterminal while its workspace
+    // transaction is publishing. Poll for the bounded terminal receipt instead
+    // of assuming reconciliation always completes within one fixed sleep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let poll = execute_tool(
+            support::shared_run_context(),
+            &make_tool_call("bash_output", &json!({ "shell_id": shell_id })),
+        );
+        assert!(!poll.is_error(), "B1e: poll of finished shell must succeed");
+        if poll.content().contains("finished") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B1e: shell did not publish a finished receipt before the deadline; got: {}",
+            poll.content()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

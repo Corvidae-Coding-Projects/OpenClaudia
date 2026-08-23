@@ -490,6 +490,10 @@ pub struct HookEngine {
     /// Optional callback for executing model hooks.
     /// Takes (prompt, model, provider) and returns the model's response text.
     model_hook_callback: Option<Arc<ModelHookCallback>>,
+    /// Full-sandbox command hooks publish transactional workspace generations.
+    /// Serialize those publications within one engine so hooks from the same
+    /// event observe and preserve the effects of earlier configured hooks.
+    command_projection_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HookEngine {
@@ -498,6 +502,7 @@ impl HookEngine {
         Self {
             config,
             model_hook_callback: None,
+            command_projection_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1054,12 +1059,17 @@ impl HookEngine {
         let sandbox_mode = policy.map_or(SandboxMode::FullSandbox, |hook_policy| {
             hook_policy.sandbox.clone()
         });
-        if sandbox_mode == SandboxMode::FullSandbox {
-            let sandboxed = crate::tools::sandboxed_hook_command(run, &child_cmd, &project_dir)
-                .map_err(|error| {
+        let _projection_guard = if sandbox_mode == SandboxMode::FullSandbox {
+            Some(self.command_projection_lock.lock().await)
+        } else {
+            None
+        };
+        let prepared_command = if sandbox_mode == SandboxMode::FullSandbox {
+            crate::tools::sandboxed_hook_command(run, &child_cmd, &project_dir).map_err(
+                |error| {
                     HookError::CommandFailed(format!("failed to create full hook sandbox: {error}"))
-                })?;
-            child_cmd = sandboxed;
+                },
+            )?
         } else {
             let trusted = TRUST_UNSANDBOXED_HOOKS
                 .as_ref()
@@ -1077,7 +1087,8 @@ impl HookEngine {
                 env = TRUST_UNSANDBOXED_HOOKS_ENV,
                 "Hook OS sandbox explicitly disabled by the host operator"
             );
-        }
+            crate::tools::command::PreparedProcessCommand::host(child_cmd)
+        };
 
         let limits = crate::tools::command::ProcessLimits::new(Duration::from_secs(timeout_secs))
             .with_output_limit(
@@ -1086,7 +1097,7 @@ impl HookEngine {
             );
         match crate::tools::command::run_prepared_run_owned(
             run,
-            child_cmd,
+            prepared_command,
             "hook",
             limits,
             Some(input_json.as_bytes().to_vec()),
@@ -1174,26 +1185,45 @@ mod tests {
     use std::task::{Context, Poll};
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
-        crate::tools::security::test_run_context()
+        static RUN: std::sync::OnceLock<std::sync::Arc<crate::tools::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-workspaces")
+                .join(format!("hook-unit-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("isolated hook fixture root");
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &root)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .provider("hook-unit-test")
+                .build()
+                .expect("hook unit-test run")
+        })
     }
 
     fn test_run_with_environment(
         grants: std::collections::HashMap<String, String>,
     ) -> std::sync::Arc<crate::tools::ToolRunContext> {
-        crate::tools::ToolRunContext::builder(
-            crate::state::SessionId::new(),
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
-        )
-        .read_only_roots(Vec::new())
-        .read_write_roots(Vec::new())
-        .environment_grants(grants)
-        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
-        .process(true)
-        .network(false)
-        .secrets(false)
-        .provider("hook-environment-test")
-        .build()
-        .expect("explicit hook test run")
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-workspaces")
+            .join(format!("hook-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("isolated hook environment root");
+        crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &root)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(grants)
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("hook-environment-test")
+            .build()
+            .expect("explicit hook test run")
     }
 
     struct FailingAsyncWrite;
@@ -2094,6 +2124,42 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_sandbox_hook_publishes_success_and_discards_failure() {
+        let root = tempfile::tempdir_in(".").expect("hook workspace root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let policy = Some(HookPolicy {
+            allowed_commands: None,
+            sandbox: SandboxMode::FullSandbox,
+        });
+
+        let engine = HookEngine::new(make_command_config(
+            "printf committed > hook-success",
+            true,
+            policy.clone(),
+        ));
+        let input = HookInput::for_run(&run, HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        assert!(result.errors.is_empty(), "hook failed: {:?}", result.errors);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("hook-success"))
+                .expect("published hook output"),
+            "committed"
+        );
+
+        let engine = HookEngine::new(make_command_config(
+            "printf uncommitted > hook-failure; exit 7",
+            true,
+            policy,
+        ));
+        let input = HookInput::for_run(&run, HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        assert_eq!(result.errors.len(), 1);
+        assert!(!root.path().join("hook-failure").exists());
     }
 
     /// Allowlist with a single entry permits a matching binary.

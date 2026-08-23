@@ -6128,7 +6128,7 @@ blast_radius:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn acp_partial_mutation_routes_failure_hook_with_exact_typed_result() {
+    async fn acp_failed_mutation_rolls_back_and_routes_failure_hook_with_exact_typed_result() {
         let (mut server, _rx, _tmp) = test_server();
         let run = Arc::clone(test_run(&server));
         let fixture = tempfile::tempdir_in(run.working_directory())
@@ -6201,8 +6201,12 @@ blast_radius:
             result.is_partial(),
             "effectful nonzero Bash must be partial"
         );
+        assert!(
+            !mutation.exists(),
+            "a failed transactional Bash command published its partial workspace mutation"
+        );
         assert_eq!(
-            std::fs::read_to_string(&mutation).expect("the command's mutation must be observable"),
+            std::fs::read_to_string(&source).expect("the source fixture must remain unchanged"),
             "effect-observed\n"
         );
         assert!(

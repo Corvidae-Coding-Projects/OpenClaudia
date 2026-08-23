@@ -702,10 +702,13 @@ mod tests {
         crate::tools::security::test_run_context()
     }
 
-    fn isolated_test_run() -> std::sync::Arc<crate::tools::ToolRunContext> {
-        crate::tools::security::test_run_context_for(std::path::Path::new(env!(
-            "CARGO_MANIFEST_DIR"
-        )))
+    fn isolated_test_run() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::tools::ToolRunContext>,
+    ) {
+        let root = tempfile::TempDir::new().expect("isolated grounding workspace");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        (root, run)
     }
 
     fn run_gate(
@@ -734,7 +737,7 @@ mod tests {
 
     #[test]
     fn prompt_packet_separates_runtime_receipts_from_navigation() {
-        let run = isolated_test_run();
+        let (_root, run) = isolated_test_run();
         let mut ledger = RealityLedger::new();
         let task = ledger
             .observe_user_task(&run, "Audit the binary commands.", "test-model")
@@ -893,7 +896,7 @@ mod tests {
 
     #[test]
     fn structured_final_claims_render_and_record_allow() {
-        let run = isolated_test_run();
+        let (_root, run) = isolated_test_run();
         let mut ledger = RealityLedger::new();
         let diff = ledger
             .observe_diff(&run, vec!["src/lib.rs".to_string()], "patch")

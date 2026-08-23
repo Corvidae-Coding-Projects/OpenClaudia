@@ -148,7 +148,15 @@ mod tests {
     use std::collections::HashMap;
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
-        crate::tools::security::test_run_context()
+        static RUN: std::sync::OnceLock<std::sync::Arc<crate::tools::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-workspaces")
+                .join(format!("bash-output-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("isolated bash-output fixture root");
+            crate::tools::security::test_run_context_for(&root)
+        })
     }
 
     // ── Phase 2 pinning tests (crosslink #541) ────────────────────────────────
@@ -330,12 +338,21 @@ mod tests {
             .spawn(test_run(), "echo done_b1e")
             .expect("b1_output_finished: spawn must succeed");
 
-        // Wait for the shell to finish
-        std::thread::sleep(std::time::Duration::from_millis(400));
-
         let mut args = HashMap::new();
         args.insert("shell_id".to_string(), serde_json::Value::String(shell_id));
-        let (msg, is_error) = execute_bash_output(test_run(), &args);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (msg, is_error) = loop {
+            let result = execute_bash_output(test_run(), &args);
+            if result.0.contains("finished") {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "b1_output_finished: shell did not settle; last response: {}",
+                result.0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(
             !is_error,
             "b1_output_finished: poll must succeed; got: {msg}"

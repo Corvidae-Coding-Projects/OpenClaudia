@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -25,6 +25,77 @@ const MAX_CAPTURE_BYTES_PER_STREAM: usize = 10 * 1024 * 1024;
 const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[output truncated at 10 MiB]\n";
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A process command together with any host-side workspace transaction that
+/// must be settled after the child reaches a terminal state.
+pub struct PreparedProcessCommand {
+    command: Command,
+    workspace_projection: Option<crate::tools::file::workspace_projection::WorkspaceProjection>,
+}
+
+impl PreparedProcessCommand {
+    #[must_use]
+    pub(crate) const fn host(command: Command) -> Self {
+        Self {
+            command,
+            workspace_projection: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn sandboxed(
+        command: Command,
+        workspace_projection: Option<crate::tools::file::workspace_projection::WorkspaceProjection>,
+    ) -> Self {
+        Self {
+            command,
+            workspace_projection,
+        }
+    }
+
+    pub(crate) const fn command_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_args(&self) -> std::process::CommandArgs<'_> {
+        self.command.get_args()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_envs(&self) -> std::process::CommandEnvs<'_> {
+        self.command.get_envs()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output(&mut self) -> std::io::Result<Output> {
+        if self.workspace_projection.is_some() {
+            return Err(std::io::Error::other(
+                "writable projected commands must use the shared supervisor",
+            ));
+        }
+        self.command.output()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&mut self) -> std::io::Result<ExitStatus> {
+        if self.workspace_projection.is_some() {
+            return Err(std::io::Error::other(
+                "writable projected commands must use the shared supervisor",
+            ));
+        }
+        self.command.status()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Command,
+        Option<crate::tools::file::workspace_projection::WorkspaceProjection>,
+    ) {
+        (self.command, self.workspace_projection)
+    }
+}
 
 struct ActiveRunProcesses {
     session_id: String,
@@ -348,7 +419,7 @@ fn run_test_host_with_timeout_inner(
     }
     run_prepared_with_timeout(
         ProcessExecution::TestHost,
-        command,
+        PreparedProcessCommand::host(command),
         program_str,
         timeout,
         stdin_input,
@@ -359,7 +430,7 @@ fn run_test_host_with_timeout_inner(
 /// deadline.
 pub fn run_prepared_sandboxed_with_timeout(
     run: &crate::tools::security::ToolRunContext,
-    command: Command,
+    command: PreparedProcessCommand,
     program_label: &str,
     timeout: Duration,
 ) -> Result<Output, CommandError> {
@@ -371,7 +442,7 @@ pub fn run_prepared_sandboxed_with_timeout(
 /// while preserving typed bounded-stream metadata for capability callers.
 pub fn run_prepared_run_owned_sync(
     run: &crate::tools::security::ToolRunContext,
-    command: Command,
+    command: PreparedProcessCommand,
     program_label: &str,
     limits: ProcessLimits,
 ) -> Result<SupervisedProcessOutput, CommandError> {
@@ -536,7 +607,7 @@ fn process_snapshot(
 
 fn run_prepared_with_timeout(
     execution: ProcessExecution<'_>,
-    cmd: Command,
+    cmd: PreparedProcessCommand,
     program_str: String,
     timeout: Duration,
     stdin_input: Option<&[u8]>,
@@ -555,7 +626,7 @@ fn run_prepared_with_timeout(
 /// Execute a prepared run-owned process on the shared async supervisor.
 pub async fn run_prepared_run_owned(
     run: &crate::tools::security::ToolRunContext,
-    command: Command,
+    command: PreparedProcessCommand,
     program_label: &str,
     limits: ProcessLimits,
     stdin_input: Option<Vec<u8>>,
@@ -581,7 +652,7 @@ fn build_process_runtime(context: &'static str) -> Result<tokio::runtime::Runtim
 
 fn drive_supervisor_sync(
     execution: ProcessExecution<'_>,
-    command: Command,
+    command: PreparedProcessCommand,
     program: String,
     limits: ProcessLimits,
     stdin_input: Option<Vec<u8>>,
@@ -627,11 +698,12 @@ fn drive_supervisor_sync(
 #[allow(clippy::too_many_lines)] // Spawn setup and terminal transitions form one lifecycle state machine.
 async fn supervise_prepared_process(
     execution: ProcessExecution<'_>,
-    mut command: Command,
+    prepared: PreparedProcessCommand,
     program: String,
     limits: ProcessLimits,
     stdin_input: Option<Vec<u8>>,
 ) -> Result<SupervisedProcessOutput, CommandError> {
+    let (mut command, mut workspace_projection) = prepared.into_parts();
     if let Some(input) = stdin_input.as_ref() {
         if input.len() > limits.stdin_bytes {
             return Err(CommandError::InputTooLarge {
@@ -752,14 +824,30 @@ async fn supervise_prepared_process(
     loop {
         if let Some(exit_status) = status {
             if io_tasks.is_empty() {
-                return Ok(SupervisedProcessOutput {
+                let output = SupervisedProcessOutput {
                     status: exit_status,
                     stdout: capture_snapshot(&stdout_state),
                     stderr: capture_snapshot(&stderr_state),
                     stdin: stdin_snapshot(&stdin_state),
                     stdout_truncated_marker: limits.stdout_truncated_marker,
                     stderr_truncated_marker: limits.stderr_truncated_marker,
-                });
+                };
+                if let Some(projection) = workspace_projection.as_mut() {
+                    if let Err(error) = projection.settle(exit_status.success()) {
+                        return Err(CommandError::WorkspaceReconciliationFailed {
+                            program,
+                            source: error.to_string(),
+                            recovery_path: error.recovery_path().map(Path::to_path_buf),
+                            partial: Box::new(ProcessSnapshot {
+                                status: Some(output.status),
+                                stdout: output.stdout,
+                                stderr: output.stderr,
+                                stdin: output.stdin,
+                            }),
+                        });
+                    }
+                }
+                return Ok(output);
             }
         }
 
@@ -989,6 +1077,14 @@ pub enum CommandError {
         source: String,
         partial: Box<ProcessSnapshot>,
     },
+    /// The child reached a terminal state, but its isolated workspace
+    /// generation could not be reconciled with ordinary certainty.
+    WorkspaceReconciliationFailed {
+        program: String,
+        source: String,
+        recovery_path: Option<PathBuf>,
+        partial: Box<ProcessSnapshot>,
+    },
     /// A synchronous compatibility caller could not create or drive Tokio.
     RuntimeFailed { source: String },
 }
@@ -999,7 +1095,8 @@ impl CommandError {
         match self {
             Self::TimedOut { partial, .. }
             | Self::Cancelled { partial, .. }
-            | Self::WaitFailed { partial, .. } => Some(partial),
+            | Self::WaitFailed { partial, .. }
+            | Self::WorkspaceReconciliationFailed { partial, .. } => Some(partial),
             Self::SpawnFailed { .. } | Self::InputTooLarge { .. } | Self::RuntimeFailed { .. } => {
                 None
             }
@@ -1033,6 +1130,18 @@ impl std::fmt::Display for CommandError {
                 program, source, ..
             } => {
                 write!(f, "{program} wait failed: {source}")
+            }
+            Self::WorkspaceReconciliationFailed {
+                program,
+                source,
+                recovery_path,
+                ..
+            } => {
+                write!(f, "{program} workspace reconciliation failed: {source}")?;
+                if let Some(path) = recovery_path {
+                    write!(f, " (recovery: {})", path.display())?;
+                }
+                Ok(())
             }
             Self::RuntimeFailed { source } => write!(f, "process runtime failed: {source}"),
         }
@@ -1186,7 +1295,7 @@ mod tests {
             command.args(["-c", "printf '%s\\n' $$; sleep 60"]);
             run_prepared_run_owned(
                 &run_for_process,
-                command,
+                PreparedProcessCommand::host(command),
                 "cancellation-test",
                 ProcessLimits::new(Duration::from_secs(30)),
                 None,

@@ -2345,12 +2345,11 @@ mod tests {
     }
 
     fn run_test_quality_gate(config: QualityGatesConfig) -> Vec<QualityCheckResult> {
-        crate::evidence_freshness::bind_policy(
-            test_run(),
-            "guardrails-unit-test-policy".to_string(),
-        )
-        .expect("bind test verification policy");
-        QualityGateRunner::new(config).run(test_run(), "test-model")
+        let root = tempfile::TempDir::new().expect("isolated quality-gate workspace");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        crate::evidence_freshness::bind_policy(&run, "guardrails-unit-test-policy".to_string())
+            .expect("bind test verification policy");
+        QualityGateRunner::new(config).run(&run, "test-model")
     }
     use crate::config::QualityCheck;
 

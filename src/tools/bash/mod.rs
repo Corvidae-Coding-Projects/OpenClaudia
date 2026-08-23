@@ -15,6 +15,7 @@ pub use direct::{
     execute_direct_shell, execute_direct_shell_async, DirectShellAction, DirectShellError,
     DirectShellExecution,
 };
+pub use kill::pause_sandbox_process_tree;
 pub use kill::terminate_sandbox_process_tree;
 pub use kill::{execute_kill_shell, execute_kill_shells_for_agent, terminate_process_tree};
 pub use output::{bash_output_operations, classify_bash_output, execute_bash_output};
@@ -31,7 +32,7 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use uuid::Uuid;
@@ -117,6 +118,26 @@ struct BackgroundShell {
     control: Option<BackgroundJobControl>,
 }
 
+struct BackgroundPreparationSlot<'a> {
+    preparing: &'a AtomicUsize,
+    held: bool,
+}
+
+impl BackgroundPreparationSlot<'_> {
+    fn release(&mut self) {
+        if self.held {
+            self.preparing.fetch_sub(1, Ordering::SeqCst);
+            self.held = false;
+        }
+    }
+}
+
+impl Drop for BackgroundPreparationSlot<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl BackgroundShell {
     fn recovered(core: JobCore) -> Self {
         Self {
@@ -162,6 +183,7 @@ impl BackgroundShell {
 pub struct BackgroundShellManager {
     shells: Mutex<HashMap<String, Arc<BackgroundShell>>>,
     hydrated_sessions: Mutex<HashSet<String>>,
+    preparing: AtomicUsize,
 }
 
 impl BackgroundShellManager {
@@ -169,6 +191,7 @@ impl BackgroundShellManager {
         Self {
             shells: Mutex::new(HashMap::new()),
             hydrated_sessions: Mutex::new(HashSet::new()),
+            preparing: AtomicUsize::new(0),
         }
     }
 
@@ -230,7 +253,67 @@ impl BackgroundShellManager {
             return Err("Run budget has no remaining time for a background process".to_string());
         }
 
+        let mut preparation_slot = {
+            let mut shells = recover_mutex_lock(&self.shells, "spawn", "shells", None);
+            let active = shells
+                .values()
+                .filter(|shell| shell.state().is_running())
+                .count();
+            let occupied = active.saturating_add(self.preparing.load(Ordering::SeqCst));
+            if occupied >= MAX_BACKGROUND_SHELLS {
+                return Err(format!(
+                    "Maximum active background shell limit ({MAX_BACKGROUND_SHELLS}) reached. Kill or wait for existing shells to finish."
+                ));
+            }
+            if shells.len() > 200 {
+                let mut terminal = shells
+                    .iter()
+                    .filter_map(|(id, shell)| {
+                        let summary = shell.summary();
+                        summary
+                            .state
+                            .is_terminal()
+                            .then_some((summary.created_unix_ms, id.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                terminal.sort_unstable();
+                let remove_count = shells.len().saturating_sub(200);
+                for (_, id) in terminal.into_iter().take(remove_count) {
+                    shells.remove(&id);
+                }
+            }
+            self.preparing.fetch_add(1, Ordering::SeqCst);
+            drop(shells);
+            BackgroundPreparationSlot {
+                preparing: &self.preparing,
+                held: true,
+            }
+        };
+
+        let cwd = run.working_directory().to_path_buf();
+        #[cfg(windows)]
+        let mut prepared_command = {
+            let bash = find_git_bash(run).unwrap_or(bash_bin(run)?);
+            sandbox::sandboxed_bash_command(run, &bash, command, &cwd)?
+        };
+        #[cfg(not(windows))]
+        let mut prepared_command = {
+            let bash = bash_bin(run)?;
+            sandbox::sandboxed_bash_command(run, &bash, command, &cwd)?
+        };
+        prepared_command
+            .command_mut()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(not(windows))]
+        prepared_command.command_mut().process_group(0);
+        let (mut process_command, background_projection) = prepared_command.into_parts();
+
+        // Project snapshotting can be expensive. Keep it outside the shared
+        // job-manager lock, then recheck capacity before creating durable job
+        // state so concurrent spawns cannot exceed the limit.
         let mut shells = recover_mutex_lock(&self.shells, "spawn", "shells", None);
+        preparation_slot.release();
         let active = shells
             .values()
             .filter(|shell| shell.state().is_running())
@@ -240,23 +323,6 @@ impl BackgroundShellManager {
                 "Maximum active background shell limit ({MAX_BACKGROUND_SHELLS}) reached. Kill or wait for existing shells to finish."
             ));
         }
-        if shells.len() > 200 {
-            let mut terminal = shells
-                .iter()
-                .filter_map(|(id, shell)| {
-                    let summary = shell.summary();
-                    summary
-                        .state
-                        .is_terminal()
-                        .then_some((summary.created_unix_ms, id.clone()))
-                })
-                .collect::<Vec<_>>();
-            terminal.sort_unstable();
-            for (_, id) in terminal.into_iter().take(shells.len().saturating_sub(200)) {
-                shells.remove(&id);
-            }
-        }
-
         let background_freshness = crate::evidence_freshness::reserve_mutation(
             run,
             crate::tools::effect::ToolEffect::Destructive,
@@ -269,28 +335,11 @@ impl BackgroundShellManager {
                 ..crate::runtime::BudgetAmounts::default()
             })
             .map_err(|error| format!("Run budget denied background process: {error}"))?;
-
         let shell_id = Uuid::new_v4().to_string();
         let core = Arc::new(Mutex::new(JobCore::create(
             run, &shell_id, command, timeout,
         )?));
-        let cwd = run.working_directory().to_path_buf();
-        #[cfg(windows)]
-        let child = {
-            let bash = find_git_bash(run).unwrap_or(bash_bin(run)?);
-            let mut cmd = sandbox::sandboxed_bash_command(run, &bash, command, &cwd)?;
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            cmd.spawn()
-        };
-        #[cfg(not(windows))]
-        let child = {
-            let bash = bash_bin(run)?;
-            let mut cmd = sandbox::sandboxed_bash_command(run, &bash, command, &cwd)?;
-            cmd.stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .process_group(0);
-            cmd.spawn()
-        };
+        let child = process_command.spawn();
         let mut child = match child {
             Ok(child) => child,
             Err(error) => {
@@ -411,6 +460,7 @@ impl BackgroundShellManager {
                 &supervisor_id,
                 background_freshness,
                 background_budget,
+                background_projection,
             );
         });
 
@@ -600,7 +650,7 @@ impl BackgroundShellManager {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn supervise_background_job(
     mut child: std::process::Child,
     pid: u32,
@@ -620,10 +670,13 @@ fn supervise_background_job(
     job_id: &str,
     mut background_freshness: crate::evidence_freshness::MutationReservation,
     background_budget: crate::runtime::BudgetReservation,
+    mut background_projection: Option<
+        crate::tools::file::workspace_projection::WorkspaceProjection,
+    >,
 ) {
     let deadline = std::time::Instant::now() + timeout;
     let mut root_status = None;
-    let terminal_state = loop {
+    let mut terminal_state = loop {
         if let Ok(error) = errors.try_recv() {
             terminate_sandbox_process_tree(pid);
             let _ = child.kill();
@@ -686,6 +739,21 @@ fn supervise_background_job(
     for reader in readers {
         let _ = reader.join();
     }
+    if let Some(projection) = background_projection.as_mut() {
+        let publish = matches!(terminal_state, BackgroundJobState::Exited { exit_code: 0 });
+        if let Err(error) = projection.settle(publish) {
+            terminal_state = BackgroundJobState::DeliveryFailed {
+                error: format!("background workspace reconciliation failed: {error}"),
+            };
+        }
+    }
+    // Release the run's concurrency lease before publishing a terminal job
+    // state. Callers use that state as the signal that a replacement job may
+    // be admitted, so exposing it first can transiently oversubscribe the run
+    // budget during rapid kill/spawn waves.
+    if let Err(error) = background_budget.commit() {
+        tracing::error!(job_id, %error, "Failed to release background process budget");
+    }
     let mut core = recover_mutex_lock(core, "supervise", "job_core", Some(job_id));
     if let Err(error) = core.set_state(terminal_state) {
         tracing::error!(job_id, %error, "Failed to persist terminal background-job state");
@@ -714,9 +782,6 @@ fn supervise_background_job(
         run_for_ledger.run_id,
         run_for_ledger.capability_generation,
     );
-    if let Err(error) = background_budget.commit() {
-        tracing::error!(job_id, %error, "Failed to release background process budget");
-    }
 }
 
 fn stop_background_shell(shell: &BackgroundShell, requested: BackgroundJobState) {
@@ -978,7 +1043,8 @@ pub fn try_execute_bash(
         Err(
             error @ (super::command::CommandError::TimedOut { .. }
             | super::command::CommandError::Cancelled { .. }
-            | super::command::CommandError::WaitFailed { .. }),
+            | super::command::CommandError::WaitFailed { .. }
+            | super::command::CommandError::WorkspaceReconciliationFailed { .. }),
         ) => {
             let mut diagnostic = format!("Failed to execute command after it started: {error}");
             if let Some(partial) = error.partial() {
@@ -1179,7 +1245,25 @@ mod tests {
     use std::collections::HashMap;
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
-        crate::tools::security::test_run_context()
+        static RUN: std::sync::OnceLock<std::sync::Arc<crate::tools::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-workspaces")
+                .join(format!("bash-unit-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("isolated bash fixture root");
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &root)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(true)
+                .secrets(true)
+                .provider("bash-unit-test")
+                .build()
+                .expect("bash unit-test run")
+        })
     }
 
     // ── Phase 2 pinning tests (crosslink #541) ────────────────────────────────
@@ -1839,6 +1923,52 @@ mod tests {
         assert_eq!(read.state, BackgroundJobState::TimedOut);
         #[cfg(target_os = "linux")]
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn background_workspace_publishes_success_and_discards_failure() {
+        let root = tempfile::tempdir_in(".").expect("background workspace root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let manager = BackgroundShellManager::new();
+        let wait_for_terminal = |id: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let read = manager
+                    .get_output(&run, id, Some(0))
+                    .expect("background job remains readable");
+                if read.state.is_terminal() {
+                    break read.state;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "background job did not settle"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        let committed = manager
+            .spawn(&run, "printf committed > background-success")
+            .expect("successful background spawn");
+        assert_eq!(
+            wait_for_terminal(&committed),
+            BackgroundJobState::Exited { exit_code: 0 }
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("background-success"))
+                .expect("published background output"),
+            "committed"
+        );
+
+        let failed = manager
+            .spawn(&run, "printf uncommitted > background-failure; exit 7")
+            .expect("failed background command still spawns");
+        assert_eq!(
+            wait_for_terminal(&failed),
+            BackgroundJobState::Exited { exit_code: 7 }
+        );
+        assert!(!root.path().join("background-failure").exists());
     }
 
     #[test]

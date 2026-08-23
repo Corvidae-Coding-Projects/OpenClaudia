@@ -7,11 +7,13 @@
 
 use super::{bash_bin, dangerous_shell_construct, path_lint, sandbox, validate_command};
 use crate::runtime::{BudgetAmounts, BudgetReservation};
-use crate::tools::command::{CommandError, ProcessSnapshot, SupervisedProcessOutput};
+use crate::tools::command::{
+    CommandError, PreparedProcessCommand, ProcessSnapshot, SupervisedProcessOutput,
+};
 use crate::tools::effect::ToolEffect;
 use crate::tools::{ToolResource, ToolRunContext};
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus};
+use std::process::ExitStatus;
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(super::DEFAULT_FOREGROUND_TIMEOUT_MS);
@@ -101,7 +103,7 @@ impl std::error::Error for DirectShellError {}
 struct PreparedDirectShell {
     action: DirectShellAction,
     cwd: PathBuf,
-    command: Option<Command>,
+    command: Option<PreparedProcessCommand>,
     freshness: Option<crate::evidence_freshness::MutationReservation>,
     budget: BudgetReservation,
 }
@@ -480,6 +482,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn sandbox_masks_generated_targets_belonging_to_nested_cargo_roots() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        let nested = root.path().join("fuzz");
+        std::fs::create_dir_all(nested.join("target/debug")).expect("nested target tree");
+        std::fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("nested Cargo manifest");
+        std::fs::write(nested.join("target/debug/stale-cache"), "generated")
+            .expect("nested generated cache");
+        let run = test_run(root.path(), HashMap::new(), BudgetLimits::default());
+
+        let result = execute(
+            &run,
+            "test -d fuzz/target && test ! -e fuzz/target/debug/stale-cache",
+        )
+        .expect("nested Cargo target should be projected as an empty cache");
+
+        assert_eq!(result.exit_code(), Some(0));
+        assert_eq!(
+            std::fs::read_to_string(nested.join("target/debug/stale-cache"))
+                .expect("host cache remains intact"),
+            "generated"
+        );
+    }
+
+    #[test]
     fn environment_is_exactly_run_granted_and_host_secrets_are_absent() {
         let root = tempfile::tempdir_in(".").expect("direct shell root");
         let run = test_run(
@@ -595,6 +626,211 @@ mod tests {
         assert_eq!(result.exit_code(), Some(7));
         assert_eq!(result.stdout, "terminal");
         assert_eq!(result.stderr, "diagnostic");
+    }
+
+    #[test]
+    fn nonzero_command_discards_workspace_writes() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        let run = test_run(root.path(), HashMap::new(), BudgetLimits::default());
+
+        let result = execute(&run, "printf uncommitted > failed-output; exit 7")
+            .expect("nonzero status is still a terminal result");
+
+        assert_eq!(result.exit_code(), Some(7));
+        assert!(
+            !root.path().join("failed-output").exists(),
+            "a failed command published its isolated workspace"
+        );
+    }
+
+    #[test]
+    fn successful_command_can_replace_workspace_entry_types() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        std::fs::write(root.path().join("becomes-directory"), "old file").expect("file fixture");
+        std::fs::create_dir(root.path().join("becomes-file")).expect("directory fixture");
+        std::fs::write(root.path().join("becomes-file/old-child"), "old child")
+            .expect("directory child fixture");
+        let run = test_run(root.path(), HashMap::new(), BudgetLimits::default());
+
+        let result = execute(
+            &run,
+            "rm becomes-directory; mkdir becomes-directory; printf child > becomes-directory/new-child; rm -rf becomes-file; printf replacement > becomes-file",
+        )
+        .expect("ordinary entry-type replacements must publish");
+
+        assert_eq!(result.exit_code(), Some(0));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("becomes-directory/new-child"))
+                .expect("replacement directory child"),
+            "child"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("becomes-file")).expect("replacement file"),
+            "replacement"
+        );
+    }
+
+    #[test]
+    fn cargo_build_cache_is_run_private_while_source_edits_publish() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("Cargo manifest fixture");
+        std::fs::create_dir(root.path().join("target")).expect("host target fixture");
+        std::fs::write(root.path().join("target/host-only"), "host cache")
+            .expect("host cache fixture");
+        let run = test_run(root.path(), HashMap::new(), BudgetLimits::default());
+
+        let result = execute(
+            &run,
+            "test ! -e target/host-only; printf cache > target/project-path; printf cache > \"$CARGO_TARGET_DIR/env-path\"; printf source > src.txt",
+        )
+        .expect("ordinary source edit with private Cargo cache");
+
+        assert_eq!(result.exit_code(), Some(0));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.txt")).expect("published source edit"),
+            "source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("target/host-only"))
+                .expect("unchanged host cache"),
+            "host cache"
+        );
+        assert!(!root.path().join("target/project-path").exists());
+        assert!(!root.path().join("target/env-path").exists());
+        assert!(run
+            .private_temp_root()
+            .join("cargo-target/project-path")
+            .exists());
+        assert!(run
+            .private_temp_root()
+            .join("cargo-target/env-path")
+            .exists());
+    }
+
+    #[test]
+    fn successful_command_cannot_publish_protected_metadata() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        let run = test_run(root.path(), HashMap::new(), BudgetLimits::default());
+
+        let error = execute(
+            &run,
+            "mkdir .git; printf forged > .git/config; printf ordinary > ordinary.txt",
+        )
+        .expect_err("protected metadata must reject the complete transaction");
+
+        assert!(
+            error.to_string().contains("protected workspace path"),
+            "unexpected reconciliation error: {error}"
+        );
+        assert_eq!(
+            error
+                .partial_execution()
+                .expect("the command reached a terminal status")
+                .exit_code(),
+            Some(0)
+        );
+        assert!(!root.path().join(".git").exists());
+        assert!(!root.path().join("ordinary.txt").exists());
+    }
+
+    #[test]
+    fn successful_command_cannot_create_an_absent_denied_leaf() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        let denied = root.path().join("private").join("generated-secret");
+        let run = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .project_secret_masks(vec![
+                PathBuf::from(".openclaudia"),
+                PathBuf::from(".claude"),
+                PathBuf::from("private/generated-secret"),
+            ])
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("direct-shell-denied-leaf-test")
+            .build()
+            .expect("denied-leaf test run");
+
+        let error = execute(
+            &run,
+            "mkdir -p private; printf secret > private/generated-secret; printf ordinary > ordinary.txt",
+        )
+        .expect_err("absent denied leaf must reject the complete transaction");
+
+        assert!(
+            error.to_string().contains("protected workspace path"),
+            "unexpected reconciliation error: {error}"
+        );
+        assert!(!denied.exists());
+        assert!(!root.path().join("ordinary.txt").exists());
+    }
+
+    #[test]
+    fn successful_command_cannot_publish_an_escaping_symlink() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        let run = test_run(root.path(), HashMap::new(), BudgetLimits::default());
+
+        let error = execute(&run, "ln -s ../../outside escaped-link")
+            .expect_err("escaping symlink must reject reconciliation");
+
+        assert!(error.to_string().contains("escapes the workspace"));
+        assert!(!root.path().join("escaped-link").exists());
+    }
+
+    #[test]
+    fn successful_command_cannot_publish_a_hardlink() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        std::fs::write(root.path().join("source.txt"), "baseline").expect("source fixture");
+        let run = test_run(root.path(), HashMap::new(), BudgetLimits::default());
+
+        let error = execute(&run, "ln source.txt linked.txt")
+            .expect_err("hardlink must reject reconciliation");
+
+        assert!(error.to_string().contains("hardlinked workspace file"));
+        assert!(!root.path().join("linked.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("source.txt")).expect("original source"),
+            "baseline"
+        );
+    }
+
+    #[test]
+    fn concurrent_host_edit_wins_instead_of_being_overwritten() {
+        let root = tempfile::tempdir_in(".").expect("direct shell root");
+        std::fs::write(root.path().join("shared.txt"), "baseline").expect("baseline file");
+        let run = test_run(root.path(), HashMap::new(), BudgetLimits::default());
+        let ready = run.private_temp_root().join("conflict-ready");
+        let run_for_command = Arc::clone(&run);
+        let command = std::thread::spawn(move || {
+            execute(
+                &run_for_command,
+                "printf ready > \"$TMPDIR/conflict-ready\"; sleep .2; printf sandbox > shared.txt",
+            )
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "sandbox did not reach the conflict barrier");
+        std::fs::write(root.path().join("shared.txt"), "host").expect("concurrent host edit");
+
+        let error = command
+            .join()
+            .expect("direct shell thread")
+            .expect_err("host generation conflict must reject reconciliation");
+        assert!(error.to_string().contains("generation conflict"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("shared.txt")).expect("host file"),
+            "host"
+        );
     }
 
     #[test]

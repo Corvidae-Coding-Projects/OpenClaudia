@@ -28,7 +28,6 @@ mod accumulator;
 pub(crate) mod args;
 mod ask_user;
 mod bash;
-pub(crate) use bash::record_command_observation_for_session;
 pub use bash::sandbox::{
     sandbox_diagnostics, sandbox_diagnostics_for_run, sandbox_preflight, SandboxDiagnostics,
 };
@@ -39,6 +38,10 @@ pub(crate) use bash::sandbox::{
 pub use bash::{
     execute_direct_shell, execute_direct_shell_async, DirectShellAction, DirectShellError,
     DirectShellExecution,
+};
+pub(crate) use bash::{
+    pause_sandbox_process_tree, record_command_observation_for_session,
+    terminate_sandbox_process_tree,
 };
 pub mod catalog;
 pub(crate) mod command;

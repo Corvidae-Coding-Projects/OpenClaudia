@@ -261,7 +261,10 @@ pub fn validate_branch_name(
         }
         error @ (crate::tools::command::CommandError::InputTooLarge { .. }
         | crate::tools::command::CommandError::Cancelled { .. }
-        | crate::tools::command::CommandError::RuntimeFailed { .. }) => error.to_string(),
+        | crate::tools::command::CommandError::RuntimeFailed { .. }
+        | crate::tools::command::CommandError::WorkspaceReconciliationFailed { .. }) => {
+            error.to_string()
+        }
     })?;
 
     if output.status.success() {
@@ -345,7 +348,10 @@ fn git_in(
         }
         error @ (crate::tools::command::CommandError::InputTooLarge { .. }
         | crate::tools::command::CommandError::Cancelled { .. }
-        | crate::tools::command::CommandError::RuntimeFailed { .. }) => error.to_string(),
+        | crate::tools::command::CommandError::RuntimeFailed { .. }
+        | crate::tools::command::CommandError::WorkspaceReconciliationFailed { .. }) => {
+            error.to_string()
+        }
     })
 }
 
@@ -1107,6 +1113,51 @@ mod tests {
     /// workspace is mutually exclusive.
     fn cwd_lock() -> MutexGuard<'static, ()> {
         process_cwd_lock()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn git_worktree_profile_reconciles_repository_metadata_and_files() {
+        let _lock = cwd_lock();
+        let root = tempfile::tempdir_in(".").expect("Git projection root");
+        let git = which::which("git").expect("git test dependency");
+        let run_host_git = |args: &[&str]| {
+            let output = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("run fixture git");
+            assert!(
+                output.status.success(),
+                "fixture git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_host_git(&["init", "-q"]);
+        run_host_git(&["config", "user.name", "OpenClaudia Test"]);
+        run_host_git(&["config", "user.email", "openclaudia@example.invalid"]);
+        std::fs::write(root.path().join("tracked.txt"), "baseline\n").expect("tracked fixture");
+        run_host_git(&["add", "tracked.txt"]);
+        run_host_git(&["commit", "-qm", "fixture"]);
+
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let branch = "s108-transactional-worktree";
+        let mut enter_args = HashMap::new();
+        enter_args.insert("branch".to_string(), Value::String(branch.to_string()));
+        let (message, is_error) = execute_enter_worktree(&run, &enter_args);
+        assert!(!is_error, "enter worktree failed: {message}");
+        let worktree = root.path().join(".worktrees").join(branch);
+        assert!(worktree.join("tracked.txt").exists());
+
+        let mut exit_args = HashMap::new();
+        exit_args.insert(
+            "path".to_string(),
+            Value::String(worktree.to_string_lossy().into_owned()),
+        );
+        exit_args.insert("discard_changes".to_string(), Value::Bool(true));
+        let (message, is_error) = execute_exit_worktree(&run, &exit_args);
+        assert!(!is_error, "exit worktree failed: {message}");
+        assert!(!worktree.exists());
     }
 
     #[test]

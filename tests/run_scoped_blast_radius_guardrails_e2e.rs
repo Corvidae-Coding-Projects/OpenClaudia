@@ -519,7 +519,7 @@ fn mutation_limit_blocks_a_different_family_before_its_effect() {
 
 #[cfg(unix)]
 #[test]
-fn partially_failed_bash_effect_commits_its_mutation_reservation() {
+fn failed_bash_rolls_back_effect_but_commits_its_mutation_reservation() {
     let root = tempfile::tempdir().expect("project root");
     let run = isolated_run(root.path());
     let config = strict_config(BlastRadiusConfig {
@@ -549,8 +549,12 @@ fn partially_failed_bash_effect_commits_its_mutation_reservation() {
         partial.content()
     );
     assert!(
-        sentinel.exists(),
-        "test command must prove a real partial effect"
+        !sentinel.exists(),
+        "a failed transactional Bash command must not publish its partial workspace effect"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).expect("source remains after rollback"),
+        "partial\n"
     );
 
     let write = tool_call(
