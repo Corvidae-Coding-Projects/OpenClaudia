@@ -1,6 +1,6 @@
 {
   "next_display_id": 1109,
-  "next_comment_id": 1309,
+  "next_comment_id": 1310,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16120,11 +16120,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T07:20:15.059790695Z",
-      "updated_at": "2026-08-23T07:25:19.372937156Z",
+      "updated_at": "2026-08-23T07:25:24.544965937Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "074239c1-c880-42f2-8b69-df59b12c37f6": {
+          "display_id": 1309,
+          "author": "6Vw9",
+          "content": "[action] Started S-057/#1108 preflight: replacing lossy frontend-specific compaction with one causal typed checkpoint path across all production loops",
+          "created_at": "2026-08-23T07:25:24.542497320Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAE1BqZo1PyMvqKaehJ9wAuceiN1u94gZdHoB2ChXXiL8tJDj6wxAo/4nXl6f+IvAjH2JyYPdn/6fVsJPBSuhyAg=="
+        },
         "7958848f-6942-4d6d-b77b-a53edf1139e3": {
           "display_id": 1308,
           "author": "6Vw9",
@@ -34958,11 +34967,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1140,
       "timestamp": "2026-08-23T07:25:19.372937156Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1141,
+      "timestamp": "2026-08-23T07:25:24.544965937Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T07:25:19.372937156Z",
+    "timestamp": "2026-08-23T07:25:24.544965937Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1140
+    "agent_seq": 1141
   }
 }
