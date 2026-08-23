@@ -1,6 +1,6 @@
 {
   "next_display_id": 1119,
-  "next_comment_id": 1385,
+  "next_comment_id": 1386,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28221,7 +28221,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:33:45.737689540Z",
-      "updated_at": "2026-08-23T16:21:06.317499195Z",
+      "updated_at": "2026-08-23T16:21:21.274042243Z",
       "labels": [
         "remediation"
       ],
@@ -28261,6 +28261,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ10elLY5SxV/VdKsBIKle5hM5ih7kJYbuub5UVhsKLXZ78Eeagy8dtgb9rvc9nEj1vKUyqI3GINdzN9umcylDQ=="
+        },
+        "e303771d-acc4-4674-97d0-54a543ddb57e": {
+          "display_id": 1385,
+          "author": "6Vw9",
+          "content": "Correction to the 15:59 progress note: the final S-042 code does not add a dormant Browser profile. Browser connection/process isolation and conformance remain explicitly owned by S-071/S-072. DocumentParser and McpHeaderHelper are the scratch-only profiles delivered here; S-108/#1118 owns transactional writable workspace projection.",
+          "created_at": "2026-08-23T16:21:21.271616124Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAT8XoDmY54UNfYuKTmErGQRMRxMXK8viASdD9d3GuAU7A1iNI//ExwQZr1gfp4btXfV6Hu7bO77OPpjyTJxvQCg=="
         },
         "ee6c2a5a-63f2-42a7-8552-812559d6a0e2": {
           "display_id": 1382,
@@ -36547,11 +36556,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1278,
       "timestamp": "2026-08-23T16:21:06.317499195Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1279,
+      "timestamp": "2026-08-23T16:21:21.274042243Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T16:21:06.317499195Z",
+    "timestamp": "2026-08-23T16:21:21.274042243Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1278
+    "agent_seq": 1279
   }
 }
