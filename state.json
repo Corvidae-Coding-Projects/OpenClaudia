@@ -1,6 +1,6 @@
 {
   "next_display_id": 1120,
-  "next_comment_id": 1400,
+  "next_comment_id": 1401,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24865,11 +24865,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:59:50.703902730Z",
-      "updated_at": "2026-08-23T20:51:34.053410813Z",
+      "updated_at": "2026-08-23T20:51:38.563881229Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "5f829534-8fee-429f-8e59-6026e039710a": {
+          "display_id": 1400,
+          "author": "6Vw9",
+          "content": "Implementation and review complete before commit. Writable Linux processes use pinned baseline/candidate/backup generations with validated atomic publication or rollback; direct/background shell, hooks, Git/worktree, LSP, ACP, and request-checkpointed MCP remain operational. Final review fixed the background preparation reservation race, closed-MCP PID reuse risk, bounded background terminal polling, and nested Cargo-cache projection overhead. Exact Rust 1.98 full native matrix, strict Clippy/fmt, Windows GNU, fuzz, technical-memory evidence, repository policy 27/27, hygiene, metadata, and cargo-deny gates pass. S-088 remains the explicit alternate-model VDD boundary.",
+          "created_at": "2026-08-23T20:51:38.561105353Z",
+          "kind": "action",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAc5dWwIUZK0kmh9nJ3GdM7nj31Tp+TTKE+mc61MvLcgfI81w+nyfxXLcZ3591UJea7lzSSMFzY+eFcnlnIsocBQ=="
+        },
         "92b4e3ac-4c07-4927-b0c5-0d1070dc2c9b": {
           "display_id": 1399,
           "author": "6Vw9",
@@ -36823,11 +36832,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1302,
       "timestamp": "2026-08-23T20:51:34.053410813Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1303,
+      "timestamp": "2026-08-23T20:51:38.563881229Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T20:51:34.053410813Z",
+    "timestamp": "2026-08-23T20:51:38.563881229Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1302
+    "agent_seq": 1303
   }
 }
