@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1119,
+  "next_display_id": 1120,
   "next_comment_id": 1388,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -660,6 +660,7 @@
     "a35bda57-3a1a-48d9-926c-db542cc624bd": 950,
     "a41317f3-7178-4ef3-85c7-1207927336e7": 450,
     "a4827d35-0632-4fab-9c15-8f017fd0e194": 38,
+    "a4b9624f-c7fa-4d8f-b856-14a9f61be66f": 1119,
     "a50491f2-e653-4fa5-b390-33f3a5beb986": 699,
     "a5981680-6556-4b66-a4db-5f7aa07a2a5f": 379,
     "a5b59098-f4b8-4173-af83-8563a38fae0e": 316,
@@ -19876,6 +19877,18 @@
         }
       }
     },
+    "a4b9624f-c7fa-4d8f-b856-14a9f61be66f": {
+      "uuid": "a4b9624f-c7fa-4d8f-b856-14a9f61be66f",
+      "display_id": 1119,
+      "title": "S-043: Route direct shell through the process capability",
+      "description": "Implement docs/remediation-slices/043-unify-direct-shell-execution.md. Route every application direct-shell path through the canonical run-owned supervised process capability and the S-042 sandbox profile instead of spawning host processes directly. Preserve user-visible shell, review, doctor, init, editor, and print workflows; use Rust 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo/tests, focus plausible application behavior, and keep unrelated cleanup out.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T16:24:26.863403747Z",
+      "updated_at": "2026-08-23T16:24:26.863403747Z"
+    },
     "a50491f2-e653-4fa5-b390-33f3a5beb986": {
       "uuid": "a50491f2-e653-4fa5-b390-33f3a5beb986",
       "display_id": 699,
@@ -36596,11 +36609,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1283,
       "timestamp": "2026-08-23T16:22:26.800908108Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1284,
+      "timestamp": "2026-08-23T16:24:26.863403747Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T16:22:26.800908108Z",
+    "timestamp": "2026-08-23T16:24:26.863403747Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1283
+    "agent_seq": 1284
   }
 }
