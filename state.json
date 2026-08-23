@@ -1,6 +1,6 @@
 {
   "next_display_id": 1114,
-  "next_comment_id": 1338,
+  "next_comment_id": 1339,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1448,7 +1448,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:38.668193082Z",
-      "updated_at": "2026-08-23T12:15:05.220455065Z",
+      "updated_at": "2026-08-23T12:15:22.087901204Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
@@ -1462,6 +1462,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5WMnc4Cz8RfouVdpttSN/ia/szyM3lwv6lC/AGOHW4LO6oSJKrLv3H/BmXpKJK1if5eTHPgk88ZYySWBdKe0Bg=="
+        },
+        "48229b5f-f1bf-4505-b157-43d94b49b9c9": {
+          "display_id": 1338,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit e6944c69 (feat(modes): bind behavioral scopes to approved targets). Full Rust 1.98 validation and cross-platform check passed before commit.",
+          "created_at": "2026-08-23T12:15:22.085474034Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+2FI8Du7XHJ5Lvj/JxE9IOFKGUNAYExSau94AbvyPHNfkvhNO2iMolDqTov497XXf2n63swz8F3xrsTfralhBg=="
         },
         "5704821d-6d35-4090-ada9-55474760932b": {
           "display_id": 1335,
@@ -35607,11 +35616,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1197,
       "timestamp": "2026-08-23T12:15:05.220455065Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1198,
+      "timestamp": "2026-08-23T12:15:22.087901204Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T12:15:05.220455065Z",
+    "timestamp": "2026-08-23T12:15:22.087901204Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1197
+    "agent_seq": 1198
   }
 }
