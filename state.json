@@ -24860,12 +24860,13 @@
       "display_id": 1118,
       "title": "S-108: Make writable sandbox workspace projection transactional",
       "description": "Complete the structural remainder of F-049 after S-042: replace broad writable project bind exposure with a transactional overlay, broker, or equivalent race-safe projection so absent protected control paths and denied leaves cannot be created, scan-then-bind races disappear, ordinary intended workspace edits are preserved and reconciled, and failure or cancellation rolls back cleanly. This is docs/remediation-slices/108-transactional-writable-workspace-projection.md, separate from S-073 worktree apply. Keep shell, Git, hook, and MCP workflows operational; Rust 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:59:50.703902730Z",
-      "updated_at": "2026-08-23T20:52:16.117596130Z",
+      "updated_at": "2026-08-23T20:52:29.166324069Z",
+      "closed_at": "2026-08-23T20:52:29.166322606Z",
       "labels": [
         "remediation"
       ],
@@ -36851,11 +36852,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1304,
       "timestamp": "2026-08-23T20:52:16.117596130Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1305,
+      "timestamp": "2026-08-23T20:52:29.166324069Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T20:52:16.117596130Z",
+    "timestamp": "2026-08-23T20:52:29.166324069Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1304
+    "agent_seq": 1305
   }
 }
