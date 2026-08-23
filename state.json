@@ -1,6 +1,6 @@
 {
   "next_display_id": 1104,
-  "next_comment_id": 1269,
+  "next_comment_id": 1270,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23412,10 +23412,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T02:17:19.644312884Z",
-      "updated_at": "2026-08-23T02:17:23.918359073Z",
+      "updated_at": "2026-08-23T02:17:43.463475167Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "f1103627-701b-408d-8386-82e5fdffbb14": {
+          "display_id": 1269,
+          "author": "6Vw9",
+          "content": "Map every current model/capability caller, introduce one typed catalog and resolution contract with explicit provenance/freshness/access states, ingest authenticated provider discovery without interpreting model-name substrings as proof, and retain a dated conservative fallback only when discovery is unavailable. Route selection, request feature negotiation, context budgeting, model listing, and cost reporting through the same resolved descriptor while keeping transport hardening and provider-private reasoning in their owning slices.",
+          "created_at": "2026-08-23T02:17:43.460892468Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA10Evw1/g6O4QNzi1UamrMSY8V6uCtNgd6bYfp1iwcWVPEl+A/PPupOvgqI9rFuZc9WKjvbfmgqegM400Y0JmAQ=="
+        }
+      }
     },
     "cbf93f8b-d67c-4a4f-862c-48172521bffa": {
       "uuid": "cbf93f8b-d67c-4a4f-862c-48172521bffa",
@@ -34166,11 +34177,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1073,
       "timestamp": "2026-08-23T02:17:29.383844163Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1074,
+      "timestamp": "2026-08-23T02:17:43.463475167Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T02:17:29.383844163Z",
+    "timestamp": "2026-08-23T02:17:43.463475167Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1073
+    "agent_seq": 1074
   }
 }
