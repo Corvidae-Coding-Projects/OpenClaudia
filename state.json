@@ -1,6 +1,6 @@
 {
   "next_display_id": 1110,
-  "next_comment_id": 1317,
+  "next_comment_id": 1318,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28099,7 +28099,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T08:45:03.862099956Z",
-      "updated_at": "2026-08-23T08:46:07.275364506Z",
+      "updated_at": "2026-08-23T08:54:21.014672504Z",
       "labels": [
         "remediation"
       ],
@@ -28107,6 +28107,15 @@
         "46f1d200-b3c8-465c-9e83-85fa06120cb7"
       ],
       "comments": {
+        "6177c3f7-58e0-4950-b692-d94acfe2a352": {
+          "display_id": 1317,
+          "author": "6Vw9",
+          "content": "[action] Resuming S-014 with production-likelihood filter: implement shared runtime mode enforcement and real frontend transitions; defer hypothetical edge cases.",
+          "created_at": "2026-08-23T08:54:21.011797722Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1C0REjouu7ydT2U+TiMfUwshUHjyA32ed4CYDpk83MJytCgc+rFF4PAhJLYj8H3+I9m8hydOT/iakaVKZCQdAA=="
+        },
         "eb1e4005-daf8-44bd-911b-d3cd570b3f9a": {
           "display_id": 1316,
           "author": "6Vw9",
@@ -35142,11 +35151,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1157,
       "timestamp": "2026-08-23T08:46:07.275364506Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1158,
+      "timestamp": "2026-08-23T08:54:21.014672504Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T08:46:07.275364506Z",
+    "timestamp": "2026-08-23T08:54:21.014672504Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1157
+    "agent_seq": 1158
   }
 }
