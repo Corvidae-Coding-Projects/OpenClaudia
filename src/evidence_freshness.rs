@@ -742,7 +742,7 @@ fn artifact_set(root: &Path) -> Result<ArtifactSetBinding, String> {
     })
 }
 
-fn artifact_path_is_excluded(relative: &Path) -> bool {
+pub fn artifact_path_is_excluded(relative: &Path) -> bool {
     let components = relative
         .components()
         .map(std::path::Component::as_os_str)

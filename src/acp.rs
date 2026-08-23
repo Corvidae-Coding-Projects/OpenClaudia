@@ -2188,6 +2188,38 @@ impl AcpServer {
                         self.messages.push(result.openai_message());
                     }
 
+                    if let Some(report) = crate::guardrails::run_quality_gates_at(
+                        run,
+                        &self.model,
+                        crate::config::RunAfter::EveryTurn,
+                    ) {
+                        if report.prevents_progress() {
+                            let detail = report.reason().map_or_else(
+                                || {
+                                    report
+                                        .results()
+                                        .iter()
+                                        .filter(|check| !check.passed())
+                                        .map(|check| {
+                                            format!("{} ({:?})", check.name(), check.status())
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                },
+                                ToString::to_string,
+                            );
+                            self.messages.push(json!({
+                                "role": "system",
+                                "content": format!(
+                                    "Configured quality-gate findings must be addressed before finalization: {detail}"
+                                ),
+                                "metadata": {
+                                    "openclaudia_context_source": "reality"
+                                }
+                            }));
+                        }
+                    }
+
                     // Continue the loop — re-prompt with tool results
                 }
                 StreamResult::Cancelled => {

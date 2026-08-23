@@ -751,6 +751,29 @@ impl ToolExecutionResult {
         self
     }
 
+    /// Mark a successful effect as incomplete because a trusted postcondition
+    /// failed after publication. Existing errors and partial outcomes retain
+    /// their stronger/earlier failure state.
+    #[must_use]
+    pub(crate) fn with_postcondition_failure(mut self, failure: ToolFailure) -> Self {
+        if matches!(self.outcome, ToolOutcome::Success { .. }) {
+            let ToolOutcome::Success { content } = std::mem::replace(
+                &mut self.outcome,
+                ToolOutcome::Error {
+                    failure: failure.clone(),
+                },
+            ) else {
+                unreachable!("success outcome was checked before replacement")
+            };
+            self.outcome = ToolOutcome::Partial {
+                content,
+                failures: vec![failure],
+                continuation: None,
+            };
+        }
+        self
+    }
+
     #[must_use]
     pub const fn display(&self) -> &ToolDisplay {
         &self.display

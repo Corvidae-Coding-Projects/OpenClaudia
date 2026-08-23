@@ -9,17 +9,18 @@
 
 use regex::Regex;
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{
     BlastRadiusConfig, DiffMonitorConfig, GuardrailAction, GuardrailMode, GuardrailsConfig,
-    QualityGatesConfig,
+    QualityGatesConfig, RunAfter,
 };
 
 // ==========================================================================
@@ -111,7 +112,7 @@ fn config_has_active_guards(config: &GuardrailsConfig) -> bool {
 /// Returns an error when policy compilation fails, the registry is poisoned,
 /// or policy is already immutably bound to this exact run generation.
 pub fn configure(
-    run: &crate::tools::ToolRunContext,
+    run: &Arc<crate::tools::ToolRunContext>,
     config: &GuardrailsConfig,
 ) -> Result<(), String> {
     // Build the new state OUTSIDE the lock. `GuardrailsEngine::try_from_config`
@@ -119,7 +120,7 @@ pub fn configure(
     // none of that needs the guardrails mutex held. Tightening the critical
     // section to the swap also lets concurrent `check_file_access` calls
     // make progress while a startup `configure` is mid-flight.
-    let engine = GuardrailsEngine::try_from_config(config)?;
+    let engine = GuardrailsEngine::try_from_config(run, config)?;
     let policy_sha256 = guardrails_policy_sha256(config)?;
     let (new_state, log_msg) = if config_has_active_guards(config) {
         (
@@ -650,36 +651,189 @@ pub(crate) fn begin_path_resource_batch(
 pub fn record_file_modification(
     run: &crate::tools::ToolRunContext,
     path: &str,
-    lines_added: u32,
-    lines_removed: u32,
+    _lines_added: u32,
+    _lines_removed: u32,
 ) {
     run.record_skill_path_touch(std::path::Path::new(path));
+}
+
+/// Pre-publication permit for one exact diff candidate. Dropping the permit
+/// releases it without advancing the run's diff revision; committing records
+/// the exact candidate that was actually published.
+pub(crate) struct DiffChangePermit {
+    monitor: Option<Arc<DiffMonitor>>,
+    stats: Option<Result<DiffStats, String>>,
+    edit_revision: Option<Arc<AtomicU64>>,
+    _lease: Option<DiffMutationLease>,
+}
+
+impl DiffChangePermit {
+    pub(crate) fn commit(mut self) {
+        if let (Some(monitor), Some(stats)) = (self.monitor.take(), self.stats.take()) {
+            monitor.commit_stats(stats);
+        }
+        if let Some(revision) = self.edit_revision.take() {
+            revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    pub(crate) fn reconcile_live(mut self) {
+        if let Some(monitor) = self.monitor.take() {
+            monitor.commit_stats(monitor.evaluate_live());
+        }
+        self.stats = None;
+        if let Some(revision) = self.edit_revision.take() {
+            revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Run-bound handle carried by a transactional workspace projection. The
+/// candidate tree is evaluated before its bytes are published to the host.
+#[derive(Clone)]
+#[cfg(target_os = "linux")]
+pub(crate) struct WorkspaceDiffGate {
+    monitor: Option<Arc<DiffMonitor>>,
+    edit_revision: Arc<AtomicU64>,
+}
+
+#[cfg(target_os = "linux")]
+impl WorkspaceDiffGate {
+    pub(crate) fn admit_candidate(&self, candidate: &Path) -> Result<DiffChangePermit, String> {
+        let Some(monitor) = &self.monitor else {
+            return Ok(DiffChangePermit {
+                monitor: None,
+                stats: None,
+                edit_revision: Some(Arc::clone(&self.edit_revision)),
+                _lease: None,
+            });
+        };
+        let lease = monitor.begin_change()?;
+        admit_diff_candidate(
+            Arc::clone(monitor),
+            monitor.evaluate_root(candidate),
+            Arc::clone(&self.edit_revision),
+            lease,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn workspace_diff_gate(
+    run: &crate::tools::ToolRunContext,
+) -> Result<Option<WorkspaceDiffGate>, String> {
     let guard = lock_or_poison();
     if guard.poisoned {
-        error!(
-            path = path,
-            "record_file_modification: registry poisoned — skipping"
-        );
-        return;
+        return Err(POISON_ERR.to_string());
+    }
+    Ok(match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => Some(WorkspaceDiffGate {
+            monitor: engine.diff_monitor.clone(),
+            edit_revision: Arc::clone(&engine.workspace_edits),
+        }),
+        Some(GuardrailsState::Disabled) | None => None,
+    })
+}
+
+pub(crate) fn admit_file_change(
+    run: &crate::tools::ToolRunContext,
+    canonical_path: &Path,
+    content: &[u8],
+) -> Result<DiffChangePermit, String> {
+    let guard = lock_or_poison();
+    if guard.poisoned {
+        return Err(POISON_ERR.to_string());
+    }
+    let Some(GuardrailsState::Enabled(engine)) = guard.runs.get(&run_key(run)) else {
+        return Ok(DiffChangePermit {
+            monitor: None,
+            stats: None,
+            edit_revision: None,
+            _lease: None,
+        });
+    };
+    let monitor = engine.diff_monitor.clone();
+    let edit_revision = Arc::clone(&engine.workspace_edits);
+    drop(guard);
+    let Some(monitor) = monitor else {
+        return Ok(DiffChangePermit {
+            monitor: None,
+            stats: None,
+            edit_revision: Some(edit_revision),
+            _lease: None,
+        });
+    };
+    let lease = monitor.begin_change()?;
+    let stats = monitor.evaluate_file_overlay(canonical_path, content);
+    admit_diff_candidate(monitor, stats, edit_revision, lease)
+}
+
+fn admit_diff_candidate(
+    monitor: Arc<DiffMonitor>,
+    stats: Result<DiffStats, String>,
+    edit_revision: Arc<AtomicU64>,
+    lease: DiffMutationLease,
+) -> Result<DiffChangePermit, String> {
+    let refusal = match &stats {
+        Ok(stats) => monitor.threshold_warning(stats).and_then(|warning| {
+            (warning.action == GuardrailAction::Block).then_some(warning.message)
+        }),
+        Err(error) if monitor.config.action == GuardrailAction::Block => Some(format!(
+            "Diff block could not evaluate the proposed workspace generation: {error}"
+        )),
+        Err(_) => None,
+    };
+    if let Some(reason) = refusal {
+        return Err(reason);
+    }
+    Ok(DiffChangePermit {
+        monitor: Some(monitor),
+        stats: Some(stats),
+        edit_revision: Some(edit_revision),
+        _lease: Some(lease),
+    })
+}
+
+fn diff_monitor_for_run(
+    run: &crate::tools::ToolRunContext,
+) -> Result<Option<Arc<DiffMonitor>>, String> {
+    let guard = lock_or_poison();
+    if guard.poisoned {
+        return Err(POISON_ERR.to_string());
+    }
+    Ok(match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.diff_monitor.clone(),
+        Some(GuardrailsState::Disabled) | None => None,
+    })
+}
+
+pub(crate) fn diff_revision(run: &crate::tools::ToolRunContext) -> u64 {
+    let guard = lock_or_poison();
+    if guard.poisoned {
+        return 0;
     }
     match guard.runs.get(&run_key(run)) {
-        Some(GuardrailsState::Enabled(engine)) => {
-            engine.record_modification(path, lines_added, lines_removed);
-        }
-        Some(GuardrailsState::Disabled) | None => {}
+        Some(GuardrailsState::Enabled(engine)) => engine.workspace_edits.load(Ordering::Acquire),
+        Some(GuardrailsState::Disabled) | None => 0,
     }
 }
 
 /// Check diff thresholds. Returns a warning if thresholds exceeded.
 pub fn check_diff_thresholds(run: &crate::tools::ToolRunContext) -> Option<DiffWarning> {
-    let guard = lock_or_poison();
-    if guard.poisoned {
-        error!("check_diff_thresholds: registry poisoned — returning None");
-        return None;
-    }
-    match guard.runs.get(&run_key(run)) {
-        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().check_diff_thresholds(),
-        Some(GuardrailsState::Disabled) | None => None,
+    let monitor = match diff_monitor_for_run(run) {
+        Ok(monitor) => monitor?,
+        Err(error) => {
+            error!(%error, "check_diff_thresholds: registry unavailable");
+            return None;
+        }
+    };
+    match monitor.evaluate_live() {
+        Ok(stats) => monitor.threshold_warning(&stats),
+        Err(error) => Some(DiffWarning {
+            message: format!("Diff policy could not evaluate the live workspace: {error}"),
+            stats: DiffStats::default(),
+            action: monitor.config.action.clone(),
+        }),
     }
 }
 
@@ -688,35 +842,104 @@ pub fn run_quality_gates(
     run: &std::sync::Arc<crate::tools::ToolRunContext>,
     model_identity: &str,
 ) -> Vec<QualityCheckResult> {
+    run_quality_gates_at(run, model_identity, RunAfter::EveryTurn)
+        .map_or_else(Vec::new, |report| report.results)
+}
+
+/// Evaluate quality gates at an exact configured lifecycle cadence.
+/// `None` means quality gates are disabled for the run; a configured but
+/// non-matching cadence returns an explicit skipped report.
+pub fn run_quality_gates_at(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    model_identity: &str,
+    cadence: RunAfter,
+) -> Option<QualityGateReport> {
     let guard = lock_or_poison();
     if guard.poisoned {
-        error!("run_quality_gates: registry poisoned — returning empty");
-        return Vec::new();
+        error!("run_quality_gates: registry poisoned — blocking configured verification");
+        return Some(QualityGateReport {
+            cadence: cadence.clone(),
+            configured_cadence: cadence,
+            action: GuardrailAction::Block,
+            disposition: QualityGateDisposition::Blocked,
+            results: Vec::new(),
+            reason: Some(POISON_ERR.to_string()),
+        });
     }
-    let config = match guard.runs.get(&run_key(run)) {
-        Some(GuardrailsState::Enabled(engine)) => engine
-            .quality_gates
-            .as_ref()
-            .map(|runner| runner.config.clone()),
+    let runner = match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.quality_gates.clone(),
         Some(GuardrailsState::Disabled) | None => None,
     };
     drop(guard);
-    config.map_or_else(Vec::new, |config| {
-        QualityGateRunner::new(config).run(run, model_identity)
+    runner.map(|runner| runner.run_at(run, model_identity, cadence))
+}
+
+/// Bind the model identity used by post-mutation quality-gate execution in
+/// the shared tool executor.
+pub(crate) fn bind_quality_gate_model(
+    run: &crate::tools::ToolRunContext,
+    model_identity: &str,
+) -> Result<(), String> {
+    let Some(runner) = quality_runner_for_run(run)? else {
+        return Ok(());
+    };
+    runner.bind_model(model_identity)
+}
+
+/// Evaluate the configured cadence with the model identity already bound to
+/// this exact run. Returns `None` only when quality gates are disabled.
+pub fn run_bound_quality_gates_at(
+    run: &crate::tools::ToolRunContext,
+    cadence: RunAfter,
+) -> Option<QualityGateReport> {
+    match quality_runner_for_run(run) {
+        Ok(Some(runner)) => Some(runner.run_bound_at(cadence)),
+        Ok(None) => None,
+        Err(error) => Some(registry_failure_report(cadence, &error)),
+    }
+}
+
+pub(crate) fn quality_gate_report_for_finalization(
+    run: &crate::tools::ToolRunContext,
+    model_identity: &str,
+) -> Option<QualityGateReport> {
+    match quality_runner_for_run(run) {
+        Ok(Some(runner)) => Some(runner.for_finalization(model_identity)),
+        Ok(None) => None,
+        Err(error) => Some(registry_failure_report(RunAfter::EveryTurn, &error)),
+    }
+}
+
+fn registry_failure_report(cadence: RunAfter, error: &str) -> QualityGateReport {
+    QualityGateReport {
+        cadence: cadence.clone(),
+        configured_cadence: cadence,
+        action: GuardrailAction::Block,
+        disposition: QualityGateDisposition::Blocked,
+        results: Vec::new(),
+        reason: Some(error.to_string()),
+    }
+}
+
+fn quality_runner_for_run(
+    run: &crate::tools::ToolRunContext,
+) -> Result<Option<Arc<QualityGateRunner>>, String> {
+    let guard = lock_or_poison();
+    if guard.poisoned {
+        return Err(POISON_ERR.to_string());
+    }
+    Ok(match guard.runs.get(&run_key(run)) {
+        Some(GuardrailsState::Enabled(engine)) => engine.quality_gates.clone(),
+        Some(GuardrailsState::Disabled) | None => None,
     })
 }
 
 /// Get current diff stats summary.
 pub fn get_diff_summary(run: &crate::tools::ToolRunContext) -> Option<DiffStats> {
-    let guard = lock_or_poison();
-    if guard.poisoned {
-        error!("get_diff_summary: registry poisoned — returning None");
-        return None;
-    }
-    match guard.runs.get(&run_key(run)) {
-        Some(GuardrailsState::Enabled(engine)) => engine.as_ref().get_diff_stats(),
-        Some(GuardrailsState::Disabled) | None => None,
-    }
+    diff_monitor_for_run(run)
+        .ok()
+        .flatten()
+        .and_then(|monitor| monitor.evaluate_live().ok())
 }
 
 // ==========================================================================
@@ -783,7 +1006,7 @@ pub struct DiffWarning {
 }
 
 /// Accumulated diff statistics for the session
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffStats {
     pub lines_added: u32,
     pub lines_removed: u32,
@@ -792,12 +1015,84 @@ pub struct DiffStats {
     pub file_list: Vec<String>,
 }
 
+/// Why a configured quality check reached its terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityCheckStatus {
+    Passed,
+    Failed,
+    Skipped,
+    Stale,
+    Error,
+}
+
+/// Aggregate policy outcome for one configured quality-gate cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityGateDisposition {
+    Passed,
+    Warning,
+    Findings,
+    Blocked,
+    Skipped,
+}
+
+/// Typed result of evaluating the configured quality checks at one lifecycle
+/// boundary. A skipped cadence is distinct from an empty successful run.
+#[derive(Debug, Clone)]
+pub struct QualityGateReport {
+    cadence: RunAfter,
+    configured_cadence: RunAfter,
+    action: GuardrailAction,
+    disposition: QualityGateDisposition,
+    results: Vec<QualityCheckResult>,
+    reason: Option<String>,
+}
+
+impl QualityGateReport {
+    #[must_use]
+    pub const fn cadence(&self) -> &RunAfter {
+        &self.cadence
+    }
+
+    #[must_use]
+    pub const fn configured_cadence(&self) -> &RunAfter {
+        &self.configured_cadence
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> &GuardrailAction {
+        &self.action
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> QualityGateDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub fn results(&self) -> &[QualityCheckResult] {
+        &self.results
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    #[must_use]
+    pub const fn prevents_progress(&self) -> bool {
+        matches!(
+            self.disposition,
+            QualityGateDisposition::Findings | QualityGateDisposition::Blocked
+        )
+    }
+}
+
 /// Result of running a single quality gate check
 #[derive(Debug, Clone)]
 pub struct QualityCheckResult {
     name: String,
     command: String,
-    passed: bool,
+    status: QualityCheckStatus,
     exit_code: i32,
     stdout: String,
     stderr: String,
@@ -830,7 +1125,12 @@ impl QualityCheckResult {
 
     #[must_use]
     pub const fn passed(&self) -> bool {
-        self.passed
+        matches!(self.status, QualityCheckStatus::Passed)
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> QualityCheckStatus {
+        self.status
     }
 
     #[must_use]
@@ -910,12 +1210,16 @@ pub enum ShellResult {
 
 struct GuardrailsEngine {
     blast_radius: Option<Arc<BlastRadiusGuard>>,
-    diff_monitor: Option<DiffMonitor>,
-    quality_gates: Option<QualityGateRunner>,
+    diff_monitor: Option<Arc<DiffMonitor>>,
+    quality_gates: Option<Arc<QualityGateRunner>>,
+    workspace_edits: Arc<AtomicU64>,
 }
 
 impl GuardrailsEngine {
-    fn try_from_config(config: &GuardrailsConfig) -> Result<Self, String> {
+    fn try_from_config(
+        run: &Arc<crate::tools::ToolRunContext>,
+        config: &GuardrailsConfig,
+    ) -> Result<Self, String> {
         // Compile even a disabled supplied section. A malformed policy must
         // never sit latent until a later reload enables it.
         let compiled_blast = config
@@ -945,15 +1249,20 @@ impl GuardrailsEngine {
             );
         }
 
-        let diff_monitor = config.diff_monitor.as_ref().filter(|c| c.enabled).map(|c| {
-            info!(
-                max_lines = c.max_lines_changed,
-                max_files = c.max_files_changed,
-                action = %c.action,
-                "Diff monitor enabled"
-            );
-            DiffMonitor::new(c.clone())
-        });
+        let diff_monitor = config
+            .diff_monitor
+            .as_ref()
+            .filter(|c| c.enabled)
+            .map(|c| {
+                info!(
+                    max_lines = c.max_lines_changed,
+                    max_files = c.max_files_changed,
+                    action = %c.action,
+                    "Diff monitor enabled"
+                );
+                DiffMonitor::try_new(run, c.clone()).map(Arc::new)
+            })
+            .transpose()?;
 
         let quality_gates = config
             .quality_gates
@@ -965,30 +1274,16 @@ impl GuardrailsEngine {
                     run_after = %c.run_after,
                     "Quality gates enabled"
                 );
-                QualityGateRunner::new(c.clone())
-            });
+                QualityGateRunner::try_new(c.clone(), Arc::downgrade(run)).map(Arc::new)
+            })
+            .transpose()?;
 
         Ok(Self {
             blast_radius,
             diff_monitor,
             quality_gates,
+            workspace_edits: Arc::new(AtomicU64::new(0)),
         })
-    }
-
-    fn record_modification(&self, path: &str, lines_added: u32, lines_removed: u32) {
-        if let Some(dm) = &self.diff_monitor {
-            dm.record(path, lines_added, lines_removed);
-        }
-    }
-
-    fn check_diff_thresholds(&self) -> Option<DiffWarning> {
-        self.diff_monitor
-            .as_ref()
-            .and_then(DiffMonitor::check_thresholds)
-    }
-
-    fn get_diff_stats(&self) -> Option<DiffStats> {
-        self.diff_monitor.as_ref().map(DiffMonitor::get_stats)
     }
 }
 
@@ -1364,56 +1659,244 @@ impl Drop for LedgerReservation {
 
 struct DiffMonitor {
     config: DiffMonitorConfig,
-    stats: Mutex<DiffStatsInternal>,
+    workspace_root: PathBuf,
+    baseline: WorkspaceDiffSnapshot,
+    current: Mutex<DiffMonitorState>,
+    mutation_in_flight: Arc<AtomicBool>,
 }
 
-struct DiffStatsInternal {
-    lines_added: u32,
-    lines_removed: u32,
-    files: HashSet<String>,
+struct DiffMutationLease {
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for DiffMutationLease {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiffMonitorState {
+    stats: Result<DiffStats, String>,
+}
+
+const MAX_DIFF_SNAPSHOT_ENTRIES: usize = 100_000;
+const MAX_DIFF_TEXT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DIFF_BASELINE_TEXT_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceDiffEntry {
+    kind: u8,
+    digest: [u8; 32],
+    text: Option<Arc<str>>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceDiffSnapshot {
+    entries: BTreeMap<PathBuf, WorkspaceDiffEntry>,
+}
+
+impl WorkspaceDiffSnapshot {
+    fn capture(root: &Path) -> Result<Self, String> {
+        let mut entries = BTreeMap::new();
+        let mut queue = VecDeque::from([root.to_path_buf()]);
+        let mut retained_text_bytes = 0_u64;
+        while let Some(directory) = queue.pop_front() {
+            let mut children = std::fs::read_dir(&directory)
+                .map_err(|error| format!("cannot enumerate diff snapshot: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("cannot enumerate diff snapshot: {error}"))?;
+            children.sort_by_key(std::fs::DirEntry::file_name);
+            for child in children {
+                let path = child.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| format!("diff snapshot escaped workspace: {error}"))?
+                    .to_path_buf();
+                if crate::evidence_freshness::artifact_path_is_excluded(&relative) {
+                    continue;
+                }
+                let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                    format!("cannot inspect diff artifact '{}': {error}", path.display())
+                })?;
+                if metadata.is_dir() {
+                    queue.push_back(path);
+                    continue;
+                }
+                if entries.len() >= MAX_DIFF_SNAPSHOT_ENTRIES {
+                    return Err(format!(
+                        "diff snapshot exceeds {MAX_DIFF_SNAPSHOT_ENTRIES} files"
+                    ));
+                }
+                let entry = if metadata.file_type().is_symlink() {
+                    let target = std::fs::read_link(&path).map_err(|error| {
+                        format!("cannot read diff symlink '{}': {error}", path.display())
+                    })?;
+                    WorkspaceDiffEntry::from_bytes(
+                        b'l',
+                        target.as_os_str().as_encoded_bytes(),
+                        &mut retained_text_bytes,
+                    )?
+                } else if metadata.is_file() {
+                    WorkspaceDiffEntry::from_file(&path, metadata.len(), &mut retained_text_bytes)?
+                } else {
+                    return Err(format!(
+                        "diff snapshot contains unsupported special file '{}'",
+                        path.display()
+                    ));
+                };
+                entries.insert(relative, entry);
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    fn with_text_override(mut self, relative: PathBuf, content: &[u8]) -> Result<Self, String> {
+        let mut retained = self
+            .entries
+            .values()
+            .filter_map(|entry| entry.text.as_ref())
+            .map(|text| u64::try_from(text.len()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
+        if let Some(previous) = self
+            .entries
+            .get(&relative)
+            .and_then(|entry| entry.text.as_ref())
+        {
+            retained = retained.saturating_sub(u64::try_from(previous.len()).unwrap_or(u64::MAX));
+        }
+        let replacement = WorkspaceDiffEntry::from_bytes(b'f', content, &mut retained)?;
+        self.entries.insert(relative, replacement);
+        Ok(self)
+    }
+}
+
+impl WorkspaceDiffEntry {
+    fn from_file(path: &Path, len: u64, retained: &mut u64) -> Result<Self, String> {
+        let mut file = std::fs::File::open(path)
+            .map_err(|error| format!("cannot open diff artifact '{}': {error}", path.display()))?;
+        let mut digest = Sha256::new();
+        let mut bytes = if len <= MAX_DIFF_TEXT_FILE_BYTES {
+            Vec::with_capacity(usize::try_from(len).unwrap_or(0))
+        } else {
+            Vec::new()
+        };
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|error| {
+                format!("cannot read diff artifact '{}': {error}", path.display())
+            })?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+            if len <= MAX_DIFF_TEXT_FILE_BYTES {
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+        }
+        let text = if len <= MAX_DIFF_TEXT_FILE_BYTES {
+            std::str::from_utf8(&bytes).ok().map(Arc::<str>::from)
+        } else {
+            None
+        };
+        if let Some(text) = &text {
+            *retained = retained.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+            if *retained > MAX_DIFF_BASELINE_TEXT_BYTES {
+                return Err(format!(
+                    "diff snapshot text exceeds {MAX_DIFF_BASELINE_TEXT_BYTES} bytes"
+                ));
+            }
+        }
+        Ok(Self {
+            kind: b'f',
+            digest: digest.finalize().into(),
+            text,
+        })
+    }
+
+    fn from_bytes(kind: u8, bytes: &[u8], retained: &mut u64) -> Result<Self, String> {
+        let text = if u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_DIFF_TEXT_FILE_BYTES {
+            std::str::from_utf8(bytes).ok().map(Arc::<str>::from)
+        } else {
+            None
+        };
+        if let Some(text) = &text {
+            *retained = retained.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+            if *retained > MAX_DIFF_BASELINE_TEXT_BYTES {
+                return Err(format!(
+                    "diff snapshot text exceeds {MAX_DIFF_BASELINE_TEXT_BYTES} bytes"
+                ));
+            }
+        }
+        Ok(Self {
+            kind,
+            digest: Sha256::digest(bytes).into(),
+            text,
+        })
+    }
 }
 
 impl DiffMonitor {
-    fn new(config: DiffMonitorConfig) -> Self {
-        Self {
+    fn try_new(
+        run: &crate::tools::ToolRunContext,
+        config: DiffMonitorConfig,
+    ) -> Result<Self, String> {
+        let workspace_root = run.project_root().to_path_buf();
+        let baseline = WorkspaceDiffSnapshot::capture(&workspace_root)?;
+        Ok(Self {
             config,
-            stats: Mutex::new(DiffStatsInternal {
-                lines_added: 0,
-                lines_removed: 0,
-                files: HashSet::new(),
+            workspace_root,
+            baseline,
+            current: Mutex::new(DiffMonitorState {
+                stats: Ok(DiffStats::default()),
             }),
-        }
+            mutation_in_flight: Arc::new(AtomicBool::new(false)),
+        })
     }
 
-    fn stats_guard(&self, operation: &'static str) -> Option<MutexGuard<'_, DiffStatsInternal>> {
-        match self.stats.lock() {
+    fn begin_change(&self) -> Result<DiffMutationLease, String> {
+        self.mutation_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                "another workspace mutation is awaiting diff-policy settlement; retry after it completes"
+                    .to_string()
+            })?;
+        Ok(DiffMutationLease {
+            active: Arc::clone(&self.mutation_in_flight),
+        })
+    }
+
+    fn state_guard(&self, operation: &'static str) -> Option<MutexGuard<'_, DiffMonitorState>> {
+        match self.current.lock() {
             Ok(guard) => Some(guard),
             Err(err) => {
-                error!(operation, error = %err, "Diff monitor stats lock poisoned");
+                error!(operation, error = %err, "Diff monitor state lock poisoned");
                 None
             }
         }
     }
 
-    fn record(&self, path: &str, lines_added: u32, lines_removed: u32) {
-        if let Some(mut stats) = self.stats_guard("record") {
-            stats.lines_added += lines_added;
-            stats.lines_removed += lines_removed;
-            stats.files.insert(normalize_path(path));
-            debug!(
-                path = path,
-                added = lines_added,
-                removed = lines_removed,
-                total_files = stats.files.len(),
-                "Diff monitor: recorded modification"
-            );
-        }
+    fn evaluate_root(&self, root: &Path) -> Result<DiffStats, String> {
+        let current = WorkspaceDiffSnapshot::capture(root)?;
+        diff_snapshot_stats(&self.workspace_root, &self.baseline, &current, &self.config)
     }
 
-    fn check_thresholds(&self) -> Option<DiffWarning> {
-        let stats = self.stats_guard("check_thresholds")?;
-        let total_lines = stats.lines_added + stats.lines_removed;
-        let total_files = u32::try_from(stats.files.len()).unwrap_or(u32::MAX);
+    fn evaluate_file_overlay(&self, path: &Path, content: &[u8]) -> Result<DiffStats, String> {
+        let relative = path.strip_prefix(&self.workspace_root).map_err(|_| {
+            format!(
+                "diff policy cannot evaluate path '{}' outside workspace '{}'",
+                path.display(),
+                self.workspace_root.display()
+            )
+        })?;
+        let current = WorkspaceDiffSnapshot::capture(&self.workspace_root)?
+            .with_text_override(relative.to_path_buf(), content)?;
+        diff_snapshot_stats(&self.workspace_root, &self.baseline, &current, &self.config)
+    }
+
+    fn threshold_warning(&self, stats: &DiffStats) -> Option<DiffWarning> {
+        let total_lines = stats.lines_changed;
+        let total_files = stats.files_changed;
 
         let mut warnings = Vec::new();
 
@@ -1440,29 +1923,76 @@ impl DiffMonitor {
 
         Some(DiffWarning {
             message,
-            stats: DiffStats {
-                lines_added: stats.lines_added,
-                lines_removed: stats.lines_removed,
-                lines_changed: total_lines,
-                files_changed: total_files,
-                file_list: stats.files.iter().cloned().collect(),
-            },
+            stats: stats.clone(),
             action: self.config.action.clone(),
         })
     }
 
-    fn get_stats(&self) -> DiffStats {
-        let Some(stats) = self.stats_guard("get_stats") else {
-            return DiffStats::default();
-        };
-        DiffStats {
-            lines_added: stats.lines_added,
-            lines_removed: stats.lines_removed,
-            lines_changed: stats.lines_added + stats.lines_removed,
-            files_changed: u32::try_from(stats.files.len()).unwrap_or(u32::MAX),
-            file_list: stats.files.iter().cloned().collect(),
+    fn evaluate_live(&self) -> Result<DiffStats, String> {
+        let result = self.evaluate_root(&self.workspace_root);
+        if let Some(mut state) = self.state_guard("evaluate_live") {
+            state.stats.clone_from(&result);
+        }
+        result
+    }
+
+    fn commit_stats(&self, stats: Result<DiffStats, String>) {
+        if let Some(mut state) = self.state_guard("commit_stats") {
+            state.stats = stats;
         }
     }
+}
+
+fn diff_snapshot_stats(
+    workspace_root: &Path,
+    baseline: &WorkspaceDiffSnapshot,
+    current: &WorkspaceDiffSnapshot,
+    config: &DiffMonitorConfig,
+) -> Result<DiffStats, String> {
+    let paths = baseline
+        .entries
+        .keys()
+        .chain(current.entries.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut stats = DiffStats::default();
+    for path in paths {
+        let before = baseline.entries.get(&path);
+        let after = current.entries.get(&path);
+        if before == after {
+            continue;
+        }
+        stats.files_changed = stats.files_changed.saturating_add(1);
+        stats
+            .file_list
+            .push(workspace_root.join(&path).to_string_lossy().to_string());
+        if config.max_lines_changed == 0 {
+            continue;
+        }
+        let before_text = before.and_then(|entry| entry.text.as_deref()).unwrap_or("");
+        let after_text = after.and_then(|entry| entry.text.as_deref()).unwrap_or("");
+        if before.is_some_and(|entry| entry.text.is_none())
+            || after.is_some_and(|entry| entry.text.is_none())
+        {
+            return Err(format!(
+                "cannot count changed lines for large or non-UTF-8 artifact '{}'",
+                workspace_root.join(&path).display()
+            ));
+        }
+        for change in similar::TextDiff::from_lines(before_text, after_text).iter_all_changes() {
+            match change.tag() {
+                similar::ChangeTag::Insert => {
+                    stats.lines_added = stats.lines_added.saturating_add(1);
+                }
+                similar::ChangeTag::Delete => {
+                    stats.lines_removed = stats.lines_removed.saturating_add(1);
+                }
+                similar::ChangeTag::Equal => {}
+            }
+        }
+    }
+    stats.lines_changed = stats.lines_added.saturating_add(stats.lines_removed);
+    Ok(stats)
 }
 
 // ==========================================================================
@@ -1471,14 +2001,240 @@ impl DiffMonitor {
 
 struct QualityGateRunner {
     config: QualityGatesConfig,
+    run: std::sync::Weak<crate::tools::ToolRunContext>,
+    bound_model: Mutex<Option<String>>,
+    cache: Mutex<Option<CachedQualityGateReport>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedQualityGateReport {
+    diff_revision: u64,
+    report: QualityGateReport,
 }
 
 impl QualityGateRunner {
-    const fn new(config: QualityGatesConfig) -> Self {
-        Self { config }
+    fn try_new(
+        config: QualityGatesConfig,
+        run: std::sync::Weak<crate::tools::ToolRunContext>,
+    ) -> Result<Self, String> {
+        if config.checks.is_empty() {
+            return Err("enabled quality_gates requires at least one check".to_string());
+        }
+        if config.timeout_seconds == 0 {
+            return Err(
+                "enabled quality_gates timeout_seconds must be greater than zero".to_string(),
+            );
+        }
+        let mut names = BTreeSet::new();
+        for check in &config.checks {
+            if check.name.trim().is_empty() {
+                return Err("quality-gate check name must not be empty".to_string());
+            }
+            if check.command.trim().is_empty() {
+                return Err(format!(
+                    "quality-gate check '{}' command must not be empty",
+                    check.name
+                ));
+            }
+            if !names.insert(check.name.clone()) {
+                return Err(format!(
+                    "quality-gate check name '{}' is duplicated",
+                    check.name
+                ));
+            }
+            shlex::split(&check.command)
+                .filter(|argv| !argv.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "quality-gate check '{}' command has invalid quoting",
+                        check.name
+                    )
+                })?;
+        }
+        Ok(Self {
+            config,
+            run,
+            bound_model: Mutex::new(None),
+            cache: Mutex::new(None),
+        })
     }
 
-    fn run(
+    fn bind_model(&self, model_identity: &str) -> Result<(), String> {
+        let model_identity = model_identity.trim();
+        if model_identity.is_empty() {
+            return Err("quality-gate model identity must not be empty".to_string());
+        }
+        let changed = {
+            let mut bound = self
+                .bound_model
+                .lock()
+                .map_err(|error| format!("quality-gate model binding lock poisoned: {error}"))?;
+            let changed = bound.as_deref() != Some(model_identity);
+            if changed {
+                *bound = Some(model_identity.to_string());
+            }
+            changed
+        };
+        if changed {
+            self.cache
+                .lock()
+                .map_err(|error| format!("quality-gate cache lock poisoned: {error}"))?
+                .take();
+        }
+        Ok(())
+    }
+
+    fn run_bound_at(&self, cadence: RunAfter) -> QualityGateReport {
+        let Some(run) = self.run.upgrade() else {
+            return self.failure_report(
+                cadence,
+                "quality-gate run generation was released before execution",
+            );
+        };
+        let model = self.bound_model.lock().ok().and_then(|model| model.clone());
+        match model {
+            Some(model) => self.run_at(&run, &model, cadence),
+            None => self.failure_report(cadence, "quality-gate model identity is not bound"),
+        }
+    }
+
+    fn run_at(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        model_identity: &str,
+        cadence: RunAfter,
+    ) -> QualityGateReport {
+        if cadence != self.config.run_after {
+            return QualityGateReport {
+                cadence,
+                configured_cadence: self.config.run_after.clone(),
+                action: self.config.fail_action.clone(),
+                disposition: QualityGateDisposition::Skipped,
+                results: Vec::new(),
+                reason: Some("quality gates are not due at this lifecycle boundary".to_string()),
+            };
+        }
+        if let Err(error) = self.bind_model(model_identity) {
+            return self.failure_report(cadence, &error);
+        }
+        let results = self.run_checks(run, model_identity);
+        let report = self.report_from_results(cadence, results);
+        let diff_revision = diff_revision(run);
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = Some(CachedQualityGateReport {
+                diff_revision,
+                report: report.clone(),
+            });
+        }
+        report
+    }
+
+    fn for_finalization(&self, model_identity: &str) -> QualityGateReport {
+        let Some(run) = self.run.upgrade() else {
+            return self.failure_report(
+                self.config.run_after.clone(),
+                "quality-gate run generation was released before finalization",
+            );
+        };
+        if let Err(error) = self.bind_model(model_identity) {
+            return self.failure_report(self.config.run_after.clone(), &error);
+        }
+        let diff_revision = diff_revision(&run);
+        if let Some(cached) = self.current_cached_report(&run, diff_revision) {
+            return cached;
+        }
+        match self.config.run_after {
+            RunAfter::EveryTurn => self.run_at(&run, model_identity, RunAfter::EveryTurn),
+            RunAfter::EveryEdit if diff_revision == 0 => QualityGateReport {
+                cadence: RunAfter::EveryEdit,
+                configured_cadence: RunAfter::EveryEdit,
+                action: self.config.fail_action.clone(),
+                disposition: QualityGateDisposition::Skipped,
+                results: Vec::new(),
+                reason: Some("no workspace edit occurred in this run".to_string()),
+            },
+            RunAfter::EveryEdit => self.failure_report(
+                RunAfter::EveryEdit,
+                "the edited workspace has no current every_edit quality-gate receipt",
+            ),
+            RunAfter::OnCommit => QualityGateReport {
+                cadence: RunAfter::OnCommit,
+                configured_cadence: RunAfter::OnCommit,
+                action: self.config.fail_action.clone(),
+                disposition: QualityGateDisposition::Skipped,
+                results: Vec::new(),
+                reason: Some("on_commit checks are enforced before commit operations".to_string()),
+            },
+        }
+    }
+
+    fn current_cached_report(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        diff_revision: u64,
+    ) -> Option<QualityGateReport> {
+        let cache = self.cache.lock().ok()?.clone()?;
+        if cache.diff_revision != diff_revision {
+            return None;
+        }
+        for result in &cache.report.results {
+            let binding = result.evidence.verification_binding.as_ref()?;
+            if crate::evidence_freshness::validate_verification_binding(run, binding).is_err() {
+                return None;
+            }
+        }
+        Some(cache.report)
+    }
+
+    fn failure_report(&self, cadence: RunAfter, reason: &str) -> QualityGateReport {
+        let disposition = match self.config.fail_action {
+            GuardrailAction::Warn => QualityGateDisposition::Warning,
+            GuardrailAction::InjectFindings => QualityGateDisposition::Findings,
+            GuardrailAction::Block => QualityGateDisposition::Blocked,
+        };
+        QualityGateReport {
+            cadence,
+            configured_cadence: self.config.run_after.clone(),
+            action: self.config.fail_action.clone(),
+            disposition,
+            results: Vec::new(),
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    fn report_from_results(
+        &self,
+        cadence: RunAfter,
+        results: Vec<QualityCheckResult>,
+    ) -> QualityGateReport {
+        let required_failure = results
+            .iter()
+            .any(|result| result.required && result.status != QualityCheckStatus::Passed);
+        let optional_failure = results
+            .iter()
+            .any(|result| !result.required && result.status != QualityCheckStatus::Passed);
+        let disposition = if required_failure {
+            match self.config.fail_action {
+                GuardrailAction::Warn => QualityGateDisposition::Warning,
+                GuardrailAction::InjectFindings => QualityGateDisposition::Findings,
+                GuardrailAction::Block => QualityGateDisposition::Blocked,
+            }
+        } else if optional_failure {
+            QualityGateDisposition::Warning
+        } else {
+            QualityGateDisposition::Passed
+        };
+        QualityGateReport {
+            cadence,
+            configured_cadence: self.config.run_after.clone(),
+            action: self.config.fail_action.clone(),
+            disposition,
+            results,
+            reason: None,
+        }
+    }
+
+    fn run_checks(
         &self,
         run: &std::sync::Arc<crate::tools::ToolRunContext>,
         model_identity: &str,
@@ -1531,56 +2287,19 @@ impl QualityGateRunner {
                 ),
             };
 
-            // Translate the typed enum into the (passed, exit_code,
-            // stdout, stderr) shape that `QualityCheckResult` still
-            // exposes to downstream callers. Every variant is handled
-            // explicitly so a future addition forces a recompile.
-            let (passed, exit_code, stdout, stderr) = match outcome {
-                Some(ShellResult::Success { stdout, stderr }) => (true, 0, stdout, stderr),
-                Some(ShellResult::ExitFailed {
-                    code,
-                    stdout,
-                    stderr,
-                }) => (false, code, stdout, stderr),
-                Some(ShellResult::ShellMissing { tried }) => (
-                    false,
-                    -1,
-                    String::new(),
-                    format!("Program not found on PATH: tried {tried:?}"),
-                ),
-                Some(ShellResult::Timeout) => (
-                    false,
-                    -1,
-                    String::new(),
-                    format!(
-                        "Quality gate timed out after {}s (wall-clock supervisor killed child)",
-                        self.config.timeout_seconds
-                    ),
-                ),
-                None => (
-                    false,
-                    -1,
-                    String::new(),
-                    format!(
-                        "Quality gate evidence rejected: {}",
-                        evidence
-                            .freshness_error
-                            .as_deref()
-                            .unwrap_or("freshness proof unavailable")
-                    ),
-                ),
-            };
+            let (status, exit_code, stdout, stderr) =
+                classify_quality_check_outcome(outcome, &evidence, self.config.timeout_seconds);
 
-            if !passed && check.required {
+            if status != QualityCheckStatus::Passed && check.required {
                 warn!(name = %check.name, exit_code, "Required quality gate FAILED");
-            } else if passed {
+            } else if status == QualityCheckStatus::Passed {
                 debug!(name = %check.name, "Quality gate passed");
             }
 
             results.push(QualityCheckResult {
                 name: check.name.clone(),
                 command: check.command.clone(),
-                passed,
+                status,
                 exit_code,
                 stdout,
                 stderr,
@@ -1590,6 +2309,57 @@ impl QualityGateRunner {
         }
 
         results
+    }
+}
+
+fn classify_quality_check_outcome(
+    outcome: Option<ShellResult>,
+    evidence: &QualityGateEvidence,
+    timeout_seconds: u64,
+) -> (QualityCheckStatus, i32, String, String) {
+    match outcome {
+        Some(ShellResult::Success { stdout, stderr }) => {
+            (QualityCheckStatus::Passed, 0, stdout, stderr)
+        }
+        Some(ShellResult::ExitFailed {
+            code,
+            stdout,
+            stderr,
+        }) => (QualityCheckStatus::Failed, code, stdout, stderr),
+        Some(ShellResult::ShellMissing { tried }) => (
+            QualityCheckStatus::Error,
+            -1,
+            String::new(),
+            format!("Program not found on PATH: tried {tried:?}"),
+        ),
+        Some(ShellResult::Timeout) => (
+            QualityCheckStatus::Error,
+            -1,
+            String::new(),
+            format!(
+                "Quality gate timed out after {timeout_seconds}s (wall-clock supervisor killed child)"
+            ),
+        ),
+        None => (
+            if evidence
+                .freshness_error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed while the quality gate ran"))
+            {
+                QualityCheckStatus::Stale
+            } else {
+                QualityCheckStatus::Error
+            },
+            -1,
+            String::new(),
+            format!(
+                "Quality gate evidence rejected: {}",
+                evidence
+                    .freshness_error
+                    .as_deref()
+                    .unwrap_or("freshness proof unavailable")
+            ),
+        ),
     }
 }
 
@@ -2350,7 +3120,11 @@ mod tests {
         let run = crate::tools::security::test_run_context_for(root.path());
         crate::evidence_freshness::bind_policy(&run, "guardrails-unit-test-policy".to_string())
             .expect("bind test verification policy");
-        QualityGateRunner::new(config).run(&run, "test-model")
+        let cadence = config.run_after.clone();
+        QualityGateRunner::try_new(config, Arc::downgrade(&run))
+            .expect("valid quality config")
+            .run_at(&run, "test-model", cadence)
+            .results
     }
     use crate::config::QualityCheck;
 
@@ -2679,15 +3453,17 @@ mod tests {
             max_files_changed: 5,
             action: GuardrailAction::Warn,
         };
-        let monitor = DiffMonitor::new(config);
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("file1.rs"), "old\n").expect("baseline");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let monitor = DiffMonitor::try_new(&run, config).expect("monitor");
+        std::fs::write(root.path().join("file1.rs"), "new\nextra\n").expect("change");
+        std::fs::write(root.path().join("file2.rs"), "added\n").expect("new file");
 
-        monitor.record("file1.rs", 10, 5);
-        monitor.record("file2.rs", 20, 10);
-
-        let stats = monitor.get_stats();
-        assert_eq!(stats.lines_added, 30);
-        assert_eq!(stats.lines_removed, 15);
-        assert_eq!(stats.lines_changed, 45);
+        let stats = monitor.evaluate_live().expect("exact live diff");
+        assert_eq!(stats.lines_added, 3);
+        assert_eq!(stats.lines_removed, 1);
+        assert_eq!(stats.lines_changed, 4);
         assert_eq!(stats.files_changed, 2);
     }
 
@@ -2699,10 +3475,12 @@ mod tests {
             max_files_changed: 5,
             action: GuardrailAction::Warn,
         };
-        let monitor = DiffMonitor::new(config);
-
-        monitor.record("file1.rs", 10, 5);
-        assert!(monitor.check_thresholds().is_none());
+        let root = tempfile::tempdir().expect("root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let monitor = DiffMonitor::try_new(&run, config).expect("monitor");
+        std::fs::write(root.path().join("file1.rs"), "one\n").expect("change");
+        let stats = monitor.evaluate_live().expect("live diff");
+        assert!(monitor.threshold_warning(&stats).is_none());
     }
 
     #[test]
@@ -2713,15 +3491,20 @@ mod tests {
             max_files_changed: 5,
             action: GuardrailAction::Warn,
         };
-        let monitor = DiffMonitor::new(config);
-
-        monitor.record("file1.rs", 15, 10);
-
-        let warning = monitor.check_thresholds();
+        let root = tempfile::tempdir().expect("root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let monitor = DiffMonitor::try_new(&run, config).expect("monitor");
+        let mut content = String::new();
+        for line in 0..21 {
+            writeln!(content, "{line}").expect("write fixture line");
+        }
+        std::fs::write(root.path().join("file1.rs"), content).expect("change");
+        let stats = monitor.evaluate_live().expect("live diff");
+        let warning = monitor.threshold_warning(&stats);
         assert!(warning.is_some());
         let w = warning.unwrap();
         assert!(w.message.contains("lines changed"));
-        assert_eq!(w.stats.lines_changed, 25);
+        assert_eq!(w.stats.lines_changed, 21);
     }
 
     #[test]
@@ -2732,16 +3515,78 @@ mod tests {
             max_files_changed: 2,
             action: GuardrailAction::Block,
         };
-        let monitor = DiffMonitor::new(config);
+        let root = tempfile::tempdir().expect("root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let monitor = DiffMonitor::try_new(&run, config).expect("monitor");
+        std::fs::write(root.path().join("a.rs"), "a").expect("a");
+        std::fs::write(root.path().join("b.rs"), "b").expect("b");
+        let stats = monitor.evaluate_live().expect("two files");
+        assert!(monitor.threshold_warning(&stats).is_none());
 
-        monitor.record("a.rs", 1, 0);
-        monitor.record("b.rs", 1, 0);
-        assert!(monitor.check_thresholds().is_none());
-
-        monitor.record("c.rs", 1, 0);
-        let warning = monitor.check_thresholds();
+        std::fs::write(root.path().join("c.rs"), "c").expect("c");
+        let stats = monitor.evaluate_live().expect("three files");
+        let warning = monitor.threshold_warning(&stats);
         assert!(warning.is_some());
         assert!(warning.unwrap().message.contains("files changed"));
+    }
+
+    #[test]
+    fn diff_block_rejects_proposed_file_before_publication() {
+        let _serialize = lock_global_for_test();
+        let root = tempfile::tempdir_in(".").expect("root");
+        let run = isolated_run(root.path());
+        configure(
+            &run,
+            &GuardrailsConfig {
+                diff_monitor: Some(DiffMonitorConfig {
+                    enabled: true,
+                    max_lines_changed: 1,
+                    max_files_changed: 0,
+                    action: GuardrailAction::Block,
+                }),
+                ..GuardrailsConfig::default()
+            },
+        )
+        .expect("configure diff block");
+        let path = root.path().join("blocked.rs");
+        let Err(error) = admit_file_change(&run, &path, b"one\ntwo\n") else {
+            panic!("oversized proposal must be blocked");
+        };
+        assert!(error.contains("Diff size threshold exceeded"), "{error}");
+        assert!(
+            !path.exists(),
+            "pre-publication block must not create the file"
+        );
+    }
+
+    #[test]
+    fn diff_admission_serializes_concurrent_workspace_publication() {
+        let _serialize = lock_global_for_test();
+        let root = tempfile::tempdir_in(".").expect("root");
+        let run = isolated_run(root.path());
+        configure(
+            &run,
+            &GuardrailsConfig {
+                diff_monitor: Some(DiffMonitorConfig {
+                    enabled: true,
+                    max_lines_changed: 10,
+                    max_files_changed: 10,
+                    action: GuardrailAction::Block,
+                }),
+                ..GuardrailsConfig::default()
+            },
+        )
+        .expect("configure diff block");
+        let first = admit_file_change(&run, &root.path().join("first.rs"), b"first\n")
+            .expect("first proposal");
+        let Err(busy) = admit_file_change(&run, &root.path().join("second.rs"), b"second\n") else {
+            panic!("a second proposal must wait for exact diff settlement");
+        };
+        assert!(busy.contains("mutation is awaiting diff-policy settlement"));
+        drop(first);
+        let retry = admit_file_change(&run, &root.path().join("second.rs"), b"second\n")
+            .expect("released proposal can be retried");
+        drop(retry);
     }
 
     // ====== Quality gates tests ======
@@ -2762,7 +3607,7 @@ mod tests {
         let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
-        assert!(results[0].passed);
+        assert!(results[0].passed());
         assert_eq!(results[0].exit_code, 0);
         assert!(results[0].stdout.contains("ok"));
     }
@@ -2792,8 +3637,69 @@ mod tests {
         let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
-        assert!(!results[0].passed);
+        assert!(!results[0].passed());
         assert_ne!(results[0].exit_code, 0);
+    }
+
+    #[test]
+    fn quality_gate_cadence_mismatch_is_typed_skipped() {
+        let root = tempfile::tempdir().expect("root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        crate::evidence_freshness::bind_policy(&run, "cadence-policy".to_string()).expect("policy");
+        let runner = QualityGateRunner::try_new(
+            QualityGatesConfig {
+                enabled: true,
+                run_after: RunAfter::OnCommit,
+                fail_action: GuardrailAction::Block,
+                checks: vec![QualityCheck {
+                    name: "must-not-run".to_string(),
+                    command: "false".to_string(),
+                    required: true,
+                }],
+                timeout_seconds: 30,
+            },
+            Arc::downgrade(&run),
+        )
+        .expect("runner");
+        let report = runner.run_at(&run, "test-model", RunAfter::EveryTurn);
+        assert_eq!(report.disposition(), QualityGateDisposition::Skipped);
+        assert!(report.results().is_empty());
+    }
+
+    #[test]
+    fn required_failure_honors_every_configured_action() {
+        let cases = [
+            (GuardrailAction::Warn, QualityGateDisposition::Warning),
+            (
+                GuardrailAction::InjectFindings,
+                QualityGateDisposition::Findings,
+            ),
+            (GuardrailAction::Block, QualityGateDisposition::Blocked),
+        ];
+        for (action, expected) in cases {
+            let root = tempfile::tempdir().expect("root");
+            let run = crate::tools::security::test_run_context_for(root.path());
+            crate::evidence_freshness::bind_policy(&run, "action-policy".to_string())
+                .expect("policy");
+            let runner = QualityGateRunner::try_new(
+                QualityGatesConfig {
+                    enabled: true,
+                    run_after: RunAfter::EveryTurn,
+                    fail_action: action,
+                    checks: vec![QualityCheck {
+                        name: "required-failure".to_string(),
+                        command: "false".to_string(),
+                        required: true,
+                    }],
+                    timeout_seconds: 30,
+                },
+                Arc::downgrade(&run),
+            )
+            .expect("runner");
+            let report = runner.run_at(&run, "test-model", RunAfter::EveryTurn);
+            assert_eq!(report.disposition(), expected);
+            assert_eq!(report.results()[0].status(), QualityCheckStatus::Failed);
+        }
     }
 
     // ====== Quality-gate shell-injection tests (crosslink #700) ======
@@ -2858,7 +3764,7 @@ mod tests {
         let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
-        assert!(results[0].passed);
+        assert!(results[0].passed());
         // Literal `$(whoami)` must appear in stdout, NOT the resolved
         // user name. (We don't know what the test user is named, but we
         // do know `$(whoami)` is the precise input string.)
@@ -2893,7 +3799,7 @@ mod tests {
 
             assert_eq!(results.len(), 1);
             assert!(
-                !results[0].passed,
+                !results[0].passed(),
                 "long-running command was not killed by timeout wrapper"
             );
             assert!(
@@ -2904,10 +3810,9 @@ mod tests {
     }
 
     #[test]
-    fn test_quality_gate_rejects_malformed_command() {
-        // Unbalanced quotes must surface as a structured failure (exit
-        // code -1 with a non-empty stderr) rather than being passed to
-        // a shell that would silently mangle the argv.
+    fn test_quality_gate_rejects_malformed_command_at_configuration() {
+        // Unbalanced quotes fail the run configuration instead of remaining
+        // latent until the first configured cadence.
         let config = QualityGatesConfig {
             enabled: true,
             run_after: crate::config::RunAfter::EveryTurn,
@@ -2919,12 +3824,12 @@ mod tests {
             }],
             timeout_seconds: 30,
         };
-        let results = run_test_quality_gate(config);
-
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].passed);
-        assert_eq!(results[0].exit_code, -1);
-        assert!(!results[0].stderr.is_empty());
+        let root = tempfile::tempdir().expect("root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let Err(error) = QualityGateRunner::try_new(config, Arc::downgrade(&run)) else {
+            panic!("invalid command must fail configuration");
+        };
+        assert!(error.contains("invalid quoting"), "{error}");
     }
 
     #[test]
@@ -2945,7 +3850,7 @@ mod tests {
         let results = run_test_quality_gate(config);
 
         assert_eq!(results.len(), 1);
-        assert!(results[0].passed);
+        assert!(results[0].passed());
         assert_eq!(results[0].exit_code, 0);
         assert_eq!(results[0].stdout, "hello");
     }
@@ -3074,7 +3979,7 @@ mod tests {
             diff_monitor: None,
             quality_gates: None,
         };
-        GuardrailsEngine::try_from_config(&cfg).expect("valid test guardrails")
+        GuardrailsEngine::try_from_config(test_run(), &cfg).expect("valid test guardrails")
     }
 
     fn isolated_run(root: &Path) -> std::sync::Arc<crate::tools::ToolRunContext> {
@@ -3139,11 +4044,13 @@ mod tests {
 
         assert!(check_file_access(&run_a, "nested/secret.txt").is_err());
         assert!(check_file_access(&run_b, "nested/secret.txt").is_ok());
-        record_file_modification(&run_a, "src/a.rs", 4, 1);
+        std::fs::create_dir_all(root_a.path().join("src")).expect("src");
+        std::fs::write(root_a.path().join("src/a.rs"), "one\ntwo\nthree\nfour\n")
+            .expect("workspace change");
         let first = get_diff_summary(&run_a).expect("first session diff state");
         let second = get_diff_summary(&run_b).expect("second session diff state");
         assert_eq!(first.files_changed, 1);
-        assert_eq!(first.lines_changed, 5);
+        assert_eq!(first.lines_changed, 4);
         assert_eq!(second.files_changed, 0);
         assert_eq!(second.lines_changed, 0);
     }

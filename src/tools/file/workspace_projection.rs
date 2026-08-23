@@ -318,6 +318,7 @@ mod linux {
         transaction_parent: PathBuf,
         control_root: PathBuf,
         created: CreatedControlDirectories,
+        diff_gate: Option<crate::guardrails::WorkspaceDiffGate>,
         settled: bool,
     }
 
@@ -448,6 +449,7 @@ mod linux {
                 transaction_parent,
                 control_root,
                 created,
+                diff_gate: crate::guardrails::workspace_diff_gate(run)?,
                 settled: false,
             };
             projection.write_journal("prepared", &[])?;
@@ -618,6 +620,13 @@ mod linux {
                 });
             }
 
+            let mut diff_permit = self
+                .diff_gate
+                .as_ref()
+                .map(|gate| gate.admit_candidate(&self.candidate_root))
+                .transpose()
+                .map_err(WorkspaceProjectionError::rejected)?;
+
             for name in &actual_changes {
                 let baseline = self.baseline_root.join(name);
                 let host = self.project_root.join(name);
@@ -642,6 +651,9 @@ mod linux {
                     Err(error) => {
                         let rollback = self.rollback_entries(&applied);
                         if let Err(rollback_error) = rollback {
+                            if let Some(permit) = diff_permit.take() {
+                                permit.reconcile_live();
+                            }
                             let _ = self.write_journal("recovery_required", &actual_changes);
                             self.settled = true;
                             return Err(WorkspaceProjectionError::recoverable(
@@ -662,6 +674,9 @@ mod linux {
             }
 
             if let Err(error) = self.project_directory.sync_all() {
+                if let Some(permit) = diff_permit.take() {
+                    permit.commit();
+                }
                 let _ = self.write_journal("durability_uncertain", &actual_changes);
                 self.settled = true;
                 return Err(WorkspaceProjectionError::recoverable(
@@ -679,6 +694,9 @@ mod linux {
                 },
                 &actual_changes,
             ) {
+                if let Some(permit) = diff_permit.take() {
+                    permit.commit();
+                }
                 self.settled = true;
                 return Err(WorkspaceProjectionError::recoverable(
                     format!(
@@ -688,6 +706,9 @@ mod linux {
                 ));
             }
             let reconciled_digest = proposal_digest.clone();
+            if let Some(permit) = diff_permit.take() {
+                permit.commit();
+            }
             if final_settlement {
                 self.settled = true;
                 self.cleanup();

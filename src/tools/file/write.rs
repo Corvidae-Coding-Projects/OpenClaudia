@@ -58,6 +58,7 @@ struct PreparedWrite {
     lines_added: u32,
     lines_removed: u32,
     line_reservation: crate::guardrails::ChangedLineReservation,
+    diff_permit: crate::guardrails::DiffChangePermit,
 }
 
 fn prepare_write(
@@ -98,6 +99,8 @@ fn prepare_write(
         run,
         u64::from(lines_added) + u64::from(lines_removed),
     )?;
+    let diff_permit =
+        crate::guardrails::admit_file_change(run, Path::new(path), content.as_bytes())?;
     let (mut file, target_exists) = open_observed_target(run, path, open_path, observed_exists)?;
     if target_exists != observed_exists {
         return Err(format!(
@@ -118,6 +121,7 @@ fn prepare_write(
         lines_added,
         lines_removed,
         line_reservation,
+        diff_permit,
     })
 }
 
@@ -154,6 +158,7 @@ fn persist_write(
     match write_result {
         Ok(()) => {
             prepared.line_reservation.commit();
+            prepared.diff_permit.commit();
             crate::guardrails::record_file_modification(
                 run,
                 path,
@@ -177,6 +182,7 @@ fn persist_write(
                 prepared
                     .line_reservation
                     .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
+                prepared.diff_permit.reconcile_live();
                 crate::guardrails::record_file_modification(
                     run,
                     path,
@@ -191,6 +197,7 @@ fn persist_write(
                 );
             } else {
                 prepared.line_reservation.commit();
+                prepared.diff_permit.reconcile_live();
             }
             ToolHandlerResult::partial_text(
                 failure_message.clone(),

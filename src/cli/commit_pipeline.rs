@@ -60,6 +60,9 @@ pub enum CommitError {
     /// The wrapped string is stderr (or the IO error message) verbatim.
     #[error("git commit failed: {0}")]
     CommitFailed(String),
+    /// A configured quality gate refused the commit before `git commit` ran.
+    #[error("git commit blocked by configured quality gates: {0}")]
+    QualityGateBlocked(String),
 }
 
 /// How to handle unstaged changes when nothing is yet staged.
@@ -248,11 +251,20 @@ pub fn default_message(staged_files: &[String]) -> String {
 ///
 /// The pipeline never panics on git invocation failures; it returns
 /// [`CommitError`] instead so callers can render errors consistently.
-pub fn execute_commit_pipeline<G: GitRunner, P: UserPrompt>(
+/// Execute the shared commit pipeline and call `pre_commit` at the last
+/// reversible boundary, after staging/message selection but before Git can
+/// create a commit.
+pub fn execute_commit_pipeline<G, P, F>(
     git: &mut G,
     prompt: &mut P,
     opts: CommitOptions,
-) -> Result<CommitOutcome, CommitError> {
+    mut pre_commit: F,
+) -> Result<CommitOutcome, CommitError>
+where
+    G: GitRunner,
+    P: UserPrompt,
+    F: FnMut() -> Result<(), String>,
+{
     if !git.is_inside_work_tree() {
         return Err(CommitError::NotARepo);
     }
@@ -297,6 +309,7 @@ pub fn execute_commit_pipeline<G: GitRunner, P: UserPrompt>(
         },
     };
 
+    pre_commit().map_err(CommitError::QualityGateBlocked)?;
     match git.commit(&resolved) {
         Ok(_stdout) => Ok(CommitOutcome::Committed { message: resolved }),
         Err(stderr) => Err(CommitError::CommitFailed(stderr)),
@@ -426,7 +439,8 @@ mod tests {
         let mut prompt = ScriptedPrompt::accepting();
 
         let outcome =
-            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic()).unwrap();
+            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic(), || Ok(()))
+                .unwrap();
 
         assert_eq!(
             outcome,
@@ -450,7 +464,10 @@ mod tests {
         let mut prompt = ScriptedPrompt::accepting();
 
         let outcome =
-            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive()).unwrap();
+            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive(), || {
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(outcome, CommitOutcome::NothingToCommit);
         assert!(!git.log.borrow().iter().any(|e| e.starts_with("commit:")));
@@ -468,9 +485,13 @@ mod tests {
         git_auto.unstaged = true;
         git_auto.files = vec!["a.rs".into(), "b.rs".into()];
         let mut prompt_auto = ScriptedPrompt::accepting();
-        let auto_outcome =
-            execute_commit_pipeline(&mut git_auto, &mut prompt_auto, CommitOptions::automatic())
-                .unwrap();
+        let auto_outcome = execute_commit_pipeline(
+            &mut git_auto,
+            &mut prompt_auto,
+            CommitOptions::automatic(),
+            || Ok(()),
+        )
+        .unwrap();
 
         // /commit seam — interactive stage prompt, interactive message.
         let mut git_interactive = FakeGit::new();
@@ -481,6 +502,7 @@ mod tests {
             &mut git_interactive,
             &mut prompt_interactive,
             CommitOptions::interactive(),
+            || Ok(()),
         )
         .unwrap();
 
@@ -543,7 +565,10 @@ mod tests {
             log: std::cell::RefCell::new(Vec::new()),
         };
         let outcome =
-            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive()).unwrap();
+            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive(), || {
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(outcome, CommitOutcome::Cancelled);
         assert!(!git.log.borrow().iter().any(|e| e.starts_with("commit:")));
     }
@@ -559,7 +584,10 @@ mod tests {
             log: std::cell::RefCell::new(Vec::new()),
         };
         let outcome =
-            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive()).unwrap();
+            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive(), || {
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(outcome, CommitOutcome::Cancelled);
         assert!(!git.log.borrow().iter().any(|e| e.starts_with("commit:")));
     }
@@ -570,7 +598,8 @@ mod tests {
         git.in_repo = false;
         let mut prompt = ScriptedPrompt::accepting();
         let err =
-            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic()).unwrap_err();
+            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic(), || Ok(()))
+                .unwrap_err();
         assert!(matches!(err, CommitError::NotARepo));
     }
 
@@ -582,11 +611,38 @@ mod tests {
         git.commit_result = Some(Err("pre-commit hook failed".into()));
         let mut prompt = ScriptedPrompt::accepting();
         let err =
-            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic()).unwrap_err();
+            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic(), || Ok(()))
+                .unwrap_err();
         match err {
             CommitError::CommitFailed(msg) => assert!(msg.contains("pre-commit")),
             CommitError::NotARepo => panic!("expected CommitFailed, got NotARepo"),
+            CommitError::QualityGateBlocked(reason) => {
+                panic!("expected CommitFailed, got quality-gate block: {reason}")
+            }
         }
+    }
+
+    #[test]
+    fn configured_gate_runs_at_last_boundary_and_prevents_commit() {
+        let mut git = FakeGit::new();
+        git.staged = true;
+        git.files = vec!["a.rs".into()];
+        let mut prompt = ScriptedPrompt::accepting();
+        let mut gate_calls = 0_u8;
+
+        let err =
+            execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic(), || {
+                gate_calls += 1;
+                Err("tests failed".to_string())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CommitError::QualityGateBlocked(reason) if reason == "tests failed"
+        ));
+        assert_eq!(gate_calls, 1);
+        assert!(!git.log.borrow().iter().any(|e| e.starts_with("commit:")));
     }
 
     #[test]

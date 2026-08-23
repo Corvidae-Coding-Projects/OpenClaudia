@@ -412,6 +412,7 @@ pub fn create_capability_text_file(
         run,
         u64::from(lines_added) + u64::from(lines_removed),
     )?;
+    let diff_permit = crate::guardrails::admit_file_change(run, &resolved, content.as_bytes())?;
     let (mut file, existed) = secure_fs::open_regular_update_or_create(run, &open_path)?;
     if existed {
         return Err(format!("File '{}' already exists", resolved.display()));
@@ -425,6 +426,7 @@ pub fn create_capability_text_file(
             let (actual_added, actual_removed) = changed_line_counts("", &actual_content);
             line_reservation
                 .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
+            diff_permit.reconcile_live();
             crate::guardrails::record_file_modification(
                 run,
                 &resolved.to_string_lossy(),
@@ -433,11 +435,13 @@ pub fn create_capability_text_file(
             );
         } else {
             line_reservation.commit();
+            diff_permit.reconcile_live();
         }
         effect_reservation.commit();
         return Err(format!("Failed to write '{}': {error}", resolved.display()));
     }
     line_reservation.commit();
+    diff_permit.commit();
     effect_reservation.commit();
     crate::guardrails::record_file_modification(
         run,

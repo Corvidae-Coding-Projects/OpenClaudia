@@ -2793,6 +2793,35 @@ async fn run_subagent_inner(
                 "content": result.content()
             }));
         }
+        if let Some(report) = crate::guardrails::run_quality_gates_at(
+            &subagent_run,
+            &model,
+            crate::config::RunAfter::EveryTurn,
+        ) {
+            if report.prevents_progress() {
+                let detail = report.reason().map_or_else(
+                    || {
+                        report
+                            .results()
+                            .iter()
+                            .filter(|check| !check.passed())
+                            .map(|check| format!("{} ({:?})", check.name(), check.status()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                    ToString::to_string,
+                );
+                messages.push(json!({
+                    "role": "system",
+                    "content": format!(
+                        "Configured quality-gate findings must be addressed before finalization: {detail}"
+                    ),
+                    "metadata": {
+                        "openclaudia_context_source": "reality"
+                    }
+                }));
+            }
+        }
     }
 
     // Store the transcript and settle owned resources before publishing the

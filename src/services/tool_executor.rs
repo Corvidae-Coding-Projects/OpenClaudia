@@ -316,6 +316,26 @@ impl ToolExecutor {
             );
         }
 
+        let pre_commit_report = if tool_requests_git_commit(&tool_call.function.name, &arguments) {
+            crate::guardrails::run_bound_quality_gates_at(
+                run_context,
+                crate::config::RunAfter::OnCommit,
+            )
+        } else {
+            None
+        };
+        if let Some(report) = &pre_commit_report {
+            record_quality_gate_report(run_context, session_id, report);
+            if report.prevents_progress() {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::PolicyDenied,
+                    quality_gate_report_message(report, "Git commit blocked"),
+                    ToolRetryability::Safe,
+                );
+            }
+        }
+
         let budget_reservation = match run_context.budget().reserve(BudgetAmounts {
             tool_calls: 1,
             concurrent_calls: 1,
@@ -329,7 +349,8 @@ impl ToolExecutor {
             }
             Err(error) => return budget_denied_tool_result(tool_call, &error),
         };
-        let result = tools::execute_tool_after_authorization(
+        let diff_revision_before = crate::guardrails::diff_revision(run_context);
+        let mut result = tools::execute_tool_after_authorization(
             run_context,
             tool_call,
             memory_db,
@@ -340,6 +361,18 @@ impl ToolExecutor {
         if let Some(budget_reservation) = budget_reservation {
             if let Err(error) = budget_reservation.commit() {
                 return budget_accounting_failure(tool_call, &error);
+            }
+        }
+        if let Some(report) = pre_commit_report {
+            result = attach_quality_gate_report(result, &report);
+        }
+        if crate::guardrails::diff_revision(run_context) != diff_revision_before {
+            if let Some(report) = crate::guardrails::run_bound_quality_gates_at(
+                run_context,
+                crate::config::RunAfter::EveryEdit,
+            ) {
+                record_quality_gate_report(run_context, session_id, &report);
+                result = attach_quality_gate_report(result, &report);
             }
         }
         result
@@ -405,6 +438,7 @@ impl ToolExecutor {
         };
         let remotely_dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dispatch_evidence = std::sync::Arc::clone(&remotely_dispatched);
+        let diff_revision_before = crate::guardrails::diff_revision(run_context);
         let outcome = manager
             .call_tool_registered_with_dispatch(
                 &tool_call.function.name,
@@ -428,10 +462,19 @@ impl ToolExecutor {
             ),
         };
         let result = ToolResult::bind(tool_call, &tool_call.function.name, handler_result);
-        let result =
+        let mut result =
             tools::attach_automatic_learning(run_context, memory_db, app_config, None, result);
         if let Err(error) = budget_reservation.commit() {
             return budget_accounting_failure(tool_call, &error);
+        }
+        if crate::guardrails::diff_revision(run_context) != diff_revision_before {
+            if let Some(report) = crate::guardrails::run_bound_quality_gates_at(
+                run_context,
+                crate::config::RunAfter::EveryEdit,
+            ) {
+                record_quality_gate_report(run_context, session_id, &report);
+                result = attach_quality_gate_report(result, &report);
+            }
         }
         result
     }
@@ -442,6 +485,100 @@ impl ToolExecutor {
     pub fn execute_unbound(tool_call: &ToolCall) -> ToolResult {
         tools::execute_tool_without_context(tool_call)
     }
+}
+
+fn tool_requests_git_commit(tool_name: &str, arguments: &Value) -> bool {
+    if tool_name == "exit_worktree" {
+        return arguments
+            .get("apply_changes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
+    if tool_name != "bash" {
+        return false;
+    }
+    let Some(command) = arguments.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(argv) = shlex::split(command) else {
+        return false;
+    };
+    argv.iter().enumerate().any(|(index, token)| {
+        std::path::Path::new(token)
+            .file_name()
+            .is_some_and(|name| name == "git")
+            && argv[index.saturating_add(1)..]
+                .iter()
+                .any(|candidate| candidate == "commit")
+    })
+}
+
+fn quality_gate_report_message(
+    report: &crate::guardrails::QualityGateReport,
+    prefix: &str,
+) -> String {
+    let failures = report
+        .results()
+        .iter()
+        .filter(|result| !result.passed())
+        .map(|result| format!("{} ({:?})", result.name(), result.status()))
+        .collect::<Vec<_>>();
+    let detail = report
+        .reason()
+        .map_or_else(|| failures.join(", "), ToString::to_string);
+    format!("{prefix} by configured quality gates: {detail}")
+}
+
+fn record_quality_gate_report(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    report: &crate::guardrails::QualityGateReport,
+) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            tracing::warn!(session_id, %error, "failed to open quality-gate ledger");
+            return;
+        }
+    };
+    for gate in report.results() {
+        if let Err(error) =
+            crate::grounded_loop::append_quality_gate_observations(run, &mut ledger, gate)
+        {
+            tracing::warn!(session_id, gate = %gate.name(), %error, "failed to record quality gate");
+        }
+    }
+}
+
+fn attach_quality_gate_report(
+    result: ToolResult,
+    report: &crate::guardrails::QualityGateReport,
+) -> ToolResult {
+    if report.disposition() == crate::guardrails::QualityGateDisposition::Skipped {
+        return result;
+    }
+    let message = quality_gate_report_message(report, "Quality gate outcome");
+    let mut result = result.with_observation(tools::ToolObservation {
+        kind: "quality_gate".to_string(),
+        authoritative: true,
+        data: serde_json::json!({
+            "cadence": report.cadence().to_string(),
+            "action": report.action().to_string(),
+            "disposition": format!("{:?}", report.disposition()).to_ascii_lowercase(),
+            "message": message,
+        }),
+    });
+    if report.disposition() == crate::guardrails::QualityGateDisposition::Blocked {
+        result = result.with_postcondition_failure(tools::ToolFailure::new(
+            ToolFailureCode::PolicyDenied,
+            message,
+            ToolRetryability::Safe,
+        ));
+    }
+    result
 }
 
 fn handler_reports_cancellation(tool_name: &str) -> bool {
@@ -696,6 +833,10 @@ fn mcp_error_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        DiffMonitorConfig, GuardrailAction, GuardrailsConfig, QualityCheck, QualityGatesConfig,
+        RunAfter,
+    };
     use crate::services::policy::{EnterprisePolicy, PolicyEnforcer, ToolCaps};
     use crate::tools::{FunctionCall, ToolCall};
 
@@ -712,6 +853,26 @@ mod tests {
                 arguments: serde_json::json!({ "command": command }).to_string(),
             },
         }
+    }
+
+    fn write_call(path: &std::path::Path, content: &str) -> ToolCall {
+        ToolCall {
+            id: "call_write".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({ "path": path, "content": content }).to_string(),
+            },
+        }
+    }
+
+    fn isolated_run() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::tools::ToolRunContext>,
+    ) {
+        let root = tempfile::tempdir().expect("root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        (root, run)
     }
 
     fn one_tool_run() -> std::sync::Arc<crate::tools::ToolRunContext> {
@@ -1010,5 +1171,143 @@ mod tests {
             .content()
             .contains("Run budget denied tool dispatch"));
         assert!(!second_result.content().contains("second-should-not-run"));
+    }
+
+    #[test]
+    fn diff_block_rejects_write_before_publication() {
+        let (_root, run) = isolated_run();
+        crate::guardrails::configure(
+            &run,
+            &GuardrailsConfig {
+                diff_monitor: Some(DiffMonitorConfig {
+                    enabled: true,
+                    max_lines_changed: 1,
+                    max_files_changed: 0,
+                    action: GuardrailAction::Block,
+                }),
+                ..GuardrailsConfig::default()
+            },
+        )
+        .expect("configure diff block");
+        let path = run.project_root().join("blocked.txt");
+        let call = write_call(&path, "one\ntwo\n");
+        let manager = PermissionManager::unrestricted_for_run(&run);
+
+        let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: &run,
+            tool_call: &call,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &manager,
+            authorization: None,
+            session_id: None,
+            policy_enforcer: None,
+        });
+
+        assert!(result.is_error(), "unexpected result: {}", result.content());
+        assert!(result.content().contains("Diff size threshold exceeded"));
+        assert!(!path.exists(), "blocked bytes must never be published");
+    }
+
+    #[test]
+    fn every_edit_quality_gate_runs_without_diff_monitor() {
+        let (_root, run) = isolated_run();
+        crate::guardrails::configure(
+            &run,
+            &GuardrailsConfig {
+                quality_gates: Some(QualityGatesConfig {
+                    enabled: true,
+                    run_after: RunAfter::EveryEdit,
+                    fail_action: GuardrailAction::Block,
+                    checks: vec![QualityCheck {
+                        name: "reject-edit".to_string(),
+                        command: "false".to_string(),
+                        required: true,
+                    }],
+                    timeout_seconds: 30,
+                }),
+                ..GuardrailsConfig::default()
+            },
+        )
+        .expect("configure every-edit quality gate");
+        crate::guardrails::bind_quality_gate_model(&run, "test-model").expect("bind model");
+        let path = run.project_root().join("edited.txt");
+        let call = write_call(&path, "published\n");
+        let manager = PermissionManager::unrestricted_for_run(&run);
+
+        let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: &run,
+            tool_call: &call,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &manager,
+            authorization: None,
+            session_id: None,
+            policy_enforcer: None,
+        });
+
+        assert!(path.exists(), "the gate runs after successful publication");
+        assert!(result.is_partial(), "unexpected result: {result:?}");
+        assert!(result
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == "quality_gate"));
+        assert_eq!(crate::guardrails::diff_revision(&run), 1);
+    }
+
+    #[test]
+    fn on_commit_quality_gate_blocks_before_command_dispatch() {
+        let (_root, run) = isolated_run();
+        crate::guardrails::configure(
+            &run,
+            &GuardrailsConfig {
+                quality_gates: Some(QualityGatesConfig {
+                    enabled: true,
+                    run_after: RunAfter::OnCommit,
+                    fail_action: GuardrailAction::Block,
+                    checks: vec![QualityCheck {
+                        name: "reject-commit".to_string(),
+                        command: "false".to_string(),
+                        required: true,
+                    }],
+                    timeout_seconds: 30,
+                }),
+                ..GuardrailsConfig::default()
+            },
+        )
+        .expect("configure on-commit quality gate");
+        crate::guardrails::bind_quality_gate_model(&run, "test-model").expect("bind model");
+        let call = bash_call("git commit");
+        let manager = PermissionManager::unrestricted_for_run(&run);
+
+        let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: &run,
+            tool_call: &call,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &manager,
+            authorization: None,
+            session_id: None,
+            policy_enforcer: None,
+        });
+
+        assert!(result.is_error(), "unexpected result: {}", result.content());
+        assert!(result.content().contains("Git commit blocked"));
+        assert!(!result.content().contains("not a git repository"));
+    }
+
+    #[test]
+    fn worktree_apply_changes_is_a_commit_boundary() {
+        assert!(tool_requests_git_commit(
+            "exit_worktree",
+            &serde_json::json!({ "path": "/tmp/worktree", "apply_changes": true })
+        ));
+        assert!(!tool_requests_git_commit(
+            "exit_worktree",
+            &serde_json::json!({ "path": "/tmp/worktree", "discard_changes": true })
+        ));
     }
 }

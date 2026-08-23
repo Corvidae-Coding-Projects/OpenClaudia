@@ -3931,10 +3931,19 @@ impl ChatRepl {
     /// Run quality gates after a tool batch and inject any failures
     /// back into the session as system messages.
     fn run_quality_gates_and_inject(&mut self) {
-        let qg_results = guardrails::run_quality_gates(&self.run_context, &self.model);
-        self.record_quality_gate_verifications(&qg_results);
+        let Some(report) = guardrails::run_quality_gates_at(
+            &self.run_context,
+            &self.model,
+            openclaudia::config::RunAfter::EveryTurn,
+        ) else {
+            return;
+        };
+        if report.disposition() == guardrails::QualityGateDisposition::Skipped {
+            return;
+        }
+        self.record_quality_gate_verifications(report.results());
         let mut injected_failure = false;
-        for qg in &qg_results {
+        for qg in report.results() {
             if qg.passed() {
                 tracing::debug!(name = %qg.name(), "Quality gate passed");
                 continue;
@@ -3950,19 +3959,23 @@ impl ChatRepl {
                 let preview: String = qg.stderr().lines().take(3).collect::<Vec<_>>().join("\n");
                 eprintln!("  {preview}");
             }
-            self.chat_session.push_message(serde_json::json!({
-                "role": "system",
-                "content": format!(
-                    "[Quality Gate '{}' {}] exit code {}\nstdout: {}\nstderr: {}",
-                    qg.name(), severity, qg.exit_code(),
-                    if qg.stdout().len() > 500 { safe_truncate(qg.stdout(), 500) } else { qg.stdout() },
-                    if qg.stderr().len() > 500 { safe_truncate(qg.stderr(), 500) } else { qg.stderr() }
-                ),
-                "metadata": {
-                    "openclaudia_context_source": "reality"
-                }
-            }));
-            injected_failure = true;
+            if matches!(
+                report.disposition(),
+                guardrails::QualityGateDisposition::Findings
+                    | guardrails::QualityGateDisposition::Blocked
+            ) {
+                self.chat_session.push_message(serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Quality Gate '{}' {}] exit code {}. Address the typed verifier finding before finalization.",
+                        qg.name(), severity, qg.exit_code()
+                    ),
+                    "metadata": {
+                        "openclaudia_context_source": "reality"
+                    }
+                }));
+                injected_failure = true;
+            }
         }
         if injected_failure {
             persist_chat_session_update(&mut self.chat_session, "quality gate injection");

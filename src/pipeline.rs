@@ -4050,17 +4050,46 @@ fn emit_failed_quality_gate_events(
     tx: &mpsc::Sender<AppEvent>,
     session_id: Option<&str>,
     model_identity: &str,
-) {
-    for gate in crate::guardrails::run_quality_gates(run_context, model_identity) {
-        record_quality_gate_verification(run_context, session_id, &gate);
+) -> Option<Value> {
+    let report = crate::guardrails::run_quality_gates_at(
+        run_context,
+        model_identity,
+        crate::config::RunAfter::EveryTurn,
+    )?;
+    if report.disposition() == crate::guardrails::QualityGateDisposition::Skipped {
+        return None;
+    }
+    let mut findings = Vec::new();
+    for gate in report.results() {
+        record_quality_gate_verification(run_context, session_id, gate);
         if gate.passed() {
             continue;
         }
-        if tx.send(failed_quality_gate_event(&gate)).is_err() {
+        findings.push(format!("{} ({:?})", gate.name(), gate.status()));
+        if tx.send(failed_quality_gate_event(gate)).is_err() {
             tracing::warn!("TUI channel closed during tool execution");
             break;
         }
     }
+    if findings.is_empty()
+        || !matches!(
+            report.disposition(),
+            crate::guardrails::QualityGateDisposition::Findings
+                | crate::guardrails::QualityGateDisposition::Blocked
+        )
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "role": "system",
+        "content": format!(
+            "Configured quality-gate findings must be addressed before finalization: {}",
+            findings.join(", ")
+        ),
+        "metadata": {
+            "openclaudia_context_source": "reality"
+        }
+    }))
 }
 
 fn failed_quality_gate_event(gate: &crate::guardrails::QualityCheckResult) -> AppEvent {
@@ -4317,7 +4346,11 @@ async fn execute_tool_calls_for_tui(
         }
     }
 
-    emit_failed_quality_gate_events(&run_context, tx, session_id, model_identity);
+    if let Some(finding) =
+        emit_failed_quality_gate_events(&run_context, tx, session_id, model_identity)
+    {
+        results.push(finding);
+    }
 
     (results, true)
 }

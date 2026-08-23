@@ -528,6 +528,12 @@ fn write_notebook(
         u64::from(lines_added) + u64::from(lines_removed),
     )
     .map_err(|message| (message, true))?;
+    let diff_permit = crate::guardrails::admit_file_change(
+        run,
+        Path::new(&handle.canonical_path),
+        pretty.as_bytes(),
+    )
+    .map_err(|message| (message, true))?;
 
     let write_result = handle
         .file
@@ -550,6 +556,7 @@ fn write_notebook(
                 super::changed_line_counts(original_content, &actual_content);
             line_reservation
                 .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
+            diff_permit.reconcile_live();
             crate::guardrails::record_file_modification(
                 run,
                 &handle.canonical_path,
@@ -564,11 +571,13 @@ fn write_notebook(
             );
         } else {
             line_reservation.commit();
+            diff_permit.reconcile_live();
         }
         return Ok(NotebookWriteOutcome::Partial(failure_message));
     }
 
     line_reservation.commit();
+    diff_permit.commit();
     crate::guardrails::record_file_modification(
         run,
         &handle.canonical_path,

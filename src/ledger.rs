@@ -725,6 +725,8 @@ impl RealityLedger {
         let content = content.into();
         crate::evidence_freshness::advance_task(run, &content, model_identity)
             .map_err(LedgerError::InvalidEvidenceProvenance)?;
+        crate::guardrails::bind_quality_gate_model(run, model_identity)
+            .map_err(LedgerError::InvalidEvidenceProvenance)?;
         invalidate_verification_receipts_for_run(run);
         self.append(
             EvidenceProvenance::for_run(run, EvidenceTrust::UserInput, EvidenceSource::UserInput),
@@ -1420,6 +1422,8 @@ pub(crate) fn sync_model_identity(
     run: &crate::tools::ToolRunContext,
     model_identity: &str,
 ) -> Result<(), LedgerError> {
+    crate::guardrails::bind_quality_gate_model(run, model_identity)
+        .map_err(LedgerError::InvalidEvidenceProvenance)?;
     if crate::evidence_freshness::sync_model(run, model_identity)
         .map_err(LedgerError::InvalidEvidenceProvenance)?
     {

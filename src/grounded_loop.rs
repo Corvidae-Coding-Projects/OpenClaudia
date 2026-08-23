@@ -497,6 +497,54 @@ pub fn validate_and_render_final_against_ledger(
     model_identity: &str,
 ) -> Result<String, String> {
     crate::ledger::sync_model_identity(run, model_identity).map_err(|error| error.to_string())?;
+    if let Some(diff) = crate::guardrails::check_diff_thresholds(run) {
+        match diff.action {
+            crate::config::GuardrailAction::Warn => {
+                tracing::warn!(reason = %diff.message, "finalization allowed with diff warning");
+            }
+            crate::config::GuardrailAction::Block
+            | crate::config::GuardrailAction::InjectFindings => {
+                let reason = format!(
+                    "final answer rejected by configured diff gate: {}",
+                    diff.message
+                );
+                append_final_policy_decision(run, ledger, false, &reason);
+                return Err(reason);
+            }
+        }
+    }
+    if let Some(report) =
+        crate::guardrails::quality_gate_report_for_finalization(run, model_identity)
+    {
+        for gate in report.results() {
+            if let Err(error) = append_quality_gate_observations(run, ledger, gate) {
+                if report.action() == &crate::config::GuardrailAction::Warn {
+                    tracing::warn!(gate = %gate.name(), %error, "advisory quality-gate evidence was rejected");
+                } else {
+                    return Err(format!(
+                        "quality-gate evidence could not be recorded: {error}"
+                    ));
+                }
+            }
+        }
+        if report.prevents_progress() {
+            let detail = report.reason().map_or_else(
+                || {
+                    report
+                        .results()
+                        .iter()
+                        .filter(|gate| !gate.passed())
+                        .map(|gate| format!("{} ({:?})", gate.name(), gate.status()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+                ToString::to_string,
+            );
+            let reason = format!("final answer rejected by configured quality gates: {detail}");
+            append_final_policy_decision(run, ledger, false, &reason);
+            return Err(reason);
+        }
+    }
     match parse_structured_final_decision(content) {
         Ok(Some(decision)) => return validate_and_render_structured_final(run, ledger, &decision),
         Ok(None) => {}
@@ -931,6 +979,88 @@ mod tests {
                 )
             }),
             "structured final allow decision must be recorded"
+        );
+    }
+
+    #[test]
+    fn shared_finalization_rejects_required_quality_gate_failure() {
+        let (_root, run) = isolated_test_run();
+        crate::guardrails::configure(
+            &run,
+            &crate::config::GuardrailsConfig {
+                quality_gates: Some(crate::config::QualityGatesConfig {
+                    enabled: true,
+                    run_after: crate::config::RunAfter::EveryTurn,
+                    fail_action: crate::config::GuardrailAction::Block,
+                    checks: vec![crate::config::QualityCheck {
+                        name: "required-check".to_string(),
+                        command: "false".to_string(),
+                        required: true,
+                    }],
+                    timeout_seconds: 30,
+                }),
+                ..crate::config::GuardrailsConfig::default()
+            },
+        )
+        .expect("configure blocking final gate");
+        let mut ledger = RealityLedger::new();
+        let content = serde_json::json!({
+            "kind": "final",
+            "claims": [{
+                "claim_type": "unsupported",
+                "statement": "No runtime claim.",
+                "reason": "No receipt."
+            }]
+        })
+        .to_string();
+
+        let denial =
+            validate_and_render_final_against_ledger(&run, &mut ledger, &content, "test-model")
+                .expect_err("the shared final boundary must enforce required checks");
+
+        assert!(denial.contains("configured quality gates"), "{denial}");
+        assert!(denial.contains("required-check"), "{denial}");
+    }
+
+    #[test]
+    fn advisory_quality_gate_failure_allows_shared_finalization() {
+        let (_root, run) = isolated_test_run();
+        crate::guardrails::configure(
+            &run,
+            &crate::config::GuardrailsConfig {
+                quality_gates: Some(crate::config::QualityGatesConfig {
+                    enabled: true,
+                    run_after: crate::config::RunAfter::EveryTurn,
+                    fail_action: crate::config::GuardrailAction::Warn,
+                    checks: vec![crate::config::QualityCheck {
+                        name: "advisory-check".to_string(),
+                        command: "false".to_string(),
+                        required: true,
+                    }],
+                    timeout_seconds: 30,
+                }),
+                ..crate::config::GuardrailsConfig::default()
+            },
+        )
+        .expect("configure advisory final gate");
+        let mut ledger = RealityLedger::new();
+        let content = serde_json::json!({
+            "kind": "final",
+            "claims": [{
+                "claim_type": "unsupported",
+                "statement": "No runtime claim.",
+                "reason": "No receipt."
+            }]
+        })
+        .to_string();
+
+        let rendered =
+            validate_and_render_final_against_ledger(&run, &mut ledger, &content, "test-model")
+                .expect("warn action remains advisory");
+
+        assert_eq!(
+            rendered,
+            "Unsupported claim \"No runtime claim.\"; reason \"No receipt.\"."
         );
     }
 

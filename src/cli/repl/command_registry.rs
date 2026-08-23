@@ -702,8 +702,8 @@ impl CommandHandler for CommitCommand {
     fn name(&self) -> &'static str {
         "commit"
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
-        slash_commit()
+    fn handle(&self, ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
+        slash_commit(ctx.run_context)
     }
 }
 
@@ -714,8 +714,8 @@ impl CommandHandler for CommitPushPrCommand {
     fn name(&self) -> &'static str {
         "commit-push-pr"
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
-        slash_commit_push_pr()
+    fn handle(&self, ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
+        slash_commit_push_pr(ctx.run_context)
     }
 }
 

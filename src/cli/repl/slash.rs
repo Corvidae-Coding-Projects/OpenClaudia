@@ -856,19 +856,87 @@ pub fn slash_debug(provider: &str, current_model: &str, msg_count: usize) {
     println!();
 }
 
-pub fn slash_commit() -> SlashCommandResult {
+fn enforce_on_commit_quality_gate(
+    run_context: Option<&openclaudia::tools::ToolRunContext>,
+) -> Result<(), String> {
+    let run =
+        run_context.ok_or_else(|| "an active run is required for a guarded commit".to_string())?;
+    let Some(report) = openclaudia::guardrails::run_bound_quality_gates_at(
+        run,
+        openclaudia::config::RunAfter::OnCommit,
+    ) else {
+        return Ok(());
+    };
+    if !report.results().is_empty() {
+        match openclaudia::ledger::RealityLedger::open_project_session(run.session_id()) {
+            Ok(mut ledger) => {
+                for check in report.results() {
+                    if let Err(error) = openclaudia::grounded_loop::append_quality_gate_observations(
+                        run,
+                        &mut ledger,
+                        check,
+                    ) {
+                        if report.action() == &openclaudia::config::GuardrailAction::Warn {
+                            eprintln!(
+                                "Warning: advisory quality-gate evidence was rejected: {error}"
+                            );
+                        } else {
+                            return Err(format!(
+                                "quality-gate evidence could not be recorded: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(error) if report.action() == &openclaudia::config::GuardrailAction::Warn => {
+                eprintln!("Warning: advisory quality-gate evidence could not be opened: {error}");
+            }
+            Err(error) => {
+                return Err(format!(
+                    "quality-gate evidence could not be opened: {error}"
+                ));
+            }
+        }
+    }
+    let detail = report.reason().map_or_else(
+        || {
+            report
+                .results()
+                .iter()
+                .filter(|check| !check.passed())
+                .map(|check| format!("{} ({:?})", check.name(), check.status()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+        ToString::to_string,
+    );
+    if report.prevents_progress() {
+        return Err(detail);
+    }
+    if report.disposition() == openclaudia::guardrails::QualityGateDisposition::Warning {
+        eprintln!("Warning: configured on-commit quality gates reported: {detail}");
+    }
+    Ok(())
+}
+
+pub fn slash_commit(
+    run_context: Option<&openclaudia::tools::ToolRunContext>,
+) -> SlashCommandResult {
     use crate::cli::commit_pipeline::{
         execute_commit_pipeline, CommitError, CommitOptions, CommitOutcome, RealGitRunner,
         StdioPrompt,
     };
     let mut git = RealGitRunner;
     let mut prompt = StdioPrompt;
-    match execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive()) {
+    match execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive(), || {
+        enforce_on_commit_quality_gate(run_context)
+    }) {
         Ok(CommitOutcome::Committed { message }) => println!("\n✓ Committed: {message}"),
         Ok(CommitOutcome::NothingToCommit) => println!("\nNo changes to commit.\n"),
         Ok(CommitOutcome::Cancelled) => println!("Commit cancelled."),
         Err(CommitError::NotARepo) => println!("\nNot inside a git repository.\n"),
         Err(CommitError::CommitFailed(stderr)) => println!("\n✗ {stderr}"),
+        Err(CommitError::QualityGateBlocked(reason)) => println!("\n✗ {reason}"),
     }
     SlashCommandResult::Handled
 }
@@ -876,14 +944,18 @@ pub fn slash_commit() -> SlashCommandResult {
 /// Auto-stage + auto-commit step for `/commit-push-pr`. Returns `false` when
 /// the caller should bail out (commit failed). `NothingToCommit` is treated
 /// as success so the push step can still run.
-fn commit_push_pr_stage_and_commit() -> bool {
+fn commit_push_pr_stage_and_commit(
+    run_context: Option<&openclaudia::tools::ToolRunContext>,
+) -> bool {
     use crate::cli::commit_pipeline::{
         execute_commit_pipeline, CommitError, CommitOptions, CommitOutcome, RealGitRunner,
         StdioPrompt,
     };
     let mut git = RealGitRunner;
     let mut prompt = StdioPrompt;
-    match execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic()) {
+    match execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic(), || {
+        enforce_on_commit_quality_gate(run_context)
+    }) {
         Ok(CommitOutcome::Committed { message }) => {
             println!("✓ Committed: {message}");
             true
@@ -895,6 +967,10 @@ fn commit_push_pr_stage_and_commit() -> bool {
         }
         Err(CommitError::CommitFailed(stderr)) => {
             println!("✗ Commit failed: {stderr}");
+            false
+        }
+        Err(CommitError::QualityGateBlocked(reason)) => {
+            println!("✗ Commit blocked: {reason}");
             false
         }
     }
@@ -1012,11 +1088,13 @@ fn commit_push_pr_create_pr(branch: String) {
     }
 }
 
-pub fn slash_commit_push_pr() -> SlashCommandResult {
+pub fn slash_commit_push_pr(
+    run_context: Option<&openclaudia::tools::ToolRunContext>,
+) -> SlashCommandResult {
     // Repo check is performed inside `commit_push_pr_stage_and_commit`
     // (via the shared commit pipeline, #476). Bailing here would re-shell
     // out to git for no benefit.
-    if !commit_push_pr_stage_and_commit() {
+    if !commit_push_pr_stage_and_commit(run_context) {
         return SlashCommandResult::Handled;
     }
     if let Some(branch) = commit_push_pr_push() {

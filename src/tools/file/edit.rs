@@ -247,10 +247,16 @@ pub fn execute_edit_file(
         Ok(reservation) => reservation,
         Err(message) => return edit_error(message),
     };
+    let diff_permit =
+        match crate::guardrails::admit_file_change(run, Path::new(path), new_content.as_bytes()) {
+            Ok(permit) => permit,
+            Err(message) => return edit_error(message),
+        };
 
     match rewrite_in_place(&mut file, &new_content) {
         Ok(()) => {
             line_reservation.commit();
+            diff_permit.commit();
             crate::guardrails::record_file_modification(run, path, lines_added, lines_removed);
             super::record_active_diff_observation(run, path, &content, &new_content);
             format_edit_success(run, path, old_string, new_string, count, replace_all)
@@ -262,6 +268,7 @@ pub fn execute_edit_file(
                     super::changed_line_counts(&content, &actual_content);
                 line_reservation
                     .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
+                diff_permit.reconcile_live();
                 crate::guardrails::record_file_modification(
                     run,
                     path,
@@ -271,6 +278,7 @@ pub fn execute_edit_file(
                 super::record_active_diff_observation(run, path, &content, &actual_content);
             } else {
                 line_reservation.commit();
+                diff_permit.reconcile_live();
             }
             ToolHandlerResult::partial_text(
                 failure_message.clone(),
