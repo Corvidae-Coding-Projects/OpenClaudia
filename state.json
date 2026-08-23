@@ -1,6 +1,6 @@
 {
   "next_display_id": 1122,
-  "next_comment_id": 1419,
+  "next_comment_id": 1420,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25510,10 +25510,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T22:37:39.823571526Z",
-      "updated_at": "2026-08-23T22:37:43.954976817Z",
+      "updated_at": "2026-08-23T22:44:08.275498744Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "ec205162-476d-4b37-ba89-fb3379593de3": {
+          "display_id": 1419,
+          "author": "6Vw9",
+          "content": "Implementation plan after preflight: (1) replace post-write additive diff warnings with a bounded run-baseline workspace change set and typed warn/inject/block outcome; direct file changes and sandbox workspace projections must evaluate Block before publication, while finalization re-evaluates the live root to catch non-file-tool changes; (2) compile quality configuration, honor every_edit/every_turn/on_commit cadence, distinguish pass/fail/skipped/stale/error, and apply warn/inject_findings/block deliberately; (3) enforce blocking/injection recovery at the shared final-answer gate and shared execution path so CLI/TUI/ACP/subagent adapters cannot turn failures advisory; (4) add focused cross-frontend/config/transaction tests, then exact Rust 1.98 fmt/clippy/full serialized tests. Scope stays on likely production paths; unrelated hardening remains out.",
+          "created_at": "2026-08-23T22:44:08.271994853Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEMDMgmr76ZP1gOPpDRfLPhcWLo2HJK8yIEuzYXuDm9j+bRdpLdPK7OlnRI4DaXtQNrbY+VmB/GLbAxv5SnjcCw=="
+        }
+      }
     },
     "d533f94c-12c8-4481-bc0d-ecedeb971ebe": {
       "uuid": "d533f94c-12c8-4481-bc0d-ecedeb971ebe",
@@ -37197,11 +37208,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1334,
       "timestamp": "2026-08-23T22:37:49.010280020Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1335,
+      "timestamp": "2026-08-23T22:44:08.275498744Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T22:37:49.010280020Z",
+    "timestamp": "2026-08-23T22:44:08.275498744Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1334
+    "agent_seq": 1335
   }
 }
