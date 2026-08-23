@@ -1,6 +1,6 @@
 {
   "next_display_id": 1108,
-  "next_comment_id": 1301,
+  "next_comment_id": 1302,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7344,11 +7344,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T05:55:19.436743818Z",
-      "updated_at": "2026-08-23T06:01:52.754146091Z",
+      "updated_at": "2026-08-23T06:11:33.322720817Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "29166560-fd70-4b5e-b22f-bfbfe22cf536": {
+          "display_id": 1301,
+          "author": "6Vw9",
+          "content": "Shared hierarchical RunBudgetAuthority now compiles on Rust 1.98.0. It is attached to RunContext/ToolRunContext and derived frontend sessions inherit the parent ledger. Next implementation chunk is the central ToolExecutor path and production root builders, followed by provider reservations/reconciliation.",
+          "created_at": "2026-08-23T06:11:33.320060719Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAAZafQEdcnwy7ANUSCo0AjfLWT6V9oopo6kMCvgWC7fDI7wKO0HsXkd8OpobNb3DhJGABi3entSyf3UBWhZExDg=="
+        },
         "8215f679-97ca-4994-955c-13f31cf61000": {
           "display_id": 1299,
           "author": "6Vw9",
@@ -34802,11 +34811,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1127,
       "timestamp": "2026-08-23T06:01:52.754146091Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1128,
+      "timestamp": "2026-08-23T06:11:33.322720817Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T06:01:52.754146091Z",
+    "timestamp": "2026-08-23T06:11:33.322720817Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1127
+    "agent_seq": 1128
   }
 }
