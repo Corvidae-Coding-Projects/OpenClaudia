@@ -1,6 +1,6 @@
 {
   "next_display_id": 1106,
-  "next_comment_id": 1290,
+  "next_comment_id": 1291,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22195,11 +22195,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T04:54:39.590578744Z",
-      "updated_at": "2026-08-23T04:59:32.329052661Z",
+      "updated_at": "2026-08-23T04:59:36.539174974Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "8aaa1723-e96d-4795-b61b-9666c59c7bfb": {
+          "display_id": 1290,
+          "author": "6Vw9",
+          "content": "Preflight evidence: prerequisites S-010/S-044/S-048 are implemented; current false-success paths exist in pipeline chat SSE EOF/malformed handling, TUI run_agentic_loop fallthrough, REPL follow-up fallthrough, ACP EOF finalization, print SSE terminal omission, and non-stream child response parsing. These are realistic provider/network/tool-loop outcomes, not speculative edge cases.",
+          "created_at": "2026-08-23T04:59:36.536649534Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmkuDussuZ//dvxFDf0l1mic4Ko5rv4G7cDee0b/n1hQNOt1HNYhZBhn6ktyK4QT6jnLdm/gtTKq05QOy5ax1CQ=="
+        },
         "e300e824-9eb6-4e17-bbb8-86fed1e9afe2": {
           "display_id": 1288,
           "author": "6Vw9",
@@ -34568,11 +34577,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1107,
       "timestamp": "2026-08-23T04:59:32.329052661Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1108,
+      "timestamp": "2026-08-23T04:59:36.539174974Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T04:59:32.329052661Z",
+    "timestamp": "2026-08-23T04:59:36.539174974Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1107
+    "agent_seq": 1108
   }
 }
