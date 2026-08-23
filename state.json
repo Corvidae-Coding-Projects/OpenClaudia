@@ -1,6 +1,6 @@
 {
   "next_display_id": 1108,
-  "next_comment_id": 1303,
+  "next_comment_id": 1304,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7344,11 +7344,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T05:55:19.436743818Z",
-      "updated_at": "2026-08-23T06:31:24.895446072Z",
+      "updated_at": "2026-08-23T06:31:29.135774308Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "1df23c93-c05d-4794-834a-5b759890373f": {
+          "display_id": 1303,
+          "author": "6Vw9",
+          "content": "Production wiring now compiles across all targets on Rust 1.98.0. Shared adapter clamps Anthropic/OpenAI Responses/Google/Ollama output fields, reserves tokens/turn/provider/concurrency/cost before HTTP, counts TUI retries, reconciles reported usage or retains conservative unknown usage, and records model/pricing provenance. VDD adversary, builder, and verifier calls now use the same caller run. Hooks and long-lived background shells also lease the shared concurrency budget. Legacy session.stop_conditions now narrows the canonical preflight budget instead of remaining a post-call-only predicate.",
+          "created_at": "2026-08-23T06:31:29.132713369Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABABCTH7cn3o1n45c9YvSCACM771zev3753T8MQjtQcYyStrHnlSRC4BIDnW0VXxrwMPNmEgc3EFdDxWgiAhuaZDQ=="
+        },
         "1e9794f0-031f-4067-8f06-861ffd93215e": {
           "display_id": 1302,
           "author": "6Vw9",
@@ -34830,11 +34839,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1129,
       "timestamp": "2026-08-23T06:31:24.895446072Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1130,
+      "timestamp": "2026-08-23T06:31:29.135774308Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T06:31:24.895446072Z",
+    "timestamp": "2026-08-23T06:31:29.135774308Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1129
+    "agent_seq": 1130
   }
 }
