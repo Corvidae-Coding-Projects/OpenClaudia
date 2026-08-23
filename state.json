@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1105,
+  "next_display_id": 1106,
   "next_comment_id": 1288,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -774,6 +774,7 @@
     "bf744e43-2429-4d0c-9976-42fead9cd618": 830,
     "bf780edd-5695-40ec-8e15-908ad9bb15f0": 124,
     "bfbb8f4b-a4f4-4b1d-871d-cec84a8ec41a": 977,
+    "c0b76136-7bc6-4445-ac92-0f51b39252e5": 1105,
     "c0f67de3-a89a-41a4-99d8-9cffbfebe430": 775,
     "c15e8367-cf9a-4902-984b-c3e09832e0e8": 1000,
     "c16f0cbc-19e6-4406-99b8-98a725d8a8fb": 832,
@@ -22180,6 +22181,18 @@
         }
       }
     },
+    "c0b76136-7bc6-4445-ac92-0f51b39252e5": {
+      "uuid": "c0b76136-7bc6-4445-ac92-0f51b39252e5",
+      "display_id": 1105,
+      "title": "S-050: Make provider terminal outcomes truthful",
+      "description": "Implement docs/remediation-slices/050-provider-terminal-outcome-state.md. Define one typed provider terminal classification across canonical runtime and production frontends so disconnect, malformed SSE, EOF without a valid terminal, timeout, cancellation, refusal, length exhaustion, and tool-loop abort cannot become committed assistant success, normal history, ResponseDone, or zero-status completion. Keep streamed deltas provisional and preserve partial display separately; do not expand into S-051 aggregate budgets or frontend-specific redesign.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T04:54:39.590578744Z",
+      "updated_at": "2026-08-23T04:54:39.590578744Z"
+    },
     "c0f67de3-a89a-41a4-99d8-9cffbfebe430": {
       "uuid": "c0f67de3-a89a-41a4-99d8-9cffbfebe430",
       "display_id": 775,
@@ -34503,11 +34516,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1102,
       "timestamp": "2026-08-23T04:53:03.344661868Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1103,
+      "timestamp": "2026-08-23T04:54:39.590578744Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T04:53:03.344661868Z",
+    "timestamp": "2026-08-23T04:54:39.590578744Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1102
+    "agent_seq": 1103
   }
 }
