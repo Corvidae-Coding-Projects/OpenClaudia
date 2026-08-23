@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1112,
+  "next_display_id": 1113,
   "next_comment_id": 1319,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -289,6 +289,7 @@
     "484de7d3-dabd-4249-bf56-2d596446ec01": 400,
     "48ea6d1c-a1dd-4c66-b814-9a4de9f7d64c": 187,
     "4929619b-86fb-4ff2-bb4a-c18de9ee20f6": 472,
+    "494ff912-0d6c-4e43-a96c-584c668c5223": 1112,
     "4956e2e0-fc51-452d-9b2d-da82b99f33b6": 1067,
     "4979db5f-d4e8-4163-b5f1-c287a0f79936": 1060,
     "4982ed1b-8abe-4593-8690-d21f65ba603f": 84,
@@ -8765,6 +8766,17 @@
         "qa-seam-vdd",
         "refactor"
       ]
+    },
+    "494ff912-0d6c-4e43-a96c-584c668c5223": {
+      "uuid": "494ff912-0d6c-4e43-a96c-584c668c5223",
+      "display_id": 1112,
+      "title": "Quiesce in-flight background effects before restrictive mode transitions",
+      "description": "Entering Plan, Initializer, or ReadOnly prevents new mutating calls but does not revoke already-running background shells or subagents owned by the run. Add a typed transition precondition or supervised cancellation/lease revocation so a restrictive capability generation cannot coexist with earlier in-flight mutation authority. Preserve explicit user choice, bounded cleanup, and exact run ownership; test active background shell and worker transitions.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T10:01:17.823149320Z",
+      "updated_at": "2026-08-23T10:01:17.823149320Z"
     },
     "4956e2e0-fc51-452d-9b2d-da82b99f33b6": {
       "uuid": "4956e2e0-fc51-452d-9b2d-da82b99f33b6",
@@ -35236,11 +35248,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1165,
       "timestamp": "2026-08-23T09:59:12.415623074Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1166,
+      "timestamp": "2026-08-23T10:01:17.823149320Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T09:59:12.415623074Z",
+    "timestamp": "2026-08-23T10:01:17.823149320Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1165
+    "agent_seq": 1166
   }
 }
