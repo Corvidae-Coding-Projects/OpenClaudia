@@ -172,6 +172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-051: Unify token, turn, cost, retry, and concurrency budgets (#1107)
 - S-050: Make provider terminal outcomes truthful (#1105)
 - Regenerate S-048 technical-memory evidence after cited source changed (#1106)
 - S-048: Centralize hardened provider HTTP transport (#1104)
