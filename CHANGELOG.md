@@ -100,6 +100,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI: every turn now dual-writes — the existing JSON snapshot at `~/.local/share/openclaudia/chat_sessions/<uuid>.json` stays for backward compat, and new entries also append to the JSONL transcript via `App::persist_transcript_tail`. Watermark tracking skips re-appending on resume
 
 ### Fixed
+- Bash timeout waits for descendant-held pipes and weak test masks delay (#1020)
 - Emit Gemini-compatible JSON Schemas for tool declarations (#1094)
 - Process-tree termination accepts Unix sentinel PID 0 (#1022)
 - ACP cancellation can leave daemonized sandbox descendants alive under suite load (#1021)
@@ -172,6 +173,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-040: Supervise foreground process I/O (#1114)
+- Reap sandbox processes left by bash background tests (#1067)
 - Refresh capability evidence after dormant-feature promotions (#1113)
 - Quiesce in-flight background effects before restrictive mode transitions (#1112)
 - Bind narrow behavioral scope to explicit approved targets (#1110)
