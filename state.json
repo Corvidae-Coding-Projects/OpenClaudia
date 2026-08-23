@@ -1,6 +1,6 @@
 {
   "next_display_id": 1109,
-  "next_comment_id": 1312,
+  "next_comment_id": 1313,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16120,7 +16120,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T07:20:15.059790695Z",
-      "updated_at": "2026-08-23T08:19:14.764778411Z",
+      "updated_at": "2026-08-23T08:40:55.195307463Z",
       "labels": [
         "remediation"
       ],
@@ -16133,6 +16133,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAE1BqZo1PyMvqKaehJ9wAuceiN1u94gZdHoB2ChXXiL8tJDj6wxAo/4nXl6f+IvAjH2JyYPdn/6fVsJPBSuhyAg=="
+        },
+        "159fdbe1-a2bf-424f-916f-f7754f70bed5": {
+          "display_id": 1312,
+          "author": "6Vw9",
+          "content": "[verification] Implemented one canonical causal checkpoint projection across proxy, legacy REPL, TUI, ACP, and subagents. Exact transcripts remain canonical archives; only causally closed groups compact; summaries are cited assistant-role historical evidence; request-bound measurements reject stale prior-turn token counts; committed/partial/cannot-fit outcomes publish atomically. OpenAI Responses uses provider-managed context_management compaction and retires superseded opaque/portable replay while preserving monotonic native-state generations; other ordinal-bound native protocols fail explicitly rather than corrupting history. Official API basis: https://developers.openai.com/api/reference/java/resources/responses/methods/compact and https://developers.openai.com/api/reference/cli/resources/responses/methods/create. Verification on Rust 1.98.0: cargo fmt --all -- --check; CARGO_BUILD_JOBS=4 cargo clippy --all-targets --all-features -- -D warnings; CARGO_BUILD_JOBS=4 cargo test --workspace --all-targets --all-features -- --test-threads=1 (zero failures; two intentional network-only ignores); git diff --check. Retrieval evidence artifacts were regenerated and remain deliberately review-rejected; no approval was fabricated.",
+          "created_at": "2026-08-23T08:40:55.191448696Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOy2XkThNY/c6tPwvM6u7flOwVcucE9oO7ztaBDwDJBSTP/PgNQPXHtaN8QXHnq0TOiasmXfR/wQyfoAhQ+KTDQ=="
         },
         "382a7e64-e1d0-4bf7-a4a8-5accd5c15fed": {
           "display_id": 1311,
@@ -35010,11 +35019,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1145,
       "timestamp": "2026-08-23T08:19:49.981263634Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1146,
+      "timestamp": "2026-08-23T08:40:55.195307463Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T08:19:49.981263634Z",
+    "timestamp": "2026-08-23T08:40:55.195307463Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1145
+    "agent_seq": 1146
   }
 }
