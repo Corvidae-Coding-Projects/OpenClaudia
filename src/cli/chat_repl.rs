@@ -23,7 +23,7 @@
 use crate::cli::display::tool_result::display_tool_result;
 use crate::cli::repl::input::expand_file_references;
 use crate::cli::repl::keybindings::{display_keybindings, execute_key_action, key_event_to_string};
-use crate::cli::repl::permissions::execute_shell_command_with_permission;
+use crate::cli::repl::permissions::execute_shell_command;
 use crate::cli::repl::plan_mode::{
     check_plan_mode_restriction, handle_enter_plan_mode, handle_exit_plan_mode,
     process_tool_follow_up,
@@ -835,29 +835,7 @@ impl ChatRepl {
                     self.clear_transient_prompt_options();
                     return Ok(Some(false));
                 }
-                if let Err(error) = self
-                    .run_context
-                    .admit_runtime_mode_direct_operation("shell escape")
-                {
-                    eprintln!("{error}");
-                    self.clear_transient_prompt_options();
-                    return Ok(Some(false));
-                }
-                if let Some(execution) = execute_shell_command_with_permission(
-                    &self.run_context,
-                    cmd,
-                    &mut self.permissions,
-                ) {
-                    openclaudia::grounded_loop::observe_shell_command_for_session(
-                        &self.run_context,
-                        &self.chat_session.id(),
-                        &execution.cwd,
-                        &execution.command,
-                        execution.exit_code,
-                        &execution.stdout,
-                        &execution.stderr,
-                    );
-                }
+                execute_shell_command(&self.run_context, &self.chat_session.id(), cmd);
                 self.clear_transient_prompt_options();
                 return Ok(Some(false));
             }

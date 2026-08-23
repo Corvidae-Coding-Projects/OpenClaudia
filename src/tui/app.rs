@@ -2064,9 +2064,12 @@ impl App {
                 }
                 let header = format!("$ {displayed}");
                 if exit_code.is_none() {
+                    if result.is_empty() {
+                        result = "command failed without diagnostic output".to_string();
+                    }
                     self.messages.add(DisplayMessage {
                         kind: MessageKind::ToolErr { name: header },
-                        content: format!("Failed: {stderr}"),
+                        content: format!("Failed: {result}"),
                     });
                     return;
                 }
@@ -3540,25 +3543,86 @@ impl App {
 
     /// Execute a shell command and display its output.
     ///
-    /// Dispatches to the tokio runtime via [`Self::spawn_shell`] (crosslink
-    /// #371). The previous implementation blocked the sync event loop on
-    /// `std::process::Command::new("bash").output()` for the full lifetime
-    /// of the child — long-running commands froze the spinner and queued
-    /// keypresses. We now post the result back via
-    /// [`AppEvent::ShellDone`] for the receiver in `handle_app_event` to
-    /// render with the same `$ <cmd>` header as before.
+    /// Dispatches the typed user-origin action through the canonical process
+    /// capability without blocking the TUI event loop.
     fn handle_shell_command(&self, cmd: &str) {
         if cmd.is_empty() {
             return;
         }
-        // Drop the JoinHandle explicitly: the shell escape is
-        // fire-and-forget, results arrive via AppEvent::ShellDone.
-        drop(self.spawn_shell(
-            vec!["bash", "-c", cmd],
-            SpawnTarget::ShellCommand {
-                displayed: cmd.to_string(),
-            },
-        ));
+        drop(self.spawn_direct_shell(cmd));
+    }
+
+    /// Spawn one explicit `!command` action through the shared sandboxed
+    /// supervisor and deliver its bounded result through the existing TUI event.
+    fn spawn_direct_shell(&self, command: &str) -> Option<tokio::task::JoinHandle<()>> {
+        let target = SpawnTarget::ShellCommand {
+            displayed: command.to_string(),
+        };
+        let tx = self.api_event_tx.clone()?;
+        let Some(handle) = self.runtime_handle.clone() else {
+            let _ = tx.send(AppEvent::ShellDone {
+                target,
+                stdout: String::new(),
+                stderr: "no async runtime bound — cannot spawn direct shell".to_string(),
+                exit_code: None,
+            });
+            return None;
+        };
+        let run = match &self.run_context {
+            Ok(run) => std::sync::Arc::clone(run),
+            Err(error) => {
+                let _ = tx.send(AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: format!("session process capability unavailable: {error}"),
+                    exit_code: None,
+                });
+                return None;
+            }
+        };
+        let action = crate::tools::DirectShellAction::new(command, self.chat_session.id());
+        Some(handle.spawn(async move {
+            let event = match crate::tools::execute_direct_shell_async(&run, action).await {
+                Ok(execution) => {
+                    let exit_code = execution.exit_code();
+                    let mut stderr = execution.stderr;
+                    if exit_code.is_none() {
+                        if let Some(status) = execution.status.as_ref() {
+                            if !stderr.is_empty() {
+                                stderr.push('\n');
+                            }
+                            let _ = std::fmt::Write::write_fmt(
+                                &mut stderr,
+                                format_args!("terminal status: {status}"),
+                            );
+                        }
+                    }
+                    AppEvent::ShellDone {
+                        target,
+                        stdout: execution.stdout,
+                        stderr,
+                        exit_code,
+                    }
+                }
+                Err(error) => {
+                    let (stdout, mut stderr) = error.partial_execution().map_or_else(
+                        || (String::new(), String::new()),
+                        |execution| (execution.stdout.clone(), execution.stderr.clone()),
+                    );
+                    if !stderr.is_empty() {
+                        stderr.push('\n');
+                    }
+                    stderr.push_str(&error.to_string());
+                    AppEvent::ShellDone {
+                        target,
+                        stdout,
+                        stderr,
+                        exit_code: None,
+                    }
+                }
+            };
+            let _ = tx.send(event);
+        }))
     }
 
     /// Send a user message to the API.
@@ -3672,8 +3736,17 @@ impl App {
         target: SpawnTarget,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let tx = self.api_event_tx.clone();
-        let session_id = self.chat_session.id();
-        let ledger_target = target.clone();
+        if matches!(target, SpawnTarget::ShellCommand { .. }) {
+            if let Some(tx) = tx {
+                let _ = tx.send(AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: "direct shell must use the canonical process capability".to_string(),
+                    exit_code: None,
+                });
+            }
+            return None;
+        }
         // Eagerly own the argv as Strings — the future outlives `&self`.
         let argv: Vec<String> = cmd.into_iter().map(str::to_owned).collect();
 
@@ -3735,7 +3808,7 @@ impl App {
 
         let mutation_effect = match &target {
             SpawnTarget::Init => Some(crate::tools::effect::ToolEffect::WorkspaceMutation),
-            SpawnTarget::ShellCommand { .. } => Some(crate::tools::effect::ToolEffect::Destructive),
+            SpawnTarget::ShellCommand { .. } => unreachable!("direct shell rejected above"),
             SpawnTarget::Diff | SpawnTarget::Review | SpawnTarget::Files | SpawnTarget::Doctor => {
                 None
             }
@@ -3805,20 +3878,6 @@ impl App {
                     }
                     crate::ledger::invalidate_verification_receipts_for_run(&run_context);
                 }
-            }
-
-            if let (SpawnTarget::ShellCommand { displayed }, Ok(out)) = (&ledger_target, &result) {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                crate::grounded_loop::observe_shell_command_for_session(
-                    &run_context,
-                    &session_id,
-                    &cwd,
-                    displayed,
-                    out.status.code().unwrap_or(-1),
-                    &stdout,
-                    &stderr,
-                );
             }
 
             let evt = match result {
@@ -7325,8 +7384,10 @@ mod tests {
         .expect("explore mode");
         let rx = wire_app(&mut app);
 
-        let join = app.spawn_shell(vec!["echo", "must-not-run"], SpawnTarget::Diff);
-        assert!(join.is_none());
+        let join = app
+            .spawn_direct_shell("printf must-not-run")
+            .expect("mode admission runs in the nonblocking task");
+        join.await.expect("direct shell admission task");
         let (_, stdout, stderr, exit_code) =
             recv_shell_done(&rx, Duration::from_millis(100)).expect("mode denial event");
         assert!(stdout.is_empty());
@@ -7425,21 +7486,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn spawn_shell_failure_delivers_nonzero_exit() {
+    async fn direct_shell_failure_delivers_nonzero_exit() {
         // `bash -c 'exit 7'` exits with code 7. ShellDone must surface
         // exit_code = Some(7) so the renderer picks the ToolErr branch.
         let mut app = App::new("test-model", "test-provider");
         let rx = wire_app(&mut app);
 
         let join = app
-            .spawn_shell(
-                vec!["bash", "-c", "exit 7"],
-                SpawnTarget::ShellCommand {
-                    displayed: "exit 7".to_string(),
-                },
-            )
-            .expect("runtime-backed spawn_shell should return a task handle");
-        join.await.expect("spawn_shell task panicked");
+            .spawn_direct_shell("exit 7")
+            .expect("runtime-backed direct shell should return a task handle");
+        join.await.expect("direct shell task panicked");
 
         let (target, _stdout, _stderr, exit_code) =
             recv_shell_done(&rx, Duration::from_millis(500))
@@ -7453,7 +7509,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn spawn_shell_command_records_ledger_observation() {
+    async fn direct_shell_records_ledger_observation() {
         let mut app = App::new("test-model", "test-provider");
         let rx = wire_app(&mut app);
         let run = Arc::clone(app.run_context.as_ref().expect("TUI run context"));
@@ -7464,14 +7520,9 @@ mod tests {
             crate::ledger::install_active_ledger_for_session(app.chat_session.id(), ledger.clone());
 
         let join = app
-            .spawn_shell(
-                vec!["bash", "-c", "printf tui-ledger"],
-                SpawnTarget::ShellCommand {
-                    displayed: "printf tui-ledger".to_string(),
-                },
-            )
-            .expect("runtime-backed spawn_shell should return a task handle");
-        join.await.expect("spawn_shell task panicked");
+            .spawn_direct_shell("printf tui-ledger")
+            .expect("runtime-backed direct shell should return a task handle");
+        join.await.expect("direct shell task panicked");
 
         let (_target, stdout, stderr, exit_code) = recv_shell_done(&rx, Duration::from_millis(500))
             .expect("expected ShellDone event from shell command");
@@ -7518,6 +7569,46 @@ mod tests {
                     && stderr.is_empty()
             )
         }));
+    }
+
+    #[test]
+    fn legacy_shell_spawn_rejects_direct_shell_targets() {
+        let mut app = App::new("test-model", "test-provider");
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        app.api_event_tx = Some(tx);
+
+        let join = app.spawn_shell(
+            vec!["bash", "-c", "printf bypass"],
+            SpawnTarget::ShellCommand {
+                displayed: "printf bypass".to_string(),
+            },
+        );
+
+        assert!(join.is_none());
+        let (_, stdout, stderr, exit_code) = recv_shell_done(&rx, Duration::from_millis(100))
+            .expect("canonical-route rejection event");
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("canonical process capability"));
+        assert_eq!(exit_code, None);
+    }
+
+    #[test]
+    fn direct_shell_failure_rendering_preserves_partial_output() {
+        let mut app = App::new("test-model", "test-provider");
+
+        app.handle_shell_done(
+            SpawnTarget::ShellCommand {
+                displayed: "slow-command".to_string(),
+            },
+            "partial stdout",
+            "command timed out",
+            None,
+        );
+
+        let message = app.messages.messages.last().expect("shell result");
+        assert!(message.kind.is_error());
+        assert!(message.content.contains("partial stdout"));
+        assert!(message.content.contains("command timed out"));
     }
 
     #[test]

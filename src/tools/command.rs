@@ -363,11 +363,23 @@ pub fn run_prepared_sandboxed_with_timeout(
     program_label: &str,
     timeout: Duration,
 ) -> Result<Output, CommandError> {
-    run_prepared_with_timeout(
+    run_prepared_run_owned_sync(run, command, program_label, ProcessLimits::new(timeout))
+        .map(SupervisedProcessOutput::into_std_output)
+}
+
+/// Execute a prepared run-owned process on the shared synchronous supervisor
+/// while preserving typed bounded-stream metadata for capability callers.
+pub fn run_prepared_run_owned_sync(
+    run: &crate::tools::security::ToolRunContext,
+    command: Command,
+    program_label: &str,
+    limits: ProcessLimits,
+) -> Result<SupervisedProcessOutput, CommandError> {
+    drive_supervisor_sync(
         ProcessExecution::RunOwned(run),
         command,
         program_label.to_string(),
-        timeout,
+        limits,
         None,
     )
 }

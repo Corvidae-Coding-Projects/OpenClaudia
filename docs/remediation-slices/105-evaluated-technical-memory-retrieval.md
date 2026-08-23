@@ -117,13 +117,13 @@ the validator requires exact sorted receipt coverage. The artifacts and their
 SHA-256 digests are:
 
 - tuning corpus:
-  `edf98143eb3eb7b48170b6d8204a25e1622b8baef074a4792efba2d19c4f825d`;
+  `3f329f9a881ee249915385a5d16ef7b41043c392d9577a35f4b8c28663270992`;
 - held-out corpus:
-  `fbb03c70923022df4d7f40f3fc6780f439ffa22bbb4eb19ecf134540d8b84ca9`;
+  `cb35d6f11af8fb1c281b4d97fa7ce5be1344b1a37f414389bf43d884df8cfe32`;
 - evaluation:
-  `83cf41b408fa7f02af8b6dfbf4c81e6b8e21f9195cfe319b40d53d8c6b24fbe1`;
+  `be09cd2ecfca754c26f66b21cbb7acb98ca9ef48b8f704d870c6c22348536b13`;
 - deliberately rejected review:
-  `cc9ec9c19fbb5b851e078527eb1819e60d2c50692d1c491ec7115621ef96bcf0`.
+  `da8ca79cad665f034ffb81a015952d15f371df257dc187d2cc2db853e95911b5`.
 
 S-052 subsequently changed the still-cited `src/main.rs` while preserving the
 tested migration-doctor contract. S-055 later removed only the unrelated legacy
@@ -133,6 +133,12 @@ label `worktree:s055`; the checked-in generator rebuilt the evaluation and the
 deliberately rejected review was rebound to the new exact artifacts. Canonical
 `worktree:sNNN` labels allow later slices to do the same without falsely
 retaining a historical Git generation.
+
+S-043 subsequently routed direct user shell actions through the shared Bash
+process capability and changed the still-cited `src/tools/bash/mod.rs`. Its
+source citation is therefore rebound to `worktree:s043`; the checked-in
+generator rebuilt the evaluation and the deliberately rejected review remains
+rejected while binding the new exact corpus and evaluation digests above.
 
 The SHA-256 digest of the sorted `sha256sum` manifest for the 15 changed
 non-slice artifacts is

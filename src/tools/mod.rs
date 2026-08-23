@@ -36,6 +36,10 @@ pub(crate) use bash::sandbox::{
     sandboxed_hook_command, sandboxed_process_command, sandboxed_process_command_with_env,
     SandboxProfile,
 };
+pub use bash::{
+    execute_direct_shell, execute_direct_shell_async, DirectShellAction, DirectShellError,
+    DirectShellExecution,
+};
 pub mod catalog;
 pub(crate) mod command;
 mod continuation;
