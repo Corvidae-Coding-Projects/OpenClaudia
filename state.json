@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1104,
+  "next_display_id": 1105,
   "next_comment_id": 1279,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -573,6 +573,7 @@
     "90ed3939-45f3-4472-a731-124ea9c2e9cc": 793,
     "91788026-8231-4aa6-a997-9e15199b9183": 7,
     "91839fca-5749-4e67-87f4-29dcb47491a4": 109,
+    "91b0478e-fad7-44e9-a70f-1a4f98a94919": 1104,
     "91baff22-5eed-4e87-a8c1-2b2ee77ade37": 85,
     "91ca9ae2-5525-4ed5-977a-781ce4cf04db": 185,
     "925b48c0-2495-4afe-b310-91368de37c0e": 672,
@@ -16766,6 +16767,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "91b0478e-fad7-44e9-a70f-1a4f98a94919": {
+      "uuid": "91b0478e-fad7-44e9-a70f-1a4f98a94919",
+      "display_id": 1104,
+      "title": "S-048: Centralize hardened provider HTTP transport",
+      "description": "Implement docs/remediation-slices/048-hardened-provider-http-transport.md. Give every provider and auth request one bounded, cancellable, redacting HTTP policy: TLS/proxy provenance, redirects, phased and total deadlines, bounded retries only when safe, body/stream limits, normalized status/errors, and credential stripping. Cover real provider/auth call paths and deterministic slow/oversized/retry/redirect/cancellation/secret-echo fixtures without expanding into S-050 terminal outcomes.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T03:46:31.098891631Z",
+      "updated_at": "2026-08-23T03:46:31.098891631Z"
     },
     "91baff22-5eed-4e87-a8c1-2b2ee77ade37": {
       "uuid": "91baff22-5eed-4e87-a8c1-2b2ee77ade37",
@@ -34325,11 +34338,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1087,
       "timestamp": "2026-08-23T03:45:18.522006675Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1088,
+      "timestamp": "2026-08-23T03:46:31.098891631Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T03:45:18.522006675Z",
+    "timestamp": "2026-08-23T03:46:31.098891631Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1087
+    "agent_seq": 1088
   }
 }
