@@ -58,6 +58,27 @@ fn run(
         .expect("explicit adversarial run")
 }
 
+fn trusted_skill_run(root: &std::path::Path, owner: &str) -> Arc<ToolRunContext> {
+    let policy =
+        openclaudia::skills::SkillCapabilityPolicy::project(Vec::new(), false, false, false)
+            .expect("text-only project skill policy");
+    let access = openclaudia::skills::SkillRunAccess::host_granted_project(root, policy)
+        .expect("canonical skill workspace");
+    ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .process_owner(owner)
+        .environment_grants(HashMap::new())
+        .skill_access(access)
+        .workspace_access(WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider("s019-skill-isolation")
+        .build()
+        .expect("trusted skill isolation run")
+}
+
 fn shell_id(result: &ToolResult) -> String {
     result
         .content()
@@ -427,8 +448,8 @@ fn project_skill_lookup_is_bound_to_the_exact_run_root() {
     )
     .expect("skill B fixture");
 
-    let run_a = run(root_a.path(), "s019-skill-a", HashMap::new());
-    let run_b = run(root_b.path(), "s019-skill-b", HashMap::new());
+    let run_a = trusted_skill_run(root_a.path(), "s019-skill-a");
+    let run_b = trusted_skill_run(root_b.path(), "s019-skill-b");
     let own_a = execute_tool(&run_a, &call("skill", json!({"name": name_a})));
     let own_b = execute_tool(&run_b, &call("skill", json!({"name": name_b})));
     let foreign_from_a = execute_tool(&run_a, &call("skill", json!({"name": name_b})));
@@ -469,8 +490,8 @@ fn prompt_skill_catalog_is_concurrently_bound_to_each_run_root() {
         .expect("prompt skill fixture");
     }
 
-    let run_a = run(root_a.path(), "s019-prompt-skill-a", HashMap::new());
-    let run_b = run(root_b.path(), "s019-prompt-skill-b", HashMap::new());
+    let run_a = trusted_skill_run(root_a.path(), "s019-prompt-skill-a");
+    let run_b = trusted_skill_run(root_b.path(), "s019-prompt-skill-b");
     let barrier = Arc::new(Barrier::new(2));
     let prompt_a = {
         let run = Arc::clone(&run_a);

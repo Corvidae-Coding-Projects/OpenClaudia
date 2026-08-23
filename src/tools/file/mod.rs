@@ -676,6 +676,7 @@ pub fn execute_read_file(
 
     if !is_error {
         READ_TRACKER.mark_read(run, &resolved);
+        run.record_skill_path_touch(&resolved);
         record_active_file_read_observation(run, &resolved, args, &content);
     }
 

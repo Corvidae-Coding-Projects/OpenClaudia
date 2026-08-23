@@ -123,6 +123,7 @@ pub struct ToolRunContextBuilder {
     mcp_environment_grants: Option<EnvironmentGrantSource>,
     executable_search_path: Option<OsString>,
     host_home: Option<PathBuf>,
+    skill_access: Option<crate::skills::SkillRunAccess>,
     inherit_host_startup_grants: bool,
     workspace_access: Option<WorkspaceAccess>,
     process: Option<bool>,
@@ -158,6 +159,7 @@ impl ToolRunContextBuilder {
             mcp_environment_grants: None,
             executable_search_path: None,
             host_home: None,
+            skill_access: None,
             inherit_host_startup_grants: false,
             workspace_access: None,
             process: None,
@@ -295,6 +297,16 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Supply an already-captured skill discovery/trust capability.
+    ///
+    /// Derived runs copy this value from their parent. Top-level production
+    /// runs normally capture it through [`Self::host_startup_grants`].
+    #[must_use]
+    pub fn skill_access(mut self, access: crate::skills::SkillRunAccess) -> Self {
+        self.skill_access = Some(access);
+        self
+    }
+
     #[must_use]
     pub const fn process(mut self, available: bool) -> Self {
         self.process = Some(available);
@@ -409,6 +421,8 @@ pub struct ToolRunContext {
     mcp_environment_grants: crate::secrets::EnvironmentGrants,
     executable_search_path: OsString,
     host_home: Option<PathBuf>,
+    skill_access: crate::skills::SkillRunAccess,
+    skill_touched_paths: Mutex<BTreeSet<PathBuf>>,
     network_policy: AgentNetworkPolicy,
     process_available: bool,
     network_available: bool,
@@ -443,6 +457,7 @@ impl std::fmt::Debug for ToolRunContext {
             )
             .field("executable_search_path", &"<redacted>")
             .field("host_home_bound", &self.host_home.is_some())
+            .field("skill_access", &self.skill_access)
             .field("process_available", &self.process_available)
             .field("network_available", &self.network_available)
             .field("secrets_available", &self.secrets_available)
@@ -504,6 +519,7 @@ impl ToolRunContext {
             mcp_environment_grants,
             executable_search_path,
             host_home,
+            skill_access,
             inherit_host_startup_grants,
             workspace_access,
             process,
@@ -668,6 +684,13 @@ impl ToolRunContext {
             }
             None => None,
         };
+        let skill_access = skill_access.unwrap_or_else(|| {
+            if inherit_host_startup_grants {
+                crate::skills::SkillRunAccess::capture(&project_root, host_home.as_deref())
+            } else {
+                crate::skills::SkillRunAccess::default()
+            }
+        });
         if !secrets {
             if let Some(name) = environment_grants
                 .keys()
@@ -792,6 +815,8 @@ impl ToolRunContext {
             mcp_environment_grants,
             executable_search_path,
             host_home,
+            skill_access,
+            skill_touched_paths: Mutex::new(BTreeSet::new()),
             network_policy,
             process_available: process,
             network_available: network,
@@ -1284,6 +1309,7 @@ impl ToolRunContext {
             .protected_mcp_environment_grants(self.mcp_environment_grants.clone())
             .executable_search_path(&self.executable_search_path)
             .host_home(self.host_home.clone())
+            .skill_access(self.skill_access.clone())
             .workspace_access(workspace_access)
             .process(self.grants_resource(ToolResource::Process))
             .network(self.grants_resource(ToolResource::Network))
@@ -1389,6 +1415,62 @@ impl ToolRunContext {
     #[must_use]
     pub fn host_home(&self) -> Option<&Path> {
         self.host_home.as_deref()
+    }
+
+    /// Skill roots and repository trust captured for this run generation.
+    #[must_use]
+    pub const fn skill_access(&self) -> &crate::skills::SkillRunAccess {
+        &self.skill_access
+    }
+
+    /// Record a project-relative file touched by a real workspace operation.
+    ///
+    /// Conditional skill activation consults this bounded set. Paths outside
+    /// the exact project capability and control-directory paths are ignored.
+    pub(crate) fn record_skill_path_touch(&self, path: &Path) {
+        const MAX_TOUCHED_PATHS: usize = 256;
+
+        let supplied = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.working_directory.join(path)
+        };
+        let resolved = supplied
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexical_path(&supplied));
+        let Ok(relative) = resolved.strip_prefix(&self.project_root) else {
+            return;
+        };
+        if relative.as_os_str().is_empty() || self.is_denied_path(&resolved) {
+            return;
+        }
+        let mut touched = self
+            .skill_touched_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if touched.len() < MAX_TOUCHED_PATHS || touched.contains(relative) {
+            touched.insert(relative.to_path_buf());
+            drop(touched);
+        } else {
+            drop(touched);
+            tracing::warn!(
+                target: "openclaudia::skills",
+                event = "skill_touched_path_limit",
+                max_touched_paths = MAX_TOUCHED_PATHS,
+                "Conditional skill path tracking reached its run ceiling"
+            );
+        }
+    }
+
+    /// Snapshot project-relative paths available to conditional skills.
+    #[must_use]
+    pub(crate) fn skill_touched_paths(&self) -> Vec<PathBuf> {
+        self.skill_touched_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Resolve an executable using only the immutable search path captured by
@@ -1531,6 +1613,20 @@ impl ToolRunContext {
         }
         Ok(roots)
     }
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 impl Drop for ToolRunContext {

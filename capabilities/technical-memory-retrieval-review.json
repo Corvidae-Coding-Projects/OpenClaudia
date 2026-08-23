@@ -1,7 +1,7 @@
 {
-  "evaluation_digest": "sha256:56a06c70fce3abc216c7964ec826aea2cc0785ec2d0dd8f4e29d79940ce0266b",
+  "evaluation_digest": "sha256:3f08ca33e551c8aca501d2a6cde40297f59c8df93d7558752a5916496fc70457",
   "evaluation_generator_id": "s105-evaluation-runner",
-  "held_out_corpus_digest": "sha256:cb35d6f11af8fb1c281b4d97fa7ce5be1344b1a37f414389bf43d884df8cfe32",
+  "held_out_corpus_digest": "sha256:8c91f83d3a3960edc882260c781735a790ffe44ac1fa378cb6490aee6389c2a8",
   "limitations": [
     "Independent corpus and evaluation review has not yet been performed; runtime promotion must fail closed to the lexical baseline."
   ],

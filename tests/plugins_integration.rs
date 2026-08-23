@@ -10,7 +10,9 @@ use openclaudia::plugins::policy::PluginPolicy;
 use openclaudia::plugins::{
     InstalledPlugins, MarketplaceSource, PluginError, PluginInstallEntry, PluginManager,
 };
-use openclaudia::skills::{load_skills, parse_skill_file, SkillDefinition};
+use openclaudia::skills::{
+    load_skills_for_run, parse_skill_file, ResolvedSkill, SkillCapabilityPolicy, SkillRunAccess,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -603,54 +605,42 @@ fn b4_full_valid_skill_file() {
 // ---------------------------------------------------------------------------
 // B5 — `load_skills` directory scanning
 //
-// `load_skills()` reads `dirs::home_dir()` (the `HOME` env var on Linux)
-// and a cwd-relative `.openclaudia/skills` path.  Both are process-global,
-// so tests that exercise the full `load_skills` call must be serialised.
-//
-// Strategy:
-//   • Tests that can exercise the *component* behaviour (parse_skill_file,
-//     dedup algorithm) do so directly without touching global state.
-//   • The one test that must call `load_skills` with controlled fixtures
-//     (b5_load_skills_serial) holds an advisory mutex so it does not race
-//     with itself if the suite is accidentally run in parallel via cargo
-//     nextest or similar.
+// Discovery is exercised through an explicit run capability. Tests never
+// mutate HOME or the process current directory.
 // ---------------------------------------------------------------------------
 
-/// Pin the scan-both-dirs, missing-dir, dropped-bad-file, dir-format,
-/// name-fallback, and dedup (B5 + B6) contracts in a single serialised
-/// test that controls HOME and cwd.
-///
-/// All five B5 behaviours and all three B6 behaviours are pinned here to
-/// avoid process-global-state races when the suite runs with multiple
-/// threads.  Each assertion block is clearly labelled.
+/// Pin host-user + trusted-project discovery, invalid-file containment,
+/// package formats, fallback naming, and source precedence without ambient
+/// process state.
 #[test]
-fn b5_b6_load_skills_serial() {
-    use std::sync::Mutex;
-    // Advisory mutex: makes this test body sequential even when cargo
-    // runs tests in a thread pool.  The Mutex is per-process, so any
-    // other test that mutates HOME or cwd should acquire it too.
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+fn b5_b6_load_skills_from_explicit_run_grants() {
     let (user_home, project_root) = b5_b6_write_fixtures();
+    let user_skills = user_home.path().join(".openclaudia/skills");
+    let policy = SkillCapabilityPolicy::project(Vec::new(), false, false, false)
+        .expect("text-only project trust");
+    let access = SkillRunAccess::from_host_grants(
+        None,
+        Some(&user_skills),
+        Some((project_root.path(), policy)),
+    )
+    .expect("explicit skill roots");
+    let run = openclaudia::tools::ToolRunContext::builder(
+        openclaudia::state::SessionId::new(),
+        project_root.path(),
+    )
+    .read_only_roots(Vec::new())
+    .read_write_roots(Vec::new())
+    .environment_grants(std::collections::HashMap::new())
+    .skill_access(access)
+    .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+    .process(false)
+    .network(false)
+    .secrets(false)
+    .provider("plugin-skill-test")
+    .build()
+    .expect("skill discovery run");
 
-    // ---- swap global state ----
-    let original_home = std::env::var("HOME").ok();
-    let original_cwd = std::env::current_dir().ok();
-    std::env::set_var("HOME", user_home.path());
-    std::env::set_current_dir(project_root.path()).unwrap();
-
-    let skills = load_skills();
-
-    // ---- restore global state before any assertion panics ----
-    if let Some(h) = original_home {
-        std::env::set_var("HOME", h);
-    }
-    if let Some(cwd) = original_cwd {
-        let _ = std::env::set_current_dir(cwd);
-    }
+    let skills = load_skills_for_run(&run);
 
     b5_b6_assert_contracts(&skills);
 }
@@ -741,7 +731,7 @@ fn b5_b6_write_fixtures() -> (TempDir, TempDir) {
 }
 
 /// Assert all B5+B6 behavioural contracts against the loaded skills list.
-fn b5_b6_assert_contracts(skills: &[SkillDefinition]) {
+fn b5_b6_assert_contracts(skills: &[ResolvedSkill]) {
     let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
 
     // B5-a: both dirs scanned
@@ -773,7 +763,7 @@ fn b5_b6_assert_contracts(skills: &[SkillDefinition]) {
     );
 
     // B6-a: project skill shadows user skill with same name
-    let shared_entries: Vec<&SkillDefinition> =
+    let shared_entries: Vec<&ResolvedSkill> =
         skills.iter().filter(|s| s.name == "shared").collect();
     assert_eq!(
         shared_entries.len(),

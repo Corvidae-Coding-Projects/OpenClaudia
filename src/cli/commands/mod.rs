@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod hooks;
 pub mod init;
 pub mod loop_cmd;
+pub mod skills;
 pub mod start;
 pub mod team;
 

@@ -860,6 +860,9 @@ pub struct App {
     next_turn_effort_level: Option<EffortLevel>,
     next_turn_model: Option<String>,
     next_turn_allowed_tool_rules: Vec<crate::permissions::PermissionRule>,
+    next_turn_skill_context: Vec<crate::context::ContextItem>,
+    next_turn_hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    active_turn_hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     /// Memory database for auto-learning from tool execution.
     pub memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     /// Loaded app configuration passed to tools that need provider/config state
@@ -992,6 +995,9 @@ impl App {
             next_turn_effort_level: None,
             next_turn_model: None,
             next_turn_allowed_tool_rules: Vec::new(),
+            next_turn_skill_context: Vec::new(),
+            next_turn_hook_engine: None,
+            active_turn_hook_engine: None,
             memory_db: None,
             app_config: None,
             permission_mgr: None,
@@ -1185,10 +1191,13 @@ impl App {
             self.api_client.prompt_blocks = None;
             return;
         };
-        self.api_client.prompt_blocks = Some(crate::prompt::build_prompt_context_for_run(
-            &self.chat_session.behavior_mode(),
-            run,
-        ));
+        self.api_client.prompt_blocks =
+            Some(crate::prompt::build_prompt_context_with_items_for_run(
+                &self.chat_session.behavior_mode(),
+                run,
+                self.next_turn_skill_context.clone(),
+                crate::context::ContextBudget::default(),
+            ));
     }
 
     fn rebind_mcp_runtime(&mut self, run: &std::sync::Arc<crate::tools::ToolRunContext>) {
@@ -1396,14 +1405,15 @@ impl App {
     /// Fire the `Stop` hook. Invoked when a turn reaches a terminal
     /// assistant response (no further tool-call follow-up). Best-effort
     /// — runtime/engine absence short-circuits silently.
-    fn fire_stop_hook(&self) {
-        if let (Some(engine), Some(handle)) =
-            (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
-        {
+    fn fire_stop_hook(&mut self) {
+        let engine = self
+            .active_turn_hook_engine
+            .take()
+            .or_else(|| self.hook_engine.clone());
+        if let (Some(engine), Some(handle)) = (engine, self.runtime_handle.as_ref()) {
             let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
                 return;
             };
-            let engine = engine.clone();
             let session_id = self.chat_session.id();
             handle.spawn(async move {
                 let input =
@@ -1417,9 +1427,11 @@ impl App {
     /// Fire the `Notification` hook with a free-form message. Used for
     /// API errors, rate-limit warnings, etc. Best-effort as above.
     fn fire_notification_hook(&self, message: &str, level: &str) {
-        if let (Some(engine), Some(handle)) =
-            (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
-        {
+        let engine = self
+            .active_turn_hook_engine
+            .as_ref()
+            .or(self.hook_engine.as_ref());
+        if let (Some(engine), Some(handle)) = (engine, self.runtime_handle.as_ref()) {
             let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
                 return;
             };
@@ -1768,6 +1780,7 @@ impl App {
                     .add(DisplayMessage::error(format!("Error: {msg}")));
                 self.is_waiting = false;
                 self.fire_notification_hook(&format!("API error: {msg}"), "error");
+                self.active_turn_hook_engine = None;
             }
             Ok(AppEvent::ApiRetry {
                 kind,
@@ -2239,6 +2252,7 @@ impl App {
             self.is_waiting = false;
             self.messages.finish_streaming();
             self.streaming_raw_text.clear();
+            self.active_turn_hook_engine = None;
             self.messages
                 .add(DisplayMessage::system("[Response interrupted]"));
         }
@@ -2601,6 +2615,7 @@ impl App {
                 self.is_waiting = false;
                 self.messages.finish_streaming();
                 self.streaming_raw_text.clear();
+                self.active_turn_hook_engine = None;
                 self.messages
                     .add(DisplayMessage::system("[Response interrupted]"));
             }
@@ -3060,7 +3075,19 @@ impl App {
         } else {
             let list = invocable_skills
                 .iter()
-                .map(|s| format!("  /{} — {}", s.name, s.description))
+                .map(|skill| {
+                    let hint = skill
+                        .argument_hint
+                        .as_deref()
+                        .map_or(String::new(), |hint| format!(" {hint}"));
+                    format!(
+                        "  /{}{} — {} [{:?}]",
+                        skill.name,
+                        hint,
+                        skill.description,
+                        skill.provenance().source
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             self.messages
@@ -3070,23 +3097,33 @@ impl App {
 
     /// Handle skill invocations and info/diagnostic commands.
     fn handle_info_slash(&mut self, text: &str) {
-        let skill_name = if text.starts_with("/skill ") {
+        let skill_request = if text.starts_with("/skill ") {
             text.strip_prefix("/skill ").unwrap_or("").trim()
         } else {
             text.strip_prefix('/').unwrap_or("")
         };
-        if let Some(skill) = self
-            .session_skills()
-            .into_iter()
-            .find(|skill| skill.name == skill_name && skill.user_invocable)
-        {
-            self.messages.add(DisplayMessage::system(format!(
-                "Running skill: /{}",
-                skill.name
-            )));
-            self.apply_skill_turn_metadata(&skill);
+        let split_at = skill_request
+            .find(char::is_whitespace)
+            .unwrap_or(skill_request.len());
+        let skill_name = &skill_request[..split_at];
+        let arguments = skill_request[split_at..].trim();
+        let activation = self.run_context.as_ref().ok().and_then(|run| {
+            crate::skills::activate_user_invocable_skill_for_run(run, skill_name).ok()
+        });
+        if let Some(activation) = activation {
+            let name = activation.selection().name.clone();
+            self.messages
+                .add(DisplayMessage::system(format!("Running skill: /{name}")));
+            self.apply_skill_turn_metadata(&activation);
+            let content = if arguments.is_empty() {
+                format!("Use the explicitly selected `/{name}` skill reference for this turn.")
+            } else {
+                format!(
+                    "Use the explicitly selected `/{name}` skill reference for this turn.\n\nUser arguments:\n{arguments}"
+                )
+            };
             self.chat_session
-                .push_message(serde_json::json!({ "role": "user", "content": skill.prompt }));
+                .push_message(serde_json::json!({ "role": "user", "content": content }));
             self.is_waiting = true;
             self.spawn_api_turn();
             return;
@@ -3114,19 +3151,16 @@ impl App {
         )));
     }
 
-    fn apply_skill_turn_metadata(&mut self, skill: &crate::skills::SkillDefinition) {
+    fn apply_skill_turn_metadata(&mut self, activation: &crate::skills::SkillActivation) {
         self.next_turn_allowed_tool_rules =
-            crate::permissions::allowed_tool_specs_to_permission_rules(
-                skill.allowed_tools.as_deref(),
-            );
+            crate::permissions::allowed_tool_specs_to_permission_rules(activation.allowed_tools());
 
-        if let Some(model) = skill
-            .model
-            .as_deref()
+        if let Some(model) = activation
+            .model()
             .filter(|model| self.can_use_prompt_model(model))
         {
             self.next_turn_model = Some(model.to_string());
-        } else if let Some(model) = skill.model.as_deref() {
+        } else if let Some(model) = activation.model() {
             tracing::debug!(
                 model = %model,
                 provider = %self.provider,
@@ -3134,9 +3168,19 @@ impl App {
             );
         }
 
-        if let Some(level) = skill.effort.as_deref().and_then(parse_prompt_effort_level) {
+        if let Some(level) = activation.effort().and_then(parse_prompt_effort_level) {
             self.next_turn_effort_level = Some(level);
         }
+        let name = &activation.selection().name;
+        self.next_turn_skill_context =
+            vec![activation.context_item(format!("tui.skill.explicit.{name}"))];
+        self.next_turn_hook_engine = activation.hooks().cloned().map(|hooks| {
+            let engine = match self.hook_engine.as_ref() {
+                Some(engine) => engine.with_scoped_hooks(hooks),
+                None => crate::hooks::HookEngine::new(hooks),
+            };
+            std::sync::Arc::new(engine)
+        });
     }
 
     fn can_use_prompt_model(&self, model: &str) -> bool {
@@ -3439,11 +3483,9 @@ impl App {
     ///
     /// A failed run construction deliberately yields no project skills rather
     /// than falling back to the process current directory.
-    fn session_skills(&self) -> Vec<crate::skills::SkillDefinition> {
+    fn session_skills(&self) -> Vec<crate::skills::ResolvedSkill> {
         match self.run_context.as_ref() {
-            Ok(run) => {
-                crate::skills::load_skills_for_project(run.project_root(), run.working_directory())
-            }
+            Ok(run) => crate::skills::load_skills_for_run(run),
             Err(error) => {
                 tracing::warn!(%error, "skill discovery unavailable without a valid TUI run");
                 Vec::new()
@@ -3941,7 +3983,13 @@ impl App {
         let claude_code_token = api.claude_code_token;
         let prompt_blocks = api.prompt_blocks;
         let wire_api = api.wire_api;
-        let hook_engine = self.hook_engine.clone();
+        let hook_engine = self
+            .next_turn_hook_engine
+            .take()
+            .or_else(|| self.active_turn_hook_engine.clone())
+            .or_else(|| self.hook_engine.clone());
+        self.active_turn_hook_engine.clone_from(&hook_engine);
+        self.next_turn_skill_context.clear();
         let session_id_for_task = self.chat_session.id();
         let run_context = match &self.run_context {
             Ok(run_context) => std::sync::Arc::clone(run_context),
@@ -4006,6 +4054,8 @@ impl App {
         self.next_turn_effort_level = None;
         self.next_turn_model = None;
         self.next_turn_allowed_tool_rules.clear();
+        self.next_turn_skill_context.clear();
+        self.next_turn_hook_engine = None;
     }
 
     fn input_area_height(&self, area_width: u16) -> u16 {
@@ -6487,31 +6537,66 @@ mod tests {
         assert!(last_display_content(&app).contains("in flight"));
     }
 
-    fn skill_fixture(
+    fn skill_activation_fixture(
         allowed_tools: Option<Vec<String>>,
         model: Option<&str>,
         effort: Option<&str>,
-    ) -> crate::skills::SkillDefinition {
-        crate::skills::SkillDefinition {
-            name: "test-skill".to_string(),
-            description: "test skill".to_string(),
-            allowed_tools,
-            when_to_use: None,
-            argument_hint: None,
-            model: model.map(str::to_string),
-            effort: effort.map(str::to_string),
-            paths: None,
-            hooks: None,
-            user_invocable: true,
-            prompt: "Do the skill work.".to_string(),
-            path: std::path::PathBuf::new(),
-        }
+    ) -> crate::skills::SkillActivation {
+        let root = tempfile::tempdir().expect("skill activation root");
+        let directory = root.path().join(".openclaudia/skills/test-skill");
+        std::fs::create_dir_all(&directory).expect("skill activation directory");
+        let tools_yaml = allowed_tools.as_ref().map_or(String::new(), |tools| {
+            format!(
+                "allowed_tools:\n{}\n",
+                tools
+                    .iter()
+                    .map(|tool| format!(
+                        "  - {}",
+                        serde_json::to_string(tool).expect("tool fixture string")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+        let model_yaml = model.map_or(String::new(), |model| format!("model: {model}\n"));
+        let effort_yaml = effort.map_or(String::new(), |effort| format!("effort: {effort}\n"));
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!(
+                "---\nname: test-skill\ndescription: test skill\n{tools_yaml}{model_yaml}{effort_yaml}---\nDo the skill work.\n"
+            ),
+        )
+        .expect("skill activation fixture");
+        let policy = crate::skills::SkillCapabilityPolicy::project(
+            allowed_tools.unwrap_or_default(),
+            true,
+            true,
+            false,
+        )
+        .expect("skill activation policy");
+        let access = crate::skills::SkillRunAccess::host_granted_project(root.path(), policy)
+            .expect("skill activation access");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .skill_access(access)
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(false)
+                .network(false)
+                .secrets(false)
+                .provider("tui-skill-test")
+                .build()
+                .expect("TUI skill run");
+        crate::skills::activate_user_invocable_skill_for_run(&run, "test-skill")
+            .expect("TUI skill activation")
     }
 
     #[test]
     fn tui_skill_metadata_sets_next_turn_hints() {
         let mut app = App::new("claude-sonnet-4-6", "anthropic");
-        let skill = skill_fixture(
+        let skill = skill_activation_fixture(
             Some(vec!["Bash(git status *)".to_string()]),
             Some("claude-opus-4-7"),
             Some("high"),
@@ -6531,7 +6616,7 @@ mod tests {
     #[test]
     fn tui_skill_metadata_ignores_cross_provider_model_hint() {
         let mut app = App::new("claude-sonnet-4-6", "anthropic");
-        let skill = skill_fixture(None, Some("gpt-5.5"), Some("future-effort"));
+        let skill = skill_activation_fixture(None, Some("gpt-5.5"), Some("future-effort"));
 
         app.apply_skill_turn_metadata(&skill);
 

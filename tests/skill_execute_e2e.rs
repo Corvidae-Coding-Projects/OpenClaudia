@@ -1,238 +1,152 @@
-//! End-to-end tests for `tools::skill::execute_skill` —
-//! the runtime entry point that the model invokes via the
-//! `/skill <name>` slash command to materialise an installed
-//! skill into the conversation.
-//!
-//! Sprint 128 of the verification effort. Sprint 108 covered
-//! `parse_skill_file` frontmatter; this file pins the
-//! caller-facing `execute_skill` contract — error messages
-//! on missing/empty/unknown name, return envelope shape,
-//! and the `(text, is_error)` tuple discipline.
+//! Typed model-side skill selection at the real run trust boundary.
 
-#![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::missing_panics_doc)]
 
-use openclaudia::tools::skill::execute_skill as execute_skill_for_run;
+use openclaudia::skills::{SkillCapabilityPolicy, SkillRunAccess};
+use openclaudia::tools::skill::execute_skill;
+use openclaudia::tools::{ToolFailureCode, ToolOutcome, ToolRunContext, WorkspaceAccess};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
-mod support;
-
-fn execute_skill(args: &HashMap<String, Value>) -> (String, bool) {
-    execute_skill_for_run(support::shared_run_context().as_ref(), args)
+fn run(root: &Path, trust_project: bool) -> Arc<ToolRunContext> {
+    let mut builder = ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider("skill-selection-test");
+    if trust_project {
+        let policy = SkillCapabilityPolicy::project(
+            vec!["Bash(git status *)".to_string()],
+            true,
+            true,
+            true,
+        )
+        .expect("bounded test policy");
+        builder = builder.skill_access(
+            SkillRunAccess::host_granted_project(root, policy).expect("canonical test root"),
+        );
+    }
+    builder.build().expect("skill test run")
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Section A — Missing / wrong-type `name` argument
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn missing_name_argument_returns_error_tuple() {
-    let args: HashMap<String, Value> = HashMap::new();
-    let (text, is_err) = execute_skill(&args);
-    assert!(is_err, "missing name MUST be error");
-    assert!(text.contains("missing required argument"));
-    assert!(text.contains("name"));
+fn args(name: Value) -> HashMap<String, Value> {
+    HashMap::from([("name".to_string(), name)])
 }
 
-#[test]
-fn name_with_wrong_type_returns_validation_error() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!(42));
-    let (text, is_err) = execute_skill(&args);
-    assert!(is_err, "non-string name MUST be error");
-    assert!(
-        text.contains("Invalid 'name' argument: expected string"),
-        "wrong-type name MUST be rejected clearly; got {text:?}"
-    );
+fn assert_failure(result: &openclaudia::tools::ToolHandlerResult, code: ToolFailureCode) {
+    let ToolOutcome::Error { failure } = &result.outcome else {
+        panic!("expected typed failure, got {:?}", result.outcome);
+    };
+    assert_eq!(failure.code, code);
+    assert!(!failure.message.is_empty());
 }
 
-#[test]
-fn name_as_array_returns_validation_error() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!(["multi", "value"]));
-    let (text, is_err) = execute_skill(&args);
-    assert!(is_err);
-    assert!(text.contains("Invalid 'name' argument: expected string"));
-}
-
-#[test]
-fn name_as_object_returns_validation_error() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!({"nested": "value"}));
-    let (text, is_err) = execute_skill(&args);
-    assert!(is_err);
-    assert!(text.contains("Invalid 'name' argument: expected string"));
-}
-
-#[test]
-fn name_as_null_returns_validation_error() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), Value::Null);
-    let (text, is_err) = execute_skill(&args);
-    assert!(is_err);
-    assert!(text.contains("Invalid 'name' argument: expected string"));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — Empty `name` argument
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn empty_name_string_returns_error_with_documented_message() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!(""));
-    let (text, is_err) = execute_skill(&args);
-    assert!(is_err);
-    assert!(
-        text.contains("empty"),
-        "MUST surface `name is empty`; got {text:?}"
-    );
+fn write_skill(root: &Path, body: &str) {
+    let directory = root.join(".openclaudia/skills/review");
+    std::fs::create_dir_all(&directory).expect("skill directory");
+    std::fs::write(
+        directory.join("SKILL.md"),
+        format!(
+            "---\nname: review\ndescription: Review code\nallowed_tools:\n  - Bash(git status *)\nmodel: gpt-5.6\neffort: high\n---\n{body}\n"
+        ),
+    )
+    .expect("skill fixture");
 }
 
 #[test]
-fn whitespace_only_name_is_treated_as_empty_after_trim() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!("   "));
-    let (text, is_err) = execute_skill(&args);
-    assert!(is_err);
-    assert!(text.contains("empty"));
-}
-
-#[test]
-fn tab_and_newline_only_name_is_treated_as_empty() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!("\t\n\r "));
-    let (_text, is_err) = execute_skill(&args);
-    assert!(is_err);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section C — Unknown skill name
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn unknown_skill_returns_error_with_documented_message() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert(
-        "name".to_string(),
-        json!("__definitely_no_such_skill_xyz_sprint128__"),
-    );
-    let (text, is_err) = execute_skill(&args);
-    assert!(is_err);
-    assert!(
-        text.contains("unknown skill"),
-        "MUST surface `unknown skill`; got {text:?}"
-    );
-}
-
-#[test]
-fn unknown_skill_error_message_includes_offending_name() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!("missing-skill-marker-xyz"));
-    let (text, _is_err) = execute_skill(&args);
-    assert!(
-        text.contains("missing-skill-marker-xyz"),
-        "error MUST echo offending name; got {text:?}"
-    );
-}
-
-#[test]
-fn unknown_skill_error_message_does_not_dump_catalog() {
-    // PINS DOC: error MUST NOT include the full skill catalog
-    // (would surprise the model with multi-KiB output).
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!("xyz"));
-    let (text, _is_err) = execute_skill(&args);
-    // Heuristic: a multi-KiB catalogue is well over 500 bytes.
-    assert!(
-        text.len() < 500,
-        "error message MUST stay compact (<500 bytes); got {} bytes: {text:?}",
-        text.len()
-    );
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section D — Name-string trimming
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn name_with_leading_whitespace_trimmed_before_lookup() {
-    // PINS DOC: name.trim() runs before get_skill lookup —
-    // both leading + trailing whitespace stripped.
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!("   nonexistent-skill"));
-    let (text, _is_err) = execute_skill(&args);
-    // Error mentions the trimmed name (no leading spaces).
-    assert!(
-        text.contains("nonexistent-skill"),
-        "trimmed name MUST appear in error; got {text:?}"
-    );
-    assert!(
-        !text.contains("   nonexistent"),
-        "leading spaces MUST be trimmed; got {text:?}"
-    );
-}
-
-#[test]
-fn name_with_trailing_whitespace_trimmed() {
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!("nonexistent-skill   "));
-    let (text, _is_err) = execute_skill(&args);
-    assert!(text.contains("nonexistent-skill"));
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section E — Return tuple discipline
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn return_tuple_text_is_non_empty_for_every_error_path() {
-    // Every error path returns non-empty text (operators
-    // need to know why).
-    let cases: Vec<HashMap<String, Value>> = vec![
-        HashMap::new(),
-        {
-            let mut m = HashMap::new();
-            m.insert("name".to_string(), json!(""));
-            m
-        },
-        {
-            let mut m = HashMap::new();
-            m.insert("name".to_string(), json!(42));
-            m
-        },
-        {
-            let mut m = HashMap::new();
-            m.insert("name".to_string(), json!("nonexistent-skill-name"));
-            m
-        },
-    ];
-    for args in cases {
-        let (text, is_err) = execute_skill(&args);
-        assert!(is_err);
-        assert!(!text.is_empty(), "error path MUST return non-empty text");
+fn invalid_name_arguments_are_typed_and_bounded() {
+    let root = tempfile::tempdir().expect("root");
+    let run = run(root.path(), false);
+    for arguments in [HashMap::new(), args(json!(42)), args(json!("   "))] {
+        let result = execute_skill(&run, &arguments);
+        assert_failure(&result, ToolFailureCode::InvalidArguments);
+        assert!(result.content().len() < 500);
     }
 }
 
 #[test]
-fn execute_skill_does_not_panic_on_arbitrary_extra_args() {
-    // Extra args (beyond `name`) MUST be ignored, not panic.
-    let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("name".to_string(), json!("unknown"));
-    args.insert("extra".to_string(), json!("ignored"));
-    args.insert("verbose".to_string(), json!(true));
-    args.insert("count".to_string(), json!(42));
-    let (_text, is_err) = execute_skill(&args);
-    // Still errors (unknown skill) but doesn't panic on extras.
-    assert!(is_err);
+fn repository_skill_is_inert_without_host_trust() {
+    let root = tempfile::tempdir().expect("root");
+    write_skill(root.path(), "UNTRUSTED_PROJECT_BODY");
+    let run = run(root.path(), false);
+
+    let result = execute_skill(&run, &args(json!("review")));
+
+    assert_failure(&result, ToolFailureCode::Unavailable);
+    assert!(!result.content().contains("UNTRUSTED_PROJECT_BODY"));
 }
 
 #[test]
-fn execute_skill_is_must_use_returns_2_element_tuple() {
-    // Compile-time: the return is (String, bool) — verify
-    // we can destructure.
-    let args = HashMap::new();
-    let (_text, _is_err): (String, bool) = execute_skill(&args);
+fn trusted_model_selection_is_structured_reference_without_runtime_grants() {
+    let root = tempfile::tempdir().expect("root");
+    write_skill(root.path(), "REVIEW_THE_REAL_DIFF");
+    let run = run(root.path(), true);
+
+    let result = execute_skill(&run, &args(json!("  review  ")));
+
+    assert!(!matches!(result.outcome, ToolOutcome::Error { .. }));
+    assert!(result.content().contains("REVIEW_THE_REAL_DIFF"));
+    assert!(!result.content().contains("<skill"));
+    let ToolOutcome::Success { content } = &result.outcome else {
+        panic!("expected complete skill selection");
+    };
+    let structured = content.structured.as_ref().expect("typed selection");
+    assert_eq!(structured["schema"], "openclaudia.skill_selection.v1");
+    assert_eq!(structured["name"], "review");
+    assert_eq!(structured["trigger"], "model_selection");
+    assert_eq!(
+        structured["requested_allowed_tools"],
+        json!(["Bash(git status *)"])
+    );
+    assert_eq!(structured["effective_allowed_tools"], json!([]));
+    assert!(structured["effective_model"].is_null());
+    assert!(structured["effective_effort"].is_null());
+    assert_eq!(structured["hooks_active"], false);
+    assert_eq!(structured["provenance"]["source"], "project");
+    assert!(structured["provenance"]["content_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:")));
+}
+
+#[test]
+fn content_digest_cache_observes_an_in_place_edit_in_the_same_run() {
+    let root = tempfile::tempdir().expect("root");
+    write_skill(root.path(), "FIRST_BODY");
+    let run = run(root.path(), true);
+    let arguments = args(json!("review"));
+
+    let first = execute_skill(&run, &arguments);
+    let first_structured = match &first.outcome {
+        ToolOutcome::Success { content } => content.structured.as_ref().expect("first selection"),
+        ToolOutcome::Error { failure } => panic!("first selection failed: {failure:?}"),
+        ToolOutcome::Partial { .. } => panic!("skill selection cannot be partial"),
+    };
+    let first_digest = first_structured["provenance"]["content_digest"]
+        .as_str()
+        .expect("first digest")
+        .to_string();
+
+    write_skill(root.path(), "SECOND_BODY");
+    let second = execute_skill(&run, &arguments);
+    let second_structured = match &second.outcome {
+        ToolOutcome::Success { content } => content.structured.as_ref().expect("second selection"),
+        ToolOutcome::Error { failure } => panic!("second selection failed: {failure:?}"),
+        ToolOutcome::Partial { .. } => panic!("skill selection cannot be partial"),
+    };
+
+    assert!(second.content().contains("SECOND_BODY"));
+    assert!(!second.content().contains("FIRST_BODY"));
+    assert_ne!(
+        first_digest,
+        second_structured["provenance"]["content_digest"]
+            .as_str()
+            .expect("second digest")
+    );
 }

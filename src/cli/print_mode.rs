@@ -20,6 +20,26 @@ pub struct PrintOptions {
     pub prompt: String,
 }
 
+struct PrintTurn {
+    prompt: String,
+    context_items: Vec<openclaudia::context::ContextItem>,
+    skill_model: Option<String>,
+    skill_effort: Option<String>,
+    skill_hooks: Option<openclaudia::config::HooksConfig>,
+}
+
+impl PrintTurn {
+    const fn plain(prompt: String) -> Self {
+        Self {
+            prompt,
+            context_items: Vec::new(),
+            skill_model: None,
+            skill_effort: None,
+            skill_hooks: None,
+        }
+    }
+}
+
 struct PrintSseState {
     anthropic_accumulator: openclaudia::tools::AnthropicToolAccumulator,
     tool_accumulator: openclaudia::tools::ToolCallAccumulator,
@@ -79,11 +99,22 @@ fn build_print_request(
     Ok(body)
 }
 
+#[cfg(test)]
 fn build_print_chat_request(
     adapter: &dyn ProviderAdapter,
     model: &str,
     prompt: String,
     run: &openclaudia::tools::ToolRunContext,
+) -> openclaudia::proxy::ChatCompletionRequest {
+    build_print_chat_request_with_items(adapter, model, prompt, run, Vec::new())
+}
+
+fn build_print_chat_request_with_items(
+    adapter: &dyn ProviderAdapter,
+    model: &str,
+    prompt: String,
+    run: &openclaudia::tools::ToolRunContext,
+    context_items: Vec<openclaudia::context::ContextItem>,
 ) -> openclaudia::proxy::ChatCompletionRequest {
     let user_messages = vec![openclaudia::proxy::ChatMessage {
         role: "user".to_string(),
@@ -93,9 +124,11 @@ fn build_print_chat_request(
         tool_calls: None,
         extra: std::collections::HashMap::new(),
     }];
-    let prompt_context = openclaudia::prompt::build_prompt_context_for_run(
+    let prompt_context = openclaudia::prompt::build_prompt_context_with_items_for_run(
         &openclaudia::modes::BehaviorMode::default(),
         run,
+        context_items,
+        openclaudia::context::ContextBudget::default(),
     );
     openclaudia::proxy::ChatCompletionRequest {
         model: model.to_string(),
@@ -107,6 +140,88 @@ fn build_print_chat_request(
         tool_choice: None,
         extra: std::collections::HashMap::new(),
     }
+}
+
+fn resolve_print_turn(
+    prompt: String,
+    run: &openclaudia::tools::ToolRunContext,
+) -> anyhow::Result<PrintTurn> {
+    let trimmed = prompt.trim();
+    let (strict, name, arguments) = if trimmed == "/skill" {
+        anyhow::bail!("Usage: openclaudia --print '/skill <name> [arguments]'");
+    } else if let Some(rest) = trimmed.strip_prefix("/skill ") {
+        let rest = rest.trim_start();
+        let (name, arguments) = rest
+            .split_once(char::is_whitespace)
+            .map_or((rest, ""), |(name, arguments)| (name, arguments.trim()));
+        if name.is_empty() {
+            anyhow::bail!("Usage: openclaudia --print '/skill <name> [arguments]'");
+        }
+        (true, name, arguments)
+    } else if let Some(rest) = trimmed.strip_prefix('/') {
+        let (name, arguments) = rest
+            .split_once(char::is_whitespace)
+            .map_or((rest, ""), |(name, arguments)| (name, arguments.trim()));
+        if name.is_empty() {
+            return Ok(PrintTurn::plain(prompt));
+        }
+        (false, name, arguments)
+    } else {
+        return Ok(PrintTurn::plain(prompt));
+    };
+
+    let activation = match openclaudia::skills::activate_user_invocable_skill_for_run(run, name) {
+        Ok(activation) => activation,
+        Err(openclaudia::skills::SkillActivationError::Unavailable(_)) if !strict => {
+            return Ok(PrintTurn::plain(prompt));
+        }
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
+    let selected_name = activation.selection().name.clone();
+    let user_prompt = if arguments.is_empty() {
+        format!("Use the explicitly selected `/{selected_name}` skill reference for this turn.")
+    } else {
+        format!(
+            "Use the explicitly selected `/{selected_name}` skill reference for this turn.\n\nUser arguments:\n{arguments}"
+        )
+    };
+    Ok(PrintTurn {
+        prompt: user_prompt,
+        context_items: vec![
+            activation.context_item(format!("print.skill.explicit.{selected_name}"))
+        ],
+        skill_model: activation.model().map(str::to_string),
+        skill_effort: activation.effort().and_then(normalize_print_skill_effort),
+        skill_hooks: activation.hooks().cloned(),
+    })
+}
+
+fn normalize_print_skill_effort(effort: &str) -> Option<String> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => {
+            Some(effort.trim().to_ascii_lowercase())
+        }
+        "max" => Some("xhigh".to_string()),
+        _ => None,
+    }
+}
+
+fn canonical_provider_name(provider: &str) -> &str {
+    match provider {
+        "gemini" => "google",
+        "alibaba" => "qwen",
+        "zhipu" | "glm" => "zai",
+        "moonshot" => "kimi",
+        other => other,
+    }
+}
+
+fn print_provider_accepts_model(config: &openclaudia::config::AppConfig, model: &str) -> bool {
+    if openclaudia::providers::is_openai_compatible_passthrough_target(&config.proxy.target) {
+        return true;
+    }
+    let detected = openclaudia::proxy::determine_provider(model, config);
+    canonical_provider_name(&detected) == canonical_provider_name(&config.proxy.target)
 }
 
 fn enforce_print_request_policy(
@@ -444,12 +559,18 @@ fn prepare_print_transport(
 pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     crate::chdir_to_git_root();
 
-    let config = load_print_config(
-        options.model_override.as_deref(),
-        options.target_override.as_deref(),
-    )?;
+    let PrintOptions {
+        model_override,
+        target_override,
+        prompt,
+    } = options;
+    let explicit_model_override = model_override.is_some();
+    let config = load_print_config(model_override.as_deref(), target_override.as_deref())?;
     let print_root = std::env::current_dir()
         .map_err(|error| anyhow::anyhow!("could not resolve print-mode project root: {error}"))?;
+    let host_home = dirs::home_dir().and_then(|path| path.canonicalize().ok());
+    let skill_access =
+        openclaudia::skills::SkillRunAccess::capture(&print_root, host_home.as_deref());
     let print_run = openclaudia::tools::ToolRunContext::builder(
         openclaudia::state::SessionId::new(),
         &print_root,
@@ -458,6 +579,7 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     .read_only_roots(Vec::new())
     .read_write_roots(Vec::new())
     .environment_grants(std::collections::HashMap::new())
+    .skill_access(skill_access)
     .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
     .process(false)
     .network(true)
@@ -471,7 +593,33 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     )
     .build()
     .map_err(anyhow::Error::msg)?;
-    let provider = config.active_provider().ok_or_else(|| {
+    let mut print_turn = resolve_print_turn(prompt, &print_run)?;
+    if let Some(skill_hooks) = print_turn.skill_hooks.take() {
+        use openclaudia::hooks::{HookEvent, HookInput};
+
+        let hook_engine = crate::build_hook_engine(&config).with_scoped_hooks(skill_hooks);
+        let hook_input = HookInput::for_run(&print_run, HookEvent::UserPromptSubmit)
+            .with_prompt(&print_turn.prompt);
+        let hook_result = hook_engine
+            .run(HookEvent::UserPromptSubmit, &hook_input)
+            .await;
+        if !hook_result.allowed {
+            let reason = hook_result
+                .outputs
+                .first()
+                .and_then(|output| output.reason.clone())
+                .unwrap_or_else(|| "Request blocked by skill hook".to_string());
+            anyhow::bail!("Print request blocked by hook: {reason}");
+        }
+        print_turn
+            .context_items
+            .extend(openclaudia::context::hook_result_reference_items(
+                &hook_result,
+                "print_user_prompt_submit",
+                500,
+            ));
+    }
+    let mut provider = config.active_provider().cloned().ok_or_else(|| {
         anyhow::anyhow!(
             "no provider configured for target '{}'",
             config.proxy.target
@@ -479,7 +627,7 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     })?;
     let Some(chat_auth) = resolve_chat_auth(
         &config.proxy.target,
-        provider,
+        &provider,
         ChatAuthSelectionMode::Automatic,
     )
     .await?
@@ -489,18 +637,37 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
             config.proxy.target
         );
     };
-    let model = resolve_model_name(
-        options.model_override,
-        provider.model.clone(),
-        &config.proxy.target,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let mut model =
+        resolve_model_name(model_override, provider.model.clone(), &config.proxy.target)
+            .map_err(anyhow::Error::msg)?;
+    if !explicit_model_override {
+        if let Some(skill_model) = print_turn.skill_model.as_deref() {
+            if print_provider_accepts_model(&config, skill_model) {
+                model = skill_model.to_string();
+            } else {
+                tracing::debug!(
+                    model = %skill_model,
+                    provider = %config.proxy.target,
+                    "ignoring skill model hint for a different provider in print mode"
+                );
+            }
+        }
+    }
+    if let Some(skill_effort) = print_turn.skill_effort.take() {
+        provider.thinking.reasoning_effort = Some(skill_effort);
+    }
     let adapter = openclaudia::providers::get_adapter(&config.proxy.target)?;
-    let chat_request = build_print_chat_request(adapter, &model, options.prompt, &print_run);
+    let chat_request = build_print_chat_request_with_items(
+        adapter,
+        &model,
+        print_turn.prompt,
+        &print_run,
+        print_turn.context_items,
+    );
     enforce_print_request_policy(&config, &chat_request)?;
     let prepared = prepare_print_transport(&PreparePrintTransport {
         config: &config,
-        provider,
+        provider: &provider,
         adapter,
         model: &model,
         chat_request: &chat_request,
@@ -584,6 +751,27 @@ mod tests {
         })
     }
 
+    fn print_skill_run(root: &std::path::Path) -> Arc<openclaudia::tools::ToolRunContext> {
+        let policy =
+            openclaudia::skills::SkillCapabilityPolicy::project(Vec::new(), true, true, false)
+                .expect("print skill policy");
+        let access = openclaudia::skills::SkillRunAccess::host_granted_project(root, policy)
+            .expect("print skill access");
+        openclaudia::tools::ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+            .working_directory(root)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .skill_access(access)
+            .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(true)
+            .secrets(true)
+            .provider("openai")
+            .build()
+            .expect("print skill run")
+    }
+
     fn test_config_with_policy(
         policy: openclaudia::services::policy::EnterprisePolicy,
     ) -> openclaudia::config::AppConfig {
@@ -601,6 +789,81 @@ mod tests {
             policy,
             managed_settings_path: None,
         }
+    }
+
+    #[test]
+    fn print_mode_resolves_an_explicit_skill_as_one_turn_reference_context() {
+        let root = tempfile::tempdir().expect("print skill project");
+        let directory = root.path().join(".openclaudia/skills/review");
+        std::fs::create_dir_all(&directory).expect("print skill directory");
+        std::fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: review\ndescription: review code\nmodel: gpt-5.6\neffort: high\n---\nPRINT_SKILL_REFERENCE_BODY\n",
+        )
+        .expect("print skill fixture");
+        let run = print_skill_run(root.path());
+
+        let turn = resolve_print_turn("/skill review src/lib.rs".to_string(), &run)
+            .expect("print skill invocation");
+        assert_eq!(turn.skill_model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(turn.skill_effort.as_deref(), Some("high"));
+        assert!(turn.prompt.contains("User arguments:\nsrc/lib.rs"));
+        assert!(!turn.prompt.contains("PRINT_SKILL_REFERENCE_BODY"));
+
+        let request = build_print_chat_request_with_items(
+            openclaudia::providers::get_adapter("openai").expect("adapter"),
+            "gpt-5.6",
+            turn.prompt,
+            &run,
+            turn.context_items,
+        );
+        let user_projection = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| serde_json::to_string(&message.content).expect("message content"))
+            .collect::<String>();
+        let system_projection = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "system")
+            .map(|message| serde_json::to_string(&message.content).expect("message content"))
+            .collect::<String>();
+        assert!(user_projection.contains("PRINT_SKILL_REFERENCE_BODY"));
+        assert!(!system_projection.contains("PRINT_SKILL_REFERENCE_BODY"));
+    }
+
+    #[test]
+    fn print_mode_rejects_untrusted_project_skill_body() {
+        let root = tempfile::tempdir().expect("print skill project");
+        let directory = root.path().join(".openclaudia/skills/review");
+        std::fs::create_dir_all(&directory).expect("print skill directory");
+        std::fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: review\ndescription: review code\n---\nUNTRUSTED_PRINT_SKILL_BODY\n",
+        )
+        .expect("print skill fixture");
+        let run = openclaudia::tools::ToolRunContext::builder(
+            openclaudia::state::SessionId::new(),
+            root.path(),
+        )
+        .working_directory(root.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
+        .process(false)
+        .network(true)
+        .secrets(true)
+        .provider("openai")
+        .build()
+        .expect("untrusted print run");
+
+        let error = resolve_print_turn("/skill review".to_string(), &run)
+            .err()
+            .expect("untrusted skill must be unavailable");
+        assert!(error.to_string().contains("unknown or unavailable skill"));
+        assert!(!error.to_string().contains("UNTRUSTED_PRINT_SKILL_BODY"));
     }
 
     #[test]

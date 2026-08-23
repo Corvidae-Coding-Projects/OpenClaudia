@@ -487,7 +487,7 @@ fn add_output_style_item(items: &mut Vec<ContextItem>) {
 
 fn add_skill_items(items: &mut Vec<ContextItem>, run: Option<&crate::tools::ToolRunContext>) {
     let mut skills = run.map_or_else(crate::skills::load_global_skills, |run| {
-        crate::skills::load_skills_for_project(run.project_root(), run.working_directory())
+        crate::skills::load_skills_for_run(run)
     });
     skills.sort_by(|left, right| {
         left.name
@@ -496,18 +496,32 @@ fn add_skill_items(items: &mut Vec<ContextItem>, run: Option<&crate::tools::Tool
     });
     for (index, skill) in skills.into_iter().enumerate() {
         let when_to_use = skill.when_to_use.as_deref().unwrap_or(&skill.description);
+        let argument_hint = skill.argument_hint.as_deref().unwrap_or("(none)");
+        let provenance = skill.provenance();
         let content = format!(
-            "Available skill metadata\nName: /{}\nDescription: {}\nWhen to use: {}",
-            skill.name, skill.description, when_to_use
+            "Available skill metadata\nName: /{}\nDescription: {}\nWhen to use: {}\nArgument hint: {}\nSource: {:?}\nContent digest: {}",
+            skill.name,
+            skill.description,
+            when_to_use,
+            argument_hint,
+            provenance.source,
+            provenance.content_digest,
         );
         items.push(ContextItem::reference(
             format!("skill.metadata.{index}.{}", skill.name),
             ReferenceSource::Skill,
-            skill.path.display().to_string(),
+            provenance
+                .root
+                .join(&provenance.relative_path)
+                .display()
+                .to_string(),
             content,
             ContextFreshness::Session,
             200,
         ));
+    }
+    if let Some(run) = run {
+        items.extend(crate::skills::conditional_skill_context_items_for_run(run));
     }
 }
 

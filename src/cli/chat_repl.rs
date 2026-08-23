@@ -234,6 +234,8 @@ pub struct ChatRepl {
     transient_allowed_tool_rules: Vec<PermissionRule>,
     transient_model_restore: Option<String>,
     transient_effort_override: Option<EffortLevel>,
+    transient_skill_context: Vec<openclaudia::context::ContextItem>,
+    transient_hook_engine: Option<openclaudia::hooks::HookEngine>,
     pending_manual_compaction: Option<PendingManualCompaction>,
     plugin_manager: plugins::PluginManager,
 }
@@ -710,6 +712,8 @@ impl ChatRepl {
             transient_allowed_tool_rules: Vec::new(),
             transient_model_restore: None,
             transient_effort_override: None,
+            transient_skill_context: Vec::new(),
+            transient_hook_engine: None,
             pending_manual_compaction: None,
             plugin_manager,
         })
@@ -1156,7 +1160,7 @@ impl ChatRepl {
             }
             SlashCommandResult::Skill(invocation) => {
                 eprintln!("\x1b[36m⚡ Running skill...\x1b[0m");
-                self.apply_skill_invocation(input, invocation);
+                self.apply_skill_invocation(input, *invocation);
                 SlashOutcome::RewrittenPrompt
             }
             SlashCommandResult::Plugin(action) => {
@@ -1187,12 +1191,29 @@ impl ChatRepl {
     }
 
     fn apply_skill_invocation(&mut self, input: &mut String, invocation: SkillInvocation) {
+        let SkillInvocation {
+            activation,
+            arguments,
+        } = invocation;
         self.apply_prompt_metadata(
-            invocation.allowed_tools.as_deref(),
-            invocation.model.as_deref(),
-            invocation.effort.as_deref(),
+            activation.allowed_tools(),
+            activation.model(),
+            activation.effort(),
         );
-        *input = invocation.prompt;
+        let name = activation.selection().name.clone();
+        self.transient_skill_context =
+            vec![activation.context_item(format!("repl.skill.explicit.{name}"))];
+        self.transient_hook_engine = activation
+            .hooks()
+            .cloned()
+            .map(|hooks| self.hook_engine.with_scoped_hooks(hooks));
+        *input = if arguments.is_empty() {
+            format!("Use the explicitly selected `/{name}` skill reference for this turn.")
+        } else {
+            format!(
+                "Use the explicitly selected `/{name}` skill reference for this turn.\n\nUser arguments:\n{arguments}"
+            )
+        };
     }
 
     fn apply_prompt_metadata(
@@ -1233,6 +1254,14 @@ impl ChatRepl {
             self.model = model;
         }
         self.transient_effort_override = None;
+        self.transient_skill_context.clear();
+        self.transient_hook_engine = None;
+    }
+
+    fn active_hook_engine(&self) -> &openclaudia::hooks::HookEngine {
+        self.transient_hook_engine
+            .as_ref()
+            .unwrap_or(&self.hook_engine)
     }
 
     /// Handle the simple state-mutation slash results that share a
@@ -1566,7 +1595,7 @@ impl ChatRepl {
         let hook_input = HookInput::for_run(&self.run_context, HookEvent::UserPromptSubmit)
             .with_prompt(&expanded_input);
         let hook_result = self
-            .hook_engine
+            .active_hook_engine()
             .run(HookEvent::UserPromptSubmit, &hook_input)
             .await;
 
@@ -1661,7 +1690,7 @@ impl ChatRepl {
                 compactor
                     .force_compact(
                         &mut request,
-                        Some(&self.hook_engine),
+                        Some(self.active_hook_engine()),
                         &self.run_context,
                         Some(&self.chat_session.id()),
                     )
@@ -1673,7 +1702,7 @@ impl ChatRepl {
                 .auto_compact(
                     &mut request,
                     None,
-                    Some(&self.hook_engine),
+                    Some(self.active_hook_engine()),
                     &self.run_context,
                     Some(&self.chat_session.id()),
                     None,
@@ -1781,7 +1810,7 @@ impl ChatRepl {
     ) -> Option<tools::ToolResult> {
         openclaudia::services::tool_executor::ToolExecutor::run_pre_tool_use(
             &self.run_context,
-            &self.hook_engine,
+            self.active_hook_engine(),
             Some(&self.chat_session.id()),
             &tool_call.function.name,
             tool_args,
@@ -1831,6 +1860,8 @@ impl ChatRepl {
                 5,
             ));
         }
+
+        additional_items.extend(self.transient_skill_context.iter().cloned());
 
         prompt::build_prompt_context_with_items_for_run(
             &behavior_mode,
@@ -2509,7 +2540,7 @@ impl ChatRepl {
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
             &self.run_context,
-            &self.hook_engine,
+            self.active_hook_engine(),
             !final_is_error,
             &tool_call.function.name,
             tool_input,
@@ -3130,7 +3161,7 @@ impl ChatRepl {
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
             &self.run_context,
-            &self.hook_engine,
+            self.active_hook_engine(),
             !final_is_error,
             &tool_call.function.name,
             tool_input,
@@ -3820,7 +3851,7 @@ impl ChatRepl {
         );
         openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
             &self.run_context,
-            &self.hook_engine,
+            self.active_hook_engine(),
             !final_is_error,
             &tool_call.function.name,
             tool_input,

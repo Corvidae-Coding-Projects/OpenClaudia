@@ -68,14 +68,10 @@ pub struct PluginCommandInvocation {
 
 /// Resolved prompt plus per-skill metadata for a skill slash command.
 pub struct SkillInvocation {
-    /// Prompt content to send as the user message.
-    pub prompt: String,
-    /// Tools that should be pre-approved while this skill prompt runs.
-    pub allowed_tools: Option<Vec<String>>,
-    /// Optional model hint from skill front matter.
-    pub model: Option<String>,
-    /// Optional reasoning-effort hint from skill front matter.
-    pub effort: Option<String>,
+    /// Canonical one-turn activation compiled by the run's trust boundary.
+    pub activation: skills::SkillActivation,
+    /// User-authored arguments following the skill name.
+    pub arguments: String,
 }
 
 /// Slash command result
@@ -127,7 +123,7 @@ pub enum SlashCommandResult {
     /// Toggle vim mode (visual indicator in prompt)
     ToggleVim,
     /// Invoke a skill (inject its prompt as the next user message)
-    Skill(SkillInvocation),
+    Skill(Box<SkillInvocation>),
     /// Set effort level for the session (low/medium/high/max/auto)
     SetEffort(String),
     /// Cycle effort level: low → medium → high → low
@@ -1278,7 +1274,7 @@ fn slash_skill_scoped(
 ) -> SlashCommandResult {
     if args.is_empty() {
         let all_skills = run.map_or_else(skills::load_global_skills, |run| {
-            skills::load_skills_for_project(run.project_root(), run.working_directory())
+            skills::load_skills_for_run(run)
         });
         let invocable_skills = all_skills
             .iter()
@@ -1292,35 +1288,50 @@ fn slash_skill_scoped(
         } else {
             println!("\n=== Available Skills ({}) ===\n", invocable_skills.len());
             for skill in invocable_skills {
-                println!("  \x1b[36m{}\x1b[0m - {}", skill.name, skill.description);
-                println!("    \x1b[90m{}\x1b[0m", skill.path.display());
+                let hint = skill
+                    .argument_hint
+                    .as_deref()
+                    .map_or(String::new(), |hint| format!(" {hint}"));
+                let provenance = skill.provenance();
+                println!(
+                    "  \x1b[36m{}{}\x1b[0m - {}",
+                    skill.name, hint, skill.description
+                );
+                println!(
+                    "    \x1b[90m{:?}:{}\x1b[0m",
+                    provenance.source,
+                    provenance.root.join(&provenance.relative_path).display()
+                );
             }
             println!("\nUse /skill <name> to invoke a skill.\n");
         }
         SlashCommandResult::Handled
     } else {
-        let skill_name = args.trim();
-        let skill = run.map_or_else(
-            || skills::get_user_invocable_skill(skill_name),
-            |run| {
-                skills::get_user_invocable_skill_for_project(
-                    skill_name,
-                    run.project_root(),
-                    run.working_directory(),
-                )
-            },
+        let trimmed = args.trim();
+        let split_at = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let skill_name = &trimmed[..split_at];
+        let arguments = trimmed[split_at..].trim().to_string();
+        let activation = run.map_or_else(
+            || skills::activate_user_invocable_skill(skill_name),
+            |run| skills::activate_user_invocable_skill_for_run(run, skill_name),
         );
-        if let Some(skill) = skill {
-            println!("\n\x1b[36mInvoking skill: {}\x1b[0m\n", skill.name);
-            SlashCommandResult::Skill(SkillInvocation {
-                prompt: skill.prompt,
-                allowed_tools: skill.allowed_tools,
-                model: skill.model,
-                effort: skill.effort,
-            })
-        } else {
-            eprintln!("\nSkill '{skill_name}' not found. Use /skill to list available skills.\n");
-            SlashCommandResult::Handled
+        match activation {
+            Ok(activation) => {
+                println!(
+                    "\n\x1b[36mInvoking skill: {}\x1b[0m\n",
+                    activation.selection().name
+                );
+                SlashCommandResult::Skill(Box::new(SkillInvocation {
+                    activation,
+                    arguments,
+                }))
+            }
+            Err(error) => {
+                eprintln!(
+                    "\nSkill '{skill_name}' is unavailable: {error}. Use /skill to list trusted, invocable skills.\n"
+                );
+                SlashCommandResult::Handled
+            }
         }
     }
 }
@@ -3970,10 +3981,20 @@ mod tests {
         )
         .expect("slash skill fixture");
         let make_run = |root: &std::path::Path| {
+            let policy = openclaudia::skills::SkillCapabilityPolicy::project(
+                Vec::new(),
+                false,
+                false,
+                false,
+            )
+            .expect("slash skill text-only trust");
+            let access = openclaudia::skills::SkillRunAccess::host_granted_project(root, policy)
+                .expect("slash skill project grant");
             openclaudia::tools::ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
                 .read_only_roots(Vec::new())
                 .read_write_roots(Vec::new())
                 .environment_grants(HashMap::new())
+                .skill_access(access)
                 .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
                 .process(false)
                 .network(false)
@@ -3996,7 +4017,7 @@ mod tests {
         assert!(matches!(
             own,
             Some(SlashCommandResult::Skill(invocation))
-                if invocation.prompt.contains("S019-SLASH-RUN-A")
+                if invocation.activation.selection().prompt.contains("S019-SLASH-RUN-A")
         ));
 
         let foreign = handle_slash_command_for_run(

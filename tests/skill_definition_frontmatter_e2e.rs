@@ -288,11 +288,25 @@ fn parse_skill_without_allowed_tools_defaults_to_none() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section G — hooks field (inline JSON)
+// Section G — hooks field (validated native schema)
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn parse_skill_with_hooks_field_preserved_as_arbitrary_value() {
+fn parse_skill_with_valid_hooks_field_is_preserved() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = write_skill(
+        tmp.path(),
+        "s.md",
+        "name: x\ndescription: y\nhooks:\n  pre_tool_use:\n    - matcher: read_file\n      hooks:\n        - { type: command, command: ls }",
+        "body",
+    );
+    let skill = parse_or_fail(&path);
+    let hooks = skill.hooks.as_ref().expect("Some");
+    assert!(!hooks.is_null());
+}
+
+#[test]
+fn parse_skill_rejects_malformed_hook_schema() {
     let tmp = TempDir::new().expect("tempdir");
     let path = write_skill(
         tmp.path(),
@@ -300,10 +314,8 @@ fn parse_skill_with_hooks_field_preserved_as_arbitrary_value() {
         "name: x\ndescription: y\nhooks:\n  pre_tool_use:\n    - { type: command, command: ls }",
         "body",
     );
-    let skill = parse_or_fail(&path);
-    let hooks = skill.hooks.as_ref().expect("Some");
-    // Loose schema — just verify it's some non-null value.
-    assert!(!hooks.is_null());
+    let error = parse_skill_file(&path).expect_err("malformed hook entry must be inert");
+    assert!(error.to_string().contains("hooks schema is invalid"));
 }
 
 #[test]

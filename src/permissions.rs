@@ -73,7 +73,7 @@ pub fn allowed_tool_specs_to_permission_rules(specs: Option<&[String]>) -> Vec<P
         .collect()
 }
 
-fn allowed_tool_spec_to_permission_rule(spec: &str) -> Option<PermissionRule> {
+pub(crate) fn allowed_tool_spec_to_permission_rule(spec: &str) -> Option<PermissionRule> {
     let spec = spec.trim();
     if spec.is_empty() {
         return None;

@@ -49,6 +49,27 @@ pub fn test_run_context(root: &Path) -> Arc<ToolRunContext> {
         .expect("test workspace must produce a run capability")
 }
 
+pub fn trusted_project_skill_run_context(
+    root: &Path,
+    policy: openclaudia::skills::SkillCapabilityPolicy,
+) -> Arc<ToolRunContext> {
+    let access = openclaudia::skills::SkillRunAccess::host_granted_project(root, policy)
+        .expect("trusted test workspace must be canonical");
+    ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .working_directory(root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .skill_access(access)
+        .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider("trusted-project-skill-test")
+        .build()
+        .expect("trusted project skill run")
+}
+
 pub fn shared_run_context() -> &'static Arc<ToolRunContext> {
     static RUN: OnceLock<Arc<ToolRunContext>> = OnceLock::new();
     RUN.get_or_init(|| test_run_context(Path::new(env!("CARGO_MANIFEST_DIR"))))

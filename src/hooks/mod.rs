@@ -513,6 +513,20 @@ impl HookEngine {
         self
     }
 
+    /// Derive a one-turn engine with a lower-authority hook layer.
+    ///
+    /// The existing engine is host-owned and takes precedence for matching
+    /// entries and policy. Runtime resources are shared, while the derived
+    /// configuration is dropped when the turn ends.
+    #[must_use]
+    pub fn with_scoped_hooks(&self, hooks: HooksConfig) -> Self {
+        Self {
+            config: merge::merge_host_hooks(hooks, self.config.clone()),
+            model_hook_callback: self.model_hook_callback.clone(),
+            command_projection_lock: Arc::clone(&self.command_projection_lock),
+        }
+    }
+
     /// Fire a `PostToolUse` hook (success) or `PostToolUseFailure`
     /// (error), depending on `success`. Convenience wrapper around
     /// [`HookEngine::run`] so every tool-execution call site can emit
@@ -1321,6 +1335,47 @@ mod tests {
 
         assert!(result.allowed);
         assert!(result.outputs.is_empty());
+    }
+
+    #[test]
+    fn scoped_hook_policy_cannot_disable_existing_host_hook_commands() {
+        let host = HooksConfig {
+            pre_tool_use: vec![HookEntry {
+                matcher: Some("host".to_string()),
+                hooks: vec![Hook::Command {
+                    command: "echo host".to_string(),
+                    shell: false,
+                    timeout: 5,
+                }],
+            }],
+            ..HooksConfig::default()
+        };
+        let lower = HooksConfig {
+            policy: Some(HookPolicy {
+                allowed_commands: Some(std::collections::HashSet::from(["true".to_string()])),
+                sandbox: SandboxMode::FullSandbox,
+            }),
+            pre_tool_use: vec![HookEntry {
+                matcher: Some("skill".to_string()),
+                hooks: vec![Hook::Command {
+                    command: "true".to_string(),
+                    shell: false,
+                    timeout: 5,
+                }],
+            }],
+            ..HooksConfig::default()
+        };
+
+        let scoped = HookEngine::new(host).with_scoped_hooks(lower);
+        let allowed = scoped
+            .config
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.allowed_commands.as_ref())
+            .expect("scoped command allowlist");
+        assert!(allowed.contains("true"));
+        assert!(allowed.contains("echo"));
+        assert_eq!(scoped.config.pre_tool_use.len(), 2);
     }
 
     #[tokio::test]

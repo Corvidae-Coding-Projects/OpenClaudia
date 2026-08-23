@@ -653,6 +653,7 @@ pub fn record_file_modification(
     lines_added: u32,
     lines_removed: u32,
 ) {
+    run.record_skill_path_touch(std::path::Path::new(path));
     let guard = lock_or_poison();
     if guard.poisoned {
         error!(

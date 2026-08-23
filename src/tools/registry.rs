@@ -3072,9 +3072,8 @@ fn required_registry_string_arg<'a>(
 
 // ── skill (crosslink #612) ───────────────────────────────────────────────────
 //
-// Wraps `skills::get_skill` so the model can pull a user-authored skill
-// into context by name. Response is an XML-shaped `<skill>...</skill>`
-// envelope; see `skill::execute_skill` for the contract.
+// Selects a run-visible skill as typed, provenance-bearing reference data.
+// Model selection cannot activate the skill's declared runtime capabilities.
 
 struct SkillHandler;
 impl ToolHandler for SkillHandler {
@@ -3089,9 +3088,10 @@ impl ToolHandler for SkillHandler {
             "type": "function",
             "function": {
                 "name": "skill",
-                "description": "Load a user-authored skill by name and return its body wrapped in a <skill name=\"...\">...</skill> envelope. Skills live under .openclaudia/skills/ (project) and ~/.openclaudia/skills/ (user). The returned envelope is intended to be spliced into the next turn's system prompt by the orchestrator.",
+                "description": "Select a host-visible skill by name as source-labelled reference data. Repository skills are available only after an explicit host trust decision. Model selection never activates a skill's declared tools, hooks, model, or effort.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "name": {
                             "type": "string",
@@ -3103,12 +3103,12 @@ impl ToolHandler for SkillHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
+    ) -> ToolHandlerResult {
         skill::execute_skill(ctx.run.as_ref(), args)
     }
 }

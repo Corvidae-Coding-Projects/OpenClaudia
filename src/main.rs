@@ -193,6 +193,12 @@ enum Commands {
         command: Option<HookCommands>,
     },
 
+    /// Review, trust, or revoke repository skill packages
+    Skills {
+        #[command(subcommand)]
+        command: Option<SkillCommands>,
+    },
+
     /// Manage host-owned authenticated team-memory authority
     Team {
         #[command(subcommand)]
@@ -254,6 +260,29 @@ enum HookCommands {
         /// Full `sha256:...` proposal digest
         proposal_digest: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SkillCommands {
+    /// Show the exact workspace's current host trust decision
+    Status,
+    /// Trust repository skill text with an explicit capability ceiling
+    Trust {
+        /// Permit one exact declared tool specification (repeatable)
+        #[arg(long = "allow-tool", value_name = "TOOL_SPEC")]
+        allowed_tools: Vec<String>,
+        /// Permit explicitly invoked skills to request a model for one turn
+        #[arg(long)]
+        allow_model: bool,
+        /// Permit explicitly invoked skills to request reasoning effort for one turn
+        #[arg(long)]
+        allow_effort: bool,
+        /// Permit explicitly invoked skills to install sandboxed hooks for one turn
+        #[arg(long)]
+        allow_hooks: bool,
+    },
+    /// Revoke repository skill trust for this exact workspace
+    Revoke,
 }
 
 #[derive(Subcommand)]
@@ -549,6 +578,24 @@ async fn main() -> anyhow::Result<()> {
                 cli::commands::hooks::cmd_hooks_revoke(&proposal_digest)
             }
         },
+        Some(Commands::Skills { command }) => {
+            chdir_to_git_root();
+            match command.unwrap_or(SkillCommands::Status) {
+                SkillCommands::Status => cli::commands::skills::cmd_skills_status(),
+                SkillCommands::Trust {
+                    allowed_tools,
+                    allow_model,
+                    allow_effort,
+                    allow_hooks,
+                } => cli::commands::skills::cmd_skills_trust(
+                    allowed_tools,
+                    allow_model,
+                    allow_effort,
+                    allow_hooks,
+                ),
+                SkillCommands::Revoke => cli::commands::skills::cmd_skills_revoke(),
+            }
+        }
         Some(Commands::Team { command }) => {
             chdir_to_git_root();
             match command {
@@ -759,6 +806,7 @@ const fn subcommand_name(command: &Commands) -> &'static str {
         Commands::Config => "config",
         Commands::Doctor { .. } => "doctor",
         Commands::Hooks { .. } => "hooks",
+        Commands::Skills { .. } => "skills",
         Commands::Team { .. } => "team",
         Commands::Acp { .. } => "acp",
         Commands::Loop { .. } => "loop",
@@ -2934,6 +2982,49 @@ mod tests {
 
         assert_eq!(cli.mode.as_deref(), Some("safe"));
         assert_eq!(cli.scope_targets, ["src/lib.rs", "tool:bash"]);
+    }
+
+    #[test]
+    fn cli_parses_explicit_repository_skill_capability_ceiling() {
+        let cli = Cli::try_parse_from([
+            "openclaudia",
+            "skills",
+            "trust",
+            "--allow-tool",
+            "read_file",
+            "--allow-tool",
+            "Bash(git status *)",
+            "--allow-model",
+            "--allow-hooks",
+        ])
+        .expect("repository skill trust CLI");
+
+        let Some(Commands::Skills {
+            command:
+                Some(SkillCommands::Trust {
+                    allowed_tools,
+                    allow_model,
+                    allow_effort,
+                    allow_hooks,
+                }),
+        }) = cli.command
+        else {
+            panic!("expected skills trust command");
+        };
+        assert_eq!(allowed_tools, ["read_file", "Bash(git status *)"]);
+        assert!(allow_model);
+        assert!(!allow_effort);
+        assert!(allow_hooks);
+    }
+
+    #[test]
+    fn skills_command_defaults_to_visible_status() {
+        let cli =
+            Cli::try_parse_from(["openclaudia", "skills"]).expect("repository skill status CLI");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skills { command: None })
+        ));
     }
 
     #[test]
