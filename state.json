@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1109,
+  "next_display_id": 1110,
   "next_comment_id": 1316,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -993,6 +993,7 @@
     "f53d42bc-d39b-4ef0-8594-55097bb1090b": 488,
     "f590f791-0120-4b86-a6c5-c248c57729e7": 764,
     "f59a6def-dba9-4fda-a7ce-06f17e6ff4dd": 169,
+    "f5eb100a-4902-49bd-8713-b92f9293090b": 1109,
     "f6062054-9c13-4372-9596-8ccde7a0c213": 723,
     "f62adce7-35d3-4e1e-9e3d-badca8cee2cf": 570,
     "f655bb0a-1a47-4767-bac2-15c24f4c7227": 817,
@@ -28082,6 +28083,16 @@
         "enhancement"
       ]
     },
+    "f5eb100a-4902-49bd-8713-b92f9293090b": {
+      "uuid": "f5eb100a-4902-49bd-8713-b92f9293090b",
+      "display_id": 1109,
+      "title": "S-014: Make behavioral modes enforce capabilities",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T08:45:03.862099956Z",
+      "updated_at": "2026-08-23T08:45:03.862099956Z"
+    },
     "f6062054-9c13-4372-9596-8ccde7a0c213": {
       "uuid": "f6062054-9c13-4372-9596-8ccde7a0c213",
       "display_id": 723,
@@ -35076,11 +35087,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1151,
       "timestamp": "2026-08-23T08:43:56.026702694Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1152,
+      "timestamp": "2026-08-23T08:45:03.862099956Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T08:43:56.026702694Z",
+    "timestamp": "2026-08-23T08:45:03.862099956Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1151
+    "agent_seq": 1152
   }
 }
