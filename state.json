@@ -1,6 +1,6 @@
 {
   "next_display_id": 1114,
-  "next_comment_id": 1332,
+  "next_comment_id": 1333,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1448,12 +1448,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:38.668193082Z",
-      "updated_at": "2026-08-23T11:02:22.482453775Z",
+      "updated_at": "2026-08-23T11:26:47.277209573Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
       ],
       "comments": {
+        "16e11524-7928-40bd-8110-cf94488ad358": {
+          "display_id": 1332,
+          "author": "6Vw9",
+          "content": "[progress] Implemented generation-bound typed path/tool targets across CLI, legacy /mode, TUI startup/resume, persisted session state, frontend derivation, plan restore, and subagent child construction. Runtime admission now checks canonical resolved targets at the final effect boundary. Focused review caught and fixed two real integration defects: Standard-class adjacent/narrow profiles previously bypassed scope checks; after enabling them, implicit default adjacent incorrectly denied existing non-path session controls. Default adjacent now preserves compatibility while explicit adjacent/narrow require exact tool grants. Verified focused target, TUI resume, plan-mode, subagent-plan, session-isolation, and slash suites on Rust 1.98 with CARGO_BUILD_JOBS=4 and serialized test threads.",
+          "created_at": "2026-08-23T11:26:47.273256813Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5WMnc4Cz8RfouVdpttSN/ia/szyM3lwv6lC/AGOHW4LO6oSJKrLv3H/BmXpKJK1if5eTHPgk88ZYySWBdKe0Bg=="
+        },
         "c3aa2a2a-f1ee-4428-a78d-f4bd3a20aaa9": {
           "display_id": 1331,
           "author": "6Vw9",
@@ -35523,11 +35532,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1191,
       "timestamp": "2026-08-23T11:02:22.482453775Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1192,
+      "timestamp": "2026-08-23T11:26:47.277209573Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T11:02:22.482453775Z",
+    "timestamp": "2026-08-23T11:26:47.277209573Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1191
+    "agent_seq": 1192
   }
 }
