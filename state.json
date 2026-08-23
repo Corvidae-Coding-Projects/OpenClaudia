@@ -1,6 +1,6 @@
 {
   "next_display_id": 1108,
-  "next_comment_id": 1304,
+  "next_comment_id": 1305,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7344,7 +7344,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T05:55:19.436743818Z",
-      "updated_at": "2026-08-23T06:31:29.135774308Z",
+      "updated_at": "2026-08-23T07:05:09.609738735Z",
       "labels": [
         "remediation"
       ],
@@ -7393,6 +7393,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5LBT1o31UO3mcH2Ug80BzLNFzoNSl5z7hbQGNH0nqiZrfhFsH+S2NMDXB346QdCdtlph4ZU7Z1ROZn0iZtxvCA=="
+        },
+        "d9a19e31-a1fd-4e4e-923b-de6355560862": {
+          "display_id": 1304,
+          "author": "6Vw9",
+          "content": "Pre-commit review found and corrected one realistic accounting defect: OpenAI Responses usage reports cache reads/writes as a breakdown of inclusive input_tokens, while OpenClaudia TokenUsage requires disjoint buckets. Pipeline, VDD, and subagent normalization now subtract cached/write buckets from ordinary input and preserve cache_write_tokens, preventing double token/cost charging. Official OpenAI API reference confirms usage is input/output plus detailed cache breakdown.",
+          "created_at": "2026-08-23T07:05:09.599192939Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABADIpn0WA4dWZeJvmrXcdXkmbvxM2/rqjz8BR6k9NTHT3Lxei9qMJ2xHs9+49RYGdbJXRr09yGA3uS8xGYDNUyCg=="
         }
       }
     },
@@ -34844,11 +34853,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1130,
       "timestamp": "2026-08-23T06:31:29.135774308Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1131,
+      "timestamp": "2026-08-23T07:05:09.609738735Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T06:31:29.135774308Z",
+    "timestamp": "2026-08-23T07:05:09.609738735Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1130
+    "agent_seq": 1131
   }
 }
