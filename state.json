@@ -1,6 +1,6 @@
 {
   "next_display_id": 1116,
-  "next_comment_id": 1374,
+  "next_comment_id": 1375,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17247,7 +17247,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T14:22:39.418758535Z",
-      "updated_at": "2026-08-23T15:11:36.062308755Z",
+      "updated_at": "2026-08-23T15:28:16.038559029Z",
       "labels": [
         "remediation"
       ],
@@ -17296,6 +17296,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFX06IanKAfcd3yKSDfuRqtw8OE4CAr8KvoXXR2rurRCIdMLOHI02K7gUZUo7lfKvWC4Wnn92Kf1vLpBqWTgNDw=="
+        },
+        "cbc0c3b6-48b7-4f7f-a139-2f21aedccb08": {
+          "display_id": 1374,
+          "author": "6Vw9",
+          "content": "Final review complete. Background jobs now have durable generation-bound UUID records, bounded sequenced output with cursor replay, typed terminal states, cancellation/deadline supervision with process-tree reap, retained terminal output, safe restart-to-lost reconciliation without PID reattachment, exact run/owner isolation, and serialized first-use recovery for parallel tool calls. Rust 1.98.0 gates pass: full locked workspace/all-target/all-feature suite with --test-threads=1, strict all-target/all-feature Clippy with -D warnings, fmt, diff check, focused technical-memory evidence (9/9), and prior Windows GNU all-target/all-feature compile. Staged review found only intended S-041 implementation, tests, evidence, and slice documentation.",
+          "created_at": "2026-08-23T15:28:16.032572548Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABANIOPEO9BKLlzU2+P37sY7YUmglb6+qD0FTtdFHAaYUbXafCilB6YFyXcjjW6sHVI3sDfZQtzOoV0UYnqG3wNDA=="
         },
         "fb2a765b-d511-43d8-a467-fe775862aa51": {
           "display_id": 1369,
@@ -36279,11 +36288,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1255,
       "timestamp": "2026-08-23T15:12:57.035252084Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1256,
+      "timestamp": "2026-08-23T15:28:16.038559029Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:12:57.035252084Z",
+    "timestamp": "2026-08-23T15:28:16.038559029Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1255
+    "agent_seq": 1256
   }
 }
