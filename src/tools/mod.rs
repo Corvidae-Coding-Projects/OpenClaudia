@@ -138,8 +138,8 @@ pub use result::{
     ToolSensitivity, ToolUsage, TOOL_RESULT_SCHEMA_VERSION,
 };
 pub use security::{
-    ToolCapabilityError, ToolExecutableError, ToolResource, ToolRunContext, ToolRunContextBuilder,
-    WorkspaceAccess,
+    RuntimeModeTransitionError, ToolCapabilityError, ToolExecutableError, ToolResource,
+    ToolRunContext, ToolRunContextBuilder, WorkspaceAccess,
 };
 
 pub(crate) const TECHNICAL_LEARNING_CAPTURE_OBSERVATION_KIND: &str = "technical_learning_capture";

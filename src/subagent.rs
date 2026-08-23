@@ -801,6 +801,27 @@ impl BackgroundAgentManager {
             .collect()
     }
 
+    /// Active worker ids owned by one exact run generation.
+    pub(crate) fn active_ids_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+    ) -> Result<Vec<String>, String> {
+        let mut ids = {
+            let Some(agents) = self.agents_guard("active_ids_for_run") else {
+                return Err("Background agent registry is unavailable".to_string());
+            };
+            agents
+                .iter()
+                .filter(|(_, agent)| {
+                    agent.owner_run == owner.run_id() && !agent.finished.load(Ordering::SeqCst)
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
     pub fn remove_for_run(
         &self,
         owner: &crate::tools::ToolRunContext,
@@ -1759,6 +1780,22 @@ async fn run_subagent_inner(
     preallocated_agent_id: Option<&str>,
     effect_receipt: Option<&AtomicBool>,
 ) -> SubagentResult {
+    let child_registration = match parent_run.begin_child_run_registration() {
+        Ok(registration) => registration,
+        Err(error) => {
+            return SubagentResult {
+                agent_id: preallocated_agent_id
+                    .or(config.resume_agent_id.as_deref())
+                    .unwrap_or_default()
+                    .to_string(),
+                success: false,
+                output: error,
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree: None,
+            };
+        }
+    };
     // Handle resume: reuse the *original* agent_id and load transcript.
     //
     // Crosslink #582 — previously this path called `BACKGROUND_AGENTS.register(...)`,
@@ -1853,6 +1890,7 @@ async fn run_subagent_inner(
         })];
         (id, msgs, None)
     };
+    drop(child_registration);
     if let Some(receipt) = effect_receipt {
         receipt.store(true, Ordering::SeqCst);
     }
@@ -3785,6 +3823,16 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
     };
 
     if run_in_background {
+        let arguments = Value::Object(
+            args.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+        let background_registration =
+            match parent_run.begin_background_effect_registration("task", &arguments) {
+                Ok(registration) => registration,
+                Err(error) => return (error, true, false),
+            };
         // Register the agent and spawn the task.
         //
         // Crosslink #582 — on resume, we must register under the
@@ -3857,6 +3905,7 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
                 "failed to attach background subagent abort handle"
             );
         }
+        drop(background_registration);
 
         let message = format!(
             "Background agent started with ID: {agent_id}\nTask: {description}\nType: {agent_type:?}\n\nUse agent_output with this agent_id to retrieve results."

@@ -956,8 +956,19 @@ impl RuntimeModeAuthority {
     /// mutating authority.
     pub(crate) fn validate_transition(&self, mode: &RuntimeMode) -> Result<(), String> {
         let scope_targets = self.snapshot().scope_targets;
-        validate_runtime_mode(mode, &scope_targets)?;
-        BoundBehaviorScopeTargets::bind(&self.project_root, &scope_targets).map(|_| ())
+        self.validate_scoped_transition(mode, &scope_targets)
+            .map(|_| ())
+    }
+
+    /// Validate and bind a prospective complete profile without publishing it.
+    pub(crate) fn validate_scoped_transition(
+        &self,
+        mode: &RuntimeMode,
+        scope_targets: &BehaviorScopeTargets,
+    ) -> Result<RuntimeModeClass, String> {
+        let class = validate_runtime_mode(mode, scope_targets)?;
+        BoundBehaviorScopeTargets::bind(&self.project_root, scope_targets)?;
+        Ok(class)
     }
 
     pub(crate) fn transition_scoped(

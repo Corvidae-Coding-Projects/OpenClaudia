@@ -719,6 +719,26 @@ impl BackgroundShellManager {
             })
             .collect()
     }
+
+    /// Active process ids owned by one exact run generation.
+    pub(crate) fn active_ids_for_run(
+        &self,
+        run: &crate::tools::security::ToolRunContext,
+    ) -> Vec<String> {
+        let caller = run.run_id().to_string();
+        let mut ids = {
+            let shells = recover_mutex_lock(&self.shells, "active_ids_for_run", "shells", None);
+            shells
+                .iter()
+                .filter(|(_, shell)| {
+                    shell.owner_run == caller && !shell.finished.load(Ordering::SeqCst)
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+        ids.sort_unstable();
+        ids
+    }
 }
 
 /// Terminate every background job owned by a session during trusted lifecycle
@@ -872,6 +892,14 @@ pub fn try_execute_bash(
         .map_err(ToolError::InvalidArgument)?;
 
     if run_in_background {
+        let arguments = Value::Object(
+            args.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+        let _registration = run
+            .begin_background_effect_registration("bash", &arguments)
+            .map_err(ToolError::Other)?;
         // Spawn background shell and return shell_id.
         let shell_id = BACKGROUND_SHELLS
             .spawn(run, command)

@@ -11,7 +11,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use thiserror::Error;
 
@@ -24,6 +24,15 @@ use crate::runtime::{
 use crate::state::SessionId;
 
 static NEXT_CAPABILITY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn runtime_mode_name(mode: &crate::modes::RuntimeMode) -> String {
+    match mode {
+        crate::modes::RuntimeMode::Behavioral(behavior) => behavior.display_name(),
+        crate::modes::RuntimeMode::Plan => "plan".to_string(),
+        crate::modes::RuntimeMode::Initializer => "initializer".to_string(),
+        crate::modes::RuntimeMode::Coordinator => "coordinator".to_string(),
+    }
+}
 
 /// Workspace mutation authority attached to a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +66,30 @@ pub enum ToolCapabilityError {
     },
     #[error("run capability binding does not match its canonical descriptor: {detail}")]
     BindingMismatch { detail: String },
+}
+
+/// Failure to install a new run-scoped behavioral capability generation.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum RuntimeModeTransitionError {
+    #[error("{detail}")]
+    InvalidProfile { detail: String },
+    #[error("background-effect lifecycle is unavailable: {detail}")]
+    LifecycleUnavailable { detail: String },
+    #[error(
+        "Cannot enter runtime mode '{requested_mode}' while this run owns {shell_count} active background shell(s) and {agent_count} active background agent(s). Stop them with kill_shell/task_stop, then retry. shell_ids={shell_ids:?}, agent_ids={agent_ids:?}"
+    )]
+    InFlightBackgroundEffects {
+        requested_mode: String,
+        shell_count: usize,
+        agent_count: usize,
+        shell_ids: Vec<String>,
+        agent_ids: Vec<String>,
+    },
+}
+
+/// Holds the run lifecycle boundary until one background effect is registered.
+pub(crate) struct BackgroundEffectRegistration<'a> {
+    _guard: MutexGuard<'a, ()>,
 }
 
 /// Failure to resolve an executable through one run's immutable process
@@ -335,6 +368,7 @@ pub struct ToolRunContext {
     runtime: Arc<RunContext>,
     generation: CapabilityGeneration,
     runtime_mode: crate::modes::RuntimeModeAuthority,
+    background_effect_lifecycle: Mutex<()>,
     tool_catalog: super::catalog::RunToolCatalog,
     project_root: PathBuf,
     working_directory: PathBuf,
@@ -715,6 +749,7 @@ impl ToolRunContext {
             runtime,
             generation,
             runtime_mode,
+            background_effect_lifecycle: Mutex::new(()),
             tool_catalog: super::catalog::RunToolCatalog::default(),
             project_root,
             working_directory,
@@ -791,7 +826,23 @@ impl ToolRunContext {
         &self,
         mode: crate::modes::RuntimeMode,
     ) -> Result<crate::modes::RuntimeModeSnapshot, String> {
-        self.runtime_mode.transition(mode)
+        self.try_transition_runtime_mode(mode)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Atomically validate and install a mode, preserving typed refusal data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the profile is invalid, lifecycle state is
+    /// unavailable, or this run still owns effects that can mutate after a
+    /// restrictive generation would be published.
+    pub fn try_transition_runtime_mode(
+        &self,
+        mode: crate::modes::RuntimeMode,
+    ) -> Result<crate::modes::RuntimeModeSnapshot, RuntimeModeTransitionError> {
+        let targets = self.runtime_mode.snapshot().scope_targets;
+        self.try_transition_runtime_mode_scoped(mode, targets)
     }
 
     /// Atomically install a mode and its exact approved target set.
@@ -805,7 +856,94 @@ impl ToolRunContext {
         mode: crate::modes::RuntimeMode,
         targets: crate::modes::BehaviorScopeTargets,
     ) -> Result<crate::modes::RuntimeModeSnapshot, String> {
-        self.runtime_mode.transition_scoped(mode, targets)
+        self.try_transition_runtime_mode_scoped(mode, targets)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Atomically install a scoped mode while preserving typed refusal data.
+    ///
+    /// Restrictive transitions do not implicitly destroy user work. They fail
+    /// before publication until the exact run's active shells and workers have
+    /// been explicitly stopped or have completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error before mutation when validation or the restrictive
+    /// transition precondition fails.
+    pub fn try_transition_runtime_mode_scoped(
+        &self,
+        mode: crate::modes::RuntimeMode,
+        targets: crate::modes::BehaviorScopeTargets,
+    ) -> Result<crate::modes::RuntimeModeSnapshot, RuntimeModeTransitionError> {
+        let _lifecycle = self.background_effect_lifecycle.lock().map_err(|error| {
+            RuntimeModeTransitionError::LifecycleUnavailable {
+                detail: error.to_string(),
+            }
+        })?;
+        let class = self
+            .runtime_mode
+            .validate_scoped_transition(&mode, &targets)
+            .map_err(|detail| RuntimeModeTransitionError::InvalidProfile { detail })?;
+        if matches!(
+            class,
+            crate::modes::RuntimeModeClass::Plan | crate::modes::RuntimeModeClass::ReadOnly
+        ) {
+            let shell_ids = crate::tools::BACKGROUND_SHELLS.active_ids_for_run(self);
+            let agent_ids = crate::subagent::BACKGROUND_AGENTS
+                .active_ids_for_run(self)
+                .map_err(|detail| RuntimeModeTransitionError::LifecycleUnavailable { detail })?;
+            if !shell_ids.is_empty() || !agent_ids.is_empty() {
+                return Err(RuntimeModeTransitionError::InFlightBackgroundEffects {
+                    requested_mode: runtime_mode_name(&mode),
+                    shell_count: shell_ids.len(),
+                    agent_count: agent_ids.len(),
+                    shell_ids,
+                    agent_ids,
+                });
+            }
+        }
+        self.runtime_mode
+            .transition_scoped(mode, targets)
+            .map_err(|detail| RuntimeModeTransitionError::InvalidProfile { detail })
+    }
+
+    /// Serialize final background registration with restrictive transitions.
+    ///
+    /// The mode is rechecked after taking the lifecycle gate, closing the race
+    /// between canonical dispatch admission and process/worker registration.
+    pub(crate) fn begin_background_effect_registration(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<BackgroundEffectRegistration<'_>, String> {
+        let guard = self
+            .background_effect_lifecycle
+            .lock()
+            .map_err(|error| format!("background-effect lifecycle is unavailable: {error}"))?;
+        self.admit_runtime_mode_tool(tool_name, arguments)?;
+        Ok(BackgroundEffectRegistration { _guard: guard })
+    }
+
+    /// Serialize lower-level child-run registration with mode publication.
+    ///
+    /// This covers callers that enter the subagent runner without passing
+    /// through the model-facing `task` adapter.
+    pub(crate) fn begin_child_run_registration(
+        &self,
+    ) -> Result<BackgroundEffectRegistration<'_>, String> {
+        let guard = self
+            .background_effect_lifecycle
+            .lock()
+            .map_err(|error| format!("background-effect lifecycle is unavailable: {error}"))?;
+        let snapshot = self.runtime_mode();
+        if !snapshot.allows_child_runs() {
+            return Err(format!(
+                "Runtime mode '{}' generation {} denies child-run registration",
+                snapshot.display_name(),
+                snapshot.generation
+            ));
+        }
+        Ok(BackgroundEffectRegistration { _guard: guard })
     }
 
     /// Validate a prospective mode against this run's current target set

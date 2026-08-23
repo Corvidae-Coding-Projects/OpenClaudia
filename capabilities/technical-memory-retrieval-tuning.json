@@ -105,7 +105,7 @@
         "observation": "The process generation receipt is recorded during supervised cleanup.",
         "guidance": "Use process evidence only for the process runtime that emitted it.",
         "applicability": {"paths": ["src/tools/bash/mod.rs"], "components": ["process-runtime"], "tags": ["operate"]},
-        "citations": [{"kind": "source_file", "locator": "src/tools/bash/mod.rs", "source_version": "worktree:s051", "digest": "sha256:f4fc154ac6f7bd7ff28ce5524ffbac63c004ffc48836084c71c88cd89008c3a5"}],
+        "citations": [{"kind": "source_file", "locator": "src/tools/bash/mod.rs", "source_version": "worktree:s051", "digest": "sha256:5096efc654f7a920578d34ab188205413a157a503f36b6ce35fb74352b13ab34"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
