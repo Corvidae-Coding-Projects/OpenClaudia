@@ -173,6 +173,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-015: Finish skills as scoped capabilities (#1120)
 - S-108: Make writable sandbox workspace projection transactional (#1118)
 - S-043: Route direct shell through the process capability (#1119)
 - S-042: Enforce least-privilege sandbox profiles (#1117)
