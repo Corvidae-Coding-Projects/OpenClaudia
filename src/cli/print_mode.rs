@@ -242,6 +242,151 @@ async fn print_sse_response(response: reqwest::Response) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_message_values(
+    request: &openclaudia::proxy::ChatCompletionRequest,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    request
+        .messages
+        .iter()
+        .cloned()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)
+}
+
+async fn print_responses_stream(
+    response: reqwest::Response,
+    headers: &openclaudia::secrets::SensitiveHeaders,
+    provider: &str,
+    model: &str,
+    assistant_message_ordinal: u64,
+) -> anyhow::Result<()> {
+    let decoded = openclaudia::pipeline::decode_openai_responses_stream(
+        openclaudia::pipeline::OpenAiResponsesStreamParams {
+            response,
+            headers,
+            provider,
+            model_identity: model,
+            provider_native_state: None,
+            assistant_message_ordinal,
+        },
+        |_| Ok(()),
+        |_| Ok(()),
+        |_, _| Ok(()),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+
+    if !decoded.tool_calls.is_empty() {
+        anyhow::bail!(
+            "Responses provider returned {} tool call(s) to no-tools print mode",
+            decoded.tool_calls.len()
+        );
+    }
+    if decoded.content.is_empty() {
+        anyhow::bail!("Responses stream did not contain printable assistant text");
+    }
+    println!("{}", decoded.content);
+    Ok(())
+}
+
+struct PreparedPrintTransport {
+    request_body: serde_json::Value,
+    endpoint: String,
+    headers: openclaudia::secrets::SensitiveHeaders,
+    wire_api: openclaudia::pipeline::WireApi,
+    responses_assistant_ordinal: Option<u64>,
+}
+
+struct PreparePrintTransport<'a> {
+    config: &'a openclaudia::config::AppConfig,
+    provider: &'a openclaudia::config::ProviderConfig,
+    adapter: &'a dyn ProviderAdapter,
+    model: &'a str,
+    chat_request: &'a openclaudia::proxy::ChatCompletionRequest,
+    auth: &'a ChatAuth,
+}
+
+fn prepare_print_transport(
+    p: &PreparePrintTransport<'_>,
+) -> anyhow::Result<PreparedPrintTransport> {
+    let wire_api = if p.auth.codex_responses_auth.is_some() {
+        openclaudia::pipeline::WireApi::OpenAiResponses
+    } else {
+        openclaudia::pipeline::WireApi::ChatCompletions
+    };
+    let (request_body, responses_assistant_ordinal) = if wire_api.is_responses() {
+        let messages = print_message_values(p.chat_request)?;
+        let ordinal = openclaudia::pipeline::next_assistant_message_ordinal(&messages)
+            .map_err(anyhow::Error::msg)?;
+        (
+            openclaudia::pipeline::build_request_for_wire_with_exact_tools_and_state(
+                wire_api,
+                &p.config.proxy.target,
+                p.model,
+                &messages,
+                p.provider
+                    .thinking
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("medium"),
+                None,
+                None,
+                &[],
+                None,
+            )
+            .map_err(anyhow::Error::msg)?,
+            Some(ordinal),
+        )
+    } else {
+        (
+            build_print_request(
+                p.adapter,
+                p.chat_request,
+                &p.provider.thinking,
+                p.auth.claude_code_token.as_ref(),
+            )
+            .map_err(anyhow::Error::msg)?,
+            None,
+        )
+    };
+    let extra_headers = p.provider.headers.clone();
+    let (endpoint, headers) = if let Some(auth) = p.auth.codex_responses_auth.as_ref() {
+        let endpoint = openclaudia::pipeline::resolve_endpoint_for_wire(
+            wire_api,
+            &p.config.proxy.target,
+            p.model,
+            openclaudia::codex_credentials::CODEX_CHATGPT_BASE_URL,
+            None,
+        )?;
+        let mut headers = auth.headers()?;
+        headers.extend(&extra_headers);
+        (endpoint, headers)
+    } else {
+        (
+            resolve_print_endpoint(
+                p.model,
+                p.provider,
+                p.adapter,
+                p.auth.claude_code_token.as_ref(),
+            ),
+            openclaudia::pipeline::resolve_headers(
+                &p.config.proxy.target,
+                p.auth.api_key.as_ref(),
+                p.auth.claude_code_token.as_ref(),
+                &extra_headers,
+            )?,
+        )
+    };
+    Ok(PreparedPrintTransport {
+        request_body,
+        endpoint,
+        headers,
+        wire_api,
+        responses_assistant_ordinal,
+    })
+}
+
 /// Run one-shot print mode.
 ///
 /// # Errors
@@ -278,11 +423,7 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
             config.proxy.target
         )
     })?;
-    let Some(ChatAuth {
-        api_key,
-        claude_code_token,
-        codex_responses_auth,
-    }) = resolve_chat_auth(
+    let Some(chat_auth) = resolve_chat_auth(
         &config.proxy.target,
         provider,
         ChatAuthSelectionMode::Automatic,
@@ -294,11 +435,6 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
             config.proxy.target
         );
     };
-    if codex_responses_auth.is_some() {
-        anyhow::bail!(
-            "Codex ChatGPT login currently requires the full-screen TUI Responses backend"
-        );
-    }
     let model = resolve_model_name(
         options.model_override,
         provider.model.clone(),
@@ -307,21 +443,21 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     let adapter = openclaudia::providers::get_adapter(&config.proxy.target)?;
     let chat_request = build_print_chat_request(adapter, &model, options.prompt, &print_run);
     enforce_print_request_policy(&config, &chat_request)?;
-    let request_body = build_print_request(
+    let prepared = prepare_print_transport(&PreparePrintTransport {
+        config: &config,
+        provider,
         adapter,
-        &chat_request,
-        &provider.thinking,
-        claude_code_token.as_ref(),
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
-    let endpoint = resolve_print_endpoint(&model, provider, adapter, claude_code_token.as_ref());
-    let extra_headers = provider.headers.clone();
-    let headers = openclaudia::pipeline::resolve_headers(
-        &config.proxy.target,
-        api_key.as_ref(),
-        claude_code_token.as_ref(),
-        &extra_headers,
-    )?;
+        model: &model,
+        chat_request: &chat_request,
+        auth: &chat_auth,
+    })?;
+    let PreparedPrintTransport {
+        request_body,
+        endpoint,
+        headers,
+        wire_api,
+        responses_assistant_ordinal,
+    } = prepared;
 
     let client = reqwest::Client::new();
     let request = headers.apply(client.post(endpoint).json(&request_body))?;
@@ -336,7 +472,17 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         anyhow::bail!("API error {}: {diagnostic}", status.as_u16());
     }
 
-    if response_is_json(&response) {
+    if wire_api.is_responses() {
+        print_responses_stream(
+            response,
+            &headers,
+            &config.proxy.target,
+            &model,
+            responses_assistant_ordinal
+                .ok_or_else(|| anyhow::anyhow!("Responses request ordinal is missing"))?,
+        )
+        .await
+    } else if response_is_json(&response) {
         print_json_response(response, adapter).await
     } else {
         print_sse_response(response).await
@@ -436,6 +582,76 @@ mod tests {
         let mut state = PrintSseState::new();
         let json = json!({"choices": [{"delta": {"reasoning_content": "private"}}]});
         assert_eq!(extract_print_sse_text(&json, &mut state), None);
+    }
+
+    #[test]
+    fn codex_print_builds_the_shared_no_tools_responses_profile() {
+        let adapter = openclaudia::providers::get_adapter("openai").expect("OpenAI adapter");
+        let mut config =
+            test_config_with_policy(openclaudia::services::policy::EnterprisePolicy::default());
+        config.proxy.target = "openai".to_string();
+        let provider = openclaudia::config::ProviderConfig {
+            api_key: None,
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: None,
+            headers: openclaudia::secrets::SensitiveHeaders::new(),
+            thinking: openclaudia::config::ThinkingConfig {
+                reasoning_effort: Some("high".to_string()),
+                ..openclaudia::config::ThinkingConfig::default()
+            },
+        };
+        let request = build_print_chat_request(
+            adapter,
+            "gpt-test",
+            "inspect the workspace".to_string(),
+            print_test_run(),
+        );
+        let auth = ChatAuth {
+            api_key: None,
+            claude_code_token: None,
+            codex_responses_auth: Some(openclaudia::codex_credentials::CodexResponsesAuth {
+                access_token: openclaudia::secrets::OAuthToken::try_from_string(
+                    "print-responses-token".to_string(),
+                )
+                .expect("token"),
+                account_id: None,
+                is_fedramp_account: false,
+                source: openclaudia::codex_credentials::CodexAuthSource::EnvAccessToken,
+                mode: openclaudia::codex_credentials::CodexAuthMode::ChatgptAuthTokens,
+            }),
+        };
+        let prepared = prepare_print_transport(&PreparePrintTransport {
+            config: &config,
+            provider: &provider,
+            adapter,
+            model: "gpt-test",
+            chat_request: &request,
+            auth: &auth,
+        })
+        .expect("Codex print transport");
+        let body = prepared.request_body;
+
+        assert_eq!(prepared.responses_assistant_ordinal, Some(1));
+        assert_eq!(
+            prepared.wire_api,
+            openclaudia::pipeline::WireApi::OpenAiResponses
+        );
+        assert!(prepared.endpoint.ends_with("/responses"));
+        assert!(prepared
+            .headers
+            .matches_value("authorization", "Bearer print-responses-token"));
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert!(body.get("messages").is_none());
+        assert!(body.get("_openclaudia_responses_history").is_none());
+        assert!(body["input"]
+            .as_array()
+            .expect("Responses input")
+            .iter()
+            .all(|item| item.get("_openclaudia_message_ordinal").is_none()));
     }
 
     #[test]

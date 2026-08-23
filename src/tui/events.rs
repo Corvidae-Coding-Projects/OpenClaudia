@@ -120,8 +120,14 @@ pub enum AppEvent {
     },
     /// Tool results require a follow-up API call
     FollowUp,
-    /// Sync updated session messages back to the App after an agentic loop.
-    SyncMessages(Vec<serde_json::Value>),
+    /// Atomically sync the portable transcript and provider-owned continuation
+    /// after an agentic loop. The two lanes describe one completed state and
+    /// must never be committed independently.
+    SyncSession {
+        session_id: String,
+        messages: Vec<serde_json::Value>,
+        provider_native_state: Option<crate::runtime::ProviderNativeState>,
+    },
     /// Pipeline requesting permission to run a tool.
     ///
     /// Includes a tokio `oneshot::Sender` to reply with the user's

@@ -18,7 +18,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph},
 };
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::LazyLock;
@@ -1636,8 +1636,26 @@ impl App {
             Ok(AppEvent::FollowUp) => {
                 self.spawn_api_turn();
             }
-            Ok(AppEvent::SyncMessages(messages)) => {
-                self.chat_session.replace_messages(messages);
+            Ok(AppEvent::SyncSession {
+                session_id,
+                messages,
+                provider_native_state,
+            }) => {
+                if self.chat_session.id() != session_id {
+                    tracing::warn!(
+                        current_session_id = %self.chat_session.id(),
+                        response_session_id = %session_id,
+                        "ignored provider continuation for a session that is no longer active"
+                    );
+                } else if let Err(error) = self
+                    .chat_session
+                    .replace_messages_and_provider_native_state(messages, provider_native_state)
+                {
+                    self.messages.add(DisplayMessage::error(format!(
+                        "Provider continuation was not committed: {error}"
+                    )));
+                    self.is_waiting = false;
+                }
             }
             Ok(AppEvent::PermissionRequest {
                 tool_name,
@@ -1735,7 +1753,8 @@ impl App {
         self.messages.add(DisplayMessage::error(msg));
     }
 
-    /// Finalise the turn when the pipeline emits `ResponseDone`.
+    /// Finalise the turn when the orchestrator emits `ResponseDone` after its
+    /// portable/native session commit.
     ///
     /// Extracted from `handle_app_event` to keep that dispatcher under
     /// the clippy `too_many_lines` threshold. Responsible for finishing
@@ -3837,7 +3856,6 @@ struct AgenticCtx<'a> {
     wire_api: crate::pipeline::WireApi,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
-    provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
@@ -3857,6 +3875,19 @@ fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
             .then(|| message.get("content").and_then(|content| content.as_str()))
             .flatten()
     })
+}
+
+fn provider_state_after_turn(
+    wire_api: crate::pipeline::WireApi,
+    previous: Option<&crate::runtime::ProviderNativeState>,
+    returned: Option<crate::runtime::ProviderNativeState>,
+) -> Result<Option<crate::runtime::ProviderNativeState>, String> {
+    if wire_api == crate::pipeline::WireApi::OpenAiResponses {
+        return returned.map(Some).ok_or_else(|| {
+            "Responses turn completed without native continuation state".to_string()
+        });
+    }
+    Ok(returned.or_else(|| previous.cloned()))
 }
 
 fn latest_assistant_message_content(messages: &[serde_json::Value]) -> Option<&str> {
@@ -4032,7 +4063,11 @@ async fn run_preturn_hooks(
             hook_items,
             crate::context::ContextBudget::default(),
         );
-        projection.append_reference_to_json_messages(session_messages);
+        append_context_reference_message(
+            session_messages,
+            &projection.reference,
+            "user_prompt_submit_hook",
+        );
     }
     true
 }
@@ -4043,7 +4078,7 @@ async fn run_preturn_hooks(
 ///
 /// Crosslink #765: previously every `tx.send(...)` site was `let _ = ...`,
 /// which silently dropped both the event and any unflushed work — for
-/// `SyncMessages` that meant the entire accumulated `session_messages` vector
+/// `SyncSession` that meant the entire accumulated `session_messages` vector
 /// vanished, leaving the next turn to retry from a stale baseline. We now
 /// `tracing::warn!` with the event kind and any partial-state counts so an
 /// operator running with `RUST_LOG=warn` has a forensic trail. We also
@@ -4056,8 +4091,12 @@ fn send_or_warn(
     // Snapshot kind/sizes BEFORE moving the event into `send`, so the warn
     // path can describe what was lost without owning the value.
     let descriptor = describe_event(&event);
-    let partial_messages: Option<Vec<serde_json::Value>> = match &event {
-        super::events::AppEvent::SyncMessages(msgs) => Some(msgs.clone()),
+    let partial_state = match &event {
+        super::events::AppEvent::SyncSession {
+            session_id: _,
+            messages,
+            provider_native_state,
+        } => Some((messages.clone(), provider_native_state.clone())),
         _ => None,
     };
     if tx.send(event).is_err() {
@@ -4066,8 +4105,8 @@ fn send_or_warn(
             session_id = %session_id,
             "TUI event channel closed; partial turn state being persisted to recovery file"
         );
-        if let Some(msgs) = partial_messages {
-            persist_orphan_messages(session_id, &msgs);
+        if let Some((messages, provider_native_state)) = partial_state {
+            persist_orphan_session(session_id, &messages, provider_native_state.as_ref());
         }
     }
 }
@@ -4222,8 +4261,16 @@ fn format_stream_timeout_message(elapsed_secs: u64, timeout_secs: u64) -> String
 /// it and adding the derive would ripple through the rest of the file.
 fn describe_event(event: &super::events::AppEvent) -> String {
     match event {
-        super::events::AppEvent::SyncMessages(msgs) => {
-            format!("SyncMessages(n={})", msgs.len())
+        super::events::AppEvent::SyncSession {
+            session_id,
+            messages,
+            provider_native_state,
+        } => {
+            format!(
+                "SyncSession(session={session_id},n={},native={})",
+                messages.len(),
+                provider_native_state.is_some()
+            )
         }
         super::events::AppEvent::ResponseDone => "ResponseDone".to_string(),
         super::events::AppEvent::ApiError(e) => {
@@ -4290,17 +4337,21 @@ fn describe_event(event: &super::events::AppEvent) -> String {
     }
 }
 
-/// Best-effort persist orphaned session messages to a recovery file so the
-/// next run can recover the in-flight turn instead of silently losing it.
+/// Best-effort persist both lanes of an orphaned session turn to a recovery
+/// file so a later recovery tool cannot replay flattened provider state.
 /// Failures here are logged but not propagated — we are already on the
 /// shutdown path.
-fn persist_orphan_messages(session_id: &str, msgs: &[serde_json::Value]) {
+fn persist_orphan_session(
+    session_id: &str,
+    messages: &[serde_json::Value],
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+) {
     let Some(data_dir) = dirs::data_dir() else {
         tracing::warn!("no data_dir available; cannot persist orphan session state");
         return;
     };
     let dir = data_dir.join("openclaudia").join("orphan-turns");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    if let Err(e) = create_orphan_recovery_dir(&dir) {
         tracing::warn!(error = %e, dir = %dir.display(), "failed to create orphan-turn dir");
         return;
     }
@@ -4315,10 +4366,16 @@ fn persist_orphan_messages(session_id: &str, msgs: &[serde_json::Value]) {
             }
         })
         .collect();
-    let path = dir.join(format!("{safe_id}-{ts}.json"));
-    match serde_json::to_string_pretty(msgs) {
+    let path = dir.join(format!("{safe_id}-{ts}-{}.json", uuid::Uuid::new_v4()));
+    let recovery = serde_json::json!({
+        "schema_version": 1,
+        "session_id": session_id,
+        "messages": messages,
+        "provider_native_state": provider_native_state
+    });
+    match serde_json::to_string_pretty(&recovery) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = write_orphan_recovery_file(&path, json.as_bytes()) {
                 tracing::warn!(
                     error = %e,
                     path = %path.display(),
@@ -4327,7 +4384,8 @@ fn persist_orphan_messages(session_id: &str, msgs: &[serde_json::Value]) {
             } else {
                 tracing::warn!(
                     path = %path.display(),
-                    n_messages = msgs.len(),
+                    n_messages = messages.len(),
+                    has_provider_native_state = provider_native_state.is_some(),
                     "persisted orphan session state to recovery file"
                 );
             }
@@ -4341,10 +4399,60 @@ fn persist_orphan_messages(session_id: &str, msgs: &[serde_json::Value]) {
     }
 }
 
+fn create_orphan_recovery_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "orphan recovery directory is not a real directory",
+            ));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "orphan recovery directory is not a real directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_orphan_recovery_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
 /// Drive the agentic follow-up loop until the model stops requesting tools
 /// or `MAX_ITER` iterations are exhausted.
 #[allow(clippy::too_many_lines)]
-async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde_json::Value>) {
+async fn run_agentic_loop(
+    ctx: &AgenticCtx<'_>,
+    session_messages: &mut Vec<serde_json::Value>,
+    provider_native_state: &mut Option<crate::runtime::ProviderNativeState>,
+) {
     const MAX_ITER: u32 = 25;
     let mut iteration = 0u32;
     loop {
@@ -4394,7 +4502,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             effort_level: ctx.effort_level,
             claude_code_token: ctx.claude_code_token,
             prompt_blocks: ctx.prompt_blocks,
-            provider_native_state: ctx.provider_native_state,
+            provider_native_state: provider_native_state.as_ref(),
             mcp_manager: ctx.mcp_manager,
         })
         .await
@@ -4410,6 +4518,18 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                 break;
             }
         };
+        let assistant_message_ordinal =
+            match crate::pipeline::next_assistant_message_ordinal(session_messages) {
+                Ok(ordinal) => ordinal,
+                Err(error) => {
+                    send_or_warn(
+                        ctx.tx,
+                        super::events::AppEvent::ApiError(error.into()),
+                        ctx.session_id,
+                    );
+                    break;
+                }
+            };
         match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
             run_context: std::sync::Arc::clone(ctx.run_context),
             client: ctx.client,
@@ -4418,6 +4538,8 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             request_body: &body,
             provider: ctx.provider,
             model_identity: ctx.model,
+            provider_native_state: provider_native_state.as_ref(),
+            assistant_message_ordinal,
             memory_db: ctx.memory_db.clone(),
             app_config: ctx.app_config.clone(),
             permission_mgr: ctx.permission_mgr.clone(),
@@ -4430,13 +4552,28 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
         })
         .await
         {
-            Ok(followup) => {
+            Ok(mut followup) => {
                 tracing::debug!(
                     content_len = followup.content.len(),
                     tool_calls = followup.tool_calls.len(),
                     needs_followup = followup.needs_followup,
                     "Follow-up result"
                 );
+                let next_provider_state = match provider_state_after_turn(
+                    ctx.wire_api,
+                    provider_native_state.as_ref(),
+                    followup.provider_native_state.take(),
+                ) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        send_or_warn(
+                            ctx.tx,
+                            super::events::AppEvent::ApiError(error.into()),
+                            ctx.session_id,
+                        );
+                        break;
+                    }
+                };
                 if followup.needs_followup {
                     let asst = crate::pipeline::build_assistant_message_with_tools(
                         &followup.content,
@@ -4446,12 +4583,16 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                     );
                     session_messages.push(asst);
                     session_messages.extend(followup.tool_results.iter().cloned());
+                    *provider_native_state = next_provider_state;
                 } else {
                     let reasoning = followup
                         .reasoning_content
                         .as_deref()
                         .filter(|text| !text.is_empty());
-                    if !followup.content.is_empty() || reasoning.is_some() {
+                    if !followup.content.is_empty()
+                        || reasoning.is_some()
+                        || next_provider_state.is_some()
+                    {
                         let rendered_content = match render_final_response_for_history(
                             ctx.run_context,
                             ctx.session_id,
@@ -4480,6 +4621,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                                 serde_json::Value::String(reasoning.to_string());
                         }
                         session_messages.push(message);
+                        *provider_native_state = next_provider_state;
                     }
                     break;
                 }
@@ -4491,7 +4633,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                     super::events::AppEvent::ApiError(e.into()),
                     ctx.session_id,
                 );
-                // The caller's `SyncMessages` send after the loop will trigger
+                // The caller's `SyncSession` send after the loop will trigger
                 // recovery persistence if the channel is closed — no extra
                 // action needed here for partial-state capture.
                 break;
@@ -4644,6 +4786,14 @@ async fn run_api_turn_async(mut p: ApiTurnParams) {
     else {
         return;
     };
+    let assistant_message_ordinal =
+        match crate::pipeline::next_assistant_message_ordinal(&p.session_messages) {
+            Ok(ordinal) => ordinal,
+            Err(error) => {
+                send_api_error(&p.tx, error, &p.session_id);
+                return;
+            }
+        };
     match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
         run_context: std::sync::Arc::clone(&p.run_context),
         client: &p.client,
@@ -4652,6 +4802,8 @@ async fn run_api_turn_async(mut p: ApiTurnParams) {
         request_body: &initial_turn.request_body,
         provider: &p.provider,
         model_identity: &p.model,
+        provider_native_state: p.provider_native_state.as_ref(),
+        assistant_message_ordinal,
         memory_db: p.memory_db.clone(),
         app_config: p.app_config.clone(),
         permission_mgr: p.permission_mgr.clone(),
@@ -4679,7 +4831,7 @@ async fn run_api_turn_async(mut p: ApiTurnParams) {
                     wire_api: p.wire_api,
                     claude_code_token: p.claude_code_token.as_ref(),
                     prompt_blocks: p.prompt_blocks.as_ref(),
-                    provider_native_state: p.provider_native_state.as_ref(),
+                    provider_native_state: p.provider_native_state,
                     memory_db: p.memory_db,
                     app_config: p.app_config,
                     permission_mgr: p.permission_mgr,
@@ -4715,7 +4867,7 @@ struct TurnContext<'a> {
     wire_api: crate::pipeline::WireApi,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
-    provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
+    provider_native_state: Option<crate::runtime::ProviderNativeState>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
@@ -4734,7 +4886,7 @@ struct TurnContext<'a> {
 /// Handle the successful `Ok(turn_result)` branch of the first `run_turn`:
 /// either drive the agentic follow-up loop (when tool calls are present) or
 /// push the plain assistant content. Channel-closed errors on the resulting
-/// `SyncMessages` / `ResponseDone` sends go through [`send_or_warn`] so
+/// `SyncSession` / `ResponseDone` sends go through [`send_or_warn`] so
 /// partial in-flight state is persisted instead of silently dropped.
 async fn handle_turn_result(
     turn_result: crate::pipeline::TurnResult,
@@ -4749,16 +4901,36 @@ async fn handle_turn_result(
     );
     if turn_result.needs_followup {
         handle_followup_turn(turn_result, session_messages, &ctx).await;
-    } else if !turn_result.content.is_empty() {
+    } else if !turn_result.content.is_empty()
+        || turn_result.reasoning_content.is_some()
+        || turn_result.provider_native_state.is_some()
+    {
         handle_direct_turn(turn_result, session_messages, &ctx).await;
+    } else {
+        send_or_warn(
+            ctx.tx,
+            super::events::AppEvent::ResponseDone,
+            ctx.session_id,
+        );
     }
 }
 
 async fn handle_followup_turn(
-    turn_result: crate::pipeline::TurnResult,
+    mut turn_result: crate::pipeline::TurnResult,
     mut session_messages: Vec<serde_json::Value>,
     ctx: &TurnContext<'_>,
 ) {
+    let mut provider_native_state = match provider_state_after_turn(
+        ctx.wire_api,
+        ctx.provider_native_state.as_ref(),
+        turn_result.provider_native_state.take(),
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            send_api_error(ctx.tx, error, ctx.session_id);
+            return;
+        }
+    };
     let assistant = crate::pipeline::build_assistant_message_with_tools(
         &turn_result.content,
         turn_result.reasoning_content.as_deref(),
@@ -4783,7 +4955,6 @@ async fn handle_followup_turn(
         wire_api: ctx.wire_api,
         claude_code_token: ctx.claude_code_token,
         prompt_blocks: ctx.prompt_blocks,
-        provider_native_state: ctx.provider_native_state,
         memory_db: ctx.memory_db.clone(),
         app_config: ctx.app_config.clone(),
         permission_mgr: ctx.permission_mgr.clone(),
@@ -4796,13 +4967,17 @@ async fn handle_followup_turn(
         task_obs: ctx.task_obs,
         tx: ctx.tx,
     };
-    run_agentic_loop(&agentic, &mut session_messages).await;
+    run_agentic_loop(&agentic, &mut session_messages, &mut provider_native_state).await;
     if let Some(content) = latest_assistant_message_content(&session_messages).map(str::to_string) {
         run_tui_vdd_review(ctx, &content, &mut session_messages).await;
     }
     send_or_warn(
         ctx.tx,
-        super::events::AppEvent::SyncMessages(session_messages),
+        super::events::AppEvent::SyncSession {
+            session_id: ctx.session_id.to_string(),
+            messages: session_messages,
+            provider_native_state,
+        },
         ctx.session_id,
     );
     send_or_warn(
@@ -4813,10 +4988,21 @@ async fn handle_followup_turn(
 }
 
 async fn handle_direct_turn(
-    turn_result: crate::pipeline::TurnResult,
+    mut turn_result: crate::pipeline::TurnResult,
     mut session_messages: Vec<serde_json::Value>,
     ctx: &TurnContext<'_>,
 ) {
+    let provider_native_state = match provider_state_after_turn(
+        ctx.wire_api,
+        ctx.provider_native_state.as_ref(),
+        turn_result.provider_native_state.take(),
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            send_api_error(ctx.tx, error, ctx.session_id);
+            return;
+        }
+    };
     let rendered_content = match render_final_response_for_history(
         ctx.run_context,
         ctx.session_id,
@@ -4852,7 +5038,16 @@ async fn handle_direct_turn(
     run_tui_vdd_review(ctx, &rendered_content, &mut session_messages).await;
     send_or_warn(
         ctx.tx,
-        super::events::AppEvent::SyncMessages(session_messages),
+        super::events::AppEvent::SyncSession {
+            session_id: ctx.session_id.to_string(),
+            messages: session_messages,
+            provider_native_state,
+        },
+        ctx.session_id,
+    );
+    send_or_warn(
+        ctx.tx,
+        super::events::AppEvent::ResponseDone,
         ctx.session_id,
     );
 }
@@ -4914,7 +5109,11 @@ async fn run_tui_vdd_review(
                     vec![observation],
                     crate::context::ContextBudget::default(),
                 );
-                projection.append_reference_to_json_messages(session_messages);
+                append_context_reference_message(
+                    session_messages,
+                    &projection.reference,
+                    "vdd_reference",
+                );
             }
         }
         Err(error) => {
@@ -4929,6 +5128,24 @@ async fn run_tui_vdd_review(
             );
         }
     }
+}
+
+fn append_context_reference_message(
+    messages: &mut Vec<serde_json::Value>,
+    reference: &str,
+    source: &str,
+) {
+    if reference.is_empty() {
+        return;
+    }
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": reference,
+        "metadata": {
+            "openclaudia_context_source": source,
+            "authority": "reference"
+        }
+    }));
 }
 
 fn canonical_provider_name(provider: &str) -> &str {
@@ -4956,14 +5173,15 @@ fn parse_prompt_effort_level(effort: &str) -> Option<EffortLevel> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_file_ref_regex, expand_file_refs};
     use super::{
-        format_api_retry_delay, format_api_retry_message, format_review_command_output,
-        format_stream_timeout_message, git_bin, handle_turn_result, list_sessions,
-        lookup_tui_slash, read_tui_session_file, resolve_provider_switch_auth, save_session,
-        ApiClient, App, AppEvent, EffortLevel, MessageKind, ProviderSwitch, SpawnTarget,
-        TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
+        append_context_reference_message, create_orphan_recovery_dir, format_api_retry_delay,
+        format_api_retry_message, format_review_command_output, format_stream_timeout_message,
+        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, read_tui_session_file,
+        resolve_provider_switch_auth, save_session, write_orphan_recovery_file, ApiClient, App,
+        AppEvent, EffortLevel, MessageKind, ProviderSwitch, SpawnTarget, TurnContext,
+        TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
     };
+    use super::{compile_file_ref_regex, expand_file_refs};
     use crate::slash_commands::all_tui_commands;
     use crate::state::Session;
     use crate::tui::events::ApiRetryKind;
@@ -4996,6 +5214,60 @@ mod tests {
                 n = idx + 1,
             );
         }
+    }
+
+    #[test]
+    fn context_reference_append_preserves_the_provider_history_prefix() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "original task"}),
+            serde_json::json!({"role": "assistant", "content": "original answer"}),
+        ];
+        let prefix = messages.clone();
+
+        append_context_reference_message(
+            &mut messages,
+            "hook or review finding",
+            "user_prompt_submit_hook",
+        );
+
+        assert!(messages.starts_with(&prefix));
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "hook or review finding");
+        assert_eq!(
+            messages[2]["metadata"]["openclaudia_context_source"],
+            "user_prompt_submit_hook"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_native_state_recovery_is_born_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::TempDir::new().expect("recovery root");
+        let directory = root.path().join("orphan-turns");
+        create_orphan_recovery_dir(&directory).expect("private recovery directory");
+        let path = directory.join("turn.json");
+        write_orphan_recovery_file(&path, br#"{"provider_native_state":"opaque"}"#)
+            .expect("private recovery file");
+
+        assert_eq!(
+            std::fs::metadata(&directory)
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
@@ -5464,6 +5736,7 @@ mod tests {
             usage: crate::session::TokenUsage::default(),
             needs_followup: false,
             finish_reason: None,
+            provider_native_state: None,
         }
     }
 
@@ -5564,6 +5837,43 @@ mod tests {
     }
 
     #[test]
+    fn stale_session_sync_cannot_install_portable_or_native_state() {
+        let mut app = App::new("gpt-5.5", "openai");
+        let current_messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "current session"
+        })];
+        app.chat_session
+            .replace_messages_and_provider_native_state(current_messages.clone(), None)
+            .expect("seed current session");
+        let output = crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_stale_tui_sync",
+            vec![serde_json::json!({
+                "type": "message",
+                "id": "msg_stale_tui_sync",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "stale"}]
+            })],
+        )
+        .expect("Responses output");
+        let stale_native_state =
+            crate::providers::advance_openai_responses_state("openai", "gpt-5.5", None, 1, &output)
+                .expect("Responses state");
+
+        assert!(app.handle_app_event(Ok(AppEvent::SyncSession {
+            session_id: "a-different-session".to_string(),
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "stale session"}),
+                serde_json::json!({"role": "assistant", "content": "stale"}),
+            ],
+            provider_native_state: Some(stale_native_state),
+        })));
+
+        assert_eq!(app.chat_session.messages_snapshot(), current_messages);
+        assert!(app.chat_session.provider_native_state_snapshot().is_none());
+    }
+
+    #[test]
     fn bare_effort_cycles_with_provider_capabilities() {
         let mut app = App::new("gpt-5.5", "openai");
         app.chat_session.set_effort_level(EffortLevel::High);
@@ -5629,7 +5939,7 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 AppEvent::ApiError(_) => saw_error = true,
-                AppEvent::SyncMessages(messages) => synced_messages = Some(messages),
+                AppEvent::SyncSession { messages, .. } => synced_messages = Some(messages),
                 _ => {}
             }
         }
@@ -5692,7 +6002,7 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 AppEvent::ApiError(_) => saw_error = true,
-                AppEvent::SyncMessages(messages) => synced_messages = Some(messages),
+                AppEvent::SyncSession { messages, .. } => synced_messages = Some(messages),
                 _ => {}
             }
         }
@@ -5710,6 +6020,105 @@ mod tests {
                 "Changed file \"src/tui/app.rs\".\nVerification check \"tui-check\": passed."
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn tui_responses_turn_syncs_portable_and_native_state_together() {
+        let session_id = "tui-responses-native-sync";
+        let ledger_path = reset_project_ledger(session_id);
+        let (content, run) = seed_valid_final_ledger(session_id);
+        let output = crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_tui_sync",
+            vec![serde_json::json!({
+                "id": "msg_tui_sync",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": content}]
+            })],
+        )
+        .expect("native turn output");
+        let native_state = crate::providers::advance_openai_responses_state(
+            "openai", "gpt-test", None, 1, &output,
+        )
+        .expect("native state");
+        let mut turn = direct_turn_result(content);
+        turn.provider_native_state = Some(native_state.clone());
+        let (tx, rx) = mpsc::channel();
+        let client = reqwest::Client::new();
+        let headers = crate::secrets::SensitiveHeaders::new();
+        let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
+            crate::services::policy::EnterprisePolicy::default(),
+        ));
+
+        handle_turn_result(
+            turn,
+            vec![serde_json::json!({"role":"user","content":"verify this"})],
+            TurnContext {
+                run_context: &run,
+                client: &client,
+                endpoint: "https://example.invalid",
+                headers: &headers,
+                provider: "openai",
+                model: "gpt-test",
+                effort_level: EffortLevel::Medium,
+                wire_api: crate::pipeline::WireApi::OpenAiResponses,
+                claude_code_token: None,
+                prompt_blocks: None,
+                provider_native_state: None,
+                memory_db: None,
+                app_config: None,
+                permission_mgr: None,
+                vdd_engine: None,
+                mcp_manager: None,
+                vdd_builder_auth: &crate::vdd::VddProviderAuth::None,
+                transient_allowed_tool_rules: &[],
+                hook_engine: None,
+                policy_enforcer,
+                task_mgr: Arc::new(Mutex::new(crate::session::TaskManager::new())),
+                session_id,
+                task_obs: None,
+                tx: &tx,
+            },
+        )
+        .await;
+
+        let events = rx.try_iter().collect::<Vec<_>>();
+        let sync_index = events
+            .iter()
+            .position(|event| matches!(event, AppEvent::SyncSession { .. }))
+            .expect("session sync event");
+        let response_done_indices = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| matches!(event, AppEvent::ResponseDone).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            response_done_indices.len(),
+            1,
+            "one orchestrator-owned terminal event"
+        );
+        assert!(
+            sync_index < response_done_indices[0],
+            "portable/native state must sync before ResponseDone"
+        );
+        let synced = events.into_iter().find_map(|event| match event {
+            AppEvent::SyncSession {
+                session_id: synced_session_id,
+                messages,
+                provider_native_state,
+            } => Some((synced_session_id, messages, provider_native_state)),
+            _ => None,
+        });
+        let _ = std::fs::remove_file(ledger_path);
+        let (synced_session_id, messages, state) = synced.expect("atomic session sync");
+        assert_eq!(synced_session_id, session_id);
+        assert_eq!(
+            messages.last().and_then(|message| message.get("role")),
+            Some(&serde_json::json!("assistant"))
+        );
+        assert_eq!(state, Some(native_state));
     }
 
     #[tokio::test]

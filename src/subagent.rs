@@ -916,6 +916,7 @@ pub static BACKGROUND_AGENTS: LazyLock<BackgroundAgentManager> =
 pub(crate) struct StoredTranscript {
     owner_run: crate::runtime::RunId,
     messages: Vec<Value>,
+    provider_native_state: Option<crate::runtime::ProviderNativeState>,
     agent_type: AgentType,
     created_at: Instant,
 }
@@ -1133,10 +1134,21 @@ pub(crate) fn spawn_transcript_sweeper() -> bool {
 /// by retaining the most recent messages; warns when truncation occurs.
 /// Also ensures the background sweeper has been spawned so TTL
 /// eviction does not depend on insert traffic.
+#[cfg(test)]
 fn store_transcript(
     owner: &crate::tools::ToolRunContext,
     agent_id: &str,
+    messages: Vec<Value>,
+    agent_type: AgentType,
+) {
+    store_transcript_with_state(owner, agent_id, messages, None, agent_type);
+}
+
+fn store_transcript_with_state(
+    owner: &crate::tools::ToolRunContext,
+    agent_id: &str,
     mut messages: Vec<Value>,
+    mut provider_native_state: Option<crate::runtime::ProviderNativeState>,
     agent_type: AgentType,
 ) {
     // Make sure the background TTL sweep is running. Idempotent.
@@ -1156,6 +1168,12 @@ fn store_transcript(
         // the dropped prefix but bounded by `dropped` and only runs
         // when the cap is exceeded.
         messages.drain(..dropped);
+        if provider_native_state.take().is_some() {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "clearing provider-native continuation because transcript truncation changed its portable history"
+            );
+        }
     }
 
     if let Some(mut store) = transcript_store_guard("store_transcript") {
@@ -1164,6 +1182,7 @@ fn store_transcript(
             StoredTranscript {
                 owner_run: owner.run_id(),
                 messages,
+                provider_native_state,
                 agent_type,
                 created_at: Instant::now(),
             },
@@ -1177,10 +1196,23 @@ fn store_transcript(
 /// — the background sweep (see [`spawn_transcript_sweeper`]) handles
 /// that. Per-call eviction is also unnecessary because every read
 /// path verifies the entry's own age in O(1).
+#[cfg(test)]
 fn load_transcript(
     owner: &crate::tools::ToolRunContext,
     agent_id: &str,
 ) -> Option<(Vec<Value>, AgentType)> {
+    load_transcript_with_state(owner, agent_id)
+        .map(|(messages, agent_type, _)| (messages, agent_type))
+}
+
+fn load_transcript_with_state(
+    owner: &crate::tools::ToolRunContext,
+    agent_id: &str,
+) -> Option<(
+    Vec<Value>,
+    AgentType,
+    Option<crate::runtime::ProviderNativeState>,
+)> {
     // Tighten lock scope: read out what we need, then release before
     // the rest of the function body. The clippy
     // `significant_drop_tightening` lint flags holding a `MutexGuard`
@@ -1189,15 +1221,22 @@ fn load_transcript(
         store
             .get(agent_id)
             .filter(|entry| entry.owner_run == owner.run_id())
-            .map(|entry| (entry.messages.clone(), entry.agent_type, entry.created_at))
+            .map(|entry| {
+                (
+                    entry.messages.clone(),
+                    entry.agent_type,
+                    entry.provider_native_state.clone(),
+                    entry.created_at,
+                )
+            })
     });
-    let (messages, agent_type, created_at) = snapshot?;
+    let (messages, agent_type, provider_native_state, created_at) = snapshot?;
     // Treat an expired entry as absent so resume fails cleanly even
     // if the background sweep is briefly behind.
     if Instant::now().duration_since(created_at).as_secs() >= TRANSCRIPT_TTL_SECS {
         return None;
     }
-    Some((messages, agent_type))
+    Some((messages, agent_type, provider_native_state))
 }
 
 // === Worktree Isolation ===
@@ -1734,7 +1773,9 @@ async fn run_subagent_inner(
     // reattached to the tracker. If the id was already registered
     // (e.g. a previous turn of the same resume chain), `register_with_id`
     // is a no-op and preserves the existing turn counter / state.
-    let (agent_id, mut messages) = if let Some(preallocated_id) = preallocated_agent_id {
+    let (agent_id, mut messages, mut provider_native_state) = if let Some(preallocated_id) =
+        preallocated_agent_id
+    {
         if let Err(error) = BACKGROUND_AGENTS.register_with_id(
             parent_run,
             config.agent_type,
@@ -1754,10 +1795,10 @@ async fn run_subagent_inner(
             "role": "user",
             "content": format!("Task: {}\n\n{}", config.task, config.prompt)
         })];
-        (preallocated_id.to_string(), msgs)
+        (preallocated_id.to_string(), msgs, None)
     } else if let Some(ref resume_id) = config.resume_agent_id {
-        match load_transcript(parent_run, resume_id) {
-            Some((prev_messages, _prev_type)) => {
+        match load_transcript_with_state(parent_run, resume_id) {
+            Some((prev_messages, _prev_type, native_state)) => {
                 if let Err(error) = BACKGROUND_AGENTS.register_with_id(
                     parent_run,
                     config.agent_type,
@@ -1779,7 +1820,7 @@ async fn run_subagent_inner(
                     "role": "user",
                     "content": format!("Continuing from where you left off.\n\n{}", config.prompt)
                 }));
-                (resume_id.clone(), msgs)
+                (resume_id.clone(), msgs, native_state)
             }
             None => {
                 return SubagentResult {
@@ -1810,7 +1851,7 @@ async fn run_subagent_inner(
             "role": "user",
             "content": format!("Task: {}\n\n{}", config.task, config.prompt)
         })];
-        (id, msgs)
+        (id, msgs, None)
     };
     if let Some(receipt) = effect_receipt {
         receipt.store(true, Ordering::SeqCst);
@@ -2034,7 +2075,7 @@ async fn run_subagent_inner(
     // provider yields `None` and `make_api_call` omits the auth header —
     // previously this was `String::new()` (an empty key sent as
     // `Bearer <empty>`, which every upstream rejects). See crosslink #256.
-    let (base_url, api_key) = app_config
+    let (base_url, configured_api_key) = app_config
         .providers
         .get(&app_config.proxy.target)
         .map_or_else(
@@ -2046,9 +2087,36 @@ async fn run_subagent_inner(
                 )
             },
         );
+    let (api_key, codex_responses_auth) =
+        match resolve_subagent_openai_auth(&app_config.proxy.target, configured_api_key) {
+            Ok(auth) => auth,
+            Err(error) => {
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                store_transcript_with_state(
+                    parent_run,
+                    &agent_id,
+                    messages,
+                    provider_native_state,
+                    config.agent_type,
+                );
+                return SubagentResult {
+                    agent_id,
+                    success: false,
+                    output: error,
+                    turns_used: 0,
+                    is_background: config.run_in_background,
+                    worktree,
+                };
+            }
+        };
+    let wire_api = if codex_responses_auth.is_some() {
+        crate::pipeline::WireApi::OpenAiResponses
+    } else {
+        crate::pipeline::WireApi::ChatCompletions
+    };
 
     // Run the agent loop
-    let mut final_output = String::new();
+    let mut final_output: String;
     let mut turns: u64;
 
     // Library-layer permission gate — consulted by every
@@ -2069,7 +2137,13 @@ async fn run_subagent_inner(
                 let error = agent_field_guard(&agent.error, "run_subagent", &agent_id, "error")
                     .and_then(|e| e.clone())
                     .unwrap_or_else(|| "Agent stopped before the next turn".to_string());
-                store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                store_transcript_with_state(
+                    parent_run,
+                    &agent_id,
+                    messages,
+                    provider_native_state,
+                    config.agent_type,
+                );
                 let output = match delegation.finish(crate::session::TaskUpdateStatus::Canceled) {
                     Ok(()) => error,
                     Err(tracking_error) => format!(
@@ -2094,7 +2168,13 @@ async fn run_subagent_inner(
                 format!("Agent exceeded maximum turns ({MAX_SUBAGENT_TURNS})"),
             );
             // Store transcript even on failure for potential resume
-            store_transcript(parent_run, &agent_id, messages, config.agent_type);
+            store_transcript_with_state(
+                parent_run,
+                &agent_id,
+                messages,
+                provider_native_state,
+                config.agent_type,
+            );
             return SubagentResult {
                 agent_id,
                 success: false,
@@ -2117,7 +2197,13 @@ async fn run_subagent_inner(
             Ok(messages) => messages,
             Err(e) => {
                 BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
-                store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                store_transcript_with_state(
+                    parent_run,
+                    &agent_id,
+                    messages,
+                    provider_native_state,
+                    config.agent_type,
+                );
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -2138,7 +2224,13 @@ async fn run_subagent_inner(
             Ok(snapshot) => snapshot.definitions,
             Err(e) => {
                 BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
-                store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                store_transcript_with_state(
+                    parent_run,
+                    &agent_id,
+                    messages,
+                    provider_native_state,
+                    config.agent_type,
+                );
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -2151,15 +2243,21 @@ async fn run_subagent_inner(
         };
         let request_body = json!({
             "model": model,
-            "messages": prepared_request_messages,
-            "tools": progressive_tools,
+            "messages": prepared_request_messages.clone(),
+            "tools": progressive_tools.clone(),
             "max_tokens": SUBAGENT_MAX_TOKENS
         });
         let typed_request = match build_chat_completion_request(&request_body) {
             Ok(request) => request,
             Err(e) => {
                 BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
-                store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                store_transcript_with_state(
+                    parent_run,
+                    &agent_id,
+                    messages,
+                    provider_native_state,
+                    config.agent_type,
+                );
                 return SubagentResult {
                     agent_id,
                     success: false,
@@ -2173,7 +2271,13 @@ async fn run_subagent_inner(
         if let Err(e) = check_provider_request_policy(app_config, &typed_request) {
             let message = format!("Blocked by policy: {e}");
             BACKGROUND_AGENTS.fail(parent_run, &agent_id, message.clone());
-            store_transcript(parent_run, &agent_id, messages, config.agent_type);
+            store_transcript_with_state(
+                parent_run,
+                &agent_id,
+                messages,
+                provider_native_state,
+                config.agent_type,
+            );
             return SubagentResult {
                 agent_id,
                 success: false,
@@ -2184,70 +2288,191 @@ async fn run_subagent_inner(
             };
         }
 
+        let assistant_message_ordinal =
+            match crate::pipeline::next_assistant_message_ordinal(&messages) {
+                Ok(ordinal) => ordinal,
+                Err(error) => {
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                    store_transcript_with_state(
+                        parent_run,
+                        &agent_id,
+                        messages,
+                        provider_native_state,
+                        config.agent_type,
+                    );
+                    return SubagentResult {
+                        agent_id,
+                        success: false,
+                        output: error,
+                        turns_used: turns,
+                        is_background: config.run_in_background,
+                        worktree: worktree.clone(),
+                    };
+                }
+            };
+        let provider_request_body = if wire_api.is_responses() {
+            match crate::pipeline::build_request_for_wire_with_exact_tools_and_state(
+                wire_api,
+                &app_config.proxy.target,
+                &model,
+                &prepared_request_messages,
+                app_config
+                    .active_provider()
+                    .and_then(|provider| provider.thinking.reasoning_effort.as_deref())
+                    .unwrap_or("medium"),
+                None,
+                None,
+                &progressive_tools,
+                provider_native_state.as_ref(),
+            ) {
+                Ok(mut request) => {
+                    if let Err(error) = apply_subagent_responses_output_limit(&mut request) {
+                        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                        store_transcript_with_state(
+                            parent_run,
+                            &agent_id,
+                            messages,
+                            provider_native_state,
+                            config.agent_type,
+                        );
+                        return SubagentResult {
+                            agent_id,
+                            success: false,
+                            output: error,
+                            turns_used: turns,
+                            is_background: config.run_in_background,
+                            worktree: worktree.clone(),
+                        };
+                    }
+                    Some(request)
+                }
+                Err(error) => {
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                    store_transcript_with_state(
+                        parent_run,
+                        &agent_id,
+                        messages,
+                        provider_native_state,
+                        config.agent_type,
+                    );
+                    return SubagentResult {
+                        agent_id,
+                        success: false,
+                        output: format!("Responses request error: {error}"),
+                        turns_used: turns,
+                        is_background: config.run_in_background,
+                        worktree: worktree.clone(),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
         // Make the API call — provider is plumbed through so the
         // ProviderAdapter trait (canonical implementation in
         // `src/providers/`) handles request/response transformation for
         // every supported provider. See crosslink #407.
-        let response = match make_api_call(
-            client,
-            &app_config.proxy.target,
-            &base_url,
-            api_key.as_ref(),
-            &request_body,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
-                store_transcript(parent_run, &agent_id, messages, config.agent_type);
-                return SubagentResult {
-                    agent_id,
-                    success: false,
-                    output: e,
-                    turns_used: turns,
-                    is_background: config.run_in_background,
-                    worktree: worktree.clone(),
+        let (mut assistant_message, next_provider_native_state) =
+            if let Some(request) = provider_request_body.as_ref() {
+                let Some(auth) = codex_responses_auth.as_ref() else {
+                    unreachable!("Responses wire selection requires Codex auth");
                 };
-            }
-        };
-
-        // Parse the response
-        let assistant_message = match parse_response(&response) {
-            Ok(msg) => msg,
-            Err(e) => {
-                BACKGROUND_AGENTS.fail(parent_run, &agent_id, e.clone());
-                store_transcript(parent_run, &agent_id, messages, config.agent_type);
-                return SubagentResult {
-                    agent_id,
-                    success: false,
-                    output: e,
-                    turns_used: turns,
-                    is_background: config.run_in_background,
-                    worktree: worktree.clone(),
-                };
-            }
-        };
-
-        // Check for text content (final response)
-        if let Some(content) = assistant_message.get("content") {
-            if let Some(text) = content.as_str() {
-                if !text.is_empty() {
-                    final_output = text.to_string();
-                }
-            } else if let Some(arr) = content.as_array() {
-                // Handle Anthropic-style content array
-                for part in arr {
-                    if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            if !text.is_empty() {
-                                final_output = text.to_string();
-                            }
-                        }
+                match make_openai_responses_api_call(
+                    client,
+                    &app_config.proxy.target,
+                    &model,
+                    crate::codex_credentials::CODEX_CHATGPT_BASE_URL,
+                    auth,
+                    app_config
+                        .active_provider()
+                        .map(|provider| &provider.headers),
+                    request,
+                    provider_native_state.as_ref(),
+                    assistant_message_ordinal,
+                )
+                .await
+                {
+                    Ok(decoded) => {
+                        let assistant = responses_subagent_assistant_message(&decoded);
+                        (assistant, Some(decoded.provider_native_state))
+                    }
+                    Err(error) => {
+                        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                        store_transcript_with_state(
+                            parent_run,
+                            &agent_id,
+                            messages,
+                            provider_native_state,
+                            config.agent_type,
+                        );
+                        return SubagentResult {
+                            agent_id,
+                            success: false,
+                            output: error,
+                            turns_used: turns,
+                            is_background: config.run_in_background,
+                            worktree: worktree.clone(),
+                        };
                     }
                 }
-            }
-        }
+            } else {
+                let response = match make_api_call(
+                    client,
+                    &app_config.proxy.target,
+                    &base_url,
+                    api_key.as_ref(),
+                    &request_body,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                        store_transcript_with_state(
+                            parent_run,
+                            &agent_id,
+                            messages,
+                            provider_native_state,
+                            config.agent_type,
+                        );
+                        return SubagentResult {
+                            agent_id,
+                            success: false,
+                            output: error,
+                            turns_used: turns,
+                            is_background: config.run_in_background,
+                            worktree: worktree.clone(),
+                        };
+                    }
+                };
+                let assistant = match parse_response(&response) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                        store_transcript_with_state(
+                            parent_run,
+                            &agent_id,
+                            messages,
+                            provider_native_state,
+                            config.agent_type,
+                        );
+                        return SubagentResult {
+                            agent_id,
+                            success: false,
+                            output: error,
+                            turns_used: turns,
+                            is_background: config.run_in_background,
+                            worktree: worktree.clone(),
+                        };
+                    }
+                };
+                (assistant, None)
+            };
+
+        // Text belongs to this exact provider turn. Never carry a tool-bearing
+        // preamble forward as the final answer for a later empty response.
+        final_output = subagent_assistant_text(&assistant_message);
 
         // Check for tool calls
         let tool_calls = assistant_message
@@ -2268,7 +2493,13 @@ async fn run_subagent_inner(
                 }
                 Err(reason) => {
                     BACKGROUND_AGENTS.fail(parent_run, &agent_id, reason.clone());
-                    store_transcript(parent_run, &agent_id, messages, config.agent_type);
+                    store_transcript_with_state(
+                        parent_run,
+                        &agent_id,
+                        messages,
+                        provider_native_state,
+                        config.agent_type,
+                    );
                     return SubagentResult {
                         agent_id,
                         success: false,
@@ -2279,12 +2510,20 @@ async fn run_subagent_inner(
                     };
                 }
             }
+            if let Some(next_state) = next_provider_native_state {
+                assistant_message["content"] = Value::String(final_output.clone());
+                messages.push(assistant_message);
+                provider_native_state = Some(next_state);
+            }
             // No tool calls means agent is done
             break;
         }
 
         // Add assistant message to history
         messages.push(assistant_message.clone());
+        if let Some(next_state) = next_provider_native_state {
+            provider_native_state = Some(next_state);
+        }
 
         // Execute tool calls and add results
         for (tool_call_index, tool_call) in tool_calls.iter().enumerate() {
@@ -2367,7 +2606,13 @@ async fn run_subagent_inner(
     // Store the transcript and settle owned resources before publishing the
     // terminal graph state. The caller cannot observe success until the
     // canonical delegation node commits `completed`.
-    store_transcript(parent_run, &agent_id, messages, config.agent_type);
+    store_transcript_with_state(
+        parent_run,
+        &agent_id,
+        messages,
+        provider_native_state,
+        config.agent_type,
+    );
 
     // Handle worktree cleanup: remove if no changes, keep if changes exist
     let final_worktree = worktree.and_then(|wt| {
@@ -2451,6 +2696,35 @@ fn resolve_subagent_adapter(
     }
     crate::providers::get_adapter(&normalized)
         .map_err(|e| format!("Subagent provider '{provider}' adapter lookup failed: {e}"))
+}
+
+fn resolve_subagent_openai_auth(
+    provider: &str,
+    api_key: Option<crate::providers::ApiKey>,
+) -> Result<
+    (
+        Option<crate::providers::ApiKey>,
+        Option<crate::codex_credentials::CodexResponsesAuth>,
+    ),
+    String,
+> {
+    if !provider.eq_ignore_ascii_case("openai") || api_key.is_some() {
+        return Ok((api_key, None));
+    }
+    match crate::codex_credentials::load_codex_auth()? {
+        Some(crate::codex_credentials::CodexAuthMaterial::ApiKey { api_key, .. }) => {
+            Ok((Some(api_key), None))
+        }
+        Some(crate::codex_credentials::CodexAuthMaterial::Responses(auth)) => {
+            Ok((None, Some(auth)))
+        }
+        Some(crate::codex_credentials::CodexAuthMaterial::Unsupported { mode, .. }) => Err(
+            format!("{} is not supported for child runs", mode.display_name()),
+        ),
+        None => {
+            Err("OpenAI child run requires an API key or supported Codex credential".to_string())
+        }
+    }
 }
 
 /// Decode the in-flight subagent `request_body` JSON into the typed
@@ -2713,6 +2987,120 @@ fn strip_subagent_decision_argument(tool_call: &ToolCall) -> ToolCall {
     let mut stripped = tool_call.clone();
     stripped.function.arguments = Value::Object(args).to_string();
     stripped
+}
+
+fn responses_subagent_assistant_message(
+    decoded: &crate::pipeline::OpenAiResponsesDecodedTurn,
+) -> Value {
+    let tool_calls = decoded
+        .tool_calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "role": "assistant",
+        "content": if decoded.content.is_empty() && !tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(decoded.content.clone())
+        },
+        "tool_calls": tool_calls,
+    })
+}
+
+fn apply_subagent_responses_output_limit(request: &mut Value) -> Result<(), String> {
+    request
+        .as_object_mut()
+        .ok_or_else(|| "Responses child request must be an object".to_string())?
+        .insert(
+            "max_output_tokens".to_string(),
+            Value::from(SUBAGENT_MAX_TOKENS),
+        );
+    Ok(())
+}
+
+fn subagent_assistant_text(message: &Value) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    content.as_array().map_or_else(String::new, |parts| {
+        parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn make_openai_responses_api_call(
+    client: &Client,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    auth: &crate::codex_credentials::CodexResponsesAuth,
+    extra_headers: Option<&crate::secrets::SensitiveHeaders>,
+    request_body: &Value,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
+) -> Result<crate::pipeline::OpenAiResponsesDecodedTurn, String> {
+    let endpoint = crate::pipeline::resolve_endpoint_for_wire(
+        crate::pipeline::WireApi::OpenAiResponses,
+        provider,
+        model,
+        base_url,
+        None,
+    )
+    .map_err(|error| format!("Responses endpoint error: {error}"))?;
+    let mut headers = auth
+        .headers()
+        .map_err(|error| format!("Responses header error: {error}"))?;
+    if let Some(extra_headers) = extra_headers {
+        headers.extend(extra_headers);
+    }
+    let request = headers
+        .apply(client.post(endpoint).json(request_body))
+        .map_err(|error| format!("Responses header error: {error}"))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Responses request failed: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = crate::secrets::read_bounded_diagnostic_body(response)
+            .await
+            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+        return Err(format!(
+            "Responses API error ({status}): {}",
+            headers.sanitize_diagnostic(&body)
+        ));
+    }
+    crate::pipeline::decode_openai_responses_stream(
+        crate::pipeline::OpenAiResponsesStreamParams {
+            response,
+            headers: &headers,
+            provider,
+            model_identity: model,
+            provider_native_state,
+            assistant_message_ordinal,
+        },
+        |_| Ok(()),
+        |_| Ok(()),
+        |_, _| Ok(()),
+    )
+    .await
 }
 
 /// Make an API call to the LLM provider.
@@ -5115,6 +5503,188 @@ memory:
         assert_eq!(loaded.0[2]["content"].as_str(), Some("Done."));
     }
 
+    fn responses_test_state() -> crate::runtime::ProviderNativeState {
+        let output = crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_child_resume",
+            vec![json!({
+                "type": "reasoning",
+                "id": "rs_child",
+                "encrypted_content": "opaque-child-state"
+            })],
+        )
+        .expect("Responses output");
+        crate::providers::advance_openai_responses_state("openai", "gpt-test", None, 1, &output)
+            .expect("Responses state")
+    }
+
+    #[test]
+    fn responses_child_resume_round_trips_native_state_with_portable_transcript() {
+        let id = format!("s045-resume-{}", Uuid::new_v4());
+        let messages = vec![
+            json!({"role": "user", "content": "inspect"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        let state = responses_test_state();
+
+        store_transcript_with_state(
+            test_run(),
+            &id,
+            messages.clone(),
+            Some(state.clone()),
+            AgentType::Explore,
+        );
+        let (loaded_messages, loaded_type, loaded_state) =
+            load_transcript_with_state(test_run(), &id).expect("stored Responses transcript");
+
+        assert_eq!(loaded_messages, messages);
+        assert_eq!(loaded_type, AgentType::Explore);
+        assert_eq!(loaded_state, Some(state));
+    }
+
+    #[test]
+    fn responses_child_projection_preserves_exact_tool_call_identity() {
+        let decoded = crate::pipeline::OpenAiResponsesDecodedTurn {
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: "call_native_7".to_string(),
+                call_type: "function".to_string(),
+                function: crate::tools::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.to_string(),
+                },
+            }],
+            usage: crate::session::TokenUsage::default(),
+            provider_native_state: responses_test_state(),
+        };
+
+        let message = responses_subagent_assistant_message(&decoded);
+        assert!(message["content"].is_null());
+        assert_eq!(message["tool_calls"][0]["id"], "call_native_7");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"src/lib.rs"}"#
+        );
+    }
+
+    #[test]
+    fn responses_child_request_keeps_the_host_output_token_cap() {
+        let mut request = json!({
+            "model": "gpt-test",
+            "input": [],
+            "store": false,
+            "stream": true
+        });
+
+        apply_subagent_responses_output_limit(&mut request).expect("Responses child output limit");
+
+        assert_eq!(request["max_output_tokens"], SUBAGENT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn child_turn_text_is_recomputed_and_all_text_blocks_are_preserved() {
+        let previous = json!({"role": "assistant", "content": "tool preamble"});
+        assert_eq!(subagent_assistant_text(&previous), "tool preamble");
+
+        let empty_terminal = json!({"role": "assistant", "content": null});
+        assert!(subagent_assistant_text(&empty_terminal).is_empty());
+
+        let multipart = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "first "},
+                {"type": "thinking", "thinking": "private"},
+                {"type": "text", "text": "second"}
+            ]
+        });
+        assert_eq!(subagent_assistant_text(&multipart), "first second");
+    }
+
+    #[tokio::test]
+    async fn responses_child_transport_uses_terminal_validated_shared_decoder() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_child_transport",
+            "encrypted_content": "opaque-child-transport"
+        });
+        let function_call = json!({
+            "type": "function_call",
+            "id": "fc_child_transport",
+            "call_id": "call_child_transport",
+            "name": "read_file",
+            "arguments": r#"{"path":"src/lib.rs"}"#
+        });
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({"type":"response.created","response":{"id":"resp_child_transport"}}),
+            json!({"type":"response.output_item.done","item":reasoning}),
+            json!({"type":"response.output_item.done","item":function_call}),
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp_child_transport",
+                    "status":"completed",
+                    "output":[reasoning, function_call],
+                    "usage":{"input_tokens":11,"output_tokens":7}
+                }
+            })
+        );
+        let request_body = json!({
+            "model": "gpt-test",
+            "store": false,
+            "stream": true,
+            "input": [{"role":"user","content":"inspect"}]
+        });
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer child-transport-token"))
+            .and(body_json(request_body.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = crate::codex_credentials::CodexResponsesAuth {
+            access_token: crate::secrets::OAuthToken::try_from_string(
+                "child-transport-token".to_string(),
+            )
+            .expect("token"),
+            account_id: None,
+            is_fedramp_account: false,
+            source: crate::codex_credentials::CodexAuthSource::EnvAccessToken,
+            mode: crate::codex_credentials::CodexAuthMode::ChatgptAuthTokens,
+        };
+
+        let decoded = make_openai_responses_api_call(
+            &Client::new(),
+            "openai",
+            "gpt-test",
+            &server.uri(),
+            &auth,
+            None,
+            &request_body,
+            None,
+            1,
+        )
+        .await
+        .expect("Responses child turn");
+
+        assert_eq!(decoded.tool_calls.len(), 1);
+        assert_eq!(decoded.tool_calls[0].id, "call_child_transport");
+        assert_eq!(decoded.usage.input_tokens, 11);
+        assert_eq!(decoded.provider_native_state.generation().get(), 1);
+        assert!(decoded.provider_native_state.items().iter().any(|item| {
+            item.payload()["item"]["encrypted_content"] == "opaque-child-transport"
+        }));
+    }
+
     #[test]
     fn transcript_resume_is_bound_to_exact_owner_run() {
         let owner = isolated_test_run("transcript-owner");
@@ -5986,6 +6556,7 @@ memory:
                 StoredTranscript {
                     owner_run: test_run().run_id(),
                     messages: vec![json!({"role": "user", "content": "x"})],
+                    provider_native_state: None,
                     agent_type: AgentType::Explore,
                     // Stagger timestamps so #0 is unambiguously oldest.
                     created_at: base + Duration::from_micros(i),
@@ -6026,6 +6597,7 @@ memory:
                 StoredTranscript {
                     owner_run: test_run().run_id(),
                     messages: vec![json!({"role": "user", "content": "x"})],
+                    provider_native_state: None,
                     agent_type: AgentType::Explore,
                     created_at: base + Duration::from_micros(i_u64),
                 },
@@ -6045,6 +6617,7 @@ memory:
             StoredTranscript {
                 owner_run: test_run().run_id(),
                 messages: vec![json!({"role": "assistant", "content": "new"})],
+                provider_native_state: None,
                 agent_type: AgentType::Plan,
                 created_at: base
                     + Duration::from_micros(
@@ -6137,6 +6710,7 @@ memory:
             StoredTranscript {
                 owner_run: test_run().run_id(),
                 messages: vec![],
+                provider_native_state: None,
                 agent_type: AgentType::Explore,
                 created_at: past,
             },
@@ -6146,6 +6720,7 @@ memory:
             StoredTranscript {
                 owner_run: test_run().run_id(),
                 messages: vec![],
+                provider_native_state: None,
                 agent_type: AgentType::Plan,
                 // Slightly older still; ordering breakup needs unique keys.
                 created_at: past
@@ -6158,6 +6733,7 @@ memory:
             StoredTranscript {
                 owner_run: test_run().run_id(),
                 messages: vec![],
+                provider_native_state: None,
                 agent_type: AgentType::GeneralPurpose,
                 created_at: now,
             },

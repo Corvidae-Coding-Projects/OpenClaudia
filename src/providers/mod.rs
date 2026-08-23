@@ -60,7 +60,8 @@ pub use model_catalog::{
     STATIC_MODEL_CATALOG_PROVIDERS, ZAI_MODELS,
 };
 pub use ollama::OllamaAdapter;
-pub use openai::OpenAIAdapter;
+pub(crate) use openai::finalize_responses_request;
+pub use openai::{advance_openai_responses_state, OpenAIAdapter, OpenAiResponsesTurnOutput};
 pub use qwen::QwenAdapter;
 pub use zai::ZaiAdapter;
 
@@ -350,8 +351,23 @@ static ANTHROPIC_STATE_CONTRACT: ProviderStateContract =
     retained_evidence_contract(ProviderWireProtocol::AnthropicMessages);
 static OPENAI_CHAT_STATE_CONTRACT: ProviderStateContract =
     retained_evidence_contract(ProviderWireProtocol::OpenAiChatCompletions);
-static OPENAI_RESPONSES_STATE_CONTRACT: ProviderStateContract =
-    retained_evidence_contract(ProviderWireProtocol::OpenAiResponses);
+static OPENAI_RESPONSES_STATE_CONTRACT: ProviderStateContract = ProviderStateContract {
+    protocol: ProviderWireProtocol::OpenAiResponses,
+    native_message: ProviderStateSupport::RoundTrip,
+    tool_calls: ProviderStateSupport::RoundTrip,
+    parallel_tool_calls: ProviderStateSupport::RoundTrip,
+    reasoning: ProviderStateSupport::RoundTrip,
+    refusal: ProviderStateSupport::EvidenceOnly,
+    usage: ProviderStateSupport::EvidenceOnly,
+    cache_metadata: ProviderStateSupport::EvidenceOnly,
+    compaction: ProviderStateSupport::RoundTrip,
+    // The Responses transport is deliberately stateless (`store:false`).
+    // Response IDs are retained for evidence and trace correlation, but are
+    // not sent back as `previous_response_id`; exact output items carry the
+    // continuation instead.
+    server_continuation: ProviderStateSupport::EvidenceOnly,
+    terminal_state: ProviderStateSupport::EvidenceOnly,
+};
 static GEMINI_GENERATE_CONTENT_STATE_CONTRACT: ProviderStateContract =
     retained_evidence_contract(ProviderWireProtocol::GeminiGenerateContent);
 static GEMINI_INTERACTIONS_STATE_CONTRACT: ProviderStateContract =
@@ -925,6 +941,51 @@ mod tests {
                 .protocol,
             ProviderWireProtocol::OpenAiResponses
         );
+    }
+
+    #[test]
+    fn openai_responses_native_contract_is_stateless_and_round_trip() {
+        let responses = get_adapter("openai")
+            .expect("OpenAI adapter")
+            .state_contract(ProviderWireProtocol::OpenAiResponses)
+            .expect("Responses contract");
+        for facet in [
+            ProviderStateFacet::NativeMessage,
+            ProviderStateFacet::ToolCalls,
+            ProviderStateFacet::ParallelToolCalls,
+            ProviderStateFacet::Reasoning,
+            ProviderStateFacet::Compaction,
+        ] {
+            responses
+                .validate_state(&native_state_for(
+                    "openai",
+                    ProviderWireProtocol::OpenAiResponses,
+                    facet,
+                    ProviderNativeItemPurpose::Continuation,
+                ))
+                .unwrap_or_else(|error| panic!("Responses must round-trip {facet:?}: {error}"));
+        }
+        let response_id_evidence = native_state_for(
+            "openai",
+            ProviderWireProtocol::OpenAiResponses,
+            ProviderStateFacet::ServerContinuation,
+            ProviderNativeItemPurpose::Evidence,
+        );
+        responses
+            .validate_state(&response_id_evidence)
+            .expect("stateless Responses retains response ids as evidence");
+        let error = responses
+            .validate_state(&native_state_for(
+                "openai",
+                ProviderWireProtocol::OpenAiResponses,
+                ProviderStateFacet::ServerContinuation,
+                ProviderNativeItemPurpose::Continuation,
+            ))
+            .expect_err("store:false must not claim previous_response_id replay");
+        assert!(matches!(
+            error,
+            crate::runtime::ProviderStateContractError::EvidenceOnlyContinuation { .. }
+        ));
     }
 
     #[test]

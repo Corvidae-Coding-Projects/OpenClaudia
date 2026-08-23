@@ -668,6 +668,13 @@ pub enum ProviderStateError {
         "provider-native state generation {generation} conflicts with the current state digest"
     )]
     GenerationConflict { generation: ContinuationGeneration },
+    #[error(
+        "provider-native continuation cannot replace portable history (current messages: {current_messages}, attempted messages: {attempted_messages})"
+    )]
+    PortableHistoryConflict {
+        current_messages: usize,
+        attempted_messages: usize,
+    },
 }
 
 fn validate_model(model: &str) -> Result<(), ProviderStateError> {

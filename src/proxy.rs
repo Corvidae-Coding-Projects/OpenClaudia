@@ -1910,7 +1910,11 @@ async fn proxy_passthrough(
         "user-agent",
         "content-type",
     ];
-    let path = request.uri().path();
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
+    let method = request.method().clone();
     let provider = state
         .config
         .active_provider()
@@ -1921,10 +1925,17 @@ async fn proxy_passthrough(
         return Err(ProxyError::NoApiKey(state.config.proxy.target.clone()));
     }
 
-    let url = format!("{}{}", normalize_base_url(&provider.base_url), path);
+    let url = format!(
+        "{}{}",
+        normalize_base_url(&provider.base_url),
+        path_and_query
+    );
     debug!("Passthrough request");
 
-    let mut req_builder = state.client.request(request.method().clone(), &url);
+    let body = axum::body::to_bytes(request.into_body(), state.config.proxy.max_response_bytes)
+        .await
+        .map_err(|error| ProxyError::InvalidBody(format!("passthrough body rejected: {error}")))?;
+    let mut req_builder = state.client.request(method, &url).body(body);
 
     for (key, value) in &headers {
         let key_lower = key.as_str().to_lowercase();
@@ -3286,6 +3297,67 @@ mod tests {
             .expect("model list data")
             .iter()
             .all(|item| item["owned_by"] == "anthropic"));
+    }
+
+    #[tokio::test]
+    async fn responses_passthrough_preserves_native_continuation_body_and_query() {
+        use wiremock::matchers::{body_json, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let request_body = serde_json::json!({
+            "model": "gpt-test",
+            "store": false,
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-native-state"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok"
+                }
+            ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(query_param("include", "reasoning.encrypted_content"))
+            .and(body_json(request_body.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_proxy",
+                "status": "completed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = minimal_config("openai");
+        config
+            .providers
+            .insert("openai".to_string(), test_provider_config(server.uri()));
+        let state = test_proxy_state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-proxy-test"),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses?include=reasoning.encrypted_content")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(request_body.to_string()))
+            .expect("request");
+
+        let response = proxy_passthrough(State(state), headers, request)
+            .await
+            .expect("Responses passthrough");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     async fn upstream_response(

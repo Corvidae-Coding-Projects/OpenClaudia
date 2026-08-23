@@ -318,6 +318,84 @@ impl Session {
         });
     }
 
+    /// Atomically commit the portable transcript and the provider-native
+    /// continuation that was captured from the same completed turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without mutating either lane when identity, protocol,
+    /// generation, or digest continuity is invalid.
+    pub fn replace_messages_and_provider_native_state(
+        &self,
+        messages: Vec<Value>,
+        provider_state: Option<crate::runtime::ProviderNativeState>,
+    ) -> Result<(), crate::runtime::ProviderStateError> {
+        if let Some(next) = &provider_state {
+            next.validate()?;
+            next.validate_identity(&self.provider, &self.model)?;
+        }
+        self.state.update(|state, events| {
+            if let (Some(current), Some(next)) = (
+                state.conversation.provider_native_state.as_ref(),
+                provider_state.as_ref(),
+            ) {
+                if current.protocol() != next.protocol() {
+                    return Err(crate::runtime::ProviderStateError::ProtocolMismatch {
+                        stored: current.protocol(),
+                        requested: next.protocol(),
+                    });
+                }
+                match next.generation().cmp(&current.generation()) {
+                    std::cmp::Ordering::Less => {
+                        return Err(crate::runtime::ProviderStateError::StaleGeneration {
+                            current: current.generation(),
+                            attempted: next.generation(),
+                        });
+                    }
+                    std::cmp::Ordering::Equal if next != current => {
+                        return Err(crate::runtime::ProviderStateError::GenerationConflict {
+                            generation: current.generation(),
+                        });
+                    }
+                    std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {}
+                }
+            }
+            if provider_state.is_some()
+                && !messages.starts_with(state.conversation.messages.as_slice())
+            {
+                return Err(
+                    crate::runtime::ProviderStateError::PortableHistoryConflict {
+                        current_messages: state.conversation.messages.len(),
+                        attempted_messages: messages.len(),
+                    },
+                );
+            }
+
+            let previous_len = state.conversation.messages.len();
+            state.conversation.messages = messages;
+            state.conversation.provider_native_state = provider_state;
+            if previous_len > 0 && state.conversation.messages.is_empty() {
+                events.push(StateEvent::Cleared);
+            }
+            events.extend(
+                state
+                    .conversation
+                    .messages
+                    .iter()
+                    .skip(previous_len)
+                    .map(|message| {
+                        message
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
+                    .map(|role| StateEvent::MessageAppended { role }),
+            );
+            Ok(())
+        })
+    }
+
     /// Mutate portable history while preserving native continuation state only
     /// when the previous history remains an exact prefix. Appending new input
     /// can continue a provider turn; rewriting prior input creates a branch and
@@ -721,6 +799,69 @@ mod tests {
             session.provider_native_state_snapshot(),
             Some(generation_three)
         );
+    }
+
+    #[test]
+    fn portable_and_native_turn_state_commit_atomically() {
+        let session = Session::new("gpt-test", "openai");
+        let generation_two = provider_state_at("openai", "gpt-test", 2, 20);
+        let messages_two = vec![
+            json!({"role": "user", "content": "inspect"}),
+            json!({"role": "assistant", "content": "checking"}),
+        ];
+        let mut messages_three = messages_two.clone();
+        messages_three.push(json!({"role": "user", "content": "continue"}));
+        messages_three.push(json!({"role": "assistant", "content": "done"}));
+        session
+            .replace_messages_and_provider_native_state(messages_two, Some(generation_two))
+            .expect("first atomic sync");
+
+        let generation_three = provider_state_at("openai", "gpt-test", 3, 30);
+        session
+            .replace_messages_and_provider_native_state(
+                messages_three.clone(),
+                Some(generation_three.clone()),
+            )
+            .expect("new generation atomically advances both lanes");
+        assert_eq!(session.messages_snapshot(), messages_three);
+        assert_eq!(
+            session.provider_native_state_snapshot(),
+            Some(generation_three)
+        );
+
+        let stale_messages = vec![json!({"role": "user", "content": "stale overwrite"})];
+        let error = session
+            .replace_messages_and_provider_native_state(
+                stale_messages,
+                Some(provider_state_at("openai", "gpt-test", 1, 10)),
+            )
+            .expect_err("stale native state must reject the entire sync");
+        assert!(matches!(
+            error,
+            crate::runtime::ProviderStateError::StaleGeneration { .. }
+        ));
+        assert_eq!(session.messages_snapshot(), messages_three);
+        assert_eq!(
+            session
+                .provider_native_state_snapshot()
+                .expect("state retained")
+                .generation()
+                .get(),
+            3
+        );
+
+        let rewritten = vec![json!({"role": "user", "content": "different history"})];
+        let error = session
+            .replace_messages_and_provider_native_state(
+                rewritten,
+                Some(provider_state_at("openai", "gpt-test", 4, 40)),
+            )
+            .expect_err("advanced native state cannot overwrite a different portable history");
+        assert!(matches!(
+            error,
+            crate::runtime::ProviderStateError::PortableHistoryConflict { .. }
+        ));
+        assert_eq!(session.messages_snapshot(), messages_three);
     }
 
     #[test]

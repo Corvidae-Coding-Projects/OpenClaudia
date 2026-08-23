@@ -144,6 +144,15 @@ pub struct AcpServer {
     /// translators, while the ACP loop selects OAuth headers/endpoints above
     /// that layer.
     claude_code_token: Option<crate::secrets::OAuthToken>,
+    /// Codex ChatGPT/PAT authentication selects the `OpenAI` Responses wire
+    /// protocol without copying credentials into conversation state.
+    codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
+    /// Exact Responses continuation paired with the active portable transcript.
+    provider_native_state: Option<crate::runtime::ProviderNativeState>,
+    /// ACP wire session that owns the in-memory transcript/native pair. ACP's
+    /// broader durable multi-session consolidation remains W12 work, but state
+    /// from one live wire session must never be replayed into another.
+    active_conversation_acp_session_id: Option<String>,
     /// Session-scoped enterprise policy enforcer for model/token/tool caps.
     policy_enforcer: Arc<crate::services::policy::PolicyEnforcer>,
     /// Cancellation flag for in-flight prompts
@@ -856,6 +865,9 @@ impl AcpServer {
             .policy()
             .check_model(model)
             .map_err(|err| format!("Blocked by policy: {err}"))?;
+        if self.model != model {
+            self.provider_native_state = None;
+        }
         self.model = model.to_string();
         Ok(())
     }
@@ -871,6 +883,7 @@ impl AcpServer {
         model: String,
         api_key: Option<crate::providers::ApiKey>,
         claude_code_token: Option<crate::secrets::OAuthToken>,
+        codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
         stdout_tx: mpsc::UnboundedSender<String>,
         launch_root: std::path::PathBuf,
     ) -> Result<Self, String> {
@@ -881,17 +894,20 @@ impl AcpServer {
             model,
             api_key,
             claude_code_token,
+            codex_responses_auth,
             stdout_tx,
             launch_root,
             host_home,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_host_home(
         config: AppConfig,
         model: String,
         api_key: Option<crate::providers::ApiKey>,
         claude_code_token: Option<crate::secrets::OAuthToken>,
+        codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
         stdout_tx: mpsc::UnboundedSender<String>,
         launch_root: std::path::PathBuf,
         host_home: std::path::PathBuf,
@@ -949,6 +965,9 @@ impl AcpServer {
             model,
             api_key,
             claude_code_token,
+            codex_responses_auth,
+            provider_native_state: None,
+            active_conversation_acp_session_id: None,
             policy_enforcer,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
@@ -977,6 +996,19 @@ impl AcpServer {
             replacement.identity.session_id = session_id;
         }
         self.state.replace(replacement);
+    }
+
+    fn activate_conversation(&mut self, acp_session_id: &str) {
+        if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
+            return;
+        }
+        tracing::warn!(
+            acp_session_id,
+            "ACP conversation switched; clearing the prior in-memory transcript and native continuation"
+        );
+        self.messages.clear();
+        self.provider_native_state = None;
+        self.active_conversation_acp_session_id = Some(acp_session_id.to_string());
     }
 
     // ========================================================================
@@ -1173,6 +1205,8 @@ impl AcpServer {
         let acp_session_id = uuid::Uuid::new_v4().to_string();
         self.upsert_session_mapping(acp_session_id.clone(), oc_session_id, run_context);
         self.messages.clear();
+        self.provider_native_state = None;
+        self.active_conversation_acp_session_id = Some(acp_session_id.clone());
         if let Some(oc_session_id) = self.session_map.get(&acp_session_id) {
             self.reset_state_for_session(oc_session_id);
         }
@@ -1221,6 +1255,9 @@ impl AcpServer {
                 };
                 self.replace_run_context(acp_session_id.clone(), run_context);
                 self.reset_state_for_session(&oc_id);
+                self.messages.clear();
+                self.provider_native_state = None;
+                self.active_conversation_acp_session_id = Some(acp_session_id.clone());
                 self.send_response(
                     id,
                     Some(json!({
@@ -1247,6 +1284,8 @@ impl AcpServer {
         };
         self.upsert_session_mapping(acp_session_id.clone(), oc_session_id, run_context);
         self.messages.clear();
+        self.provider_native_state = None;
+        self.active_conversation_acp_session_id = Some(acp_session_id.clone());
         if let Some(oc_session_id) = self.session_map.get(&acp_session_id) {
             self.reset_state_for_session(oc_session_id);
         }
@@ -1507,6 +1546,7 @@ impl AcpServer {
             self.send_error(id, INVALID_PARAMS, "Unknown ACP sessionId");
             return;
         };
+        self.activate_conversation(&acp_session_id);
         // A prompt is one cancellable run generation. Rotate the capability
         // rather than clearing a process-global cancellation bit so a prior
         // cancelled turn can never poison or revive another turn.
@@ -1574,6 +1614,11 @@ impl AcpServer {
             }
         };
         let client = reqwest::Client::new();
+        let wire_api = if self.codex_responses_auth.is_some() {
+            crate::pipeline::WireApi::OpenAiResponses
+        } else {
+            crate::pipeline::WireApi::ChatCompletions
+        };
         // crosslink #717: the iteration ceiling is now resolved from
         // `AcpConfig` (default 50, matches the previous hard-coded
         // value). Operators raising the cap to support long-horizon
@@ -1634,6 +1679,13 @@ impl AcpServer {
                 }
             };
             let all_messages = prompt_context.prepare_chat_messages(&decoded_messages);
+            let assistant_message_ordinal =
+                match crate::pipeline::next_assistant_message_ordinal(&self.messages) {
+                    Ok(ordinal) => ordinal,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(acp_session_id, &error);
+                    }
+                };
 
             // Build a ChatCompletionRequest for the adapter
             let chat_request = crate::proxy::ChatCompletionRequest {
@@ -1651,19 +1703,58 @@ impl AcpServer {
                     .fail_prompt_with_update(acp_session_id, &format!("Blocked by policy: {e}"));
             }
 
-            // Transform for provider
-            let mut transformed = match adapter.transform_request_with_thinking(
-                &chat_request,
-                &self
-                    .config
-                    .active_provider()
-                    .map(|p| p.thinking.clone())
-                    .unwrap_or_default(),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    return self
-                        .fail_prompt_with_update(acp_session_id, &format!("Provider error: {e}"));
+            // Transform through the canonical wire builder. Responses uses the
+            // exact ACP capability-filtered catalog and native continuation;
+            // Chat Completions retains the established adapter path.
+            let thinking = self
+                .config
+                .active_provider()
+                .map(|p| p.thinking.clone())
+                .unwrap_or_default();
+            let mut transformed = if wire_api.is_responses() {
+                let message_values = match chat_request
+                    .messages
+                    .iter()
+                    .cloned()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider message conversion failed: {error}"),
+                        );
+                    }
+                };
+                match crate::pipeline::build_request_for_wire_with_exact_tools_and_state(
+                    wire_api,
+                    &self.config.proxy.target,
+                    &self.model,
+                    &message_values,
+                    thinking.reasoning_effort.as_deref().unwrap_or("medium"),
+                    None,
+                    None,
+                    chat_request.tools.as_deref().unwrap_or_default(),
+                    self.provider_native_state.as_ref(),
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider error: {error}"),
+                        );
+                    }
+                }
+            } else {
+                match adapter.transform_request_with_thinking(&chat_request, &thinking) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider error: {error}"),
+                        );
+                    }
                 }
             };
 
@@ -1678,10 +1769,16 @@ impl AcpServer {
             {
                 crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
             }
-            let endpoint = match crate::pipeline::resolve_endpoint(
+            let endpoint_base = if wire_api.is_responses() {
+                crate::codex_credentials::CODEX_CHATGPT_BASE_URL
+            } else {
+                &provider.base_url
+            };
+            let endpoint = match crate::pipeline::resolve_endpoint_for_wire(
+                wire_api,
                 &self.config.proxy.target,
                 &self.model,
-                &provider.base_url,
+                endpoint_base,
                 claude_code_token,
             ) {
                 Ok(endpoint) => endpoint,
@@ -1693,16 +1790,33 @@ impl AcpServer {
 
             // Build HTTP request with headers
             let extra_headers = provider.headers.clone();
-            let headers = match crate::pipeline::resolve_headers(
-                &self.config.proxy.target,
-                self.api_key.as_ref(),
-                claude_code_token,
-                &extra_headers,
-            ) {
-                Ok(headers) => headers,
-                Err(e) => {
-                    return self
-                        .fail_prompt_with_update(acp_session_id, &format!("Provider error: {e}"));
+            let headers = if let Some(auth) = self.codex_responses_auth.as_ref() {
+                match auth.headers() {
+                    Ok(mut headers) => {
+                        headers.extend(&extra_headers);
+                        headers
+                    }
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider header error: {error}"),
+                        );
+                    }
+                }
+            } else {
+                match crate::pipeline::resolve_headers(
+                    &self.config.proxy.target,
+                    self.api_key.as_ref(),
+                    claude_code_token,
+                    &extra_headers,
+                ) {
+                    Ok(headers) => headers,
+                    Err(e) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider error: {e}"),
+                        );
+                    }
                 }
             };
 
@@ -1751,10 +1865,43 @@ impl AcpServer {
                 return "error".to_string();
             }
 
-            // Stream the response
-            let stream_result = self
-                .stream_provider_response(acp_session_id, response)
-                .await;
+            // Decode the provider response. Responses terminal validation and
+            // continuation advancement are shared with every other frontend;
+            // ACP retains its existing multi-provider stream parser for Chat
+            // Completions protocols.
+            let (stream_result, next_provider_native_state) = if wire_api.is_responses() {
+                let decoded = match crate::pipeline::decode_openai_responses_stream(
+                    crate::pipeline::OpenAiResponsesStreamParams {
+                        response,
+                        headers: &headers,
+                        provider: &self.config.proxy.target,
+                        model_identity: &self.model,
+                        provider_native_state: self.provider_native_state.as_ref(),
+                        assistant_message_ordinal,
+                    },
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_, _| Ok(()),
+                )
+                .await
+                {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider stream error: {error}"),
+                        );
+                    }
+                };
+                let (stream_result, state) = acp_responses_stream_result(decoded);
+                (stream_result, Some(state))
+            } else {
+                (
+                    self.stream_provider_response(acp_session_id, response)
+                        .await,
+                    None,
+                )
+            };
 
             match stream_result {
                 StreamResult::EndTurn { content } => {
@@ -1784,10 +1931,15 @@ impl AcpServer {
                             "agent_message_chunk",
                             &json!({"type": "text", "text": rendered_content}),
                         );
+                    }
+                    if wire_api.is_responses() || !rendered_content.is_empty() {
                         self.messages.push(json!({
                             "role": "assistant",
                             "content": rendered_content,
                         }));
+                    }
+                    if let Some(state) = next_provider_native_state {
+                        self.provider_native_state = Some(state);
                     }
                     return "end_turn".to_string();
                 }
@@ -1822,6 +1974,9 @@ impl AcpServer {
                         "content": if content.is_empty() { Value::Null } else { Value::String(content) },
                         "tool_calls": tool_calls_json,
                     }));
+                    if let Some(state) = next_provider_native_state {
+                        self.provider_native_state = Some(state);
+                    }
 
                     // Execute tools via ACP client methods
                     for tc in &tool_calls {
@@ -3071,6 +3226,31 @@ fn finish_acp_stream(content: String, tool_calls: Vec<AccumulatedToolCall>) -> S
     }
 }
 
+fn acp_responses_stream_result(
+    decoded: crate::pipeline::OpenAiResponsesDecodedTurn,
+) -> (StreamResult, crate::runtime::ProviderNativeState) {
+    let tool_calls = decoded
+        .tool_calls
+        .into_iter()
+        .map(|call| AccumulatedToolCall {
+            id: call.id,
+            name: call.function.name,
+            arguments: call.function.arguments,
+        })
+        .collect::<Vec<_>>();
+    let result = if tool_calls.is_empty() {
+        StreamResult::EndTurn {
+            content: decoded.content,
+        }
+    } else {
+        StreamResult::ToolCalls {
+            content: decoded.content,
+            tool_calls,
+        }
+    };
+    (result, decoded.provider_native_state)
+}
+
 fn decode_acp_messages(messages: &[Value]) -> Result<Vec<crate::proxy::ChatMessage>, String> {
     messages
         .iter()
@@ -3143,6 +3323,7 @@ pub async fn run_acp_server(
     model: String,
     api_key: Option<crate::providers::ApiKey>,
     claude_code_token: Option<crate::secrets::OAuthToken>,
+    codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
 ) -> Result<()> {
     let launch_root = std::env::current_dir()
         .map_err(|error| anyhow::anyhow!("Cannot resolve ACP workspace: {error}"))?;
@@ -3170,6 +3351,7 @@ pub async fn run_acp_server(
         model,
         api_key,
         claude_code_token,
+        codex_responses_auth,
         stdout_tx,
         launch_root,
         host_home,
@@ -3984,7 +4166,10 @@ mod tool_definition_tests {
 
 #[cfg(test)]
 mod stream_tool_call_tests {
-    use super::{finish_acp_stream, AccumulatedToolCall, StreamResult};
+    use super::{
+        acp_responses_stream_result, finish_acp_stream, AccumulatedToolCall, StreamResult,
+    };
+    use serde_json::json;
 
     #[test]
     fn finish_stream_returns_complete_tool_calls() {
@@ -4048,6 +4233,51 @@ mod stream_tool_call_tests {
                 assert!(message.contains("id"), "{message}");
             }
             other => panic!("expected missing id to error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_turn_keeps_native_state_and_exact_tool_identity_for_acp_followup() {
+        let output = crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_acp_1",
+            vec![json!({
+                "type": "function_call",
+                "id": "fc_acp_1",
+                "call_id": "call_acp_1",
+                "name": "bash",
+                "arguments": r#"{"command":"pwd"}"#
+            })],
+        )
+        .expect("Responses output");
+        let state = crate::providers::advance_openai_responses_state(
+            "openai", "gpt-test", None, 1, &output,
+        )
+        .expect("Responses state");
+        let decoded = crate::pipeline::OpenAiResponsesDecodedTurn {
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![crate::tools::ToolCall {
+                id: "call_acp_1".to_string(),
+                call_type: "function".to_string(),
+                function: crate::tools::FunctionCall {
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"pwd"}"#.to_string(),
+                },
+            }],
+            usage: crate::session::TokenUsage::default(),
+            provider_native_state: state.clone(),
+        };
+
+        let (result, retained) = acp_responses_stream_result(decoded);
+        assert_eq!(retained, state);
+        match result {
+            StreamResult::ToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "call_acp_1");
+                assert_eq!(tool_calls[0].name, "bash");
+                assert_eq!(tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+            }
+            other => panic!("expected Responses tool call, got {other:?}"),
         }
     }
 }
@@ -4192,6 +4422,9 @@ memory:
             model: "local-model".to_string(),
             api_key: None,
             claude_code_token: None,
+            codex_responses_auth: None,
+            provider_native_state: None,
+            active_conversation_acp_session_id: None,
             policy_enforcer: Arc::new(crate::services::policy::PolicyEnforcer::new(
                 crate::services::policy::EnterprisePolicy::default(),
             )),
@@ -4213,6 +4446,45 @@ memory:
             .run_contexts
             .get("unit-test")
             .expect("test server carries an explicit run capability")
+    }
+
+    #[test]
+    fn conversation_switch_clears_portable_and_native_state_without_clearing_same_session() {
+        let (mut server, _rx, _tmp) = test_server();
+        let output = crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_acp_session_1",
+            vec![json!({
+                "type": "message",
+                "id": "msg_acp_session_1",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "answer"}]
+            })],
+        )
+        .expect("Responses output");
+        let native_state = crate::providers::advance_openai_responses_state(
+            "openai", "gpt-test", None, 1, &output,
+        )
+        .expect("Responses state");
+        let messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "answer"}),
+        ];
+
+        server.active_conversation_acp_session_id = Some("session-a".to_string());
+        server.messages.clone_from(&messages);
+        server.provider_native_state = Some(native_state.clone());
+
+        server.activate_conversation("session-a");
+        assert_eq!(server.messages, messages);
+        assert_eq!(server.provider_native_state, Some(native_state));
+
+        server.activate_conversation("session-b");
+        assert!(server.messages.is_empty());
+        assert!(server.provider_native_state.is_none());
+        assert_eq!(
+            server.active_conversation_acp_session_id.as_deref(),
+            Some("session-b")
+        );
     }
 
     #[cfg(unix)]
@@ -4312,6 +4584,7 @@ memory:
         let server = AcpServer::new_with_host_home(
             config,
             "local-model".to_string(),
+            None,
             None,
             None,
             stdout_tx,
