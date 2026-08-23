@@ -1,6 +1,6 @@
 {
   "next_display_id": 1120,
-  "next_comment_id": 1390,
+  "next_comment_id": 1391,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19891,7 +19891,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T16:24:26.863403747Z",
-      "updated_at": "2026-08-23T16:28:33.596846372Z",
+      "updated_at": "2026-08-23T16:29:52.349097788Z",
       "labels": [
         "remediation"
       ],
@@ -19907,6 +19907,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "3bf95b56-8692-4587-8b35-348834cf9594": {
+          "display_id": 1390,
+          "author": "6Vw9",
+          "content": "S-043 implementation boundary: add one public typed user-origin direct-shell action in the library; enforce Process capability, runtime-mode admission, case-insensitive hard command policy, Shell sandbox profile, concurrent-process budget, mutation freshness, shared S-040 timeout/cancellation/bounded-output supervisor, terminal status, ledger observation, and verification invalidation. Route CLI and TUI !command through it. Preserve TUI nonblocking event delivery. Remove the public unchecked CLI helper and its substring prompt as a false authority boundary. Leave unrelated /diff, /review, /init subprocess paths to their owning slices. Validate realistic quoting/case, workspace write/protected path, environment secrecy, network denial, deadline/cancellation/reap, output bounds, nonzero status, and frontend routing.",
+          "created_at": "2026-08-23T16:29:52.346579351Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATlUS+VyRur4xNmWD2CqbRoISUXirwv1SIaGaZOYB0QcAkU7Oj7hZOphwrLbQL8S4fXneFRMRjiUadWqvTTsMDw=="
         },
         "db1c259b-b12f-48e0-871b-1c88bad3b0cf": {
           "display_id": 1389,
@@ -36664,11 +36673,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1288,
       "timestamp": "2026-08-23T16:28:33.596846372Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1289,
+      "timestamp": "2026-08-23T16:29:52.349097788Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T16:28:33.596846372Z",
+    "timestamp": "2026-08-23T16:29:52.349097788Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1288
+    "agent_seq": 1289
   }
 }
