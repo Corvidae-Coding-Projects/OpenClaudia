@@ -1,6 +1,6 @@
 {
   "next_display_id": 1116,
-  "next_comment_id": 1369,
+  "next_comment_id": 1370,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17247,7 +17247,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T14:22:39.418758535Z",
-      "updated_at": "2026-08-23T14:23:03.547300860Z",
+      "updated_at": "2026-08-23T14:23:08.063089231Z",
       "labels": [
         "remediation"
       ],
@@ -17260,6 +17260,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFX06IanKAfcd3yKSDfuRqtw8OE4CAr8KvoXXR2rurRCIdMLOHI02K7gUZUo7lfKvWC4Wnn92Kf1vLpBqWTgNDw=="
+        },
+        "fb2a765b-d511-43d8-a467-fe775862aa51": {
+          "display_id": 1369,
+          "author": "6Vw9",
+          "content": "[action] Starting S-041 as the next dependency-ready functional slice. Preflight confirms the real gaps are detached line readers, destructive output, truncated IDs, incomplete terminal states, and no restart record. Implementing bounded persisted cursor jobs and lifecycle supervision without expanding into unlikely cgroup/platform perfection.",
+          "created_at": "2026-08-23T14:23:08.060635257Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdbBhmqUWk/R1ZnZNGGQu0+utwWHY4ZkwR8FkSmIgPsDVkg9kgr8s5A3SzN/ArT6puwCxEBjahS4VrmYYT2cwAQ=="
         }
       }
     },
@@ -36199,11 +36208,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1248,
       "timestamp": "2026-08-23T14:23:03.547300860Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1249,
+      "timestamp": "2026-08-23T14:23:08.063089231Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T14:23:03.547300860Z",
+    "timestamp": "2026-08-23T14:23:08.063089231Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1248
+    "agent_seq": 1249
   }
 }
