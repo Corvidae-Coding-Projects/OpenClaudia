@@ -15,7 +15,7 @@
         "observation": "A certificate requirement appears in a remediation plan, not runtime evidence.",
         "guidance": "Do not treat planned transport work as an implemented authentication fact.",
         "applicability": {"paths": ["docs/remediation-slices/048-hardened-provider-http-transport.md"], "components": ["documentation"], "tags": ["docs"]},
-        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/048-hardened-provider-http-transport.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:18bb1587d385d4f1cbc9b9159071c88dfa7088f5fa9293306b1c1d32e9634f6d"}],
+        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/048-hardened-provider-http-transport.md", "source_version": "worktree:s048", "digest": "sha256:6f21ab8b305bd7ead6abc4a8070ba7aee481f32ba02dba4623ba889182301432"}],
         "confidence": "observed_once",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}

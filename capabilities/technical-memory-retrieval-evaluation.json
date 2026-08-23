@@ -5,7 +5,7 @@
   "evaluator_model_id": "openclaudia-deterministic-retrieval-evaluator-v1",
   "evaluator_config_digest": "sha256:127969295a539ae27223a5a9cb76c342aa1453a5277383fc9e5bbca67c7deded",
   "tuning_corpus_id": "openclaudia-technical-memory-tuning-v1",
-  "tuning_corpus_digest": "sha256:6d7c88a1c602c59cc951cee19355bf6fe856aec9c380c74a0a87f4273d47dfcc",
+  "tuning_corpus_digest": "sha256:29e2d1c9c052362de2cc9b3fed4e38b781d030e37974084c4db692df04c6e773",
   "held_out_corpus_id": "openclaudia-technical-memory-heldout-v1",
   "held_out_corpus_digest": "sha256:153ce08ab7c3ec0886142993e6c0f13961a1ed8b2e1fe6d704f5055355eda62b",
   "trial_count": 3,
@@ -100,10 +100,10 @@
     {
       "kind": "documentation",
       "locator": "docs/remediation-slices/048-hardened-provider-http-transport.md",
-      "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4",
-      "expected_digest": "sha256:18bb1587d385d4f1cbc9b9159071c88dfa7088f5fa9293306b1c1d32e9634f6d",
-      "observed_digest": "sha256:18bb1587d385d4f1cbc9b9159071c88dfa7088f5fa9293306b1c1d32e9634f6d",
-      "byte_len": 1494
+      "source_version": "worktree:s048",
+      "expected_digest": "sha256:6f21ab8b305bd7ead6abc4a8070ba7aee481f32ba02dba4623ba889182301432",
+      "observed_digest": "sha256:6f21ab8b305bd7ead6abc4a8070ba7aee481f32ba02dba4623ba889182301432",
+      "byte_len": 3099
     },
     {
       "kind": "source_file",
@@ -299,7 +299,7 @@
         {
           "trial": 2,
           "output_digest": "sha256:08eb0cd75327cabbceb73f19021eaab5da1177522652c5b64bac8c3d824daff3",
-          "elapsed_micros": 88
+          "elapsed_micros": 86
         },
         {
           "trial": 3,
@@ -322,8 +322,8 @@
         "stale_returns": 2,
         "evidence_choice_successes": 6,
         "state_classification_successes": 8,
-        "evidence_bytes": 14326,
-        "estimated_evidence_tokens": 14326,
+        "evidence_bytes": 14295,
+        "estimated_evidence_tokens": 14295,
         "remote_cost_microusd": 0,
         "deterministic_work_units": 50
       },
@@ -398,18 +398,18 @@
       "trials": [
         {
           "trial": 1,
-          "output_digest": "sha256:8289a8bc02cb4f099c90092986270c70c66da345fb1dc650335f6803f3524c37",
-          "elapsed_micros": 3214
+          "output_digest": "sha256:8a13c421d809594fbcfb76436c201205c3ad19bb75f4baa2dc5f72a0f88ac6e5",
+          "elapsed_micros": 3197
         },
         {
           "trial": 2,
-          "output_digest": "sha256:2cf9a7107a498bab9ae21c2d7bec86b19f1421802eee2f0904a575f957cd1189",
-          "elapsed_micros": 3173
+          "output_digest": "sha256:b1b1cb6baed421e74a86d46b2a22fa9fe992eaf20d4900ae520839468b4e5f3a",
+          "elapsed_micros": 3146
         },
         {
           "trial": 3,
-          "output_digest": "sha256:24563ce15f63e065913c341881e40df39e51b0bece4473a4fb4eb12b8b1ebb21",
-          "elapsed_micros": 3081
+          "output_digest": "sha256:79f3c2a47fceab1bee4ad6902ac73dddf67131684eb4e012b398499d4b95ba3f",
+          "elapsed_micros": 3150
         }
       ]
     },
@@ -427,8 +427,8 @@
         "stale_returns": 2,
         "evidence_choice_successes": 7,
         "state_classification_successes": 8,
-        "evidence_bytes": 14308,
-        "estimated_evidence_tokens": 14308,
+        "evidence_bytes": 14277,
+        "estimated_evidence_tokens": 14277,
         "remote_cost_microusd": 0,
         "deterministic_work_units": 50
       },
@@ -503,18 +503,18 @@
       "trials": [
         {
           "trial": 1,
-          "output_digest": "sha256:5b165035aa946d07d4ddda1e37b49ee61a21e1ab488c549d43420cd2ca7f5860",
-          "elapsed_micros": 2657
+          "output_digest": "sha256:cac65a4dbbf0e84a93e4b589b459d3995e1ded78b0a003707f809a9262d8e987",
+          "elapsed_micros": 3251
         },
         {
           "trial": 2,
-          "output_digest": "sha256:10cbd32d69ba836b455e6b6955930e377347774da4a0379dc22ca51990f76ed2",
-          "elapsed_micros": 2670
+          "output_digest": "sha256:aa701036202b7c6137a08692527bc1cff9e4f6e4cd4854b1510259fa45884fda",
+          "elapsed_micros": 2637
         },
         {
           "trial": 3,
-          "output_digest": "sha256:e82c3d24bb57ec8d412a462cd615f490bfaa62629fb8dd3c113780c74c262b71",
-          "elapsed_micros": 2637
+          "output_digest": "sha256:4c73b4d7605f148ff739519503d78567d89011d6539e3c1e60a0be437b3b3667",
+          "elapsed_micros": 2615
         }
       ]
     },
@@ -532,8 +532,8 @@
         "stale_returns": 2,
         "evidence_choice_successes": 8,
         "state_classification_successes": 8,
-        "evidence_bytes": 14338,
-        "estimated_evidence_tokens": 14338,
+        "evidence_bytes": 14307,
+        "estimated_evidence_tokens": 14307,
         "remote_cost_microusd": 0,
         "deterministic_work_units": 50
       },
@@ -608,18 +608,18 @@
       "trials": [
         {
           "trial": 1,
-          "output_digest": "sha256:6832b540c92625bb07b52f4ca6440740df00e82490c3a77860274ab6a39c4a2c",
-          "elapsed_micros": 2689
+          "output_digest": "sha256:2fd45446cf9ae699b28c37f5fb5c4371a1994dc37d86ed9444a506fc3429ac90",
+          "elapsed_micros": 2679
         },
         {
           "trial": 2,
-          "output_digest": "sha256:d4af2b5bc85bc0e3d893d8ac9894d94b8836d0f4de44c65f1bda17176f62c14d",
-          "elapsed_micros": 2676
+          "output_digest": "sha256:54a450e869e09ef1dc7a18cb18a4c7c96bc23ce003060dd7ec7c6767199bc37a",
+          "elapsed_micros": 2673
         },
         {
           "trial": 3,
-          "output_digest": "sha256:89f80cdc06f447f64d95bec24a43b398413c21bb978cf393427fe2793c8aa53d",
-          "elapsed_micros": 2678
+          "output_digest": "sha256:b974f1949ed6a315438353f13b961f1f198063d049bb888b265b6a0634ce588a",
+          "elapsed_micros": 2668
         }
       ]
     },
@@ -637,8 +637,8 @@
         "stale_returns": 1,
         "evidence_choice_successes": 9,
         "state_classification_successes": 8,
-        "evidence_bytes": 14247,
-        "estimated_evidence_tokens": 14247,
+        "evidence_bytes": 14216,
+        "estimated_evidence_tokens": 14216,
         "remote_cost_microusd": 0,
         "deterministic_work_units": 50
       },
@@ -713,18 +713,18 @@
       "trials": [
         {
           "trial": 1,
-          "output_digest": "sha256:d79069cad38e7f0f2222231fc2944f1f6f47d197854ad41ff8eedae752d2aa82",
-          "elapsed_micros": 2675
+          "output_digest": "sha256:f54de5f84325ef76051872d0742761f74cbfb1821190b0a995ccebe346266b15",
+          "elapsed_micros": 2665
         },
         {
           "trial": 2,
-          "output_digest": "sha256:c6b2bf77e6e890341725e6534c3a61b8966c9867e8536ed80b3f3d49c35c1393",
-          "elapsed_micros": 2700
+          "output_digest": "sha256:bfd4d7a59cb55106d819189887bae9e34c66aed26d94a5b4f4e63c32047dc3a8",
+          "elapsed_micros": 2665
         },
         {
           "trial": 3,
-          "output_digest": "sha256:8e6fe539bb58373378f00b52408e7b3c820d1f5c76c2f060c784fdb3f144ee9a",
-          "elapsed_micros": 2690
+          "output_digest": "sha256:9210b724ebc14eee3c8aa8470e93eca8bdb00ed493a6cf5d3ec9ed8e4afa348f",
+          "elapsed_micros": 2694
         }
       ]
     },
@@ -817,17 +817,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:51960ec31856bb2726d454053dfb39093741afe4696b0ac6d7e81de04c8e7b14",
-          "elapsed_micros": 2561
+          "elapsed_micros": 2550
         },
         {
           "trial": 2,
           "output_digest": "sha256:0b403fb71d3753cb96f3efe9d8b96e94a85abcc62b11c95d3d894a82c3b6ccc8",
-          "elapsed_micros": 2555
+          "elapsed_micros": 2553
         },
         {
           "trial": 3,
           "output_digest": "sha256:0d139af0d4cc0e639c49bf4c9ba94ec1d424ffcc7ebc555611d295063db9b8fa",
-          "elapsed_micros": 2558
+          "elapsed_micros": 2554
         }
       ]
     },
@@ -920,17 +920,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:5d317e4e7a4cf7caa13b51a5abf6a95b221ab7000248fbdd438ab5f78d7d3284",
-          "elapsed_micros": 2591
+          "elapsed_micros": 2572
         },
         {
           "trial": 2,
           "output_digest": "sha256:35c88aa1b7389a2a8804980d3af911f8a1d54171d8ddae94902bf2c96e34ed33",
-          "elapsed_micros": 2571
+          "elapsed_micros": 2567
         },
         {
           "trial": 3,
           "output_digest": "sha256:515b1b125e2fa9791b4e6e8d661fc77af43c527882e4726aaae3aceb143e1eb5",
-          "elapsed_micros": 2587
+          "elapsed_micros": 2578
         }
       ]
     }
@@ -1011,7 +1011,7 @@
         {
           "trial": 1,
           "output_digest": "sha256:856ac89c77f1a217b92abac7242bb35f640fd340102902a69cad374f4cf41fe6",
-          "elapsed_micros": 64
+          "elapsed_micros": 69
         },
         {
           "trial": 2,
@@ -1115,17 +1115,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:53692287577d117b91ac0b977eb53872fb634e6d09ea98a5ffb307d7fd46bfff",
-          "elapsed_micros": 2337
+          "elapsed_micros": 2320
         },
         {
           "trial": 2,
           "output_digest": "sha256:b89da651ecd976f484a2f9a141f631703d391d1fa2dca86b5e61d6997f62770b",
-          "elapsed_micros": 2333
+          "elapsed_micros": 2314
         },
         {
           "trial": 3,
           "output_digest": "sha256:9a069098cfffe95f7dd3d14c53995e7843ad20984e4c1cc56d74c064c9651f14",
-          "elapsed_micros": 2322
+          "elapsed_micros": 2321
         }
       ]
     },
@@ -1219,17 +1219,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:f8af0c9d66e8598df4518e6cca7ea3d63b1f52f96a7412c6f729ec2858bfaa52",
-          "elapsed_micros": 2491
+          "elapsed_micros": 2486
         },
         {
           "trial": 2,
           "output_digest": "sha256:70a50c037ca54858907ea4bebcfd40426699f4324fbd2fca420932a2327060d9",
-          "elapsed_micros": 2479
+          "elapsed_micros": 2482
         },
         {
           "trial": 3,
           "output_digest": "sha256:4c9cfe7901cb06f70dae7565c1d4441e3fc812657268defde7c5eff5ed8afafe",
-          "elapsed_micros": 2485
+          "elapsed_micros": 2475
         }
       ]
     },
@@ -1323,17 +1323,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:ff200dddba55a34eac64d4fe13915facfeac11d63a9400a107f8e6beb2f75c11",
-          "elapsed_micros": 2538
+          "elapsed_micros": 2531
         },
         {
           "trial": 2,
           "output_digest": "sha256:cda18a11c3c4cf5c00084e401b2262ac83a438badf4a308028d446150cbce48f",
-          "elapsed_micros": 2534
+          "elapsed_micros": 2530
         },
         {
           "trial": 3,
           "output_digest": "sha256:6a3c372ebbb9f1dbc92a682224c7745406ff70981c783da0d66d3978b323e03e",
-          "elapsed_micros": 2537
+          "elapsed_micros": 2540
         }
       ]
     },
@@ -1427,17 +1427,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:6862e31902bd27c3de2c8e317b497b42cc16cddd168bffe543c489d2c86169cf",
-          "elapsed_micros": 2526
+          "elapsed_micros": 2536
         },
         {
           "trial": 2,
           "output_digest": "sha256:f4d686fcdbc649d216ed6beecafa379564866cec8cd2f7cca82b3b0b7bea090d",
-          "elapsed_micros": 2521
+          "elapsed_micros": 2516
         },
         {
           "trial": 3,
           "output_digest": "sha256:abbd6dba98bb45f849a7f23092b9618a8701470c9cf70e491ec6bb0128acd948",
-          "elapsed_micros": 2546
+          "elapsed_micros": 2532
         }
       ]
     },
@@ -1534,12 +1534,12 @@
         {
           "trial": 2,
           "output_digest": "sha256:3eb0ca82a0faccca616a55781b0d175c2c7b0b5691a44535427c05b7b687b386",
-          "elapsed_micros": 2412
+          "elapsed_micros": 2408
         },
         {
           "trial": 3,
           "output_digest": "sha256:76cb7f5dc3b0f68cf44946868139f8af25341153cec76cf7a23baa688c91560e",
-          "elapsed_micros": 2402
+          "elapsed_micros": 2416
         }
       ]
     },
@@ -1631,17 +1631,17 @@
         {
           "trial": 1,
           "output_digest": "sha256:90c79cde5d556d3156310adb62460ecf8effc07dfed6ef9ae289db09b9ba1b6e",
-          "elapsed_micros": 2416
+          "elapsed_micros": 2419
         },
         {
           "trial": 2,
           "output_digest": "sha256:b75ce5926b973b2e9d2ac58ebde70cf7eb9c9ba7084fc4048b148125fd1c11f7",
-          "elapsed_micros": 2410
+          "elapsed_micros": 2417
         },
         {
           "trial": 3,
           "output_digest": "sha256:a6e0868ab53f5929d5ef64ed566bc9e36be7ae15f50ec272263439e24a80ac5d",
-          "elapsed_micros": 2409
+          "elapsed_micros": 2422
         }
       ]
     }
