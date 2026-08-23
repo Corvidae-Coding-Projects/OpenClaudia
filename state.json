@@ -1,6 +1,6 @@
 {
   "next_display_id": 1120,
-  "next_comment_id": 1395,
+  "next_comment_id": 1396,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8237,7 +8237,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-23T15:32:46.336745437Z",
+      "updated_at": "2026-08-23T17:05:03.555793497Z",
       "labels": [
         "remediation"
       ],
@@ -8322,6 +8322,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAyU352w7tA3vJsjFCZNVKeeZ58V8ip9UbRjTKRSkHeakuj4+ryqRnssrPiK/7CX9i1I0U2H2WGEbr681jTaN/AA=="
+        },
+        "1c67159d-9d3e-4700-9b4e-8f8e3ac3688b": {
+          "display_id": 1395,
+          "author": "6Vw9",
+          "content": "Partial result: child S-043/#1119 is closed. Signed commits 9fc9f45e (canonical direct-shell process capability) and cd57a7ef (exact Crosslink closure changelog). Rust 1.98 native/full, strict Clippy/fmt, focused behavior, evidence validation, and Windows GNU gates passed. Parent #1071 remains open for the remaining dormant-feature slices.",
+          "created_at": "2026-08-23T17:05:03.553334154Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAeH3ifdNIVqd+Np2G/mmnAPg78K8Ksit5FQO8QTquxBu9ikqbkTyF32TW/UJVmFvQYJmth8LoNWsG6+7fP96gCg=="
         },
         "1ddf9c45-9013-416e-81ce-0195ab44c14d": {
           "display_id": 1229,
@@ -36741,11 +36750,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1295,
       "timestamp": "2026-08-23T17:04:26.371130151Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1296,
+      "timestamp": "2026-08-23T17:05:03.555793497Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T17:04:26.371130151Z",
+    "timestamp": "2026-08-23T17:05:03.555793497Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1295
+    "agent_seq": 1296
   }
 }
