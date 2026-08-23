@@ -24682,12 +24682,13 @@
       "display_id": 1106,
       "title": "Regenerate S-048 technical-memory evidence after cited source changed",
       "description": "The completed S-048 slice changed docs/remediation-slices/048-hardened-provider-http-transport.md without regenerating the checked-in technical-memory retrieval tuning/evaluation/review artifacts that bind that citation digest. Regenerate through the public evidence builder, preserve the independent review as rejected, and verify the bundled-corpora evidence test.",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T05:49:30.736961057Z",
-      "updated_at": "2026-08-23T05:50:52.699058336Z",
+      "updated_at": "2026-08-23T05:51:01.571022591Z",
+      "closed_at": "2026-08-23T05:51:01.571021430Z",
       "comments": {
         "51702b91-5e07-4f72-885a-c5c6b2d1eabf": {
           "display_id": 1293,
@@ -34653,11 +34654,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1113,
       "timestamp": "2026-08-23T05:50:52.699058336Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1114,
+      "timestamp": "2026-08-23T05:51:01.571022591Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T05:50:52.699058336Z",
+    "timestamp": "2026-08-23T05:51:01.571022591Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1113
+    "agent_seq": 1114
   }
 }
