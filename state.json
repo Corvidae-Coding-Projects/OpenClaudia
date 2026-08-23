@@ -1,6 +1,6 @@
 {
   "next_display_id": 1120,
-  "next_comment_id": 1391,
+  "next_comment_id": 1392,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19891,7 +19891,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T16:24:26.863403747Z",
-      "updated_at": "2026-08-23T16:29:52.349097788Z",
+      "updated_at": "2026-08-23T16:44:19.309264371Z",
       "labels": [
         "remediation"
       ],
@@ -19925,6 +19925,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABADuOuidDv6iQt2NYqeNmJQ4wvAC1103sEN7/23xbGDXGc9k03B7R37xF94wN+sU5hR2PKg3DYmC6wNcakTh9OCA=="
+        },
+        "e64a2218-e01a-4722-91e6-8bd5a5e9f91a": {
+          "display_id": 1391,
+          "author": "6Vw9",
+          "content": "Implemented the live S-043 route: a public typed DirectShellAction now owns Process admission, runtime-mode checks, hard Bash policy, Shell sandbox compilation, concurrent-process budget, destructive freshness reservation, shared bounded sync/async supervision, deadline/cancellation cleanup, terminal metadata, tracing, ledger observation, and verifier invalidation. CLI and TUI !command now call it; the old public unchecked CLI executor and case-sensitive substring prompt are gone; generic TUI spawn_shell rejects ShellCommand targets. Focused direct-shell tests are 10/10 and frontend routing/ledger tests pass; Rust 1.98 strict all-target/all-feature Clippy passes. Full suite and cross-target checks remain.",
+          "created_at": "2026-08-23T16:44:19.305650459Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1jgxSyzNygWFRjY1URTYRwv5Quz6HwcsuDWaf19492WaRaDrr/6XxS5DFtxNxasaydtjIhFXBbkx6/4F4TnXAA=="
         }
       }
     },
@@ -36678,11 +36687,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1289,
       "timestamp": "2026-08-23T16:29:52.349097788Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1290,
+      "timestamp": "2026-08-23T16:44:19.309264371Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T16:29:52.349097788Z",
+    "timestamp": "2026-08-23T16:44:19.309264371Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1289
+    "agent_seq": 1290
   }
 }
