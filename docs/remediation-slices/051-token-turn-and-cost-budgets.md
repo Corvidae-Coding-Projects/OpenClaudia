@@ -1,6 +1,6 @@
 # S-051: Unify token, turn, cost, retry, and concurrency budgets
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD pending S-088
 Effort: Medium
 Primary findings: F-017, F-062, F-066
 Workstreams: W10
@@ -27,3 +27,13 @@ Enforce one atomic run budget before work starts and reconcile exact or unknown 
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Implementation record — 2026-08-23
+
+Signed commit `d477d321` binds one atomic cancellation-aware hierarchical
+budget tree to production runs and derived subagent/MCP workers. Provider,
+tool, process, hook, VDD, retry, concurrency, token, time, and checked
+fixed-point cost reservations occur before work and reconcile exact or unknown
+usage without free allowance. Rust 1.98 formatting, strict all-target/all-feature
+Clippy, complete serialized tests, and technical-memory evidence validation
+passed. Canonical artifact-bound VDD promotion remains pending S-088.

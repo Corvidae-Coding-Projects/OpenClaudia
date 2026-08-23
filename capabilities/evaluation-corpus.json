@@ -15,11 +15,11 @@
       "execution_isolation": "in_process_no_child",
       "grader": {
         "expected_files": [
-          { "path": "release/binary-capability-matrix.md", "content_sha256": "sha256:40a50c35164ac8eb000376979f6e71511523dff1ffa92cfae48967198d69407d", "max_bytes": 131072 },
+          { "path": "release/binary-capability-matrix.md", "content_sha256": "sha256:5c8d01edbedd7de477d81e189a7b0167c1be9af2d164e3c2763374105c0e090f", "max_bytes": 131072 },
           { "path": "release/outcome.json", "content_sha256": "sha256:7e5ab64d41a3b06ca8031419f32788979108b944776edc44d8d25dbb5ea8f36b", "max_bytes": 1024 }
         ],
         "absent_paths": ["release/operational.json", "release/rejected.json"],
-        "expected_environment_sha256": "sha256:e04d0c4861c2620a2cc18feb4d1b9d70206a31e124303f21c3eedf1bd56e1791",
+        "expected_environment_sha256": "sha256:2a0ad215c36d96bb81e9c051ed8f3798fb08cafcd5600feee84bf78a1d9545f4",
         "expected_trace": {
           "schema_version": 1,
           "scenario_id": "registry-render-success",

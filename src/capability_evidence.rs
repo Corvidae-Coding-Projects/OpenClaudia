@@ -91,6 +91,8 @@ pub enum EntrypointKind {
     Config,
     Doctor,
     Hooks,
+    TeamCli,
+    AgentTool,
     LibraryApi,
 }
 
@@ -108,6 +110,8 @@ impl EntrypointKind {
             Self::Config => "config",
             Self::Doctor => "doctor",
             Self::Hooks => "hooks",
+            Self::TeamCli => "team_cli",
+            Self::AgentTool => "agent_tool",
             Self::LibraryApi => "library_api",
         }
     }

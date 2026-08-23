@@ -3,7 +3,7 @@
   "review_id": "capability-corpus-review-v2",
   "reviewer_id": "primary-orchestrator-6vw9",
   "corpus_id": "capability-evidence-v1",
-  "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
+  "corpus_sha256": "sha256:92df29453752aae3b5f2174d999174f2736d40312afaf2e73d3e0b7ea517e049",
   "verdict": "approved",
   "reviewed_scenario_ids": [
     "registry-render-success",
@@ -19,6 +19,7 @@
     "artifact_bounds_and_isolation"
   ],
   "limitations": [
+    "S-1113 changed only the generation-4 registry records, deterministic matrix projection, and render-scenario final-environment digests after the cited dormant-feature tests passed; the primary reviewer rechecked that exact projection delta and retained every scenario, trace, effect proof, trial, and failure grader unchanged. Partial maturity does not claim artifact-bound VDD approval.",
     "S-012 changed only the deterministic registry-render expected file and final-environment digests for registry generation 3; the primary reviewer rechecked that exact internal-record/header projection delta and retained every scenario, trace, effect proof, trial, and failure grader unchanged.",
     "S-006 changed only the deterministic registry-render expected file and final-environment digests for registry generation 2; the primary reviewer rechecked that exact projection delta and retained every scenario, trace, effect proof, trial, and failure grader unchanged.",
     "Independent primary review approved the frozen registry and corpus after inspecting effect proof binding, final-state grading, trace identity, input bounds, executable scenarios, and adversarial tests; approval does not promote other runtime capabilities.",

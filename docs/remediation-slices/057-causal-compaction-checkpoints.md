@@ -1,6 +1,6 @@
 # S-057: Replace lossy compaction with causal checkpoints
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD pending S-088
 Effort: Medium
 Primary findings: F-077, F-078
 Workstreams: W5, W10, W12
@@ -27,3 +27,15 @@ Give every frontend one typed, provider-valid, artifact-cited checkpoint operati
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Implementation record — 2026-08-23
+
+Signed commit `135d425` delivers one canonical causal checkpoint projection
+across proxy, legacy REPL, TUI, ACP, and subagents. Exact transcripts remain the
+canonical archive; only causally closed groups compact; cited summaries remain
+non-authoritative historical evidence; stale measurements fail; and typed
+committed, partial, and cannot-fit outcomes publish atomically. OpenAI Responses
+uses provider-managed compaction with monotonic continuation state, while
+incompatible ordinal-bound protocols fail explicitly. Rust 1.98 formatting,
+strict all-target/all-feature Clippy, and the complete serialized workspace test
+suite passed. Canonical artifact-bound VDD promotion remains pending S-088.

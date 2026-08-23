@@ -1,6 +1,6 @@
 # S-014: Make behavioral modes enforce capabilities
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD pending S-088
 Effort: Medium
 Primary findings: F-029, F-064, F-119
 Workstreams: W2, W17
@@ -27,3 +27,21 @@ Turn planning, read-only, scope, and coordinator modes into validated runtime ca
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Implementation record — 2026-08-23
+
+- Signed commit `6dc02af1` installs typed runtime capability profiles and routes
+  TUI, legacy REPL, ACP, proxy, session restore, tools, and child runs through
+  the same atomic mode authority.
+- Signed follow-ups `e6944c69`, `5738f231`, and `6f31d170` bind explicit
+  adjacent/narrow targets, complete typed full-screen TUI plan follow-ups, and
+  serialize restrictive transitions with exact-run background-effect
+  registration. Active shells or workers now produce a typed refusal without
+  publishing a new generation; explicit `kill_shell`/`task_stop` preserves
+  user choice.
+- Rust 1.98 formatting, strict all-target/all-feature Clippy, complete
+  serialized workspace tests, Windows GNU compilation, and focused mode,
+  target-binding, TUI, shell, worker, and transition-race tests passed.
+- Registry generation 4 therefore classifies behavioral modes as `partial`
+  rather than `experimental`. `Operational` remains withheld until canonical
+  artifact-bound VDD receipts cover the production entrypoints and failures.

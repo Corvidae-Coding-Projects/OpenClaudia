@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generation": 3,
+  "generation": 4,
   "capabilities": [
     {
       "id": "interactive-tui",
@@ -8,7 +8,7 @@
       "visibility": "user_facing",
       "maturity": "partial",
       "summary": "Full-screen interactive agent frontend and its launch-time variants.",
-      "limitation": "Provider continuation, canonical lifecycle, cancellation, and terminal-state evidence are incomplete.",
+      "limitation": "Provider continuation, truthful terminal outcomes, run budgets, causal checkpoints, and runtime modes are wired; supervised cancellation and complete artifact-bound frontend evidence remain pending.",
       "entrypoints": [
         { "id": "tui.default", "kind": "default_tui", "invocation": "openclaudia", "reachability": "reachable", "required_failure_modes": [] },
         { "id": "tui.model", "kind": "default_tui", "invocation": "openclaudia -m <model>", "reachability": "reachable", "required_failure_modes": [] },
@@ -30,7 +30,7 @@
       "visibility": "user_facing",
       "maturity": "partial",
       "summary": "Line-oriented compatibility frontend with a separate orchestration loop.",
-      "limitation": "Request, tool, hook, transcript, and finalization semantics drift from the default TUI.",
+      "limitation": "The route shares truthful terminal outcomes, budgets, checkpoints, and runtime modes, but request, hook, transcript, and cancellation semantics still drift from the default TUI.",
       "entrypoints": [
         { "id": "repl.default", "kind": "legacy_repl", "invocation": "openclaudia --tui-mode", "reachability": "reachable", "required_failure_modes": [] }
       ],
@@ -45,9 +45,9 @@
       "id": "coordinator-prompt-mode",
       "display_name": "Coordinator prompt mode",
       "visibility": "user_facing",
-      "maturity": "experimental",
-      "summary": "Legacy REPL launch shape that selects coordinator-oriented prompts.",
-      "limitation": "Coordinator dispatch, isolation, supervision, and lifecycle enforcement are not operational.",
+      "maturity": "partial",
+      "summary": "Legacy REPL launch shape backed by the coordinator runtime capability profile.",
+      "limitation": "Coordinator child-run authority is enforced, but durable orchestration, cancellation, and artifact-bound lifecycle evidence remain incomplete.",
       "entrypoints": [
         { "id": "coordinator.repl", "kind": "legacy_repl", "invocation": "openclaudia --coordinator --tui-mode", "reachability": "reachable", "required_failure_modes": [] }
       ],
@@ -61,9 +61,9 @@
       "id": "behavioral-mode-presets",
       "display_name": "Behavioral mode presets",
       "visibility": "user_facing",
-      "maturity": "experimental",
-      "summary": "Prompt-oriented mode selection at TUI startup.",
-      "limitation": "Mode names do not yet enforce effect or resource capabilities.",
+      "maturity": "partial",
+      "summary": "Runtime-enforced behavioral profiles with atomic transitions and explicit narrow-scope targets.",
+      "limitation": "Tool, effect, child-run, target, and in-flight background authority are enforced across production mode paths; artifact-bound VDD receipts remain pending.",
       "entrypoints": [
         { "id": "modes.tui", "kind": "default_tui", "invocation": "openclaudia --mode <preset>", "reachability": "reachable", "required_failure_modes": [] }
       ],
@@ -78,7 +78,7 @@
       "visibility": "user_facing",
       "maturity": "partial",
       "summary": "Non-interactive single-prompt provider route.",
-      "limitation": "The route lacks canonical state, aggregate budgets, trace, and typed partial or cancelled terminal status.",
+      "limitation": "Truthful terminal outcomes and aggregate budgets are wired; the route still lacks resumable canonical session state, supervised cancellation, and complete trace parity.",
       "entrypoints": [
         { "id": "print.default", "kind": "print", "invocation": "openclaudia --print \"prompt\"", "reachability": "reachable", "required_failure_modes": [] }
       ],
@@ -148,7 +148,7 @@
       "visibility": "user_facing",
       "maturity": "partial",
       "summary": "ACP JSON-RPC server over standard input and output.",
-      "limitation": "Session isolation, tool and mode parity, cancellation, and partial terminal outcomes remain incomplete.",
+      "limitation": "Typed partial outcomes, runtime modes, dynamic tools, budgets, and causal checkpoints are wired; session isolation, transport bounds, cancellation, and effective-capability negotiation remain incomplete.",
       "entrypoints": [
         { "id": "acp.default", "kind": "acp", "invocation": "openclaudia acp", "reachability": "reachable", "required_failure_modes": [] },
         { "id": "acp.model", "kind": "acp", "invocation": "openclaudia acp -m <model>", "reachability": "reachable", "required_failure_modes": [] }
@@ -166,7 +166,7 @@
       "visibility": "user_facing",
       "maturity": "partial",
       "summary": "Current iterative provider and Stop-hook command path.",
-      "limitation": "It uses a separate lifecycle; one iteration counter is not an aggregate budget or durable stop condition.",
+      "limitation": "The loop consumes the canonical aggregate budget and truthful terminal outcomes, but still uses a separate orchestration lifecycle without durable stop/resume or cancellation parity.",
       "entrypoints": [
         { "id": "loop.default", "kind": "loop", "invocation": "openclaudia loop", "reachability": "reachable", "required_failure_modes": [] },
         { "id": "loop.finite", "kind": "loop", "invocation": "openclaudia loop -n 10", "reachability": "reachable", "required_failure_modes": [] }
@@ -184,7 +184,7 @@
       "visibility": "user_facing",
       "maturity": "partial",
       "summary": "Loads and renders current configuration.",
-      "limitation": "Secret redaction, provenance, duplicate loaders, and unknown-field handling need the typed configuration remediation.",
+      "limitation": "Typed loading, precedence, unknown-field rejection, and secret redaction are wired; complete user-facing source provenance and conflict diagnostics remain incomplete.",
       "entrypoints": [
         { "id": "config.default", "kind": "config", "invocation": "openclaudia config", "reachability": "reachable", "required_failure_modes": [] }
       ],
@@ -232,12 +232,32 @@
       "evidence_ids": []
     },
     {
+      "id": "authenticated-team-technical-memory",
+      "display_name": "Authenticated team technical memory",
+      "visibility": "user_facing",
+      "maturity": "partial",
+      "summary": "Authenticated, encrypted, causally versioned team-scoped technical lessons retrieved explicitly through canonical memory tools.",
+      "limitation": "Authority, bounded replication, scoped tools, conflict handling, and production frontend activation are wired and deterministically tested; artifact-bound VDD receipts and non-Unix descriptor-safe private storage remain pending.",
+      "entrypoints": [
+        { "id": "team.cli", "kind": "team_cli", "invocation": "openclaudia team <command>", "reachability": "reachable", "required_failure_modes": [] },
+        { "id": "team.memory-tools", "kind": "agent_tool", "invocation": "memory_save|search|list|conflicts|update|delete (scope=team)", "reachability": "reachable", "required_failure_modes": [] }
+      ],
+      "required_effects": [
+        { "id": "team.filesystem-read", "kind": "filesystem_read", "expectation": "may_occur", "description": "Host-owned authority, replica, and technical-lesson state are read through descriptor-safe storage." },
+        { "id": "team.filesystem-write", "kind": "filesystem_write", "expectation": "may_occur", "description": "Authorized operations atomically update credentials, causal replica state, and audit receipts." },
+        { "id": "team.network", "kind": "network_request", "expectation": "may_occur", "description": "Pinned TLS replication synchronizes authenticated team revisions." },
+        { "id": "team.credentials", "kind": "credential_read", "expectation": "may_occur", "description": "Host-owned membership and signing material authorize exact team operations." },
+        { "id": "team.external", "kind": "external_mutation", "expectation": "may_occur", "description": "Authorized pushes can mutate the remote team replica." }
+      ],
+      "evidence_ids": []
+    },
+    {
       "id": "lifecycle-service-reachability",
       "display_name": "Lifecycle service reachability",
       "visibility": "internal",
       "maturity": "partial",
       "summary": "Validates an immutable catalog that distinguishes wired services from disabled, experimental, unavailable, and test-only implementations.",
-      "limitation": "The typed catalog and deterministic tests bind current analytics, compaction, and fail-closed configuration paths; artifact-bound VDD evidence remains pending S-088, and incomplete background, team-memory, LSP, feature-rollout, and shadow MCP implementations are not promoted.",
+      "limitation": "The typed catalog and deterministic tests bind current analytics, compaction, authenticated team memory, and fail-closed configuration paths; artifact-bound VDD evidence remains pending S-088, and incomplete background scheduling, LSP, feature-rollout, and shadow MCP implementations are not promoted.",
       "entrypoints": [
         {
           "id": "services.lifecycle-catalog",
@@ -285,7 +305,7 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-render-success",
       "coverage": { "kind": "success" },
-      "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
+      "corpus_sha256": "sha256:92df29453752aae3b5f2174d999174f2736d40312afaf2e73d3e0b7ea517e049",
       "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {
@@ -304,9 +324,9 @@
         "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a"
       },
       "receipts": [
-        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:e04d0c4861c2620a2cc18feb4d1b9d70206a31e124303f21c3eedf1bd56e1791", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
-        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:e04d0c4861c2620a2cc18feb4d1b9d70206a31e124303f21c3eedf1bd56e1791", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
-        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:e04d0c4861c2620a2cc18feb4d1b9d70206a31e124303f21c3eedf1bd56e1791", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" }
+        { "trial": 1, "outcome": "passed", "final_environment_sha256": "sha256:2a0ad215c36d96bb81e9c051ed8f3798fb08cafcd5600feee84bf78a1d9545f4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
+        { "trial": 2, "outcome": "passed", "final_environment_sha256": "sha256:2a0ad215c36d96bb81e9c051ed8f3798fb08cafcd5600feee84bf78a1d9545f4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" },
+        { "trial": 3, "outcome": "passed", "final_environment_sha256": "sha256:2a0ad215c36d96bb81e9c051ed8f3798fb08cafcd5600feee84bf78a1d9545f4", "trace_sha256": "sha256:0d2c0fe32267d0b263d0028a3ee13ff04176f027c4dee5c0a3c769c274e7476a", "effect_observations_sha256": "sha256:341bdccbc20302495ba496370d033285e54f6daa230e9157e59f61b737101662" }
       ]
     },
     {
@@ -315,7 +335,7 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-rejects-docs-only",
       "coverage": { "kind": "failure", "failure_mode": "documentation_only_claim" },
-      "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
+      "corpus_sha256": "sha256:92df29453752aae3b5f2174d999174f2736d40312afaf2e73d3e0b7ea517e049",
       "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {
@@ -344,7 +364,7 @@
       "entrypoint_id": "registry.library",
       "scenario_id": "registry-rejects-missing-failure-evidence",
       "coverage": { "kind": "failure", "failure_mode": "missing_failure_evidence" },
-      "corpus_sha256": "sha256:2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a",
+      "corpus_sha256": "sha256:92df29453752aae3b5f2174d999174f2736d40312afaf2e73d3e0b7ea517e049",
       "quality_review_id": "capability-corpus-review-v2",
       "provenance": { "source": "executable_scenario", "authority": "capability_release", "test_target": "capability_evidence_e2e" },
       "trace": {

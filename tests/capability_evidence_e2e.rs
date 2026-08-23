@@ -216,6 +216,7 @@ fn reviewed_corpus_executes_three_final_state_trials_per_scenario() -> Result<()
 fn user_facing_matrix_is_only_a_registry_projection() -> Result<(), Box<dyn Error>> {
     let bundle = CapabilityEvidenceBundle::bundled()?;
     assert_eq!(bundle.render_user_facing_markdown(), GENERATED_MATRIX);
+    assert_eq!(bundle.registry().generation(), 4);
     assert_eq!(
         bundle
             .registry()
@@ -230,8 +231,15 @@ fn user_facing_matrix_is_only_a_registry_projection() -> Result<(), Box<dyn Erro
             .capability("behavioral-mode-presets")
             .ok_or("mode record must exist")?
             .maturity(),
-        CapabilityMaturity::Experimental
+        CapabilityMaturity::Partial
     );
+    let team_memory = bundle
+        .registry()
+        .capability("authenticated-team-technical-memory")
+        .ok_or("team technical-memory capability must exist")?;
+    assert_eq!(team_memory.maturity(), CapabilityMaturity::Partial);
+    assert!(team_memory.evidence_ids().is_empty());
+    assert_eq!(team_memory.entrypoints().len(), 2);
     Ok(())
 }
 

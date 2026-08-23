@@ -123,28 +123,32 @@ proves that the resulting ACP run rejects access.
 
 ## Capability evidence
 
-Capability registry generation: **3**.
+Current capability registry generation: **4**. Generation 3 was the original
+S-012 projection; #1113 refreshed it after the closed dormant-feature slices.
 
-The internal `lifecycle-service-reachability` record is deliberately
-`partial`. It exposes the validated typed catalog and names its unpromoted
-services. It is not marked operational because artifact-bound construction,
-consumer, shutdown, and negative-activation receipts require S-088's canonical
-VDD verifier.
+The internal `lifecycle-service-reachability` record remains deliberately
+`partial`. It now records authenticated team memory as wired, and generation 4
+adds a separate partial user-facing team technical-memory record. Neither is
+marked operational because artifact-bound construction, consumer, shutdown,
+authorization-failure, and negative-activation receipts require S-088's
+canonical VDD verifier.
 
 Final artifact SHA-256 digests:
 
 - `capabilities/registry.json`:
-  `ba4166f9a20edb768966ae41970e3d7c840f321ea4d2fa84360d3e80939b0f27`
+  `d8402e6cc054c2d2764615a629de35be0b755d420fc44ba5a1f3bd7f540124ae`
 - `capabilities/evaluation-corpus.json`:
-  `2025ebed47e67138f703c09918b11384cb758a0adb4a7d0cf17de7450cde963a`
+  `92df29453752aae3b5f2174d999174f2736d40312afaf2e73d3e0b7ea517e049`
 - `capabilities/evaluation-corpus-review.json`:
-  `26c04b7929c130808f872b7f0473889649fc7586f5b41ee3ccb475d49ea1ddd0`
+  `64aab81c8eceae23538e5b956c32b3bbb379148a6a6b89871ee01356875cf60b`
 - `docs/binary-capability-matrix.md`:
-  `40a50c35164ac8eb000376979f6e71511523dff1ffa92cfae48967198d69407d`
+  `5c8d01edbedd7de477d81e189a7b0167c1be9af2d164e3c2763374105c0e090f`
 
-The S-012 corpus change is limited to the deterministic generation-3 matrix
-projection and final-environment digest. All executable scenarios, typed trace
-and effect proofs, failure graders, and three-trial receipts remain unchanged.
+The #1113 refresh is limited to generation-4 registry records, the deterministic
+matrix projection, and the render scenario's final-environment digest. All
+executable scenarios, typed trace and effect proofs, failure graders, and
+three-trial structure remain unchanged. Partial maturity does not claim
+artifact-bound VDD approval.
 
 ## Verification evidence
 

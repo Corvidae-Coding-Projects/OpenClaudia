@@ -1,6 +1,6 @@
 # S-050: Make provider terminal outcomes truthful
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD pending S-088
 Effort: Medium
 Primary findings: F-096
 Workstreams: W3, W12
@@ -27,3 +27,13 @@ Prevent partial streams, loop aborts, and provider failures from being recorded 
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Implementation record — 2026-08-23
+
+Signed commit `684a812` delivers one typed provider terminal contract across
+TUI, legacy REPL, print, ACP, child-agent, and VDD paths. Incomplete streams,
+truncation, refusal, filtering, malformed or partial tool calls, cancellation,
+and loop aborts cannot become committed assistant success. Rust 1.98 formatting,
+native all-target/all-feature checks, strict Clippy, focused negative tests, and
+the complete serialized all-feature test suite passed. Canonical artifact-bound
+VDD promotion remains pending S-088.
