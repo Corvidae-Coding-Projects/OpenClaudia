@@ -1,6 +1,6 @@
 {
   "next_display_id": 1118,
-  "next_comment_id": 1381,
+  "next_comment_id": 1382,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28205,7 +28205,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:33:45.737689540Z",
-      "updated_at": "2026-08-23T15:41:43.015913920Z",
+      "updated_at": "2026-08-23T15:41:47.291881398Z",
       "labels": [
         "remediation"
       ],
@@ -28218,6 +28218,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQNX8PBUq180HlvgQzbkRSEzjcXcWtw1aAsvpeskaUbnxOKAcKu1stECXBGuVjEkMToMj6Jq764Cj7TIUwzQLAA=="
+        },
+        "6e02c4c4-e8af-44c8-96ca-0bef6a3c0be3": {
+          "display_id": 1381,
+          "author": "6Vw9",
+          "content": "Preflight found the real defect: all eight named profiles currently receive every run bind root with original write mode and every environment grant. Extra command env is also added after sandbox construction. The implementation will centralize effective grants per profile, make parser/analyzer/LSP/quality/hook profiles read-only or scratch-only as appropriate, restrict general env inheritance, preserve explicit declared hook/MCP/Git env, and prove realistic isolation. Shell/Git write workflows remain operational; broad platform redesign is out of this slice.",
+          "created_at": "2026-08-23T15:41:47.289448662Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl5DLWis512J78IkmJ0GMl7/LvmKc75ugRnW3TOYwgv6qlH8u4CzVjZdbeSQpF36xQuKKvcoUv7DhhcJdL1ndDg=="
         }
       }
     },
@@ -36460,11 +36469,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1271,
       "timestamp": "2026-08-23T15:41:43.015913920Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1272,
+      "timestamp": "2026-08-23T15:41:47.291881398Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:41:43.015913920Z",
+    "timestamp": "2026-08-23T15:41:47.291881398Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1271
+    "agent_seq": 1272
   }
 }
