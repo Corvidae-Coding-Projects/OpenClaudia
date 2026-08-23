@@ -1,6 +1,6 @@
 {
   "next_display_id": 1115,
-  "next_comment_id": 1358,
+  "next_comment_id": 1359,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15345,7 +15345,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T13:28:40.687327778Z",
-      "updated_at": "2026-08-23T13:56:35.222179633Z",
+      "updated_at": "2026-08-23T14:14:04.047306254Z",
       "labels": [
         "remediation"
       ],
@@ -15371,6 +15371,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAM1AIYd6yw/TkF8hivZC4bPQnoJ0A+PLkzIkekzLMNESgemmym+66R2JJb2zoDgA2asvYw28h/iCjhBlM/ytdDQ=="
+        },
+        "9f767a3e-17be-4cba-b9e9-ed3e8e660a78": {
+          "display_id": 1358,
+          "author": "6Vw9",
+          "content": "S-040 implementation and review complete. One run-owned Tokio supervisor now covers concurrent bounded stdin delivery, stdout/stderr drain, root exit, aggregate deadline, typed cancellation, forceful process-tree cleanup, reap, and typed partial outcomes. Bash exposes and enforces timeout=1..=600000 ms; hooks, guardrail quality gates, and VDD static analysis use the same async lifecycle. Verification: Rust 1.98 fmt; strict locked workspace/all-target/all-feature Clippy with -D warnings; locked Windows GNU workspace/all-target/all-feature check (only #1099 warnings); complete locked native workspace/all-target/all-feature suite serialized with --test-threads=1, including 2867 passed/1 ignored in the library harness and no failures; final supervisor rerun 8/8. Review found no unresolved S-040 production blocker. Artifact-bound alternate-model receipt remains explicitly S-088.",
+          "created_at": "2026-08-23T14:14:04.041568437Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmptbTSyPN2btFvTO27GOp4xxelwzu95SABaFJlDgCf/1GdItQDSPK3DsQq2cbTxw2UXJh3PWU/Gp3qoYvmn6Bw=="
         }
       }
     },
@@ -35989,11 +35998,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1230,
       "timestamp": "2026-08-23T13:56:44.452156236Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1231,
+      "timestamp": "2026-08-23T14:14:04.047306254Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T13:56:44.452156236Z",
+    "timestamp": "2026-08-23T14:14:04.047306254Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1230
+    "agent_seq": 1231
   }
 }
