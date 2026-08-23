@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1108,
+  "next_display_id": 1109,
   "next_comment_id": 1308,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -545,6 +545,7 @@
     "87b9f874-574a-45b6-8cdd-5a2c636b50fb": 1100,
     "87fc2730-649b-4fb1-99e7-81d8f4086603": 228,
     "882c2f29-e7b5-4142-a8e3-17033d947244": 765,
+    "88892f32-745a-46d8-a26c-9771f2214046": 1108,
     "88ba4eea-27ad-4f08-8523-1e262e5a3b9e": 1048,
     "8915a34f-10f9-4f21-b7a4-9ec62c8b794e": 108,
     "89571bd5-e0fe-43c1-9eea-91102e4cb0d0": 543,
@@ -16104,6 +16105,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZEAFHNfFgIzWhIawGx1yPDw/wAM5j5DzFgDTUTGoMySdym8Lz9yHLIOpSG9/pDp1Q9AmnoXue0AGPvgI+JgbDg=="
         }
       }
+    },
+    "88892f32-745a-46d8-a26c-9771f2214046": {
+      "uuid": "88892f32-745a-46d8-a26c-9771f2214046",
+      "display_id": 1108,
+      "title": "S-057: Replace lossy compaction with causal checkpoints",
+      "description": "Implement one canonical typed compaction/checkpoint operation that preserves causal task, tool, evidence, budget, and provider-continuation state across all production frontends. Atomically persist the checkpoint/archive boundary with idempotency and truthful success/partial/cannot-fit/error outcomes. Scope is the real application compaction path; unrelated polish remains out of scope.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T07:20:15.059790695Z",
+      "updated_at": "2026-08-23T07:20:15.059790695Z"
     },
     "88ba4eea-27ad-4f08-8523-1e262e5a3b9e": {
       "uuid": "88ba4eea-27ad-4f08-8523-1e262e5a3b9e",
@@ -34907,11 +34920,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1136,
       "timestamp": "2026-08-23T07:17:00.581935589Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1137,
+      "timestamp": "2026-08-23T07:20:15.059790695Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T07:17:00.581935589Z",
+    "timestamp": "2026-08-23T07:20:15.059790695Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1136
+    "agent_seq": 1137
   }
 }
