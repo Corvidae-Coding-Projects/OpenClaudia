@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1121,
+  "next_display_id": 1122,
   "next_comment_id": 1419,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -860,6 +860,7 @@
     "d39fa8e6-4de2-42c3-8b43-9147be60a07e": 465,
     "d3b33f9a-57a5-4a31-a7e3-b81ecd80c9b8": 628,
     "d46ad86e-64ab-4c75-b69b-5cc01db5f19a": 2,
+    "d4f3071e-4972-47f4-b7ae-7cede35463b0": 1121,
     "d533f94c-12c8-4481-bc0d-ecedeb971ebe": 419,
     "d540a4ac-154d-41a4-99c2-806571971163": 633,
     "d5450800-e81f-4fb5-b01b-1851167886d0": 437,
@@ -25495,6 +25496,18 @@
         }
       }
     },
+    "d4f3071e-4972-47f4-b7ae-7cede35463b0": {
+      "uuid": "d4f3071e-4972-47f4-b7ae-7cede35463b0",
+      "display_id": 1121,
+      "title": "S-022: Enforce diff blocks and quality gates",
+      "description": "Implement docs/remediation-slices/022-diff-and-quality-completion-gates.md under parent #1071. Bind proposed diffs and quality-check plans to exact artifact generations; execute configured gates through canonical bounded process/review capabilities; return typed pass, fail, skipped, stale, and error states; block mutation or final success for required gate failure, absence, parse error, or stale evidence across every frontend. Rust exactly 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo, wiring rather than removal, and production-likely functionality over speculative edge cases.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T22:37:39.823571526Z",
+      "updated_at": "2026-08-23T22:37:39.823571526Z"
+    },
     "d533f94c-12c8-4481-bc0d-ecedeb971ebe": {
       "uuid": "d533f94c-12c8-4481-bc0d-ecedeb971ebe",
       "display_id": 419,
@@ -37162,11 +37175,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1331,
       "timestamp": "2026-08-23T22:37:18.410129622Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1332,
+      "timestamp": "2026-08-23T22:37:39.823571526Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T22:37:18.410129622Z",
+    "timestamp": "2026-08-23T22:37:39.823571526Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1331
+    "agent_seq": 1332
   }
 }
