@@ -1,6 +1,6 @@
 {
   "next_display_id": 1115,
-  "next_comment_id": 1356,
+  "next_comment_id": 1357,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13945,14 +13945,25 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T05:27:21.421113555Z",
-      "updated_at": "2026-08-23T13:29:18.325817930Z",
+      "updated_at": "2026-08-23T13:56:40.037149788Z",
       "labels": [
         "bug",
         "tests"
       ],
       "related": [
         "7e5b2dff-ef17-4d7f-9404-5b41f3a795be"
-      ]
+      ],
+      "comments": {
+        "c4590b55-f076-48de-a244-5ce1a8b06f4a": {
+          "display_id": 1356,
+          "author": "6Vw9",
+          "content": "S-040 root cause repaired in the working diff: the old helper joined reader threads after the root exited with no remaining deadline. The new supervisor keeps root exit and pipe drain inside one aggregate deadline, preserves partial stdout/status, force-kills the owned process group, and joins all I/O tasks. Deterministic regression 'descendant_held_output_pipe_cannot_outlive_deadline' passes with root status present and partial stdout 'done'. Closure awaits full S-040 gates/commit.",
+          "created_at": "2026-08-23T13:56:40.034686455Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAjZwzTcZrxio8RVKE36sw5JlEGnT5LL6YCEbZQ/gBL2oisAZ3Ct5By7YF5RKsbxm3YdNhWobYZX3P5V0FTY0mDw=="
+        }
+      }
     },
     "72d3cf2b-955d-4410-8c56-a896d263b039": {
       "uuid": "72d3cf2b-955d-4410-8c56-a896d263b039",
@@ -35959,11 +35970,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1228,
       "timestamp": "2026-08-23T13:56:35.222179633Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1229,
+      "timestamp": "2026-08-23T13:56:40.037149788Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T13:56:35.222179633Z",
+    "timestamp": "2026-08-23T13:56:40.037149788Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1228
+    "agent_seq": 1229
   }
 }
