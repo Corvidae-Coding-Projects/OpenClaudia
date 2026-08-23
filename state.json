@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1116,
+  "next_display_id": 1117,
   "next_comment_id": 1376,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -828,6 +828,7 @@
     "ca1677e3-6e31-4ead-81d6-974b5674e09b": 115,
     "ca53a968-2b8d-40f3-9662-b66cc8b197ae": 1019,
     "ca7c4ab9-a985-4d34-ab6c-355009d8ac9c": 718,
+    "caee1f97-49f1-4343-88a1-73a3d8e32fda": 1116,
     "cb15988c-7787-4b3d-82bf-be348a8b22f7": 748,
     "cb7d5e52-6550-4867-a029-52d7930b427b": 1103,
     "cbf93f8b-d67c-4a4f-862c-48172521bffa": 362,
@@ -24396,6 +24397,18 @@
         "security"
       ]
     },
+    "caee1f97-49f1-4343-88a1-73a3d8e32fda": {
+      "uuid": "caee1f97-49f1-4343-88a1-73a3d8e32fda",
+      "display_id": 1116,
+      "title": "Bound durable background-job artifact retention",
+      "description": "S-041 bounds each job record to 2 MiB and bounds the in-memory/recovered working set, but terminal UUID artifact directories remain on disk so a long-lived resumed session can accumulate records indefinitely. Add a practical age/count retention policy that deletes only validated terminal job directories, preserves active/recent replay, is race-safe with concurrent readers, and never follows symlinks or acts on recovered PIDs. This is storage maintenance, not a redesign of process supervision.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T15:31:14.478304503Z",
+      "updated_at": "2026-08-23T15:31:14.478304503Z"
+    },
     "cb15988c-7787-4b3d-82bf-be348a8b22f7": {
       "uuid": "cb15988c-7787-4b3d-82bf-be348a8b22f7",
       "display_id": 748,
@@ -36314,11 +36327,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1259,
       "timestamp": "2026-08-23T15:28:54.835045342Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1260,
+      "timestamp": "2026-08-23T15:31:14.478304503Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:28:54.835045342Z",
+    "timestamp": "2026-08-23T15:31:14.478304503Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1259
+    "agent_seq": 1260
   }
 }
