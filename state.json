@@ -1,6 +1,6 @@
 {
   "next_display_id": 1110,
-  "next_comment_id": 1316,
+  "next_comment_id": 1317,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28099,13 +28099,24 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T08:45:03.862099956Z",
-      "updated_at": "2026-08-23T08:46:02.548361450Z",
+      "updated_at": "2026-08-23T08:46:07.275364506Z",
       "labels": [
         "remediation"
       ],
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7"
-      ]
+      ],
+      "comments": {
+        "eb1e4005-daf8-44bd-911b-d3cd570b3f9a": {
+          "display_id": 1316,
+          "author": "6Vw9",
+          "content": "Implement only the production-relevant S-014 path: canonical mode profiles, atomic generation-bound transitions, and enforcement at the shared tool admission boundary, then wire frontend mode changes through that contract. Verify ordinary prohibited/allowed tool behavior and resume persistence; defer unrelated UI polish and hypothetical cases.",
+          "created_at": "2026-08-23T08:46:07.272766110Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA4hV0hFEzdfCtkNsETPdNZhbMJJ1Addzumk/l9iXDDoOPUe+Fptn4GyLSNMxDrp+X6EnMPVE9ij6FEBM2189EAA=="
+        }
+      }
     },
     "f6062054-9c13-4372-9596-8ccde7a0c213": {
       "uuid": "f6062054-9c13-4372-9596-8ccde7a0c213",
@@ -35126,11 +35137,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1156,
       "timestamp": "2026-08-23T08:46:02.548361450Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1157,
+      "timestamp": "2026-08-23T08:46:07.275364506Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T08:46:02.548361450Z",
+    "timestamp": "2026-08-23T08:46:07.275364506Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1156
+    "agent_seq": 1157
   }
 }
