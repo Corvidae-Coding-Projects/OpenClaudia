@@ -8776,7 +8776,10 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T10:01:17.823149320Z",
-      "updated_at": "2026-08-23T10:01:17.823149320Z"
+      "updated_at": "2026-08-23T10:01:22.337565899Z",
+      "related": [
+        "f5eb100a-4902-49bd-8713-b92f9293090b"
+      ]
     },
     "4956e2e0-fc51-452d-9b2d-da82b99f33b6": {
       "uuid": "4956e2e0-fc51-452d-9b2d-da82b99f33b6",
@@ -28145,13 +28148,14 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T08:45:03.862099956Z",
-      "updated_at": "2026-08-23T09:59:12.415623074Z",
+      "updated_at": "2026-08-23T10:01:22.337565899Z",
       "labels": [
         "remediation"
       ],
       "related": [
         "043f7401-aebe-4cf3-ad6a-8a34576034db",
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+        "494ff912-0d6c-4e43-a96c-584c668c5223",
         "7bb5d5db-e5a7-487e-8679-0618d3a1b54b"
       ],
       "comments": {
@@ -35253,11 +35257,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1166,
       "timestamp": "2026-08-23T10:01:17.823149320Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1167,
+      "timestamp": "2026-08-23T10:01:22.337565899Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T10:01:17.823149320Z",
+    "timestamp": "2026-08-23T10:01:22.337565899Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1166
+    "agent_seq": 1167
   }
 }
