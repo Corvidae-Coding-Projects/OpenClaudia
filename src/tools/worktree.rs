@@ -259,6 +259,9 @@ pub fn validate_branch_name(
         crate::tools::command::CommandError::WaitFailed { source, .. } => {
             format!("git check-ref-format wait failed: {source}")
         }
+        error @ (crate::tools::command::CommandError::InputTooLarge { .. }
+        | crate::tools::command::CommandError::Cancelled { .. }
+        | crate::tools::command::CommandError::RuntimeFailed { .. }) => error.to_string(),
     })?;
 
     if output.status.success() {
@@ -340,6 +343,9 @@ fn git_in(
         crate::tools::command::CommandError::WaitFailed { source, .. } => {
             format!("Git wait failed: {source}")
         }
+        error @ (crate::tools::command::CommandError::InputTooLarge { .. }
+        | crate::tools::command::CommandError::Cancelled { .. }
+        | crate::tools::command::CommandError::RuntimeFailed { .. }) => error.to_string(),
     })
 }
 

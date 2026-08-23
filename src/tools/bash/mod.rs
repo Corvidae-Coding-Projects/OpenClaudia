@@ -18,6 +18,7 @@ use crate::tools::args::{ToolArgError, ToolArgs as _, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -32,7 +33,8 @@ use uuid::Uuid;
 const MAX_BACKGROUND_SHELLS: usize = 50;
 const LEDGER_COMMAND_OUTPUT_MAX_BYTES: usize = 100_000;
 const BACKGROUND_OUTPUT_MAX_BYTES_PER_STREAM: usize = 1024 * 1024;
-const FOREGROUND_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 300_000;
+const MAX_FOREGROUND_TIMEOUT_MS: u64 = 600_000;
 
 fn bash_bin(run: &crate::tools::ToolRunContext) -> Result<PathBuf, String> {
     run.resolve_executable("bash")
@@ -577,9 +579,8 @@ impl BackgroundShellManager {
 
     /// Kill a background shell by terminating the OS process and its process group.
     ///
-    /// Sends SIGTERM first, waits for graceful exit, then escalates to SIGKILL
-    /// if needed. Only removes the shell from tracking after the process has
-    /// been terminated.
+    /// Force-stops the owned sandbox tree, then waits for the existing waiter
+    /// and output-reader threads to publish reap/drain completion.
     pub(crate) fn kill(
         &self,
         run: &crate::tools::security::ToolRunContext,
@@ -605,19 +606,10 @@ impl BackgroundShellManager {
             return Err(format!("Shell '{shell_id}' not found"));
         }
 
-        if let Some(shell) = shells.remove(shell_id) {
-            if !shell.finished.load(Ordering::SeqCst) {
-                // Terminate the process group (SIGTERM -> wait -> SIGKILL)
-                terminate_process_tree(shell.pid);
-            }
-            // Crosslink #674: keep `finished` and `reaped` flipped together
-            // so the killed shell never appears as `is_running=true` to a
-            // subsequent `get_output` poll. The wait thread will still race
-            // to write the exit status; either it wins (exit_status=Some)
-            // or kill closes the channel first (exit_status=None) — both
-            // are valid for an explicitly-killed shell.
-            shell.finished.store(true, Ordering::SeqCst);
-            shell.reaped.store(true, Ordering::SeqCst);
+        let shell = shells.remove(shell_id);
+        drop(shells);
+        if let Some(shell) = shell {
+            stop_background_shell(&shell);
             Ok(format!(
                 "Shell '{}' terminated (command: {}, pid: {})",
                 shell_id, shell.command, shell.pid
@@ -654,11 +646,7 @@ impl BackgroundShellManager {
 
         let mut killed_ids = Vec::with_capacity(removed.len());
         for (shell_id, shell) in removed {
-            if !shell.finished.load(Ordering::SeqCst) {
-                terminate_process_tree(shell.pid);
-            }
-            shell.finished.store(true, Ordering::SeqCst);
-            shell.reaped.store(true, Ordering::SeqCst);
+            stop_background_shell(&shell);
             killed_ids.push(shell_id);
         }
 
@@ -764,6 +752,35 @@ fn wait_for_output_readers(stdout_done: &AtomicBool, stderr_done: &AtomicBool, s
         );
         thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+fn stop_background_shell(shell: &BackgroundShell) {
+    // A root shell can already be reaped while a descendant still owns one of
+    // its pipes. In that state `finished` is true but the sandbox is not gone.
+    // Force the owned tree whenever either reader has not reached EOF, then
+    // wait briefly for the existing waiter/reader threads to publish reality.
+    if !shell.finished.load(Ordering::SeqCst)
+        || !shell.stdout_done.load(Ordering::SeqCst)
+        || !shell.stderr_done.load(Ordering::SeqCst)
+    {
+        terminate_sandbox_process_tree(shell.pid);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if shell.reaped.load(Ordering::SeqCst)
+            && shell.stdout_done.load(Ordering::SeqCst)
+            && shell.stderr_done.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    tracing::warn!(
+        target: "openclaudia::bash",
+        event = "background_shell_reap_delayed",
+        pid = shell.pid,
+        "Background shell did not publish reap and pipe-drain completion within cleanup deadline"
+    );
 }
 
 /// Global background shell manager
@@ -891,7 +908,33 @@ pub fn try_execute_bash(
         .arg_bool_or_strict("run_in_background", false)
         .map_err(ToolError::InvalidArgument)?;
 
+    let timeout_ms = match args.get("timeout") {
+        None => DEFAULT_FOREGROUND_TIMEOUT_MS,
+        Some(Value::Number(value)) => value.as_u64().ok_or_else(|| {
+            ToolError::InvalidInput(
+                "Invalid 'timeout' argument: expected a positive integer in milliseconds"
+                    .to_string(),
+            )
+        })?,
+        Some(_) => {
+            return Err(ToolError::InvalidArgument(ToolArgError::WrongType {
+                key: "timeout",
+                expected: "positive integer",
+            }));
+        }
+    };
+    if timeout_ms == 0 || timeout_ms > MAX_FOREGROUND_TIMEOUT_MS {
+        return Err(ToolError::InvalidInput(format!(
+            "Invalid 'timeout' argument: expected 1..={MAX_FOREGROUND_TIMEOUT_MS} milliseconds"
+        )));
+    }
+
     if run_in_background {
+        if args.contains_key("timeout") {
+            return Err(ToolError::InvalidInput(
+                "The 'timeout' argument applies only to foreground bash commands".to_string(),
+            ));
+        }
         let arguments = Value::Object(
             args.iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -923,7 +966,7 @@ pub fn try_execute_bash(
             run,
             cmd,
             "bash",
-            FOREGROUND_COMMAND_TIMEOUT,
+            std::time::Duration::from_millis(timeout_ms),
         )
     };
 
@@ -936,7 +979,7 @@ pub fn try_execute_bash(
             run,
             cmd,
             "bash",
-            FOREGROUND_COMMAND_TIMEOUT,
+            std::time::Duration::from_millis(timeout_ms),
         )
     };
 
@@ -948,12 +991,42 @@ pub fn try_execute_bash(
             )));
         }
         Err(
+            error @ (super::command::CommandError::InputTooLarge { .. }
+            | super::command::CommandError::RuntimeFailed { .. }),
+        ) => {
+            return Err(ToolError::External(format!(
+                "Failed to execute command: {error}"
+            )));
+        }
+        Err(
             error @ (super::command::CommandError::TimedOut { .. }
+            | super::command::CommandError::Cancelled { .. }
             | super::command::CommandError::WaitFailed { .. }),
         ) => {
-            return Err(ToolError::PartialExternal(format!(
-                "Failed to execute command after it started: {error}"
-            )));
+            let mut diagnostic = format!("Failed to execute command after it started: {error}");
+            if let Some(partial) = error.partial() {
+                if let Some(status) = partial.status.as_ref() {
+                    let _ = write!(diagnostic, "\nterminal status: {status}");
+                }
+                if !matches!(&partial.stdin, super::command::StdinDelivery::NotRequested) {
+                    let _ = write!(diagnostic, "\nstdin delivery: {:?}", partial.stdin);
+                }
+                if !partial.stdout.bytes.is_empty() {
+                    diagnostic.push_str("\npartial stdout:\n");
+                    diagnostic.push_str(&String::from_utf8_lossy(&partial.stdout.bytes));
+                }
+                if partial.stdout.truncated {
+                    diagnostic.push_str("\n[partial stdout truncated]");
+                }
+                if !partial.stderr.bytes.is_empty() {
+                    diagnostic.push_str("\npartial stderr:\n");
+                    diagnostic.push_str(&String::from_utf8_lossy(&partial.stderr.bytes));
+                }
+                if partial.stderr.truncated {
+                    diagnostic.push_str("\n[partial stderr truncated]");
+                }
+            }
+            return Err(ToolError::PartialExternal(diagnostic));
         }
     };
     record_active_command_observation(run, &cwd, command, &output);
@@ -1402,22 +1475,28 @@ mod tests {
             .spawn(test_run(), "sleep 30")
             .expect("b2_kill_running: spawn must succeed");
 
-        // Confirm it's tracked
+        // Confirm it's tracked and retain the exact OS pid for the reap check.
+        let pid;
         {
             let shells = BACKGROUND_SHELLS
                 .shells
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let contains = shells.contains_key(&id);
+            pid = shells.get(&id).expect("tracked shell").pid;
             drop(shells);
             assert!(contains, "b2_kill_running: must be in map before kill");
         }
-
         let result = BACKGROUND_SHELLS.kill(test_run(), &id);
         assert!(
             result.is_ok(),
             "b2_kill_running: kill must succeed; err={:?}",
             result.err()
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "killed background sandbox pid {pid} must be reaped"
         );
 
         // Entry must be removed after kill

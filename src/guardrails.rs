@@ -1861,20 +1861,17 @@ async fn run_shell_command_async(
     } else {
         timeout_seconds
     });
-    let program_for_worker = program_owned.clone();
-    let run_for_worker = std::sync::Arc::clone(&run);
-    let result = match tokio::task::spawn_blocking(move || {
-        crate::tools::run_prepared_sandboxed_with_timeout(
-            &run_for_worker,
-            sandboxed,
-            &program_for_worker,
-            effective_timeout,
-        )
-    })
+    let result = match crate::tools::command::run_prepared_run_owned(
+        &run,
+        sandboxed,
+        &program_owned,
+        crate::tools::command::ProcessLimits::new(effective_timeout),
+        None,
+    )
     .await
     {
-        Ok(Ok(output)) => Some(output),
-        Ok(Err(crate::tools::CommandError::TimedOut { .. })) => {
+        Ok(output) => Some(output.into_std_output()),
+        Err(crate::tools::CommandError::TimedOut { .. }) => {
             warn!(
                 program = %program_owned,
                 timeout_seconds = effective_timeout.as_secs(),
@@ -1882,12 +1879,8 @@ async fn run_shell_command_async(
             );
             return ShellResult::Timeout;
         }
-        Ok(Err(error)) => {
-            error!(%error, "Quality gate: sandboxed command failed");
-            None
-        }
         Err(error) => {
-            error!(%error, "Quality gate: blocking worker failed");
+            error!(%error, "Quality gate: sandboxed command failed");
             None
         }
     };

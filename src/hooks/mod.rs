@@ -46,13 +46,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -977,7 +975,7 @@ impl HookEngine {
         project_dir: &std::path::Path,
     ) {
         cmd.env_clear();
-        run.environment_grants().apply_tokio(cmd);
+        run.environment_grants().apply_std(cmd);
         cmd.env("HOME", run.private_temp_root())
             .env("TMPDIR", run.private_temp_root())
             .env("TMP", run.private_temp_root())
@@ -1000,119 +998,19 @@ impl HookEngine {
         Ok((shell_path, shell_arg))
     }
 
+    #[cfg(test)]
     async fn write_hook_stdin<W>(stdin: &mut W, input_json: &str) -> Result<(), HookError>
     where
-        W: AsyncWrite + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
     {
-        stdin.write_all(input_json.as_bytes()).await.map_err(|e| {
-            HookError::CommandFailed(format!("failed to write hook input to stdin: {e}"))
-        })?;
-        stdin
-            .shutdown()
+        tokio::io::AsyncWriteExt::write_all(stdin, input_json.as_bytes())
+            .await
+            .map_err(|e| {
+                HookError::CommandFailed(format!("failed to write hook input to stdin: {e}"))
+            })?;
+        tokio::io::AsyncWriteExt::shutdown(stdin)
             .await
             .map_err(|e| HookError::CommandFailed(format!("failed to close hook input stdin: {e}")))
-    }
-
-    async fn terminate_child_after_stdin_failure(child: &mut Child) {
-        if let Some(pid) = child.id() {
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::tools::terminate_process_tree(pid);
-            })
-            .await;
-        }
-        if let Err(e) = child.start_kill() {
-            debug!(error = %e, "Failed to kill hook process after stdin failure");
-        }
-        if let Err(e) = child.wait().await {
-            debug!(error = %e, "Failed to reap hook process after stdin failure");
-        }
-    }
-
-    async fn read_bounded_hook_stream<R>(mut stream: R) -> Result<Vec<u8>, std::io::Error>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let mut retained = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let mut truncated = false;
-        loop {
-            let count = stream.read(&mut chunk).await?;
-            if count == 0 {
-                break;
-            }
-            let remaining = MAX_HOOK_OUTPUT_BYTES_PER_STREAM.saturating_sub(retained.len());
-            let keep = remaining.min(count);
-            retained.extend_from_slice(&chunk[..keep]);
-            truncated |= keep < count;
-        }
-        if truncated {
-            retained.extend_from_slice(HOOK_OUTPUT_TRUNCATED_MARKER);
-        }
-        Ok(retained)
-    }
-
-    async fn wait_for_hook_output(
-        mut child: Child,
-        timeout_secs: u64,
-    ) -> Result<std::process::Output, HookError> {
-        let pid = child.id();
-        let stdout = child.stdout.take().ok_or_else(|| {
-            HookError::CommandFailed("hook stdout unavailable after spawn".to_string())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            HookError::CommandFailed("hook stderr unavailable after spawn".to_string())
-        })?;
-        let stdout_reader = tokio::spawn(Self::read_bounded_hook_stream(stdout));
-        let stderr_reader = tokio::spawn(Self::read_bounded_hook_stream(stderr));
-        let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(error)) => {
-                if let Some(pid) = pid {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::tools::terminate_process_tree(pid);
-                    })
-                    .await;
-                }
-                return Err(HookError::CommandFailed(error.to_string()));
-            }
-            Err(_) => {
-                if let Some(pid) = pid {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::tools::terminate_process_tree(pid);
-                    })
-                    .await;
-                }
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                let _ = stdout_reader.await;
-                let _ = stderr_reader.await;
-                return Err(HookError::Timeout(timeout_secs));
-            }
-        };
-        let stdout = stdout_reader
-            .await
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
-        let stderr = stderr_reader
-            .await
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
-        Ok(std::process::Output {
-            status,
-            stdout,
-            stderr,
-        })
-    }
-
-    #[cfg(unix)]
-    fn isolate_hook_process_group(command: &mut Command) {
-        use std::os::unix::process::CommandExt as _;
-        command.as_std_mut().process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    fn isolate_hook_process_group(_command: &mut Command) {
-        // The enforced Windows backend uses a Job object when available.
     }
 
     /// Execute a command hook.
@@ -1157,14 +1055,11 @@ impl HookEngine {
             hook_policy.sandbox.clone()
         });
         if sandbox_mode == SandboxMode::FullSandbox {
-            let sandboxed =
-                crate::tools::sandboxed_hook_command(run, child_cmd.as_std(), &project_dir)
-                    .map_err(|error| {
-                        HookError::CommandFailed(format!(
-                            "failed to create full hook sandbox: {error}"
-                        ))
-                    })?;
-            child_cmd = Command::from(sandboxed);
+            let sandboxed = crate::tools::sandboxed_hook_command(run, &child_cmd, &project_dir)
+                .map_err(|error| {
+                    HookError::CommandFailed(format!("failed to create full hook sandbox: {error}"))
+                })?;
+            child_cmd = sandboxed;
         } else {
             let trusted = TRUST_UNSANDBOXED_HOOKS
                 .as_ref()
@@ -1184,32 +1079,22 @@ impl HookEngine {
             );
         }
 
-        Self::isolate_hook_process_group(&mut child_cmd);
-        let mut child = child_cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| HookError::CommandFailed(e.to_string()))?;
-        let _process_registration = child
-            .id()
-            .map(|pid| crate::tools::command::ActiveSandboxProcess::register(run, pid));
-
-        let Some(mut stdin) = child.stdin.take() else {
-            Self::terminate_child_after_stdin_failure(&mut child).await;
-            return Err(HookError::CommandFailed(
-                "hook stdin unavailable".to_string(),
-            ));
-        };
-        let stdin_result = Self::write_hook_stdin(&mut stdin, input_json).await;
-        drop(stdin);
-        if let Err(e) = stdin_result {
-            Self::terminate_child_after_stdin_failure(&mut child).await;
-            return Err(e);
-        }
-
-        match Self::wait_for_hook_output(child, timeout_secs).await {
+        let limits = crate::tools::command::ProcessLimits::new(Duration::from_secs(timeout_secs))
+            .with_output_limit(
+                MAX_HOOK_OUTPUT_BYTES_PER_STREAM,
+                HOOK_OUTPUT_TRUNCATED_MARKER,
+            );
+        match crate::tools::command::run_prepared_run_owned(
+            run,
+            child_cmd,
+            "hook",
+            limits,
+            Some(input_json.as_bytes().to_vec()),
+        )
+        .await
+        {
             Ok(output) => {
+                let output = output.into_std_output();
                 let exit_code = output.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1231,7 +1116,10 @@ impl HookEngine {
                 }
                 Ok((Self::parse_hook_output(&stdout), exit_code))
             }
-            Err(e) => Err(e),
+            Err(crate::tools::command::CommandError::TimedOut { .. }) => {
+                Err(HookError::Timeout(timeout_secs))
+            }
+            Err(error) => Err(HookError::CommandFailed(error.to_string())),
         }
     }
 
@@ -1467,6 +1355,24 @@ mod tests {
             }
             other => panic!("expected CommandFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn command_hook_deadline_covers_blocked_stdin_delivery() {
+        let engine = HookEngine::new(HooksConfig::default());
+        let input = "x".repeat(2 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let error = engine
+            .run_command_hook(test_run(), "sleep 60", false, None, &input, 1)
+            .await
+            .expect_err("blocked hook stdin must obey the hook deadline");
+
+        assert!(matches!(error, HookError::Timeout(1)), "{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "one-second hook deadline did not return promptly"
+        );
     }
 
     // ========================================================================
@@ -2319,7 +2225,6 @@ mod tests {
         HookEngine::apply_hook_env(&mut command, test_run(), test_run().project_root());
 
         let configured = command
-            .as_std()
             .get_envs()
             .map(|(key, value)| {
                 (

@@ -377,6 +377,12 @@ impl ToolHandler for BashHandler {
                         "run_in_background": {
                             "type": "boolean",
                             "description": "If true, run the command in the background and return a shell_id. Use bash_output to retrieve output later."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 600_000,
+                            "description": "Foreground command timeout in milliseconds (default 300000, maximum 600000). Not valid with run_in_background."
                         }
                     },
                     "required": ["command"]

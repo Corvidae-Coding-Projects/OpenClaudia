@@ -13,6 +13,7 @@ use openclaudia::tools::{
 use serde_json::{json, Value};
 use std::fs;
 use std::sync::Mutex;
+use std::time::Instant;
 use tempfile::TempDir;
 
 /// Global lock for tests that depend on the shared `READ_TRACKER` state.
@@ -944,15 +945,18 @@ mod bash_tools {
             }),
         );
 
-        let result = execute_tool(support::shared_run_context(), &tool_call);
+        let started = Instant::now();
+        let result = execute_tool_with_bash_approval(&tool_call);
+        let elapsed = started.elapsed();
 
-        // Should either error with timeout or produce some output
         assert!(
-            result.is_error()
-                || result.content().contains("timeout")
-                || result.content().contains("timed out")
-                || !result.content().is_empty(),
-            "Timeout test should produce output or error, got empty result"
+            result.is_partial() && result.content().contains("timed out after 1s"),
+            "foreground timeout must surface the supervisor result: {}",
+            result.content()
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "one-second Bash timeout must return promptly, took {elapsed:?}"
         );
     }
 

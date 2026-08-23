@@ -122,10 +122,10 @@ pub use bash::policy::{
 pub(crate) use bash::BACKGROUND_SHELLS;
 pub(crate) use bash::{terminate_process_tree, terminate_session_background_jobs};
 pub(crate) use command::run_sandboxed_with_timeout_with_env;
+pub(crate) use command::CommandError;
 pub(crate) use command::{
     cancel_all_sandbox_processes, cancel_run_sandbox_processes, cancel_session_sandbox_processes,
 };
-pub(crate) use command::{run_prepared_sandboxed_with_timeout, CommandError};
 pub use continuation::{
     ToolContinuation, ToolContinuationError, ToolExchange, TOOL_CONTINUATION_SCHEMA_VERSION,
 };

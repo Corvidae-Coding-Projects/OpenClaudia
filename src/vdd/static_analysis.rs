@@ -109,20 +109,18 @@ pub(crate) async fn run_shell_command(
             };
         }
     };
-    let program_label = program.clone();
-    let run_for_worker = std::sync::Arc::clone(run);
-    let result = tokio::task::spawn_blocking(move || {
-        crate::tools::run_prepared_sandboxed_with_timeout(
-            &run_for_worker,
-            sandboxed,
-            &program_label,
-            timeout,
-        )
-    })
+    let result = crate::tools::command::run_prepared_run_owned(
+        run,
+        sandboxed,
+        program,
+        crate::tools::command::ProcessLimits::new(timeout),
+        None,
+    )
     .await;
 
     match result {
-        Ok(Ok(output)) => {
+        Ok(output) => {
+            let output = output.into_std_output();
             let exit_code = output.status.code().unwrap_or(-1);
             StaticAnalysisResult {
                 command: command.to_string(),
@@ -132,18 +130,11 @@ pub(crate) async fn run_shell_command(
                 passed: exit_code == 0,
             }
         }
-        Ok(Err(e)) => StaticAnalysisResult {
+        Err(e) => StaticAnalysisResult {
             command: command.to_string(),
             exit_code: -1,
             stdout: String::new(),
             stderr: format!("Command failed to execute: {e}"),
-            passed: false,
-        },
-        Err(error) => StaticAnalysisResult {
-            command: command.to_string(),
-            exit_code: -1,
-            stdout: String::new(),
-            stderr: format!("Static-analysis worker failed: {error}"),
             passed: false,
         },
     }

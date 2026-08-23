@@ -274,6 +274,29 @@ fn bash_output_schema_allows_no_shell_id_list_mode() {
     );
 }
 
+#[test]
+fn bash_schema_advertises_the_enforced_foreground_timeout_contract() {
+    let definition = registry()
+        .get("bash")
+        .expect("bash registered")
+        .definition();
+    let timeout = definition
+        .pointer("/function/parameters/properties/timeout")
+        .expect("bash timeout schema");
+
+    assert_eq!(timeout["type"], "integer");
+    assert_eq!(timeout["minimum"], 1);
+    assert_eq!(timeout["maximum"], 600_000);
+    let description = timeout["description"]
+        .as_str()
+        .expect("bash timeout description");
+    assert!(description.contains("default 300000"), "{description}");
+    assert!(
+        description.contains("Not valid with run_in_background"),
+        "{description}"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section C — registry handler dispatch
 // ───────────────────────────────────────────────────────────────────────────

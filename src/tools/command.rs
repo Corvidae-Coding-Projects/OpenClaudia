@@ -8,28 +8,23 @@
 //! is the single chokepoint so a fix or tuning change applies
 //! uniformly (crosslink #836).
 //!
-//! The polling-with-backoff loop is intentionally NOT a `tokio::spawn`
-//! / `tokio::time::timeout` pair: many callers (the `read_pdf_file`
-//! tool, the `git_in` helper in worktree.rs) execute synchronously
-//! inside a blocking tool dispatch — pulling tokio in would require a
-//! runtime handle the caller does not always have. The exponential
-//! backoff matches the schedule worktree.rs already used so trivial
-//! commands still see sub-millisecond exit-detection overhead.
+//! The supervisor is async so stdin delivery, stdout/stderr draining, child
+//! exit, cancellation, and the aggregate deadline advance concurrently.
+//! Synchronous tool paths use a small runtime-aware bridge rather than
+//! maintaining a second process lifecycle.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write as _};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
-/// Exponential-backoff polling schedule (ms between `try_wait` calls).
-/// Pins on the last entry once exhausted so long-running commands cost
-/// at most one poll per 100 ms (crosslink #956, #836).
-const WAIT_BACKOFF_MS: &[u64] = &[1, 2, 5, 10, 25, 50, 100];
 const MAX_CAPTURE_BYTES_PER_STREAM: usize = 10 * 1024 * 1024;
+const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[output truncated at 10 MiB]\n";
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ActiveRunProcesses {
     session_id: String,
@@ -172,9 +167,9 @@ pub fn cancel_all_sandbox_processes() {
 
 /// Run `program` with `args` under `timeout`. Captures stdout and
 /// stderr (both `Stdio::piped`) and returns them in [`Output`] on a
-/// clean exit. On deadline expiry, sends SIGKILL via [`Child::kill`]
-/// and reaps the zombie before returning a structured timeout error
-/// so callers can render the program name + argv tail to the user.
+/// clean exit. On deadline expiry, terminates the owned process tree and reaps
+/// the root before returning a structured timeout error so callers can render
+/// the program name + argv tail to the user.
 ///
 /// `cwd` is applied via [`Command::current_dir`] when `Some`. Pass
 /// `None` to inherit the parent's working directory — the caller is
@@ -324,7 +319,7 @@ fn run_sandboxed_with_timeout_inner(
     })?;
     cmd.envs(env);
     run_prepared_with_timeout(
-        ProcessExecution::Sandboxed(run),
+        ProcessExecution::RunOwned(run),
         cmd,
         program_str,
         timeout,
@@ -365,7 +360,7 @@ pub fn run_prepared_sandboxed_with_timeout(
     timeout: Duration,
 ) -> Result<Output, CommandError> {
     run_prepared_with_timeout(
-        ProcessExecution::Sandboxed(run),
+        ProcessExecution::RunOwned(run),
         command,
         program_label.to_string(),
         timeout,
@@ -375,167 +370,569 @@ pub fn run_prepared_sandboxed_with_timeout(
 
 #[derive(Clone, Copy)]
 enum ProcessExecution<'a> {
-    Sandboxed(&'a crate::tools::security::ToolRunContext),
+    RunOwned(&'a crate::tools::security::ToolRunContext),
     #[cfg(test)]
     TestHost,
 }
 
+/// Aggregate limits for one supervised child invocation.
+#[derive(Clone, Copy)]
+pub struct ProcessLimits {
+    timeout: Duration,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    stdin_bytes: usize,
+    stdout_truncated_marker: &'static [u8],
+    stderr_truncated_marker: &'static [u8],
+}
+
+impl ProcessLimits {
+    #[must_use]
+    pub const fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            stdout_bytes: MAX_CAPTURE_BYTES_PER_STREAM,
+            stderr_bytes: MAX_CAPTURE_BYTES_PER_STREAM,
+            stdin_bytes: MAX_STDIN_BYTES,
+            stdout_truncated_marker: OUTPUT_TRUNCATED_MARKER,
+            stderr_truncated_marker: OUTPUT_TRUNCATED_MARKER,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_output_limit(
+        mut self,
+        bytes_per_stream: usize,
+        truncated_marker: &'static [u8],
+    ) -> Self {
+        self.stdout_bytes = bytes_per_stream;
+        self.stderr_bytes = bytes_per_stream;
+        self.stdout_truncated_marker = truncated_marker;
+        self.stderr_truncated_marker = truncated_marker;
+        self
+    }
+}
+
+/// How much of the supplied stdin payload reached the child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdinDelivery {
+    NotRequested,
+    Pending {
+        written: usize,
+        total: usize,
+    },
+    Complete {
+        bytes: usize,
+    },
+    Failed {
+        written: usize,
+        total: usize,
+        error: String,
+    },
+}
+
+/// Bounded bytes retained from one child output stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedStream {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+impl CapturedStream {
+    fn rendered(mut self, marker: &[u8]) -> Vec<u8> {
+        if self.truncated {
+            self.bytes.extend_from_slice(marker);
+        }
+        self.bytes
+    }
+}
+
+/// The observable state of a child at a terminal supervisor outcome.
+#[derive(Debug, Clone)]
+pub struct ProcessSnapshot {
+    pub status: Option<ExitStatus>,
+    pub stdout: CapturedStream,
+    pub stderr: CapturedStream,
+    pub stdin: StdinDelivery,
+}
+
+/// Successful typed result from the shared process supervisor.
+#[derive(Debug)]
+pub struct SupervisedProcessOutput {
+    pub status: ExitStatus,
+    pub stdout: CapturedStream,
+    pub stderr: CapturedStream,
+    pub stdin: StdinDelivery,
+    stdout_truncated_marker: &'static [u8],
+    stderr_truncated_marker: &'static [u8],
+}
+
+impl SupervisedProcessOutput {
+    pub fn into_std_output(self) -> Output {
+        debug_assert!(matches!(
+            self.stdin,
+            StdinDelivery::NotRequested | StdinDelivery::Complete { .. }
+        ));
+        Output {
+            status: self.status,
+            stdout: self.stdout.rendered(self.stdout_truncated_marker),
+            stderr: self.stderr.rendered(self.stderr_truncated_marker),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CaptureState {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn capture_snapshot(state: &Arc<Mutex<CaptureState>>) -> CapturedStream {
+    let state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    CapturedStream {
+        bytes: state.bytes.clone(),
+        truncated: state.truncated,
+    }
+}
+
+fn stdin_snapshot(state: &Arc<Mutex<StdinDelivery>>) -> StdinDelivery {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn process_snapshot(
+    status: Option<ExitStatus>,
+    stdout: &Arc<Mutex<CaptureState>>,
+    stderr: &Arc<Mutex<CaptureState>>,
+    stdin: &Arc<Mutex<StdinDelivery>>,
+) -> ProcessSnapshot {
+    ProcessSnapshot {
+        status,
+        stdout: capture_snapshot(stdout),
+        stderr: capture_snapshot(stderr),
+        stdin: stdin_snapshot(stdin),
+    }
+}
+
 fn run_prepared_with_timeout(
     execution: ProcessExecution<'_>,
-    mut cmd: Command,
+    cmd: Command,
     program_str: String,
     timeout: Duration,
     stdin_input: Option<&[u8]>,
 ) -> Result<Output, CommandError> {
-    let (tracked_run, terminate_tree) = match execution {
-        ProcessExecution::Sandboxed(run) => (Some(run), true),
-        #[cfg(test)]
-        ProcessExecution::TestHost => (None, false),
-    };
-    #[cfg(unix)]
-    if terminate_tree {
-        use std::os::unix::process::CommandExt as _;
+    let stdin = stdin_input.map(<[u8]>::to_vec);
+    drive_supervisor_sync(
+        execution,
+        cmd,
+        program_str,
+        ProcessLimits::new(timeout),
+        stdin,
+    )
+    .map(SupervisedProcessOutput::into_std_output)
+}
 
-        // `terminate_process_tree` signals `-pid` so the spawned wrapper must
-        // lead its own process group.  Foreground callers historically omitted
-        // this even though the teardown helper documented the requirement,
-        // leaving cancellation dependent on racy `/proc` descendant scans.
-        cmd.process_group(0);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if stdin_input.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
-    let mut child = cmd.spawn().map_err(|e| CommandError::SpawnFailed {
-        program: program_str.clone(),
-        source: e.to_string(),
-    })?;
-    let pid = child.id();
-    let _active_process = tracked_run.map(|run| ActiveSandboxProcess::register(run, pid));
-    let stdout_reader = child.stdout.take().map(spawn_bounded_reader);
-    let stderr_reader = child.stderr.take().map(spawn_bounded_reader);
+/// Execute a prepared run-owned process on the shared async supervisor.
+pub async fn run_prepared_run_owned(
+    run: &crate::tools::security::ToolRunContext,
+    command: Command,
+    program_label: &str,
+    limits: ProcessLimits,
+    stdin_input: Option<Vec<u8>>,
+) -> Result<SupervisedProcessOutput, CommandError> {
+    supervise_prepared_process(
+        ProcessExecution::RunOwned(run),
+        command,
+        program_label.to_string(),
+        limits,
+        stdin_input,
+    )
+    .await
+}
 
-    if let Some(input) = stdin_input {
-        let write_result = child
-            .stdin
-            .take()
-            .ok_or_else(|| CommandError::WaitFailed {
-                program: program_str.clone(),
-                source: "stdin pipe unavailable".to_string(),
-            })
-            .and_then(|mut stdin| {
-                stdin
-                    .write_all(input)
-                    .map_err(|e| CommandError::WaitFailed {
-                        program: program_str.clone(),
-                        source: format!("stdin write failed: {e}"),
+fn build_process_runtime(context: &'static str) -> Result<tokio::runtime::Runtime, CommandError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| CommandError::RuntimeFailed {
+            source: format!("failed to build {context} process runtime: {error}"),
+        })
+}
+
+fn drive_supervisor_sync(
+    execution: ProcessExecution<'_>,
+    command: Command,
+    program: String,
+    limits: ProcessLimits,
+    stdin_input: Option<Vec<u8>>,
+) -> Result<SupervisedProcessOutput, CommandError> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                handle.block_on(supervise_prepared_process(
+                    execution,
+                    command,
+                    program,
+                    limits,
+                    stdin_input,
+                ))
+            }),
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        build_process_runtime("helper")?.block_on(supervise_prepared_process(
+                            execution,
+                            command,
+                            program,
+                            limits,
+                            stdin_input,
+                        ))
                     })
+                    .join()
+                    .map_err(|_| CommandError::RuntimeFailed {
+                        source: "process runtime helper thread panicked".to_string(),
+                    })?
+            }),
+        };
+    }
+    build_process_runtime("foreground")?.block_on(supervise_prepared_process(
+        execution,
+        command,
+        program,
+        limits,
+        stdin_input,
+    ))
+}
+
+#[allow(clippy::too_many_lines)] // Spawn setup and terminal transitions form one lifecycle state machine.
+async fn supervise_prepared_process(
+    execution: ProcessExecution<'_>,
+    mut command: Command,
+    program: String,
+    limits: ProcessLimits,
+    stdin_input: Option<Vec<u8>>,
+) -> Result<SupervisedProcessOutput, CommandError> {
+    if let Some(input) = stdin_input.as_ref() {
+        if input.len() > limits.stdin_bytes {
+            return Err(CommandError::InputTooLarge {
+                program,
+                bytes: input.len(),
+                max_bytes: limits.stdin_bytes,
             });
-        if let Err(err) = write_result {
-            terminate_child(&mut child, pid, terminate_tree);
-            let _ = child.wait();
-            let _ = join_bounded_reader(stdout_reader);
-            let _ = join_bounded_reader(stderr_reader);
-            return Err(err);
         }
     }
 
-    let deadline = Instant::now() + timeout;
-    let mut step = 0usize;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = join_bounded_reader(stdout_reader).map_err(|source| {
-                    CommandError::WaitFailed {
-                        program: program_str.clone(),
-                        source,
-                    }
-                })?;
-                let stderr = join_bounded_reader(stderr_reader).map_err(|source| {
-                    CommandError::WaitFailed {
-                        program: program_str.clone(),
-                        source,
-                    }
-                })?;
-                return Ok(Output {
+    let deadline = tokio::time::Instant::now() + limits.timeout;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin_input.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| CommandError::SpawnFailed {
+        program: program.clone(),
+        source: error.to_string(),
+    })?;
+    let pid = child.id().ok_or_else(|| CommandError::WaitFailed {
+        program: program.clone(),
+        source: "spawned process has no process identifier".to_string(),
+        partial: Box::new(ProcessSnapshot {
+            status: None,
+            stdout: CapturedStream {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+            stderr: CapturedStream {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+            stdin: StdinDelivery::NotRequested,
+        }),
+    })?;
+    let tracked_run = match execution {
+        ProcessExecution::RunOwned(run) => Some(run),
+        #[cfg(test)]
+        ProcessExecution::TestHost => None,
+    };
+    let _active_process = tracked_run.map(|run| ActiveSandboxProcess::register(run, pid));
+    let cancellation = tracked_run.map(|run| run.runtime().cancellation());
+
+    let stdout_state = Arc::new(Mutex::new(CaptureState::default()));
+    let stderr_state = Arc::new(Mutex::new(CaptureState::default()));
+    let stdin_state = Arc::new(Mutex::new(stdin_input.as_ref().map_or(
+        StdinDelivery::NotRequested,
+        |input| StdinDelivery::Pending {
+            written: 0,
+            total: input.len(),
+        },
+    )));
+    let mut io_tasks = tokio::task::JoinSet::new();
+
+    let Some(stdout) = child.stdout.take() else {
+        let status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;
+        return Err(CommandError::WaitFailed {
+            program,
+            source: "stdout pipe unavailable after spawn".to_string(),
+            partial: Box::new(process_snapshot(
+                status,
+                &stdout_state,
+                &stderr_state,
+                &stdin_state,
+            )),
+        });
+    };
+    io_tasks.spawn(read_bounded_stream(
+        stdout,
+        Arc::clone(&stdout_state),
+        limits.stdout_bytes,
+        "stdout",
+    ));
+    let Some(stderr) = child.stderr.take() else {
+        let status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;
+        return Err(CommandError::WaitFailed {
+            program,
+            source: "stderr pipe unavailable after spawn".to_string(),
+            partial: Box::new(process_snapshot(
+                status,
+                &stdout_state,
+                &stderr_state,
+                &stdin_state,
+            )),
+        });
+    };
+    io_tasks.spawn(read_bounded_stream(
+        stderr,
+        Arc::clone(&stderr_state),
+        limits.stderr_bytes,
+        "stderr",
+    ));
+    if let Some(input) = stdin_input {
+        let Some(stdin) = child.stdin.take() else {
+            let status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;
+            return Err(CommandError::WaitFailed {
+                program,
+                source: "stdin pipe unavailable after spawn".to_string(),
+                partial: Box::new(process_snapshot(
                     status,
-                    stdout,
-                    stderr,
+                    &stdout_state,
+                    &stderr_state,
+                    &stdin_state,
+                )),
+            });
+        };
+        io_tasks.spawn(write_stdin(stdin, input, Arc::clone(&stdin_state)));
+    }
+
+    let mut status = None;
+    loop {
+        if let Some(exit_status) = status {
+            if io_tasks.is_empty() {
+                return Ok(SupervisedProcessOutput {
+                    status: exit_status,
+                    stdout: capture_snapshot(&stdout_state),
+                    stderr: capture_snapshot(&stderr_state),
+                    stdin: stdin_snapshot(&stdin_state),
+                    stdout_truncated_marker: limits.stdout_truncated_marker,
+                    stderr_truncated_marker: limits.stderr_truncated_marker,
                 });
             }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    terminate_child(&mut child, pid, terminate_tree);
-                    let _ = child.wait();
-                    let _ = join_bounded_reader(stdout_reader);
-                    let _ = join_bounded_reader(stderr_reader);
-                    return Err(CommandError::TimedOut {
-                        program: program_str,
-                        timeout,
+        }
+
+        tokio::select! {
+            biased;
+            receipt = wait_for_cancellation(cancellation.clone()) => {
+                let final_status = terminate_and_reap(&mut child, pid, status, &mut io_tasks).await;
+                return Err(CommandError::Cancelled {
+                    program,
+                    reason: receipt.reason,
+                    partial: Box::new(process_snapshot(
+                        final_status,
+                        &stdout_state,
+                        &stderr_state,
+                        &stdin_state,
+                    )),
+                });
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                let final_status = terminate_and_reap(&mut child, pid, status, &mut io_tasks).await;
+                return Err(CommandError::TimedOut {
+                    program,
+                    timeout: limits.timeout,
+                    partial: Box::new(process_snapshot(
+                        final_status,
+                        &stdout_state,
+                        &stderr_state,
+                        &stdin_state,
+                    )),
+                });
+            }
+            wait_result = child.wait(), if status.is_none() => {
+                match wait_result {
+                    Ok(exit_status) => status = Some(exit_status),
+                    Err(error) => {
+                        let final_status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;
+                        return Err(CommandError::WaitFailed {
+                            program,
+                            source: error.to_string(),
+                            partial: Box::new(process_snapshot(
+                                final_status,
+                                &stdout_state,
+                                &stderr_state,
+                                &stdin_state,
+                            )),
+                        });
+                    }
+                }
+            }
+            task_result = io_tasks.join_next(), if !io_tasks.is_empty() => {
+                let task_error = match task_result {
+                    Some(Ok(Ok(()))) | None => None,
+                    Some(Ok(Err(error))) => Some(error),
+                    Some(Err(error)) => Some(format!("process I/O task failed: {error}")),
+                };
+                if let Some(source) = task_error {
+                    let final_status = terminate_and_reap(&mut child, pid, status, &mut io_tasks).await;
+                    return Err(CommandError::WaitFailed {
+                        program,
+                        source,
+                        partial: Box::new(process_snapshot(
+                            final_status,
+                            &stdout_state,
+                            &stderr_state,
+                            &stdin_state,
+                        )),
                     });
                 }
-                let idx = step.min(WAIT_BACKOFF_MS.len() - 1);
-                std::thread::sleep(Duration::from_millis(WAIT_BACKOFF_MS[idx]));
-                step = step.saturating_add(1);
-            }
-            Err(e) => {
-                terminate_child(&mut child, pid, terminate_tree);
-                let _ = child.wait();
-                let _ = join_bounded_reader(stdout_reader);
-                let _ = join_bounded_reader(stderr_reader);
-                return Err(CommandError::WaitFailed {
-                    program: program_str,
-                    source: e.to_string(),
-                });
             }
         }
     }
 }
 
-fn terminate_child(child: &mut std::process::Child, pid: u32, terminate_tree: bool) {
-    if terminate_tree {
-        crate::tools::bash::terminate_process_tree(pid);
+async fn wait_for_cancellation(
+    cancellation: Option<crate::runtime::CancellationHandle>,
+) -> crate::runtime::CancellationReceipt {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending().await,
     }
-    let _ = child.kill();
 }
 
-fn spawn_bounded_reader<R: Read + Send + 'static>(
-    mut reader: R,
-) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
-    std::thread::spawn(move || {
-        let mut retained = Vec::new();
-        let mut buffer = [0u8; 8192];
-        let mut truncated = false;
-        loop {
-            let count = reader
-                .read(&mut buffer)
-                .map_err(|error| format!("captured-output read failed: {error}"))?;
-            if count == 0 {
-                break;
+async fn read_bounded_stream<R>(
+    mut stream: R,
+    state: Arc<Mutex<CaptureState>>,
+    limit: usize,
+    label: &'static str,
+) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|error| format!("{label} read failed: {error}"))?;
+        if count == 0 {
+            return Ok(());
+        }
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remaining = limit.saturating_sub(state.bytes.len());
+        let keep = count.min(remaining);
+        state.bytes.extend_from_slice(&chunk[..keep]);
+        state.truncated |= keep < count;
+    }
+}
+
+async fn write_stdin(
+    mut stdin: tokio::process::ChildStdin,
+    input: Vec<u8>,
+    state: Arc<Mutex<StdinDelivery>>,
+) -> Result<(), String> {
+    let total = input.len();
+    let mut written = 0_usize;
+    while written < total {
+        match stdin.write(&input[written..]).await {
+            Ok(0) => {
+                let error = "stdin closed before the input payload was delivered".to_string();
+                *state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = StdinDelivery::Failed {
+                    written,
+                    total,
+                    error: error.clone(),
+                };
+                return Err(error);
             }
-            let remaining = MAX_CAPTURE_BYTES_PER_STREAM.saturating_sub(retained.len());
-            let keep = count.min(remaining);
-            retained.extend_from_slice(&buffer[..keep]);
-            truncated |= keep < count;
+            Ok(count) => {
+                written += count;
+                *state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    StdinDelivery::Pending { written, total };
+            }
+            Err(error) => {
+                let error = format!("stdin write failed: {error}");
+                *state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = StdinDelivery::Failed {
+                    written,
+                    total,
+                    error: error.clone(),
+                };
+                return Err(error);
+            }
         }
-        if truncated {
-            retained.extend_from_slice(OUTPUT_TRUNCATED_MARKER);
-        }
-        Ok(retained)
+    }
+    if let Err(error) = stdin.shutdown().await {
+        let error = format!("stdin close failed: {error}");
+        *state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = StdinDelivery::Failed {
+            written,
+            total,
+            error: error.clone(),
+        };
+        return Err(error);
+    }
+    *state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        StdinDelivery::Complete { bytes: written };
+    Ok(())
+}
+
+async fn terminate_and_reap(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    known_status: Option<ExitStatus>,
+    io_tasks: &mut tokio::task::JoinSet<Result<(), String>>,
+) -> Option<ExitStatus> {
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::tools::bash::terminate_sandbox_process_tree(pid);
     })
-}
-
-fn join_bounded_reader(
-    reader: Option<std::thread::JoinHandle<Result<Vec<u8>, String>>>,
-) -> Result<Vec<u8>, String> {
-    reader.map_or_else(
-        || Ok(Vec::new()),
-        |reader| {
-            reader
-                .join()
-                .map_err(|_| "captured-output reader panicked".to_string())?
-        },
-    )
+    .await;
+    let _ = child.start_kill();
+    let status = match known_status {
+        Some(status) => Some(status),
+        None => tokio::time::timeout(PROCESS_CLEANUP_TIMEOUT, child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok),
+    };
+    io_tasks.abort_all();
+    while io_tasks.join_next().await.is_some() {}
+    status
 }
 
 /// Errors returned by [`run_with_timeout`]. The variants are
@@ -548,13 +945,50 @@ pub enum CommandError {
     /// `Command::spawn` failed — program not on PATH, EACCES,
     /// fork failure, etc.
     SpawnFailed { program: String, source: String },
+    /// Caller supplied more stdin than the configured process boundary allows.
+    InputTooLarge {
+        program: String,
+        bytes: usize,
+        max_bytes: usize,
+    },
     /// Deadline elapsed before the child exited; the child has been
     /// killed and reaped before this variant is returned.
-    TimedOut { program: String, timeout: Duration },
+    TimedOut {
+        program: String,
+        timeout: Duration,
+        partial: Box<ProcessSnapshot>,
+    },
+    /// The owning run was cancelled; its process tree has been killed and
+    /// reaped and any retained output is attached.
+    Cancelled {
+        program: String,
+        reason: crate::runtime::CancellationReason,
+        partial: Box<ProcessSnapshot>,
+    },
     /// The `wait`/`wait_with_output` path itself returned an error. Rare;
     /// usually signal-handler races (`EINTR` storms) or pipe-buffer
     /// exhaustion after the child exited.
-    WaitFailed { program: String, source: String },
+    WaitFailed {
+        program: String,
+        source: String,
+        partial: Box<ProcessSnapshot>,
+    },
+    /// A synchronous compatibility caller could not create or drive Tokio.
+    RuntimeFailed { source: String },
+}
+
+impl CommandError {
+    #[must_use]
+    pub const fn partial(&self) -> Option<&ProcessSnapshot> {
+        match self {
+            Self::TimedOut { partial, .. }
+            | Self::Cancelled { partial, .. }
+            | Self::WaitFailed { partial, .. } => Some(partial),
+            Self::SpawnFailed { .. } | Self::InputTooLarge { .. } | Self::RuntimeFailed { .. } => {
+                None
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for CommandError {
@@ -563,12 +997,28 @@ impl std::fmt::Display for CommandError {
             Self::SpawnFailed { program, source } => {
                 write!(f, "Failed to spawn {program}: {source}")
             }
-            Self::TimedOut { program, timeout } => {
+            Self::InputTooLarge {
+                program,
+                bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "{program} stdin payload is {bytes} bytes; maximum is {max_bytes} bytes"
+            ),
+            Self::TimedOut {
+                program, timeout, ..
+            } => {
                 write!(f, "{program} timed out after {}s", timeout.as_secs())
             }
-            Self::WaitFailed { program, source } => {
+            Self::Cancelled {
+                program, reason, ..
+            } => write!(f, "{program} was cancelled: {reason:?}"),
+            Self::WaitFailed {
+                program, source, ..
+            } => {
                 write!(f, "{program} wait failed: {source}")
             }
+            Self::RuntimeFailed { source } => write!(f, "process runtime failed: {source}"),
         }
     }
 }
@@ -578,6 +1028,7 @@ impl std::error::Error for CommandError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// A trivial `true` invocation completes well inside the timeout
     /// and reports an empty-stdout success Output. This pins the
@@ -655,6 +1106,99 @@ mod tests {
         .expect("cat must echo stdin");
         assert!(out.status.success(), "cat exit status must be 0");
         assert_eq!(out.stdout, b"alpha\nbeta\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn blocked_stdin_delivery_obeys_the_aggregate_deadline() {
+        let payload = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        let result = run_with_timeout_with_input(
+            "sh",
+            &["-c", "sleep 60"],
+            None,
+            Duration::from_millis(200),
+            &payload,
+        );
+        let elapsed = started.elapsed();
+
+        let Err(CommandError::TimedOut { partial, .. }) = result else {
+            panic!("blocked stdin must time out, got {result:?}");
+        };
+        assert!(elapsed < Duration::from_secs(2), "timeout took {elapsed:?}");
+        match partial.stdin {
+            StdinDelivery::Pending { written, total }
+            | StdinDelivery::Failed { written, total, .. } => {
+                assert_eq!(total, payload.len());
+                assert!(written < total, "child unexpectedly consumed all stdin");
+            }
+            other => panic!("expected partial stdin delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn descendant_held_output_pipe_cannot_outlive_deadline() {
+        let started = Instant::now();
+        let result = run_with_timeout(
+            "sh",
+            &["-c", "sleep 60 & printf done"],
+            None,
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+
+        let Err(CommandError::TimedOut { partial, .. }) = result else {
+            panic!("descendant-held pipe must time out, got {result:?}");
+        };
+        assert!(elapsed < Duration::from_secs(2), "timeout took {elapsed:?}");
+        assert!(
+            partial.status.is_some(),
+            "root shell should exit before its descendant closes the pipe"
+        );
+        assert_eq!(partial.stdout.bytes, b"done");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_cancellation_reaps_the_owned_process() {
+        let root = tempfile::TempDir::new().expect("temporary run root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let run_for_process = Arc::clone(&run);
+        let process = tokio::spawn(async move {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf '%s\\n' $$; sleep 60"]);
+            run_prepared_run_owned(
+                &run_for_process,
+                command,
+                "cancellation-test",
+                ProcessLimits::new(Duration::from_secs(30)),
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _receipt = run
+            .runtime()
+            .cancellation()
+            .cancel(crate::runtime::CancellationReason::User);
+
+        let result = process.await.expect("supervisor task must join");
+        let Err(CommandError::Cancelled {
+            reason, partial, ..
+        }) = result
+        else {
+            panic!("run cancellation must stop the child, got {result:?}");
+        };
+        assert_eq!(reason, crate::runtime::CancellationReason::User);
+        let pid = String::from_utf8_lossy(&partial.stdout.bytes)
+            .trim()
+            .parse::<u32>()
+            .expect("child must report its pid before sleeping");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "cancelled child {pid} must be reaped"
+        );
     }
 
     #[test]

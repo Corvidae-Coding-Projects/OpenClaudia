@@ -167,9 +167,10 @@ pub fn terminate_process_tree(pid: u32) {
 /// isolation means the inner command is not necessarily in the outer
 /// wrapper's process group. Linux cancellation therefore freezes the wrapper,
 /// discovers and freezes every current descendant, and only then sends
-/// `SIGKILL`. The ordinary [`terminate_process_tree`] path remains graceful
-/// for user-requested background-shell termination; this stronger path is
-/// reserved for a cancelled synchronous sandbox whose authority is revoked.
+/// `SIGKILL`. The ordinary [`terminate_process_tree`] path remains available
+/// for cooperative long-lived services; this stronger path is used when a
+/// supervised deadline, run cancellation, or explicit background-shell kill
+/// revokes the owned sandbox's authority to continue.
 pub fn terminate_sandbox_process_tree(pid: u32) {
     if pid == 0 {
         tracing::debug!("terminate_sandbox_process_tree: refusing process-group sentinel PID 0");
