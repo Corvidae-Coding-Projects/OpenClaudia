@@ -3195,8 +3195,9 @@ mod tests {
     fn language_server_profile_cannot_read_host_or_create_socket() {
         let outside = tempfile::NamedTempFile::new().expect("host sentinel");
         std::fs::write(outside.path(), "lsp-secret").expect("sentinel");
-        let marker_dir = tempfile::tempdir_in(".").expect("project marker directory");
-        let marker = marker_dir.path().join("result");
+        let root = tempfile::tempdir_in(".").expect("LSP project");
+        let security = test_run_with_environment(root.path(), HashMap::new());
+        let marker = security.private_temp_root().join("result");
         let script = format!(
             r#"
 import errno, pathlib, socket
@@ -3213,9 +3214,8 @@ marker.write_text("confined" if file_blocked and network_blocked else "escaped")
             outside = outside.path().to_string_lossy(),
             marker = marker.to_string_lossy(),
         );
-        let security = test_run();
         let mut child = spawn_language_server(
-            security,
+            &security,
             "python3",
             &["-c", &script],
             security.working_directory(),
@@ -3233,11 +3233,13 @@ marker.write_text("confined" if file_blocked and network_blocked else "escaped")
     #[cfg(target_os = "linux")]
     fn language_server_receives_exact_run_environment_grant() {
         let root = tempfile::tempdir_in(".").expect("LSP environment root");
-        let marker = root.path().join("environment-result");
         let run = test_run_with_environment(
             root.path(),
             HashMap::from([("S019_LSP_ENV".to_string(), "exact".to_string())]),
         );
+        // LSP receives read-only source plus run-owned scratch for caches and
+        // diagnostics; the test must not require writable source authority.
+        let marker = run.private_temp_root().join("environment-result");
         let script = format!(
             r#"
 import os, pathlib

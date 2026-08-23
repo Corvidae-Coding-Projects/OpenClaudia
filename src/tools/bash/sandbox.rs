@@ -63,7 +63,102 @@ pub enum SandboxProfile {
     QualityGate,
     DocumentParser,
     McpStdio,
+    McpHeaderHelper,
     GitWorktree,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMountPolicy {
+    /// Only the run-owned private scratch directory is visible.
+    ScratchOnly,
+    /// Only the project and scratch are visible, with the project read-only.
+    ProjectReadOnly,
+    /// Only the project and scratch are visible, preserving project write mode.
+    ProjectRunBound,
+    /// Preserve the exact read/write modes in the immutable run capability.
+    RunBound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnvironmentPolicy {
+    Empty,
+    NonSecretRunGrants,
+    RunGrants,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SandboxProfilePolicy {
+    workspace: WorkspaceMountPolicy,
+    environment: EnvironmentPolicy,
+    permits_explicit_environment: bool,
+    permits_project_path: bool,
+    permits_child_processes: bool,
+}
+
+impl SandboxProfile {
+    /// Compile a subprocess class into concrete authority. Keeping the matrix in
+    /// one place prevents a new caller from silently inheriting shell access.
+    const fn policy(self) -> SandboxProfilePolicy {
+        match self {
+            Self::Shell => SandboxProfilePolicy {
+                workspace: WorkspaceMountPolicy::RunBound,
+                environment: EnvironmentPolicy::RunGrants,
+                permits_explicit_environment: false,
+                permits_project_path: true,
+                permits_child_processes: true,
+            },
+            Self::RepositoryHook => SandboxProfilePolicy {
+                // Hooks commonly format files and maintain generated state.
+                workspace: WorkspaceMountPolicy::ProjectRunBound,
+                environment: EnvironmentPolicy::NonSecretRunGrants,
+                permits_explicit_environment: true,
+                permits_project_path: true,
+                permits_child_processes: true,
+            },
+            Self::LanguageServer | Self::StaticAnalyzer | Self::QualityGate => {
+                // Compiler, language-server, and cache output is redirected to
+                // private scratch while source stays read-only.
+                SandboxProfilePolicy {
+                    workspace: WorkspaceMountPolicy::ProjectReadOnly,
+                    environment: EnvironmentPolicy::NonSecretRunGrants,
+                    permits_explicit_environment: false,
+                    permits_project_path: true,
+                    permits_child_processes: true,
+                }
+            }
+            Self::DocumentParser => SandboxProfilePolicy {
+                // Parser input arrives over stdin; project files are unnecessary.
+                workspace: WorkspaceMountPolicy::ScratchOnly,
+                environment: EnvironmentPolicy::Empty,
+                permits_explicit_environment: false,
+                permits_project_path: false,
+                permits_child_processes: false,
+            },
+            Self::McpStdio => SandboxProfilePolicy {
+                // The MCP-specific derived run carries only the server's declared
+                // environment and its explicitly granted workspace access.
+                workspace: WorkspaceMountPolicy::ProjectRunBound,
+                environment: EnvironmentPolicy::RunGrants,
+                permits_explicit_environment: false,
+                permits_project_path: false,
+                permits_child_processes: true,
+            },
+            Self::McpHeaderHelper => SandboxProfilePolicy {
+                workspace: WorkspaceMountPolicy::ScratchOnly,
+                environment: EnvironmentPolicy::Empty,
+                permits_explicit_environment: true,
+                permits_project_path: false,
+                permits_child_processes: true,
+            },
+            Self::GitWorktree => SandboxProfilePolicy {
+                workspace: WorkspaceMountPolicy::ProjectRunBound,
+                environment: EnvironmentPolicy::Empty,
+                permits_explicit_environment: true,
+                permits_project_path: false,
+                permits_child_processes: true,
+            },
+        }
+    }
 }
 
 /// Redacted status for operator diagnostics. Counts and policy states are
@@ -236,14 +331,7 @@ impl SandboxProfile {
     }
 
     const fn permits_project_path(self) -> bool {
-        matches!(
-            self,
-            Self::Shell
-                | Self::RepositoryHook
-                | Self::LanguageServer
-                | Self::StaticAnalyzer
-                | Self::QualityGate
-        )
+        self.policy().permits_project_path
     }
 }
 
@@ -275,33 +363,44 @@ pub fn sandboxed_process_command(
     args: &[OsString],
     cwd: &Path,
 ) -> Result<Command, String> {
-    sandboxed_process_command_for_profile(run, profile, program, args, cwd)
+    sandboxed_process_command_for_profile(run, profile, program, args, cwd, &[])
+}
+
+/// Build a sandboxed process with a small caller-declared environment overlay.
+/// Profiles that do not explicitly permit such an overlay fail closed.
+pub fn sandboxed_process_command_with_env(
+    run: &crate::tools::security::ToolRunContext,
+    profile: SandboxProfile,
+    program: &OsStr,
+    args: &[OsString],
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+) -> Result<Command, String> {
+    sandboxed_process_command_for_profile(run, profile, program, args, cwd, environment)
 }
 
 /// Contain a user-configured hook while leaving its control-directory scripts
-/// readable. The source command's explicit environment changes are preserved
-/// on top of the sandbox's allowlisted environment.
+/// readable. Only the harness-owned project-directory value is forwarded from
+/// the prepared command; ambient and credential environment remains excluded.
 pub fn sandboxed_hook_command(
     run: &crate::tools::security::ToolRunContext,
     source: &Command,
     cwd: &Path,
 ) -> Result<Command, String> {
     let args: Vec<OsString> = source.get_args().map(OsString::from).collect();
-    let mut command = sandboxed_process_command_for_profile(
+    let environment = source
+        .get_envs()
+        .filter(|(key, _)| *key == OsStr::new("CLAUDE_PROJECT_DIR"))
+        .filter_map(|(key, value)| value.map(|value| (key.to_os_string(), value.to_os_string())))
+        .collect::<Vec<_>>();
+    sandboxed_process_command_for_profile(
         run,
         SandboxProfile::RepositoryHook,
         source.get_program(),
         &args,
         cwd,
-    )?;
-    for (key, value) in source.get_envs() {
-        if let Some(value) = value {
-            command.env(key, value);
-        } else {
-            command.env_remove(key);
-        }
-    }
-    Ok(command)
+        &environment,
+    )
 }
 
 fn sandboxed_process_command_for_profile(
@@ -310,9 +409,11 @@ fn sandboxed_process_command_for_profile(
     program: &OsStr,
     args: &[OsString],
     cwd: &Path,
+    explicit_environment: &[(OsString, OsString)],
 ) -> Result<Command, String> {
     run.require(crate::tools::security::ToolResource::Process)
         .map_err(|error| error.to_string())?;
+    validate_explicit_environment(profile, explicit_environment)?;
     if *SANDBOX_DISABLED.as_ref().map_err(Clone::clone)? {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -322,12 +423,12 @@ fn sandboxed_process_command_for_profile(
                 "Bash OS sandbox explicitly disabled by the host user; model commands have host access"
             );
         }
-        return unsandboxed_process_command(run, program, args, cwd);
+        return unsandboxed_process_command(run, profile, program, args, cwd, explicit_environment);
     }
 
     #[cfg(target_os = "linux")]
     {
-        linux_bubblewrap_command(run, profile, program, args, cwd)
+        linux_bubblewrap_command(run, profile, program, args, cwd, explicit_environment)
     }
 
     #[cfg(target_os = "macos")]
@@ -363,6 +464,57 @@ fn sandboxed_process_command_for_profile(
     }
 }
 
+fn validate_explicit_environment(
+    profile: SandboxProfile,
+    environment: &[(OsString, OsString)],
+) -> Result<(), String> {
+    if environment.is_empty() {
+        return Ok(());
+    }
+    if !profile.policy().permits_explicit_environment {
+        return Err(format!(
+            "Sandbox profile {profile:?} does not permit an explicit environment overlay"
+        ));
+    }
+    for (name, _) in environment {
+        let name = name
+            .to_str()
+            .ok_or_else(|| "Environment variable names must be Unicode".to_string())?;
+        let mut characters = name.chars();
+        let valid = characters
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+        if !valid {
+            return Err(format!("Refusing invalid child environment name '{name}'"));
+        }
+        let upper = name.to_ascii_uppercase();
+        if upper.starts_with("LD_")
+            || upper.starts_with("DYLD_")
+            || matches!(
+                upper.as_str(),
+                "HOME"
+                    | "PATH"
+                    | "TMPDIR"
+                    | "TMP"
+                    | "TEMP"
+                    | "CARGO_HOME"
+                    | "RUSTUP_HOME"
+                    | "GCONV_PATH"
+                    | "GLIBC_TUNABLES"
+                    | "LOCPATH"
+                    | "NLSPATH"
+                    | "OPENCLAUDIA_SANDBOX"
+            )
+        {
+            return Err(format!(
+                "Refusing child environment override for sandbox-owned or loader variable '{name}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn sandbox_explicitly_disabled_from_env() -> Result<bool, String> {
     std::env::var_os(DISABLE_ENV).map_or(Ok(false), |value| {
         value.to_str().map_or_else(
@@ -388,11 +540,18 @@ fn sandbox_explicitly_disabled_value(value: &str) -> Result<bool, String> {
 
 fn unsandboxed_process_command(
     run: &crate::tools::security::ToolRunContext,
+    profile: SandboxProfile,
     program: &OsStr,
     args: &[OsString],
     cwd: &Path,
+    explicit_environment: &[(OsString, OsString)],
 ) -> Result<Command, String> {
-    let cwd = canonical_working_directory(cwd)?;
+    let policy = profile.policy();
+    let cwd = if policy.workspace == WorkspaceMountPolicy::ScratchOnly {
+        canonical_working_directory(run.private_temp_root())?
+    } else {
+        canonical_working_directory(cwd)?
+    };
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
     super::apply_env_scrub(&mut cmd);
@@ -401,7 +560,12 @@ fn unsandboxed_process_command(
         .env("TMP", run.private_temp_root())
         .env("TEMP", run.private_temp_root())
         .env("PATH", run.executable_search_path());
-    run.environment_grants().apply_std(&mut cmd);
+    apply_profile_environment(run, policy.environment, &mut cmd);
+    cmd.envs(
+        explicit_environment
+            .iter()
+            .map(|(name, value)| (name, value)),
+    );
     Ok(cmd)
 }
 
@@ -413,10 +577,16 @@ fn linux_bubblewrap_command(
     program: &OsStr,
     args: &[OsString],
     cwd: &Path,
+    explicit_environment: &[(OsString, OsString)],
 ) -> Result<Command, String> {
-    let cwd = canonical_working_directory(cwd)?;
+    let policy = profile.policy();
+    let cwd = if policy.workspace == WorkspaceMountPolicy::ScratchOnly {
+        canonical_working_directory(security.private_temp_root())?
+    } else {
+        canonical_working_directory(cwd)?
+    };
     let backend = BWRAP_BACKEND.as_ref().map_err(Clone::clone)?;
-    if !security.permits_read(&cwd) {
+    if policy.workspace != WorkspaceMountPolicy::ScratchOnly && !security.permits_read(&cwd) {
         return Err(format!(
             "Sandbox working directory '{}' is outside the immutable session capabilities rooted at '{}'",
             cwd.display(),
@@ -428,8 +598,9 @@ fn linux_bubblewrap_command(
 
     // A writable bind of HOME (or an ancestor of it) would make the nominal
     // "project" mount expose credentials and host configuration.
-    if is_unsafe_broad_project_root(project_root)
-        || host_home.is_some_and(|home| home == project_root || home.starts_with(project_root))
+    if policy.workspace != WorkspaceMountPolicy::ScratchOnly
+        && (is_unsafe_broad_project_root(project_root)
+            || host_home.is_some_and(|home| home == project_root || home.starts_with(project_root)))
     {
         return Err(format!(
             "Refusing to sandbox Bash with working directory '{}': choose a dedicated \
@@ -437,22 +608,58 @@ fn linux_bubblewrap_command(
             project_root.display()
         ));
     }
-    for writable_root in security.read_write_roots() {
-        validate_writable_project_tree(writable_root)?;
+    let sandbox_home =
+        host_home.map_or_else(|| PathBuf::from("/home/openclaudia"), Path::to_path_buf);
+    let mut pinned_bind_roots = security.duplicate_linux_bind_roots()?;
+    pinned_bind_roots.retain(|root| match policy.workspace {
+        WorkspaceMountPolicy::ScratchOnly => root.path == security.private_temp_root(),
+        WorkspaceMountPolicy::ProjectReadOnly | WorkspaceMountPolicy::ProjectRunBound => {
+            root.path == security.private_temp_root() || root.path == project_root
+        }
+        WorkspaceMountPolicy::RunBound => true,
+    });
+    if policy.workspace == WorkspaceMountPolicy::ProjectReadOnly {
+        for root in &mut pinned_bind_roots {
+            if root.path != security.private_temp_root() {
+                root.writable = false;
+            }
+        }
     }
+    for writable_root in pinned_bind_roots
+        .iter()
+        .filter(|root| root.writable && root.path != security.private_temp_root())
+    {
+        validate_writable_project_tree(&writable_root.path)?;
+    }
+    let effective_read_write_roots = pinned_bind_roots
+        .iter()
+        .filter(|root| root.writable)
+        .count();
+    let effective_read_only_roots = pinned_bind_roots.len() - effective_read_write_roots;
+    let effective_environment_grants = match policy.environment {
+        EnvironmentPolicy::Empty => 0,
+        EnvironmentPolicy::NonSecretRunGrants => security
+            .environment_grants()
+            .keys()
+            .filter(|name| !super::is_sensitive_env(name))
+            .count(),
+        EnvironmentPolicy::RunGrants => security.environment_grants().len(),
+    } + explicit_environment.len();
     tracing::debug!(
+        target: "openclaudia::sandbox",
+        event = "effective_subprocess_grants",
         session_id = security.session_id(),
         project_root = %project_root.display(),
         working_directory = %cwd.display(),
-        read_only_roots = security.read_only_roots().len(),
-        read_write_roots = security.read_write_roots().len(),
         profile = ?profile,
-        "Building agent subprocess sandbox from immutable session capabilities"
+        read_only_roots = effective_read_only_roots,
+        read_write_roots = effective_read_write_roots,
+        environment_grants = effective_environment_grants,
+        network = "denied",
+        devices = "minimal",
+        child_processes = policy.permits_child_processes,
+        "Compiled least-privilege subprocess profile"
     );
-
-    let sandbox_home =
-        host_home.map_or_else(|| PathBuf::from("/home/openclaudia"), Path::to_path_buf);
-    let pinned_bind_roots = security.duplicate_linux_bind_roots()?;
     let mut metadata_bind_fds = Vec::new();
     let mut cmd = Command::new(&backend.path);
     cmd.args(["--die-with-parent", "--new-session", "--unshare-all"]);
@@ -513,7 +720,9 @@ fn linux_bubblewrap_command(
     // Repository metadata and harness control state are not ordinary project
     // output. A shell must not persist hooks/configuration that execute after
     // the sandbox exits, or read transcripts and local agent state.
-    if matches!(profile, SandboxProfile::GitWorktree) {
+    if policy.workspace == WorkspaceMountPolicy::ScratchOnly {
+        // The project is absent from this namespace.
+    } else if matches!(profile, SandboxProfile::GitWorktree) {
         tracing::info!(
             target: "openclaudia::sandbox",
             event = "git_metadata_write_grant",
@@ -528,27 +737,29 @@ fn linux_bubblewrap_command(
             project_root,
         )?;
     }
-    match profile.control_path_access() {
-        ControlPathAccess::Hidden => {
-            hide_control_path(&mut cmd, &project_root.join(".openclaudia"));
-            hide_control_path(&mut cmd, &project_root.join(".claude"));
-        }
-        ControlPathAccess::ReadOnly => {
-            for control_path in [
-                project_root.join(".openclaudia"),
-                project_root.join(".claude"),
-            ] {
-                if control_path.exists() {
-                    add_pinned_read_only_bind(&mut cmd, &mut metadata_bind_fds, &control_path)?;
+    if policy.workspace != WorkspaceMountPolicy::ScratchOnly {
+        match profile.control_path_access() {
+            ControlPathAccess::Hidden => {
+                hide_control_path(&mut cmd, &project_root.join(".openclaudia"));
+                hide_control_path(&mut cmd, &project_root.join(".claude"));
+            }
+            ControlPathAccess::ReadOnly => {
+                for control_path in [
+                    project_root.join(".openclaudia"),
+                    project_root.join(".claude"),
+                ] {
+                    if control_path.exists() {
+                        add_pinned_read_only_bind(&mut cmd, &mut metadata_bind_fds, &control_path)?;
+                    }
                 }
             }
         }
-    }
-    for denied_path in security.denied_paths() {
-        if denied_path != &project_root.join(".openclaudia")
-            && denied_path != &project_root.join(".claude")
-        {
-            hide_control_path(&mut cmd, denied_path);
+        for denied_path in security.denied_paths() {
+            if denied_path != &project_root.join(".openclaudia")
+                && denied_path != &project_root.join(".claude")
+            {
+                hide_control_path(&mut cmd, denied_path);
+            }
         }
     }
 
@@ -570,8 +781,17 @@ fn linux_bubblewrap_command(
         .args(["--setenv", "TEMP"])
         .arg(private_temp)
         .args(["--setenv", "CARGO_HOME"])
-        .arg(&sandbox_cargo)
-        .args(["--setenv", "RUSTUP_HOME"])
+        .arg(&sandbox_cargo);
+    if matches!(
+        policy.workspace,
+        WorkspaceMountPolicy::ScratchOnly | WorkspaceMountPolicy::ProjectReadOnly
+    ) {
+        cmd.args(["--setenv", "CARGO_TARGET_DIR"])
+            .arg(private_temp.join("cargo-target"))
+            .args(["--setenv", "PYTHONPYCACHEPREFIX"])
+            .arg(private_temp.join("python-cache"));
+    }
+    cmd.args(["--setenv", "RUSTUP_HOME"])
         .arg(sandbox_home.join(".rustup"))
         .args(["--setenv", "PATH", &safe_path])
         .args(["--setenv", "XDG_CONFIG_HOME", "/tmp/xdg/config"])
@@ -590,13 +810,18 @@ fn linux_bubblewrap_command(
         .args(args)
         .current_dir(&cwd);
     super::apply_env_scrub(&mut cmd);
-    security.environment_grants().apply_std(&mut cmd);
+    apply_profile_environment(security, policy.environment, &mut cmd);
+    cmd.envs(
+        explicit_environment
+            .iter()
+            .map(|(name, value)| (name, value)),
+    );
     let inherited_bind_fds = pinned_bind_roots
         .into_iter()
         .map(|root| root.directory)
         .chain(metadata_bind_fds)
         .collect();
-    install_linux_process_hardening(&mut cmd, inherited_bind_fds)?;
+    install_linux_process_hardening(&mut cmd, inherited_bind_fds, policy.permits_child_processes)?;
     Ok(cmd)
 }
 
@@ -691,7 +916,7 @@ fn probe_bwrap(bwrap: &Path, share_network_namespace: bool) -> Result<(), String
     );
     let root_fd = root.as_raw_fd();
     let root_for_child = Arc::clone(&root);
-    let filter = Arc::new(linux_seccomp_filter()?);
+    let filter = Arc::new(linux_seccomp_filter(true)?);
     let filter_for_child = Arc::clone(&filter);
     let mut command = Command::new(bwrap);
     command.args(["--die-with-parent", "--new-session", "--unshare-all"]);
@@ -927,8 +1152,9 @@ fn decode_mountinfo_path(encoded: &str) -> Result<String, String> {
 fn install_linux_process_hardening(
     command: &mut Command,
     inherited_bind_fds: Vec<OwnedFd>,
+    permits_child_processes: bool,
 ) -> Result<(), String> {
-    let filter = Arc::new(linux_seccomp_filter()?);
+    let filter = Arc::new(linux_seccomp_filter(permits_child_processes)?);
     let process_limit = host_uid_process_limit()?;
     let inherited_bind_fds = Arc::new(inherited_bind_fds);
     let preserved_fds: Vec<libc::c_int> = inherited_bind_fds
@@ -1111,7 +1337,7 @@ fn install_seccomp_filter_fd(filter: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_seccomp_filter() -> Result<Vec<u8>, String> {
+fn linux_seccomp_filter(permits_child_processes: bool) -> Result<Vec<u8>, String> {
     #[cfg(target_arch = "x86_64")]
     const AUDIT_ARCH: u32 = 0xc000_003e;
     #[cfg(target_arch = "aarch64")]
@@ -1149,7 +1375,7 @@ fn linux_seccomp_filter() -> Result<Vec<u8>, String> {
         statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
         statement(BPF_LD_W_ABS, 0),
     ];
-    for syscall in denied_linux_syscalls() {
+    for syscall in denied_linux_syscalls(permits_child_processes) {
         program.push(jump(syscall, 0, 1));
         program.push(statement(
             BPF_RET_K,
@@ -1170,8 +1396,8 @@ fn linux_seccomp_filter() -> Result<Vec<u8>, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn denied_linux_syscalls() -> Vec<u32> {
-    [
+fn denied_linux_syscalls(permits_child_processes: bool) -> Vec<u32> {
+    let mut denied = vec![
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
@@ -1206,10 +1432,36 @@ fn denied_linux_syscalls() -> Vec<u32> {
         libc::SYS_reboot,
         libc::SYS_swapon,
         libc::SYS_swapoff,
-    ]
-    .into_iter()
-    .filter_map(|syscall| u32::try_from(syscall).ok())
-    .collect()
+    ];
+    if !permits_child_processes {
+        denied.extend([libc::SYS_clone, libc::SYS_clone3]);
+        #[cfg(target_arch = "x86_64")]
+        denied.extend([libc::SYS_fork, libc::SYS_vfork]);
+    }
+    denied
+        .into_iter()
+        .filter_map(|syscall| u32::try_from(syscall).ok())
+        .collect()
+}
+
+fn apply_profile_environment(
+    run: &crate::tools::security::ToolRunContext,
+    policy: EnvironmentPolicy,
+    command: &mut Command,
+) {
+    match policy {
+        EnvironmentPolicy::Empty => {}
+        EnvironmentPolicy::NonSecretRunGrants => {
+            for name in run.environment_grants().keys() {
+                if !super::is_sensitive_env(name) {
+                    let _ = run.environment_grants().with_value(name, |value| {
+                        command.env(name, value);
+                    });
+                }
+            }
+        }
+        EnvironmentPolicy::RunGrants => run.environment_grants().apply_std(command),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1485,6 +1737,236 @@ fn sandbox_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subprocess_profiles_compile_to_distinct_least_privilege_policies() {
+        assert_eq!(
+            SandboxProfile::Shell.policy(),
+            SandboxProfilePolicy {
+                workspace: WorkspaceMountPolicy::RunBound,
+                environment: EnvironmentPolicy::RunGrants,
+                permits_explicit_environment: false,
+                permits_project_path: true,
+                permits_child_processes: true,
+            }
+        );
+        assert_eq!(
+            SandboxProfile::DocumentParser.policy(),
+            SandboxProfilePolicy {
+                workspace: WorkspaceMountPolicy::ScratchOnly,
+                environment: EnvironmentPolicy::Empty,
+                permits_explicit_environment: false,
+                permits_project_path: false,
+                permits_child_processes: false,
+            }
+        );
+        assert_eq!(
+            SandboxProfile::LanguageServer.policy().workspace,
+            WorkspaceMountPolicy::ProjectReadOnly
+        );
+        assert_eq!(
+            SandboxProfile::McpHeaderHelper.policy().workspace,
+            WorkspaceMountPolicy::ScratchOnly
+        );
+        for profile in [
+            SandboxProfile::RepositoryHook,
+            SandboxProfile::LanguageServer,
+            SandboxProfile::StaticAnalyzer,
+            SandboxProfile::QualityGate,
+            SandboxProfile::DocumentParser,
+            SandboxProfile::McpHeaderHelper,
+            SandboxProfile::GitWorktree,
+        ] {
+            assert_ne!(
+                profile.policy().environment,
+                EnvironmentPolicy::RunGrants,
+                "{profile:?} must not receive secret-bearing general run grants"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_environment_is_profile_scoped_and_cannot_replace_sandbox_state() {
+        let safe = [(
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            OsString::from("/dev/null"),
+        )];
+        assert!(validate_explicit_environment(SandboxProfile::GitWorktree, &safe).is_ok());
+        assert!(validate_explicit_environment(SandboxProfile::Shell, &safe).is_err());
+
+        let loader = [(OsString::from("LD_PRELOAD"), OsString::from("attack.so"))];
+        assert!(validate_explicit_environment(SandboxProfile::GitWorktree, &loader).is_err());
+        let sandbox_owned = [(OsString::from("PATH"), OsString::from("/host/bin"))];
+        assert!(
+            validate_explicit_environment(SandboxProfile::McpHeaderHelper, &sandbox_owned).is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn profile_mounts_and_environment_match_the_compiled_policy() {
+        let project = tempfile::tempdir().expect("profile project");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), project.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::from([
+                    ("CARGO_BUILD_JOBS".to_string(), "4".to_string()),
+                    ("OPENAI_API_KEY".to_string(), "secret".to_string()),
+                ]))
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(true)
+                .build()
+                .expect("profile run");
+
+        let language_server = sandboxed_process_command(
+            &run,
+            SandboxProfile::LanguageServer,
+            OsStr::new("/usr/bin/true"),
+            &[],
+            project.path(),
+        )
+        .expect("language server sandbox");
+        let args = language_server
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|window| { window[0] == "--setenv" && window[1] == "CARGO_TARGET_DIR" }));
+        assert!(args.windows(3).any(|window| {
+            window[0] == "--ro-bind-fd" && window[2] == project.path().to_string_lossy()
+        }));
+        let env_names = language_server
+            .get_envs()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(env_names.iter().any(|name| name == "CARGO_BUILD_JOBS"));
+        assert!(!env_names.iter().any(|name| name == "OPENAI_API_KEY"));
+
+        let parser = sandboxed_process_command(
+            &run,
+            SandboxProfile::DocumentParser,
+            OsStr::new("/usr/bin/true"),
+            &[],
+            project.path(),
+        )
+        .expect("parser sandbox");
+        let args = parser
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args
+            .iter()
+            .any(|arg| arg == &project.path().to_string_lossy()));
+        assert!(args.windows(2).any(|window| {
+            window[0] == "--chdir" && window[1] == run.private_temp_root().to_string_lossy()
+        }));
+
+        let shell = sandboxed_process_command(
+            &run,
+            SandboxProfile::Shell,
+            OsStr::new("/usr/bin/true"),
+            &[],
+            project.path(),
+        )
+        .expect("shell sandbox");
+        let args = shell
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args
+            .windows(2)
+            .any(|window| { window[0] == "--setenv" && window[1] == "CARGO_TARGET_DIR" }));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parser_cannot_observe_project_and_read_only_profiles_cannot_modify_it() {
+        let project = tempfile::tempdir().expect("runtime profile project");
+        let sentinel = project.path().join("sentinel");
+        std::fs::write(&sentinel, "original").expect("sentinel");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), project.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::from([(
+                    "OPENAI_API_KEY".to_string(),
+                    "secret".to_string(),
+                )]))
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(true)
+                .build()
+                .expect("runtime profile run");
+
+        let probe = format!(
+            "if test -e {}; then printf visible; else printf hidden; fi; printf ':%s' \"${{OPENAI_API_KEY-unset}}\"",
+            shlex::try_quote(sentinel.to_str().expect("UTF-8 sentinel")).expect("quote sentinel")
+        );
+        let mut parser = sandboxed_process_command(
+            &run,
+            SandboxProfile::DocumentParser,
+            OsStr::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from(probe)],
+            project.path(),
+        )
+        .expect("parser command");
+        let output = parser.output().expect("run parser probe");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hidden:unset");
+
+        let mut parser_child_probe = sandboxed_process_command(
+            &run,
+            SandboxProfile::DocumentParser,
+            OsStr::new("/usr/bin/python3"),
+            &[
+                OsString::from("-c"),
+                OsString::from(
+                    "import os,sys\ntry:\n os.fork()\nexcept PermissionError:\n sys.exit(0)\nsys.exit(1)",
+                ),
+            ],
+            project.path(),
+        )
+        .expect("parser child-process probe");
+        assert!(
+            parser_child_probe
+                .status()
+                .expect("run parser child-process probe")
+                .success(),
+            "document parser unexpectedly created a child process"
+        );
+
+        for profile in [
+            SandboxProfile::LanguageServer,
+            SandboxProfile::StaticAnalyzer,
+            SandboxProfile::QualityGate,
+        ] {
+            let write = format!(
+                "printf changed > {}",
+                shlex::try_quote(sentinel.to_str().expect("UTF-8 sentinel"))
+                    .expect("quote sentinel")
+            );
+            let mut child = sandboxed_process_command(
+                &run,
+                profile,
+                OsStr::new("/bin/sh"),
+                &[OsString::from("-c"), OsString::from(write)],
+                project.path(),
+            )
+            .expect("read-only profile command");
+            let output = child.output().expect("run read-only profile probe");
+            assert!(!output.status.success(), "{profile:?} wrote the project");
+            assert_eq!(
+                std::fs::read_to_string(&sentinel).expect("sentinel"),
+                "original",
+                "{profile:?} changed the project"
+            );
+        }
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

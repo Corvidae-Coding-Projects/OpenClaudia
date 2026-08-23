@@ -604,23 +604,13 @@ fn derive_mcp_stdio_run(
             "Cannot bind MCP process to parent session: {error}"
         ))
     })?;
-    let is_parent_intrinsic_root = |root: &&PathBuf| {
-        root.as_path() == parent.project_root() || root.as_path() == parent.private_temp_root()
-    };
-    let read_only_roots = parent
-        .read_only_roots()
-        .iter()
-        .filter(|root| !is_parent_intrinsic_root(root))
-        .cloned()
-        .collect();
-    let read_write_roots = parent
-        .read_write_roots()
-        .iter()
-        .filter(|root| !is_parent_intrinsic_root(root))
-        .cloned()
-        .collect();
-    let mut environment_grants = parent.environment_grants().clone();
-    environment_grants.extend(extra_environment);
+    // MCP roots/list exposes the project, not unrelated attachment roots from
+    // the parent. The child builder adds its project and private scratch roots.
+    let read_only_roots = Vec::new();
+    let read_write_roots = Vec::new();
+    // A stdio server receives only the environment declared for that server,
+    // never unrelated provider credentials from the parent agent run.
+    let environment_grants = extra_environment.clone();
     let workspace_access = if parent.grants_resource(crate::tools::ToolResource::WorkspaceWrite) {
         crate::tools::WorkspaceAccess::ReadWrite
     } else {
@@ -2100,7 +2090,7 @@ fn run_headers_helper(
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = crate::tools::command::run_sandboxed_with_timeout_with_env(
         run,
-        crate::tools::SandboxProfile::McpStdio,
+        crate::tools::SandboxProfile::McpHeaderHelper,
         &program,
         &arg_refs,
         run.working_directory(),
@@ -3419,6 +3409,12 @@ mod tests {
         assert!(child
             .environment_grants()
             .matches_value("S019_MCP_ENV", "exact"));
+        for parent_name in parent.environment_grants().keys() {
+            assert!(
+                !child.environment_grants().contains_key(parent_name),
+                "unrelated parent environment grant {parent_name} leaked into MCP"
+            );
+        }
         assert!(!parent.environment_grants().contains_key("S019_MCP_ENV"));
         assert_ne!(
             child.runtime().descriptor().capabilities.manifest_digest,
@@ -3426,6 +3422,46 @@ mod tests {
         );
         assert!(child.require(crate::tools::ToolResource::Process).is_ok());
         assert!(child.require(crate::tools::ToolResource::Network).is_err());
+    }
+
+    #[test]
+    fn mcp_stdio_run_drops_unrelated_parent_roots_and_environment() {
+        let project = tempfile::tempdir().expect("MCP project");
+        let attachment = tempfile::tempdir().expect("MCP attachment");
+        let output = tempfile::tempdir().expect("MCP auxiliary output");
+        let parent =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), project.path())
+                .read_only_roots(vec![attachment.path().to_path_buf()])
+                .read_write_roots(vec![output.path().to_path_buf()])
+                .environment_grants(HashMap::from([(
+                    "PARENT_PROVIDER_TOKEN".to_string(),
+                    "parent-only".to_string(),
+                )]))
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(true)
+                .provider("mcp-parent-test")
+                .build()
+                .expect("MCP parent run");
+        let declared = protected_env(&[("MCP_SERVER_TOKEN", "server-only")]);
+
+        let child = derive_mcp_stdio_run(&parent, &declared).expect("derive MCP child");
+
+        assert!(!child
+            .read_only_roots()
+            .iter()
+            .any(|root| root == attachment.path()));
+        assert!(!child
+            .read_write_roots()
+            .iter()
+            .any(|root| root == output.path()));
+        assert!(child
+            .environment_grants()
+            .matches_value("MCP_SERVER_TOKEN", "server-only"));
+        assert!(!child
+            .environment_grants()
+            .contains_key("PARENT_PROVIDER_TOKEN"));
     }
 
     #[test]

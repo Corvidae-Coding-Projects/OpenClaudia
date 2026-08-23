@@ -32,7 +32,10 @@ pub(crate) use bash::record_command_observation_for_session;
 pub use bash::sandbox::{
     sandbox_diagnostics, sandbox_diagnostics_for_run, sandbox_preflight, SandboxDiagnostics,
 };
-pub(crate) use bash::sandbox::{sandboxed_hook_command, sandboxed_process_command, SandboxProfile};
+pub(crate) use bash::sandbox::{
+    sandboxed_hook_command, sandboxed_process_command, sandboxed_process_command_with_env,
+    SandboxProfile,
+};
 pub mod catalog;
 pub(crate) mod command;
 mod continuation;

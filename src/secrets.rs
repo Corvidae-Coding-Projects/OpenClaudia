@@ -170,10 +170,6 @@ impl EnvironmentGrants {
         Ok(())
     }
 
-    pub(crate) fn extend(&mut self, other: &Self) {
-        self.0.extend(other.0.clone());
-    }
-
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()

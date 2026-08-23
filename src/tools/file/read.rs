@@ -296,10 +296,9 @@ const PDF_TIMEOUT_SECS: u64 = 30;
 ///
 /// # Locale dependency
 ///
-/// `pdftotext` sees only locale variables explicitly captured in the run's
-/// environment grants. It never inherits the process environment at spawn.
-/// Operators that need a specific encoding should grant the corresponding
-/// `LANG`/`LC_*` value when constructing the top-level run.
+/// `pdftotext` receives no run environment grants and never inherits the host
+/// process environment. PDF bytes arrive over stdin and parser output leaves
+/// over stdout, so locale and credential state are outside this profile.
 pub fn read_pdf_file(
     run: &super::super::security::ToolRunContext,
     path: &str,

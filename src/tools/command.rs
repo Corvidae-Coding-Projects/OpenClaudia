@@ -306,18 +306,22 @@ fn run_sandboxed_with_timeout_inner(
 ) -> Result<Output, CommandError> {
     let program_str = program.as_ref().to_string_lossy().into_owned();
     let sandbox_args: Vec<OsString> = args.iter().map(|arg| arg.as_ref().to_os_string()).collect();
-    let mut cmd = crate::tools::sandboxed_process_command(
+    let explicit_environment = env
+        .iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect::<Vec<_>>();
+    let cmd = crate::tools::sandboxed_process_command_with_env(
         run,
         profile,
         program.as_ref(),
         &sandbox_args,
         project_root,
+        &explicit_environment,
     )
     .map_err(|source| CommandError::SpawnFailed {
         program: program_str.clone(),
         source,
     })?;
-    cmd.envs(env);
     run_prepared_with_timeout(
         ProcessExecution::RunOwned(run),
         cmd,
