@@ -1,6 +1,6 @@
 {
   "next_display_id": 1115,
-  "next_comment_id": 1359,
+  "next_comment_id": 1360,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13954,7 +13954,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T05:27:21.421113555Z",
-      "updated_at": "2026-08-23T13:56:40.037149788Z",
+      "updated_at": "2026-08-23T14:14:08.618041741Z",
       "labels": [
         "bug",
         "tests"
@@ -13963,6 +13963,15 @@
         "7e5b2dff-ef17-4d7f-9404-5b41f3a795be"
       ],
       "comments": {
+        "8712526b-14cc-42e1-b629-dbda27ff542e": {
+          "display_id": 1359,
+          "author": "6Vw9",
+          "content": "Resolved by S-040. Reader completion now remains under the same aggregate deadline after root exit; timeout preserves root status and partial output, force-stops descendants, and joins I/O tasks. The public Bash regression enforces timeout=1000 and returns in under five seconds; the direct descendant-held-pipe regression preserves status/stdout and returns at its 200 ms deadline. Full Rust 1.98 suite passes.",
+          "created_at": "2026-08-23T14:14:08.615680418Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArxcgXceX0oWVdZ6fb9ft4d7UeCxO2ZKoVXKE4VFnLPX4+2KNhDgte7n7ct6ETmZSRFzLcz/W6gx7eZqNTzOxDA=="
+        },
         "c4590b55-f076-48de-a244-5ce1a8b06f4a": {
           "display_id": 1356,
           "author": "6Vw9",
@@ -36003,11 +36012,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1231,
       "timestamp": "2026-08-23T14:14:04.047306254Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1232,
+      "timestamp": "2026-08-23T14:14:08.618041741Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T14:14:04.047306254Z",
+    "timestamp": "2026-08-23T14:14:08.618041741Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1231
+    "agent_seq": 1232
   }
 }
