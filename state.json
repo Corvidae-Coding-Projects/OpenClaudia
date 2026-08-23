@@ -1,6 +1,6 @@
 {
   "next_display_id": 1114,
-  "next_comment_id": 1331,
+  "next_comment_id": 1332,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1448,11 +1448,22 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:38.668193082Z",
-      "updated_at": "2026-08-23T09:59:00.363072401Z",
+      "updated_at": "2026-08-23T11:02:22.482453775Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
-      ]
+      ],
+      "comments": {
+        "c3aa2a2a-f1ee-4428-a78d-f4bd3a20aaa9": {
+          "display_id": 1331,
+          "author": "6Vw9",
+          "content": "[plan] Implement one typed scope-target contract: persist project-relative path/tool intent in session state; bind canonical target identities into the runtime mode generation; check every resolved tool target at final admission; require explicit targets for narrow activation; retain launch-workspace approval for adjacent compatibility; wire CLI, legacy REPL, full-screen TUI resume, and child derivation; verify target escape and atomic transition behavior on Rust 1.98. Credible alternative rejected: inferring targets from task prose, because it is ambiguous and cannot be generation-bound.",
+          "created_at": "2026-08-23T11:02:22.479552907Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAHGWjDX/IU+RML2cLV9mY8xNy793yrfggH0neqbfUA2JTuMlqWI2ObOeHOa4mdHT/IyKc7nIeeRs2FR0lMeDDAg=="
+        }
+      }
     },
     "04a1506d-8eef-47d7-8dc9-3e31fa5fefba": {
       "uuid": "04a1506d-8eef-47d7-8dc9-3e31fa5fefba",
@@ -35507,11 +35518,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1190,
       "timestamp": "2026-08-23T10:55:55.370351570Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1191,
+      "timestamp": "2026-08-23T11:02:22.482453775Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T10:55:55.370351570Z",
+    "timestamp": "2026-08-23T11:02:22.482453775Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1190
+    "agent_seq": 1191
   }
 }
