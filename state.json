@@ -1,6 +1,6 @@
 {
   "next_display_id": 1115,
-  "next_comment_id": 1360,
+  "next_comment_id": 1361,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9061,7 +9061,7 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T08:34:51.434913457Z",
-      "updated_at": "2026-08-23T13:56:44.452156236Z",
+      "updated_at": "2026-08-23T14:14:13.121757571Z",
       "labels": [
         "defect"
       ],
@@ -9069,6 +9069,15 @@
         "7e5b2dff-ef17-4d7f-9404-5b41f3a795be"
       ],
       "comments": {
+        "a1826575-ef26-412a-9081-68ccf1c8f8d3": {
+          "display_id": 1360,
+          "author": "6Vw9",
+          "content": "Resolved at the observed shared teardown cause. Explicit background cleanup removes the entry without holding the global map lock, force-stops the sandbox whenever the root or either output reader is incomplete, then waits for waiter/readers to publish reap/drain completion. The regression captures the exact PID and proves /proc/<pid> disappears; no matching stale spawn-7 bwrap remains after the full suite. Full Rust 1.98 suite passes.",
+          "created_at": "2026-08-23T14:14:13.119233875Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA0LW17qTqW2IBEMixLSmEMS09vT+Hory9FaYrRDtxGrAJCcAPnwamRzcQdXx2MSzBxA9X0qYgjW5l7XFvjSu+DA=="
+        },
         "bd281e08-c052-40e4-ab25-f500b9b3a0ca": {
           "display_id": 1357,
           "author": "6Vw9",
@@ -36017,11 +36026,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1232,
       "timestamp": "2026-08-23T14:14:08.618041741Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1233,
+      "timestamp": "2026-08-23T14:14:13.121757571Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T14:14:08.618041741Z",
+    "timestamp": "2026-08-23T14:14:13.121757571Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1232
+    "agent_seq": 1233
   }
 }
