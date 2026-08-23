@@ -1,6 +1,6 @@
 {
   "next_display_id": 1105,
-  "next_comment_id": 1284,
+  "next_comment_id": 1285,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16782,11 +16782,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T03:46:31.098891631Z",
-      "updated_at": "2026-08-23T04:44:42.591451311Z",
+      "updated_at": "2026-08-23T04:51:46.556941938Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "00a41df6-8473-4551-a037-33f47ad5a555": {
+          "display_id": 1284,
+          "author": "6Vw9",
+          "content": "Commit 3117fd9 feat(transport): harden provider HTTP. Delivered the canonical Rustls provider/auth client, redirect and endpoint policy, phased/total deadlines, bounded JSON/raw-stream readers, sanitized typed failures, safe model-POST retry admission, and production migrations across pipeline/proxy/discovery/auth/frontends/subagents/web distillation/VDD. Verification: Rust 1.98.0 fmt check; strict all-target/all-feature Clippy; focused redirect, timeout, oversize, retry, redaction, provider, VDD, Claude credential, and OAuth suites; full locked all-feature serial matrix with zero failures.",
+          "created_at": "2026-08-23T04:51:46.554345643Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/uufYZqVzQlRinE5KEuc0aQuh0UVyodGv9c+ZfMVtQqtvhIoL0hRdvuNCob2fvvYkMn1aXwKnnodvDCd/jFyBw=="
+        },
         "072315c3-3132-4014-84f5-dcdd1a5f9e07": {
           "display_id": 1279,
           "author": "6Vw9",
@@ -34432,11 +34441,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1095,
       "timestamp": "2026-08-23T04:44:42.591451311Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1096,
+      "timestamp": "2026-08-23T04:51:46.556941938Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T04:44:42.591451311Z",
+    "timestamp": "2026-08-23T04:51:46.556941938Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1095
+    "agent_seq": 1096
   }
 }
