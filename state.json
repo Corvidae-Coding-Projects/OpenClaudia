@@ -1,6 +1,6 @@
 {
   "next_display_id": 1118,
-  "next_comment_id": 1383,
+  "next_comment_id": 1384,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28205,7 +28205,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T15:33:45.737689540Z",
-      "updated_at": "2026-08-23T15:59:30.511015114Z",
+      "updated_at": "2026-08-23T15:59:34.835386977Z",
       "labels": [
         "remediation"
       ],
@@ -28227,6 +28227,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl5DLWis512J78IkmJ0GMl7/LvmKc75ugRnW3TOYwgv6qlH8u4CzVjZdbeSQpF36xQuKKvcoUv7DhhcJdL1ndDg=="
+        },
+        "b2fe5d95-371b-4c81-818c-e75d6b01f93c": {
+          "display_id": 1383,
+          "author": "6Vw9",
+          "content": "[action] S-042 core implemented and targeted tests green: distinct profile filesystem/env/process policies, project-only roots, read-only analyzers/LSP/quality with scratch caches, parser scratch-only, MCP child narrowing, restricted explicit env, effective grant trace. Auditing residual F-049 transactional writable projection before final gates.",
+          "created_at": "2026-08-23T15:59:34.832862792Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ10elLY5SxV/VdKsBIKle5hM5ih7kJYbuub5UVhsKLXZ78Eeagy8dtgb9rvc9nEj1vKUyqI3GINdzN9umcylDQ=="
         },
         "ee6c2a5a-63f2-42a7-8552-812559d6a0e2": {
           "display_id": 1382,
@@ -36488,11 +36497,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1273,
       "timestamp": "2026-08-23T15:59:30.511015114Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1274,
+      "timestamp": "2026-08-23T15:59:34.835386977Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T15:59:30.511015114Z",
+    "timestamp": "2026-08-23T15:59:34.835386977Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1273
+    "agent_seq": 1274
   }
 }
