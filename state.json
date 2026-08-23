@@ -1,6 +1,6 @@
 {
   "next_display_id": 1113,
-  "next_comment_id": 1320,
+  "next_comment_id": 1321,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28150,7 +28150,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T08:45:03.862099956Z",
-      "updated_at": "2026-08-23T10:02:54.586103607Z",
+      "updated_at": "2026-08-23T10:08:50.272662839Z",
       "labels": [
         "remediation"
       ],
@@ -28187,6 +28187,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAn77PsYctZFQ7kgkIZmojEuZSEMrVp8vNoyNsesyV9O5T155j4af552rZ23QSbZMZ4/33QWo+92+Vh1EjwE6UAg=="
+        },
+        "a3b818a2-dd81-48eb-896f-f25527a1622c": {
+          "display_id": 1320,
+          "author": "6Vw9",
+          "content": "[result] 6dc02af1 feat(modes): enforce runtime capability profiles. Delivered shared generation-bound runtime modes, catalog filtering, final dispatch rechecks, pinned plan-file enforcement, and CLI/TUI/ACP/proxy/resume wiring. Verified with Rust 1.98 fmt check, strict workspace/all-target/all-feature Clippy, complete serialized workspace/all-target/all-feature test suite, generated technical-memory evidence tests, diff/security review, and signed commit verification. Residual independent work is tracked in #1110, #1111, and #1112.",
+          "created_at": "2026-08-23T10:08:50.269806160Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ7c2FZF9sHpdXh4oYv8LR6aE8mAQDJSoStVlWZaJPNP8ZvsKYlCT0gTYdyx2jnoNMdb6YpCXcBiZ5oBqkzRKBw=="
         },
         "eb1e4005-daf8-44bd-911b-d3cd570b3f9a": {
           "display_id": 1316,
@@ -35283,11 +35292,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1169,
       "timestamp": "2026-08-23T10:02:54.586103607Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1170,
+      "timestamp": "2026-08-23T10:08:50.272662839Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T10:02:54.586103607Z",
+    "timestamp": "2026-08-23T10:08:50.272662839Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1169
+    "agent_seq": 1170
   }
 }
