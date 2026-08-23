@@ -123,6 +123,35 @@ impl ToolCallAccumulator {
             .collect()
     }
 
+    /// Convert every observed slot into a complete executable call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any streamed slot is incomplete, repeats an id,
+    /// or contains arguments that are not valid JSON.
+    pub fn finalize_checked(&self) -> Result<Vec<ToolCall>, String> {
+        let mut ids = std::collections::HashSet::new();
+        for partial in &self.tool_calls {
+            if partial.id.is_empty() || partial.function_name.is_empty() {
+                return Err(format!(
+                    "Provider returned incomplete tool call at index {}",
+                    partial.index
+                ));
+            }
+            if !ids.insert(partial.id.as_str()) {
+                return Err(format!("Provider repeated tool call id {:?}", partial.id));
+            }
+            serde_json::from_str::<Value>(&normalized_tool_arguments(&partial.function_arguments))
+                .map_err(|error| {
+                    format!(
+                        "Provider returned invalid JSON arguments for tool call {:?}: {error}",
+                        partial.id
+                    )
+                })?;
+        }
+        Ok(self.finalize())
+    }
+
     /// Check if we have any complete tool calls.
     ///
     /// The accumulator may contain partial slots with only an id or only a
@@ -317,6 +346,40 @@ impl AnthropicToolAccumulator {
             .collect()
     }
 
+    /// Convert every Anthropic `tool_use` block into a complete tool call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing/repeated ids, missing names, or malformed
+    /// streamed input JSON.
+    pub fn finalize_tool_calls_checked(&self) -> Result<Vec<ToolCall>, String> {
+        let mut ids = std::collections::HashSet::new();
+        for block in &self.blocks {
+            let AnthropicContentBlock::ToolUse {
+                id,
+                name,
+                input_json,
+            } = block
+            else {
+                continue;
+            };
+            if id.is_empty() || name.is_empty() {
+                return Err("Provider returned incomplete Anthropic tool_use block".to_string());
+            }
+            if !ids.insert(id.as_str()) {
+                return Err(format!("Provider repeated tool call id {id:?}"));
+            }
+            serde_json::from_str::<Value>(&normalized_tool_arguments(input_json)).map_err(
+                |error| {
+                    format!(
+                        "Provider returned invalid JSON arguments for tool call {id:?}: {error}"
+                    )
+                },
+            )?;
+        }
+        Ok(self.finalize_tool_calls())
+    }
+
     /// Convert to OpenAI-format `tool_calls` JSON for storage in `chat_session`.
     /// This allows `convert_messages_to_anthropic` to handle the back-conversion.
     #[must_use]
@@ -345,5 +408,69 @@ impl AnthropicToolAccumulator {
     pub fn clear(&mut self) {
         self.blocks.clear();
         self.stop_reason = None;
+    }
+}
+
+#[cfg(test)]
+mod terminal_tool_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn openai_checked_finalize_rejects_partial_slot() {
+        let mut accumulator = ToolCallAccumulator::new();
+        accumulator.process_delta(&json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"arguments": "{}"}
+            }]
+        }));
+
+        let error = accumulator
+            .finalize_checked()
+            .expect_err("missing function name must fail");
+        assert!(error.contains("incomplete tool call"), "{error}");
+    }
+
+    #[test]
+    fn openai_checked_finalize_rejects_malformed_arguments() {
+        let mut accumulator = ToolCallAccumulator::new();
+        accumulator.process_delta(&json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{"}
+            }]
+        }));
+
+        let error = accumulator
+            .finalize_checked()
+            .expect_err("malformed arguments must fail");
+        assert!(error.contains("invalid JSON arguments"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_checked_finalize_requires_closed_input_json() {
+        let mut accumulator = AnthropicToolAccumulator::new();
+        accumulator.process_event(&json!({
+            "type": "content_block_start",
+            "content_block": {"type": "tool_use", "id": "tool_1", "name": "read_file"}
+        }));
+        accumulator.process_event(&json!({
+            "type": "content_block_delta",
+            "delta": {"type": "input_json_delta", "partial_json": "{"}
+        }));
+        accumulator.process_event(&json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"}
+        }));
+
+        let error = accumulator
+            .finalize_tool_calls_checked()
+            .expect_err("unterminated input_json must fail");
+        assert!(error.contains("invalid JSON arguments"), "{error}");
     }
 }

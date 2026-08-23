@@ -1659,6 +1659,9 @@ impl ChatRepl {
     /// Gemini `GenerateContent` and Ollama Chat both return one complete native
     /// JSON turn. Decode them through the shared continuation state machine and
     /// commit each assistant projection before executing any projected tool.
+    // Keep decode, terminal validation, continuation install, and tool dispatch
+    // in their wire-order so no effect can move ahead of provider validation.
+    #[allow(clippy::too_many_lines)]
     async fn process_native_json_response(
         &mut self,
         response: reqwest::Response,
@@ -1703,6 +1706,15 @@ impl ChatRepl {
                     return;
                 }
             };
+            if let Err(error) = openclaudia::pipeline::ensure_provider_turn_succeeded(
+                decoded.terminal_outcome,
+                decoded.tool_calls.len(),
+            ) {
+                display_partial_provider_response(&decoded.content);
+                self.record_failed_turn(&error);
+                eprintln!("\nProvider did not complete the turn: {error}");
+                return;
+            }
             usage.accumulate(&decoded.usage);
             self.audit_native_json_response(&decoded);
 
@@ -1711,6 +1723,7 @@ impl ChatRepl {
                 reasoning_content: _,
                 tool_calls,
                 usage: _,
+                terminal_outcome: _,
                 finish_reason: _,
                 provider_native_state,
             } = decoded;
@@ -1729,6 +1742,7 @@ impl ChatRepl {
                 eprintln!(
                     "\n\x1b[33m⚠ Reached max_turns limit ({max_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
                 );
+                self.record_failed_turn("native JSON tool loop reached max_turns");
                 return;
             }
             if let Err(error) = self.install_native_json_assistant_turn(
@@ -2227,12 +2241,13 @@ impl ChatRepl {
             .await;
 
         if let Some(error) = stream_result.transport_failure.as_deref() {
+            display_partial_provider_response(&stream_result.full_content);
             self.record_failed_turn(error);
             eprintln!("\nProvider stream failed: {error}");
             return false;
         }
 
-        let mut full_content = stream_result.full_content;
+        let full_content = stream_result.full_content;
         let reasoning_content = stream_result.reasoning_content;
         let cancelled = stream_result.cancelled;
         let pending_action = stream_result.pending_action;
@@ -2241,8 +2256,8 @@ impl ChatRepl {
         self.log_streaming_completion(&full_content, cancelled, &stream_usage);
         self.draw_stream_status_bar(&full_content, &stream_usage);
 
-        if cancelled && !full_content.is_empty() {
-            full_content.push_str("\n\n[Response interrupted by user]");
+        if cancelled {
+            display_partial_provider_response(&full_content);
         }
 
         if self.config.proxy.target.eq_ignore_ascii_case("anthropic") && !cancelled {
@@ -2339,7 +2354,7 @@ impl ChatRepl {
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
     ) {
-        let final_content = self
+        let final_content = match self
             .run_anthropic_structured_tool_loop(
                 anthropic_accumulator,
                 full_content,
@@ -2347,7 +2362,15 @@ impl ChatRepl {
                 prompt_blocks,
                 memory_db,
             )
-            .await;
+            .await
+        {
+            Ok(content) => content,
+            Err(error) => {
+                self.record_failed_turn(&error);
+                eprintln!("\nAnthropic turn failed: {error}");
+                return;
+            }
+        };
         if let Some(ref engine) = self.vdd_engine {
             if final_content.trim().is_empty() {
                 println!();
@@ -2395,6 +2418,8 @@ impl ChatRepl {
         .eventsource();
         let mut cancelled = false;
         let mut transport_failure = None;
+        let mut terminal =
+            openclaudia::pipeline::ChatStreamTerminal::new(&self.config.proxy.target);
         let mut pending_action: Option<SlashCommandResult> = None;
 
         let mut in_thinking_block = false;
@@ -2425,21 +2450,48 @@ impl ChatRepl {
                 }
             };
             if sse.data == "[DONE]" {
+                terminal.observe_done();
                 break;
             }
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse.data) {
-                let mut ctx = SseFrameCtx {
-                    full_content: &mut full_content,
-                    reasoning_content: &mut reasoning_content,
-                    tool_accumulator,
-                    anthropic_accumulator,
-                    stream_usage,
-                    in_thinking_block: &mut in_thinking_block,
-                    thinking_start_time: &mut thinking_start_time,
-                    reasoning_started: &mut reasoning_started,
-                };
-                Self::route_sse_frame(&json, &mut ctx);
+            let json = match serde_json::from_str::<serde_json::Value>(&sse.data) {
+                Ok(json) => json,
+                Err(error) => {
+                    transport_failure = Some(format!("Malformed provider SSE event: {error}"));
+                    break;
+                }
+            };
+            if let Err(error) = terminal.observe(&json) {
+                transport_failure = Some(error);
+                break;
             }
+            let mut ctx = SseFrameCtx {
+                full_content: &mut full_content,
+                reasoning_content: &mut reasoning_content,
+                tool_accumulator,
+                anthropic_accumulator,
+                stream_usage,
+                in_thinking_block: &mut in_thinking_block,
+                thinking_start_time: &mut thinking_start_time,
+                reasoning_started: &mut reasoning_started,
+            };
+            Self::route_sse_frame(&json, &mut ctx);
+        }
+        if !cancelled && transport_failure.is_none() {
+            let terminal_outcome = terminal.finish();
+            let tool_call_count = if self.config.proxy.target.eq_ignore_ascii_case("anthropic") {
+                anthropic_accumulator
+                    .finalize_tool_calls_checked()
+                    .map(|calls| calls.len())
+            } else {
+                tool_accumulator.finalize_checked().map(|calls| calls.len())
+            };
+            transport_failure = terminal_outcome
+                .and_then(|outcome| {
+                    tool_call_count.and_then(|count| {
+                        openclaudia::pipeline::ensure_provider_turn_succeeded(outcome, count)
+                    })
+                })
+                .err();
         }
         if reasoning_started {
             let elapsed = thinking_start_time.map_or(0.0, |t| t.elapsed().as_secs_f64());
@@ -2571,7 +2623,7 @@ impl ChatRepl {
         transport: TurnTransport<'_>,
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
-    ) -> String {
+    ) -> Result<String, String> {
         let max_proxy_iterations = self.config.session.max_turns;
         let mut proxy_iteration: u32 = 0;
         let mut executed_tool_sigs: std::collections::HashSet<String> =
@@ -2594,15 +2646,12 @@ impl ChatRepl {
                 eprintln!(
                     "\n\x1b[33m⚠ Reached max_turns limit ({max_proxy_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
                 );
-                break;
+                return Err("Anthropic tool loop reached max_turns".to_string());
             }
             proxy_iteration += 1;
 
-            let Some(tool_calls) =
-                self.collect_anthropic_iteration(&*anthropic_accumulator, &mut executed_tool_sigs)
-            else {
-                break;
-            };
+            let tool_calls =
+                self.collect_anthropic_iteration(&*anthropic_accumulator, &mut executed_tool_sigs)?;
 
             self.dispatch_anthropic_tool_batch(&tool_calls, anthropic_accumulator, memory_db)
                 .await;
@@ -2612,14 +2661,14 @@ impl ChatRepl {
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build Anthropic follow-up request");
                     eprintln!("\n\x1b[31mRequest build error: {e}\x1b[0m");
-                    break;
+                    return Err(format!("Anthropic follow-up request build failed: {e}"));
                 }
             };
             full_content = String::new();
             if !self.followup_request_policy_allows("anthropic follow-up") {
-                break;
+                return Err("Anthropic follow-up blocked by provider policy".to_string());
             }
-            if !self
+            if let Err(error) = self
                 .send_anthropic_followup(
                     followup_req,
                     transport,
@@ -2628,13 +2677,14 @@ impl ChatRepl {
                 )
                 .await
             {
-                break;
+                display_partial_provider_response(&full_content);
+                return Err(error);
             }
         }
 
         if !full_content.trim().is_empty() {
             let Some(rendered) = self.render_final_response(full_content.trim(), false) else {
-                return String::new();
+                return Err("Anthropic final answer failed grounding validation".to_string());
             };
             println!("{rendered}");
             push_chat_session_message_and_persist(
@@ -2647,7 +2697,7 @@ impl ChatRepl {
             );
             full_content = rendered;
         }
-        full_content
+        Ok(full_content)
     }
 
     /// Finalize tool calls + assistant message for one Anthropic loop
@@ -2657,13 +2707,13 @@ impl ChatRepl {
         &mut self,
         anthropic_accumulator: &tools::AnthropicToolAccumulator,
         executed_tool_sigs: &mut std::collections::HashSet<String>,
-    ) -> Option<Vec<tools::ToolCall>> {
+    ) -> Result<Vec<tools::ToolCall>, String> {
         let text = anthropic_accumulator.get_text();
-        let tool_calls = anthropic_accumulator.finalize_tool_calls();
+        let tool_calls = anthropic_accumulator.finalize_tool_calls_checked()?;
 
         if !tool_calls.is_empty() && all_signatures_seen(&tool_calls, executed_tool_sigs) {
             eprintln!("\n\x1b[33m⚠ Detected duplicate tool calls - breaking agentic loop\x1b[0m");
-            return None;
+            return Err("Provider repeated the same Anthropic tool calls".to_string());
         }
         for tc in &tool_calls {
             executed_tool_sigs.insert(tool_call_signature(tc));
@@ -2679,7 +2729,7 @@ impl ChatRepl {
             ),
             "anthropic tool-call assistant turn",
         );
-        Some(tool_calls)
+        Ok(tool_calls)
     }
 
     /// Execute every tool from one Anthropic iteration, run quality
@@ -2917,15 +2967,15 @@ impl ChatRepl {
     }
 
     /// Send the Anthropic follow-up and stream its content into
-    /// `anthropic_accumulator` + `full_content`. Returns `false` on
-    /// transport/HTTP error (caller should break the loop).
+    /// `anthropic_accumulator` + `full_content` and require a truthful
+    /// provider terminal state before the caller continues.
     async fn send_anthropic_followup(
         &self,
         followup_req: serde_json::Value,
         transport: TurnTransport<'_>,
         anthropic_accumulator: &mut tools::AnthropicToolAccumulator,
         full_content: &mut String,
-    ) -> bool {
+    ) -> Result<(), String> {
         use futures::StreamExt;
 
         let req = match transport
@@ -2935,7 +2985,7 @@ impl ChatRepl {
             Ok(request) => request,
             Err(error) => {
                 eprintln!("\nProvider header error: {error}");
-                return false;
+                return Err(format!("Provider header error: {error}"));
             }
         };
         match openclaudia::provider_transport::send(req).await {
@@ -2946,37 +2996,46 @@ impl ChatRepl {
                 )
                 .eventsource();
                 let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
+                let mut terminal = openclaudia::pipeline::ChatStreamTerminal::new("anthropic");
                 loop {
                     let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
                         Ok(Some(Ok(sse))) => sse,
                         Ok(Some(Err(e))) => {
                             eprintln!("\nStream error: {e}");
-                            break;
+                            return Err(format!("Stream error: {e}"));
                         }
                         Ok(None) => break,
                         Err(_) => {
                             Self::handle_stream_timeout(full_content);
-                            break;
+                            return Err(format!(
+                                "Provider stream timed out after {} seconds",
+                                proxy::SSE_STREAM_TIMEOUT_SECS
+                            ));
                         }
                     };
                     if sse.data == "[DONE]" {
+                        terminal.observe_done();
                         break;
                     }
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse.data) {
-                        if let Some(text) = anthropic_accumulator.process_event(&json) {
-                            full_content.push_str(&text);
-                        }
+                    let json = serde_json::from_str::<serde_json::Value>(&sse.data)
+                        .map_err(|error| format!("Malformed provider SSE event: {error}"))?;
+                    terminal.observe(&json)?;
+                    if let Some(text) = anthropic_accumulator.process_event(&json) {
+                        full_content.push_str(&text);
                     }
                 }
-                true
+                let outcome = terminal.finish()?;
+                let tool_calls = anthropic_accumulator.finalize_tool_calls_checked()?;
+                openclaudia::pipeline::ensure_provider_turn_succeeded(outcome, tool_calls.len())?;
+                Ok(())
             }
             Ok(response) => {
                 eprintln!("\nFollow-up request failed: {}", response.status());
-                false
+                Err(format!("Follow-up request failed: {}", response.status()))
             }
             Err(e) => {
                 eprintln!("\nFollow-up request error: {e}");
-                false
+                Err(format!("Follow-up request error: {e}"))
             }
         }
     }
@@ -2993,6 +3052,7 @@ impl ChatRepl {
     ) {
         let max_iterations = self.config.session.max_turns;
         let mut iteration: u32 = 0;
+        let mut loop_failure: Option<String> = None;
         let mut executed_tool_sigs: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
@@ -3001,7 +3061,13 @@ impl ChatRepl {
             && (max_iterations == 0 || iteration < max_iterations)
         {
             iteration += 1;
-            let tool_calls = tool_accumulator.finalize();
+            let tool_calls = match tool_accumulator.finalize_checked() {
+                Ok(tool_calls) => tool_calls,
+                Err(error) => {
+                    loop_failure = Some(error);
+                    break;
+                }
+            };
 
             if iteration > 1
                 && !tool_calls.is_empty()
@@ -3010,6 +3076,7 @@ impl ChatRepl {
                 eprintln!(
                     "\n\x1b[33m⚠ Detected duplicate tool calls - breaking agentic loop\x1b[0m"
                 );
+                loop_failure = Some("Provider repeated the same OpenAI tool calls".to_string());
                 break;
             }
             for tc in &tool_calls {
@@ -3030,22 +3097,30 @@ impl ChatRepl {
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build OpenAI follow-up request");
                     eprintln!("\n\x1b[31mRequest build error: {e}\x1b[0m");
+                    loop_failure = Some(format!("OpenAI follow-up request build failed: {e}"));
                     break;
                 }
             };
             state.current_content.clear();
             state.current_reasoning_content.clear();
             if !self.followup_request_policy_allows("openai follow-up") {
+                loop_failure = Some("OpenAI follow-up blocked by provider policy".to_string());
                 break;
             }
-            self.stream_openai_followup(
-                request_body,
-                transport,
-                tool_accumulator,
-                &mut state.current_content,
-                &mut state.current_reasoning_content,
-            )
-            .await;
+            if let Err(error) = self
+                .stream_openai_followup(
+                    request_body,
+                    transport,
+                    tool_accumulator,
+                    &mut state.current_content,
+                    &mut state.current_reasoning_content,
+                )
+                .await
+            {
+                display_partial_provider_response(&state.current_content);
+                loop_failure = Some(error);
+                break;
+            }
         }
 
         if max_iterations > 0 && iteration >= max_iterations && tool_accumulator.has_tool_calls() {
@@ -3055,6 +3130,13 @@ impl ChatRepl {
             eprintln!(
                 "\n\x1b[33m⚠ Reached max_turns limit ({max_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
             );
+            loop_failure = Some("OpenAI tool loop reached max_turns".to_string());
+        }
+
+        if let Some(error) = loop_failure {
+            self.record_failed_turn(&error);
+            eprintln!("\nOpenAI turn failed: {error}");
+            return;
         }
 
         let final_allowed = self.persist_openai_loop_state(
@@ -3149,6 +3231,7 @@ impl ChatRepl {
             && !tool_accumulator.has_tool_calls()
         {
             self.record_failed_turn("provider returned no assistant content or tool calls");
+            return false;
         }
         true
     }
@@ -3221,6 +3304,9 @@ impl ChatRepl {
 
     /// Stream an OpenAI-style follow-up into `current_content` and feed
     /// tool deltas into `tool_accumulator` for the next loop iteration.
+    // This is one ordered streaming state machine; splitting display and
+    // terminal phases would make their shared accumulator harder to audit.
+    #[allow(clippy::too_many_lines)]
     async fn stream_openai_followup(
         &self,
         request_body: serde_json::Value,
@@ -3228,20 +3314,18 @@ impl ChatRepl {
         tool_accumulator: &mut tools::ToolCallAccumulator,
         current_content: &mut String,
         current_reasoning_content: &mut String,
-    ) {
+    ) -> Result<(), String> {
         use futures::StreamExt;
 
-        let Ok(req) = transport
+        let req = transport
             .headers
             .apply(self.client.post(transport.endpoint).json(&request_body))
-        else {
-            return;
-        };
-        let Ok(response) = openclaudia::provider_transport::send(req).await else {
-            return;
-        };
+            .map_err(|error| format!("Provider header error: {error}"))?;
+        let response = openclaudia::provider_transport::send(req)
+            .await
+            .map_err(|error| format!("Follow-up request error: {error}"))?;
         if !response.status().is_success() {
-            return;
+            return Err(format!("Follow-up request failed: {}", response.status()));
         }
         let mut stream = openclaudia::provider_transport::bounded_byte_stream(
             response,
@@ -3253,70 +3337,77 @@ impl ChatRepl {
         let mut in_thinking_block = false;
         let mut thinking_start_time: Option<std::time::Instant> = None;
         let mut reasoning_started = false;
+        let mut terminal =
+            openclaudia::pipeline::ChatStreamTerminal::new(&self.config.proxy.target);
         loop {
             let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
                 Ok(Some(Ok(sse))) => sse,
                 Ok(Some(Err(e))) => {
                     eprintln!("\nStream error: {e}");
-                    break;
+                    return Err(format!("Stream error: {e}"));
                 }
                 Ok(None) => break,
                 Err(_) => {
                     Self::handle_stream_timeout(current_content);
-                    break;
+                    return Err(format!(
+                        "Provider stream timed out after {} seconds",
+                        proxy::SSE_STREAM_TIMEOUT_SECS
+                    ));
                 }
             };
             if sse.data == "[DONE]" {
+                terminal.observe_done();
                 break;
             }
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse.data) {
-                match openclaudia::pipeline::process_sse_event(
-                    &json,
-                    in_thinking_block,
-                    &mut anthropic_accumulator,
-                    tool_accumulator,
-                ) {
-                    openclaudia::pipeline::SseAction::Text(text) => {
-                        if reasoning_started {
-                            let elapsed = thinking_start_time
-                                .map_or(0.0, |started| started.elapsed().as_secs_f64());
-                            tui::print_thinking_end(elapsed);
-                            reasoning_started = false;
-                            thinking_start_time = None;
-                        }
-                        current_content.push_str(&text);
-                    }
-                    openclaudia::pipeline::SseAction::Thinking(text) => {
-                        tui::print_thinking_chunk(&text);
-                    }
-                    openclaudia::pipeline::SseAction::Reasoning(text) => {
-                        let display_text = openclaudia::pipeline::merge_reasoning_delta(
-                            current_reasoning_content,
-                            &text,
-                        );
-                        if !display_text.is_empty() {
-                            if !reasoning_started {
-                                reasoning_started = true;
-                                thinking_start_time = Some(std::time::Instant::now());
-                                tui::print_thinking_start();
-                            }
-                            tui::print_thinking_chunk(&display_text);
-                        }
-                    }
-                    openclaudia::pipeline::SseAction::ThinkingStart => {
-                        in_thinking_block = true;
-                        thinking_start_time = Some(std::time::Instant::now());
-                        tui::print_thinking_start();
-                    }
-                    openclaudia::pipeline::SseAction::ThinkingEnd => {
+            let json = serde_json::from_str::<serde_json::Value>(&sse.data)
+                .map_err(|error| format!("Malformed provider SSE event: {error}"))?;
+            terminal.observe(&json)?;
+            match openclaudia::pipeline::process_sse_event(
+                &json,
+                in_thinking_block,
+                &mut anthropic_accumulator,
+                tool_accumulator,
+            ) {
+                openclaudia::pipeline::SseAction::Text(text) => {
+                    if reasoning_started {
                         let elapsed = thinking_start_time
                             .map_or(0.0, |started| started.elapsed().as_secs_f64());
                         tui::print_thinking_end(elapsed);
-                        in_thinking_block = false;
+                        reasoning_started = false;
                         thinking_start_time = None;
                     }
-                    openclaudia::pipeline::SseAction::None => {}
+                    current_content.push_str(&text);
                 }
+                openclaudia::pipeline::SseAction::Thinking(text) => {
+                    tui::print_thinking_chunk(&text);
+                }
+                openclaudia::pipeline::SseAction::Reasoning(text) => {
+                    let display_text = openclaudia::pipeline::merge_reasoning_delta(
+                        current_reasoning_content,
+                        &text,
+                    );
+                    if !display_text.is_empty() {
+                        if !reasoning_started {
+                            reasoning_started = true;
+                            thinking_start_time = Some(std::time::Instant::now());
+                            tui::print_thinking_start();
+                        }
+                        tui::print_thinking_chunk(&display_text);
+                    }
+                }
+                openclaudia::pipeline::SseAction::ThinkingStart => {
+                    in_thinking_block = true;
+                    thinking_start_time = Some(std::time::Instant::now());
+                    tui::print_thinking_start();
+                }
+                openclaudia::pipeline::SseAction::ThinkingEnd => {
+                    let elapsed =
+                        thinking_start_time.map_or(0.0, |started| started.elapsed().as_secs_f64());
+                    tui::print_thinking_end(elapsed);
+                    in_thinking_block = false;
+                    thinking_start_time = None;
+                }
+                openclaudia::pipeline::SseAction::None => {}
             }
         }
         if reasoning_started {
@@ -3324,6 +3415,10 @@ impl ChatRepl {
                 thinking_start_time.map_or(0.0, |started| started.elapsed().as_secs_f64());
             tui::print_thinking_end(elapsed);
         }
+        let outcome = terminal.finish()?;
+        let tool_calls = tool_accumulator.finalize_checked()?;
+        openclaudia::pipeline::ensure_provider_turn_succeeded(outcome, tool_calls.len())?;
+        Ok(())
     }
 
     /// Execute a single tool call from the OpenAI-style loop (matches
@@ -3567,6 +3662,16 @@ struct InitialStreamResult {
 }
 
 // ── Free helpers (no `self`) used by ChatRepl methods ──
+
+fn display_partial_provider_response(content: &str) {
+    if content.trim().is_empty() {
+        return;
+    }
+    eprintln!(
+        "\n\x1b[33mPartial provider response (not saved to conversation history):\x1b[0m\n{}",
+        tools::safe_truncate(content, 4_000)
+    );
+}
 
 /// Resolve the REPL's provider adapter from `proxy.target`. Returns
 /// `None` (with an error printed to stderr) when the configured target

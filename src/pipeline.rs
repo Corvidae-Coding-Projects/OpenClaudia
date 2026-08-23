@@ -34,6 +34,121 @@ macro_rules! send_event {
     };
 }
 
+#[cfg(test)]
+mod provider_terminal_outcome_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn done_without_finish_reason_is_not_success() {
+        let mut terminal = ChatStreamTerminal::new("openai");
+        terminal
+            .observe(&json!({"choices": [{"delta": {"content": "partial"}}]}))
+            .expect("text delta is valid");
+        terminal.observe_done();
+
+        let error = terminal.finish().expect_err("terminal reason is required");
+        assert!(error.contains("without a valid terminal reason"), "{error}");
+    }
+
+    #[test]
+    fn valid_finish_reason_survives_transport_eof() {
+        let mut terminal = ChatStreamTerminal::new("openai-compatible");
+        terminal
+            .observe(&json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}]
+            }))
+            .expect("known terminal reason");
+
+        assert_eq!(
+            terminal.finish().expect("finish reason is terminal"),
+            ProviderTerminalOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn anthropic_requires_message_stop_after_stop_reason() {
+        let mut terminal = ChatStreamTerminal::new("anthropic");
+        terminal
+            .observe(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"}
+            }))
+            .expect("known stop reason");
+
+        let error = terminal.finish().expect_err("message_stop is required");
+        assert!(error.contains("before message_stop"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_message_stop_commits_normal_completion() {
+        let mut terminal = ChatStreamTerminal::new("anthropic");
+        terminal
+            .observe(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"}
+            }))
+            .expect("known stop reason");
+        terminal
+            .observe(&json!({"type": "message_stop"}))
+            .expect("message_stop");
+
+        assert_eq!(
+            terminal.finish().expect("complete Anthropic stream"),
+            ProviderTerminalOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn length_and_refusal_are_typed_non_success_outcomes() {
+        let mut length = ChatStreamTerminal::new("openai");
+        length
+            .observe(&json!({
+                "choices": [{"delta": {}, "finish_reason": "length"}]
+            }))
+            .expect("known length reason");
+        let outcome = length.finish().expect("typed terminal outcome");
+        assert_eq!(outcome, ProviderTerminalOutcome::LengthLimited);
+        assert!(ensure_provider_turn_succeeded(outcome, 0).is_err());
+
+        let mut refusal = ChatStreamTerminal::new("openai");
+        refusal
+            .observe(&json!({
+                "choices": [{
+                    "delta": {"refusal": "cannot comply"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .expect("refusal delta");
+        let outcome = refusal.finish().expect("typed terminal outcome");
+        assert_eq!(outcome, ProviderTerminalOutcome::Refused);
+        assert!(ensure_provider_turn_succeeded(outcome, 0).is_err());
+    }
+
+    #[test]
+    fn nonstream_chat_requires_terminal_reason_and_matching_tools() {
+        let missing = json!({
+            "choices": [{"message": {"role": "assistant", "content": "partial"}}]
+        });
+        assert!(validate_chat_completion_terminal(&missing).is_err());
+
+        let tool_turn = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": "call_1"}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        assert_eq!(
+            validate_chat_completion_terminal(&tool_turn).expect("matching tool terminal"),
+            ProviderTerminalOutcome::ToolCalls
+        );
+    }
+}
+
 /// Send an event to the TUI from a non-Result context (tool execution loop).
 /// Returns from the enclosing function with current results if channel is dead.
 macro_rules! send_event_or_break {
@@ -43,6 +158,268 @@ macro_rules! send_event_or_break {
             break;
         }
     };
+}
+
+/// Provider-authored terminal state for one completed model turn.
+///
+/// Text and reasoning deltas are provisional until one of these states has
+/// been decoded from the provider protocol. Only [`Self::Completed`] and
+/// [`Self::ToolCalls`] are successful application outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderTerminalOutcome {
+    /// The provider completed a normal assistant response.
+    Completed,
+    /// The provider completed the turn by requesting tools.
+    ToolCalls,
+    /// The provider stopped because its output limit was reached.
+    LengthLimited,
+    /// The provider explicitly refused the request.
+    Refused,
+    /// The provider filtered or suppressed the response.
+    ContentFiltered,
+}
+
+impl std::fmt::Display for ProviderTerminalOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Completed => "completed",
+            Self::ToolCalls => "tool_calls",
+            Self::LengthLimited => "length_limited",
+            Self::Refused => "refused",
+            Self::ContentFiltered => "content_filtered",
+        })
+    }
+}
+
+/// Require a provider terminal state that agrees with the decoded tool calls.
+///
+/// # Errors
+///
+/// Returns an error for refusal/filter/length outcomes or when the terminal
+/// reason disagrees with the response structure.
+pub fn ensure_provider_turn_succeeded(
+    outcome: ProviderTerminalOutcome,
+    tool_call_count: usize,
+) -> Result<(), String> {
+    match outcome {
+        ProviderTerminalOutcome::Completed if tool_call_count == 0 => Ok(()),
+        ProviderTerminalOutcome::Completed => Err(format!(
+            "Provider reported a normal completion but returned {tool_call_count} tool call(s)"
+        )),
+        ProviderTerminalOutcome::ToolCalls if tool_call_count > 0 => Ok(()),
+        ProviderTerminalOutcome::ToolCalls => {
+            Err("Provider reported tool calls but returned no complete tool call".to_string())
+        }
+        ProviderTerminalOutcome::LengthLimited => {
+            Err("Provider response stopped at its output limit".to_string())
+        }
+        ProviderTerminalOutcome::Refused => Err("Provider refused the request".to_string()),
+        ProviderTerminalOutcome::ContentFiltered => {
+            Err("Provider filtered the response".to_string())
+        }
+    }
+}
+
+fn classify_provider_finish_reason(
+    reason: &str,
+    refusal_observed: bool,
+) -> Result<ProviderTerminalOutcome, String> {
+    let normalized = reason.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "stop" | "end_turn" | "stop_sequence" if refusal_observed => {
+            Ok(ProviderTerminalOutcome::Refused)
+        }
+        "stop" | "end_turn" | "stop_sequence" => Ok(ProviderTerminalOutcome::Completed),
+        "tool_calls" | "tool_use" | "function_call" => Ok(ProviderTerminalOutcome::ToolCalls),
+        "length" | "max_tokens" | "model_context_window_exceeded" => {
+            Ok(ProviderTerminalOutcome::LengthLimited)
+        }
+        "refusal" | "refused" => Ok(ProviderTerminalOutcome::Refused),
+        "content_filter" | "content_filtered" | "safety" | "safety_blocked" | "recitation"
+        | "blocklist" => Ok(ProviderTerminalOutcome::ContentFiltered),
+        "" => Err("Provider emitted an empty terminal reason".to_string()),
+        _ => Err(format!(
+            "Provider emitted unknown terminal reason {reason:?}"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatStreamProtocol {
+    Anthropic,
+    OpenAiCompatible,
+}
+
+/// Shared terminal-state tracker for Anthropic and OpenAI-compatible chat SSE.
+///
+/// Frontends may render deltas while streaming, but must call [`Self::finish`]
+/// before committing them as assistant history or reporting success.
+#[derive(Debug)]
+pub struct ChatStreamTerminal {
+    protocol: ChatStreamProtocol,
+    outcome: Option<ProviderTerminalOutcome>,
+    refusal_observed: bool,
+    protocol_complete: bool,
+}
+
+impl ChatStreamTerminal {
+    #[must_use]
+    pub fn new(provider: &str) -> Self {
+        Self {
+            protocol: if provider.trim().eq_ignore_ascii_case("anthropic") {
+                ChatStreamProtocol::Anthropic
+            } else {
+                ChatStreamProtocol::OpenAiCompatible
+            },
+            outcome: None,
+            refusal_observed: false,
+            protocol_complete: false,
+        }
+    }
+
+    /// Observe an SSE `event:` name when the frontend parses frames manually.
+    /// Eventsource-based callers normally receive the equivalent JSON event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a provider error event is observed.
+    pub fn observe_event_name(&mut self, event: &str) -> Result<(), String> {
+        match event.trim() {
+            "message_stop" => {
+                self.protocol_complete = true;
+                Ok(())
+            }
+            "error" => Err("Provider emitted an SSE error event".to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Observe one decoded provider SSE data object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for provider error envelopes, unknown terminal reasons,
+    /// or contradictory terminal states.
+    pub fn observe(&mut self, json: &Value) -> Result<(), String> {
+        if let Some(error) = json.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+                .filter(|message| !message.is_empty())
+                .unwrap_or("provider stream error");
+            return Err(format!("Provider stream error: {message}"));
+        }
+
+        if let Some(event_type) = json.get("type").and_then(Value::as_str) {
+            match event_type {
+                "error" => return Err("Provider emitted an SSE error event".to_string()),
+                "message_stop" => self.protocol_complete = true,
+                "message_delta" => {
+                    if let Some(reason) = json
+                        .get("delta")
+                        .and_then(|delta| delta.get("stop_reason"))
+                        .and_then(Value::as_str)
+                    {
+                        let outcome =
+                            classify_provider_finish_reason(reason, self.refusal_observed)?;
+                        self.record_outcome(outcome)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(choice) = json
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        {
+            self.refusal_observed |= choice
+                .get("delta")
+                .and_then(|delta| delta.get("refusal"))
+                .and_then(Value::as_str)
+                .is_some_and(|refusal| !refusal.is_empty());
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                let outcome = classify_provider_finish_reason(reason, self.refusal_observed)?;
+                self.record_outcome(outcome)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark an OpenAI-compatible `[DONE]` sentinel.
+    pub fn observe_done(&mut self) {
+        if self.protocol == ChatStreamProtocol::OpenAiCompatible {
+            self.protocol_complete = true;
+        }
+    }
+
+    /// Return the validated provider terminal outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream ended without a terminal reason, or an
+    /// Anthropic stream omitted its required `message_stop` event.
+    pub fn finish(self) -> Result<ProviderTerminalOutcome, String> {
+        let outcome = self
+            .outcome
+            .ok_or_else(|| "Provider stream ended without a valid terminal reason".to_string())?;
+        if self.protocol == ChatStreamProtocol::Anthropic && !self.protocol_complete {
+            return Err("Anthropic stream ended before message_stop".to_string());
+        }
+        Ok(outcome)
+    }
+
+    fn record_outcome(&mut self, outcome: ProviderTerminalOutcome) -> Result<(), String> {
+        if let Some(previous) = self.outcome {
+            if previous != outcome {
+                return Err(format!(
+                    "Provider stream emitted contradictory terminal reasons: {previous} then {outcome}"
+                ));
+            }
+        } else {
+            self.outcome = Some(outcome);
+        }
+        Ok(())
+    }
+}
+
+/// Classify a complete OpenAI-compatible chat response.
+///
+/// # Errors
+///
+/// Returns an error when the first choice lacks a terminal reason, carries an
+/// unknown/non-success reason, or disagrees with its tool-call payload.
+pub fn validate_chat_completion_terminal(
+    response: &Value,
+) -> Result<ProviderTerminalOutcome, String> {
+    let choice = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| "Provider response is missing choices[0]".to_string())?;
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Provider response choices[0] is missing message".to_string())?;
+    let refusal_observed = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .is_some_and(|refusal| !refusal.is_empty());
+    let reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "Provider response choices[0] is missing a terminal finish_reason".to_string()
+        })?;
+    let outcome = classify_provider_finish_reason(reason, refusal_observed)?;
+    let tool_call_count = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    ensure_provider_turn_succeeded(outcome, tool_call_count)?;
+    Ok(outcome)
 }
 
 /// Outcome of a single conversation turn (one API round-trip + tool execution).
@@ -61,6 +438,8 @@ pub struct TurnResult {
     pub usage: TokenUsage,
     /// Whether the model returned tool calls that need a follow-up API call.
     pub needs_followup: bool,
+    /// Validated provider terminal state for this turn.
+    pub terminal_outcome: ProviderTerminalOutcome,
     /// Normalized finish reason surfaced to the caller, when the provider
     /// reports one. `None` for normal stop on streams that do not propagate
     /// a distinct termination cause through this layer.
@@ -1685,6 +2064,7 @@ pub struct ProviderNativeJsonDecodedTurn {
     pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
+    pub terminal_outcome: ProviderTerminalOutcome,
     pub finish_reason: Option<String>,
     pub provider_native_state: crate::runtime::ProviderNativeState,
 }
@@ -1696,6 +2076,9 @@ pub struct ProviderNativeJsonDecodedTurn {
 ///
 /// Returns an error for upstream error envelopes, malformed/incomplete native
 /// output, unsupported provider identity, or invalid continuation advancement.
+// Keeping both native protocols in one match makes their terminal-state
+// differences visible at the shared continuation boundary.
+#[allow(clippy::too_many_lines)]
 pub fn decode_provider_native_json_turn(
     provider: &str,
     model_identity: &str,
@@ -1729,6 +2112,13 @@ pub fn decode_provider_native_json_turn(
             )
             .map_err(|error| error.to_string())?;
             let classification = classify_google_finish_reason(response, content.len());
+            let finish_reason = classification.finish_reason.as_deref().ok_or_else(|| {
+                "Gemini response is missing candidates[0].finishReason".to_string()
+            })?;
+            let mut terminal_outcome = classify_provider_finish_reason(finish_reason, false)?;
+            if terminal_outcome == ProviderTerminalOutcome::Completed && !tool_calls.is_empty() {
+                terminal_outcome = ProviderTerminalOutcome::ToolCalls;
+            }
             let (input_tokens, output_tokens) = extract_google_usage(response);
             Ok(ProviderNativeJsonDecodedTurn {
                 content,
@@ -1740,6 +2130,7 @@ pub fn decode_provider_native_json_turn(
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },
+                terminal_outcome,
                 finish_reason: classification.finish_reason,
                 provider_native_state,
             })
@@ -1755,6 +2146,9 @@ pub fn decode_provider_native_json_turn(
             }
             let output = crate::providers::OllamaChatTurnOutput::new(response)
                 .map_err(|error| error.to_string())?;
+            if !output.done() {
+                return Err("Ollama response ended before done=true".to_string());
+            }
             let tool_calls = output
                 .tool_calls(assistant_message_ordinal)
                 .map_err(|error| error.to_string())?;
@@ -1778,6 +2172,11 @@ pub fn decode_provider_native_json_turn(
             } else {
                 Some("tool_calls".to_string())
             };
+            let terminal_outcome = if tool_calls.is_empty() {
+                classify_provider_finish_reason(finish_reason.as_deref().unwrap_or("stop"), false)?
+            } else {
+                ProviderTerminalOutcome::ToolCalls
+            };
             Ok(ProviderNativeJsonDecodedTurn {
                 content: output.text().to_string(),
                 reasoning_content: None,
@@ -1794,6 +2193,7 @@ pub fn decode_provider_native_json_turn(
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },
+                terminal_outcome,
                 finish_reason,
                 provider_native_state,
             })
@@ -1859,9 +2259,12 @@ async fn handle_provider_native_json_response(
         reasoning_content,
         tool_calls,
         usage,
+        terminal_outcome,
         finish_reason,
         provider_native_state,
     } = decoded;
+
+    ensure_provider_turn_succeeded(terminal_outcome, tool_calls.len())?;
 
     // Execute tool calls if any
     let (tool_results, needs_followup) = execute_tool_calls_for_tui(
@@ -1887,6 +2290,7 @@ async fn handle_provider_native_json_response(
         tool_results,
         usage,
         needs_followup,
+        terminal_outcome,
         finish_reason,
         provider_native_state: Some(provider_native_state),
     })
@@ -1987,11 +2391,14 @@ struct SseStreamParams<'a> {
     tx: &'a mpsc::Sender<AppEvent>,
 }
 
+// Streaming, terminal validation, and provisional rendering share one ordered
+// state machine; extracting a phase would obscure the commit boundary.
+#[allow(clippy::too_many_lines)]
 async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
         run_context,
         response,
-        headers: _,
+        headers,
         provider,
         model_identity,
         provider_native_state: _,
@@ -2016,6 +2423,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
     let mut tool_accumulator = ToolCallAccumulator::new();
     let mut anthropic_accumulator = AnthropicToolAccumulator::new();
     let mut stream_usage = TokenUsage::default();
+    let mut terminal = ChatStreamTerminal::new(provider);
     let mut in_thinking_block = false;
     let mut last_data_time = std::time::Instant::now();
     let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
@@ -2040,31 +2448,42 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
 
         last_data_time = std::time::Instant::now();
         if sse.data == "[DONE]" {
+            terminal.observe_done();
             break;
         }
-        if let Ok(json) = serde_json::from_str::<Value>(&sse.data) {
-            // Extract usage BEFORE the accumulator (both can process the same event)
-            if let Some(usage) = proxy::extract_usage_from_sse_event(&json) {
-                stream_usage.accumulate(&usage);
-            }
-
-            let action = process_sse_event(
-                &json,
-                in_thinking_block,
-                &mut anthropic_accumulator,
-                &mut tool_accumulator,
-            );
-            dispatch_sse_action(
-                action,
-                SseActionDispatch {
-                    full_content: &mut full_content,
-                    reasoning_content: &mut reasoning_content,
-                    in_thinking_block: &mut in_thinking_block,
-                    tx,
-                },
-            )?;
+        let json = serde_json::from_str::<Value>(&sse.data).map_err(|error| {
+            headers
+                .sanitize_diagnostic(&format!("Malformed provider SSE event: {error}"))
+                .to_string()
+        })?;
+        terminal
+            .observe(&json)
+            .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+        // Extract usage BEFORE the accumulator (both can process the same event)
+        if let Some(usage) = proxy::extract_usage_from_sse_event(&json) {
+            stream_usage.accumulate(&usage);
         }
+
+        let action = process_sse_event(
+            &json,
+            in_thinking_block,
+            &mut anthropic_accumulator,
+            &mut tool_accumulator,
+        );
+        dispatch_sse_action(
+            action,
+            SseActionDispatch {
+                full_content: &mut full_content,
+                reasoning_content: &mut reasoning_content,
+                in_thinking_block: &mut in_thinking_block,
+                tx,
+            },
+        )?;
     }
+
+    let terminal_outcome = terminal
+        .finish()
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
 
     finalize_sse_stream(SseFinalize {
         run_context,
@@ -2074,6 +2493,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         reasoning_content,
         tool_accumulator,
         anthropic_accumulator,
+        terminal_outcome,
         stream_usage,
         memory_db,
         app_config,
@@ -2142,6 +2562,7 @@ struct SseFinalize<'a> {
     reasoning_content: String,
     tool_accumulator: ToolCallAccumulator,
     anthropic_accumulator: AnthropicToolAccumulator,
+    terminal_outcome: ProviderTerminalOutcome,
     stream_usage: TokenUsage,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -2160,12 +2581,17 @@ struct SseFinalize<'a> {
 async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
     // Determine tool calls from the appropriate accumulator
     let tool_calls = if f.provider == "anthropic" && f.anthropic_accumulator.has_tool_use() {
-        f.anthropic_accumulator.finalize_tool_calls()
+        f.anthropic_accumulator.finalize_tool_calls_checked()?
     } else if f.tool_accumulator.has_tool_calls() {
-        f.tool_accumulator.finalize()
+        f.tool_accumulator.finalize_checked()?
+    } else if f.provider == "anthropic" {
+        f.anthropic_accumulator.finalize_tool_calls_checked()?
+    } else if !f.tool_accumulator.tool_calls.is_empty() {
+        f.tool_accumulator.finalize_checked()?
     } else {
         vec![]
     };
+    ensure_provider_turn_succeeded(f.terminal_outcome, tool_calls.len())?;
 
     // Execute tool calls if any
     let (tool_results, has_tools) = execute_tool_calls_for_tui(
@@ -2191,10 +2617,10 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
         tool_results,
         usage: f.stream_usage,
         needs_followup: has_tools,
-        // The SSE accumulators expose stop_reason internally but this
-        // layer does not currently surface it. Anthropic / OpenAI
-        // streams report `None`; only the Google JSON path populates
-        // this field today (crosslink #788).
+        terminal_outcome: f.terminal_outcome,
+        // The typed terminal outcome above carries the normalized state.
+        // This legacy string field remains `None` for Anthropic/OpenAI SSE;
+        // only the native JSON path populates it today (crosslink #788).
         finish_reason: None,
         provider_native_state: None,
     })
@@ -2462,6 +2888,67 @@ fn responses_visible_output_text(output_items: &[Value]) -> Result<String, Strin
     Ok(text)
 }
 
+fn responses_contains_refusal(output_items: &[Value]) -> Result<bool, String> {
+    for (item_index, item) in output_items.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let content = item
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!("Responses message output item {item_index} is missing content array")
+            })?;
+        if content.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("refusal")
+                && part
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .is_some_and(|refusal| !refusal.is_empty())
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Validate the terminal state of a complete, non-streaming Responses object.
+///
+/// # Errors
+///
+/// Returns an error when `status` is not `completed`, output is malformed, or
+/// the response represents refusal rather than a successful terminal turn.
+pub fn validate_openai_responses_terminal_json(
+    response: &Value,
+) -> Result<ProviderTerminalOutcome, String> {
+    if response.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err(format!(
+            "Responses request did not complete successfully (status={:?})",
+            response.get("status").and_then(Value::as_str)
+        ));
+    }
+    let output_items = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Responses completed response is missing output array".to_string())?;
+    let refusal_observed = responses_contains_refusal(output_items)?;
+    let mut tool_call_count = 0_usize;
+    for item in output_items {
+        if parse_responses_function_call(item)?.is_some() {
+            tool_call_count = tool_call_count.saturating_add(1);
+        }
+    }
+    let outcome = if refusal_observed {
+        ProviderTerminalOutcome::Refused
+    } else if tool_call_count > 0 {
+        ProviderTerminalOutcome::ToolCalls
+    } else {
+        ProviderTerminalOutcome::Completed
+    };
+    ensure_provider_turn_succeeded(outcome, tool_call_count)?;
+    Ok(outcome)
+}
+
 fn process_responses_sse_event(json: &Value) -> Result<ResponsesSseAction, String> {
     match json.get("type").and_then(Value::as_str).unwrap_or_default() {
         "response.created" => {
@@ -2591,13 +3078,21 @@ fn finalize_responses_capture(
     model_identity: &str,
     provider_native_state: Option<&crate::runtime::ProviderNativeState>,
     assistant_message_ordinal: u64,
-) -> Result<(crate::runtime::ProviderNativeState, Vec<ToolCall>), String> {
+) -> Result<
+    (
+        crate::runtime::ProviderNativeState,
+        Vec<ToolCall>,
+        ProviderTerminalOutcome,
+    ),
+    String,
+> {
     if !capture.completed {
         return Err("Responses stream ended before response.completed".to_string());
     }
     let response_id = capture
         .response_id
         .ok_or_else(|| "Responses completed without a response id".to_string())?;
+    let refusal_observed = responses_contains_refusal(&capture.output_items)?;
     let provider_output =
         crate::providers::OpenAiResponsesTurnOutput::new(response_id, capture.output_items)?;
     let next_provider_state = crate::providers::advance_openai_responses_state(
@@ -2621,7 +3116,14 @@ fn finalize_responses_capture(
             tool_calls.push(call);
         }
     }
-    Ok((next_provider_state, tool_calls))
+    let terminal_outcome = if refusal_observed {
+        ProviderTerminalOutcome::Refused
+    } else if tool_calls.is_empty() {
+        ProviderTerminalOutcome::Completed
+    } else {
+        ProviderTerminalOutcome::ToolCalls
+    };
+    Ok((next_provider_state, tool_calls, terminal_outcome))
 }
 
 /// Inputs for the shared bounded `OpenAI` Responses stream decoder.
@@ -2649,6 +3151,7 @@ pub struct OpenAiResponsesDecodedTurn {
     pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
+    pub terminal_outcome: ProviderTerminalOutcome,
     pub provider_native_state: crate::runtime::ProviderNativeState,
 }
 
@@ -2745,7 +3248,7 @@ pub async fn decode_openai_responses_stream(
         );
     }
 
-    let (next_provider_state, tool_calls) = finalize_responses_capture(
+    let (next_provider_state, tool_calls, terminal_outcome) = finalize_responses_capture(
         capture,
         provider,
         model_identity,
@@ -2759,6 +3262,7 @@ pub async fn decode_openai_responses_stream(
         reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
         tool_calls,
         usage: stream_usage,
+        terminal_outcome,
         provider_native_state: next_provider_state,
     })
 }
@@ -2828,8 +3332,11 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         reasoning_content,
         tool_calls,
         usage,
+        terminal_outcome,
         provider_native_state: next_provider_state,
     } = decoded;
+
+    ensure_provider_turn_succeeded(terminal_outcome, tool_calls.len())?;
 
     let (tool_results, needs_followup) = execute_tool_calls_for_tui(
         run_context,
@@ -2853,6 +3360,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         tool_results,
         usage,
         needs_followup,
+        terminal_outcome,
         finish_reason: None,
         provider_native_state: Some(next_provider_state),
     })
@@ -4899,7 +5407,7 @@ memory:
             decode_provider_native_json_turn("ollama", "qwen3", &incomplete_ollama, None, 1)
                 .err()
                 .expect("incomplete Ollama output cannot advance continuation");
-        assert!(error.contains("incomplete response"), "{error}");
+        assert!(error.contains("before done=true"), "{error}");
     }
 
     #[test]

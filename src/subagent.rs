@@ -1739,7 +1739,7 @@ fn validate_and_render_subagent_final_response(
     model_identity: &str,
 ) -> Result<String, String> {
     if final_output.trim().is_empty() {
-        return Ok(String::new());
+        return Err("Provider completed the child turn without assistant content".to_string());
     }
     crate::grounded_loop::validate_and_render_agentic_final_response(
         run,
@@ -3199,7 +3199,7 @@ async fn make_openai_responses_api_call_impl(
             headers.sanitize_diagnostic(&body)
         ));
     }
-    crate::pipeline::decode_openai_responses_stream(
+    let decoded = crate::pipeline::decode_openai_responses_stream(
         crate::pipeline::OpenAiResponsesStreamParams {
             response,
             headers: &headers,
@@ -3212,7 +3212,12 @@ async fn make_openai_responses_api_call_impl(
         |_| Ok(()),
         |_, _| Ok(()),
     )
-    .await
+    .await?;
+    crate::pipeline::ensure_provider_turn_succeeded(
+        decoded.terminal_outcome,
+        decoded.tool_calls.len(),
+    )?;
+    Ok(decoded)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3259,14 +3264,19 @@ async fn make_provider_native_json_api_call(
     )
     .await
     .map_err(|error| format!("Provider JSON error: {error}"))?;
-    crate::pipeline::decode_provider_native_json_turn(
+    let decoded = crate::pipeline::decode_provider_native_json_turn(
         provider,
         model,
         &response,
         provider_native_state,
         assistant_message_ordinal,
     )
-    .map_err(|error| headers.sanitize_diagnostic(&error).to_string())
+    .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+    crate::pipeline::ensure_provider_turn_succeeded(
+        decoded.terminal_outcome,
+        decoded.tool_calls.len(),
+    )?;
+    Ok(decoded)
 }
 
 /// Make an API call to the LLM provider.
@@ -3362,9 +3372,11 @@ async fn make_api_call(
     // Translate provider-native response back to OpenAI chat shape so
     // `parse_response` (which expects `choices[0].message`) keeps
     // working unchanged for every provider.
-    adapter
+    let transformed = adapter
         .transform_response(json, false)
-        .map_err(|e| format!("Adapter transform_response failed: {e}"))
+        .map_err(|e| format!("Adapter transform_response failed: {e}"))?;
+    crate::pipeline::validate_chat_completion_terminal(&transformed)?;
+    Ok(transformed)
 }
 
 /// Parse the response to extract the assistant message
@@ -5732,6 +5744,7 @@ memory:
                 },
             }],
             usage: crate::session::TokenUsage::default(),
+            terminal_outcome: crate::pipeline::ProviderTerminalOutcome::ToolCalls,
             provider_native_state: responses_test_state(),
         };
 

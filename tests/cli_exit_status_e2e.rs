@@ -735,7 +735,7 @@ fn unused_loopback_port() -> u16 {
 
 fn spawn_local_sse_server_rejecting_auth() -> (JoinHandle<Result<(), String>>, String) {
     spawn_local_sse_server_rejecting_auth_with_body(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"local ok\"}}]}\n\ndata: [DONE]\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"local ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
     )
 }
 
@@ -1799,7 +1799,9 @@ fn print_rejects_malformed_sse_data_instead_of_succeeding_empty() {
 fn print_rejects_sse_stream_without_printable_text() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
-    let (server, base_url) = spawn_local_sse_server_rejecting_auth_with_body("data: [DONE]\n\n");
+    let (server, base_url) = spawn_local_sse_server_rejecting_auth_with_body(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    );
     write_local_provider_config_with_base_url(&cwd, &base_url);
 
     let output = isolated_command(&cwd, &home)

@@ -191,6 +191,7 @@ fn responses_usage_from_json(json: &Value) -> TokenUsage {
 fn responses_text_from_sse(raw: &str) -> Result<(String, TokenUsage), VddError> {
     let mut text = String::new();
     let mut usage = TokenUsage::default();
+    let mut completed = false;
     for line in raw.lines() {
         let Some(data) = line.trim_start().strip_prefix("data:") else {
             continue;
@@ -210,6 +211,14 @@ fn responses_text_from_sse(raw: &str) -> Result<(String, TokenUsage), VddError> 
             }
             "response.completed" => {
                 if let Some(response) = json.get("response") {
+                    crate::pipeline::validate_openai_responses_terminal_json(response).map_err(
+                        |error| {
+                            VddError::AdversaryRequestFailed(format!(
+                                "responses terminal validation: {error}"
+                            ))
+                        },
+                    )?;
+                    completed = true;
                     usage.accumulate(&responses_usage_from_json(response));
                     if text.is_empty() {
                         if let Some(final_text) = responses_text_from_json(response) {
@@ -235,7 +244,31 @@ fn responses_text_from_sse(raw: &str) -> Result<(String, TokenUsage), VddError> 
             _ => {}
         }
     }
+    if !completed {
+        return Err(VddError::AdversaryRequestFailed(
+            "Responses stream ended before response.completed".to_string(),
+        ));
+    }
+    if text.trim().is_empty() {
+        return Err(VddError::AdversaryRequestFailed(
+            "Responses verifier completed without assistant content".to_string(),
+        ));
+    }
     Ok((text, usage))
+}
+
+fn validate_vdd_chat_terminal(
+    adapter: &dyn ProviderAdapter,
+    response: &Value,
+) -> Result<(), String> {
+    let normalized = adapter
+        .transform_response(response.clone(), false)
+        .map_err(|error| format!("provider response transform failed: {error}"))?;
+    let terminal = crate::pipeline::validate_chat_completion_terminal(&normalized)?;
+    if terminal != crate::pipeline::ProviderTerminalOutcome::Completed {
+        return Err("VDD provider requested tools in a no-tools verification turn".to_string());
+    }
+    Ok(())
 }
 
 async fn send_to_codex_responses(
@@ -323,10 +356,16 @@ async fn send_to_codex_responses(
     }
     let json = serde_json::from_slice::<Value>(&raw)
         .map_err(|e| VddError::AdversaryRequestFailed(format!("responses JSON decode: {e}")))?;
-    Ok((
-        responses_text_from_json(&json).unwrap_or_default(),
-        responses_usage_from_json(&json),
-    ))
+    crate::pipeline::validate_openai_responses_terminal_json(&json).map_err(|error| {
+        VddError::AdversaryRequestFailed(format!("responses terminal validation: {error}"))
+    })?;
+    let text = responses_text_from_json(&json).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(VddError::AdversaryRequestFailed(
+            "Responses verifier completed without assistant content".to_string(),
+        ));
+    }
+    Ok((text, responses_usage_from_json(&json)))
 }
 
 fn adversary_headers_and_endpoint(
@@ -469,6 +508,8 @@ pub async fn send_to_adversary(
         elapsed_secs: timeout_secs,
     })?
     .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
+    validate_vdd_chat_terminal(adapter, &response_json)
+        .map_err(VddError::AdversaryRequestFailed)?;
 
     // Crosslink #479: route extraction through the ProviderAdapter trait
     // so provider-specific response shapes (Gemini, Ollama, Anthropic) are
@@ -478,6 +519,11 @@ pub async fn send_to_adversary(
     let text = adapter
         .extract_response_text(&response_json)
         .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(VddError::AdversaryRequestFailed(
+            "Adversary completed without assistant content".to_string(),
+        ));
+    }
     let tokens = adapter
         .extract_token_usage(&response_json)
         .unwrap_or_default();
@@ -610,11 +656,17 @@ pub async fn send_to_builder(
         elapsed_secs: timeout_secs,
     })?
     .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
+    validate_vdd_chat_terminal(adapter, &response_json).map_err(VddError::BuilderRevisionFailed)?;
 
     // Crosslink #479: trait dispatch instead of hardcoded shape matching.
     let text = adapter
         .extract_response_text(&response_json)
         .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(VddError::BuilderRevisionFailed(
+            "Builder completed without assistant content".to_string(),
+        ));
+    }
     let tokens = adapter
         .extract_token_usage(&response_json)
         .unwrap_or_default();
@@ -721,11 +773,19 @@ pub async fn send_to_builder_for_verification(
         elapsed_secs: timeout_secs,
     })?
     .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier response: {e}")))?;
+    validate_vdd_chat_terminal(adapter, &response_json).map_err(|error| {
+        VddError::AdversaryRequestFailed(format!("verifier terminal validation: {error}"))
+    })?;
 
     // Crosslink #479: trait dispatch instead of hardcoded shape matching.
     let text = adapter
         .extract_response_text(&response_json)
         .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(VddError::AdversaryRequestFailed(
+            "Verifier completed without assistant content".to_string(),
+        ));
+    }
     let tokens = adapter
         .extract_token_usage(&response_json)
         .unwrap_or_default();
@@ -756,6 +816,32 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn responses_verifier_requires_completed_terminal_event() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
+            "data: [DONE]\n"
+        );
+        let error = responses_text_from_sse(raw).expect_err("missing completion must fail");
+        assert!(
+            error.to_string().contains("before response.completed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn responses_verifier_rejects_refusal_as_success() {
+        let raw = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{",
+            "\"type\":\"message\",\"content\":[{",
+            "\"type\":\"refusal\",\"refusal\":\"cannot comply\"}]}]}}\n",
+            "data: [DONE]\n"
+        );
+        let error = responses_text_from_sse(raw).expect_err("refusal must fail");
+        assert!(error.to_string().contains("refused"), "{error}");
     }
 
     fn app_cfg_with_provider(provider: &str, base_url: &str) -> AppConfig {

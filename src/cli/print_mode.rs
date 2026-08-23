@@ -24,14 +24,16 @@ struct PrintSseState {
     anthropic_accumulator: openclaudia::tools::AnthropicToolAccumulator,
     tool_accumulator: openclaudia::tools::ToolCallAccumulator,
     in_thinking_block: bool,
+    terminal: openclaudia::pipeline::ChatStreamTerminal,
 }
 
 impl PrintSseState {
-    const fn new() -> Self {
+    fn new(provider: &str) -> Self {
         Self {
             anthropic_accumulator: openclaudia::tools::AnthropicToolAccumulator::new(),
             tool_accumulator: openclaudia::tools::ToolCallAccumulator::new(),
             in_thinking_block: false,
+            terminal: openclaudia::pipeline::ChatStreamTerminal::new(provider),
         }
     }
 }
@@ -185,10 +187,12 @@ fn extract_print_sse_line(line: &str, state: &mut PrintSseState) -> anyhow::Resu
         return Ok(None);
     };
     if data == "[DONE]" {
+        state.terminal.observe_done();
         return Ok(None);
     }
     let json = serde_json::from_str::<serde_json::Value>(data)
         .map_err(|e| anyhow::anyhow!("invalid SSE data JSON: {e}"))?;
+    state.terminal.observe(&json).map_err(anyhow::Error::msg)?;
     Ok(extract_print_sse_text(&json, state))
 }
 
@@ -212,6 +216,14 @@ async fn print_json_response(
         openclaudia::provider_transport::MAX_JSON_RESPONSE_BYTES,
     )
     .await?;
+    let normalized = adapter
+        .transform_response(body.clone(), false)
+        .map_err(|error| anyhow::anyhow!("provider response transform failed: {error}"))?;
+    let terminal = openclaudia::pipeline::validate_chat_completion_terminal(&normalized)
+        .map_err(anyhow::Error::msg)?;
+    if terminal != openclaudia::pipeline::ProviderTerminalOutcome::Completed {
+        anyhow::bail!("provider requested tools in no-tools print mode");
+    }
     let text = adapter.extract_response_text(&body).ok_or_else(|| {
         anyhow::anyhow!("provider response did not contain printable assistant text")
     })?;
@@ -219,28 +231,50 @@ async fn print_json_response(
     Ok(())
 }
 
-async fn print_sse_response(response: reqwest::Response) -> anyhow::Result<()> {
+async fn print_sse_response(response: reqwest::Response, provider: &str) -> anyhow::Result<()> {
     let mut stream = openclaudia::provider_transport::bounded_byte_stream(
         response,
         openclaudia::provider_transport::MAX_STREAM_RESPONSE_BYTES,
     )
     .eventsource();
-    let mut state = PrintSseState::new();
+    let mut state = PrintSseState::new(provider);
     let mut emitted_text = false;
 
     while let Some(event) = stream.next().await {
         let event = event.map_err(|err| anyhow::anyhow!("SSE stream error: {err}"))?;
         if event.data == "[DONE]" {
+            state.terminal.observe_done();
             break;
         }
         let json = serde_json::from_str::<serde_json::Value>(&event.data)
             .map_err(|err| anyhow::anyhow!("invalid SSE data JSON: {err}"))?;
+        state.terminal.observe(&json).map_err(anyhow::Error::msg)?;
         if let Some(text) = extract_print_sse_text(&json, &mut state) {
             emitted_text |= !text.is_empty();
             print!("{text}");
             std::io::stdout().flush()?;
         }
     }
+
+    let tool_call_count = if provider.eq_ignore_ascii_case("anthropic") {
+        state
+            .anthropic_accumulator
+            .finalize_tool_calls_checked()
+            .map_err(anyhow::Error::msg)?
+            .len()
+    } else {
+        state
+            .tool_accumulator
+            .finalize_checked()
+            .map_err(anyhow::Error::msg)?
+            .len()
+    };
+    let terminal = state.terminal.finish().map_err(anyhow::Error::msg)?;
+    if tool_call_count > 0 {
+        anyhow::bail!("provider returned {tool_call_count} tool call(s) to no-tools print mode");
+    }
+    openclaudia::pipeline::ensure_provider_turn_succeeded(terminal, tool_call_count)
+        .map_err(anyhow::Error::msg)?;
 
     if !emitted_text {
         anyhow::bail!("provider stream did not contain printable assistant text");
@@ -291,6 +325,11 @@ async fn print_responses_stream(
             decoded.tool_calls.len()
         );
     }
+    openclaudia::pipeline::ensure_provider_turn_succeeded(
+        decoded.terminal_outcome,
+        decoded.tool_calls.len(),
+    )
+    .map_err(anyhow::Error::msg)?;
     if decoded.content.is_empty() {
         anyhow::bail!("Responses stream did not contain printable assistant text");
     }
@@ -495,7 +534,7 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     } else if response_is_json(&response) {
         print_json_response(response, adapter).await
     } else {
-        print_sse_response(response).await
+        print_sse_response(response, &config.proxy.target).await
     }
 }
 
@@ -547,7 +586,7 @@ mod tests {
 
     #[test]
     fn print_sse_extracts_openai_text_delta() {
-        let mut state = PrintSseState::new();
+        let mut state = PrintSseState::new("openai");
         let json = json!({"choices": [{"delta": {"content": "hello"}}]});
         assert_eq!(
             extract_print_sse_text(&json, &mut state),
@@ -557,7 +596,7 @@ mod tests {
 
     #[test]
     fn print_sse_extracts_anthropic_text_delta() {
-        let mut state = PrintSseState::new();
+        let mut state = PrintSseState::new("anthropic");
         let json = json!({
             "type": "content_block_delta",
             "delta": {"type": "text_delta", "text": "world"}
@@ -570,7 +609,7 @@ mod tests {
 
     #[test]
     fn print_sse_suppresses_thinking_deltas() {
-        let mut state = PrintSseState::new();
+        let mut state = PrintSseState::new("anthropic");
         let start = json!({
             "type": "content_block_start",
             "content_block": {"type": "thinking"}
@@ -589,7 +628,7 @@ mod tests {
 
     #[test]
     fn print_sse_suppresses_openai_reasoning_delta() {
-        let mut state = PrintSseState::new();
+        let mut state = PrintSseState::new("openai");
         let json = json!({"choices": [{"delta": {"reasoning_content": "private"}}]});
         assert_eq!(extract_print_sse_text(&json, &mut state), None);
     }
@@ -666,7 +705,7 @@ mod tests {
 
     #[test]
     fn print_sse_line_rejects_malformed_data_json() {
-        let mut state = PrintSseState::new();
+        let mut state = PrintSseState::new("openai");
         let err = extract_print_sse_line("data: {not valid json}", &mut state).unwrap_err();
         assert!(
             err.to_string().contains("invalid SSE data JSON"),

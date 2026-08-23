@@ -1600,8 +1600,7 @@ impl App {
             }
             Ok(AppEvent::ResponseDone) => self.handle_response_done(),
             Ok(AppEvent::ApiError(msg)) => {
-                self.messages.finish_streaming();
-                self.streaming_raw_text.clear();
+                self.preserve_failed_stream_for_display();
                 self.messages
                     .add(DisplayMessage::error(format!("Error: {msg}")));
                 self.is_waiting = false;
@@ -1775,6 +1774,19 @@ impl App {
         let _ = self.chat_session.refresh_estimated_tokens();
         self.persist_session();
         self.fire_stop_hook();
+    }
+
+    fn preserve_failed_stream_for_display(&mut self) {
+        let partial = std::mem::take(&mut self.streaming_raw_text);
+        self.messages.finish_thinking();
+        self.messages.finish_streaming();
+        if partial.trim().is_empty() {
+            return;
+        }
+        self.messages.add(DisplayMessage::system(format!(
+            "Partial provider response (not saved to conversation history):\n{}",
+            crate::tools::safe_truncate(&partial, 4_000)
+        )));
     }
 
     fn prepare_streaming_final_for_display(&mut self) {
@@ -4463,7 +4475,7 @@ async fn run_agentic_loop(
     ctx: &AgenticCtx<'_>,
     session_messages: &mut Vec<serde_json::Value>,
     provider_native_state: &mut Option<crate::runtime::ProviderNativeState>,
-) {
+) -> Result<(), String> {
     const MAX_ITER: u32 = 25;
     let mut iteration = 0u32;
     loop {
@@ -4475,7 +4487,7 @@ async fn run_agentic_loop(
                 super::events::AppEvent::ApiError("Reached maximum tool iterations (25)".into()),
                 ctx.session_id,
             );
-            break;
+            return Err("Reached maximum tool iterations (25)".to_string());
         }
         let request_messages = match request_messages_with_grounding(
             ctx.run_context,
@@ -4488,10 +4500,10 @@ async fn run_agentic_loop(
                 tracing::error!(error = %e, "Failed to build grounded agentic follow-up request");
                 send_or_warn(
                     ctx.tx,
-                    super::events::AppEvent::ApiError(e.into()),
+                    super::events::AppEvent::ApiError(e.clone().into()),
                     ctx.session_id,
                 );
-                break;
+                return Err(e);
             }
         };
         if !check_provider_request_policy_for_messages(
@@ -4502,7 +4514,7 @@ async fn run_agentic_loop(
             ctx.tx,
             ctx.session_id,
         ) {
-            break;
+            return Err("Provider request blocked by policy".to_string());
         }
         let body = match build_request_with_live_mcp(LiveMcpRequest {
             run: ctx.run_context,
@@ -4523,10 +4535,10 @@ async fn run_agentic_loop(
                 tracing::error!(error = %e, "Failed to build agentic follow-up request");
                 send_or_warn(
                     ctx.tx,
-                    super::events::AppEvent::ApiError(e.into()),
+                    super::events::AppEvent::ApiError(e.clone().into()),
                     ctx.session_id,
                 );
-                break;
+                return Err(e);
             }
         };
         let assistant_message_ordinal =
@@ -4535,10 +4547,10 @@ async fn run_agentic_loop(
                 Err(error) => {
                     send_or_warn(
                         ctx.tx,
-                        super::events::AppEvent::ApiError(error.into()),
+                        super::events::AppEvent::ApiError(error.clone().into()),
                         ctx.session_id,
                     );
-                    break;
+                    return Err(error);
                 }
             };
         match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
@@ -4579,10 +4591,10 @@ async fn run_agentic_loop(
                     Err(error) => {
                         send_or_warn(
                             ctx.tx,
-                            super::events::AppEvent::ApiError(error.into()),
+                            super::events::AppEvent::ApiError(error.clone().into()),
                             ctx.session_id,
                         );
-                        break;
+                        return Err(error);
                     }
                 };
                 if followup.needs_followup {
@@ -4600,54 +4612,57 @@ async fn run_agentic_loop(
                         .reasoning_content
                         .as_deref()
                         .filter(|text| !text.is_empty());
-                    if !followup.content.is_empty()
-                        || reasoning.is_some()
-                        || next_provider_state.is_some()
-                    {
-                        let rendered_content = match render_final_response_for_history(
-                            ctx.run_context,
+                    if followup.content.is_empty() {
+                        let error = "Provider completed the follow-up without assistant content";
+                        send_or_warn(
+                            ctx.tx,
+                            super::events::AppEvent::ApiError(error.into()),
                             ctx.session_id,
-                            &followup.content,
-                            ctx.model,
-                        ) {
-                            Ok(rendered) => rendered,
-                            Err(reason) => {
-                                send_or_warn(
-                                    ctx.tx,
-                                    super::events::AppEvent::ApiError(
-                                        format!("Final answer failed grounding gate: {reason}")
-                                            .into(),
-                                    ),
-                                    ctx.session_id,
-                                );
-                                break;
-                            }
-                        };
-                        let mut message = serde_json::json!({
-                            "role": "assistant",
-                            "content": rendered_content
-                        });
-                        if let Some(reasoning) = reasoning {
-                            message["reasoning_content"] =
-                                serde_json::Value::String(reasoning.to_string());
-                        }
-                        session_messages.push(message);
-                        *provider_native_state = next_provider_state;
+                        );
+                        return Err(error.to_string());
                     }
-                    break;
+                    let rendered_content = match render_final_response_for_history(
+                        ctx.run_context,
+                        ctx.session_id,
+                        &followup.content,
+                        ctx.model,
+                    ) {
+                        Ok(rendered) => rendered,
+                        Err(reason) => {
+                            send_or_warn(
+                                ctx.tx,
+                                super::events::AppEvent::ApiError(
+                                    format!("Final answer failed grounding gate: {reason}").into(),
+                                ),
+                                ctx.session_id,
+                            );
+                            return Err(format!("Final answer failed grounding gate: {reason}"));
+                        }
+                    };
+                    let mut message = serde_json::json!({
+                        "role": "assistant",
+                        "content": rendered_content
+                    });
+                    if let Some(reasoning) = reasoning {
+                        message["reasoning_content"] =
+                            serde_json::Value::String(reasoning.to_string());
+                    }
+                    session_messages.push(message);
+                    *provider_native_state = next_provider_state;
+                    return Ok(());
                 }
             }
             Err(e) => {
                 tracing::error!(error = %e, "Agentic follow-up failed");
                 send_or_warn(
                     ctx.tx,
-                    super::events::AppEvent::ApiError(e.into()),
+                    super::events::AppEvent::ApiError(e.clone().into()),
                     ctx.session_id,
                 );
                 // The caller's `SyncSession` send after the loop will trigger
                 // recovery persistence if the channel is closed — no extra
                 // action needed here for partial-state capture.
-                break;
+                return Err(e);
             }
         }
     }
@@ -4904,6 +4919,13 @@ async fn handle_turn_result(
     session_messages: Vec<serde_json::Value>,
     ctx: TurnContext<'_>,
 ) {
+    if let Err(error) = crate::pipeline::ensure_provider_turn_succeeded(
+        turn_result.terminal_outcome,
+        turn_result.tool_calls.len(),
+    ) {
+        send_api_error(ctx.tx, error, ctx.session_id);
+        return;
+    }
     tracing::debug!(
         content_len = turn_result.content.len(),
         tool_calls = turn_result.tool_calls.len(),
@@ -4912,15 +4934,12 @@ async fn handle_turn_result(
     );
     if turn_result.needs_followup {
         handle_followup_turn(turn_result, session_messages, &ctx).await;
-    } else if !turn_result.content.is_empty()
-        || turn_result.reasoning_content.is_some()
-        || turn_result.provider_native_state.is_some()
-    {
+    } else if !turn_result.content.is_empty() {
         handle_direct_turn(turn_result, session_messages, &ctx).await;
     } else {
-        send_or_warn(
+        send_api_error(
             ctx.tx,
-            super::events::AppEvent::ResponseDone,
+            "Provider returned no assistant content or tool calls".to_string(),
             ctx.session_id,
         );
     }
@@ -4978,7 +4997,20 @@ async fn handle_followup_turn(
         task_obs: ctx.task_obs,
         tx: ctx.tx,
     };
-    run_agentic_loop(&agentic, &mut session_messages, &mut provider_native_state).await;
+    let loop_outcome =
+        run_agentic_loop(&agentic, &mut session_messages, &mut provider_native_state).await;
+    if loop_outcome.is_err() {
+        send_or_warn(
+            ctx.tx,
+            super::events::AppEvent::SyncSession {
+                session_id: ctx.session_id.to_string(),
+                messages: session_messages,
+                provider_native_state,
+            },
+            ctx.session_id,
+        );
+        return;
+    }
     if let Some(content) = latest_assistant_message_content(&session_messages).map(str::to_string) {
         run_tui_vdd_review(ctx, &content, &mut session_messages).await;
     }
@@ -5027,11 +5059,6 @@ async fn handle_direct_turn(
                 super::events::AppEvent::ApiError(
                     format!("Final answer failed grounding gate: {reason}").into(),
                 ),
-                ctx.session_id,
-            );
-            send_or_warn(
-                ctx.tx,
-                super::events::AppEvent::ResponseDone,
                 ctx.session_id,
             );
             return;
@@ -5745,6 +5772,7 @@ mod tests {
             tool_results: Vec::new(),
             usage: crate::session::TokenUsage::default(),
             needs_followup: false,
+            terminal_outcome: crate::pipeline::ProviderTerminalOutcome::Completed,
             finish_reason: None,
             provider_native_state: None,
         }

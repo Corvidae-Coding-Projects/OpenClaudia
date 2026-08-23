@@ -477,7 +477,7 @@ impl ProviderAdapter for AnthropicAdapter {
         let id = require_nonempty_str(&response, "id")?.to_string();
         let model = require_nonempty_str(&response, "model")?.to_string();
         let stop_reason_str = require_str(&response, "stop_reason")?;
-        let finish_reason = map_stop_reason(stop_reason_str);
+        let finish_reason = map_stop_reason(stop_reason_str)?;
 
         let content_arr = response
             .get("content")
@@ -668,17 +668,20 @@ fn require_nonempty_str<'a>(response: &'a Value, field: &str) -> Result<&'a str,
 }
 
 /// Map Anthropic `stop_reason` to the `OpenAI` `finish_reason` vocabulary.
-fn map_stop_reason(stop_reason: &str) -> &'static str {
+fn map_stop_reason(stop_reason: &str) -> Result<&'static str, ProviderError> {
     match stop_reason {
-        "tool_use" => "tool_calls",
-        "max_tokens" => "length",
-        "end_turn" | "stop_sequence" => "stop",
+        "tool_use" => Ok("tool_calls"),
+        "max_tokens" | "model_context_window_exceeded" => Ok("length"),
+        "end_turn" | "stop_sequence" => Ok("stop"),
+        "refusal" => Ok("refusal"),
         other => {
             warn!(
                 stop_reason = other,
-                "Unknown Anthropic stop_reason; mapping to 'stop' (crosslink #413)"
+                "Unknown Anthropic stop_reason; rejecting ambiguous terminal state"
             );
-            "stop"
+            Err(ProviderError::InvalidResponse(format!(
+                "Unknown Anthropic stop_reason {other:?}"
+            )))
         }
     }
 }

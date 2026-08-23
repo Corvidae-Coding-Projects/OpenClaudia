@@ -2081,6 +2081,7 @@ impl AcpServer {
                         "agent_message_chunk",
                         &json!({"type": "text", "text": msg}),
                     );
+                    self.record_failed_prompt_turn(&msg);
                     return "error".to_string();
                 }
             }
@@ -2101,220 +2102,205 @@ impl AcpServer {
         acp_session_id: &str,
         response: reqwest::Response,
     ) -> StreamResult {
+        use eventsource_stream::Eventsource as _;
         use futures::StreamExt;
 
         let mut stream = crate::provider_transport::bounded_byte_stream(
             response,
             crate::provider_transport::MAX_STREAM_RESPONSE_BYTES,
-        );
-        let mut buffer = String::new();
+        )
+        .eventsource();
         let mut full_content = String::new();
         let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
-
-        // Track partial tool call state
         let mut current_tool_index: Option<usize> = None;
+        let mut terminal = crate::pipeline::ChatStreamTerminal::new(&self.config.proxy.target);
+        let stream_timeout = std::time::Duration::from_secs(crate::proxy::SSE_STREAM_TIMEOUT_SECS);
 
-        while let Some(chunk_result) = stream.next().await {
+        loop {
             if self.cancel_flag.load(Ordering::SeqCst) {
+                if !full_content.trim().is_empty() {
+                    self.send_session_update(
+                        acp_session_id,
+                        "agent_message_chunk",
+                        &json!({
+                            "type": "text",
+                            "text": format!(
+                                "Partial provider response (not committed to conversation history):\n{}",
+                                crate::tools::safe_truncate(&full_content, 4_000)
+                            )
+                        }),
+                    );
+                }
                 return StreamResult::Cancelled;
             }
 
-            let chunk = match chunk_result {
-                Ok(c) => c,
-                Err(e) => {
-                    return StreamResult::Error(format!("Stream error: {e}"));
+            let event = match tokio::time::timeout(stream_timeout, stream.next()).await {
+                Ok(Some(Ok(event))) => event,
+                Ok(Some(Err(error))) => {
+                    return failed_acp_stream(format!("Stream error: {error}"), &full_content);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return failed_acp_stream(
+                        format!(
+                            "Provider stream timed out after {} seconds",
+                            crate::proxy::SSE_STREAM_TIMEOUT_SECS
+                        ),
+                        &full_content,
+                    );
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            // Process complete SSE lines
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim().to_string();
-                buffer = buffer[line_end + 1..].to_string();
-
-                if line.is_empty() || line == "data: [DONE]" {
-                    if line == "data: [DONE]" {
-                        // Stream complete
-                        return finish_acp_stream(full_content, tool_calls);
-                    }
-                    continue;
+            if let Err(error) = terminal.observe_event_name(&event.event) {
+                return failed_acp_stream(error, &full_content);
+            }
+            if event.data == "[DONE]" {
+                terminal.observe_done();
+                break;
+            }
+            let json: Value = match serde_json::from_str(&event.data) {
+                Ok(value) => value,
+                Err(error) => {
+                    return failed_acp_stream(
+                        format!("Malformed provider SSE event: {error}"),
+                        &full_content,
+                    );
                 }
+            };
+            if let Err(error) = terminal.observe(&json) {
+                return failed_acp_stream(error, &full_content);
+            }
 
-                if !line.starts_with("data: ") {
-                    // Handle Anthropic event: lines
-                    if line.starts_with("event: ") {
-                        let event_type = line.trim_start_matches("event: ");
-                        if event_type == "message_stop" {
-                            return finish_acp_stream(full_content, tool_calls);
-                        }
+            // Handle OpenAI-format streaming
+            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                for choice in choices {
+                    let Some(delta) = choice.get("delta") else {
+                        continue;
+                    };
+
+                    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                        full_content.push_str(text);
                     }
-                    continue;
-                }
 
-                let data = &line["data: ".len()..];
-                let json: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                // Handle OpenAI-format streaming
-                if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                    for choice in choices {
-                        let Some(delta) = choice.get("delta") else {
-                            continue;
-                        };
-
-                        // Text content
-                        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                            full_content.push_str(text);
-                        }
-
-                        // Tool calls
-                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                            for tc_delta in tcs {
-                                #[allow(clippy::cast_possible_truncation)]
-                                // Tool call index is always small; truncation is safe
-                                let index = tc_delta
-                                    .get("index")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0)
-                                    as usize;
-
-                                while tool_calls.len() <= index {
-                                    tool_calls.push(AccumulatedToolCall::default());
-                                }
-
-                                if let Some(tc_id) = tc_delta.get("id").and_then(|i| i.as_str()) {
-                                    tool_calls[index].id = tc_id.to_string();
-                                }
-
-                                // New tool call
-                                if let Some(func) = tc_delta.get("function") {
-                                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                        tool_calls[index].name = name.to_string();
-                                        current_tool_index = Some(index);
-                                    }
-                                    if let Some(args) =
-                                        func.get("arguments").and_then(|a| a.as_str())
-                                    {
-                                        tool_calls[index].arguments.push_str(args);
-                                    }
-                                }
+                    if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc_delta in tcs {
+                            let index = tc_delta
+                                .get("index")
+                                .and_then(serde_json::Value::as_u64)
+                                .map_or(0, |value| usize::try_from(value).unwrap_or(usize::MAX));
+                            if index >= crate::tools::MAX_PARALLEL_TOOL_CALL_SLOTS {
+                                return failed_acp_stream(
+                                    format!(
+                                        "Provider tool call index {index} exceeds the supported limit"
+                                    ),
+                                    &full_content,
+                                );
                             }
-                        }
 
-                        // Finish reason
-                        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                            if reason == "stop" && tool_calls.is_empty() {
-                                return StreamResult::EndTurn {
-                                    content: full_content,
-                                };
+                            while tool_calls.len() <= index {
+                                tool_calls.push(AccumulatedToolCall::default());
                             }
-                            if reason == "tool_calls" {
-                                return finish_acp_stream(full_content, tool_calls);
+
+                            if let Some(tc_id) = tc_delta.get("id").and_then(|i| i.as_str()) {
+                                tool_calls[index].id = tc_id.to_string();
+                            }
+
+                            if let Some(func) = tc_delta.get("function") {
+                                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                    tool_calls[index].name = name.to_string();
+                                    current_tool_index = Some(index);
+                                }
+                                if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                    tool_calls[index].arguments.push_str(args);
+                                }
                             }
                         }
                     }
                 }
+            }
 
-                // Handle Anthropic-format streaming
-                if let Some(delta_type) = json.get("type").and_then(|t| t.as_str()) {
-                    match delta_type {
-                        "content_block_start" => {
-                            let content_block = json.get("content_block").unwrap_or(&Value::Null);
-                            let block_type = content_block
-                                .get("type")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("");
+            // Handle Anthropic-format streaming
+            if let Some(delta_type) = json.get("type").and_then(|t| t.as_str()) {
+                match delta_type {
+                    "content_block_start" => {
+                        let content_block = json.get("content_block").unwrap_or(&Value::Null);
+                        let block_type = content_block
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
 
-                            match block_type {
-                                "thinking" => {
+                        match block_type {
+                            "thinking" => {
+                                self.send_session_update(
+                                    acp_session_id,
+                                    "thinking",
+                                    &json!({"type": "thinking", "status": "started"}),
+                                );
+                            }
+                            "tool_use" => {
+                                let name = content_block
+                                    .get("name")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("");
+                                let tc_id = content_block
+                                    .get("id")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("");
+                                tool_calls.push(AccumulatedToolCall {
+                                    id: tc_id.to_string(),
+                                    name: name.to_string(),
+                                    arguments: String::new(),
+                                });
+                                current_tool_index = Some(tool_calls.len() - 1);
+                            }
+                            _ => {}
+                        }
+                    }
+                    "content_block_delta" => {
+                        let delta = json.get("delta").unwrap_or(&Value::Null);
+                        let delta_type = delta
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+
+                        match delta_type {
+                            "text_delta" => {
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                    full_content.push_str(text);
+                                }
+                            }
+                            "thinking_delta" => {
+                                if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
                                     self.send_session_update(
                                         acp_session_id,
                                         "thinking",
-                                        &json!({"type": "thinking", "status": "started"}),
+                                        &json!({"type": "thinking", "text": text}),
                                     );
                                 }
-                                "tool_use" => {
-                                    let name = content_block
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("");
-                                    let tc_id = content_block
-                                        .get("id")
-                                        .and_then(|i| i.as_str())
-                                        .unwrap_or("");
-                                    tool_calls.push(AccumulatedToolCall {
-                                        id: tc_id.to_string(),
-                                        name: name.to_string(),
-                                        arguments: String::new(),
-                                    });
-                                    current_tool_index = Some(tool_calls.len() - 1);
-                                }
-                                _ => {}
                             }
-                        }
-                        "content_block_delta" => {
-                            let delta = json.get("delta").unwrap_or(&Value::Null);
-                            let delta_type =
-                                delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                            match delta_type {
-                                "text_delta" => {
-                                    if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                        full_content.push_str(text);
-                                    }
-                                }
-                                "thinking_delta" => {
-                                    if let Some(text) =
-                                        delta.get("thinking").and_then(|t| t.as_str())
-                                    {
-                                        self.send_session_update(
-                                            acp_session_id,
-                                            "thinking",
-                                            &json!({"type": "thinking", "text": text}),
-                                        );
-                                    }
-                                }
-                                "input_json_delta" => {
-                                    if let Some(partial) =
-                                        delta.get("partial_json").and_then(|p| p.as_str())
-                                    {
-                                        if let Some(idx) = current_tool_index {
-                                            if idx < tool_calls.len() {
-                                                tool_calls[idx].arguments.push_str(partial);
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        "message_delta" => {
-                            if let Some(delta) = json.get("delta") {
-                                if let Some(reason) =
-                                    delta.get("stop_reason").and_then(|r| r.as_str())
+                            "input_json_delta" => {
+                                if let Some(partial) =
+                                    delta.get("partial_json").and_then(|value| value.as_str())
                                 {
-                                    if reason == "end_turn" && tool_calls.is_empty() {
-                                        return StreamResult::EndTurn {
-                                            content: full_content,
-                                        };
-                                    }
-                                    if reason == "tool_use" {
-                                        return finish_acp_stream(full_content, tool_calls);
+                                    if let Some(call) = current_tool_index
+                                        .and_then(|index| tool_calls.get_mut(index))
+                                    {
+                                        call.arguments.push_str(partial);
                                     }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
 
-        // Stream ended without explicit stop
-        finish_acp_stream(full_content, tool_calls)
+        match terminal.finish() {
+            Ok(outcome) => finish_acp_stream(full_content, tool_calls, outcome),
+            Err(error) => failed_acp_stream(error, &full_content),
+        }
     }
 
     // ========================================================================
@@ -3255,8 +3241,21 @@ impl AccumulatedToolCall {
     }
 }
 
-fn finish_acp_stream(content: String, tool_calls: Vec<AccumulatedToolCall>) -> StreamResult {
+fn finish_acp_stream(
+    content: String,
+    tool_calls: Vec<AccumulatedToolCall>,
+    terminal_outcome: crate::pipeline::ProviderTerminalOutcome,
+) -> StreamResult {
     if tool_calls.is_empty() {
+        if let Err(error) = crate::pipeline::ensure_provider_turn_succeeded(terminal_outcome, 0) {
+            return failed_acp_stream(error, &content);
+        }
+        if content.is_empty() {
+            return failed_acp_stream(
+                "Provider completed the turn without assistant content".to_string(),
+                &content,
+            );
+        }
         return StreamResult::EndTurn { content };
     }
 
@@ -3271,9 +3270,37 @@ fn finish_acp_stream(content: String, tool_calls: Vec<AccumulatedToolCall>) -> S
             missing = %missing,
             "Provider returned incomplete ACP streamed tool call"
         );
-        return StreamResult::Error(format!(
-            "Provider returned incomplete tool call at index {index}: missing {missing}"
-        ));
+        return failed_acp_stream(
+            format!("Provider returned incomplete tool call at index {index}: missing {missing}"),
+            &content,
+        );
+    }
+
+    let mut ids = std::collections::HashSet::new();
+    for (index, call) in tool_calls.iter().enumerate() {
+        if !ids.insert(call.id.as_str()) {
+            return failed_acp_stream(
+                format!("Provider repeated tool call id {:?}", call.id),
+                &content,
+            );
+        }
+        let arguments = if call.arguments.trim().is_empty() {
+            "{}"
+        } else {
+            &call.arguments
+        };
+        if let Err(error) = serde_json::from_str::<Value>(arguments) {
+            return failed_acp_stream(
+                format!("Provider returned invalid JSON arguments for tool call {index}: {error}"),
+                &content,
+            );
+        }
+    }
+
+    if let Err(error) =
+        crate::pipeline::ensure_provider_turn_succeeded(terminal_outcome, tool_calls.len())
+    {
+        return failed_acp_stream(error, &content);
     }
 
     StreamResult::ToolCalls {
@@ -3282,9 +3309,20 @@ fn finish_acp_stream(content: String, tool_calls: Vec<AccumulatedToolCall>) -> S
     }
 }
 
+fn failed_acp_stream(message: String, partial: &str) -> StreamResult {
+    if partial.trim().is_empty() {
+        return StreamResult::Error(message);
+    }
+    StreamResult::Error(format!(
+        "Partial provider response (not committed to conversation history):\n{}\n\n{message}",
+        crate::tools::safe_truncate(partial, 4_000)
+    ))
+}
+
 fn acp_responses_stream_result(
     decoded: crate::pipeline::OpenAiResponsesDecodedTurn,
 ) -> (StreamResult, crate::runtime::ProviderNativeState) {
+    let terminal_outcome = decoded.terminal_outcome;
     let tool_calls = decoded
         .tool_calls
         .into_iter()
@@ -3294,22 +3332,14 @@ fn acp_responses_stream_result(
             arguments: call.function.arguments,
         })
         .collect::<Vec<_>>();
-    let result = if tool_calls.is_empty() {
-        StreamResult::EndTurn {
-            content: decoded.content,
-        }
-    } else {
-        StreamResult::ToolCalls {
-            content: decoded.content,
-            tool_calls,
-        }
-    };
+    let result = finish_acp_stream(decoded.content, tool_calls, terminal_outcome);
     (result, decoded.provider_native_state)
 }
 
 fn acp_native_json_stream_result(
     decoded: crate::pipeline::ProviderNativeJsonDecodedTurn,
 ) -> (StreamResult, crate::runtime::ProviderNativeState) {
+    let terminal_outcome = decoded.terminal_outcome;
     let tool_calls = decoded
         .tool_calls
         .into_iter()
@@ -3319,16 +3349,7 @@ fn acp_native_json_stream_result(
             arguments: call.function.arguments,
         })
         .collect::<Vec<_>>();
-    let result = if tool_calls.is_empty() {
-        StreamResult::EndTurn {
-            content: decoded.content,
-        }
-    } else {
-        StreamResult::ToolCalls {
-            content: decoded.content,
-            tool_calls,
-        }
-    };
+    let result = finish_acp_stream(decoded.content, tool_calls, terminal_outcome);
     (result, decoded.provider_native_state)
 }
 
@@ -4262,6 +4283,7 @@ mod stream_tool_call_tests {
                 name: "bash".to_string(),
                 arguments: r#"{"command":"pwd"}"#.to_string(),
             }],
+            crate::pipeline::ProviderTerminalOutcome::ToolCalls,
         );
 
         match result {
@@ -4287,6 +4309,7 @@ mod stream_tool_call_tests {
                 name: String::new(),
                 arguments: r#"{"command":"pwd"}"#.to_string(),
             }],
+            crate::pipeline::ProviderTerminalOutcome::ToolCalls,
         );
 
         match result {
@@ -4307,6 +4330,7 @@ mod stream_tool_call_tests {
                 name: "bash".to_string(),
                 arguments: r#"{"command":"pwd"}"#.to_string(),
             }],
+            crate::pipeline::ProviderTerminalOutcome::ToolCalls,
         );
 
         match result {
@@ -4315,6 +4339,22 @@ mod stream_tool_call_tests {
                 assert!(message.contains("id"), "{message}");
             }
             other => panic!("expected missing id to error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_stream_rejects_length_limited_text_as_success() {
+        let result = finish_acp_stream(
+            "partial".to_string(),
+            Vec::new(),
+            crate::pipeline::ProviderTerminalOutcome::LengthLimited,
+        );
+
+        match result {
+            StreamResult::Error(message) => {
+                assert!(message.contains("output limit"), "{message}");
+            }
+            other => panic!("expected length-limited turn to error, got {other:?}"),
         }
     }
 
@@ -4347,6 +4387,7 @@ mod stream_tool_call_tests {
                 },
             }],
             usage: crate::session::TokenUsage::default(),
+            terminal_outcome: crate::pipeline::ProviderTerminalOutcome::ToolCalls,
             provider_native_state: state.clone(),
         };
 

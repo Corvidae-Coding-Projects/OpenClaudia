@@ -20,6 +20,7 @@ const SSE_TEXT_ONLY: &str = concat!(
     "data: {\"type\":\"content_block_stop\"}\n\n",
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
     "\"usage\":{\"output_tokens\":5}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
     "data: [DONE]\n\n",
 );
 
