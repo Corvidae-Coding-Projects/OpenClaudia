@@ -1,6 +1,6 @@
 {
   "next_display_id": 1120,
-  "next_comment_id": 1394,
+  "next_comment_id": 1395,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19887,7 +19887,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T16:24:26.863403747Z",
-      "updated_at": "2026-08-23T17:04:12.630744464Z",
+      "updated_at": "2026-08-23T17:04:26.371130151Z",
       "closed_at": "2026-08-23T17:04:12.630743197Z",
       "labels": [
         "remediation"
@@ -19922,6 +19922,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAR7nVI5cXsKTBnAZhQY4HeXp18TOBS6RsylWCLGKUALhaOH5thgJfFDZ42X4sdw8kpN/97L9m9xtyQgsaTpEnCA=="
+        },
+        "a21dc7e6-d4be-4784-a040-fb29e7d9e64e": {
+          "display_id": 1394,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 9fc9f45e: unified CLI and TUI direct shell execution behind the typed run-owned Process capability with sandboxing, policy, budgets, freshness, cancellation, bounded output, ledger grounding, realistic tests, and refreshed technical-memory evidence. Rust 1.98 native, Clippy, formatting, focused, and Windows GNU gates passed; parent #1071 remains open.",
+          "created_at": "2026-08-23T17:04:26.368690316Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmqiAFlVgfh/OUInz4As9H7Uvhq6NH+lGRs4lOwMSOgB2tWs16ISB6k2f72OkaX/ZaHgFZQRUcTXkDIkm3FfNBg=="
         },
         "daa31152-1807-41ec-aaea-8192d01cee50": {
           "display_id": 1393,
@@ -36727,11 +36736,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1294,
       "timestamp": "2026-08-23T17:04:16.604016476Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1295,
+      "timestamp": "2026-08-23T17:04:26.371130151Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T17:04:16.604016476Z",
+    "timestamp": "2026-08-23T17:04:26.371130151Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1294
+    "agent_seq": 1295
   }
 }
