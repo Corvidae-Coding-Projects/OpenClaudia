@@ -172,6 +172,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-050: Make provider terminal outcomes truthful (#1105)
+- Regenerate S-048 technical-memory evidence after cited source changed (#1106)
 - S-048: Centralize hardened provider HTTP transport (#1104)
 - SSE buffer can grow unbounded when upstream never emits newlines (#1000)
 - S-047: Replace static model-name capability guesses (#1103)
