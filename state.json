@@ -1,6 +1,6 @@
 {
   "next_display_id": 1108,
-  "next_comment_id": 1300,
+  "next_comment_id": 1301,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7344,7 +7344,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T05:55:19.436743818Z",
-      "updated_at": "2026-08-23T06:01:48.516904205Z",
+      "updated_at": "2026-08-23T06:01:52.754146091Z",
       "labels": [
         "remediation"
       ],
@@ -7357,6 +7357,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPRmFrA7PlrHAnNAJb0W23vNxXTY968MF3AeDVsiBVqrFStnAU+MruEjl6tkkNGUraJ4sryaKf7X2kOYdn2iiBA=="
+        },
+        "c655b5ea-91a6-464c-9fe1-6b197878b7ee": {
+          "display_id": 1300,
+          "author": "6Vw9",
+          "content": "[action] S-051 preflight complete: RunBudget is descriptor-only, stop conditions are unreachable, children reset budgets, and provider/tool/cost limits are not atomically reserved; implementing shared ToolRunContext budget authority and fixed-point reconciliation",
+          "created_at": "2026-08-23T06:01:52.751832101Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5LBT1o31UO3mcH2Ug80BzLNFzoNSl5z7hbQGNH0nqiZrfhFsH+S2NMDXB346QdCdtlph4ZU7Z1ROZn0iZtxvCA=="
         }
       }
     },
@@ -34788,11 +34797,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1126,
       "timestamp": "2026-08-23T06:01:48.516904205Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1127,
+      "timestamp": "2026-08-23T06:01:52.754146091Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T06:01:48.516904205Z",
+    "timestamp": "2026-08-23T06:01:52.754146091Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1126
+    "agent_seq": 1127
   }
 }
