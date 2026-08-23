@@ -1,6 +1,6 @@
 {
   "next_display_id": 1122,
-  "next_comment_id": 1420,
+  "next_comment_id": 1421,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25510,11 +25510,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T22:37:39.823571526Z",
-      "updated_at": "2026-08-23T22:44:08.275498744Z",
+      "updated_at": "2026-08-23T22:44:12.441513567Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "a50f23ab-e5d6-4b64-83e0-195efca1a51b": {
+          "display_id": 1420,
+          "author": "6Vw9",
+          "content": "[action] S-022 preflight complete: implementing bounded baseline diff block before direct/projection publication plus typed cadence/action quality finalization gate at shared boundaries.",
+          "created_at": "2026-08-23T22:44:12.438901661Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/KMxX6smkmqwPxdqtQFhx8cH0MOPrJev0O6CB+FwrPcf499sMWwK1fkWnSFifbeQTgVjgU8PkJLt/kvQNtwWDg=="
+        },
         "ec205162-476d-4b37-ba89-fb3379593de3": {
           "display_id": 1419,
           "author": "6Vw9",
@@ -37213,11 +37222,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1335,
       "timestamp": "2026-08-23T22:44:08.275498744Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1336,
+      "timestamp": "2026-08-23T22:44:12.441513567Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T22:44:08.275498744Z",
+    "timestamp": "2026-08-23T22:44:12.441513567Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1335
+    "agent_seq": 1336
   }
 }
