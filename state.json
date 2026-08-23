@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1103,
+  "next_display_id": 1104,
   "next_comment_id": 1269,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -819,6 +819,7 @@
     "ca53a968-2b8d-40f3-9662-b66cc8b197ae": 1019,
     "ca7c4ab9-a985-4d34-ab6c-355009d8ac9c": 718,
     "cb15988c-7787-4b3d-82bf-be348a8b22f7": 748,
+    "cb7d5e52-6550-4867-a029-52d7930b427b": 1103,
     "cbf93f8b-d67c-4a4f-862c-48172521bffa": 362,
     "cc1a1bec-f646-47ed-af0c-d8a9e36fd9a2": 813,
     "cc6a32ff-b404-4717-9226-d3e344302198": 94,
@@ -23397,6 +23398,18 @@
       "updated_at": "2026-05-20T07:13:17.589017920Z",
       "closed_at": "2026-05-20T07:13:17.589017920Z"
     },
+    "cb7d5e52-6550-4867-a029-52d7930b427b": {
+      "uuid": "cb7d5e52-6550-4867-a029-52d7930b427b",
+      "display_id": 1103,
+      "title": "S-047: Replace static model-name capability guesses",
+      "description": "Implement docs/remediation-slices/047-dynamic-model-capability-catalog.md on top of S-044. Discover authenticated provider models and metadata, preserve canonical identity separately from aliases, cache with provenance/expiry/access/deprecation/unknown-cost state, and validate tools, thinking, context, output, streaming, and pricing capabilities at model selection. Unknown or inaccessible models must remain explicit rather than mapping to unrelated defaults. Do not claim transport hardening, reasoning privacy, terminal outcomes, or OAuth slices.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-23T02:17:19.644312884Z",
+      "updated_at": "2026-08-23T02:17:19.644312884Z"
+    },
     "cbf93f8b-d67c-4a4f-862c-48172521bffa": {
       "uuid": "cbf93f8b-d67c-4a4f-862c-48172521bffa",
       "display_id": 362,
@@ -34131,11 +34144,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1070,
       "timestamp": "2026-08-23T02:15:49.960765701Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1071,
+      "timestamp": "2026-08-23T02:17:19.644312884Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T02:15:49.960765701Z",
+    "timestamp": "2026-08-23T02:17:19.644312884Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1070
+    "agent_seq": 1071
   }
 }
