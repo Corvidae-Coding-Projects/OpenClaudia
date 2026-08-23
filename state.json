@@ -1,6 +1,6 @@
 {
   "next_display_id": 1113,
-  "next_comment_id": 1324,
+  "next_comment_id": 1325,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14637,11 +14637,22 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:43.428627970Z",
-      "updated_at": "2026-08-23T09:59:08.372642824Z",
+      "updated_at": "2026-08-23T10:14:05.864019840Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
-      ]
+      ],
+      "comments": {
+        "331182de-79bd-40bf-8780-117c9ace6ec1": {
+          "display_id": 1324,
+          "author": "6Vw9",
+          "content": "[plan] Use the existing TUI oneshot event boundary: pipeline sends typed enter/exit requests; App owns canonical session/run/task mutation. Extract shared prepare/commit helpers that bind displayed bytes and runtime generation, re-read before approval, publish the canonical task binding before widening capabilities, and distinguish direct /mode cancellation from model-requested approval. Verify entry, approval, rejection, cancellation, and stale edits.",
+          "created_at": "2026-08-23T10:14:05.861427118Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFdB0w1VpdGX4i909kZ9JAZGLfwegg7NVZ9EqqHBI4LeiXx2sPS1+j02tjAHfOZd/Fx9xg1tNILbukyP9X4W1AQ=="
+        }
+      }
     },
     "7c18165c-0dbd-455e-b0c3-a4cfd6efa312": {
       "uuid": "7c18165c-0dbd-455e-b0c3-a4cfd6efa312",
@@ -35356,11 +35367,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1177,
       "timestamp": "2026-08-23T10:10:56.233476822Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1178,
+      "timestamp": "2026-08-23T10:14:05.864019840Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T10:10:56.233476822Z",
+    "timestamp": "2026-08-23T10:14:05.864019840Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1177
+    "agent_seq": 1178
   }
 }
