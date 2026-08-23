@@ -1,6 +1,6 @@
 {
   "next_display_id": 1103,
-  "next_comment_id": 1262,
+  "next_comment_id": 1263,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10521,10 +10521,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T00:29:40.630208184Z",
-      "updated_at": "2026-08-23T00:29:44.584839978Z",
+      "updated_at": "2026-08-23T00:43:26.569882085Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "6b8cfa96-65e9-468f-a58a-c072e50a5458": {
+          "display_id": 1262,
+          "author": "6Vw9",
+          "content": "Architecture decision: preserve each completed Gemini/Ollama assistant message byte-equivalent as bounded ProviderNativeState continuation, with an evidence header binding portable assistant ordinal and exact call mapping. Provider request drafts retain private construction-only ordinal/call bindings; native-state application validates/replaces assistant projections and checks missing, duplicate, reordered, or orphan results before those bindings are removed. State advances before tool dispatch across TUI, legacy CLI, ACP, and child runs. Gemini replays thoughtSignature and provider functionCall.id exactly and batches parallel functionResponse parts; Ollama replays the exact assistant message/tool_calls/thinking and emits ordered tool_name results. Alternative rejected: embedding signatures/native messages in portable transcript fields would expose provider-private state and cannot preserve future native fields. Server-managed Gemini Interactions and streaming/transport terminal hardening remain their owning slices.",
+          "created_at": "2026-08-23T00:43:26.566988751Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAHttcGDRE7a/V0SgMrmpUCEGA2X4l2Esawzhts9E90j1+3nwuINgmZy/Y9ETIxKnY3mxE8w2rAm6D/q2X/W6ADg=="
+        }
+      }
     },
     "5cabfc3b-d756-4c81-8b55-08fec79cd65d": {
       "uuid": "5cabfc3b-d756-4c81-8b55-08fec79cd65d",
@@ -34024,11 +34035,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1061,
       "timestamp": "2026-08-23T00:29:49.405766473Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1062,
+      "timestamp": "2026-08-23T00:43:26.569882085Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T00:29:49.405766473Z",
+    "timestamp": "2026-08-23T00:43:26.569882085Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1061
+    "agent_seq": 1062
   }
 }
