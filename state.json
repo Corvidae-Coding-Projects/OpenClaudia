@@ -14633,11 +14633,12 @@
       "display_id": 1111,
       "title": "Complete typed plan-mode follow-ups in the full-screen TUI",
       "description": "The full-screen TUI currently cancels pending EnterPlanMode and ExitPlanMode ToolFollowUp values as unsupported. Add a typed UI handshake that routes model-requested entry through the canonical pinned-plan transition and model-requested exit through explicit digest/version-bound user approval, restoring runtime capabilities atomically. Keep direct user /mode cancellation distinct from plan approval and test both paths end to end.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T09:58:43.428627970Z",
-      "updated_at": "2026-08-23T10:50:07.579188025Z",
+      "updated_at": "2026-08-23T10:50:18.558886739Z",
+      "closed_at": "2026-08-23T10:50:18.558885431Z",
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7",
         "f5eb100a-4902-49bd-8713-b92f9293090b"
@@ -35428,11 +35429,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1182,
       "timestamp": "2026-08-23T10:50:07.579188025Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1183,
+      "timestamp": "2026-08-23T10:50:18.558886739Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T10:50:07.579188025Z",
+    "timestamp": "2026-08-23T10:50:18.558886739Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1182
+    "agent_seq": 1183
   }
 }
