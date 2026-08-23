@@ -1,6 +1,6 @@
 {
   "next_display_id": 1107,
-  "next_comment_id": 1293,
+  "next_comment_id": 1294,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24687,8 +24687,17 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T05:49:30.736961057Z",
-      "updated_at": "2026-08-23T05:50:40.165169470Z",
+      "updated_at": "2026-08-23T05:50:52.699058336Z",
       "comments": {
+        "51702b91-5e07-4f72-885a-c5c6b2d1eabf": {
+          "display_id": 1293,
+          "author": "6Vw9",
+          "content": "result: 7239e33 fix(memory): regenerate S-048 retrieval evidence. Updated the S-048 citation digest and regenerated tuning/evaluation/review bindings through the public evidence builder without fabricating approval; the review remains rejected. Verification: memory::retrieval_evidence::tests::bundled_corpora_prove_every_selected_ablation_step passed, then the complete Rust 1.98 all-feature test suite passed with exit 0; formatting, Clippy -D warnings, and diff checks passed.",
+          "created_at": "2026-08-23T05:50:52.696658080Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsdEY46rh2PcR9bfqYEc9b2RcqdEksU+Un3Efpr7NH5+LUeADY4bSdm2BVpLoNfzFjg0sUSxNlTJ9gyHKG55ADA=="
+        },
         "6677f445-dc81-4368-bcb0-6050e9f66f54": {
           "display_id": 1292,
           "author": "6Vw9",
@@ -34639,11 +34648,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1112,
       "timestamp": "2026-08-23T05:50:40.165169470Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1113,
+      "timestamp": "2026-08-23T05:50:52.699058336Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T05:50:40.165169470Z",
+    "timestamp": "2026-08-23T05:50:52.699058336Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1112
+    "agent_seq": 1113
   }
 }
