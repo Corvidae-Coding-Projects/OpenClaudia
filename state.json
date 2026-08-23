@@ -16230,12 +16230,13 @@
       "display_id": 1120,
       "title": "S-015: Finish skills as scoped capabilities",
       "description": "Implement docs/remediation-slices/015-skills-trust-and-capabilities.md under parent #1071. Bound and deterministically cache skill discovery by trusted scope, path identity, digest, schema, and workspace generation; treat skill instructions as untrusted reviewed context; compile declared tool/hook/file/network needs into explicit run capabilities; preserve operational skills across frontends. Rust exactly 1.98.0, CARGO_BUILD_JOBS=4, serialized Cargo, wiring rather than removal, production-likely behavior over speculative edge cases.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T20:55:04.838797192Z",
-      "updated_at": "2026-08-23T22:34:57.268555805Z",
+      "updated_at": "2026-08-23T22:35:06.189857382Z",
+      "closed_at": "2026-08-23T22:35:06.189851858Z",
       "labels": [
         "remediation"
       ],
@@ -37113,11 +37114,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1326,
       "timestamp": "2026-08-23T22:34:57.268555805Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1327,
+      "timestamp": "2026-08-23T22:35:06.189857382Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T22:34:57.268555805Z",
+    "timestamp": "2026-08-23T22:35:06.189857382Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1326
+    "agent_seq": 1327
   }
 }
