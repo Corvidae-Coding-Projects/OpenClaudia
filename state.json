@@ -1,6 +1,6 @@
 {
   "next_display_id": 1115,
-  "next_comment_id": 1355,
+  "next_comment_id": 1356,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15325,7 +15325,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-23T13:28:40.687327778Z",
-      "updated_at": "2026-08-23T13:35:36.053886170Z",
+      "updated_at": "2026-08-23T13:56:35.222179633Z",
       "labels": [
         "remediation"
       ],
@@ -15334,6 +15334,15 @@
         "72d111a6-ef81-4821-be15-71fb92bcd054"
       ],
       "comments": {
+        "08675f28-56f4-4cbd-9809-d53df8242fd9": {
+          "display_id": 1355,
+          "author": "6Vw9",
+          "content": "Implemented the S-040 production path: one Tokio supervisor now owns concurrent bounded stdin delivery, stdout/stderr drain, root exit, aggregate deadline, run cancellation, forceful process-tree cleanup, reap, and typed partial snapshots. Migrated command hooks, guardrail quality gates, and VDD static analysis; synchronous PDF/LSP/git/Bash callers use the runtime-aware compatibility bridge. Bash now product-wires its documented millisecond timeout (1..=600000) instead of ignoring it. Focused receipts currently pass: supervisor 8/8, hooks 78/78 plus blocked-stdin regression, quality-gate 10/10, VDD static analysis 3/3, Bash timeout, background PID reap. Full gates still pending.",
+          "created_at": "2026-08-23T13:56:35.217039828Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/LRGs7F0VAu/sSI3Rz0BaypMsvJm9L+sYeorDu2E+LeXKRv1BqZp33QcYdhS6khyAUwCcF8PBDM1qH4KzELQCg=="
+        },
         "2a28259f-3b86-4c19-8077-075788480f11": {
           "display_id": 1354,
           "author": "6Vw9",
@@ -35945,11 +35954,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1227,
       "timestamp": "2026-08-23T13:35:36.053886170Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1228,
+      "timestamp": "2026-08-23T13:56:35.222179633Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T13:35:36.053886170Z",
+    "timestamp": "2026-08-23T13:56:35.222179633Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1227
+    "agent_seq": 1228
   }
 }
