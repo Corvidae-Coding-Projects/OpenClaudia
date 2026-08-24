@@ -9329,9 +9329,12 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:07:01.696684309Z",
-      "updated_at": "2026-08-24T00:07:05.984348519Z",
+      "updated_at": "2026-08-24T00:07:19.500033189Z",
       "labels": [
         "defect"
+      ],
+      "related": [
+        "95529073-f3ee-4935-8580-ac744ef4b861"
       ]
     },
     "49c38102-2591-461e-9287-c3ed3b5c9a27": {
@@ -18473,9 +18476,12 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:01:18.302848830Z",
-      "updated_at": "2026-08-24T00:01:22.436730348Z",
+      "updated_at": "2026-08-24T00:07:19.500033189Z",
       "labels": [
         "remediation"
+      ],
+      "related": [
+        "498aec22-126b-4f73-8ca1-341df6191fb8"
       ]
     },
     "955c9fa9-e629-441e-8d31-104beeda2818": {
@@ -37379,11 +37385,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1349,
       "timestamp": "2026-08-24T00:07:05.984348519Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1350,
+      "timestamp": "2026-08-24T00:07:19.500033189Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T00:07:05.984348519Z",
+    "timestamp": "2026-08-24T00:07:19.500033189Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1349
+    "agent_seq": 1350
   }
 }
