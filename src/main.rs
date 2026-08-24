@@ -1861,15 +1861,109 @@ fn prompt_openai_api_key() -> anyhow::Result<openclaudia::providers::ApiKey> {
     prompt_provider_api_key("OpenAI")
 }
 
-fn prompt_provider_api_key(target: &str) -> anyhow::Result<openclaudia::providers::ApiKey> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyDestinationChoice {
+    SessionOnly,
+    UserStore,
+    Cancel,
+}
+
+fn parse_api_key_destination_choice(
+    input: &str,
+    user_store_available: bool,
+) -> Option<ApiKeyDestinationChoice> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "session" => Some(ApiKeyDestinationChoice::SessionOnly),
+        "2" | "save" | "store" if user_store_available => Some(ApiKeyDestinationChoice::UserStore),
+        "q" | "quit" | "cancel" => Some(ApiKeyDestinationChoice::Cancel),
+        _ => None,
+    }
+}
+
+fn prompt_api_key_destination(target: &str) -> anyhow::Result<(bool, bool)> {
     use std::io::Write as _;
 
-    eprint!("{target} API key: ");
+    let store_path = if openclaudia::provider_credentials::protected_persistence_supported() {
+        openclaudia::provider_credentials::user_store_path().ok()
+    } else {
+        None
+    };
+    let user_store_available = store_path.is_some();
+
+    eprintln!("\nProvider: {target}");
+    eprintln!("Choose API-key scope and destination:");
+    eprintln!("  1. This session only (not saved)");
+    if let Some(path) = &store_path {
+        eprintln!(
+            "  2. Save for this user in the protected OpenClaudia store ({})",
+            path.display()
+        );
+    } else {
+        eprintln!("  Protected user persistence is unavailable on this platform.");
+    }
+    eprintln!("  q. Cancel");
+
+    for _ in 0..3 {
+        eprint!("Select destination [1]: ");
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        match parse_api_key_destination_choice(&input, user_store_available) {
+            Some(ApiKeyDestinationChoice::SessionOnly) => return Ok((false, false)),
+            Some(ApiKeyDestinationChoice::Cancel) => {
+                anyhow::bail!("API-key entry cancelled; no credentials were changed");
+            }
+            Some(ApiKeyDestinationChoice::UserStore) => {
+                let existing = openclaudia::provider_credentials::has_saved_user_api_key(target)?;
+                if existing {
+                    eprintln!("A protected key is already saved for {target}.");
+                    if !prompt_stderr_confirmation("Replace the existing saved key? [y/N]: ")? {
+                        anyhow::bail!(
+                            "API-key replacement cancelled; the existing credential is unchanged"
+                        );
+                    }
+                }
+                return Ok((true, existing));
+            }
+            None => eprintln!("Invalid destination. Enter 1, 2, or q."),
+        }
+    }
+    anyhow::bail!("No valid API-key destination selected; no credentials were changed")
+}
+
+fn prompt_stderr_confirmation(prompt: &str) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+
+    eprint!("{prompt}");
     std::io::stderr().flush()?;
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-    openclaudia::providers::ApiKey::try_from_string(input.trim().to_string())
-        .map_err(|e| anyhow::anyhow!("{target} API key is invalid: {e}"))
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn prompt_provider_api_key(target: &str) -> anyhow::Result<openclaudia::providers::ApiKey> {
+    let (save, overwrite) = prompt_api_key_destination(target)?;
+    let api_key = openclaudia::provider_credentials::prompt_hidden_api_key(target)?;
+    if save {
+        let path = openclaudia::provider_credentials::user_store_path()?;
+        let outcome = openclaudia::provider_credentials::save_user_api_key(
+            target,
+            api_key.clone(),
+            overwrite,
+        )?;
+        let action = match outcome {
+            openclaudia::provider_credentials::SaveOutcome::Saved => "saved",
+            openclaudia::provider_credentials::SaveOutcome::Replaced => "replaced",
+            openclaudia::provider_credentials::SaveOutcome::Unchanged => "already current",
+        };
+        eprintln!("Protected API key {action} at {}.", path.display());
+    } else {
+        eprintln!("Using the API key for this session only; nothing was saved.");
+    }
+    Ok(api_key)
 }
 
 fn prompt_provider_target_choice(prompt: &str, targets: &[String]) -> anyhow::Result<String> {
@@ -3050,6 +3144,27 @@ mod tests {
             Some("gpt-5.5"),
             None
         )));
+    }
+
+    #[test]
+    fn api_key_destination_defaults_to_non_persistent_session_scope() {
+        assert_eq!(
+            parse_api_key_destination_choice("", true),
+            Some(ApiKeyDestinationChoice::SessionOnly)
+        );
+        assert_eq!(
+            parse_api_key_destination_choice("cancel", true),
+            Some(ApiKeyDestinationChoice::Cancel)
+        );
+    }
+
+    #[test]
+    fn api_key_destination_never_selects_an_unavailable_store() {
+        assert_eq!(parse_api_key_destination_choice("2", false), None);
+        assert_eq!(
+            parse_api_key_destination_choice("store", true),
+            Some(ApiKeyDestinationChoice::UserStore)
+        );
     }
 
     #[tokio::test]

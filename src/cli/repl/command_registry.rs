@@ -396,8 +396,8 @@ impl CommandHandler for ConnectCommand {
     fn aliases(&self) -> &'static [&'static str] {
         &["auth"]
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
-        configure_provider_api_key();
+    fn handle(&self, ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
+        configure_provider_api_key(ctx.app_config);
         SlashCommandResult::Handled
     }
 }

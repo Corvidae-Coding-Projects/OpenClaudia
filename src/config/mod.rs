@@ -265,6 +265,12 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     let mut config: AppConfig = merged.try_deserialize()?;
     config.permissions.project_proposal = project_permission_proposal;
 
+    // The protected user credential store is deliberately the lowest-priority
+    // source. Project/home configuration and the typed environment registry
+    // have already populated explicit keys above; stored keys fill only gaps.
+    crate::provider_credentials::apply_user_api_keys(&mut config)
+        .map_err(|error| ConfigError::Message(error.to_string()))?;
+
     // Validate VDD settings that do not depend on the final runtime target.
     // Provider-pair validation runs after CLI/TUI target overrides and startup
     // auth selection have resolved the actual builder/adversary providers.
@@ -322,7 +328,9 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     Ok(config)
 }
 
-fn canonical_provider_config_key(name: &str) -> Option<&'static str> {
+/// Resolve a supported provider or alias to its canonical configuration key.
+#[must_use]
+pub fn canonical_provider_config_key(name: &str) -> Option<&'static str> {
     match name.trim().to_ascii_lowercase().as_str() {
         "anthropic" => Some("anthropic"),
         "openai" => Some("openai"),

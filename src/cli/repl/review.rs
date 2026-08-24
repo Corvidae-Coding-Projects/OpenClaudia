@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::LazyLock;
@@ -179,38 +178,40 @@ fn review_branch_comparison(branch: &str) {
     }
 }
 
-/// Configure API key for a provider interactively
-pub fn configure_provider_api_key() {
+/// Save a provider API key to the protected user credential store.
+pub fn configure_provider_api_key(app_config: Option<&openclaudia::config::AppConfig>) {
     use std::io::{self, Write};
 
-    let providers = [
-        ("anthropic", "Anthropic (Claude)", "ANTHROPIC_API_KEY"),
-        ("openai", "OpenAI (GPT)", "OPENAI_API_KEY"),
-        (
-            "google",
-            "Google (Gemini)",
-            "GOOGLE_API_KEY or GEMINI_API_KEY",
-        ),
-        ("deepseek", "DeepSeek", "DEEPSEEK_API_KEY"),
-        (
-            "qwen",
-            "Qwen (Alibaba)",
-            "QWEN_API_KEY, DASHSCOPE_API_KEY, or ALIYUN_API_KEY",
-        ),
-        ("zai", "Z.AI (GLM)", "ZAI_API_KEY"),
-        (
-            "kimi",
-            "Kimi (Moonshot)",
-            "KIMI_API_KEY or MOONSHOT_API_KEY",
-        ),
-        ("minimax", "MiniMax", "MINIMAX_API_KEY"),
-    ];
+    if !openclaudia::provider_credentials::protected_persistence_supported() {
+        eprintln!("\nProtected API-key persistence is unavailable on this platform.\n");
+        return;
+    }
+
+    let loaded_config = if app_config.is_none() {
+        match openclaudia::config::load_config() {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("\nFailed to load provider configuration: {error}\n");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let config = app_config
+        .or(loaded_config.as_ref())
+        .expect("configuration is loaded when the caller does not supply it");
+    let providers = openclaudia::provider_credentials::api_key_targets(config);
+    if providers.is_empty() {
+        eprintln!("\nNo remote API-key providers are configured.\n");
+        return;
+    }
 
     println!("\n=== Configure API Provider ===\n");
     println!("Select a provider to configure:\n");
 
-    for (i, (_, name, _)) in providers.iter().enumerate() {
-        println!("  {}. {}", i + 1, name);
+    for (index, provider) in providers.iter().enumerate() {
+        println!("  {}. {provider}", index + 1);
     }
     println!();
 
@@ -231,170 +232,73 @@ pub fn configure_provider_api_key() {
         }
     };
 
-    let (provider_id, provider_name, env_var) = providers[choice - 1];
-
-    println!("\nConfiguring {provider_name}...");
-    println!("You can get an API key from the provider's website.\n");
-
-    print!("Enter API key (or press Enter to skip): ");
-    io::stdout().flush().ok();
-
-    let mut api_key = String::new();
-    if io::stdin().read_line(&mut api_key).is_err() {
-        eprintln!("Failed to read input.\n");
-        return;
-    }
-
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        println!("Skipped. Set {env_var} environment variable instead.\n");
-        return;
-    }
-
-    let config_path = provider_api_key_config_path();
-    let Some(config_dir) = config_path.parent() else {
-        eprintln!("Failed to resolve provider config directory.\n");
-        return;
-    };
-
-    if let Err(e) = fs::create_dir_all(config_dir) {
-        eprintln!("Failed to create config directory: {e}\n");
-        return;
-    }
-
-    match upsert_provider_api_key_config(&config_path, provider_id, provider_name, api_key) {
-        Ok(ProviderConfigUpdate::AlreadyConfigured) => {
-            println!("\nProvider already configured in config file.");
-            println!("Edit {} to update.\n", config_path.display());
-        }
-        Ok(ProviderConfigUpdate::Saved) => {
-            println!("\nSaved API key to: {}", config_path.display());
-            println!("Restart the chat to use the new configuration.\n");
-        }
-        Err(e) => eprintln!("\n{e}\n"),
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ProviderConfigUpdate {
-    AlreadyConfigured,
-    Saved,
-}
-
-fn provider_api_key_config_path() -> PathBuf {
-    dirs::home_dir().map_or_else(
-        || PathBuf::from(".openclaudia/config.yaml"),
-        |home| home.join(".openclaudia/config.yaml"),
-    )
-}
-
-fn upsert_provider_api_key_config(
-    config_path: &Path,
-    provider_id: &str,
-    _provider_name: &str,
-    api_key: &str,
-) -> Result<ProviderConfigUpdate, String> {
-    let config_content = match fs::read_to_string(config_path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(format!(
-                "Failed to read existing config {}: {e}",
-                config_path.display()
-            ));
+    let provider = &providers[choice - 1];
+    let store_path = match openclaudia::provider_credentials::user_store_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("\n{error}\n");
+            return;
         }
     };
 
-    let mut root = if config_content.trim().is_empty() {
-        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
-    } else {
-        serde_yaml::from_str::<serde_yaml::Value>(&config_content).map_err(|e| {
-            format!(
-                "Failed to parse existing config {}: {e}",
-                config_path.display()
-            )
-        })?
-    };
-
-    let serde_yaml::Value::Mapping(root_map) = &mut root else {
-        return Err(format!(
-            "Failed to update config {}: root document must be a mapping",
-            config_path.display()
-        ));
-    };
-
-    let providers_yaml_key = serde_yaml::Value::String("providers".to_string());
-    let selected_provider_yaml_key = serde_yaml::Value::String(provider_id.to_string());
-    let api_key_yaml_key = serde_yaml::Value::String("api_key".to_string());
-
-    if !root_map.contains_key(&providers_yaml_key) {
-        root_map.insert(
-            providers_yaml_key.clone(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-        );
+    println!("\nProvider: {provider}");
+    println!("Scope: this user account");
+    println!("Destination: {}", store_path.display());
+    println!("Effect: available to new OpenClaudia chats; project files are unchanged.\n");
+    if !prompt_confirmation("Save to this destination? [y/N]: ") {
+        println!("Cancelled; no credentials were changed.\n");
+        return;
     }
 
-    let providers = root_map.get_mut(&providers_yaml_key).ok_or_else(|| {
-        format!(
-            "Failed to update config {}: providers block missing after initialization",
-            config_path.display()
-        )
-    })?;
-    let serde_yaml::Value::Mapping(providers_map) = providers else {
-        return Err(format!(
-            "Failed to update config {}: providers must be a mapping",
-            config_path.display()
-        ));
+    let overwrite = match openclaudia::provider_credentials::has_saved_user_api_key(provider) {
+        Ok(false) => false,
+        Ok(true) => {
+            println!("A protected key is already saved for {provider}.");
+            if !prompt_confirmation("Replace the existing saved key? [y/N]: ") {
+                println!("Cancelled; the existing credential is unchanged.\n");
+                return;
+            }
+            true
+        }
+        Err(error) => {
+            eprintln!("\nFailed to inspect protected credentials: {error}\n");
+            return;
+        }
     };
 
-    if !providers_map.contains_key(&selected_provider_yaml_key) {
-        providers_map.insert(
-            selected_provider_yaml_key.clone(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-        );
-    }
-
-    let selected_provider = providers_map
-        .get_mut(&selected_provider_yaml_key)
-        .ok_or_else(|| {
-            format!(
-                "Failed to update config {}: provider block missing after initialization",
-                config_path.display()
-            )
-        })?;
-    let serde_yaml::Value::Mapping(selected_provider_map) = selected_provider else {
-        return Err(format!(
-            "Failed to update config {}: providers.{provider_id} must be a mapping",
-            config_path.display()
-        ));
+    let api_key = match openclaudia::provider_credentials::prompt_hidden_api_key(provider) {
+        Ok(api_key) => api_key,
+        Err(error) => {
+            eprintln!("\n{error}\n");
+            return;
+        }
     };
-
-    if selected_provider_map.contains_key(&api_key_yaml_key) {
-        return Ok(ProviderConfigUpdate::AlreadyConfigured);
+    match openclaudia::provider_credentials::save_user_api_key(provider, api_key, overwrite) {
+        Ok(_) => {
+            println!("\nSaved protected API key to: {}", store_path.display());
+            println!("Start a new chat to use it.\n");
+        }
+        Err(error) => eprintln!("\nFailed to save protected API key: {error}\n"),
     }
+}
 
-    selected_provider_map.insert(
-        api_key_yaml_key,
-        serde_yaml::Value::String(api_key.to_string()),
-    );
+fn prompt_confirmation(prompt: &str) -> bool {
+    use std::io::{self, Write as _};
 
-    let rendered = serde_yaml::to_string(&root).map_err(|e| {
-        format!(
-            "Failed to encode API key for config {}: {e}",
-            config_path.display()
-        )
-    })?;
-
-    fs::write(config_path, rendered)
-        .map_err(|e| format!("Failed to save config {}: {e}", config_path.display()))?;
-
-    Ok(ProviderConfigUpdate::Saved)
+    print!("{prompt}");
+    if io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml::Value as YamlValue;
 
     #[test]
     fn review_git_helpers_use_resolved_binary_path() {
@@ -433,80 +337,15 @@ mod tests {
     }
 
     #[test]
-    fn upsert_provider_api_key_config_rejects_unreadable_utf8_without_overwrite() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
-        fs::write(&config_path, [0xff, 0xfe, 0xfd]).unwrap();
+    fn legacy_connect_source_has_no_yaml_secret_writer_or_echoed_key_read() {
+        let source = include_str!("review.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
 
-        let err = upsert_provider_api_key_config(&config_path, "openai", "OpenAI", "sk-new-key")
-            .expect_err("invalid UTF-8 config must not be treated as empty");
-
-        assert!(err.contains("Failed to read existing config"), "{err}");
-        assert_eq!(fs::read(&config_path).unwrap(), vec![0xff, 0xfe, 0xfd]);
-    }
-
-    #[test]
-    fn upsert_provider_api_key_config_writes_nested_provider_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
-        let api_key = "sk-quote\"and\\slash";
-
-        let update = upsert_provider_api_key_config(&config_path, "openai", "OpenAI", api_key)
-            .expect("new config should be written");
-
-        assert_eq!(update, ProviderConfigUpdate::Saved);
-        let config = fs::read_to_string(&config_path).unwrap();
-        let parsed: YamlValue = serde_yaml::from_str(&config).unwrap();
-        assert_eq!(
-            parsed["providers"]["openai"]["api_key"].as_str(),
-            Some(api_key)
-        );
-    }
-
-    #[test]
-    fn upsert_provider_api_key_config_preserves_existing_provider_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
-        let original = "providers:\n  openai:\n    api_key: \"sk-existing\"\n";
-        fs::write(&config_path, original).unwrap();
-
-        let update = upsert_provider_api_key_config(&config_path, "openai", "OpenAI", "sk-new")
-            .expect("existing readable config should load");
-
-        assert_eq!(update, ProviderConfigUpdate::AlreadyConfigured);
-        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
-    }
-
-    #[test]
-    fn upsert_provider_api_key_config_does_not_treat_legacy_key_as_configured() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
-        fs::write(&config_path, "openai_api_key: \"sk-legacy\"\n").unwrap();
-
-        let update = upsert_provider_api_key_config(&config_path, "openai", "OpenAI", "sk-new")
-            .expect("legacy top-level key should not block current schema");
-
-        assert_eq!(update, ProviderConfigUpdate::Saved);
-        let config = fs::read_to_string(&config_path).unwrap();
-        let parsed: YamlValue = serde_yaml::from_str(&config).unwrap();
-        assert_eq!(
-            parsed["providers"]["openai"]["api_key"].as_str(),
-            Some("sk-new")
-        );
-        assert_eq!(parsed["openai_api_key"].as_str(), Some("sk-legacy"));
-    }
-
-    #[test]
-    fn upsert_provider_api_key_config_rejects_invalid_yaml_without_overwrite() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
-        let original = "providers:\n  openai: [unterminated\n";
-        fs::write(&config_path, original).unwrap();
-
-        let err = upsert_provider_api_key_config(&config_path, "openai", "OpenAI", "sk-new")
-            .expect_err("invalid YAML config must not be overwritten");
-
-        assert!(err.contains("Failed to parse existing config"), "{err}");
-        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        assert!(!production.contains(".openclaudia/config.yaml"));
+        assert!(!production.contains("upsert_provider_api_key_config"));
+        assert!(production.contains("prompt_hidden_api_key"));
     }
 }

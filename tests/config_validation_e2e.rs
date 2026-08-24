@@ -798,6 +798,67 @@ fn load_config_accepts_provider_api_key_env_aliases() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn load_config_discovers_protected_user_provider_key() {
+    let _lock = process_env_lock();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let data = tempfile::tempdir().expect("data tempdir");
+    let _cwd_guard = CwdGuard::set_to(cwd.path());
+    let _home_guard = EnvGuard::set_path("HOME", home.path());
+    let _data_guard = EnvGuard::set_path("XDG_DATA_HOME", data.path());
+    let _clean_env: Vec<EnvGuard> = CONFIG_ENV_VARS
+        .iter()
+        .copied()
+        .map(EnvGuard::remove)
+        .collect();
+    let stored = ApiKey::try_from_string("sk-protected-user-key".to_string()).expect("valid key");
+
+    openclaudia::provider_credentials::save_user_api_key("openai", stored, false)
+        .expect("save protected key");
+    let cfg = load_config().expect("config with protected key");
+
+    assert!(cfg.providers["openai"]
+        .api_key
+        .as_ref()
+        .is_some_and(|key| key.matches("sk-protected-user-key")));
+    assert!(!cwd.path().join(".openclaudia/config.yaml").exists());
+    assert_eq!(
+        openclaudia::provider_credentials::user_store_path().expect("store path"),
+        data.path().join("openclaudia/provider_api_keys.json")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_environment_key_precedes_protected_user_key() {
+    let _lock = process_env_lock();
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let data = tempfile::tempdir().expect("data tempdir");
+    let _cwd_guard = CwdGuard::set_to(cwd.path());
+    let _home_guard = EnvGuard::set_path("HOME", home.path());
+    let _data_guard = EnvGuard::set_path("XDG_DATA_HOME", data.path());
+    let _clean_env: Vec<EnvGuard> = CONFIG_ENV_VARS
+        .iter()
+        .copied()
+        .map(EnvGuard::remove)
+        .collect();
+    let stored =
+        ApiKey::try_from_string("sk-lower-priority-store".to_string()).expect("valid stored key");
+    openclaudia::provider_credentials::save_user_api_key("openai", stored, false)
+        .expect("save protected key");
+    let _environment_key = EnvGuard::set("OPENAI_API_KEY", "sk-higher-priority-environment");
+
+    let cfg = load_config().expect("config with explicit environment key");
+
+    assert!(cfg.providers["openai"]
+        .api_key
+        .as_ref()
+        .is_some_and(|key| key.matches("sk-higher-priority-environment")));
+}
+
 #[test]
 fn load_config_accepts_advertised_prefixed_provider_api_keys() {
     let _lock = process_env_lock();

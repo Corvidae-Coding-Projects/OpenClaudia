@@ -47,6 +47,7 @@ pub mod pipeline;
 pub mod plugins;
 pub mod prompt;
 pub mod provider_budget;
+pub mod provider_credentials;
 pub mod provider_transport;
 pub mod providers;
 pub mod proxy;

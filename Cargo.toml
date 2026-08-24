@@ -105,6 +105,7 @@ rustyline = { version = "18", features = ["derive"] }
 indicatif = "0.18"
 crossterm = "0.29"
 arboard = "3"
+rpassword = "7.5"
 
 # TUI framework
 ratatui = "0.30"
