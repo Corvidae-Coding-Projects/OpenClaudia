@@ -15,6 +15,26 @@ pub const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 pub const CODEX_ACCESS_TOKEN_ENV_VAR: &str = "CODEX_ACCESS_TOKEN";
 pub const CODEX_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
+/// Remove public Responses API fields rejected by the account backend.
+///
+/// Budget admission happens before this final `ChatGPT` Codex wire projection,
+/// so omitting the field does not weaken local limits.
+pub fn finalize_chatgpt_responses_request(request: &mut serde_json::Value) {
+    if let Some(object) = request.as_object_mut() {
+        object.remove("max_output_tokens");
+    }
+}
+
+/// Whether an already-resolved endpoint targets the account-backed Codex API.
+#[must_use]
+pub fn is_chatgpt_codex_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .strip_prefix(CODEX_CHATGPT_BASE_URL)
+        .is_some_and(|suffix| {
+            suffix.is_empty() || suffix.starts_with('/') || suffix.starts_with('?')
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexAuthMode {
     ApiKey,
@@ -582,5 +602,25 @@ mod tests {
             let err = load_codex_auth_from_path(&link).unwrap_err();
             assert!(err.contains("refusing to read symlinked"));
         }
+    }
+
+    #[test]
+    fn chatgpt_responses_wire_projection_omits_public_api_output_limit() {
+        let mut request = json!({
+            "model": "gpt-test",
+            "input": [],
+            "max_output_tokens": 123,
+            "stream": true
+        });
+        finalize_chatgpt_responses_request(&mut request);
+        assert!(request.get("max_output_tokens").is_none());
+        assert_eq!(request["model"], "gpt-test");
+        assert_eq!(request["stream"], true);
+        assert!(is_chatgpt_codex_endpoint(
+            "https://chatgpt.com/backend-api/codex/responses"
+        ));
+        assert!(!is_chatgpt_codex_endpoint(
+            "https://api.openai.com/v1/responses"
+        ));
     }
 }

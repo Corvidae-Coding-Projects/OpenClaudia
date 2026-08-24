@@ -1950,6 +1950,9 @@ impl AcpServer {
                     );
                 }
             };
+            if self.codex_responses_auth.is_some() {
+                crate::codex_credentials::finalize_chatgpt_responses_request(&mut transformed);
+            }
 
             let req = match headers.apply(client.post(&endpoint).json(&transformed)) {
                 Ok(request) => request,

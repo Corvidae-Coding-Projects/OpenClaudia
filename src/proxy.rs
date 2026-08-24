@@ -8,7 +8,7 @@ use axum::{
     extract::{Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
     Json, Router,
 };
 use reqwest::Client;
@@ -122,6 +122,9 @@ pub enum ProxyError {
     #[error("No API key configured for provider: {0}")]
     NoApiKey(String),
 
+    #[error("Authentication failed: {0}")]
+    Unauthorized(&'static str),
+
     #[error("Request error: {0}")]
     RequestError(#[from] reqwest::Error),
 
@@ -144,7 +147,9 @@ pub enum ProxyError {
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            Self::NoApiKey(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
+            Self::NoApiKey(_) | Self::Unauthorized(_) => {
+                (StatusCode::UNAUTHORIZED, self.to_string())
+            }
             Self::RequestError(_) | Self::ProviderTransport(_) => {
                 (StatusCode::BAD_GATEWAY, self.to_string())
             }
@@ -231,12 +236,10 @@ pub fn create_router(state: ProxyState) -> Router {
         .route("/health", get(health_check))
         // Auth routes (device flow for Claude Max OAuth)
         .route("/auth/device", get(auth_device_page))
-        .route("/auth/device/start", axum::routing::post(auth_device_start))
-        .route(
-            "/auth/device/submit",
-            axum::routing::post(auth_device_submit),
-        )
+        .route("/auth/device/start", post(auth_device_start))
+        .route("/auth/device/submit", post(auth_device_submit))
         .route("/auth/status", get(auth_status))
+        .route("/auth/logout", post(auth_logout))
         // Stats endpoint for token usage
         .route("/stats", get(session_stats))
         // OpenAI-compatible endpoints
@@ -308,16 +311,18 @@ async fn auth_device_page() -> impl IntoResponse {
 }
 
 /// Start device authorization flow
-async fn auth_device_start(
-    State(state): State<ProxyState>,
-) -> Result<impl IntoResponse, ProxyError> {
-    use crate::oauth::PkceParams;
+async fn auth_device_start(State(state): State<ProxyState>) -> Result<Response, ProxyError> {
+    use crate::oauth::{generate_client_binding, PkceParams};
 
     let pkce = PkceParams::generate();
-    let oauth_state = pkce.state.clone();
+    let oauth_state = pkce
+        .state
+        .expose(|state| zeroize::Zeroizing::new(state.to_string()));
+    let client_binding = generate_client_binding();
 
-    // Store PKCE for later verification
-    state.oauth_store.store_challenge(pkce.clone());
+    state
+        .oauth_store
+        .store_bound_challenge(pkce.clone(), &client_binding);
 
     // Build authorization URL via the canonical builder so OAUTH_SCOPES and
     // OAUTH_AUTHORIZE_URL remain the single source of truth.
@@ -328,10 +333,59 @@ async fn auth_device_start(
 
     info!("Device flow auth URL generated");
 
-    Ok(Json(serde_json::json!({
+    let mut response = Json(serde_json::json!({
         "auth_url": auth_url,
-        "state": oauth_state
-    })))
+        "state": oauth_state.as_str()
+    }))
+    .into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        oauth_cookie_header(
+            OAUTH_CLIENT_COOKIE,
+            &client_binding,
+            OAUTH_COOKIE_MAX_AGE_SECS,
+        )?,
+    );
+    Ok(response)
+}
+
+const OAUTH_CLIENT_COOKIE: &str = "openclaudia_oauth_client";
+const OAUTH_SESSION_COOKIE: &str = "anthropic_session";
+const OAUTH_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+
+fn oauth_cookie_header(
+    name: &str,
+    value: &crate::secrets::SecretString,
+    max_age_secs: i64,
+) -> Result<HeaderValue, ProxyError> {
+    // The proxy currently serves plain HTTP on loopback, so adding `Secure`
+    // would make browsers discard these cookies. Add it when the TLS slice
+    // moves this route to HTTPS.
+    value.expose(|raw| {
+        HeaderValue::from_str(&format!(
+            "{name}={raw}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_secs}"
+        ))
+        .map_err(|_| ProxyError::InvalidBody("invalid OAuth cookie value".to_string()))
+    })
+}
+
+fn cleared_oauth_cookie(name: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+    ))
+    .expect("fixed OAuth cookie header must be valid")
+}
+
+fn oauth_cookie_secret(headers: &HeaderMap, name: &str) -> Option<crate::secrets::SecretString> {
+    let prefix = format!("{name}=");
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .flat_map(|cookies| cookies.split(';'))
+        .find_map(|cookie| cookie.trim().strip_prefix(&prefix))
+        .filter(|value| !value.is_empty())
+        .and_then(|value| crate::secrets::SecretString::try_from_string(value.to_string()).ok())
 }
 
 fn required_non_empty_payload_string<'a>(
@@ -370,17 +424,21 @@ fn extract_device_submit_fields(payload: &Value) -> Result<(String, String), Pro
 /// Submit authorization code from device flow
 async fn auth_device_submit(
     State(state): State<ProxyState>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
-) -> Result<impl IntoResponse, ProxyError> {
+) -> Result<Response, ProxyError> {
     use crate::oauth::{OAuthClient, OAuthSession};
 
     let (code, oauth_state) = extract_device_submit_fields(&payload)?;
+    let client_binding = oauth_cookie_secret(&headers, OAUTH_CLIENT_COOKIE)
+        .ok_or(ProxyError::Unauthorized("OAuth client binding is missing"))?;
 
-    // Get PKCE challenge
     let pkce = state
         .oauth_store
-        .take_challenge(&oauth_state)
-        .ok_or_else(|| ProxyError::InvalidBody("Invalid state parameter".to_string()))?;
+        .take_bound_challenge(&oauth_state, &client_binding)
+        .ok_or(ProxyError::Unauthorized(
+            "OAuth state is invalid, expired, replayed, or belongs to another client",
+        ))?;
 
     // Exchange code for tokens
     let client = OAuthClient::new()
@@ -395,52 +453,81 @@ async fn auth_device_submit(
 
     // Try to create API key if we have the scope
     if session.can_create_api_key() {
-        if let Ok(api_key) = client
+        match client
             .create_api_key(&session.credentials.access_token)
             .await
         {
-            session.api_key = Some(api_key);
+            Ok(api_key) => session.api_key = Some(api_key),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "OAuth API-key creation failed; using bearer authentication"
+                );
+                session.auth_mode = crate::oauth::AuthMode::BearerToken;
+            }
         }
     }
 
-    let session_id = session.id.clone();
-    state.oauth_store.store_session(session);
+    let session_cookie = crate::secrets::SecretString::try_from_string(session.id.clone())
+        .map_err(|_| ProxyError::InvalidBody("invalid OAuth session identifier".to_string()))?;
+    state
+        .oauth_store
+        .try_store_bound_session(session, &client_binding)
+        .map_err(|error| {
+            ProxyError::InvalidBody(format!("Failed to persist OAuth session: {error:#}"))
+        })?;
 
-    info!(
-        "Device flow authentication successful, session: {}",
-        session_id
-    );
+    info!("Device flow authentication successful");
 
-    Ok(Json(serde_json::json!({
+    let mut response = Json(serde_json::json!({
         "success": true,
-        "message": "Authentication successful",
-        "session_id": session_id
-    })))
+        "message": "Authentication successful"
+    }))
+    .into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        oauth_cookie_header(
+            OAUTH_SESSION_COOKIE,
+            &session_cookie,
+            OAUTH_COOKIE_MAX_AGE_SECS,
+        )?,
+    );
+    Ok(response)
 }
 
 /// Check authentication status
-async fn auth_status(State(state): State<ProxyState>, headers: HeaderMap) -> impl IntoResponse {
-    // Crosslink #908: cookie-parsing chain was duplicated between this
-    // route and `proxy_anthropic_messages`. Both now share
-    // `lookup_oauth_session_from_cookie` so any future cookie-parsing
-    // change (e.g. moving to the `cookie` crate for proper RFC-6265
-    // handling) only needs to land in one place.
-    let session = lookup_oauth_session_from_cookie(&headers, &state.oauth_store);
+async fn auth_status(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    let authenticated = lookup_oauth_session_from_cookie(&headers, &state.oauth_store)
+        .await
+        .is_ok_and(|session| session.is_some());
+    Json(serde_json::json!({ "authenticated": authenticated })).into_response()
+}
 
-    // No "any valid session" fallback — an absent cookie returns
-    // `authenticated: false`. The previous fallback let any unauth
-    // caller learn another user's session id. See crosslink #375.
-
-    match session {
-        Some(s) => Json(serde_json::json!({
-            "authenticated": true,
-            "session_id": s.id
-        })),
-        None => Json(serde_json::json!({
-            "authenticated": false,
-            "session_id": null
-        })),
-    }
+/// Revoke the current browser-bound native OAuth session.
+async fn auth_logout(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+) -> Result<Response, ProxyError> {
+    let session_id = oauth_cookie_secret(&headers, OAUTH_SESSION_COOKIE)
+        .ok_or(ProxyError::Unauthorized("OAuth session is missing"))?;
+    let client_binding = oauth_cookie_secret(&headers, OAUTH_CLIENT_COOKIE)
+        .ok_or(ProxyError::Unauthorized("OAuth client binding is missing"))?;
+    let session_id = session_id.expose(|id| zeroize::Zeroizing::new(id.to_string()));
+    let revoked = state
+        .oauth_store
+        .revoke_session_for_client(&session_id, &client_binding)
+        .await
+        .map_err(|_| ProxyError::Unauthorized("OAuth session could not be revoked"))?;
+    let mut response = Json(serde_json::json!({ "revoked": revoked })).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        cleared_oauth_cookie(OAUTH_SESSION_COOKIE),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        cleared_oauth_cookie(OAUTH_CLIENT_COOKIE),
+    );
+    Ok(response)
 }
 
 fn model_list_json(data: Vec<Value>) -> Value {
@@ -1864,36 +1951,28 @@ enum AnthropicAuth {
     ApiKey(ApiKey),
 }
 
-/// Look up an OAuth session from the request's `anthropic_session`
-/// cookie, if any.
+/// Look up a browser-bound OAuth session from request cookies, if any.
 ///
-/// Returns `None` when the cookie header is absent, malformed, or
-/// names a session that is not in the store. Does NOT fall back to
-/// "any valid session" — see crosslink #375 (critical) for the
+/// Returns `Ok(None)` only when the session cookie is absent. A malformed,
+/// unbound, expired, revoked, or otherwise unusable supplied session is an
+/// authorization error and cannot fall back to another credential. Does NOT
+/// fall back to "any valid session" — see crosslink #375 (critical) for the
 /// reasoning. Extracted from the inline parse chain in
 /// `proxy_anthropic_messages` for crosslink #386.
-fn lookup_oauth_session_from_cookie(
+async fn lookup_oauth_session_from_cookie(
     headers: &HeaderMap,
     oauth_store: &OAuthStore,
-) -> Option<crate::oauth::OAuthSession> {
-    headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|cookie| {
-                let cookie = cookie.trim();
-                cookie
-                    .strip_prefix("anthropic_session=")
-                    .map(std::string::ToString::to_string)
-            })
-        })
-        .and_then(|session_id| {
-            debug!(
-                "[/v1/messages] Looking up session from cookie: {}",
-                session_id
-            );
-            oauth_store.get_session(&session_id)
-        })
+) -> Result<Option<crate::oauth::OAuthSession>, crate::oauth::OAuthSessionUseError> {
+    let Some(session_id) = oauth_cookie_secret(headers, OAUTH_SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    let client_binding = oauth_cookie_secret(headers, OAUTH_CLIENT_COOKIE)
+        .ok_or(crate::oauth::OAuthSessionUseError::ClientBinding)?;
+    let session_id = session_id.expose(|id| zeroize::Zeroizing::new(id.to_string()));
+    oauth_store
+        .get_session_for_use(&session_id, &client_binding)
+        .await
+        .map(Some)
 }
 
 /// Resolve the authentication mode for an Anthropic `/v1/messages`
@@ -1903,13 +1982,31 @@ fn lookup_oauth_session_from_cookie(
 /// an API key from `Authorization` / `x-api-key` / provider config is
 /// used. Returns `Err(ProxyError::NoApiKey)` only when neither path is
 /// available. Extracted for crosslink #386.
-fn resolve_anthropic_auth(
+async fn resolve_anthropic_auth(
     headers: &HeaderMap,
     oauth_store: &OAuthStore,
     provider: &ProviderConfig,
 ) -> Result<AnthropicAuth, ProxyError> {
-    if let Some(session) = lookup_oauth_session_from_cookie(headers, oauth_store) {
-        return Ok(AnthropicAuth::Oauth(session));
+    match lookup_oauth_session_from_cookie(headers, oauth_store).await {
+        Ok(Some(session)) => {
+            return match &session.auth_mode {
+                crate::oauth::AuthMode::BearerToken => Ok(AnthropicAuth::Oauth(session)),
+                crate::oauth::AuthMode::ApiKey => {
+                    session.api_key.clone().map(AnthropicAuth::ApiKey).ok_or(
+                        ProxyError::Unauthorized("OAuth API-key session has no usable key"),
+                    )
+                }
+                crate::oauth::AuthMode::ProxyMode => Err(ProxyError::Unauthorized(
+                    "OAuth proxy-mode session is unsupported",
+                )),
+            };
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return Err(ProxyError::Unauthorized(
+                "OAuth session is invalid, expired, revoked, or belongs to another client",
+            ));
+        }
     }
     let api_key = extract_api_key(headers)?
         .or_else(|| provider.api_key.clone())
@@ -1936,7 +2033,7 @@ async fn send_oauth_anthropic_messages(
     request: &Value,
     max_bytes: usize,
 ) -> Result<Response, ProxyError> {
-    info!("[/v1/messages] Using OAuth session: {}", session.id);
+    info!("[/v1/messages] Using browser-bound OAuth session");
 
     let url = format!("{}/v1/messages", normalize_base_url(&provider.base_url));
     crate::provider_transport::validate_endpoint("anthropic", &url)?;
@@ -2007,7 +2104,7 @@ async fn proxy_anthropic_messages(
         .ok_or_else(|| ProxyError::ProviderNotConfigured("anthropic".to_string()))?;
 
     let max_bytes = state.config.proxy.max_response_bytes;
-    let auth = resolve_anthropic_auth(&headers, &state.oauth_store, provider)?;
+    let auth = resolve_anthropic_auth(&headers, &state.oauth_store, provider).await?;
     if matches!(auth, AnthropicAuth::Oauth(_)) {
         crate::claude_credentials::inject_oauth_prefix_only(&mut request);
         crate::claude_credentials::strip_cache_control_ttl(&mut request);
@@ -3260,7 +3357,7 @@ mod tests {
             session_manager: Arc::new(RwLock::new(SessionManager::new(&session_path))),
             plugin_manager: Arc::new(PluginManager::with_paths(vec![])),
             mcp_manager: Arc::new(RwLock::new(McpManager::new(Arc::clone(test_run())))),
-            oauth_store: Arc::new(OAuthStore::new()),
+            oauth_store: Arc::new(OAuthStore::ephemeral()),
             vdd_engine: None,
             loop_control: None,
         }
@@ -3832,6 +3929,111 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn device_start_returns_raw_state_only_to_bound_http_client() {
+        let state = test_proxy_state(minimal_config("anthropic"));
+        let response = auth_device_start(State(state.clone()))
+            .await
+            .expect("start flow");
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("client binding cookie")
+            .to_string();
+        assert!(set_cookie.starts_with("openclaudia_oauth_client="));
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+        let binding_value = set_cookie
+            .split(';')
+            .next()
+            .and_then(|cookie| cookie.split_once('='))
+            .map(|(_, value)| value)
+            .expect("binding value");
+        let binding = crate::secrets::SecretString::try_from_string(binding_value.to_string())
+            .expect("binding secret");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("json");
+        let oauth_state = payload["state"].as_str().expect("raw state");
+        assert_ne!(oauth_state, crate::secrets::REDACTED_SECRET);
+        assert!(payload["auth_url"]
+            .as_str()
+            .expect("auth url")
+            .contains(urlencoding::encode(oauth_state).as_ref()));
+        assert!(state
+            .oauth_store
+            .take_bound_challenge(oauth_state, &binding)
+            .is_some());
+        assert!(state
+            .oauth_store
+            .take_bound_challenge(oauth_state, &binding)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_logout_revokes_session_and_clears_both_cookies() {
+        let state = test_proxy_state(minimal_config("anthropic"));
+        let binding = crate::oauth::generate_client_binding();
+        let session = crate::oauth::OAuthSession {
+            id: "proxy-logout-session".to_string(),
+            credentials: crate::oauth::OAuthCredentials {
+                access_token: crate::secrets::OAuthToken::try_from_string(
+                    "proxy-logout-access".to_string(),
+                )
+                .expect("access"),
+                refresh_token: Some(
+                    crate::secrets::OAuthToken::try_from_string("proxy-logout-refresh".to_string())
+                        .expect("refresh"),
+                ),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+            api_key: None,
+            auth_mode: crate::oauth::AuthMode::BearerToken,
+            granted_scopes: vec!["user:inference".to_string()],
+            created_at: chrono::Utc::now(),
+            user_id: None,
+        };
+        state
+            .oauth_store
+            .try_store_bound_session(session, &binding)
+            .expect("store");
+        let cookie = binding.expose(|raw| {
+            format!("{OAUTH_SESSION_COOKIE}=proxy-logout-session; {OAUTH_CLIENT_COOKIE}={raw}")
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookie).expect("cookie"),
+        );
+
+        let response = auth_logout(State(state.clone()), headers.clone())
+            .await
+            .expect("logout");
+        let cleared: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert_eq!(cleared.len(), 2);
+        assert!(cleared.iter().all(|cookie| cookie.contains("Max-Age=0")));
+        assert!(state
+            .oauth_store
+            .get_session("proxy-logout-session")
+            .is_none());
+
+        let repeated = auth_logout(State(state), headers)
+            .await
+            .expect("repeated logout");
+        let body = axum::body::to_bytes(repeated.into_body(), 1024)
+            .await
+            .expect("logout body");
+        let payload: Value = serde_json::from_slice(&body).expect("logout json");
+        assert_eq!(payload["revoked"], false);
+    }
+
     #[test]
     fn device_flow_page_surfaces_structured_proxy_errors_as_text() {
         let html = include_str!("../assets/device_flow.html");
@@ -3839,6 +4041,8 @@ mod tests {
         assert!(html.contains("function errorMessage(data)"), "{html}");
         assert!(html.contains("data.error.message"), "{html}");
         assert!(html.contains("status.textContent = message"), "{html}");
+        assert!(!html.contains("data.session_id"), "{html}");
+        assert!(!html.contains("status.innerHTML"), "{html}");
         assert!(
             html.contains(
                 "showTextStatus('Authentication failed: ' + errorMessage(data), 'error')"

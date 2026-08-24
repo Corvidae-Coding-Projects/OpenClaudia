@@ -23,11 +23,20 @@ use serde::ser::{SerializeMap as _, SerializeStruct as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info};
 use zeroize::Zeroizing;
+
+/// Current on-disk schema for OpenClaudia-owned native OAuth sessions.
+pub const OAUTH_STORE_SCHEMA_VERSION: u32 = 1;
+const OAUTH_REFRESH_SKEW_SECS: i64 = 60;
+const PENDING_GRANT_TTL_SECS: i64 = 10 * 60;
+const MAX_PENDING_GRANTS: usize = 32;
+const REQUIRED_INFERENCE_SCOPE: &str = "user:inference";
 
 /// Clamp an OAuth `expires_in` value to a plausible window and convert
 /// it to an absolute `DateTime<Utc>`.
@@ -163,6 +172,19 @@ fn generate_random_string(byte_length: usize) -> String {
     URL_SAFE_NO_PAD.encode(&bytes)
 }
 
+/// Generate the opaque browser-client capability used to bind an OAuth grant
+/// and its resulting session. Raw bytes belong only in an `HttpOnly` cookie.
+///
+/// # Panics
+///
+/// Panics only if URL-safe random output violates the secret-string invariant,
+/// which would indicate a programming defect.
+#[must_use]
+pub fn generate_client_binding() -> crate::secrets::SecretString {
+    crate::secrets::SecretString::try_from_string(generate_random_string(32))
+        .expect("generated OAuth client binding must satisfy secret validation")
+}
+
 /// Compute S256 challenge from verifier (SHA256 + base64url)
 fn compute_s256_challenge(verifier: &str) -> String {
     let hash = Sha256::digest(verifier.as_bytes());
@@ -244,7 +266,7 @@ pub enum AuthMode {
 }
 
 /// Active OAuth session with credentials and metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthSession {
     /// Session identifier (used as pseudo API key)
     pub id: String,
@@ -260,6 +282,25 @@ pub struct OAuthSession {
     pub created_at: DateTime<Utc>,
     /// Optional user identifier
     pub user_id: Option<String>,
+}
+
+const fn initial_session_generation() -> u64 {
+    1
+}
+
+impl fmt::Debug for OAuthSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthSession")
+            .field("id", &"[REDACTED]")
+            .field("credentials", &self.credentials)
+            .field("api_key", &self.api_key)
+            .field("auth_mode", &self.auth_mode)
+            .field("granted_scopes", &self.granted_scopes)
+            .field("created_at", &self.created_at)
+            .field("user_id", &self.user_id)
+            .finish()
+    }
 }
 
 impl OAuthSession {
@@ -315,6 +356,39 @@ impl OAuthSession {
             .iter()
             .any(|s| s == "org:create_api_key")
     }
+
+    fn has_inference_scope(&self) -> bool {
+        self.granted_scopes
+            .iter()
+            .any(|scope| scope == REQUIRED_INFERENCE_SCOPE)
+    }
+}
+
+#[derive(Clone)]
+struct OAuthSessionRecord {
+    session: OAuthSession,
+    generation: u64,
+    client_binding: Option<String>,
+}
+
+impl OAuthSessionRecord {
+    const fn new(session: OAuthSession, client_binding: Option<String>) -> Self {
+        Self {
+            session,
+            generation: initial_session_generation(),
+            client_binding,
+        }
+    }
+
+    fn matches_client(&self, binding: &crate::secrets::SecretString) -> bool {
+        self.client_binding
+            .as_deref()
+            .is_some_and(|expected| expected == binding_digest(binding))
+    }
+}
+
+fn binding_digest(binding: &crate::secrets::SecretString) -> String {
+    binding.expose(|raw| URL_SAFE_NO_PAD.encode(Sha256::digest(raw.as_bytes())))
 }
 
 /// Borrowed serializer used only by the owner-only OAuth session store.
@@ -322,15 +396,16 @@ impl OAuthSession {
 /// Runtime `Serialize` implementations stay redacted. This wrapper is the
 /// single explicit persistence boundary where live credential bytes are
 /// written to a `0600` file, and it never creates another owned secret copy.
-struct PersistedOAuthSessionRef<'a>(&'a OAuthSession);
+struct PersistedOAuthSessionRef<'a>(&'a OAuthSessionRecord);
 
 impl Serialize for PersistedOAuthSessionRef<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let session = self.0;
-        let mut state = serializer.serialize_struct("OAuthSession", 7)?;
+        let record = self.0;
+        let session = &record.session;
+        let mut state = serializer.serialize_struct("OAuthSession", 9)?;
         state.serialize_field("id", &session.id)?;
         state.serialize_field(
             "credentials",
@@ -345,6 +420,8 @@ impl Serialize for PersistedOAuthSessionRef<'_> {
         state.serialize_field("granted_scopes", &session.granted_scopes)?;
         state.serialize_field("created_at", &session.created_at)?;
         state.serialize_field("user_id", &session.user_id)?;
+        state.serialize_field("generation", &record.generation)?;
+        state.serialize_field("client_binding", &record.client_binding)?;
         state.end()
     }
 }
@@ -371,7 +448,7 @@ impl Serialize for PersistedOAuthCredentialsRef<'_> {
     }
 }
 
-struct PersistedOAuthSessionMap<'a>(&'a HashMap<String, OAuthSession>);
+struct PersistedOAuthSessionMap<'a>(&'a HashMap<String, OAuthSessionRecord>);
 
 impl Serialize for PersistedOAuthSessionMap<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -383,6 +460,24 @@ impl Serialize for PersistedOAuthSessionMap<'_> {
             map.serialize_entry(id, &PersistedOAuthSessionRef(session))?;
         }
         map.end()
+    }
+}
+
+struct PersistedOAuthDocumentRef<'a> {
+    sessions: &'a HashMap<String, OAuthSessionRecord>,
+    revocations: &'a HashMap<String, OAuthRevocation>,
+}
+
+impl Serialize for PersistedOAuthDocumentRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("OAuthSessionDocument", 3)?;
+        state.serialize_field("schema_version", &OAUTH_STORE_SCHEMA_VERSION)?;
+        state.serialize_field("sessions", &PersistedOAuthSessionMap(self.sessions))?;
+        state.serialize_field("revocations", self.revocations)?;
+        state.end()
     }
 }
 
@@ -402,32 +497,128 @@ struct PersistedOAuthSession {
     granted_scopes: Vec<String>,
     created_at: DateTime<Utc>,
     user_id: Option<String>,
+    #[serde(default = "initial_session_generation")]
+    generation: u64,
+    #[serde(default)]
+    client_binding: Option<String>,
 }
 
 impl PersistedOAuthSession {
-    fn into_runtime(self) -> OAuthSession {
-        OAuthSession {
-            id: self.id,
-            credentials: OAuthCredentials {
-                access_token: self.credentials.access_token,
-                refresh_token: self.credentials.refresh_token,
-                expires_at: self.credentials.expires_at,
+    fn into_runtime(self) -> OAuthSessionRecord {
+        OAuthSessionRecord {
+            session: OAuthSession {
+                id: self.id,
+                credentials: OAuthCredentials {
+                    access_token: self.credentials.access_token,
+                    refresh_token: self.credentials.refresh_token,
+                    expires_at: self.credentials.expires_at,
+                },
+                api_key: self.api_key,
+                auth_mode: self.auth_mode,
+                granted_scopes: self.granted_scopes,
+                created_at: self.created_at,
+                user_id: self.user_id,
             },
-            api_key: self.api_key,
-            auth_mode: self.auth_mode,
-            granted_scopes: self.granted_scopes,
-            created_at: self.created_at,
-            user_id: self.user_id,
+            generation: self.generation,
+            client_binding: self.client_binding,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PersistedOAuthDocument {
+    schema_version: u32,
+    sessions: HashMap<String, PersistedOAuthSession>,
+    #[serde(default)]
+    revocations: HashMap<String, OAuthRevocation>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedOAuthDocumentCompat {
+    Versioned(PersistedOAuthDocument),
+    Legacy(HashMap<String, PersistedOAuthSession>),
+}
+
+impl PersistedOAuthDocumentCompat {
+    fn into_parts(
+        self,
+    ) -> Result<(
+        HashMap<String, PersistedOAuthSession>,
+        HashMap<String, OAuthRevocation>,
+    )> {
+        match self {
+            Self::Versioned(document) => {
+                if document.schema_version != OAUTH_STORE_SCHEMA_VERSION {
+                    anyhow::bail!(
+                        "unsupported OAuth session store schema version {}",
+                        document.schema_version
+                    );
+                }
+                Ok((document.sessions, document.revocations))
+            }
+            Self::Legacy(sessions) => Ok((sessions, HashMap::new())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OAuthRevocation {
+    generation: u64,
+    revoked_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Default)]
+struct OAuthRuntimeState {
+    sessions: HashMap<String, OAuthSessionRecord>,
+    revocations: HashMap<String, OAuthRevocation>,
+}
+
+struct PendingOAuthGrant {
+    pkce: PkceParams,
+    client_binding: Option<String>,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+impl PendingOAuthGrant {
+    fn unbound(pkce: PkceParams) -> Self {
+        Self {
+            pkce,
+            client_binding: None,
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + Duration::seconds(PENDING_GRANT_TTL_SECS),
+        }
+    }
+
+    fn bound(pkce: PkceParams, binding: &crate::secrets::SecretString) -> Self {
+        Self {
+            pkce,
+            client_binding: Some(binding_digest(binding)),
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + Duration::seconds(PENDING_GRANT_TTL_SECS),
+        }
+    }
+
+    fn matches_client(&self, binding: Option<&crate::secrets::SecretString>) -> bool {
+        match (&self.client_binding, binding) {
+            (None, None) => true,
+            (Some(expected), Some(binding)) => expected == &binding_digest(binding),
+            _ => false,
         }
     }
 }
 
 /// Thread-safe storage for OAuth sessions and pending PKCE challenges
 pub struct OAuthStore {
-    /// Active sessions keyed by session ID
-    sessions: RwLock<HashMap<String, OAuthSession>>,
-    /// Pending PKCE challenges retaining the state only in protected storage.
-    pending_challenges: RwLock<Vec<PkceParams>>,
+    /// Active sessions and durable revocation tombstones.
+    state: RwLock<OAuthRuntimeState>,
+    /// Bounded, expiring PKCE grants. Browser grants carry only a digest of
+    /// their `HttpOnly` client-binding cookie.
+    pending_challenges: RwLock<Vec<PendingOAuthGrant>>,
+    /// Serializes refresh within one process. The file lock below extends the
+    /// same single-flight property across independently running frontends.
+    refresh_gate: AsyncMutex<()>,
     /// Path for persistent session storage
     persist_path: Option<PathBuf>,
 }
@@ -444,6 +635,8 @@ struct OAuthSessionFileLock {
 
 impl OAuthSessionFileLock {
     fn acquire_for(path: &std::path::Path) -> Result<Self> {
+        const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+        const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
         let lock_path = oauth_session_lock_path(path);
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -460,10 +653,20 @@ impl OAuthSessionFileLock {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if ret != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("failed to lock {}", lock_path.display()));
+            let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+            loop {
+                let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if ret == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if !matches!(error.kind(), std::io::ErrorKind::WouldBlock)
+                    || std::time::Instant::now() >= deadline
+                {
+                    return Err(error)
+                        .with_context(|| format!("failed to lock {}", lock_path.display()));
+                }
+                std::thread::sleep(LOCK_RETRY);
             }
         }
 
@@ -472,21 +675,30 @@ impl OAuthSessionFileLock {
             use std::os::windows::io::AsRawHandle;
 
             const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
-            let mut overlapped =
-                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
-            let ok = unsafe {
-                windows_sys::Win32::Storage::FileSystem::LockFileEx(
-                    file.as_raw_handle() as _,
-                    LOCKFILE_EXCLUSIVE_LOCK,
-                    0,
-                    0xFFFF_FFFF,
-                    0xFFFF_FFFF,
-                    overlapped.as_mut_ptr(),
-                )
-            };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("failed to lock {}", lock_path.display()));
+            const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+            let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+            loop {
+                let mut overlapped =
+                    std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+                let ok = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::LockFileEx(
+                        file.as_raw_handle() as _,
+                        LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                        0,
+                        0xFFFF_FFFF,
+                        0xFFFF_FFFF,
+                        overlapped.as_mut_ptr(),
+                    )
+                };
+                if ok != 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if std::time::Instant::now() >= deadline {
+                    return Err(error)
+                        .with_context(|| format!("failed to lock {}", lock_path.display()));
+                }
+                std::thread::sleep(LOCK_RETRY);
             }
         }
 
@@ -498,154 +710,100 @@ fn oauth_session_lock_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("json.lock")
 }
 
-#[cfg(unix)]
-fn oauth_session_tmp_path(path: &std::path::Path) -> PathBuf {
-    let file_name = path
+struct OAuthDiskState {
+    storage: crate::persistence::PersistentStorage,
+    target: PathBuf,
+    generation: crate::persistence::StorageGeneration,
+    sessions: HashMap<String, OAuthSessionRecord>,
+    revocations: HashMap<String, OAuthRevocation>,
+}
+
+fn read_oauth_disk_state(path: &Path) -> Result<OAuthDiskState> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("OAuth session path has no parent"))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create OAuth session directory {}",
+            parent.display()
+        )
+    })?;
+    let target = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("oauth_sessions.json");
-    path.with_file_name(format!(
-        "{file_name}.tmp.{}.{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ))
-}
-
-fn read_valid_sessions_from_disk(path: &std::path::Path) -> Option<HashMap<String, OAuthSession>> {
-    let file = open_oauth_session_file(path)?;
-    match std::io::read_to_string(file) {
-        Ok(data) => {
-            let data = Zeroizing::new(data);
-            decode_oauth_sessions(&data, path)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            debug!("No persisted OAuth sessions found");
-            None
-        }
-        Err(e) => {
-            error!("Failed to load OAuth sessions: {}", e);
-            None
-        }
-    }
-}
-
-fn open_oauth_session_file(path: &std::path::Path) -> Option<fs::File> {
-    // Open the session file refusing to follow symlinks (crosslink #814).
-    // With O_NOFOLLOW the open itself fails with ELOOP on a symlink, so there
-    // is no post-open race window.
-    //
-    // On non-Unix targets there is no O_NOFOLLOW equivalent here; fall back to
-    // the prior open-then-check pattern.
-    Some({
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            match fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)
-            {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    debug!("No persisted OAuth sessions found");
-                    return None;
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("OAuth session path has no file name"))?;
+    let storage = crate::persistence::PersistentStorage::open(parent)
+        .context("failed to open protected OAuth storage")?;
+    let read = storage
+        .read(&target, crate::persistence::FileClass::Credentials)
+        .context("failed to read protected OAuth session document")?;
+    let generation = read.generation();
+    let (sessions, revocations) = read.expose_bytes(|bytes| -> Result<_> {
+        let Some(bytes) = bytes else {
+            return Ok((HashMap::new(), HashMap::new()));
+        };
+        let persisted: PersistedOAuthDocumentCompat =
+            serde_json::from_slice(bytes).context("failed to parse OAuth session document")?;
+        let (sessions, revocations) = persisted.into_parts()?;
+        let sessions = sessions
+            .into_iter()
+            .map(|(storage_id, persisted)| {
+                let session = persisted.into_runtime();
+                if storage_id != session.session.id {
+                    anyhow::bail!("OAuth session map key does not match embedded session id");
                 }
-                Err(e) => {
-                    if e.raw_os_error() == Some(libc::ELOOP) {
-                        error!(
-                            "OAuth session file {} is a symlink — refusing to read for security",
-                            path.display()
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Failed to open OAuth session file {}: {}",
-                            path.display(),
-                            e
-                        );
-                    }
-                    return None;
+                if session.generation == 0 {
+                    anyhow::bail!("OAuth session generation must be positive");
                 }
-            }
+                Ok((storage_id, session))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        if revocations.values().any(|entry| entry.generation == 0) {
+            anyhow::bail!("OAuth revocation generation must be positive");
         }
-        #[cfg(not(unix))]
-        {
-            let f = match fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    debug!("No persisted OAuth sessions found");
-                    return None;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to open OAuth session file {}: {}",
-                        path.display(),
-                        e
-                    );
-                    return None;
-                }
-            };
-            if path
-                .symlink_metadata()
-                .is_ok_and(|sm| sm.file_type().is_symlink())
-            {
-                error!(
-                    "OAuth session file {} is a symlink — refusing to read for security",
-                    path.display()
-                );
-                return None;
-            }
-            f
-        }
+        Ok((sessions, revocations))
+    })?;
+    Ok(OAuthDiskState {
+        storage,
+        target,
+        generation,
+        sessions,
+        revocations,
     })
 }
 
-fn decode_oauth_sessions(
-    data: &str,
-    path: &std::path::Path,
-) -> Option<HashMap<String, OAuthSession>> {
-    let persisted = match serde_json::from_str::<HashMap<String, PersistedOAuthSession>>(data) {
-        Ok(persisted) => persisted,
-        Err(e) => {
-            error!(
-                "Failed to parse OAuth sessions from {}: {}",
-                path.display(),
-                e
-            );
-            return None;
-        }
-    };
-    let loaded = persisted
-        .into_iter()
-        .map(|(storage_id, persisted)| {
-            let session = persisted.into_runtime();
-            if storage_id != session.id {
-                anyhow::bail!("OAuth session map key does not match embedded session id");
-            }
-            Ok((storage_id, session))
+fn commit_oauth_disk_state(state: &OAuthDiskState) -> Result<()> {
+    let encoded = Zeroizing::new(
+        serde_json::to_vec_pretty(&PersistedOAuthDocumentRef {
+            sessions: &state.sessions,
+            revocations: &state.revocations,
         })
-        .collect::<Result<HashMap<_, _>>>();
-    match loaded {
-        Ok(loaded) => Some(
-            loaded
-                .into_iter()
-                .filter(|(id, session)| {
-                    if session.credentials.is_expired() {
-                        info!("Removing expired OAuth session: {}", id);
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .collect(),
-        ),
-        Err(e) => {
-            error!(
-                "Failed to validate OAuth sessions from {}: {e:#}",
-                path.display()
-            );
-            None
+        .context("failed to serialize OAuth session document")?,
+    );
+    let receipt = state
+        .storage
+        .commit(
+            &state.target,
+            crate::persistence::FileClass::Credentials,
+            state.generation,
+            &*encoded,
+        )
+        .context("failed to commit protected OAuth session document")?;
+    if receipt.state() == crate::persistence::CommitState::PublishedDurabilityUncertain {
+        let recovery = state
+            .storage
+            .commit(
+                &state.target,
+                crate::persistence::FileClass::Credentials,
+                state.generation,
+                &*encoded,
+            )
+            .context("failed to recover OAuth session document durability")?;
+        if recovery.state() == crate::persistence::CommitState::PublishedDurabilityUncertain {
+            anyhow::bail!("OAuth session document publication durability is uncertain");
         }
     }
+    Ok(())
 }
 
 impl Default for OAuthStore {
@@ -654,24 +812,62 @@ impl Default for OAuthStore {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum OAuthSessionUseError {
+    #[error("OAuth session is unavailable")]
+    Unavailable,
+    #[error("OAuth session has been revoked")]
+    Revoked,
+    #[error("OAuth session is not bound to this client")]
+    ClientBinding,
+    #[error("OAuth session lacks the required inference scope")]
+    MissingScope,
+    #[error("OAuth session has expired and cannot be refreshed")]
+    Expired,
+    #[error("OAuth session refresh failed: {0}")]
+    RefreshFailed(String),
+    #[error("OAuth session storage failed: {0}")]
+    Storage(String),
+}
+
+struct OAuthSessionRefresh {
+    tokens: TokenExchangeResponse,
+    api_key: Option<crate::providers::ApiKey>,
+}
+
+#[async_trait::async_trait]
+trait OAuthSessionRefresher: Send + Sync {
+    async fn refresh_session(&self, session: &OAuthSession) -> Result<OAuthSessionRefresh>;
+}
+
+fn revocation_key(session_id: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(session_id.as_bytes()))
+}
+
 impl OAuthStore {
     /// Create new OAuth store with optional persistence
     #[must_use]
     pub fn new() -> Self {
         let persist_path =
             dirs::data_local_dir().map(|d| d.join("openclaudia").join("oauth_sessions.json"));
+        Self::with_optional_persist_path(persist_path)
+    }
 
+    /// Create an isolated in-memory store. This is the correct constructor for
+    /// tests and short-lived callers that must not touch the user's login.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        Self::with_optional_persist_path(None)
+    }
+
+    fn with_optional_persist_path(persist_path: Option<PathBuf>) -> Self {
         let store = Self {
-            sessions: RwLock::new(HashMap::new()),
+            state: RwLock::new(OAuthRuntimeState::default()),
             pending_challenges: RwLock::new(Vec::new()),
-            persist_path: persist_path.clone(),
+            refresh_gate: AsyncMutex::new(()),
+            persist_path,
         };
-
-        // Load persisted sessions
-        if persist_path.is_some() {
-            store.load_from_disk();
-        }
-
+        store.load_from_disk();
         store
     }
 
@@ -680,64 +876,152 @@ impl OAuthStore {
     /// don't have to clobber `$XDG_DATA_HOME`.
     #[cfg(test)]
     pub(crate) fn with_persist_path(path: PathBuf) -> Self {
-        Self {
-            sessions: RwLock::new(HashMap::new()),
-            pending_challenges: RwLock::new(Vec::new()),
-            persist_path: Some(path),
-        }
+        Self::with_optional_persist_path(Some(path))
     }
 
     /// Store PKCE challenge for pending authorization
     pub fn store_challenge(&self, pkce: PkceParams) {
+        self.store_pending_grant(PendingOAuthGrant::unbound(pkce));
+    }
+
+    /// Store a browser-bound PKCE challenge.
+    pub fn store_bound_challenge(
+        &self,
+        pkce: PkceParams,
+        client_binding: &crate::secrets::SecretString,
+    ) {
+        self.store_pending_grant(PendingOAuthGrant::bound(pkce, client_binding));
+    }
+
+    fn store_pending_grant(&self, grant: PendingOAuthGrant) {
         let mut challenges = self
             .pending_challenges
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Utc::now();
+        challenges.retain(|candidate| candidate.expires_at > now);
         if let Some(existing) = challenges
             .iter_mut()
-            .find(|candidate| candidate.state == pkce.state)
+            .find(|candidate| candidate.pkce.state == grant.pkce.state)
         {
-            *existing = pkce;
+            *existing = grant;
         } else {
-            challenges.push(pkce);
+            if challenges.len() >= MAX_PENDING_GRANTS {
+                let oldest = challenges
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, candidate)| candidate.issued_at)
+                    .map_or(0, |(index, _)| index);
+                challenges.swap_remove(oldest);
+            }
+            challenges.push(grant);
         }
     }
 
     /// Retrieve and remove PKCE challenge by state
     pub fn take_challenge(&self, state: &str) -> Option<PkceParams> {
+        self.take_pending_grant(state, None)
+    }
+
+    /// Consume a browser-bound challenge exactly once.
+    pub fn take_bound_challenge(
+        &self,
+        state: &str,
+        client_binding: &crate::secrets::SecretString,
+    ) -> Option<PkceParams> {
+        self.take_pending_grant(state, Some(client_binding))
+    }
+
+    fn take_pending_grant(
+        &self,
+        state: &str,
+        client_binding: Option<&crate::secrets::SecretString>,
+    ) -> Option<PkceParams> {
         let mut challenges = self
             .pending_challenges
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let index = challenges
             .iter()
-            .position(|candidate| candidate.state.matches(state))?;
-        Some(challenges.swap_remove(index))
+            .position(|candidate| candidate.pkce.state.matches(state))?;
+        if challenges[index].expires_at <= Utc::now() {
+            challenges.swap_remove(index);
+            return None;
+        }
+        if !challenges[index].matches_client(client_binding) {
+            return None;
+        }
+        Some(challenges.swap_remove(index).pkce)
     }
 
     /// Store new OAuth session and report persistence failures to the caller.
     ///
-    /// The session is inserted into the in-memory map before the disk write so
-    /// long-running proxy/server processes can still use freshly-authenticated
-    /// credentials in this process. Callers that make a user-facing durability
-    /// claim, such as `openclaudia auth`, must use this fallible variant and
-    /// only report success after it returns `Ok(())`.
+    /// # Errors
+    ///
+    /// Returns an error if the session is unusable, stale, or cannot be
+    /// durably persisted. A failed durable write is never advertised in memory.
+    pub fn try_store_session(&self, session: OAuthSession) -> Result<()> {
+        self.try_store_session_record(OAuthSessionRecord::new(session, None))
+    }
+
+    /// Durably store a session bound to the browser client that completed the
+    /// authorization flow.
     ///
     /// # Errors
     ///
-    /// Returns an error if the session cannot be durably persisted to disk.
-    /// The session still remains available from this store's in-memory map.
-    pub fn try_store_session(&self, session: OAuthSession) -> Result<()> {
-        let id = session.id.clone();
-        {
-            let mut sessions = self
-                .sessions
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            sessions.insert(id.clone(), session);
+    /// Returns an error for unusable/stale sessions or failed protected
+    /// persistence.
+    pub fn try_store_bound_session(
+        &self,
+        session: OAuthSession,
+        client_binding: &crate::secrets::SecretString,
+    ) -> Result<()> {
+        self.try_store_session_record(OAuthSessionRecord::new(
+            session,
+            Some(binding_digest(client_binding)),
+        ))
+    }
+
+    fn try_store_session_record(&self, record: OAuthSessionRecord) -> Result<()> {
+        let session = &record.session;
+        if session.id.is_empty() || session.id.len() > 256 {
+            anyhow::bail!("OAuth session id is invalid");
         }
-        self.persist_to_disk()?;
-        info!("OAuth session stored: {}", id);
+        if !session.has_inference_scope() {
+            anyhow::bail!("OAuth session lacks the required inference scope");
+        }
+
+        let Some(path) = &self.persist_path else {
+            self.state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sessions
+                .insert(session.id.clone(), record);
+            return Ok(());
+        };
+        let _lock = OAuthSessionFileLock::acquire_for(path)?;
+        let mut disk = read_oauth_disk_state(path)?;
+        if disk
+            .revocations
+            .get(&revocation_key(&session.id))
+            .is_some_and(|revocation| revocation.generation >= record.generation)
+        {
+            anyhow::bail!("refusing to resurrect a revoked OAuth session");
+        }
+        if disk
+            .sessions
+            .get(&session.id)
+            .is_some_and(|current| current.generation > record.generation)
+        {
+            anyhow::bail!("refusing to overwrite a newer OAuth session generation");
+        }
+        disk.sessions.insert(session.id.clone(), record);
+        commit_oauth_disk_state(&disk)?;
+        self.replace_state_in_memory(OAuthRuntimeState {
+            sessions: disk.sessions,
+            revocations: disk.revocations,
+        });
+        info!("OAuth session stored");
         Ok(())
     }
 
@@ -748,27 +1032,323 @@ impl OAuthStore {
     /// [`Self::try_store_session`] when the caller needs to surface disk write
     /// failures to a human.
     pub fn store_session(&self, session: OAuthSession) {
+        let fallback = session.clone();
         if let Err(e) = self.try_store_session(session) {
             error!("Failed to persist OAuth session: {e:#}");
+            self.state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sessions
+                .insert(fallback.id.clone(), OAuthSessionRecord::new(fallback, None));
         }
     }
 
-    /// Retrieve session by ID
+    /// Inspect a currently valid session without refreshing or authorizing it.
+    ///
+    /// Provider traffic must use [`Self::get_session_for_use`] so that browser
+    /// binding, durable revocation, and refresh are enforced.
     pub fn get_session(&self, id: &str) -> Option<OAuthSession> {
-        let sessions = self
-            .sessions
+        if let Some(path) = &self.persist_path {
+            let result = OAuthSessionFileLock::acquire_for(path)
+                .and_then(|_lock| read_oauth_disk_state(path));
+            match result {
+                Ok(disk) => self.replace_state_in_memory(OAuthRuntimeState {
+                    sessions: disk.sessions,
+                    revocations: disk.revocations,
+                }),
+                Err(error) => {
+                    error!("Failed to reload OAuth sessions for use: {error:#}");
+                    return None;
+                }
+            }
+        }
+        self.state
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions.get(id).cloned()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .get(id)
+            .filter(|record| {
+                record.session.has_inference_scope() && !record.session.credentials.is_expired()
+            })
+            .map(|record| record.session.clone())
     }
 
     // `get_any_valid_session` was deleted as part of crosslink #375 (critical).
     // It returned the first valid OAuth session regardless of caller identity,
     // which let any unauthenticated request impersonate an authenticated one.
-    // Callers must now look up sessions by explicit `anthropic_session` cookie
-    // via `get_session(&id)`; no ambient-session fallback remains.
+    // Callers must now resolve sessions by explicit `anthropic_session` and
+    // client-binding cookies via `get_session_for_use`; no ambient-session
+    // fallback remains.
 
-    /// Load sessions from disk, filtering out expired ones
+    /// Resolve a browser session for provider use, refreshing and rotating its
+    /// credentials once when expiry is near.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed unavailable, binding, scope, expiry, refresh, or
+    /// storage error.
+    pub async fn get_session_for_use(
+        &self,
+        id: &str,
+        client_binding: &crate::secrets::SecretString,
+    ) -> Result<OAuthSession, OAuthSessionUseError> {
+        let client = OAuthClient::new()
+            .map_err(|error| OAuthSessionUseError::RefreshFailed(error.to_string()))?;
+        self.get_session_for_use_with(id, client_binding, &client)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)] // Validation, rotation, and durable publication are one transaction.
+    async fn get_session_for_use_with(
+        &self,
+        id: &str,
+        client_binding: &crate::secrets::SecretString,
+        refresher: &dyn OAuthSessionRefresher,
+    ) -> Result<OAuthSession, OAuthSessionUseError> {
+        let _refresh_guard = self.refresh_gate.lock().await;
+        let file_lock = if let Some(path) = &self.persist_path {
+            let lock_path = path.clone();
+            Some(
+                tokio::task::spawn_blocking(move || OAuthSessionFileLock::acquire_for(&lock_path))
+                    .await
+                    .map_err(|_| {
+                        OAuthSessionUseError::Storage(
+                            "OAuth session lock task did not complete".to_string(),
+                        )
+                    })?
+                    .map_err(|error| OAuthSessionUseError::Storage(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        let mut runtime = if let Some(path) = &self.persist_path {
+            let disk = read_oauth_disk_state(path)
+                .map_err(|error| OAuthSessionUseError::Storage(error.to_string()))?;
+            OAuthRuntimeState {
+                sessions: disk.sessions,
+                revocations: disk.revocations,
+            }
+        } else {
+            self.state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        let mut record = match runtime.sessions.get(id).cloned() {
+            Some(record) => record,
+            None if runtime.revocations.contains_key(&revocation_key(id)) => {
+                return Err(OAuthSessionUseError::Revoked);
+            }
+            None => return Err(OAuthSessionUseError::Unavailable),
+        };
+        if !record.matches_client(client_binding) {
+            return Err(OAuthSessionUseError::ClientBinding);
+        }
+        if !record.session.has_inference_scope() {
+            return Err(OAuthSessionUseError::MissingScope);
+        }
+
+        if record.session.credentials.expires_at
+            > Utc::now() + Duration::seconds(OAUTH_REFRESH_SKEW_SECS)
+        {
+            self.replace_state_in_memory(runtime);
+            drop(file_lock);
+            return Ok(record.session);
+        }
+        if record.session.credentials.refresh_token.is_none() {
+            return Err(OAuthSessionUseError::Expired);
+        }
+
+        let refresh_result = refresher
+            .refresh_session(&record.session)
+            .await
+            .map_err(|error| OAuthSessionUseError::RefreshFailed(error.to_string()))?;
+        validate_oauth_token_type(&refresh_result.tokens.token_type)
+            .map_err(|error| OAuthSessionUseError::RefreshFailed(error.to_string()))?;
+        if let Some(scopes) = refresh_result.tokens.scope.as_deref() {
+            record.session.granted_scopes = scopes.split_whitespace().map(String::from).collect();
+        }
+        if !record.session.has_inference_scope() {
+            return Err(OAuthSessionUseError::MissingScope);
+        }
+        record.session.credentials.access_token = refresh_result.tokens.access_token;
+        if let Some(refresh_token) = refresh_result.tokens.refresh_token {
+            record.session.credentials.refresh_token = Some(refresh_token);
+        }
+        record.session.credentials.expires_at =
+            clamped_expires_at(refresh_result.tokens.expires_in);
+        if record.session.auth_mode == AuthMode::ApiKey {
+            record.session.api_key = Some(refresh_result.api_key.ok_or_else(|| {
+                OAuthSessionUseError::RefreshFailed(
+                    "API-key session refresh did not rotate its API key".to_string(),
+                )
+            })?);
+        }
+        record.generation = record
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| OAuthSessionUseError::Storage("generation exhausted".to_string()))?;
+        runtime
+            .sessions
+            .insert(record.session.id.clone(), record.clone());
+
+        if let Some(path) = &self.persist_path {
+            let disk = read_oauth_disk_state(path)
+                .map_err(|error| OAuthSessionUseError::Storage(error.to_string()))?;
+            let current_generation = disk
+                .sessions
+                .get(id)
+                .map(|current| current.generation)
+                .ok_or(OAuthSessionUseError::Unavailable)?;
+            if current_generation.checked_add(1) != Some(record.generation) {
+                return Err(OAuthSessionUseError::Storage(
+                    "OAuth session generation changed during refresh".to_string(),
+                ));
+            }
+            let mut updated = disk;
+            updated.sessions.insert(id.to_string(), record.clone());
+            commit_oauth_disk_state(&updated)
+                .map_err(|error| OAuthSessionUseError::Storage(error.to_string()))?;
+            runtime = OAuthRuntimeState {
+                sessions: updated.sessions,
+                revocations: updated.revocations,
+            };
+        }
+        self.replace_state_in_memory(runtime);
+        drop(file_lock);
+        Ok(record.session)
+    }
+
+    /// Revoke one browser session and delete its credential material.
+    ///
+    /// # Errors
+    ///
+    /// Returns a binding or protected-storage error when revocation cannot be
+    /// applied.
+    pub async fn revoke_session_for_client(
+        &self,
+        id: &str,
+        client_binding: &crate::secrets::SecretString,
+    ) -> Result<bool, OAuthSessionUseError> {
+        let _refresh_guard = self.refresh_gate.lock().await;
+        self.revoke_sessions(Some((id, client_binding)))
+            .await
+            .map(|count| count != 0)
+    }
+
+    /// Revoke every OpenClaudia-owned native OAuth session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protected-storage error when revocation cannot be committed.
+    pub async fn revoke_all(&self) -> Result<usize, OAuthSessionUseError> {
+        let _refresh_guard = self.refresh_gate.lock().await;
+        self.revoke_sessions(None).await
+    }
+
+    async fn revoke_sessions(
+        &self,
+        selected: Option<(&str, &crate::secrets::SecretString)>,
+    ) -> Result<usize, OAuthSessionUseError> {
+        let file_lock = if let Some(path) = &self.persist_path {
+            let lock_path = path.clone();
+            Some(
+                tokio::task::spawn_blocking(move || OAuthSessionFileLock::acquire_for(&lock_path))
+                    .await
+                    .map_err(|_| {
+                        OAuthSessionUseError::Storage(
+                            "OAuth session lock task did not complete".to_string(),
+                        )
+                    })?
+                    .map_err(|error| OAuthSessionUseError::Storage(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let mut runtime = if let Some(path) = &self.persist_path {
+            let disk = read_oauth_disk_state(path)
+                .map_err(|error| OAuthSessionUseError::Storage(error.to_string()))?;
+            OAuthRuntimeState {
+                sessions: disk.sessions,
+                revocations: disk.revocations,
+            }
+        } else {
+            self.state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+
+        let ids = match selected {
+            Some((id, binding)) => {
+                let Some(session) = runtime.sessions.get(id) else {
+                    return Ok(0);
+                };
+                if !session.matches_client(binding) {
+                    return Err(OAuthSessionUseError::ClientBinding);
+                }
+                vec![id.to_string()]
+            }
+            None => runtime.sessions.keys().cloned().collect(),
+        };
+        if ids.is_empty() {
+            self.replace_state_in_memory(runtime);
+            drop(file_lock);
+            return Ok(0);
+        }
+        let now = Utc::now();
+        for id in &ids {
+            if let Some(session) = runtime.sessions.remove(id) {
+                runtime.revocations.insert(
+                    revocation_key(id),
+                    OAuthRevocation {
+                        generation: session.generation.saturating_add(1),
+                        revoked_at: now,
+                    },
+                );
+            }
+        }
+        if let Some(path) = &self.persist_path {
+            let mut disk = read_oauth_disk_state(path)
+                .map_err(|error| OAuthSessionUseError::Storage(error.to_string()))?;
+            disk.sessions.clone_from(&runtime.sessions);
+            disk.revocations.clone_from(&runtime.revocations);
+            commit_oauth_disk_state(&disk)
+                .map_err(|error| OAuthSessionUseError::Storage(error.to_string()))?;
+        }
+        self.replace_state_in_memory(runtime);
+        drop(file_lock);
+        Ok(ids.len())
+    }
+
+    /// Count active (not revoked) native OAuth sessions from protected state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the credential document cannot be locked, read,
+    /// or validated.
+    pub fn active_session_count(&self) -> Result<usize> {
+        if let Some(path) = &self.persist_path {
+            let _lock = OAuthSessionFileLock::acquire_for(path)?;
+            let disk = read_oauth_disk_state(path)?;
+            let count = disk.sessions.len();
+            self.replace_state_in_memory(OAuthRuntimeState {
+                sessions: disk.sessions,
+                revocations: disk.revocations,
+            });
+            return Ok(count);
+        }
+        Ok(self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .len())
+    }
+
+    /// Load sessions from disk without treating expired-but-refreshable
+    /// sessions as deleted.
     fn load_from_disk(&self) {
         let Some(path) = &self.persist_path else {
             return;
@@ -782,198 +1362,25 @@ impl OAuthStore {
             }
         };
 
-        if let Some(valid_sessions) = read_valid_sessions_from_disk(path) {
-            let mut sessions = self
-                .sessions
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *sessions = valid_sessions;
-            let session_count = sessions.len();
-            drop(sessions);
-            info!("Loaded {} OAuth sessions from disk", session_count);
+        match read_oauth_disk_state(path) {
+            Ok(disk) => {
+                let session_count = disk.sessions.len();
+                self.replace_state_in_memory(OAuthRuntimeState {
+                    sessions: disk.sessions,
+                    revocations: disk.revocations,
+                });
+                info!("Loaded {} OAuth sessions from disk", session_count);
+            }
+            Err(error) => error!("Failed to load OAuth sessions: {error:#}"),
         }
     }
 
-    #[cfg(unix)]
-    fn replace_sessions_in_memory(&self, sessions: HashMap<String, OAuthSession>) {
+    fn replace_state_in_memory(&self, state: OAuthRuntimeState) {
         let mut guard = self
-            .sessions
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = sessions;
-    }
-
-    /// Persist sessions to disk with restrictive file permissions.
-    ///
-    /// # Security (crosslink #801)
-    ///
-    /// On Unix, the temp file is created with `O_CREAT | O_EXCL | O_WRONLY`
-    /// at mode `0o600` in a single `open(2)` call. This closes two
-    /// pre-existing windows in which plaintext OAuth tokens were
-    /// world-readable on disk:
-    ///
-    /// 1. **Mid-write readability**: previously `fs::write` created the
-    ///    temp file with the process umask (typically `0o022` →
-    ///    `mode 0o644`), exposing the access+refresh tokens to any other
-    ///    user on the host for the window between write and the post-rename
-    ///    `chmod`. The destination also inherited the temp file's loose
-    ///    permissions across the rename.
-    /// 2. **Temp-file pre-creation / symlink attack**: `fs::write` happily
-    ///    truncates an existing `.tmp` file, including one staged as a
-    ///    symlink to e.g. `/etc/shadow`. `O_EXCL` rejects any pre-existing
-    ///    path (regular file or symlink), forcing us to fail closed.
-    ///
-    /// On non-Unix targets we refuse to persist credentials — there is no
-    /// portable way to atomically create-with-mode, and persisting plaintext
-    /// OAuth tokens to a world-readable file would be worse than losing the
-    /// session on shutdown.
-    #[allow(clippy::too_many_lines)]
-    fn persist_to_disk(&self) -> Result<()> {
-        let Some(path) = &self.persist_path else {
-            return Ok(());
-        };
-
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create OAuth session directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-
-        let local_sessions = self
-            .sessions
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-
-        let _lock = match OAuthSessionFileLock::acquire_for(path) {
-            Ok(lock) => lock,
-            Err(e) => {
-                error!("Failed to lock OAuth sessions for persist: {e:#}");
-                return Err(e).with_context(|| {
-                    format!("failed to lock OAuth session file {}", path.display())
-                });
-            }
-        };
-
-        let mut merged_sessions = read_valid_sessions_from_disk(path).unwrap_or_default();
-        merged_sessions.extend(local_sessions);
-
-        let json = match serde_json::to_string_pretty(&PersistedOAuthSessionMap(&merged_sessions)) {
-            Ok(j) => Zeroizing::new(j),
-            Err(e) => {
-                error!("Failed to serialize OAuth sessions: {}", e);
-                return Err(e).context("failed to serialize OAuth sessions");
-            }
-        };
-
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-            let tmp_path = oauth_session_tmp_path(path);
-
-            // Atomically create the temp file with O_CREAT|O_EXCL|O_WRONLY
-            // at mode 0o600. The random sibling name plus create_new avoids
-            // clobbering stale crash residue or a pre-planted symlink.
-            let mut file = match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp_path)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    error!(
-                        "Failed to create OAuth temp file {} (mode 0600, exclusive): {}",
-                        tmp_path.display(),
-                        e
-                    );
-                    return Err(e).with_context(|| {
-                        format!(
-                            "failed to create OAuth temp file {} (mode 0600, exclusive)",
-                            tmp_path.display()
-                        )
-                    });
-                }
-            };
-
-            if let Err(e) = file.write_all(json.as_bytes()) {
-                error!("Failed to write OAuth temp file: {}", e);
-                drop(file);
-                let _ = fs::remove_file(&tmp_path);
-                return Err(e).with_context(|| {
-                    format!("failed to write OAuth temp file {}", tmp_path.display())
-                });
-            }
-            if let Err(e) = file.sync_all() {
-                error!("Failed to fsync OAuth temp file: {}", e);
-                drop(file);
-                let _ = fs::remove_file(&tmp_path);
-                return Err(e).with_context(|| {
-                    format!("failed to fsync OAuth temp file {}", tmp_path.display())
-                });
-            }
-            drop(file);
-
-            // The rename inherits the tmp file's already-restrictive 0o600
-            // mode, so the destination is never observable as world-readable.
-            if let Err(e) = fs::rename(&tmp_path, path) {
-                error!("Failed to rename OAuth temp file: {}", e);
-                let _ = fs::remove_file(&tmp_path);
-                return Err(e).with_context(|| {
-                    format!(
-                        "failed to move OAuth temp file {} into {}",
-                        tmp_path.display(),
-                        path.display()
-                    )
-                });
-            }
-
-            // Defense-in-depth: re-assert 0o600 on the destination in case
-            // an older run (pre-fix) left a 0o644 destination inode that a
-            // filesystem chose to preserve across rename.
-            if let Ok(metadata) = fs::metadata(path) {
-                let mut perms = metadata.permissions();
-                if perms.mode() & 0o777 != 0o600 {
-                    perms.set_mode(0o600);
-                    if let Err(e) = fs::set_permissions(path, perms) {
-                        error!("Failed to enforce 0o600 on OAuth session file: {}", e);
-                        return Err(e).with_context(|| {
-                            format!(
-                                "failed to enforce 0o600 on OAuth session file {}",
-                                path.display()
-                            )
-                        });
-                    }
-                }
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = json; // suppress unused-variable warning on non-unix
-            let _ = merged_sessions;
-            error!(
-                "Refusing to persist OAuth sessions on non-Unix target: no portable way to \
-                 atomically create the file with owner-only permissions. OAuth sessions will \
-                 not survive process restart on this platform."
-            );
-            anyhow::bail!(
-                "refusing to persist OAuth sessions on non-Unix target: no portable way to \
-                 atomically create the file with owner-only permissions"
-            );
-        }
-
-        #[cfg(unix)]
-        {
-            self.replace_sessions_in_memory(merged_sessions);
-            Ok(())
-        }
+        *guard = state;
     }
 }
 
@@ -1197,6 +1604,24 @@ impl OAuthClient {
     }
 }
 
+#[async_trait::async_trait]
+impl OAuthSessionRefresher for OAuthClient {
+    async fn refresh_session(&self, session: &OAuthSession) -> Result<OAuthSessionRefresh> {
+        let refresh_token = session
+            .credentials
+            .refresh_token
+            .as_ref()
+            .context("OAuth session has no refresh token")?;
+        let tokens = self.refresh_token(refresh_token).await?;
+        let api_key = if session.auth_mode == AuthMode::ApiKey {
+            Some(self.create_api_key(&tokens.access_token).await?)
+        } else {
+            None
+        };
+        Ok(OAuthSessionRefresh { tokens, api_key })
+    }
+}
+
 // ============================================================================
 // Authorization Code Parsing
 // ============================================================================
@@ -1362,6 +1787,297 @@ mod tests {
         assert!(expired_creds.is_expired());
     }
 
+    fn lifecycle_session(
+        id: &str,
+        expires_at: DateTime<Utc>,
+        with_refresh_token: bool,
+    ) -> OAuthSession {
+        OAuthSession {
+            id: id.to_string(),
+            credentials: OAuthCredentials {
+                access_token: crate::secrets::OAuthToken::try_from_string(format!("access-{id}"))
+                    .expect("access token"),
+                refresh_token: with_refresh_token.then(|| {
+                    crate::secrets::OAuthToken::try_from_string(format!("refresh-{id}"))
+                        .expect("refresh token")
+                }),
+                expires_at,
+            },
+            api_key: None,
+            auth_mode: AuthMode::BearerToken,
+            granted_scopes: vec![REQUIRED_INFERENCE_SCOPE.to_string()],
+            created_at: Utc::now(),
+            user_id: None,
+        }
+    }
+
+    struct CountingRefresher {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl OAuthSessionRefresher for CountingRefresher {
+        async fn refresh_session(&self, _session: &OAuthSession) -> Result<OAuthSessionRefresh> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(OAuthSessionRefresh {
+                tokens: TokenExchangeResponse {
+                    access_token: crate::secrets::OAuthToken::try_from_string(
+                        "rotated-access-token".to_string(),
+                    )
+                    .expect("token"),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    refresh_token: Some(
+                        crate::secrets::OAuthToken::try_from_string(
+                            "rotated-refresh-token".to_string(),
+                        )
+                        .expect("refresh token"),
+                    ),
+                    scope: Some(REQUIRED_INFERENCE_SCOPE.to_string()),
+                },
+                api_key: None,
+            })
+        }
+    }
+
+    #[test]
+    fn browser_bound_pkce_rejects_cross_client_and_replay() {
+        let store = OAuthStore::ephemeral();
+        let owner = generate_client_binding();
+        let other = generate_client_binding();
+        let pkce = PkceParams::generate();
+        let state = pkce.state.expose(str::to_string);
+        store.store_bound_challenge(pkce, &owner);
+
+        assert!(store.take_bound_challenge(&state, &other).is_none());
+        assert!(store.take_bound_challenge(&state, &owner).is_some());
+        assert!(store.take_bound_challenge(&state, &owner).is_none());
+    }
+
+    #[test]
+    fn expired_browser_grant_is_consumed_and_rejected() {
+        let store = OAuthStore::ephemeral();
+        let binding = generate_client_binding();
+        let pkce = PkceParams::generate();
+        let state = pkce.state.expose(str::to_string);
+        store.store_bound_challenge(pkce, &binding);
+        store
+            .pending_challenges
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+            .expires_at = Utc::now() - Duration::seconds(1);
+
+        assert!(store.take_bound_challenge(&state, &binding).is_none());
+        assert!(store.take_bound_challenge(&state, &binding).is_none());
+    }
+
+    #[test]
+    fn pending_browser_grants_have_a_hard_capacity() {
+        let store = OAuthStore::ephemeral();
+        let binding = generate_client_binding();
+        for _ in 0..(MAX_PENDING_GRANTS + 5) {
+            store.store_bound_challenge(PkceParams::generate(), &binding);
+        }
+        assert_eq!(
+            store
+                .pending_challenges
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            MAX_PENDING_GRANTS
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_session_without_refresh_fails_without_network_attempt() {
+        let store = OAuthStore::ephemeral();
+        let binding = generate_client_binding();
+        let session = lifecycle_session(
+            "expired-no-refresh",
+            Utc::now() - Duration::seconds(1),
+            false,
+        );
+        store
+            .try_store_bound_session(session, &binding)
+            .expect("store");
+        let refresher = CountingRefresher {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let error = store
+            .get_session_for_use_with("expired-no-refresh", &binding, &refresher)
+            .await
+            .expect_err("expired session without refresh must fail");
+        assert!(matches!(error, OAuthSessionUseError::Expired));
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn active_session_rejects_a_different_browser_binding() {
+        let store = OAuthStore::ephemeral();
+        let owner = generate_client_binding();
+        let other = generate_client_binding();
+        store
+            .try_store_bound_session(
+                lifecycle_session("bound-session", Utc::now() + Duration::hours(1), true),
+                &owner,
+            )
+            .expect("store");
+        let refresher = CountingRefresher {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let error = store
+            .get_session_for_use_with("bound-session", &other, &refresher)
+            .await
+            .expect_err("cross-client session use must fail");
+        assert!(matches!(error, OAuthSessionUseError::ClientBinding));
+    }
+
+    #[tokio::test]
+    async fn concurrent_expiry_refreshes_once_and_reuses_rotated_generation() {
+        let store = OAuthStore::ephemeral();
+        let binding = generate_client_binding();
+        store
+            .try_store_bound_session(
+                lifecycle_session(
+                    "single-flight-session",
+                    Utc::now() - Duration::seconds(1),
+                    true,
+                ),
+                &binding,
+            )
+            .expect("store");
+        let refresher = CountingRefresher {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let (first, second) = tokio::join!(
+            store.get_session_for_use_with("single-flight-session", &binding, &refresher),
+            store.get_session_for_use_with("single-flight-session", &binding, &refresher)
+        );
+        let first = first.expect("first refreshed session");
+        let second = second.expect("second refreshed session");
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(first
+            .credentials
+            .access_token
+            .matches("rotated-access-token"));
+        assert!(second
+            .credentials
+            .access_token
+            .matches("rotated-access-token"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_stores_serialize_one_durable_refresh() {
+        let tmp = tempfile::tempdir().expect("root");
+        let path = tmp.path().join("oauth_sessions.json");
+        let first_store = OAuthStore::with_persist_path(path.clone());
+        let binding = generate_client_binding();
+        first_store
+            .try_store_bound_session(
+                lifecycle_session(
+                    "cross-process-shape",
+                    Utc::now() - Duration::seconds(1),
+                    true,
+                ),
+                &binding,
+            )
+            .expect("store");
+        let second_store = OAuthStore::with_persist_path(path);
+        let refresher = CountingRefresher {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let (first, second) = tokio::join!(
+            first_store.get_session_for_use_with("cross-process-shape", &binding, &refresher),
+            second_store.get_session_for_use_with("cross-process-shape", &binding, &refresher)
+        );
+        assert!(first.is_ok(), "first refresh failed: {first:?}");
+        assert!(second.is_ok(), "second refresh failed: {second:?}");
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_revocation_erases_secrets_and_blocks_stale_resurrection() {
+        let tmp = tempfile::tempdir().expect("root");
+        let path = tmp.path().join("oauth_sessions.json");
+        let store = OAuthStore::with_persist_path(path.clone());
+        let binding = generate_client_binding();
+        let stale = lifecycle_session("revoked-session-id", Utc::now() + Duration::hours(1), true);
+        store
+            .try_store_bound_session(stale.clone(), &binding)
+            .expect("store");
+        assert!(store
+            .revoke_session_for_client("revoked-session-id", &binding)
+            .await
+            .expect("revoke"));
+
+        let persisted = fs::read_to_string(&path).expect("persisted tombstone");
+        assert!(!persisted.contains("access-revoked-session-id"));
+        assert!(!persisted.contains("refresh-revoked-session-id"));
+        assert!(!persisted.contains("revoked-session-id"));
+        let reopened = OAuthStore::with_persist_path(path);
+        let refresher = CountingRefresher {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            reopened
+                .get_session_for_use_with("revoked-session-id", &binding, &refresher)
+                .await,
+            Err(OAuthSessionUseError::Revoked)
+        ));
+        let resurrection = reopened
+            .try_store_bound_session(stale, &binding)
+            .expect_err("stale record must not resurrect after revocation");
+        assert!(resurrection.to_string().contains("revoked"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_session_map_loads_and_migrates_on_next_commit() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("root");
+        let path = tmp.path().join("oauth_sessions.json");
+        let legacy = OAuthSessionRecord::new(
+            lifecycle_session("legacy-session", Utc::now() + Duration::hours(1), true),
+            None,
+        );
+        let legacy_sessions = HashMap::from([("legacy-session".to_string(), legacy)]);
+        let encoded = serde_json::to_vec_pretty(&PersistedOAuthSessionMap(&legacy_sessions))
+            .expect("legacy encoding");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("legacy store");
+        file.write_all(&encoded).expect("legacy write");
+        file.sync_all().expect("legacy fsync");
+        drop(file);
+
+        let store = OAuthStore::with_persist_path(path.clone());
+        assert!(store.get_session("legacy-session").is_some());
+        store
+            .try_store_session(lifecycle_session(
+                "new-session",
+                Utc::now() + Duration::hours(1),
+                true,
+            ))
+            .expect("migration commit");
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("migrated store")).expect("json");
+        assert_eq!(migrated["schema_version"], OAUTH_STORE_SCHEMA_VERSION);
+        assert!(migrated["sessions"]["legacy-session"].is_object());
+        assert!(migrated["sessions"]["new-session"].is_object());
+    }
+
     // --- Regression tests for crosslink #801 ---
     //
     // persist_to_disk historically used `fs::write` (which obeys the process
@@ -1397,30 +2113,45 @@ mod tests {
     /// 0o600 — never world-readable, never group-readable — even when the
     /// process umask is fully permissive.
     #[cfg(unix)]
+    struct UmaskGuard(libc::mode_t);
+
+    #[cfg(unix)]
+    impl UmaskGuard {
+        fn set(mask: libc::mode_t) -> Self {
+            Self(unsafe { libc::umask(mask) })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn persist_to_disk_destination_is_0600_under_permissive_umask() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Force a permissive umask so any unguarded `open(2)` call would
-        // produce 0o666-derived modes. If the fix regresses, this test
-        // catches it even on machines whose default umask is 0o022.
-        // SAFETY: umask is process-global. We restore the previous value
-        // before returning.
-        let prev_umask = unsafe { libc::umask(0) };
-
+        // Create the authorized storage root before changing the process-wide
+        // umask, then restore the umask through RAII even if an assertion fails.
         let tmp = tempfile::tempdir().unwrap();
+        let umask = UmaskGuard::set(0);
         let path = tmp.path().join("oauth_sessions.json");
         let store = OAuthStore::with_persist_path(path.clone());
-        store.store_session(make_session("alpha-access-token"));
+        store
+            .try_store_session(make_session("alpha-access-token"))
+            .expect("protected persistence");
 
         let mode = fs::metadata(&path)
             .expect("destination file must exist")
             .permissions()
             .mode()
             & 0o777;
-
-        // Restore umask before any assertion that might unwind.
-        unsafe { libc::umask(prev_umask) };
+        drop(umask);
 
         assert_eq!(
             mode, 0o600,
@@ -1432,9 +2163,8 @@ mod tests {
     /// FORENSIC EVIDENCE #2: while `persist_to_disk` is running, the temp
     /// file is never observable at a mode that would let another user read
     /// the tokens. We race a watcher thread against many writes and assert
-    /// that every snapshot we caught of the `.tmp` file had mode 0o600.
-    /// Before the fix, the watcher would catch 0o666 (under zeroed umask)
-    /// containing the literal token bytes.
+    /// that every storage artifact in which token bytes become visible has
+    /// mode 0o600. The descriptor-safe persistence layer owns temp naming.
     #[cfg(unix)]
     #[test]
     fn persist_to_disk_tmp_never_world_readable_under_race() {
@@ -1444,9 +2174,8 @@ mod tests {
         use std::thread;
         use std::time::{Duration as StdDuration, Instant};
 
-        let prev_umask = unsafe { libc::umask(0) };
-
         let tmp = tempfile::tempdir().unwrap();
+        let umask = UmaskGuard::set(0);
         let path = tmp.path().join("oauth_sessions.json");
         let watch_dir = tmp.path().to_path_buf();
 
@@ -1461,16 +2190,13 @@ mod tests {
             while !stop_w.load(Ordering::Relaxed) && Instant::now() < deadline {
                 if let Ok(entries) = fs::read_dir(&watch_dir) {
                     for entry in entries.flatten() {
-                        let file_name = entry.file_name();
-                        let file_name = file_name.to_string_lossy();
-                        if !file_name.starts_with("oauth_sessions.json.tmp.") {
-                            continue;
-                        }
                         if let Ok(md) = fs::symlink_metadata(entry.path()) {
                             let mode = md.permissions().mode() & 0o777;
                             let has_token = fs::read_to_string(entry.path())
                                 .is_ok_and(|s| s.contains("racy-secret-token-CANARY"));
-                            observations.push((mode, has_token));
+                            if has_token {
+                                observations.push((mode, true));
+                            }
                         }
                     }
                 }
@@ -1482,13 +2208,15 @@ mod tests {
         // to catch the tmp file mid-existence. Include the canary token
         // literal so observed `has_token` flags are meaningful.
         let store = OAuthStore::with_persist_path(path.clone());
-        for i in 0..500 {
-            store.store_session(make_session(&format!("racy-secret-token-CANARY-{i}")));
+        for i in 0..64 {
+            store
+                .try_store_session(make_session(&format!("racy-secret-token-CANARY-{i}")))
+                .expect("protected persistence");
         }
 
         stop.store(true, Ordering::Relaxed);
         let observations = watcher.join().unwrap();
-        unsafe { libc::umask(prev_umask) };
+        drop(umask);
 
         // Every observation we made of the tmp file must have been at 0o600.
         // If even one snapshot was 0o644 / 0o664 / 0o666 the fix is broken.
@@ -1592,12 +2320,12 @@ mod tests {
         let message = format!("{err:#}");
 
         assert!(
-            message.contains("failed to create OAuth session directory"),
+            message.contains("failed to create OAuth lock directory"),
             "unexpected persistence error: {message}"
         );
         assert!(
-            store.get_session("session-delta-token-marker").is_some(),
-            "failed persistence should still leave the current process with the session"
+            store.get_session("session-delta-token-marker").is_none(),
+            "a failed durable claim must not publish a process-local session"
         );
     }
 

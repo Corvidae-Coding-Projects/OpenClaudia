@@ -141,7 +141,7 @@
         "observation": "The current contract binds state and redirect authority before token exchange.",
         "guidance": "Use the current authenticated contract when changing flow code.",
         "applicability": {"paths": ["src/oauth.rs"], "components": ["oauth"], "tags": ["verify"]},
-        "citations": [{"kind": "source_file", "locator": "src/oauth.rs", "source_version": "worktree:s048", "digest": "sha256:da5ba7125f44c4f88b5a5c3a5a197ecc0efbbc0757c6184b693aa7b789d2b5bc"}],
+        "citations": [{"kind": "source_file", "locator": "src/oauth.rs", "source_version": "worktree:s029", "digest": "sha256:266faaaed215e115862d19c9f04667b7d509c70350f252648408d34382cfa701"}],
         "confidence": "verified_by_test",
         "sensitivity": "confidential",
         "retention": {"policy": "indefinite"}

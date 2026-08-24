@@ -688,6 +688,9 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         u64::from(config.session.token_tracking.max_output_tokens),
     )
     .map_err(|error| anyhow::anyhow!("Run budget denied provider call: {error}"))?;
+    if chat_auth.codex_responses_auth.is_some() {
+        openclaudia::codex_credentials::finalize_chatgpt_responses_request(&mut request_body);
+    }
 
     let client = openclaudia::provider_transport::shared_client()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;

@@ -2333,19 +2333,39 @@ fn auth_logout_describes_native_session_scope() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn auth_logout_removes_native_session_store_without_deleting_shared_credentials() {
+fn auth_logout_revokes_native_sessions_without_deleting_shared_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     let xdg_data = home.path().join(".local/share");
     let store_dir = xdg_data.join("openclaudia");
     fs::create_dir_all(&store_dir).expect("oauth store dir");
     let native_store = store_dir.join("oauth_sessions.json");
+    let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
     fs::write(
         &native_store,
-        r#"{"native-session":{"access_token":"tok"}}"#,
+        serde_json::json!({
+            "native-session": {
+                "id": "native-session",
+                "credentials": {
+                    "access_token": "native-access-token",
+                    "refresh_token": "native-refresh-token",
+                    "expires_at": expires_at
+                },
+                "api_key": null,
+                "auth_mode": "BearerToken",
+                "granted_scopes": ["user:inference"],
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "user_id": null
+            }
+        })
+        .to_string(),
     )
     .expect("native oauth store fixture");
+    fs::set_permissions(&native_store, fs::Permissions::from_mode(0o600)).expect("credential mode");
 
     let claude_config = home.path().join("claude-config");
     write_claude_oauth_credentials(&claude_config);
@@ -2375,10 +2395,20 @@ fn auth_logout_removes_native_session_store_without_deleting_shared_credentials(
             && combined.contains("Shared Claude credentials were not deleted"),
         "logout output must distinguish native sessions from shared credentials; got {combined:?}"
     );
-    assert!(
-        !native_store.exists(),
-        "auth --logout must remove the native OAuth session cache"
+    let native_after = fs::read_to_string(&native_store).expect("revocation document");
+    let native_after: serde_json::Value =
+        serde_json::from_str(&native_after).expect("versioned OAuth document");
+    assert_eq!(native_after["schema_version"], 1);
+    assert_eq!(native_after["sessions"], serde_json::json!({}));
+    assert_eq!(
+        native_after["revocations"]
+            .as_object()
+            .expect("revocations")
+            .len(),
+        1
     );
+    assert!(!native_after.to_string().contains("native-access-token"));
+    assert!(!native_after.to_string().contains("native-refresh-token"));
     assert!(
         credentials_path.exists(),
         "auth --logout must not delete shared Claude credentials"

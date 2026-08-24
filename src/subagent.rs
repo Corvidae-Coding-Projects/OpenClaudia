@@ -3366,6 +3366,7 @@ async fn make_openai_responses_api_call_impl(
         u64::from(SUBAGENT_MAX_TOKENS),
     )
     .map_err(|error| format!("Run budget denied provider call: {error}"))?;
+    crate::codex_credentials::finalize_chatgpt_responses_request(&mut request_body);
     let request = headers
         .apply(client.post(endpoint).json(&request_body))
         .map_err(|error| format!("Responses header error: {error}"))?;
@@ -6137,10 +6138,12 @@ memory:
             "max_output_tokens": SUBAGENT_MAX_TOKENS,
             "input": [{"role":"user","content":"inspect"}]
         });
+        let mut expected_request_body = request_body.clone();
+        crate::codex_credentials::finalize_chatgpt_responses_request(&mut expected_request_body);
         Mock::given(method("POST"))
             .and(path("/responses"))
             .and(header("authorization", "Bearer child-transport-token"))
-            .and(body_json(request_body.clone()))
+            .and(body_json(expected_request_body))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")

@@ -1872,6 +1872,9 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         configured_max_output,
     )
     .map_err(|error| format!("Run budget denied provider call: {error}"))?;
+    if crate::codex_credentials::is_chatgpt_codex_endpoint(endpoint) {
+        crate::codex_credentials::finalize_chatgpt_responses_request(&mut request_body);
+    }
     trace_run_turn_request(endpoint, &request_body);
 
     let response =
@@ -3061,15 +3064,16 @@ fn process_responses_sse_event(json: &Value) -> Result<ResponsesSseAction, Strin
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| "Responses response.completed is missing response.id".to_string())?;
-            let output_items = response.get("output").map(|output| {
-                output
-                    .as_array()
-                    .cloned()
-                    .ok_or_else(|| "Responses completed output must be an array".to_string())
-            });
+            let output_items = match response.get("output") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(output)) => Some(output.clone()),
+                Some(_) => {
+                    return Err("Responses completed output must be an array or null".to_string());
+                }
+            };
             Ok(ResponsesSseAction::Completed {
                 response_id: response_id.to_string(),
-                output_items: output_items.transpose()?,
+                output_items,
                 usage: parse_responses_usage(response),
             })
         }
@@ -3114,13 +3118,14 @@ fn dispatch_responses_action(
         } => {
             capture.observe_response_id(response_id)?;
             if let Some(output_items) = output_items {
-                if !capture.output_items.is_empty() && capture.output_items != output_items {
-                    return Err(
-                        "Responses completed output disagrees with output_item.done events"
-                            .to_string(),
-                    );
+                // The account-backed Codex API can omit fields from the
+                // completed envelope that were present in output_item.done.
+                // Codex itself treats the done events as authoritative. Keep
+                // the completed output only as a compatibility fallback for
+                // providers that do not emit per-item events.
+                if capture.output_items.is_empty() {
+                    capture.replace_completed_output(output_items)?;
                 }
-                capture.replace_completed_output(output_items)?;
             }
             if let Some(observed) = observed_usage {
                 usage.accumulate(&observed);
@@ -6319,6 +6324,64 @@ memory:
             }
             _ => panic!("expected completed event"),
         }
+    }
+
+    #[test]
+    fn responses_completed_accepts_null_output_from_chatgpt_backend() {
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_null_output",
+                "status": "completed",
+                "output": null
+            }
+        });
+        match process_responses_sse_event(&completed).expect("completed event") {
+            ResponsesSseAction::Completed { output_items, .. } => {
+                assert!(output_items.is_none());
+            }
+            _ => panic!("expected completed event"),
+        }
+    }
+
+    #[test]
+    fn responses_done_item_remains_authoritative_over_lean_completed_copy() {
+        let rich_item = serde_json::json!({
+            "id": "rs_authoritative",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "encrypted-continuation"
+        });
+        let lean_item = serde_json::json!({
+            "id": "rs_authoritative",
+            "type": "reasoning",
+            "summary": []
+        });
+        let mut capture = ResponsesStreamCapture::default();
+        capture
+            .observe_output_item(rich_item.clone())
+            .expect("done item");
+        let mut full_content = String::new();
+        let mut reasoning_content = String::new();
+        let mut usage = TokenUsage::default();
+
+        let done = dispatch_responses_action(
+            ResponsesSseAction::Completed {
+                response_id: "resp_authoritative".to_string(),
+                output_items: Some(vec![lean_item]),
+                usage: None,
+            },
+            &mut full_content,
+            &mut reasoning_content,
+            &mut capture,
+            &mut usage,
+            &mut |_: &str| Ok(()),
+            &mut |_: &str| Ok(()),
+        )
+        .expect("completed event");
+
+        assert!(done);
+        assert_eq!(capture.output_items, vec![rich_item]);
     }
 
     #[test]

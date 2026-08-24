@@ -35,14 +35,6 @@ fn native_oauth_session_store_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("openclaudia").join("oauth_sessions.json"))
 }
 
-fn native_oauth_session_store_path_exists(path: &Path) -> Result<bool, String> {
-    match path.symlink_metadata() {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!("failed to inspect {}: {err}", path.display())),
-    }
-}
-
 fn native_oauth_session_store_status() -> NativeOAuthSessionStoreStatus {
     let Some(path) = native_oauth_session_store_path() else {
         return NativeOAuthSessionStoreStatus::Missing;
@@ -67,8 +59,35 @@ fn native_oauth_session_store_status() -> NativeOAuthSessionStoreStatus {
         }
     };
 
-    match serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&content) {
-        Ok(sessions) => NativeOAuthSessionStoreStatus::SessionCount(sessions.len()),
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(serde_json::Value::Object(document)) => {
+            if let Some(version) = document.get("schema_version") {
+                if version.as_u64()
+                    != Some(u64::from(openclaudia::oauth::OAUTH_STORE_SCHEMA_VERSION))
+                {
+                    return NativeOAuthSessionStoreStatus::Unreadable(format!(
+                        "failed to parse {}: unsupported OAuth store schema",
+                        path.display()
+                    ));
+                }
+                let Some(sessions) = document
+                    .get("sessions")
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    return NativeOAuthSessionStoreStatus::Unreadable(format!(
+                        "failed to parse {}: versioned store has no sessions object",
+                        path.display()
+                    ));
+                };
+                NativeOAuthSessionStoreStatus::SessionCount(sessions.len())
+            } else {
+                NativeOAuthSessionStoreStatus::SessionCount(document.len())
+            }
+        }
+        Ok(_) => NativeOAuthSessionStoreStatus::Unreadable(format!(
+            "failed to parse {}: expected an object",
+            path.display()
+        )),
         Err(err) => NativeOAuthSessionStoreStatus::Unreadable(format!(
             "failed to parse {}: {err}",
             path.display()
@@ -188,21 +207,29 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
 
     // Handle --logout flag
     if logout {
-        let persist_path = native_oauth_session_store_path();
-
-        if let Some(path) = persist_path {
-            if native_oauth_session_store_path_exists(&path)
-                .map_err(|e| anyhow::anyhow!("could not inspect native OAuth session store: {e}"))?
-            {
-                std::fs::remove_file(&path).map_err(|e| {
+        match native_oauth_session_store_status() {
+            NativeOAuthSessionStoreStatus::Missing
+            | NativeOAuthSessionStoreStatus::SessionCount(0) => {
+                println!("No native OAuth sessions to clear.");
+            }
+            NativeOAuthSessionStoreStatus::SessionCount(_) => {
+                let revoked = store
+                    .revoke_all()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("could not revoke native OAuth sessions: {e}"))?;
+                println!("Native OAuth sessions cleared (revoked: {revoked}).");
+            }
+            NativeOAuthSessionStoreStatus::Unreadable(_) => {
+                let path = native_oauth_session_store_path().ok_or_else(|| {
+                    anyhow::anyhow!("could not resolve native OAuth session store")
+                })?;
+                std::fs::remove_file(&path).map_err(|error| {
                     anyhow::anyhow!(
-                        "could not remove native OAuth session store {}: {e}",
+                        "could not remove unreadable native OAuth session store {}: {error}",
                         path.display()
                     )
                 })?;
-                println!("Native OAuth sessions cleared.");
-            } else {
-                println!("No native OAuth sessions to clear.");
+                println!("Native OAuth sessions cleared (unreadable store removed).");
             }
         }
         println!("Shared Claude credentials were not deleted.");
@@ -242,11 +269,15 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
     let (code, parsed_state) = parse_auth_code(code_input);
 
     let expected_state = &pkce.state;
-    if let Some(ref state) = parsed_state {
-        if !expected_state.matches(state) {
-            eprintln!("State mismatch! This could be a CSRF attack. Authentication cancelled.");
-            anyhow::bail!("authentication cancelled: OAuth state mismatch");
-        }
+    let state = parsed_state
+        .as_deref()
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("authentication cancelled: authorization code omitted OAuth state")
+        })?;
+    if !expected_state.matches(state) {
+        eprintln!("State mismatch! This could be a CSRF attack. Authentication cancelled.");
+        anyhow::bail!("authentication cancelled: OAuth state mismatch");
     }
 
     println!("\nExchanging code for tokens...");

@@ -311,6 +311,7 @@ async fn send_to_codex_responses(
     .map_err(|error| {
         VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
     })?;
+    crate::codex_credentials::finalize_chatgpt_responses_request(&mut body);
 
     let endpoint = format!(
         "{}/responses",

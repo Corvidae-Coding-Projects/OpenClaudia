@@ -141,15 +141,9 @@
                 });
                 const data = await response.json();
                 if (response.ok) {
-                    let msg = '<strong>Authentication successful!</strong><br><br>';
-                    if (data.session_id) {
-                        msg += '<strong>Session ID:</strong><br>';
-                        msg += '<code style="user-select: all;">' + data.session_id + '</code><br><br>';
-                        msg += '<strong>To use with curl:</strong><br>';
-                        msg += '<code>curl -b "anthropic_session=' + data.session_id + '" http://localhost:8080/v1/messages ...</code>';
-                    }
-                    showHtmlStatus(msg, 'success');
+                    showTextStatus('Authentication successful. This browser is now signed in.', 'success');
                     document.getElementById('auth-code').value = '';
+                    currentState = '';
                 } else {
                     showTextStatus('Authentication failed: ' + errorMessage(data), 'error');
                 }
@@ -173,11 +167,6 @@
             status.className = type;
         }
 
-        function showHtmlStatus(message, type) {
-            const status = document.getElementById('status');
-            status.innerHTML = message;
-            status.className = type;
-        }
     </script>
 </body>
 </html>
