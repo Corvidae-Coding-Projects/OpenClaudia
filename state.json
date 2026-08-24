@@ -1,6 +1,6 @@
 {
   "next_display_id": 1129,
-  "next_comment_id": 1474,
+  "next_comment_id": 1475,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4426,10 +4426,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T06:46:20.434770076Z",
-      "updated_at": "2026-08-24T06:46:24.782636196Z",
+      "updated_at": "2026-08-24T06:50:27.338701443Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "04f649a0-bd9a-4358-a0e1-8e2872a78372": {
+          "display_id": 1474,
+          "author": "6Vw9",
+          "content": "Preflight: official Codex docs identify SDK/app-server as the supported embedding boundary and managed ChatGPT auth as owner of OAuth persistence/refresh. Preferred implementation is a typed Codex-owned subprocess capability for ChatGPT login, with schema-constrained host turns and OpenClaudia-owned tools/budgets/guardrails; normal provider API keys remain direct public-API capabilities. Rejected alternative: refreshing then scraping/forwarding private auth.json tokens, because it cannot bind account/FedRAMP metadata to an official response. Expected paths: codex credential/transport module plus existing main/TUI/print/ACP/subagent/VDD transport wiring and S-028 record. Verification: fake executable contract/security tests, focused suites, Rust 1.98 fmt/clippy/tests, manual paid-account binary conversation, credential-store digest check, cargo clean. CARGO_BUILD_JOBS=4 and serialized Cargo due RAM pressure.",
+          "created_at": "2026-08-24T06:50:27.336100109Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8zxGajPiMjVlhaPdxKLisbupFo+aXBlWlN87fkVyvfTt1DxRAtgq0nevq/pSKAzwUvfM9q2L8xv51ZOAe3bDCw=="
+        }
+      }
     },
     "21371662-2722-4f5e-b80a-0fe8fcc1b6d4": {
       "uuid": "21371662-2722-4f5e-b80a-0fe8fcc1b6d4",
@@ -38338,11 +38349,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1433,
       "timestamp": "2026-08-24T06:46:29.756022024Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1434,
+      "timestamp": "2026-08-24T06:50:27.338701443Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T06:46:29.756022024Z",
+    "timestamp": "2026-08-24T06:50:27.338701443Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1433
+    "agent_seq": 1434
   }
 }
