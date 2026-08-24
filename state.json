@@ -1,6 +1,6 @@
 {
   "next_display_id": 1127,
-  "next_comment_id": 1462,
+  "next_comment_id": 1463,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8053,7 +8053,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T04:30:05.624298691Z",
-      "updated_at": "2026-08-24T04:34:51.183677104Z",
+      "updated_at": "2026-08-24T04:59:19.511099523Z",
       "labels": [
         "remediation"
       ],
@@ -8075,6 +8075,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAjHeX+5Aa1XqIbMkjvaQk9pX4FJlQSW+QZQ8VZvXlNzRDY6S84GhRa34/YASE6fpbx0IKXjJnCDBAO1nSDU9/DQ=="
+        },
+        "47a3c2d3-40bc-4c1b-9a64-0716e54f6ff9": {
+          "display_id": 1462,
+          "author": "6Vw9",
+          "content": "Implemented the supported Claude Agent SDK transport boundary and wired it into print mode, the shared TUI agentic turn loop (including OpenClaudia-owned tool execution), provider switching, and VDD builder/adversary/verifier auth. The unmodified claude executable owns authentication; OpenClaudia passes constrained structured turns with Claude tools/MCP/session persistence disabled. Direct subscription protocol remains behind the Cargo feature plus exact runtime acknowledgement. Rust 1.98 library and binary checks currently pass; skeptical tests and live built-binary validation remain.",
+          "created_at": "2026-08-24T04:59:19.508528704Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEPE/VPViAaRvBSMaqXMUFRTxsueMTjk6ps3xgw7lH3W2d7HDwiyRKn1Crrfjf2Nnuon3Ah+KdTzzu2f1D85jBA=="
         }
       }
     },
@@ -38071,11 +38080,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1409,
       "timestamp": "2026-08-24T04:34:51.183677104Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1410,
+      "timestamp": "2026-08-24T04:59:19.511099523Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T04:34:51.183677104Z",
+    "timestamp": "2026-08-24T04:59:19.511099523Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1409
+    "agent_seq": 1410
   }
 }
