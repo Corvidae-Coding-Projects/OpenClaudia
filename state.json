@@ -1,6 +1,6 @@
 {
   "next_display_id": 1125,
-  "next_comment_id": 1451,
+  "next_comment_id": 1452,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9501,7 +9501,7 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T10:03:51.204175849Z",
-      "updated_at": "2026-08-22T14:08:56.694453546Z",
+      "updated_at": "2026-08-24T02:48:30.115673556Z",
       "labels": [
         "workflow"
       ],
@@ -9532,6 +9532,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAoKU3G9IIgLuPbKafhBzJG6TZzKyDHqxojS0MiXh9BCnBAQuSbOxOCXyYWBqcK4aN5RY/+G0+U0KFp6pq4turBw=="
+        },
+        "86686a7f-851a-451a-ba47-5112af9fe453": {
+          "display_id": 1451,
+          "author": "6Vw9",
+          "content": "Reproduced on S-030/#1124: crosslink issue close generated the correct CHANGELOG.md line and cleared the active issue, then the enabled PreToolUse hook blocked the required separate changelog commit with 'Git commit requires an active crosslink issue.' Workaround was to set the still-open parent #1071 active before committing exact machine output as 74c3481f; no changelog edits were made.",
+          "created_at": "2026-08-24T02:48:30.113253084Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABACDqV6Y9Wnw7Snt9yNLnJxn7BKBY7jjZBv0cQIC9UpcZIYzoBdwKxFgRTOp4B4b4tt2AX0Rc98iJS7jN6PFcuBA=="
         },
         "b2e6c417-45b8-4827-9c23-0c7af0611c8f": {
           "display_id": 1044,
@@ -37803,11 +37812,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1384,
       "timestamp": "2026-08-24T02:48:19.701553357Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1385,
+      "timestamp": "2026-08-24T02:48:30.115673556Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T02:48:19.701553357Z",
+    "timestamp": "2026-08-24T02:48:30.115673556Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1384
+    "agent_seq": 1385
   }
 }
