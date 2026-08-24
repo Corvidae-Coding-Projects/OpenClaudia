@@ -1,6 +1,6 @@
 {
   "next_display_id": 1125,
-  "next_comment_id": 1449,
+  "next_comment_id": 1450,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10790,7 +10790,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T01:52:48.843928461Z",
-      "updated_at": "2026-08-24T02:46:13.932797858Z",
+      "updated_at": "2026-08-24T02:47:10.678514659Z",
       "labels": [
         "remediation"
       ],
@@ -10806,6 +10806,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9YoRB88v/gXkyVYtmJndccwLMnBEHI0M0RfXGhejEMg6Hhsxy2AT12c6lGqUtnSFHAOqKP1K3It7R5Q9nJVDAg=="
+        },
+        "07d035d3-994f-439c-965f-940eb2216e44": {
+          "display_id": 1449,
+          "author": "6Vw9",
+          "content": "bd26de5d fix(auth): make interactive API-key setup secret-safe. Verified with Rust 1.98: locked full native all-target/all-feature tests, strict Clippy, formatting/diff, focused credential/config/UI regressions, Windows GNU all-target/all-feature check, locked fuzz check/Clippy/tests, repository hygiene/policy, generated digest checks, and isolated PTY startup/save/discovery/overwrite/live-connect probes. No test key echoed or entered project files; denied overwrite and project config remained byte-identical.",
+          "created_at": "2026-08-24T02:47:10.675795695Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARiL8ZFHMpNwD764WiK5XvZQo1zYM98OWJq6dqhPiWJoqeq6cbophJqQe4tIvTr2m4NJgik8VovKOTuzR4+0aCw=="
         },
         "424a465c-ce5f-40d5-8020-b51a82bf75bb": {
           "display_id": 1445,
@@ -37768,11 +37777,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1380,
       "timestamp": "2026-08-24T02:46:13.932797858Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1381,
+      "timestamp": "2026-08-24T02:47:10.678514659Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T02:46:13.932797858Z",
+    "timestamp": "2026-08-24T02:47:10.678514659Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1380
+    "agent_seq": 1381
   }
 }
