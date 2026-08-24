@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1130,
+  "next_display_id": 1131,
   "next_comment_id": 1494,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -29,6 +29,7 @@
     "05463966-6d0d-43da-8ef6-59a2aa9eff3c": 107,
     "05627fa6-df38-4ce6-8571-681be1113fdb": 767,
     "0570f229-1d34-4f10-a667-b8e932183c3c": 13,
+    "0572ed71-41c5-45ea-9b53-c897475360d9": 1130,
     "0582677c-07fd-45ec-8ef2-4edd9bd58a3f": 611,
     "05b8284c-263a-4e0c-95fc-7f879a27b46d": 603,
     "05c1618b-a40d-4a88-8902-5fef60512da1": 519,
@@ -1773,6 +1774,18 @@
       "labels": [
         "refactor"
       ]
+    },
+    "0572ed71-41c5-45ea-9b53-c897475360d9": {
+      "uuid": "0572ed71-41c5-45ea-9b53-c897475360d9",
+      "display_id": 1130,
+      "title": "Regenerate the stale fuzz lockfile for Rust 1.98 runners",
+      "description": "The PR linux and msrv jobs both fail before fuzz validation because cargo check --locked --manifest-path fuzz/Cargo.toml reports that fuzz/Cargo.lock needs an update. Regenerate only the fuzz lockfile from the current manifests and verify the exact locked fuzz metadata/check/Clippy/test commands.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T19:26:13.560123234Z",
+      "updated_at": "2026-08-24T19:26:13.560123234Z"
     },
     "0582677c-07fd-45ec-8ef2-4edd9bd58a3f": {
       "uuid": "0582677c-07fd-45ec-8ef2-4edd9bd58a3f",
@@ -38704,11 +38717,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1466,
       "timestamp": "2026-08-24T19:24:32.718923957Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1467,
+      "timestamp": "2026-08-24T19:26:13.560123234Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:24:32.718923957Z",
+    "timestamp": "2026-08-24T19:26:13.560123234Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1466
+    "agent_seq": 1467
   }
 }
