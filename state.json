@@ -1,6 +1,6 @@
 {
   "next_display_id": 1124,
-  "next_comment_id": 1429,
+  "next_comment_id": 1430,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18476,7 +18476,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:01:18.302848830Z",
-      "updated_at": "2026-08-24T00:07:28.932904129Z",
+      "updated_at": "2026-08-24T00:13:58.430065360Z",
       "labels": [
         "remediation"
       ],
@@ -18492,6 +18492,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAaHwT7O3dm5OuS+IRqKB1ZaBaqZ3fW03TnjZ2lNsRhJXhNSIBOMG5j98qkHlCbpQ/DI99WsspT6fZqNbKhQbvCQ=="
+        },
+        "7698b326-5022-46d2-b10b-883b6a82d232": {
+          "display_id": 1429,
+          "author": "6Vw9",
+          "content": "Architecture decision: keep Claude Code and Codex credential adapters/store files outside S-029 and byte-preserving; repair only OpenClaudia-owned native OAuth state. Use a backward-reading, versioned session document on S-031 descriptor-safe credential persistence; persist per-session generation/revocation/client-binding metadata; reload at use; validate inference scope, binding, revocation, and expiry; serialize refresh in-process and cross-process so stale rotations cannot publish. Bind pending browser grants with an HttpOnly random client cookie, bounded TTL/capacity and take-once state; set the opaque session cookie only after durable commit; add persisted logout/revocation. Preserve legacy document migration and keep S-026/S-027/S-028/S-092/S-093 boundaries separate. Rejected alternatives: owning/migrating foreign CLI stores (breaks user compatibility and ownership) and in-memory-only expiry checks (cannot enforce live logout/revocation or cross-process rotation).",
+          "created_at": "2026-08-24T00:13:58.424292256Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAN+UuKGoVpq0pahiulP82ZVmzESI/DH9nnIVIrxg3MeCqVeF6pdNCuQvxMjQUsoUS7lhQdpx6JuvoTiZucQktAA=="
         },
         "bb31f074-9cd1-4feb-b92d-cf9bbb05f110": {
           "display_id": 1427,
@@ -37420,11 +37429,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1352,
       "timestamp": "2026-08-24T00:07:28.932904129Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1353,
+      "timestamp": "2026-08-24T00:13:58.430065360Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T00:07:28.932904129Z",
+    "timestamp": "2026-08-24T00:13:58.430065360Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1352
+    "agent_seq": 1353
   }
 }
