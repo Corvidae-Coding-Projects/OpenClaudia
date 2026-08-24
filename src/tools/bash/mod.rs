@@ -40,6 +40,8 @@ use uuid::Uuid;
 /// Maximum number of background shells allowed before refusing new ones
 const MAX_BACKGROUND_SHELLS: usize = 50;
 const LEDGER_COMMAND_OUTPUT_MAX_BYTES: usize = 100_000;
+const BACKGROUND_OUTPUT_BATCH_BYTES: usize = 256 * 1024;
+const BACKGROUND_OUTPUT_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 300_000;
 const MAX_FOREGROUND_TIMEOUT_MS: u64 = 600_000;
 
@@ -82,17 +84,44 @@ where
         .name(format!("background-output-{job_id}"))
         .spawn(move || {
             let mut chunk = [0_u8; 16 * 1024];
+            let mut pending = Vec::with_capacity(BACKGROUND_OUTPUT_BATCH_BYTES);
+            let mut published_output = false;
+            let mut last_publish = std::time::Instant::now();
             loop {
                 match stream.read(&mut chunk) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        if !pending.is_empty() {
+                            let result = recover_mutex_lock(
+                                &core,
+                                "output_reader",
+                                "job_core",
+                                Some(&job_id),
+                            )
+                            .append_output(output_stream, &pending);
+                            if let Err(error) = result {
+                                let _ = errors.send(error);
+                            }
+                        }
+                        break;
+                    }
                     Ok(count) => {
+                        pending.extend_from_slice(&chunk[..count]);
+                        let should_publish = !published_output
+                            || pending.len() >= BACKGROUND_OUTPUT_BATCH_BYTES
+                            || last_publish.elapsed() >= BACKGROUND_OUTPUT_BATCH_INTERVAL;
+                        if !should_publish {
+                            continue;
+                        }
                         let result =
                             recover_mutex_lock(&core, "output_reader", "job_core", Some(&job_id))
-                                .append_output(output_stream, &chunk[..count]);
+                                .append_output(output_stream, &pending);
                         if let Err(error) = result {
                             let _ = errors.send(error);
                             break;
                         }
+                        pending.clear();
+                        published_output = true;
+                        last_publish = std::time::Instant::now();
                     }
                     Err(error) => {
                         let _ = errors.send(format!("background output read failed: {error}"));
@@ -2006,8 +2035,10 @@ mod tests {
         };
         assert_eq!(read.state.exit_code(), Some(0));
         let mut retained = 0_usize;
+        let mut retained_events = 0_usize;
         let mut page = read;
         loop {
+            retained_events = retained_events.saturating_add(page.events.len());
             retained = retained.saturating_add(
                 page.events
                     .iter()
@@ -2022,6 +2053,10 @@ mod tests {
                 .expect("read next bounded output page");
         }
         assert_eq!(retained, job::MAX_JOB_OUTPUT_BYTES);
+        assert!(
+            retained_events <= 16,
+            "high-throughput output was persisted in {retained_events} small events"
+        );
         assert!(page.stdout_truncated);
     }
 
