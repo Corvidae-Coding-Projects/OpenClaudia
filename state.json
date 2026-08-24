@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1125,
+  "next_display_id": 1126,
   "next_comment_id": 1454,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -806,6 +806,7 @@
     "c37b8c81-71db-4fc4-9da4-0a0d5d455f39": 900,
     "c3fac8f9-5b39-4902-a396-27c3efa79a06": 225,
     "c42c46c3-e478-462b-82c0-619de43b8589": 282,
+    "c45ab2d3-40b1-43cd-8dae-ce6520fda40a": 1125,
     "c465e740-cba5-41e8-a8c9-1cd700e496c0": 954,
     "c4abcad5-e0ae-48fe-a67d-0c5ab275ac4b": 92,
     "c519c063-640b-4bd6-96e4-6025b6ff1aac": 545,
@@ -24194,6 +24195,16 @@
         "qa-seam-config"
       ]
     },
+    "c45ab2d3-40b1-43cd-8dae-ce6520fda40a": {
+      "uuid": "c45ab2d3-40b1-43cd-8dae-ce6520fda40a",
+      "display_id": 1125,
+      "title": "S-026: Stop mutating the shared Claude credential store",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T03:16:26.714155934Z",
+      "updated_at": "2026-08-24T03:16:26.714155934Z"
+    },
     "c465e740-cba5-41e8-a8c9-1cd700e496c0": {
       "uuid": "c465e740-cba5-41e8-a8c9-1cd700e496c0",
       "display_id": 954,
@@ -37856,11 +37867,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1390,
       "timestamp": "2026-08-24T03:15:32.033628799Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1391,
+      "timestamp": "2026-08-24T03:16:26.714155934Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T03:15:32.033628799Z",
+    "timestamp": "2026-08-24T03:16:26.714155934Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1390
+    "agent_seq": 1391
   }
 }
