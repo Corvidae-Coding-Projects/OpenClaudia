@@ -663,8 +663,9 @@ providers:
 
 fn write_claude_oauth_credentials(claude_config: &std::path::Path) {
     fs::create_dir_all(claude_config).expect("claude config dir");
+    let credentials_path = claude_config.join(".credentials.json");
     fs::write(
-        claude_config.join(".credentials.json"),
+        &credentials_path,
         r#"
 {
   "claudeAiOauth": {
@@ -679,6 +680,12 @@ fn write_claude_oauth_credentials(claude_config: &std::path::Path) {
 "#,
     )
     .expect("credentials fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o600))
+            .expect("credentials fixture mode");
+    }
 }
 
 fn write_openai_target_with_local_fallback_config(cwd: &tempfile::TempDir) {
@@ -2247,8 +2254,14 @@ fn auth_status_with_malformed_credentials_exits_nonzero() {
     let home = tempfile::tempdir().expect("home tempdir");
     let claude_config = home.path().join("claude-config");
     fs::create_dir_all(&claude_config).expect("claude config dir");
-    fs::write(claude_config.join(".credentials.json"), "{not valid json")
-        .expect("malformed credentials fixture");
+    let credentials_path = claude_config.join(".credentials.json");
+    fs::write(&credentials_path, "{not valid json").expect("malformed credentials fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o600))
+            .expect("malformed credentials fixture mode");
+    }
 
     let output = isolated_command(&cwd, &home)
         .args(["auth", "--status"])
@@ -2270,6 +2283,62 @@ fn auth_status_with_malformed_credentials_exits_nonzero() {
     assert!(
         combined.contains("Could not read") && combined.contains(".credentials.json"),
         "status failure should identify the unreadable credentials file; got {combined:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_status_reports_expired_foreign_credentials_without_changing_them() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let claude_config = home.path().join("claude-config");
+    fs::create_dir_all(&claude_config).expect("claude config dir");
+    let credentials_path = claude_config.join(".credentials.json");
+    let original = br#"{
+  "claudeAiOauth": {
+    "accessToken": "expired-foreign-access-token",
+    "refreshToken": "foreign-refresh-token",
+    "expiresAt": 1,
+    "refreshTokenExpiresAt": 4102444800000,
+    "scopes": ["user:inference"],
+    "subscriptionType": "max",
+    "foreignField": {"preserve": true}
+  }
+}"#;
+    fs::write(&credentials_path, original).expect("expired credentials fixture");
+    fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o600))
+        .expect("credential mode");
+
+    let output = isolated_command(&cwd, &home)
+        .args(["auth", "--status"])
+        .env("CLAUDE_CONFIG_HOME_DIR", &claude_config)
+        .output()
+        .expect("openclaudia auth --status must run");
+
+    assert!(
+        output.status.success(),
+        "expired status remains an inspectable state; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("expired; run 'claude auth login' to refresh"),
+        "status must name the owning client's recovery command; got {combined:?}"
+    );
+    assert!(
+        !combined.contains("auto-refresh"),
+        "status must not promise an OpenClaudia refresh; got {combined:?}"
+    );
+    assert_eq!(
+        fs::read(&credentials_path).expect("credential document after status"),
+        original
     );
 }
 

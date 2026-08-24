@@ -837,7 +837,7 @@ struct PreparedTuiStartup {
     vdd_adversary_auth: Option<openclaudia::vdd::VddProviderAuth>,
 }
 
-async fn prepare_tui_startup(options: &TuiStartupOptions) -> anyhow::Result<PreparedTuiStartup> {
+fn prepare_tui_startup(options: &TuiStartupOptions) -> anyhow::Result<PreparedTuiStartup> {
     let mut config = config::load_config().map_err(|e| {
         if config::config_file_exists() {
             eprintln!("Failed to parse configuration: {e}");
@@ -849,7 +849,7 @@ async fn prepare_tui_startup(options: &TuiStartupOptions) -> anyhow::Result<Prep
     })?;
 
     let startup_auth = if should_prompt_tui_startup_auth(options) {
-        select_tui_startup_auth(&config).await?
+        select_tui_startup_auth(&config)?
     } else {
         None
     };
@@ -911,7 +911,7 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         config,
         startup_auth,
         vdd_adversary_auth,
-    } = prepare_tui_startup(&options).await?;
+    } = prepare_tui_startup(&options)?;
 
     let Some(provider) = config.active_provider() else {
         eprintln!(
@@ -1805,12 +1805,11 @@ impl TuiStartupAuthCandidate {
         }
     }
 
-    async fn into_selection(self) -> anyhow::Result<TuiStartupAuthSelection> {
+    fn into_selection(self) -> anyhow::Result<TuiStartupAuthSelection> {
         let target = self.target().map(str::to_string);
         let auth = match self {
             Self::AnthropicClaudeCode => {
                 let creds = openclaudia::claude_credentials::load_credentials()
-                    .await
                     .map_err(|e| anyhow::anyhow!("Claude Code credentials unusable: {e}"))?;
                 ChatAuth {
                     api_key: None,
@@ -1848,8 +1847,8 @@ impl TuiStartupAuthCandidate {
         Ok(TuiStartupAuthSelection { target, auth })
     }
 
-    async fn into_vdd_selection(self) -> anyhow::Result<TuiStartupVddSelection> {
-        let selection = self.into_selection().await?;
+    fn into_vdd_selection(self) -> anyhow::Result<TuiStartupVddSelection> {
+        let selection = self.into_selection()?;
         Ok(TuiStartupVddSelection {
             target: selection.target,
             auth: selection.auth,
@@ -2398,7 +2397,7 @@ fn prompt_tui_startup_vdd_auth_choice(
     anyhow::bail!("VDD login selection cancelled")
 }
 
-async fn select_tui_startup_auth(
+fn select_tui_startup_auth(
     config: &config::AppConfig,
 ) -> anyhow::Result<Option<TuiStartupSelections>> {
     use std::io::IsTerminal as _;
@@ -2414,7 +2413,7 @@ async fn select_tui_startup_auth(
 
     let selected = prompt_tui_startup_auth_choice(&candidates)?;
     let label = candidates[selected].label();
-    let chat = candidates.remove(selected).into_selection().await?;
+    let chat = candidates.remove(selected).into_selection()?;
     eprintln!("✓ Starting with {label}");
 
     let mut vdd_candidates = collect_tui_startup_vdd_auth_candidates(config, &chat.target);
@@ -2429,7 +2428,7 @@ async fn select_tui_startup_auth(
         }
         TuiStartupVddPromptChoice::Candidate(selected) => {
             let label = vdd_candidates[selected].label();
-            let selection = vdd_candidates.remove(selected).into_vdd_selection().await?;
+            let selection = vdd_candidates.remove(selected).into_vdd_selection()?;
             eprintln!("✓ VDD adversary will use {label}");
             TuiStartupVddChoice::Adversary(selection)
         }
@@ -2542,10 +2541,10 @@ async fn resolve_chat_auth(
     if target.eq_ignore_ascii_case("anthropic") && provider.api_key.is_none() {
         if !openclaudia::claude_credentials::has_claude_code_credentials() {
             eprintln!("No API key configured for Anthropic.");
-            eprintln!("Install Claude Code and run `claude` to log in, or set ANTHROPIC_API_KEY.");
+            eprintln!("Install Claude Code and run `claude auth login`, or set ANTHROPIC_API_KEY.");
             return Ok(None);
         }
-        match openclaudia::claude_credentials::load_credentials().await {
+        match openclaudia::claude_credentials::load_credentials() {
             Ok(creds) => {
                 eprintln!(
                     "✓ Authenticated via Claude Code ({}, {})",
@@ -3167,8 +3166,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn tui_startup_openai_api_key_candidate_selects_openai_auth() {
+    #[test]
+    fn tui_startup_openai_api_key_candidate_selects_openai_auth() {
         let api_key =
             openclaudia::providers::ApiKey::try_from_string("sk-startup-openai".to_string())
                 .expect("valid api key");
@@ -3178,7 +3177,6 @@ mod tests {
             label: "configured OpenAI API key".to_string(),
         })
         .into_selection()
-        .await
         .expect("selection");
 
         assert_eq!(selection.target, "openai");

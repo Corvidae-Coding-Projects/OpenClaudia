@@ -1,8 +1,8 @@
 use openclaudia::config;
 
-fn anthropic_oauth_unavailable_message(error: &str) -> String {
+fn anthropic_oauth_unavailable_message(error: impl std::fmt::Display) -> String {
     format!(
-        "No API key configured for 'anthropic', and Claude OAuth credentials are unavailable: {error}. Run 'openclaudia auth' or set ANTHROPIC_API_KEY."
+        "No API key configured for 'anthropic', and Claude OAuth credentials are unavailable: {error}. Run 'claude auth login' or set ANTHROPIC_API_KEY."
     )
 }
 
@@ -46,10 +46,10 @@ pub async fn cmd_acp(
     let (api_key, claude_code_token, codex_responses_auth) = if let Some(k) = provider_api_key {
         (Some(k), None, None)
     } else if target.eq_ignore_ascii_case("anthropic") {
-        match openclaudia::claude_credentials::load_credentials().await {
+        match openclaudia::claude_credentials::load_credentials() {
             Ok(creds) => (None, Some(creds.access_token), None),
             Err(e) => {
-                let msg = anthropic_oauth_unavailable_message(&e);
+                let msg = anthropic_oauth_unavailable_message(e);
                 eprintln!("{msg}");
                 anyhow::bail!(msg);
             }

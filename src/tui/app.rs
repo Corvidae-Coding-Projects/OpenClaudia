@@ -447,24 +447,22 @@ fn missing_provider_auth_message(target: &str) -> String {
     format!("No API key configured for '{target}'. Set {env_var} or add it to config.")
 }
 
-async fn resolve_provider_switch_auth(
+fn resolve_provider_switch_auth(
     target: &str,
     provider: &crate::config::ProviderConfig,
 ) -> Result<ProviderSwitchAuth, String> {
     if target.eq_ignore_ascii_case("anthropic") && provider.api_key.is_none() {
         if !crate::claude_credentials::has_claude_code_credentials() {
             return Err(
-                "No API key configured for Anthropic. Log in with Claude Code or set ANTHROPIC_API_KEY."
+                "No API key configured for Anthropic. Run `claude auth login` or set ANTHROPIC_API_KEY."
                     .to_string(),
             );
         }
-        let creds = crate::claude_credentials::load_credentials()
-            .await
-            .map_err(|e| {
-                format!(
-                    "Claude Code credentials unusable: {e}. Log in with Claude Code or set ANTHROPIC_API_KEY."
-                )
-            })?;
+        let creds = crate::claude_credentials::load_credentials().map_err(|e| {
+            format!(
+                "Claude Code credentials unusable: {e}. Run `claude auth login` or set ANTHROPIC_API_KEY."
+            )
+        })?;
         return Ok(ProviderSwitchAuth {
             api_key: None,
             claude_code_token: Some(creds.access_token),
@@ -519,8 +517,8 @@ async fn resolve_provider_switch_auth(
     Err(missing_provider_auth_message(target))
 }
 
-async fn resolve_provider_switch(
-    requested: String,
+fn resolve_provider_switch(
+    requested: &str,
     prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
 ) -> Result<ProviderSwitch, String> {
     let target = requested.trim().to_ascii_lowercase();
@@ -535,7 +533,7 @@ async fn resolve_provider_switch(
         .get_provider(&target)
         .cloned()
         .ok_or_else(|| format!("No provider config found for '{target}'."))?;
-    let auth = resolve_provider_switch_auth(&target, &provider).await?;
+    let auth = resolve_provider_switch_auth(&target, &provider)?;
     let model = provider
         .model
         .clone()
@@ -3239,7 +3237,7 @@ impl App {
             "Switching provider to {requested}..."
         )));
         handle.spawn(async move {
-            let event = match resolve_provider_switch(requested, prompt_blocks).await {
+            let event = match resolve_provider_switch(&requested, prompt_blocks) {
                 Ok(switch) => AppEvent::ProviderSwitchReady(Box::new(switch)),
                 Err(err) => AppEvent::ProviderSwitchError(err),
             };
@@ -7090,12 +7088,11 @@ mod tests {
         assert_eq!(state, Some(native_state));
     }
 
-    #[tokio::test]
-    async fn provider_switch_auth_allows_keyless_local_provider() {
+    #[test]
+    fn provider_switch_auth_allows_keyless_local_provider() {
         let provider = provider_config_without_key("http://localhost:1234/v1");
 
         let auth = resolve_provider_switch_auth("local", &provider)
-            .await
             .expect("local provider should not require an API key");
 
         assert!(auth.api_key.is_none());
@@ -7103,12 +7100,11 @@ mod tests {
         assert!(auth.codex_responses_auth.is_none());
     }
 
-    #[tokio::test]
-    async fn provider_switch_auth_rejects_keyless_remote_provider() {
+    #[test]
+    fn provider_switch_auth_rejects_keyless_remote_provider() {
         let provider = provider_config_without_key("https://api.deepseek.com");
 
         let err = resolve_provider_switch_auth("deepseek", &provider)
-            .await
             .expect_err("remote provider should require an API key");
 
         assert!(

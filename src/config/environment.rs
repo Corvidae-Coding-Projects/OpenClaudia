@@ -2064,7 +2064,6 @@ fn is_external_openclaudia_variable(name: &str) -> bool {
                 | "OPENCLAUDIA_AGENT_READ_ONLY_ROOTS"
                 | "OPENCLAUDIA_AGENT_READ_WRITE_ROOTS"
                 | "OPENCLAUDIA_ALLOW_OUT_OF_ROOT"
-                | "OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE"
                 | "OPENCLAUDIA_BASH_SANDBOX"
                 | "OPENCLAUDIA_DISABLE_POLICY_SKILLS"
                 | "OPENCLAUDIA_DUMP_TOOLS_PATH"

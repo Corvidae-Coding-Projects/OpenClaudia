@@ -1478,9 +1478,9 @@ pub fn slash_login() -> SlashCommandResult {
                 status.rate_limit_tier.as_deref().unwrap_or("default")
             );
             if status.expired {
-                println!("  Status: expired (auto-refreshes on next use)");
+                println!("  Status: expired; run: claude auth login");
             } else if status.expires_soon {
-                println!("  Status: valid, expiring soon");
+                println!("  Status: valid, expiring soon; refresh with: claude auth login");
             } else {
                 println!("  Status: valid");
             }
@@ -1489,7 +1489,7 @@ pub fn slash_login() -> SlashCommandResult {
             println!("\n✗ Not authenticated via Claude Code.");
             println!("  To log in:");
             println!("  1. Install Claude Code: npm install -g @anthropic-ai/claude-code");
-            println!("  2. Run: claude");
+            println!("  2. Run: claude auth login");
             println!("  3. Complete the login flow");
             println!("  4. Restart OpenClaudia");
         }

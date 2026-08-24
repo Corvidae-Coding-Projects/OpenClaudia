@@ -1,22 +1,15 @@
-//! Claude Code credential reader for direct Anthropic API authentication.
+//! Read-only Claude Code credential compatibility for Anthropic authentication.
 //!
-//! Reads OAuth tokens from Claude Code's credential store (`~/.claude/.credentials.json`)
-//! and uses them directly with the Anthropic Messages API via `Authorization: Bearer`.
-//! Handles automatic token refresh when tokens are expired.
-//!
-//! This enables `OpenClaudia` users who have Claude Code installed and logged in
-//! to use their existing subscription without an API key or proxy.
+//! Valid credentials from Claude Code's store (`~/.claude/.credentials.json`)
+//! can be used directly with the Anthropic Messages API. Claude Code owns that
+//! document and its OAuth lifecycle: `OpenClaudia` never refreshes, normalizes,
+//! locks, or writes it. Expired or nearly expired credentials direct the user
+//! back to `claude auth login`.
 
-use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
-
-/// Claude Code's OAuth client ID (public, hardcoded in Claude Code source)
-const CLAUDE_CODE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-
-/// Token exchange/refresh endpoint
-const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+use thiserror::Error;
+use tracing::debug;
 
 /// OAuth beta header required when using subscriber tokens
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
@@ -51,8 +44,10 @@ pub fn claude_code_beta_header_value() -> String {
     )
 }
 
-/// 5 minute buffer before expiry to trigger refresh
+/// Five-minute margin in which Claude Code should refresh its own credentials.
 const REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
+
+const CREDENTIALS_FILENAME: &str = ".credentials.json";
 
 /// Credential structure matching Claude Code's `~/.claude/.credentials.json`
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,93 +96,7 @@ fn claude_config_dir() -> Option<PathBuf> {
 /// Get the path to Claude Code's credentials file.
 #[must_use]
 pub fn credentials_path() -> Option<PathBuf> {
-    claude_config_dir().map(|dir| dir.join(".credentials.json"))
-}
-
-/// Path to the advisory lock file for credential access.
-fn lock_path() -> Option<PathBuf> {
-    claude_config_dir().map(|dir| dir.join(".credentials.lock"))
-}
-
-/// Advisory file lock for credential access.
-/// Prevents TOCTOU race conditions when multiple processes refresh tokens.
-/// Uses flock on Unix, `CreateFile` exclusive lock on Windows.
-struct CredentialLock {
-    _file: std::fs::File,
-}
-
-impl CredentialLock {
-    /// Acquire an exclusive lock on the credentials lock file.
-    /// Blocks until the lock is available.
-    fn acquire() -> Result<Self, String> {
-        let path = lock_path().ok_or("Cannot determine home directory for lock file")?;
-
-        // Create parent directory if needed
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        // Note (crosslink #492 follow-up): this `OpenOptions::open` site is a
-        // remaining candidate for `FileError`. The focused #492 pass left it on
-        // `String` because converting `CredentialLock` to return `FileError`
-        // would also require accommodating the libc::flock branch below
-        // (an OS syscall, not file-content I/O). Tracked for a follow-up pass
-        // so the public `acquire(...) -> Result<_, String>` contract stays
-        // stable until that wider change is scoped.
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| format!("Failed to open lock file {}: {e}", path.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = file.as_raw_fd();
-            // LOCK_EX = exclusive, blocks until acquired
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-            if ret != 0 {
-                return Err(format!(
-                    "Failed to acquire credential lock: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-
-            const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
-            let handle = file.as_raw_handle();
-            let mut overlapped =
-                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
-            // SAFETY: Win32 accepts a zeroed OVERLAPPED for synchronous
-            // LockFileEx calls with a blocking file handle.
-            let ret = unsafe {
-                windows_sys::Win32::Storage::FileSystem::LockFileEx(
-                    handle as _,
-                    LOCKFILE_EXCLUSIVE_LOCK,
-                    0,
-                    0xFFFF_FFFF,
-                    0xFFFF_FFFF,
-                    overlapped.as_mut_ptr(),
-                )
-            };
-            if ret == 0 {
-                return Err(format!(
-                    "Failed to acquire credential lock: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-
-        // Lock is released when the File is dropped:
-        //   Unix: flock is released on close.
-        //   Windows: CloseHandle releases the LockFileEx lock.
-        Ok(Self { _file: file })
-    }
+    claude_config_dir().map(|dir| dir.join(CREDENTIALS_FILENAME))
 }
 
 /// Check if Claude Code credentials exist
@@ -196,78 +105,248 @@ pub fn has_claude_code_credentials() -> bool {
     credentials_path().is_some_and(|p| p.exists())
 }
 
-/// Load Claude Code credentials, refreshing if expired.
-///
-/// Returns the access token ready for use as `Authorization: Bearer <token>`.
-///
-/// # Errors
-///
-/// Returns an error if credentials cannot be found, read, parsed, or refreshed.
-pub async fn load_credentials() -> Result<LoadedCredentials, String> {
-    // Acquire advisory lock — prevents race conditions with other OpenClaudia
-    // instances or Claude Code refreshing tokens concurrently.
-    let _lock = CredentialLock::acquire()?;
+/// Typed failures from the read-only Claude Code credential adapter.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ClaudeCredentialError {
+    /// No Claude-compatible configuration directory could be resolved.
+    #[error("cannot determine the Claude Code config directory; run `claude auth login`")]
+    LocationUnavailable,
+    /// Claude Code has not published a credential document.
+    #[error("Claude Code credentials not found at {}; run `claude auth login`", path.display())]
+    Missing { path: PathBuf },
+    /// Descriptor-safe validation or reading failed.
+    #[error("could not safely read Claude Code credentials at {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: crate::persistence::PersistenceError,
+    },
+    /// A portable read-only fallback could not read the document.
+    #[error("could not read Claude Code credentials at {}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The foreign document did not name a regular, direct file.
+    #[error("refusing to read unsafe Claude Code credential path {}: {reason}", path.display())]
+    UnsafePath { path: PathBuf, reason: &'static str },
+    /// The foreign document exceeded the explicit credential ceiling.
+    #[error(
+        "Claude Code credential file {} is {actual_bytes} bytes, exceeding the {max_bytes}-byte limit",
+        path.display()
+    )]
+    TooLarge {
+        path: PathBuf,
+        actual_bytes: u64,
+        max_bytes: u64,
+    },
+    /// Claude Code replaced the document while it was being observed.
+    #[error(
+        "Claude Code credentials at {} changed while being read; retry after Claude Code finishes updating them",
+        path.display()
+    )]
+    ChangedDuringRead { path: PathBuf },
+    /// The credential document was not valid JSON for the compatibility schema.
+    #[error("invalid Claude Code credential document at {}: {source}", path.display())]
+    InvalidDocument {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The document did not include Claude's OAuth record.
+    #[error(
+        "Claude Code credentials at {} have no claudeAiOauth section; run `claude auth login`",
+        path.display()
+    )]
+    MissingOauthSection { path: PathBuf },
+    /// The token cannot authorize inference requests.
+    #[error(
+        "Claude Code credentials at {} lack the 'user:inference' scope; run `claude auth login`",
+        path.display()
+    )]
+    MissingInferenceScope { path: PathBuf },
+    /// The access token is no longer valid.
+    #[error(
+        "Claude Code credentials at {} expired at {expires_at_ms}; run `claude auth login` to refresh them",
+        path.display()
+    )]
+    Expired { path: PathBuf, expires_at_ms: i64 },
+    /// The access token is too close to expiry for a new agent operation.
+    #[error(
+        "Claude Code credentials at {} expire soon at {expires_at_ms}; run `claude auth login` to refresh them",
+        path.display()
+    )]
+    ExpiresSoon { path: PathBuf, expires_at_ms: i64 },
+}
 
-    let path = credentials_path().ok_or("Cannot determine home directory")?;
-
-    if !path.exists() {
-        return Err(format!(
-            "Claude Code credentials not found at {}. Run `claude` and log in first.",
-            path.display()
-        ));
+#[cfg(unix)]
+fn read_credentials_document(
+    config_dir: &Path,
+    before_confirmation: impl FnOnce(),
+) -> Result<Option<CredentialsFile>, ClaudeCredentialError> {
+    let path = config_dir.join(CREDENTIALS_FILENAME);
+    match std::fs::symlink_metadata(config_dir) {
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ClaudeCredentialError::Io { path, source }),
     }
 
-    // Reject symlinks to prevent credential theft via symlink attacks
-    if path
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return Err(format!(
-            "Credentials file {} is a symlink — refusing to read for security",
-            path.display()
-        ));
+    let storage = crate::persistence::PersistentStorage::open(config_dir).map_err(|source| {
+        ClaudeCredentialError::Read {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    let first = storage
+        .read(
+            CREDENTIALS_FILENAME,
+            crate::persistence::FileClass::Credentials,
+        )
+        .map_err(|source| ClaudeCredentialError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    if first.bytes().is_none() {
+        return Ok(None);
     }
 
-    // File I/O and JSON parsing flow through the typed `FileError` enum so
-    // the underlying io::ErrorKind / serde_json::Error are preserved on the
-    // way out — see crosslink #492. We stringify here at the public boundary
-    // because `load_credentials` still returns `Result<_, String>` for
-    // backwards-compat with existing callers; the rendered message now
-    // always names the file and the source chain.
-    let content = zeroize::Zeroizing::new(
-        crate::file_error::read_file(&path)
-            .map_err(|e: crate::file_error::FileError| e.to_string())?,
-    );
+    before_confirmation();
+    let confirmed = storage
+        .read(
+            CREDENTIALS_FILENAME,
+            crate::persistence::FileClass::Credentials,
+        )
+        .map_err(|source| ClaudeCredentialError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    if first.generation() != confirmed.generation() {
+        return Err(ClaudeCredentialError::ChangedDuringRead { path });
+    }
 
-    let creds: CredentialsFile = serde_json::from_str(&content)
-        .map_err(crate::file_error::FileError::json_with_path(&path))
-        .map_err(|e| e.to_string())?;
+    first
+        .expose_bytes(|bytes| {
+            let bytes = bytes.expect("present read state must expose credential bytes");
+            serde_json::from_slice(bytes)
+        })
+        .map(Some)
+        .map_err(|source| ClaudeCredentialError::InvalidDocument { path, source })
+}
 
+#[cfg(not(unix))]
+fn read_credentials_document(
+    config_dir: &Path,
+    before_confirmation: impl FnOnce(),
+) -> Result<Option<CredentialsFile>, ClaudeCredentialError> {
+    let path = config_dir.join(CREDENTIALS_FILENAME);
+    let first = read_credentials_portable(&path)?;
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    before_confirmation();
+    let confirmed = read_credentials_portable(&path)?;
+    if confirmed.as_ref().map(|bytes| bytes.as_slice()) != Some(first.as_slice()) {
+        return Err(ClaudeCredentialError::ChangedDuringRead { path });
+    }
+    serde_json::from_slice(&first)
+        .map(Some)
+        .map_err(|source| ClaudeCredentialError::InvalidDocument { path, source })
+}
+
+#[cfg(not(unix))]
+fn read_credentials_portable(
+    path: &Path,
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, ClaudeCredentialError> {
+    use std::io::Read as _;
+
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ClaudeCredentialError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ClaudeCredentialError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "the credential file is a symlink",
+        });
+    }
+    if !metadata.is_file() {
+        return Err(ClaudeCredentialError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "the credential path is not a regular file",
+        });
+    }
+
+    let max_bytes = crate::persistence::FileClass::Credentials.max_bytes();
+    if metadata.len() > max_bytes {
+        return Err(ClaudeCredentialError::TooLarge {
+            path: path.to_path_buf(),
+            actual_bytes: metadata.len(),
+            max_bytes,
+        });
+    }
+    let file = std::fs::File::open(path).map_err(|source| ClaudeCredentialError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| ClaudeCredentialError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_bytes > max_bytes {
+        return Err(ClaudeCredentialError::TooLarge {
+            path: path.to_path_buf(),
+            actual_bytes,
+            max_bytes,
+        });
+    }
+    Ok(Some(bytes))
+}
+
+fn load_credentials_from_dir_at(
+    config_dir: &Path,
+    now_ms: i64,
+    before_confirmation: impl FnOnce(),
+) -> Result<LoadedCredentials, ClaudeCredentialError> {
+    let path = config_dir.join(CREDENTIALS_FILENAME);
+    let creds = read_credentials_document(config_dir, before_confirmation)?
+        .ok_or_else(|| ClaudeCredentialError::Missing { path: path.clone() })?;
     let oauth = creds
         .claude_ai_oauth
-        .ok_or("No claudeAiOauth section in credentials file")?;
+        .ok_or_else(|| ClaudeCredentialError::MissingOauthSection { path: path.clone() })?;
 
-    // Check if user:inference scope is present
-    if !oauth.scopes.iter().any(|s| s == "user:inference") {
-        return Err(
-            "Claude Code credentials lack 'user:inference' scope. Re-login with Claude Code."
-                .to_string(),
-        );
+    if !oauth.scopes.iter().any(|scope| scope == "user:inference") {
+        return Err(ClaudeCredentialError::MissingInferenceScope { path });
     }
-
-    // Check expiry (with 5 minute buffer)
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    if now_ms + REFRESH_BUFFER_MS >= oauth.expires_at {
-        info!("Claude Code token expired or expiring soon, refreshing...");
-        return refresh_and_load(&path, &oauth).await;
+    if now_ms >= oauth.expires_at {
+        return Err(ClaudeCredentialError::Expired {
+            path,
+            expires_at_ms: oauth.expires_at,
+        });
+    }
+    if now_ms.saturating_add(REFRESH_BUFFER_MS) >= oauth.expires_at {
+        return Err(ClaudeCredentialError::ExpiresSoon {
+            path,
+            expires_at_ms: oauth.expires_at,
+        });
     }
 
     debug!(
-        "Claude Code credentials loaded (expires in {}s, type: {:?})",
+        "Claude Code credentials loaded read-only (expires in {}s, type: {:?})",
         (oauth.expires_at - now_ms) / 1000,
         oauth.subscription_type
     );
-
     Ok(LoadedCredentials {
         access_token: oauth.access_token,
         subscription_type: oauth.subscription_type,
@@ -276,422 +355,19 @@ pub async fn load_credentials() -> Result<LoadedCredentials, String> {
     })
 }
 
-/// Refresh the token and update the credentials file.
+/// Load a valid Claude Code access token without mutating its credential store.
 ///
-/// Caller must hold `CredentialLock` — this function reads, refreshes via API,
-/// and writes the credentials file. The lock prevents concurrent processes from
-/// racing on the same file.
-/// Call the OAuth token-refresh endpoint and return the raw JSON response body.
-async fn call_token_refresh_api(
-    refresh_token: &crate::secrets::OAuthToken,
-    scopes: &str,
-) -> Result<TokenRefreshResponse, String> {
-    #[derive(Serialize)]
-    struct TokenRefreshRequest<'a> {
-        grant_type: &'static str,
-        refresh_token: &'a str,
-        client_id: &'static str,
-        scope: &'a str,
-    }
-
-    let client = crate::provider_transport::shared_client().map_err(|error| error.to_string())?;
-    let request = refresh_token.expose(|refresh_raw| {
-        client.post(TOKEN_URL).json(&TokenRefreshRequest {
-            grant_type: "refresh_token",
-            refresh_token: refresh_raw,
-            client_id: CLAUDE_CODE_CLIENT_ID,
-            scope: scopes,
-        })
-    });
-    crate::provider_transport::validate_endpoint("anthropic", TOKEN_URL)
-        .map_err(|error| error.to_string())?;
-    let response = crate::provider_transport::send(request)
-        .await
-        .map_err(|e| format!("Token refresh request failed: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = crate::secrets::read_bounded_diagnostic_body(response)
-            .await
-            .map_err(|error| format!("Failed to read token refresh error body: {error}"))?;
-        let known = refresh_token.secret();
-        let safe = crate::secrets::sanitize_diagnostic(&body, [&known]);
-        tracing::debug!(status = %status, body = %safe, "token refresh failed");
-        return Err(format!("Token refresh failed ({status}): {safe}"));
-    }
-
-    crate::provider_transport::read_sensitive_json_capped(
-        response,
-        crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
-    )
-    .await
-    .map_err(|e| format!("Failed to parse refresh response: {e}"))
-}
-
-#[derive(Deserialize)]
-struct TokenRefreshResponse {
-    access_token: crate::secrets::OAuthToken,
-    refresh_token: Option<crate::secrets::OAuthToken>,
-    expires_in: i64,
-    scope: Option<String>,
-}
-
-/// Resolve the `refresh_token` to persist after a successful refresh.
-///
-/// Returns the response's `refresh_token` field when present. When absent,
-/// requires `OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE=1` to be set before
-/// silently reusing the old one — see crosslink #825.
-fn resolve_new_refresh_token(
-    response_field: Option<crate::secrets::OAuthToken>,
-    previous_refresh_token: &crate::secrets::OAuthToken,
-) -> Result<crate::secrets::OAuthToken, String> {
-    if let Some(token) = response_field {
-        return Ok(token);
-    }
-    let allow_reuse = std::env::var("OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE")
-        .ok()
-        .as_deref()
-        == Some("1");
-    if !allow_reuse {
-        return Err(
-            "Refresh response omitted 'refresh_token' field; refusing to reuse \
-             the previous one (set OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE=1 to \
-             opt in if your provider uses non-rotating refresh tokens)"
-                .to_string(),
-        );
-    }
-    tracing::warn!(
-        "Refresh response omitted 'refresh_token' field; reusing previous \
-         refresh token under OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE=1 — if your \
-         provider rotates refresh tokens this will break on the next refresh"
-    );
-    Ok(previous_refresh_token.clone())
-}
-
-async fn refresh_and_load(path: &Path, oauth: &ClaudeAiOauth) -> Result<LoadedCredentials, String> {
-    const MIN_EXPIRES_IN_SECS: i64 = 60;
-    const MAX_EXPIRES_IN_SECS: i64 = 30 * 24 * 3600;
-
-    let refresh_token = oauth
-        .refresh_token
-        .as_ref()
-        .ok_or("No refresh token available — re-login with Claude Code")?;
-
-    let scopes = oauth.scopes.join(" ");
-    let refresh_response = call_token_refresh_api(refresh_token, &scopes).await?;
-
-    let new_access_token = refresh_response.access_token;
-
-    // Crosslink #825: when the refresh response omits the `refresh_token`
-    // field, the OAuth server may either (a) be using non-rotating refresh
-    // tokens — in which case reusing the old one is intentional — or (b) be
-    // returning a partial / broken response. Silently reusing the old token
-    // under (b) means we could lose the ability to refresh on the *next*
-    // cycle without any operator-visible signal. Require an explicit
-    // opt-in (`OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE=1`) before reusing,
-    // and `warn!` so it shows up in logs either way.
-    let new_refresh_token =
-        resolve_new_refresh_token(refresh_response.refresh_token, refresh_token)?;
-
-    // `expires_in` is required by the OAuth spec — refuse to silently
-    // default to 3600 when the field is missing or malformed. A missing
-    // field indicates a protocol deviation the operator needs to see.
-    // Clamp the received value to [60s, 30d] with a tracing warn on any
-    // clamp to avoid 401-retry loops (too short) and multi-year tokens
-    // (too long). See crosslink #480.
-    let expires_in_raw = refresh_response.expires_in;
-    if expires_in_raw <= 0 {
-        return Err(format!(
-            "Refresh response returned non-positive 'expires_in' ({expires_in_raw})"
-        ));
-    }
-    let expires_in = if expires_in_raw < MIN_EXPIRES_IN_SECS {
-        tracing::warn!(
-            received = expires_in_raw,
-            clamped_to = MIN_EXPIRES_IN_SECS,
-            "Refresh expires_in too small; clamping to avoid 401-retry loop"
-        );
-        MIN_EXPIRES_IN_SECS
-    } else if expires_in_raw > MAX_EXPIRES_IN_SECS {
-        tracing::warn!(
-            received = expires_in_raw,
-            clamped_to = MAX_EXPIRES_IN_SECS,
-            "Refresh expires_in too large; clamping to refuse multi-year tokens"
-        );
-        MAX_EXPIRES_IN_SECS
-    } else {
-        expires_in_raw
-    };
-
-    let new_expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
-
-    // Parse scopes from response
-    let new_scopes: Vec<String> = refresh_response.scope.as_deref().map_or_else(
-        || oauth.scopes.clone(),
-        |s| s.split_whitespace().map(String::from).collect(),
-    );
-
-    // Update credentials file
-    let updated = CredentialsFile {
-        claude_ai_oauth: Some(ClaudeAiOauth {
-            access_token: new_access_token.clone(),
-            refresh_token: Some(new_refresh_token),
-            expires_at: new_expires_at,
-            scopes: new_scopes.clone(),
-            subscription_type: oauth.subscription_type.clone(),
-            rate_limit_tier: oauth.rate_limit_tier.clone(),
-        }),
-    };
-
-    write_credentials_file(path, &updated)?;
-
-    info!("Token refreshed successfully (expires in {}s)", expires_in);
-
-    Ok(LoadedCredentials {
-        access_token: new_access_token,
-        subscription_type: oauth.subscription_type.clone(),
-        rate_limit_tier: oauth.rate_limit_tier.clone(),
-        scopes: new_scopes,
-    })
-}
-
-fn reject_credentials_symlink(path: &Path) -> Result<(), String> {
-    if path
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return Err(format!(
-            "Credentials file {} is a symlink — refusing to write for security",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Explicit serializer for Claude Code's owner-only credential file.
-/// Generic `CredentialsFile` serialization remains redacted.
-struct PersistedCredentialsFileRef<'a>(&'a CredentialsFile);
-
-impl Serialize for PersistedCredentialsFileRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut state = serializer.serialize_struct("CredentialsFile", 1)?;
-        let oauth = self
-            .0
-            .claude_ai_oauth
-            .as_ref()
-            .map(PersistedClaudeAiOauthRef);
-        state.serialize_field("claudeAiOauth", &oauth)?;
-        state.end()
-    }
-}
-
-struct PersistedClaudeAiOauthRef<'a>(&'a ClaudeAiOauth);
-
-impl Serialize for PersistedClaudeAiOauthRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let oauth = self.0;
-        let mut state = serializer.serialize_struct("ClaudeAiOauth", 6)?;
-        oauth
-            .access_token
-            .expose(|raw| state.serialize_field("accessToken", raw))?;
-        if let Some(refresh_token) = &oauth.refresh_token {
-            refresh_token.expose(|raw| state.serialize_field("refreshToken", raw))?;
-        } else {
-            state.serialize_field("refreshToken", &Option::<&str>::None)?;
-        }
-        state.serialize_field("expiresAt", &oauth.expires_at)?;
-        state.serialize_field("scopes", &oauth.scopes)?;
-        state.serialize_field("subscriptionType", &oauth.subscription_type)?;
-        state.serialize_field("rateLimitTier", &oauth.rate_limit_tier)?;
-        state.end()
-    }
-}
-
-/// Serialize and atomically write a [`CredentialsFile`] to `path`.
-///
-/// The target must not be a symlink. The replacement is written to a random
-/// sibling temp file created with `create_new`, then atomically moved into
-/// place. On Unix the temp file is created as `0600` before secret bytes are
-/// written.
-fn write_credentials_file(path: &Path, creds: &CredentialsFile) -> Result<(), String> {
-    reject_credentials_symlink(path)?;
-
-    let parent = path.parent().ok_or_else(|| {
-        format!(
-            "credentials path {} has no parent directory",
-            path.display()
-        )
-    })?;
-    crate::file_error::create_dir_all(parent).map_err(|e| e.to_string())?;
-
-    let json = zeroize::Zeroizing::new(
-        serde_json::to_vec_pretty(&PersistedCredentialsFileRef(creds))
-            .map_err(crate::file_error::FileError::json_with_path(path))
-            .map_err(|e| e.to_string())?,
-    );
-
-    let tmp = match write_secret_tmp(parent, &json) {
-        Ok(tmp) => tmp,
-        Err(e) => return Err(format!("Failed to write credentials temp file: {e}")),
-    };
-
-    if let Err(e) = crate::file_error::replace_file_atomic(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("Failed to replace {}: {e}", path.display()));
-    }
-    sync_parent_dir(parent);
-    Ok(())
-}
-
-fn write_secret_tmp(parent: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
-    use std::io::{ErrorKind, Write};
-
-    let mut last_exists = None;
-    for _ in 0..16 {
-        let tmp = parent.join(format!(
-            ".credentials.json.tmp.{}.{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-
-        match options.open(&tmp) {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-                if let Err(e) = file.sync_all() {
-                    tracing::warn!(path = ?tmp, error = %e, "Failed to fsync credentials temp file");
-                }
-                return Ok(tmp);
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                last_exists = Some(e);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Err(last_exists.unwrap_or_else(|| {
-        std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            "could not allocate unique credentials temp file",
-        )
-    }))
-}
-
-#[cfg(unix)]
-fn sync_parent_dir(parent: &Path) {
-    if let Err(e) = std::fs::OpenOptions::new()
-        .read(true)
-        .open(parent)
-        .and_then(|dir| dir.sync_all())
-    {
-        tracing::warn!(path = ?parent, error = %e, "Failed to fsync credentials directory");
-    }
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_parent: &Path) {}
-
-fn read_existing_oauth(path: &Path) -> Option<ClaudeAiOauth> {
-    if !path.exists()
-        || path
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return None;
-    }
-    crate::file_error::read_file(path)
-        .ok()
-        .and_then(|content| {
-            let content = zeroize::Zeroizing::new(content);
-            serde_json::from_str::<CredentialsFile>(&content).ok()
-        })
-        .and_then(|creds| creds.claude_ai_oauth)
-}
-
-fn merge_oauth_fields(
-    access_token: &crate::secrets::OAuthToken,
-    refresh_token: Option<&crate::secrets::OAuthToken>,
-    expires_at_ms: i64,
-    scopes: Vec<String>,
-    subscription_type: Option<String>,
-    rate_limit_tier: Option<String>,
-    existing: Option<&ClaudeAiOauth>,
-) -> ClaudeAiOauth {
-    ClaudeAiOauth {
-        access_token: access_token.clone(),
-        refresh_token: refresh_token
-            .cloned()
-            .or_else(|| existing.and_then(|oauth| oauth.refresh_token.clone())),
-        expires_at: expires_at_ms,
-        scopes,
-        subscription_type: subscription_type
-            .or_else(|| existing.and_then(|oauth| oauth.subscription_type.clone())),
-        rate_limit_tier: rate_limit_tier
-            .or_else(|| existing.and_then(|oauth| oauth.rate_limit_tier.clone())),
-    }
-}
-
-/// Persist OAuth credentials to Claude Code's shared credential store.
-///
-/// This makes `openclaudia auth` produce the same `claudeAiOauth` file that
-/// chat, proxy, and TUI paths already consume through [`load_credentials`].
+/// Returns the access token ready for use as `Authorization: Bearer <token>`.
+/// Claude Code remains responsible for refreshing near-expiry or expired
+/// credentials.
 ///
 /// # Errors
 ///
-/// Returns an error when the config directory cannot be resolved, the target is
-/// a symlink, or the credential file cannot be written.
-pub fn store_credentials(
-    access_token: &crate::secrets::OAuthToken,
-    refresh_token: Option<&crate::secrets::OAuthToken>,
-    expires_at_ms: i64,
-    scopes: Vec<String>,
-    subscription_type: Option<String>,
-    rate_limit_tier: Option<String>,
-) -> Result<(), String> {
-    let _lock = CredentialLock::acquire()?;
-    let path = credentials_path().ok_or("Cannot determine credentials directory")?;
-    let need_existing =
-        refresh_token.is_none() || subscription_type.is_none() || rate_limit_tier.is_none();
-    let existing = if need_existing {
-        read_existing_oauth(&path)
-    } else {
-        None
-    };
-    let oauth = merge_oauth_fields(
-        access_token,
-        refresh_token,
-        expires_at_ms,
-        scopes,
-        subscription_type,
-        rate_limit_tier,
-        existing.as_ref(),
-    );
-    if oauth.refresh_token.is_none() {
-        tracing::warn!(
-            "OAuth login returned no refresh token and no existing refresh token was available; automatic refresh will be unavailable"
-        );
-    }
-
-    write_credentials_file(
-        &path,
-        &CredentialsFile {
-            claude_ai_oauth: Some(oauth),
-        },
-    )
+/// Returns a typed error when the store is missing, unsafe, malformed, stale,
+/// replaced during observation, or lacks the inference scope.
+pub fn load_credentials() -> Result<LoadedCredentials, ClaudeCredentialError> {
+    let config_dir = claude_config_dir().ok_or(ClaudeCredentialError::LocationUnavailable)?;
+    load_credentials_from_dir_at(&config_dir, chrono::Utc::now().timestamp_millis(), || {})
 }
 
 /// Read-only credential status used by `openclaudia auth --status`.
@@ -711,23 +387,19 @@ pub struct CredentialStatus {
     pub rate_limit_tier: Option<String>,
 }
 
-/// Inspect the shared Claude credential store without refreshing tokens.
+/// Inspect the shared Claude credential store without mutating it.
 ///
 /// # Errors
 ///
-/// Returns an error when an existing credential file is a symlink, unreadable,
-/// or malformed.
-pub fn peek_credentials() -> Result<Option<CredentialStatus>, String> {
-    let Some(path) = credentials_path().filter(|path| path.exists()) else {
+/// Returns an error when an existing credential file is unsafe, unreadable,
+/// malformed, or replaced during observation.
+pub fn peek_credentials() -> Result<Option<CredentialStatus>, ClaudeCredentialError> {
+    let Some(config_dir) = claude_config_dir() else {
         return Ok(None);
     };
-    reject_credentials_symlink(&path)?;
-
-    let content =
-        zeroize::Zeroizing::new(crate::file_error::read_file(&path).map_err(|e| e.to_string())?);
-    let creds: CredentialsFile = serde_json::from_str(&content)
-        .map_err(crate::file_error::FileError::json_with_path(&path))
-        .map_err(|e| e.to_string())?;
+    let Some(creds) = read_credentials_document(&config_dir, || {})? else {
+        return Ok(None);
+    };
     let Some(oauth) = creds.claude_ai_oauth else {
         return Ok(None);
     };
@@ -742,7 +414,8 @@ fn status_from_oauth(oauth: &ClaudeAiOauth, now_ms: i64) -> CredentialStatus {
     CredentialStatus {
         expires_at_ms: oauth.expires_at,
         expired: now_ms >= oauth.expires_at,
-        expires_soon: now_ms < oauth.expires_at && now_ms + REFRESH_BUFFER_MS >= oauth.expires_at,
+        expires_soon: now_ms < oauth.expires_at
+            && now_ms.saturating_add(REFRESH_BUFFER_MS) >= oauth.expires_at,
         has_inference_scope: oauth.scopes.iter().any(|scope| scope == "user:inference"),
         subscription_type: oauth.subscription_type.clone(),
         rate_limit_tier: oauth.rate_limit_tier.clone(),
@@ -902,61 +575,6 @@ mod tests {
         crate::secrets::OAuthToken::try_from_string(value.to_string()).expect("valid test token")
     }
 
-    // --- Crosslink #825: refresh_token rotation policy ---
-
-    /// Spec — when the OAuth response carries a `refresh_token`, the helper
-    /// returns it verbatim (this is the rotating-token happy path). This
-    /// path doesn't touch env vars so it can run in parallel with anything.
-    #[test]
-    fn resolve_new_refresh_token_uses_response_field_when_present() {
-        let old = token("old-token");
-        let result = resolve_new_refresh_token(Some(token("new-rotated-token")), &old)
-            .expect("rotated token");
-        assert!(result.matches("new-rotated-token"));
-    }
-
-    /// Spec — both env-var-sensitive branches of [`resolve_new_refresh_token`]
-    /// folded into one test so they cannot race each other or other tests in
-    /// this binary on the shared `OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE` slot.
-    /// Saves and restores the ambient value on the way in and out so a parent
-    /// process that legitimately set the var observes no side effect.
-    #[test]
-    fn resolve_new_refresh_token_optin_policy() {
-        const VAR: &str = "OPENCLAUDIA_ALLOW_REFRESH_TOKEN_REUSE";
-        let prev = std::env::var(VAR).ok();
-        // SAFETY (both `unsafe` calls below): this single test owns the env
-        // var for its duration — the only other site that reads it is the
-        // production code under test, called synchronously from here. No
-        // background thread in this binary writes to this var.
-        unsafe {
-            std::env::remove_var(VAR);
-        }
-        let old = token("old-token");
-        let err_result = resolve_new_refresh_token(None, &old);
-        // SAFETY: see comment above.
-        unsafe {
-            std::env::set_var(VAR, "1");
-        }
-        let reuse_result = resolve_new_refresh_token(None, &old);
-        // Restore before any assertion that might unwind.
-        // SAFETY: see comment above.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(VAR, v),
-                None => std::env::remove_var(VAR),
-            }
-        }
-
-        let err = err_result.expect_err("must refuse silent reuse without explicit opt-in");
-        assert!(
-            err.contains(VAR),
-            "error must name the opt-in env var; got: {err}"
-        );
-        assert!(reuse_result
-            .expect("with opt-in set, helper must return the previous token")
-            .matches("old-token"));
-    }
-
     #[test]
     fn test_credentials_path() {
         let path = credentials_path();
@@ -1013,126 +631,144 @@ mod tests {
         let _ = has_claude_code_credentials();
     }
 
-    #[test]
-    fn write_credentials_file_round_trips_with_claude_code_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".credentials.json");
-        let creds = CredentialsFile {
-            claude_ai_oauth: Some(ClaudeAiOauth {
-                access_token: token("sk-ant-oat01-test"),
-                refresh_token: Some(token("sk-ant-ort01-refresh")),
-                expires_at: 1_999_999_999_999,
-                scopes: vec!["user:inference".to_string(), "user:profile".to_string()],
-                subscription_type: Some("pro".to_string()),
-                rate_limit_tier: Some("default_claude_ai".to_string()),
-            }),
-        };
+    #[cfg(unix)]
+    fn credential_fixture(expires_at_ms: i64, access_token: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+  "claudeAiOauth": {{
+    "accessToken": "{access_token}",
+    "refreshToken": "fixture-refresh-token",
+    "expiresAt": {expires_at_ms},
+    "refreshTokenExpiresAt": 4102444800000,
+    "scopes": ["user:inference", "user:profile"],
+    "subscriptionType": "max",
+    "rateLimitTier": "fixture-tier",
+    "ownerMetadata": {{"mustRemain": true}}
+  }},
+  "foreignTopLevel": ["preserve", 7]
+}}"#
+        )
+        .into_bytes()
+    }
 
-        write_credentials_file(&path, &creds).unwrap();
+    #[cfg(unix)]
+    fn write_private(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt as _;
 
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"claudeAiOauth\""));
-        assert!(content.contains("\"accessToken\""));
-        assert!(content.contains("\"refreshToken\""));
-        assert!(content.contains("\"expiresAt\""));
-
-        let parsed: CredentialsFile = serde_json::from_str(&content).unwrap();
-        let oauth = parsed.claude_ai_oauth.unwrap();
-        assert!(oauth.access_token.matches("sk-ant-oat01-test"));
-        assert!(oauth
-            .refresh_token
-            .as_ref()
-            .is_some_and(|token| token.matches("sk-ant-ort01-refresh")));
-        assert_eq!(oauth.subscription_type.as_deref(), Some("pro"));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "credentials must be written 0600");
-        }
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn write_credentials_file_rejects_symlink_target() {
+    fn valid_foreign_credentials_are_loaded_without_changing_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CREDENTIALS_FILENAME);
+        let original = credential_fixture(2_000_000, "fixture-access-token");
+        write_private(&path, &original);
+
+        let loaded = load_credentials_from_dir_at(dir.path(), 1_000_000, || {}).unwrap();
+
+        assert!(loaded.access_token.matches("fixture-access-token"));
+        assert_eq!(loaded.subscription_type.as_deref(), Some("max"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_foreign_credentials_return_recovery_errors_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CREDENTIALS_FILENAME);
+        let expired = credential_fixture(999_999, "expired-access-token");
+        write_private(&path, &expired);
+        let error = load_credentials_from_dir_at(dir.path(), 1_000_000, || {}).unwrap_err();
+        assert!(matches!(error, ClaudeCredentialError::Expired { .. }));
+        assert!(error.to_string().contains("claude auth login"));
+        assert_eq!(std::fs::read(&path).unwrap(), expired);
+
+        let expiring =
+            credential_fixture(1_000_000 + REFRESH_BUFFER_MS - 1, "expiring-access-token");
+        write_private(&path, &expiring);
+        let error = load_credentials_from_dir_at(dir.path(), 1_000_000, || {}).unwrap_err();
+        assert!(matches!(error, ClaudeCredentialError::ExpiresSoon { .. }));
+        assert!(error.to_string().contains("claude auth login"));
+        assert_eq!(std::fs::read(&path).unwrap(), expiring);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_inference_scope_is_typed_and_does_not_change_foreign_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CREDENTIALS_FILENAME);
+        let original = String::from_utf8(credential_fixture(2_000_000, "fixture-access-token"))
+            .unwrap()
+            .replace("user:inference", "user:account");
+        write_private(&path, original.as_bytes());
+
+        let error = load_credentials_from_dir_at(dir.path(), 1_000_000, || {}).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ClaudeCredentialError::MissingInferenceScope { .. }
+        ));
+        assert!(error.to_string().contains("claude auth login"));
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_readable_foreign_credentials_are_rejected_without_writes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CREDENTIALS_FILENAME);
+        let original = credential_fixture(2_000_000, "fixture-access-token");
+        write_private(&path, &original);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let error = load_credentials_from_dir_at(dir.path(), 1_000_000, || {}).unwrap_err();
+        assert!(matches!(error, ClaudeCredentialError::Read { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_foreign_credentials_are_rejected_without_writes() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target.json");
-        let link = dir.path().join(".credentials.json");
-        std::fs::write(&target, "{}").unwrap();
-        symlink(&target, &link).unwrap();
+        let target = dir.path().join("real-credentials.json");
+        let path = dir.path().join(CREDENTIALS_FILENAME);
+        let original = credential_fixture(2_000_000, "fixture-access-token");
+        write_private(&target, &original);
+        symlink(&target, &path).unwrap();
 
-        let creds = CredentialsFile {
-            claude_ai_oauth: None,
-        };
-        let err = write_credentials_file(&link, &creds).unwrap_err();
-        assert!(err.contains("symlink"), "error must mention symlink: {err}");
+        let error = load_credentials_from_dir_at(dir.path(), 1_000_000, || {}).unwrap_err();
+        assert!(matches!(error, ClaudeCredentialError::Read { .. }));
+        assert_eq!(std::fs::read(&target).unwrap(), original);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn merge_oauth_fields_preserves_existing_metadata_when_missing() {
-        let existing = ClaudeAiOauth {
-            access_token: token("old-access"),
-            refresh_token: Some(token("old-refresh")),
-            expires_at: 1,
-            scopes: vec!["old".into()],
-            subscription_type: Some("max".into()),
-            rate_limit_tier: Some("tier-x".into()),
-        };
+    fn concurrent_foreign_replacement_is_reported_without_openclaudia_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CREDENTIALS_FILENAME);
+        let replacement_path = dir.path().join("replacement.json");
+        let original = credential_fixture(2_000_000, "original-access-token");
+        let replacement = credential_fixture(3_000_000, "replacement-access-token");
+        write_private(&path, &original);
+        write_private(&replacement_path, &replacement);
 
-        let new_access = token("new-access");
-        let merged = merge_oauth_fields(
-            &new_access,
-            None,
-            42,
-            vec!["user:inference".into()],
-            None,
-            None,
-            Some(&existing),
-        );
+        let error = load_credentials_from_dir_at(dir.path(), 1_000_000, || {
+            std::fs::rename(&replacement_path, &path).unwrap();
+        })
+        .unwrap_err();
 
-        assert!(merged.access_token.matches("new-access"));
-        assert_eq!(merged.expires_at, 42);
-        assert!(merged
-            .refresh_token
-            .as_ref()
-            .is_some_and(|token| token.matches("old-refresh")));
-        assert_eq!(merged.subscription_type.as_deref(), Some("max"));
-        assert_eq!(merged.rate_limit_tier.as_deref(), Some("tier-x"));
-        assert_eq!(merged.scopes, vec!["user:inference"]);
-    }
-
-    #[test]
-    fn merge_oauth_fields_prefers_fresh_values() {
-        let existing = ClaudeAiOauth {
-            access_token: token("old-access"),
-            refresh_token: Some(token("old-refresh")),
-            expires_at: 1,
-            scopes: vec![],
-            subscription_type: Some("pro".into()),
-            rate_limit_tier: Some("tier-old".into()),
-        };
-
-        let new_access = token("new-access");
-        let new_refresh = token("new-refresh");
-        let merged = merge_oauth_fields(
-            &new_access,
-            Some(&new_refresh),
-            99,
-            vec!["user:inference".into()],
-            Some("max".into()),
-            Some("tier-new".into()),
-            Some(&existing),
-        );
-
-        assert!(merged
-            .refresh_token
-            .as_ref()
-            .is_some_and(|token| token.matches("new-refresh")));
-        assert_eq!(merged.subscription_type.as_deref(), Some("max"));
-        assert_eq!(merged.rate_limit_tier.as_deref(), Some("tier-new"));
+        assert!(matches!(
+            error,
+            ClaudeCredentialError::ChangedDuringRead { .. }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
     }
 
     #[test]

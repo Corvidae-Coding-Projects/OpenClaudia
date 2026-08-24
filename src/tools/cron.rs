@@ -48,9 +48,7 @@ const fn default_true() -> bool {
 /// On Unix this is an `flock(2)` `LOCK_EX` lock on a sibling lock file;
 /// it is released when the inner `File` is dropped (the kernel releases
 /// the lock on `close(2)`). On non-Unix platforms the bare `File`
-/// handle still provides serialization across processes when combined
-/// with `OpenOptions::write(true)`, matching the pattern used by
-/// `claude_credentials::CredentialLock`.
+/// handle remains open for the duration of the schedule transaction.
 struct ScheduleLock {
     _file: std::fs::File,
 }

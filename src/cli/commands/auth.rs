@@ -167,9 +167,11 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
                     }
                 );
                 if status.expired {
-                    println!("  status       : expired (auto-refreshes on next use)");
+                    println!("  status       : expired; run 'claude auth login' to refresh");
                 } else if status.expires_soon {
-                    println!("  status       : valid, expiring soon (auto-refreshes on next use)");
+                    println!(
+                        "  status       : valid, expiring soon; refresh with 'claude auth login'"
+                    );
                 } else {
                     println!(
                         "  status       : valid (~{}h{}m remaining)",
@@ -180,7 +182,7 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
             }
             Ok(None) => {
                 println!("No Claude credentials at {credentials_path}.");
-                println!("Run 'openclaudia auth', or log in with Claude Code / openclaude.");
+                println!("Run 'claude auth login' to log in with Claude Code.");
             }
             Err(e) => {
                 eprintln!("Could not read {credentials_path}: {e}");
@@ -308,32 +310,6 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
         println!("  Granted scopes: {}", session.granted_scopes.join(", "));
     }
 
-    if session
-        .granted_scopes
-        .iter()
-        .any(|scope| scope == "user:inference")
-    {
-        match openclaudia::claude_credentials::store_credentials(
-            &session.credentials.access_token,
-            session.credentials.refresh_token.as_ref(),
-            session.credentials.expires_at.timestamp_millis(),
-            session.granted_scopes.clone(),
-            None,
-            None,
-        ) {
-            Ok(()) => {
-                let path = openclaudia::claude_credentials::credentials_path().map_or_else(
-                    || "~/.claude/.credentials.json".into(),
-                    |p| p.display().to_string(),
-                );
-                println!("Saved Claude credentials to {path}");
-            }
-            Err(e) => eprintln!("Warning: could not write Claude credentials: {e}"),
-        }
-    } else {
-        eprintln!("Note: granted scopes lack 'user:inference'; skipped writing Claude credentials");
-    }
-
     let session_id = session.id.clone();
     let auth_mode = session.auth_mode.clone();
     store
@@ -341,6 +317,8 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to save native OAuth session: {e:#}"))?;
 
     println!("\nAuthentication successful!");
+    println!("  Session stored in OpenClaudia's native OAuth store.");
+    println!("  Claude Code's shared credential file was not changed.");
     println!("  Session ID: {}", safe_truncate(&session_id, 8));
     match auth_mode {
         openclaudia::oauth::AuthMode::ApiKey => {
@@ -353,8 +331,8 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
             println!("  Auth mode: Proxy (via anthropic-proxy)");
         }
     }
-    println!("\nYour session has been saved. OpenClaudia will now use your");
-    println!("Claude Max subscription automatically when target is 'anthropic'.");
+    println!("\nYour native OAuth session has been saved.");
+    println!("Claude Code login compatibility continues to use Claude Code's own store.");
 
     Ok(())
 }
@@ -406,7 +384,7 @@ mod tests {
             .find(".try_store_session(session)")
             .expect("auth must use the fallible OAuth session persist path");
         let success_message = production
-            .find("Your session has been saved")
+            .find("Your native OAuth session has been saved")
             .expect("auth success message must be present");
 
         assert!(
@@ -416,6 +394,24 @@ mod tests {
         assert!(
             !production.contains("store.store_session(session);"),
             "auth must not use the best-effort OAuth session persist wrapper"
+        );
+    }
+
+    #[test]
+    fn auth_keeps_claude_codes_credential_store_read_only() {
+        let source = include_str!("auth.rs");
+        let cfg_test = source
+            .find("#[cfg(test)]")
+            .expect("test marker must be present");
+        let production = &source[..cfg_test];
+
+        assert!(
+            !production.contains("store_credentials"),
+            "native auth must not write Claude Code's foreign credential store"
+        );
+        assert!(
+            production.contains("Claude Code's shared credential file was not changed"),
+            "successful native auth must describe the foreign-store boundary"
         );
     }
 }
