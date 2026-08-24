@@ -302,6 +302,49 @@ fn final_claims_require_exact_runtime_and_verifier_receipts() {
 }
 
 #[test]
+fn file_observation_claim_requires_the_exact_fresh_file_read() {
+    let run = test_run();
+    let mut ledger = RealityLedger::new();
+    let read = ledger
+        .observe_file_read(
+            &run,
+            run.project_root().join("Cargo.toml").to_string_lossy(),
+            "[package]\nname = \"openclaudia\"\n",
+            1,
+            2,
+            "package metadata",
+        )
+        .expect("file read");
+    let decision = AgentDecision::Final {
+        claims: vec![FinalClaim::FileObservation {
+            path: "Cargo.toml".to_string(),
+            statement: "The package name is openclaudia.".to_string(),
+            evidence: vec![read],
+        }],
+    };
+    validate_decision(&decision, &ledger, &run).expect("exact fresh file read supports claim");
+
+    let wrong_path = AgentDecision::Final {
+        claims: vec![FinalClaim::FileObservation {
+            path: "src/lib.rs".to_string(),
+            statement: "The package name is openclaudia.".to_string(),
+            evidence: vec![read],
+        }],
+    };
+    let denial =
+        validate_decision(&wrong_path, &ledger, &run).expect_err("wrong file receipt denied");
+    assert!(denial
+        .reason()
+        .contains("not applicable to the exact file read"));
+
+    ledger
+        .mark_file_observations_stale("Cargo.toml")
+        .expect("mark file read stale");
+    let denial = validate_decision(&decision, &ledger, &run).expect_err("stale file read denied");
+    assert!(denial.reason().contains("stale receipt"));
+}
+
+#[test]
 fn arbitrary_shell_command_receipt_is_not_verification() {
     let run = test_run();
     let mut ledger = RealityLedger::new();

@@ -142,7 +142,7 @@ enum Commands {
         force: bool,
     },
 
-    /// Authenticate with Claude Max subscription via OAuth
+    /// Manage the Claude Code login used by Anthropic's supported transport
     Auth {
         /// Show current auth status instead of starting new auth
         #[arg(long)]
@@ -938,6 +938,7 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
     let ChatAuth {
         api_key,
         claude_code_token,
+        claude_agent_sdk,
         codex_responses_auth,
     } = chat_auth;
 
@@ -993,6 +994,7 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         wire_api,
         codex_responses_backend: codex_responses_auth.is_some(),
         claude_code_token,
+        claude_agent_sdk,
         builder_vdd_auth,
         vdd_adversary_auth,
         behavior_mode_override: behavior_mode_explicit.then_some(&behavior_mode),
@@ -1015,6 +1017,7 @@ struct TuiLaunchOptions<'a> {
     wire_api: openclaudia::pipeline::WireApi,
     codex_responses_backend: bool,
     claude_code_token: Option<openclaudia::secrets::OAuthToken>,
+    claude_agent_sdk: Option<openclaudia::claude_agent_sdk::ClaudeAgentSdk>,
     builder_vdd_auth: openclaudia::vdd::VddProviderAuth,
     vdd_adversary_auth: Option<openclaudia::vdd::VddProviderAuth>,
     behavior_mode_override: Option<&'a openclaudia::modes::BehaviorMode>,
@@ -1078,6 +1081,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         wire_api,
         codex_responses_backend,
         claude_code_token,
+        claude_agent_sdk,
         builder_vdd_auth,
         vdd_adversary_auth,
         behavior_mode_override,
@@ -1144,6 +1148,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         wire_api,
         Some(tui_prompt_blocks),
         claude_code_token,
+        claude_agent_sdk,
     );
     app.memory_db = memory_db.map(std::sync::Arc::new);
     guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
@@ -1650,9 +1655,9 @@ fn parse_initial_behavior_mode(
 
 /// Outcome of resolving authentication for a chat session.
 ///
-/// Exactly one of `api_key`, `claude_code_token`, or `codex_responses_auth` is set (or all
-/// `None` when `cmd_chat` has already printed an error and is about to
-/// return). See [`resolve_chat_auth`].
+/// Exactly one transport is set: a provider API key, the supported Claude
+/// Agent SDK, the experimental direct Claude token, or Codex Responses auth.
+/// All are `None` only for local providers. See [`resolve_chat_auth`].
 #[derive(Clone)]
 struct ChatAuth {
     /// Provider API key (newtype — Debug/Display redact).
@@ -1660,26 +1665,27 @@ struct ChatAuth {
     /// Claude Code OAuth Bearer token, when auth came from the
     /// `~/.claude/.credentials.json` store.
     claude_code_token: Option<openclaudia::secrets::OAuthToken>,
+    /// Supported subscription transport through Anthropic's unmodified Agent
+    /// SDK executable. `OpenClaudia` never receives its credential material.
+    claude_agent_sdk: Option<openclaudia::claude_agent_sdk::ClaudeAgentSdk>,
     /// Codex ChatGPT/PAT bearer auth. This must be sent to the Codex
     /// Responses backend, not `OpenAI` Chat Completions.
     codex_responses_auth: Option<openclaudia::codex_credentials::CodexResponsesAuth>,
 }
 
 impl ChatAuth {
+    #[allow(clippy::option_if_let_else)] // Ordered precedence prevents combining incompatible auth modes.
     fn to_vdd_provider_auth(&self) -> openclaudia::vdd::VddProviderAuth {
-        match (
-            self.codex_responses_auth.as_ref(),
-            self.claude_code_token.as_ref(),
-            self.api_key.as_ref(),
-        ) {
-            (Some(auth), _, _) => openclaudia::vdd::VddProviderAuth::codex_responses(auth.clone()),
-            (None, Some(token), _) => {
-                openclaudia::vdd::VddProviderAuth::claude_code_token(token.clone())
-            }
-            (None, None, Some(api_key)) => {
-                openclaudia::vdd::VddProviderAuth::api_key(api_key.clone())
-            }
-            (None, None, None) => openclaudia::vdd::VddProviderAuth::None,
+        if let Some(auth) = self.codex_responses_auth.as_ref() {
+            openclaudia::vdd::VddProviderAuth::codex_responses(auth.clone())
+        } else if let Some(sdk) = self.claude_agent_sdk.as_ref() {
+            openclaudia::vdd::VddProviderAuth::claude_agent_sdk(sdk.clone())
+        } else if let Some(token) = self.claude_code_token.as_ref() {
+            openclaudia::vdd::VddProviderAuth::claude_code_token(token.clone())
+        } else if let Some(api_key) = self.api_key.as_ref() {
+            openclaudia::vdd::VddProviderAuth::api_key(api_key.clone())
+        } else {
+            openclaudia::vdd::VddProviderAuth::None
         }
     }
 }
@@ -1716,7 +1722,8 @@ struct TuiStartupSelections {
 }
 
 enum TuiStartupAuthCandidate {
-    AnthropicClaudeCode,
+    AnthropicAgentSdk,
+    AnthropicExperimentalDirect,
     OpenAi(OpenAiAuthCandidate),
     CurrentProviderApiKey {
         target: String,
@@ -1754,11 +1761,13 @@ impl OpenAiAuthCandidate {
             Self::ApiKey { api_key, .. } => Ok(ChatAuth {
                 api_key: Some(api_key),
                 claude_code_token: None,
+                claude_agent_sdk: None,
                 codex_responses_auth: None,
             }),
             Self::CodexResponses(auth) => Ok(ChatAuth {
                 api_key: None,
                 claude_code_token: None,
+                claude_agent_sdk: None,
                 codex_responses_auth: Some(auth),
             }),
             Self::EnterApiKey => {
@@ -1766,6 +1775,7 @@ impl OpenAiAuthCandidate {
                 Ok(ChatAuth {
                     api_key: Some(api_key),
                     claude_code_token: None,
+                    claude_agent_sdk: None,
                     codex_responses_auth: None,
                 })
             }
@@ -1776,8 +1786,11 @@ impl OpenAiAuthCandidate {
 impl TuiStartupAuthCandidate {
     fn label(&self) -> String {
         match self {
-            Self::AnthropicClaudeCode => {
-                "Use existing provider login: Anthropic via Claude Code".to_string()
+            Self::AnthropicAgentSdk => {
+                "Anthropic subscription via official Claude Agent SDK".to_string()
+            }
+            Self::AnthropicExperimentalDirect => {
+                "EXPERIMENTAL: direct Claude subscription compatibility".to_string()
             }
             Self::OpenAi(candidate) => format!("OpenAI: {}", candidate.label()),
             Self::CurrentProviderApiKey {
@@ -1796,7 +1809,7 @@ impl TuiStartupAuthCandidate {
 
     fn target(&self) -> Option<&str> {
         match self {
-            Self::AnthropicClaudeCode => Some("anthropic"),
+            Self::AnthropicAgentSdk | Self::AnthropicExperimentalDirect => Some("anthropic"),
             Self::OpenAi(_) => Some("openai"),
             Self::CurrentProviderApiKey { target, .. } | Self::CurrentLocalProvider { target } => {
                 Some(target)
@@ -1808,24 +1821,36 @@ impl TuiStartupAuthCandidate {
     fn into_selection(self) -> anyhow::Result<TuiStartupAuthSelection> {
         let target = self.target().map(str::to_string);
         let auth = match self {
-            Self::AnthropicClaudeCode => {
+            Self::AnthropicAgentSdk => ChatAuth {
+                api_key: None,
+                claude_code_token: None,
+                claude_agent_sdk: Some(
+                    openclaudia::claude_agent_sdk::ClaudeAgentSdk::discover()
+                        .map_err(anyhow::Error::new)?,
+                ),
+                codex_responses_auth: None,
+            },
+            Self::AnthropicExperimentalDirect => {
                 let creds = openclaudia::claude_credentials::load_credentials()
                     .map_err(|e| anyhow::anyhow!("Claude Code credentials unusable: {e}"))?;
                 ChatAuth {
                     api_key: None,
                     claude_code_token: Some(creds.access_token),
+                    claude_agent_sdk: None,
                     codex_responses_auth: None,
                 }
             }
             Self::CurrentProviderApiKey { api_key, .. } => ChatAuth {
                 api_key: Some(api_key),
                 claude_code_token: None,
+                claude_agent_sdk: None,
                 codex_responses_auth: None,
             },
             Self::OpenAi(candidate) => candidate.into_chat_auth()?,
             Self::CurrentLocalProvider { .. } => ChatAuth {
                 api_key: None,
                 claude_code_token: None,
+                claude_agent_sdk: None,
                 codex_responses_auth: None,
             },
             Self::EnterProviderApiKey { allowed_targets } => {
@@ -1837,6 +1862,7 @@ impl TuiStartupAuthCandidate {
                     auth: ChatAuth {
                         api_key: Some(api_key),
                         claude_code_token: None,
+                        claude_agent_sdk: None,
                         codex_responses_auth: None,
                     },
                 });
@@ -2261,11 +2287,16 @@ fn collect_tui_startup_vdd_auth_candidates(
     collect_configured_provider_api_key_candidates(config, &mut candidates, Some(chat_target));
 
     if !same_startup_provider("anthropic", chat_target)
+        && openclaudia::claude_agent_sdk::ClaudeAgentSdk::discover().is_ok()
+    {
+        push_unique_startup_candidate(&mut candidates, TuiStartupAuthCandidate::AnthropicAgentSdk);
+    }
+    if !same_startup_provider("anthropic", chat_target)
         && openclaudia::claude_credentials::has_claude_code_credentials()
     {
         push_unique_startup_candidate(
             &mut candidates,
-            TuiStartupAuthCandidate::AnthropicClaudeCode,
+            TuiStartupAuthCandidate::AnthropicExperimentalDirect,
         );
     }
 
@@ -2287,10 +2318,13 @@ fn collect_tui_startup_auth_candidates(config: &config::AppConfig) -> Vec<TuiSta
 
     collect_configured_provider_api_key_candidates(config, &mut candidates, None);
 
+    if openclaudia::claude_agent_sdk::ClaudeAgentSdk::discover().is_ok() {
+        push_unique_startup_candidate(&mut candidates, TuiStartupAuthCandidate::AnthropicAgentSdk);
+    }
     if openclaudia::claude_credentials::has_claude_code_credentials() {
         push_unique_startup_candidate(
             &mut candidates,
-            TuiStartupAuthCandidate::AnthropicClaudeCode,
+            TuiStartupAuthCandidate::AnthropicExperimentalDirect,
         );
     }
 
@@ -2523,9 +2557,10 @@ fn resolve_openai_chat_auth(
 /// Resolve which authentication mechanism the chat session should use.
 ///
 /// Priority for Anthropic:
-///  1. Claude Code credentials (`~/.claude/.credentials.json`) — zero
-///     config, uses the active subscription.
-///  2. API key from provider config / env.
+///  1. Explicit provider API key.
+///  2. Anthropic's unmodified Agent SDK executable with its owned login.
+///  3. The direct subscription experiment only when both compile-time and
+///     runtime acknowledgement gates are active.
 ///
 /// Returns `Ok(None)` when authentication is impossible AND
 /// `cmd_chat` should exit cleanly — each such branch prints a
@@ -2537,34 +2572,51 @@ async fn resolve_chat_auth(
     provider: &openclaudia::config::ProviderConfig,
     selection_mode: ChatAuthSelectionMode,
 ) -> anyhow::Result<Option<ChatAuth>> {
-    // Anthropic / no API-key branch: try Claude Code first.
+    // Anthropic / no API-key branch: an explicit legacy acknowledgement wins
+    // so the research path remains testable; otherwise use the supported SDK.
     if target.eq_ignore_ascii_case("anthropic") && provider.api_key.is_none() {
-        if !openclaudia::claude_credentials::has_claude_code_credentials() {
-            eprintln!("No API key configured for Anthropic.");
-            eprintln!("Install Claude Code and run `claude auth login`, or set ANTHROPIC_API_KEY.");
-            return Ok(None);
-        }
-        match openclaudia::claude_credentials::load_credentials() {
-            Ok(creds) => {
-                eprintln!(
-                    "✓ Authenticated via Claude Code ({}, {})",
-                    creds.subscription_type.as_deref().unwrap_or("unknown"),
-                    creds.rate_limit_tier.as_deref().unwrap_or("default"),
-                );
-                return Ok(Some(ChatAuth {
-                    api_key: None,
-                    claude_code_token: Some(creds.access_token),
-                    codex_responses_auth: None,
-                }));
-            }
-            Err(e) => {
-                eprintln!("Error: Claude Code credentials unusable: {e}");
-                eprintln!(
-                    "Install Claude Code and run `claude` to log in, or set ANTHROPIC_API_KEY."
-                );
-                return Ok(None);
+        if openclaudia::claude_credentials::experimental_direct_subscription_enabled() {
+            match openclaudia::claude_credentials::load_credentials() {
+                Ok(creds) => {
+                    eprintln!(
+                        "⚠ EXPERIMENTAL direct Claude subscription protocol active ({}, {})",
+                        creds.subscription_type.as_deref().unwrap_or("unknown"),
+                        creds.rate_limit_tier.as_deref().unwrap_or("default"),
+                    );
+                    return Ok(Some(ChatAuth {
+                        api_key: None,
+                        claude_code_token: Some(creds.access_token),
+                        claude_agent_sdk: None,
+                        codex_responses_auth: None,
+                    }));
+                }
+                Err(error) => {
+                    eprintln!("Experimental direct Claude credentials unusable: {error}");
+                    return Ok(None);
+                }
             }
         }
+
+        match openclaudia::claude_agent_sdk::ClaudeAgentSdk::discover() {
+            Ok(sdk) => match sdk.require_authenticated().await {
+                Ok(()) => {
+                    eprintln!("✓ Authenticated via official Claude Agent SDK");
+                    return Ok(Some(ChatAuth {
+                        api_key: None,
+                        claude_code_token: None,
+                        claude_agent_sdk: Some(sdk),
+                        codex_responses_auth: None,
+                    }));
+                }
+                Err(error) => {
+                    eprintln!("Claude Agent SDK login unavailable: {error}");
+                }
+            },
+            Err(error) => eprintln!("Claude Agent SDK unavailable: {error}"),
+        }
+        eprintln!("No API key configured for Anthropic.");
+        eprintln!("Install Claude Code and run `claude auth login`, or set ANTHROPIC_API_KEY.");
+        return Ok(None);
     }
 
     if target.eq_ignore_ascii_case("openai") {
@@ -2575,6 +2627,7 @@ async fn resolve_chat_auth(
         return Ok(Some(ChatAuth {
             api_key: Some(k.clone()),
             claude_code_token: None,
+            claude_agent_sdk: None,
             codex_responses_auth: None,
         }));
     }
@@ -2583,6 +2636,7 @@ async fn resolve_chat_auth(
         return Ok(Some(ChatAuth {
             api_key: None,
             claude_code_token: None,
+            claude_agent_sdk: None,
             codex_responses_auth: None,
         }));
     }
@@ -2703,10 +2757,11 @@ fn build_chat_endpoint_and_headers(
     adapter: &dyn openclaudia::providers::ProviderAdapter,
     api_key: Option<&openclaudia::providers::ApiKey>,
     claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
-) -> (String, openclaudia::secrets::SensitiveHeaders) {
+) -> Result<(String, openclaudia::secrets::SensitiveHeaders), String> {
     let _ = target; // used only for documentation clarity; routing is on claude_code_token
     let endpoint = if claude_code_token.is_some() {
         openclaudia::claude_credentials::get_oauth_endpoint(model)
+            .map_err(|error| error.to_string())?
     } else {
         format!(
             "{}{}",
@@ -2715,17 +2770,17 @@ fn build_chat_endpoint_and_headers(
         )
     };
 
-    let mut headers = claude_code_token.map_or_else(
-        || {
-            api_key.map_or_else(openclaudia::secrets::SensitiveHeaders::new, |key| {
-                adapter.get_headers(key)
-            })
-        },
-        openclaudia::claude_credentials::get_oauth_headers,
-    );
+    let mut headers = if let Some(token) = claude_code_token {
+        openclaudia::claude_credentials::get_oauth_headers(token)
+            .map_err(|error| error.to_string())?
+    } else {
+        api_key.map_or_else(openclaudia::secrets::SensitiveHeaders::new, |key| {
+            adapter.get_headers(key)
+        })
+    };
     // Merge in any custom headers from provider config
     headers.extend(&provider.headers);
-    (endpoint, headers)
+    Ok((endpoint, headers))
 }
 
 async fn cmd_chat(args: cli::chat_repl::ChatReplArgs) -> anyhow::Result<()> {
@@ -3191,6 +3246,7 @@ mod tests {
         let auth = ChatAuth {
             api_key: Some(api_key.clone()),
             claude_code_token: None,
+            claude_agent_sdk: None,
             codex_responses_auth: None,
         };
 

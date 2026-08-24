@@ -10,16 +10,47 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
+#![cfg(feature = "experimental-claude-subscription-auth")]
 
 use openclaudia::claude_credentials::{
-    claude_code_beta_header_value, get_oauth_endpoint, get_oauth_headers, inject_oauth_prefix_only,
-    strip_cache_control_ttl, ClaudeAiOauth, CredentialsFile, CLAUDE_CODE_SYSTEM_PROMPT,
+    claude_code_beta_header_value as direct_beta_header_value,
+    get_oauth_endpoint as direct_oauth_endpoint, get_oauth_headers as direct_oauth_headers,
+    inject_oauth_prefix_only as direct_inject_oauth_prefix_only, strip_cache_control_ttl,
+    ClaudeAiOauth, CredentialsFile, CLAUDE_CODE_SYSTEM_PROMPT,
+    EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK, EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV,
 };
 use openclaudia::secrets::OAuthToken;
 use serde_json::json;
 
 fn token(value: &str) -> OAuthToken {
     OAuthToken::try_from_string(value.to_string()).expect("valid token")
+}
+
+fn enable_direct_experiment() {
+    std::env::set_var(
+        EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV,
+        EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK,
+    );
+}
+
+fn claude_code_beta_header_value() -> String {
+    enable_direct_experiment();
+    direct_beta_header_value().expect("experimental beta header")
+}
+
+fn get_oauth_headers(token: &OAuthToken) -> openclaudia::secrets::SensitiveHeaders {
+    enable_direct_experiment();
+    direct_oauth_headers(token).expect("experimental OAuth headers")
+}
+
+fn get_oauth_endpoint(model: &str) -> String {
+    enable_direct_experiment();
+    direct_oauth_endpoint(model).expect("experimental OAuth endpoint")
+}
+
+fn inject_oauth_prefix_only(request: &mut serde_json::Value) {
+    enable_direct_experiment();
+    direct_inject_oauth_prefix_only(request).expect("experimental OAuth prefix");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

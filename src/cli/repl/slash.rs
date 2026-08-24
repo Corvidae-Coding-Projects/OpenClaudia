@@ -1465,6 +1465,17 @@ pub fn slash_context(messages: &[serde_json::Value], current_model: &str) -> Sla
 }
 
 pub fn slash_login() -> SlashCommandResult {
+    if !openclaudia::claude_credentials::experimental_direct_subscription_enabled() {
+        println!("\nClaude authentication is owned by the Claude Code executable.");
+        println!("  Log in:  claude auth login");
+        println!("  Status:  openclaudia auth --status");
+        println!("  Logout:  openclaudia auth --logout");
+        println!("  OpenClaudia does not read or rewrite Claude Code's credential file.");
+        println!();
+        return SlashCommandResult::Handled;
+    }
+
+    println!("\n⚠ Experimental direct Claude subscription compatibility is enabled.");
     match openclaudia::claude_credentials::peek_credentials() {
         Ok(Some(status)) => {
             println!("\n✓ Authenticated via Claude Code credentials.");

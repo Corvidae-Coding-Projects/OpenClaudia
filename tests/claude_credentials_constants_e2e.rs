@@ -14,9 +14,11 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+use openclaudia::claude_credentials::{strip_cache_control_ttl, ClaudeAiOauth, CredentialsFile};
+#[cfg(feature = "experimental-claude-subscription-auth")]
 use openclaudia::claude_credentials::{
-    strip_cache_control_ttl, ClaudeAiOauth, CredentialsFile, CLAUDE_CODE_BETA_HEADER,
-    FINE_GRAINED_TOOL_STREAMING_BETA, INTERLEAVED_THINKING_BETA, OAUTH_BETA_HEADER,
+    CLAUDE_CODE_BETA_HEADER, FINE_GRAINED_TOOL_STREAMING_BETA, INTERLEAVED_THINKING_BETA,
+    OAUTH_BETA_HEADER,
 };
 use openclaudia::secrets::OAuthToken;
 use serde_json::json;
@@ -29,21 +31,25 @@ fn token(value: &str) -> OAuthToken {
 // Section A — Versioned beta-header constants
 // ───────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn oauth_beta_header_constant_matches_documented_version() {
     assert_eq!(OAUTH_BETA_HEADER, "oauth-2025-04-20");
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn claude_code_beta_header_constant_matches_documented_version() {
     assert_eq!(CLAUDE_CODE_BETA_HEADER, "claude-code-20250219");
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn interleaved_thinking_beta_constant_matches_documented_version() {
     assert_eq!(INTERLEAVED_THINKING_BETA, "interleaved-thinking-2025-05-14");
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn fine_grained_tool_streaming_beta_constant_matches_documented_version() {
     assert_eq!(
@@ -52,6 +58,7 @@ fn fine_grained_tool_streaming_beta_constant_matches_documented_version() {
     );
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn beta_constants_are_pairwise_distinct() {
     let consts = [
@@ -66,6 +73,7 @@ fn beta_constants_are_pairwise_distinct() {
     assert_eq!(sorted.len(), consts.len());
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn beta_constants_use_iso_date_suffix() {
     // Documented pattern: <feature>-YYYY-MM-DD.

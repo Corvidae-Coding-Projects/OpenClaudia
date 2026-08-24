@@ -74,6 +74,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Filesystem
 dirs = "6"
+tempfile = "3"
 
 # Absolute-path resolution for trusted binaries (e.g. the `git` plugin
 # helper). Resolves once at first use via PATH lookup and caches the
@@ -191,9 +192,9 @@ similar = { version = "3", features = ["inline"] }
 [features]
 default = []
 browser = ["headless_chrome", "scraper"]
+experimental-claude-subscription-auth = []
 
 [dev-dependencies]
-tempfile = "3"
 wiremock = "0.6"
 # `#[tokio::test(start_paused = true)]` relies on Tokio's test clock. Keep
 # that capability explicit and dev-only instead of obtaining it through an

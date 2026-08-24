@@ -563,7 +563,8 @@ fn build_anthropic_request_with_tools(
     }
 
     if claude_code_token.is_some() {
-        crate::claude_credentials::inject_oauth_prefix_only(&mut req);
+        crate::claude_credentials::inject_oauth_prefix_only(&mut req)
+            .map_err(|error| error.to_string())?;
     }
 
     // Apply effort level. `high` / `max` switch Anthropic into thinking mode.
@@ -1497,6 +1498,7 @@ pub fn resolve_endpoint_for_wire(
         format!("{}/responses", normalize_base_url(base_url))
     } else if claude_code_token.is_some() {
         crate::claude_credentials::get_oauth_endpoint(model)
+            .map_err(|error| crate::providers::ProviderError::Unsupported(error.to_string()))?
     } else {
         let adapter = get_adapter(provider)?;
         format!(
@@ -1532,6 +1534,7 @@ pub fn resolve_headers(
 ) -> Result<crate::secrets::SensitiveHeaders, crate::providers::ProviderError> {
     let mut headers = if let Some(token) = claude_code_token {
         crate::claude_credentials::get_oauth_headers(token)
+            .map_err(|error| crate::providers::ProviderError::Unsupported(error.to_string()))?
     } else if let Some(key) = api_key {
         let adapter = get_adapter(provider)?;
         adapter.get_headers(key)
@@ -1551,6 +1554,12 @@ pub struct RunTurnParams<'a> {
     pub client: &'a reqwest::Client,
     pub endpoint: &'a str,
     pub headers: &'a crate::secrets::SensitiveHeaders,
+    /// Supported subscription transport owned by Anthropic's unmodified
+    /// executable. When present, no provider HTTP request is made here.
+    pub claude_agent_sdk: Option<&'a crate::claude_agent_sdk::ClaudeAgentSdk>,
+    /// Provider reasoning effort forwarded to transports that expose it
+    /// outside the request body (currently the Claude Agent SDK).
+    pub effort_level: &'a str,
     pub request_body: &'a Value,
     pub provider: &'a str,
     pub model_identity: &'a str,
@@ -1845,6 +1854,8 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         client,
         endpoint,
         headers,
+        claude_agent_sdk,
+        effort_level,
         request_body,
         provider,
         model_identity,
@@ -1876,6 +1887,61 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         crate::codex_credentials::finalize_chatgpt_responses_request(&mut request_body);
     }
     trace_run_turn_request(endpoint, &request_body);
+
+    if let Some(sdk) = claude_agent_sdk {
+        let sdk_turn = match sdk.complete_turn(&request_body, effort_level).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    format!(
+                        "Claude Agent SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                    )
+                })?;
+                return Err(format!("Claude Agent SDK request failed: {error}"));
+            }
+        };
+        provider_budget
+            .reconcile(&sdk_turn.usage)
+            .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
+        if !sdk_turn.content.is_empty() {
+            tx.send(AppEvent::StreamText(sdk_turn.content.clone()))
+                .map_err(|_| {
+                    "API event receiver closed during Claude Agent SDK turn".to_string()
+                })?;
+        }
+        let terminal_outcome = if sdk_turn.tool_calls.is_empty() {
+            ProviderTerminalOutcome::Completed
+        } else {
+            ProviderTerminalOutcome::ToolCalls
+        };
+        ensure_provider_turn_succeeded(terminal_outcome, sdk_turn.tool_calls.len())?;
+        let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+            run_context,
+            &sdk_turn.tool_calls,
+            memory_db,
+            app_config,
+            permission_mgr,
+            transient_allowed_tool_rules,
+            hook_engine,
+            policy_enforcer,
+            task_mgr,
+            session_id.as_deref(),
+            model_identity,
+            &tx,
+        )
+        .await;
+        return Ok(TurnResult {
+            content: sdk_turn.content,
+            reasoning_content: None,
+            tool_calls: sdk_turn.tool_calls,
+            tool_results,
+            usage: sdk_turn.usage,
+            needs_followup,
+            terminal_outcome,
+            finish_reason: None,
+            provider_native_state: None,
+        });
+    }
 
     let response =
         match send_with_retry(&run_context, client, endpoint, headers, &request_body, &tx).await {

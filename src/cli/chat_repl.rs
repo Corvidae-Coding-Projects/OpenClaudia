@@ -571,8 +571,14 @@ impl ChatRepl {
         let ChatAuth {
             api_key,
             claude_code_token,
+            claude_agent_sdk,
             codex_responses_auth: _,
         } = resolve_repl_chat_auth(&config, provider).await?;
+        if claude_agent_sdk.is_some() {
+            anyhow::bail!(
+                "the legacy --tui-mode REPL does not own the supported Claude Agent SDK loop; use the default TUI or --print"
+            );
+        }
 
         let model = resolve_model_name(
             args.model_override,
@@ -946,14 +952,22 @@ impl ChatRepl {
                 return Ok(Some(false));
             }
         };
-        let (endpoint, headers) = build_chat_endpoint_and_headers(
+        let (endpoint, headers) = match build_chat_endpoint_and_headers(
             &self.config.proxy.target,
             &self.model,
             provider,
             self.adapter,
             self.api_key.as_ref(),
             self.claude_code_token.as_ref(),
-        );
+        ) {
+            Ok(transport) => transport,
+            Err(error) => {
+                self.clear_transient_prompt_options();
+                eprintln!("\n\x1b[31mRequest authentication error: {error}\x1b[0m");
+                self.record_failed_turn(&error);
+                return Ok(Some(false));
+            }
+        };
 
         let transport = TurnTransport {
             endpoint: &endpoint,
@@ -3349,7 +3363,8 @@ impl ChatRepl {
         });
         followup_req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
         if self.claude_code_token.is_some() {
-            openclaudia::claude_credentials::inject_oauth_prefix_only(&mut followup_req);
+            openclaudia::claude_credentials::inject_oauth_prefix_only(&mut followup_req)
+                .map_err(|error| error.to_string())?;
         }
         self.apply_provider_native_state_to_followup(&mut followup_req)?;
         Ok(followup_req)

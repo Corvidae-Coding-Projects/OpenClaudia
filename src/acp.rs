@@ -144,6 +144,9 @@ pub struct AcpServer {
     /// translators, while the ACP loop selects OAuth headers/endpoints above
     /// that layer.
     claude_code_token: Option<crate::secrets::OAuthToken>,
+    /// Supported subscription transport through Anthropic's pinned executable.
+    /// Credentials remain owned by that executable and never enter ACP state.
+    claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
     /// Codex ChatGPT/PAT authentication selects the `OpenAI` Responses wire
     /// protocol without copying credentials into conversation state.
     codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
@@ -915,11 +918,15 @@ impl AcpServer {
     ///
     /// Returns an error when the launch workspace or startup grants cannot be
     /// bound into an immutable run capability.
+    // The distinct credential carriers select different wire protocols and are
+    // deliberately never collapsed into a generic secret.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: AppConfig,
         model: String,
         api_key: Option<crate::providers::ApiKey>,
         claude_code_token: Option<crate::secrets::OAuthToken>,
+        claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
         codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
         stdout_tx: mpsc::UnboundedSender<String>,
         launch_root: std::path::PathBuf,
@@ -931,6 +938,7 @@ impl AcpServer {
             model,
             api_key,
             claude_code_token,
+            claude_agent_sdk,
             codex_responses_auth,
             stdout_tx,
             launch_root,
@@ -944,6 +952,7 @@ impl AcpServer {
         model: String,
         api_key: Option<crate::providers::ApiKey>,
         claude_code_token: Option<crate::secrets::OAuthToken>,
+        claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
         codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
         stdout_tx: mpsc::UnboundedSender<String>,
         launch_root: std::path::PathBuf,
@@ -1008,6 +1017,7 @@ impl AcpServer {
             model,
             api_key,
             claude_code_token,
+            claude_agent_sdk,
             codex_responses_auth,
             provider_native_state: None,
             active_conversation_acp_session_id: None,
@@ -1882,7 +1892,14 @@ impl AcpServer {
             if claude_code_token.is_some()
                 && self.config.proxy.target.eq_ignore_ascii_case("anthropic")
             {
-                crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
+                if let Err(error) =
+                    crate::claude_credentials::inject_oauth_prefix_only(&mut transformed)
+                {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Provider authentication error: {error}"),
+                    );
+                }
             }
             let endpoint_base = if wire_api.is_responses() {
                 crate::codex_credentials::CODEX_CHATGPT_BASE_URL
@@ -1954,128 +1971,184 @@ impl AcpServer {
                 crate::codex_credentials::finalize_chatgpt_responses_request(&mut transformed);
             }
 
-            let req = match headers.apply(client.post(&endpoint).json(&transformed)) {
-                Ok(request) => request,
-                Err(error) => {
+            let (stream_result, next_provider_native_state) = if let Some(sdk) =
+                self.claude_agent_sdk.as_ref()
+            {
+                debug!(
+                    iteration,
+                    "Sending provider request through Claude Agent SDK"
+                );
+                let turn = match sdk
+                    .complete_turn(
+                        &transformed,
+                        thinking.reasoning_effort.as_deref().unwrap_or("medium"),
+                    )
+                    .await
+                {
+                    Ok(turn) => turn,
+                    Err(error) => {
+                        if let Err(budget_error) = provider_budget.finish_unknown() {
+                            return self.fail_prompt_with_update(
+                                    acp_session_id,
+                                    &format!(
+                                        "Claude Agent SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                                    ),
+                                );
+                        }
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Claude Agent SDK request failed: {error}"),
+                        );
+                    }
+                };
+                if let Err(error) = provider_budget.reconcile(&turn.usage) {
                     return self.fail_prompt_with_update(
                         acp_session_id,
-                        &format!("Provider header error: {error}"),
+                        &format!("Provider budget reconciliation failed: {error}"),
                     );
                 }
-            };
-
-            // Send request
-            debug!(iteration, "Sending provider request");
-            let response = match crate::provider_transport::send(req).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return self
-                        .fail_prompt_with_update(acp_session_id, &format!("Request failed: {e}"));
-                }
-            };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let body = crate::secrets::read_bounded_diagnostic_body(response)
-                    .await
-                    .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
-                let error_msg = if content_type.contains("text/html") {
-                    format!("Error {status}: (HTML response — check provider configuration)")
+                let terminal = if turn.tool_calls.is_empty() {
+                    crate::pipeline::ProviderTerminalOutcome::Completed
                 } else {
-                    format!("Error {status}: {}", headers.sanitize_diagnostic(&body))
+                    crate::pipeline::ProviderTerminalOutcome::ToolCalls
                 };
-                self.send_session_update(
-                    acp_session_id,
-                    "agent_message_chunk",
-                    &json!({"type": "text", "text": error_msg}),
-                );
-                self.record_failed_prompt_turn(&error_msg);
-                return "error".to_string();
-            }
-
-            // Decode stateful protocols through their canonical terminal
-            // validators before ACP dispatches any projected tool call.
-            let (stream_result, next_provider_native_state) = if wire_api.is_responses() {
-                let decoded = match crate::pipeline::decode_openai_responses_stream(
-                    crate::pipeline::OpenAiResponsesStreamParams {
-                        response,
-                        headers: &headers,
-                        provider: &self.config.proxy.target,
-                        model_identity: &self.model,
-                        provider_native_state: self.provider_native_state.as_ref(),
-                        assistant_message_ordinal,
-                    },
-                    |_| Ok(()),
-                    |_| Ok(()),
-                    |_, _| Ok(()),
-                )
-                .await
-                {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        return self.fail_prompt_with_update(
-                            acp_session_id,
-                            &format!("Provider stream error: {error}"),
-                        );
-                    }
-                };
-                let (stream_result, state) = acp_responses_stream_result(decoded);
-                (stream_result, Some(state))
-            } else if uses_native_json {
-                let native_json = match crate::provider_transport::read_json_capped::<Value>(
-                    response,
-                    crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        return self.fail_prompt_with_update(
-                            acp_session_id,
-                            &format!("Provider JSON error: {error}"),
-                        );
-                    }
-                };
-                let decoded = match crate::pipeline::decode_provider_native_json_turn(
-                    &self.config.proxy.target,
-                    &self.model,
-                    &native_json,
-                    self.provider_native_state.as_ref(),
-                    assistant_message_ordinal,
-                ) {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        return self.fail_prompt_with_update(
-                            acp_session_id,
-                            &format!(
-                                "Provider response error: {}",
-                                headers.sanitize_diagnostic(&error)
-                            ),
-                        );
-                    }
-                };
-                let (stream_result, state) = acp_native_json_stream_result(decoded);
-                (stream_result, Some(state))
+                let tool_calls = turn
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| AccumulatedToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect();
+                (finish_acp_stream(turn.content, tool_calls, terminal), None)
             } else {
-                (
-                    self.stream_provider_response(acp_session_id, response)
-                        .await,
-                    None,
-                )
-            };
+                let req = match headers.apply(client.post(&endpoint).json(&transformed)) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider header error: {error}"),
+                        );
+                    }
+                };
 
-            if let Err(error) = provider_budget.finish_unknown() {
-                return self.fail_prompt_with_update(
-                    acp_session_id,
-                    &format!("Provider budget reconciliation failed: {error}"),
-                );
-            }
+                // Send request
+                debug!(iteration, "Sending provider request");
+                let response = match crate::provider_transport::send(req).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Request failed: {e}"),
+                        );
+                    }
+                };
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let body = crate::secrets::read_bounded_diagnostic_body(response)
+                        .await
+                        .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+                    let error_msg = if content_type.contains("text/html") {
+                        format!("Error {status}: (HTML response — check provider configuration)")
+                    } else {
+                        format!("Error {status}: {}", headers.sanitize_diagnostic(&body))
+                    };
+                    self.send_session_update(
+                        acp_session_id,
+                        "agent_message_chunk",
+                        &json!({"type": "text", "text": error_msg}),
+                    );
+                    self.record_failed_prompt_turn(&error_msg);
+                    return "error".to_string();
+                }
+
+                // Decode stateful protocols through their canonical terminal
+                // validators before ACP dispatches any projected tool call.
+                let decoded = if wire_api.is_responses() {
+                    let decoded = match crate::pipeline::decode_openai_responses_stream(
+                        crate::pipeline::OpenAiResponsesStreamParams {
+                            response,
+                            headers: &headers,
+                            provider: &self.config.proxy.target,
+                            model_identity: &self.model,
+                            provider_native_state: self.provider_native_state.as_ref(),
+                            assistant_message_ordinal,
+                        },
+                        |_| Ok(()),
+                        |_| Ok(()),
+                        |_, _| Ok(()),
+                    )
+                    .await
+                    {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!("Provider stream error: {error}"),
+                            );
+                        }
+                    };
+                    let (stream_result, state) = acp_responses_stream_result(decoded);
+                    (stream_result, Some(state))
+                } else if uses_native_json {
+                    let native_json = match crate::provider_transport::read_json_capped::<Value>(
+                        response,
+                        crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!("Provider JSON error: {error}"),
+                            );
+                        }
+                    };
+                    let decoded = match crate::pipeline::decode_provider_native_json_turn(
+                        &self.config.proxy.target,
+                        &self.model,
+                        &native_json,
+                        self.provider_native_state.as_ref(),
+                        assistant_message_ordinal,
+                    ) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!(
+                                    "Provider response error: {}",
+                                    headers.sanitize_diagnostic(&error)
+                                ),
+                            );
+                        }
+                    };
+                    let (stream_result, state) = acp_native_json_stream_result(decoded);
+                    (stream_result, Some(state))
+                } else {
+                    (
+                        self.stream_provider_response(acp_session_id, response)
+                            .await,
+                        None,
+                    )
+                };
+
+                if let Err(error) = provider_budget.finish_unknown() {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Provider budget reconciliation failed: {error}"),
+                    );
+                }
+                decoded
+            };
 
             match stream_result {
                 StreamResult::EndTurn { content } => {
@@ -3587,6 +3660,7 @@ pub async fn run_acp_server(
     model: String,
     api_key: Option<crate::providers::ApiKey>,
     claude_code_token: Option<crate::secrets::OAuthToken>,
+    claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
     codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
 ) -> Result<()> {
     let launch_root = std::env::current_dir()
@@ -3615,6 +3689,7 @@ pub async fn run_acp_server(
         model,
         api_key,
         claude_code_token,
+        claude_agent_sdk,
         codex_responses_auth,
         stdout_tx,
         launch_root,
@@ -4748,6 +4823,7 @@ memory:
             model: "local-model".to_string(),
             api_key: None,
             claude_code_token: None,
+            claude_agent_sdk: None,
             codex_responses_auth: None,
             provider_native_state: None,
             active_conversation_acp_session_id: None,
@@ -4910,6 +4986,7 @@ memory:
         let server = AcpServer::new_with_host_home(
             config,
             "local-model".to_string(),
+            None,
             None,
             None,
             None,

@@ -1,7 +1,12 @@
-//! OAuth 2.0 Device Flow Authentication for Claude Max subscriptions
+//! Experimental OAuth 2.0 Device Flow Authentication for Claude subscriptions.
 //!
-//! Enables `OpenClaudia` to authenticate using Claude Pro/Max subscriptions
-//! via OAuth 2.0 device authorization flow with PKCE.
+//! This direct protocol implementation is unsupported by Anthropic and is not
+//! part of `OpenClaudia`'s default subscription-authentication path. Operational
+//! entry points require both the `experimental-claude-subscription-auth` Cargo
+//! feature and the exact runtime acknowledgement documented by
+//! [`crate::claude_credentials::experimental_direct_subscription_enabled`].
+//! The supported default delegates authentication and transport ownership to
+//! Anthropic's unmodified `claude` executable.
 //!
 //! ## Flow Overview
 //! 1. Generate PKCE challenge and authorization URL
@@ -1403,7 +1408,9 @@ impl OAuthClient {
     /// initialize or the fixed OAuth endpoints fail validation. Without the
     /// `Claude Code/1.0` User-Agent the Anthropic OAuth endpoint rejects all
     /// token exchanges, so initialization must fail explicitly.
-    pub fn new() -> Result<Self, crate::provider_transport::ProviderTransportError> {
+    pub fn new() -> Result<Self> {
+        crate::claude_credentials::require_experimental_direct_subscription()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         crate::provider_transport::validate_endpoint("anthropic", TOKEN_ENDPOINT)?;
         crate::provider_transport::validate_endpoint("anthropic", API_KEY_ENDPOINT)?;
         let http = crate::provider_transport::client_with_user_agent("Claude Code/1.0")?;

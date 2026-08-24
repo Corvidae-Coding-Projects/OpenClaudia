@@ -83,7 +83,7 @@ IDs are stable references, not execution order. Dependencies are authoritative. 
 |---|---|---|---|---|
 | [S-025 — Keep secrets typed and redacted end to end](./025-end-to-end-secret-types-and-redaction.md) | Medium | F-015, F-022, F-034, F-079 | W3, W14, W18 | None |
 | [S-026 — Stop mutating the shared Claude credential store](./026-claude-credential-store-read-only.md) | Small | F-080 | W3, W15 | S-025, S-031 |
-| [S-027 — Replace Anthropic client impersonation](./027-supported-anthropic-authentication.md) | Medium | F-081 | W3 | S-025 |
+| [S-027 — Isolate Anthropic subscription compatibility](./027-supported-anthropic-authentication.md) | Medium | F-081 | W3 | S-025 |
 | [S-028 — Verify Codex account and compliance metadata](./028-verified-codex-auth-metadata.md) | Small | F-082 | W3 | S-025 |
 | [S-029 — Implement a complete OAuth session lifecycle](./029-oauth-session-lifecycle.md) | Medium | F-095 | W3, W15 | S-025, S-031, S-048 |
 | [S-030 — Make interactive API-key setup secret safe](./030-safe-interactive-api-key-setup.md) | Small | F-111 | W3, W14, W15 | S-025, S-031 |
@@ -285,7 +285,7 @@ IDs are stable references, not execution order. Dependencies are authoritative. 
 | F-078 | [S-057 — Replace lossy compaction with causal checkpoints](./057-causal-compaction-checkpoints.md) |
 | F-079 | [S-025 — Keep secrets typed and redacted end to end](./025-end-to-end-secret-types-and-redaction.md) |
 | F-080 | [S-026 — Stop mutating the shared Claude credential store](./026-claude-credential-store-read-only.md) |
-| F-081 | [S-027 — Replace Anthropic client impersonation](./027-supported-anthropic-authentication.md) |
+| F-081 | [S-027 — Isolate Anthropic subscription compatibility](./027-supported-anthropic-authentication.md) |
 | F-082 | [S-028 — Verify Codex account and compliance metadata](./028-verified-codex-auth-metadata.md) |
 | F-083 | [S-031 — Build descriptor-safe persistent storage](./031-descriptor-safe-persistence.md) |
 | F-084 | [S-021 — Make blast-radius guardrails atomic and run scoped](./021-run-scoped-blast-radius-guardrails.md) |

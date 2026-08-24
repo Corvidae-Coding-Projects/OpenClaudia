@@ -1,4 +1,6 @@
+use openclaudia::oauth::{parse_auth_code, OAuthClient, OAuthStore, PkceParams};
 use openclaudia::tools::safe_truncate;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,14 +134,17 @@ fn open_native_oauth_session_file(path: &Path) -> Result<Option<std::fs::File>, 
 }
 
 #[allow(clippy::too_many_lines)]
-/// Authenticate with Claude Max subscription via OAuth
+/// Manage Claude Code authentication, or the explicitly enabled experimental flow.
 pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
-    use openclaudia::oauth::{parse_auth_code, OAuthClient, OAuthStore, PkceParams};
-    use std::io::{self, IsTerminal, Write};
-
     if status && logout {
         anyhow::bail!("auth --status and --logout cannot be used together");
     }
+
+    if !openclaudia::claude_credentials::experimental_direct_subscription_enabled() {
+        return run_supported_claude_auth(status, logout).await;
+    }
+
+    eprintln!("⚠ Running the explicitly acknowledged experimental direct Claude subscription flow");
 
     let store = OAuthStore::new();
 
@@ -334,6 +339,32 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
     println!("\nYour native OAuth session has been saved.");
     println!("Claude Code login compatibility continues to use Claude Code's own store.");
 
+    Ok(())
+}
+
+async fn run_supported_claude_auth(status: bool, logout: bool) -> anyhow::Result<()> {
+    let sdk =
+        openclaudia::claude_agent_sdk::ClaudeAgentSdk::discover().map_err(anyhow::Error::new)?;
+    let action = if status {
+        "status"
+    } else if logout {
+        "logout"
+    } else {
+        "login"
+    };
+    let result = tokio::process::Command::new(sdk.binary())
+        .args(["auth", action])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .map_err(|error| anyhow::anyhow!("could not run `claude auth {action}`: {error}"))?;
+    if !result.success() {
+        anyhow::bail!("`claude auth {action}` exited with {result}");
+    }
     Ok(())
 }
 

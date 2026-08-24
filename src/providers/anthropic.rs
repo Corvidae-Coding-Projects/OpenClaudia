@@ -609,18 +609,23 @@ impl AnthropicAdapter {
     /// `proxy::proxy_anthropic_messages` — every Anthropic-specific header
     /// literal now lives in one place. See crosslink #338.
     ///
+    /// # Errors
+    /// Returns an error unless the legacy protocol was compiled and explicitly
+    /// acknowledged for this process.
+    ///
     /// # Panics
-    /// Panics only if a compile-time Anthropic header literal becomes invalid.
-    #[must_use]
+    /// Panics only if a compile-time Anthropic header literal is invalid.
     pub fn oauth_headers(
         bearer_token: &crate::secrets::OAuthToken,
-    ) -> crate::secrets::SensitiveHeaders {
+    ) -> Result<crate::secrets::SensitiveHeaders, crate::claude_credentials::ClaudeCredentialError>
+    {
+        crate::claude_credentials::require_experimental_direct_subscription()?;
         let mut headers = crate::secrets::SensitiveHeaders::new();
         headers.insert_header_bearer(reqwest::header::AUTHORIZATION, bearer_token.secret());
         headers
             .insert_literal(
                 "anthropic-beta",
-                crate::claude_credentials::claude_code_beta_header_value(),
+                crate::claude_credentials::claude_code_beta_header_value()?,
             )
             .expect("canonical Anthropic beta header must be valid");
         headers.insert_static_literal(
@@ -628,7 +633,7 @@ impl AnthropicAdapter {
             "2023-06-01",
         );
         headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
-        headers
+        Ok(headers)
     }
 }
 
@@ -1820,11 +1825,16 @@ mod tests {
 
     // --- Regression tests for crosslink #338 ---
 
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn oauth_headers_contains_all_required_fields() {
+        std::env::set_var(
+            crate::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV,
+            crate::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK,
+        );
         let token =
             crate::secrets::OAuthToken::try_from_string("access-xyz".to_string()).expect("token");
-        let h = AnthropicAdapter::oauth_headers(&token);
+        let h = AnthropicAdapter::oauth_headers(&token).expect("experimental headers");
         assert!(h.contains_name("authorization"));
         assert!(h.contains_name("anthropic-beta"));
         assert!(h.contains_name("anthropic-version"));
@@ -1833,6 +1843,7 @@ mod tests {
         assert!(h.matches_value(
             "anthropic-beta",
             &crate::claude_credentials::claude_code_beta_header_value()
+                .expect("experimental beta value")
         ));
     }
 

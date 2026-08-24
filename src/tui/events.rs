@@ -86,6 +86,9 @@ pub struct ProviderSwitch {
     pub wire_api: crate::pipeline::WireApi,
     /// Claude Code OAuth bearer for Anthropic subscription auth.
     pub claude_code_token: Option<crate::secrets::OAuthToken>,
+    /// Supported subscription transport through Anthropic's unmodified
+    /// Agent SDK executable.
+    pub claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
     /// Runtime auth used by VDD's builder-side verifier after switching.
     pub vdd_builder_auth: crate::vdd::VddProviderAuth,
     /// Existing split system prompt blocks, preserved for Anthropic cache efficiency.

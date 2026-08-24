@@ -1,7 +1,7 @@
 //! End-to-end tests for `pipeline::resolve_endpoint` and
 //! `pipeline::resolve_headers` — dispatch through adapter
-//! based on provider + handling of the OAuth
-//! `claude_code_token` path (no API key required).
+//! based on provider + deterministic containment of the experimental direct
+//! `claude_code_token` path.
 //!
 //! Sprint 119 of the verification effort. Sprint 70
 //! (`pipeline_helpers_e2e`) covered `build_*_request` per
@@ -23,6 +23,14 @@ fn key() -> ApiKey {
 
 fn token() -> OAuthToken {
     OAuthToken::try_from_string("oauth-token".to_string()).expect("valid token")
+}
+
+#[cfg(feature = "experimental-claude-subscription-auth")]
+fn enable_direct_experiment() {
+    std::env::set_var(
+        openclaudia::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV,
+        openclaudia::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK,
+    );
 }
 
 fn extras(values: &[(&str, &str)]) -> SensitiveHeaders {
@@ -118,8 +126,10 @@ fn resolve_endpoint_strips_trailing_v1_from_base_url_before_appending() {
 // Section B — resolve_endpoint (OAuth claude_code_token path)
 // ───────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn resolve_endpoint_with_claude_code_token_routes_through_oauth_path() {
+    enable_direct_experiment();
     // Token-provided path bypasses adapter dispatch.
     let token = token();
     let endpoint = resolve_endpoint(
@@ -214,8 +224,10 @@ fn resolve_headers_multiple_extras_all_appended() {
 // Section D — resolve_headers (OAuth claude_code_token path)
 // ───────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn resolve_headers_with_oauth_token_bypasses_adapter_dispatch() {
+    enable_direct_experiment();
     // claude_code_token path skips get_adapter — so an
     // unknown provider name with a token MUST NOT error.
     let token = token();
@@ -230,16 +242,20 @@ fn resolve_headers_with_oauth_token_bypasses_adapter_dispatch() {
     assert!(!headers.is_empty(), "OAuth path MUST inject auth headers");
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn resolve_headers_oauth_path_extras_still_appended() {
+    enable_direct_experiment();
     let extras = extras(&[("X-Custom", "v")]);
     let token = token();
     let headers = resolve_headers("any", None, Some(&token), &extras).expect("ok");
     assert!(headers.matches_value("X-Custom", "v"));
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn resolve_headers_token_takes_precedence_over_api_key() {
+    enable_direct_experiment();
     // When BOTH are supplied, token wins (per documented contract).
     let api_key = key();
     let token = token();
@@ -252,6 +268,30 @@ fn resolve_headers_token_takes_precedence_over_api_key() {
     .expect("ok");
     assert!(headers.matches_value("authorization", "Bearer oauth-token"));
     assert!(!headers.contains_name("x-api-key"));
+}
+
+#[cfg(not(feature = "experimental-claude-subscription-auth"))]
+#[test]
+fn direct_subscription_endpoint_and_headers_fail_closed_in_the_default_build() {
+    let direct_token = token();
+    let endpoint = resolve_endpoint(
+        "anthropic",
+        "claude-sonnet-4-5",
+        "https://api.anthropic.com",
+        Some(&direct_token),
+    )
+    .expect_err("default endpoint selection must reject a direct subscription token");
+    let headers = resolve_headers(
+        "anthropic",
+        None,
+        Some(&direct_token),
+        &SensitiveHeaders::new(),
+    )
+    .expect_err("default header selection must reject a direct subscription token");
+    for error in [endpoint, headers] {
+        assert!(matches!(error, ProviderError::Unsupported(_)));
+        assert!(error.to_string().contains("not compiled"));
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

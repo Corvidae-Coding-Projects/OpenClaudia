@@ -162,6 +162,24 @@ fn isolated_command(cwd: &tempfile::TempDir, home: &tempfile::TempDir) -> Comman
     command
 }
 
+#[cfg(unix)]
+fn install_fake_claude(home: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin_dir = home.path().join("fake-claude-bin");
+    fs::create_dir_all(&bin_dir).expect("fake Claude bin directory");
+    let binary = bin_dir.join("claude");
+    let invocation_log = home.path().join("fake-claude-invocation.txt");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$OPENCLAUDIA_TEST_CLAUDE_LOG\"\nif [ \"${1-}\" = auth ] && [ \"${2-}\" = status ] && [ \"${3-}\" = --json ]; then\n  printf '%s\\n' '{\"loggedIn\":true}'\nfi\n",
+    )
+    .expect("fake Claude executable");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+        .expect("fake Claude executable permissions");
+    (bin_dir, invocation_log)
+}
+
 fn snapshot_tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     fn payload(metadata: &fs::Metadata, contents: &[u8]) -> Vec<u8> {
         let modified = metadata
@@ -249,10 +267,25 @@ fn approve_first_repository_hook_proposal(cwd: &tempfile::TempDir, home: &tempfi
     );
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
+fn experimental_auth_command(cwd: &tempfile::TempDir, home: &tempfile::TempDir) -> Command {
+    let mut command = isolated_command(cwd, home);
+    let empty_tool_path = home.path().join("empty-experimental-tool-path");
+    fs::create_dir_all(&empty_tool_path).expect("empty experimental tool path");
+    command
+        .env(
+            openclaudia::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV,
+            openclaudia::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK,
+        )
+        .env("PATH", empty_tool_path);
+    command
+}
+
+#[cfg(feature = "experimental-claude-subscription-auth")]
 fn run_auth_with_stdin(input: &str) -> Output {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
-    let mut child = isolated_command(&cwd, &home)
+    let mut child = experimental_auth_command(&cwd, &home)
         .arg("auth")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -271,7 +304,7 @@ fn run_auth_with_stdin(input: &str) -> Output {
 }
 
 #[test]
-fn legacy_repl_login_reads_status_without_nesting_a_runtime() {
+fn legacy_repl_login_explains_supported_credential_ownership() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     write_local_provider_config(&cwd);
@@ -309,10 +342,11 @@ fn legacy_repl_login_reads_status_without_nesting_a_runtime() {
         "legacy REPL should exit cleanly after /login; got {combined:?}"
     );
     assert!(
-        combined.contains("Authenticated via Claude Code credentials")
-            && combined.contains("Type: max")
-            && combined.contains("Tier: max"),
-        "/login should report synchronous credential status; got {combined:?}"
+        combined.contains("Claude authentication is owned by the Claude Code executable")
+            && combined.contains("openclaudia auth --status")
+            && !combined.contains("Type: max")
+            && !combined.contains("Tier: max"),
+        "/login should delegate credential ownership instead of reading the foreign store; got {combined:?}"
     );
     assert!(
         !combined.contains("panicked") && !combined.contains("Cannot start a runtime"),
@@ -345,6 +379,44 @@ fn auth_status_and_logout_are_mutually_exclusive() {
         combined.contains("auth --status and --logout cannot be used together"),
         "mutually exclusive auth flags should explain the conflict; got {combined:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn supported_auth_commands_delegate_exact_actions_to_the_pinned_claude_executable() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let (fake_path, invocation_log) = install_fake_claude(&home);
+    let claude_config = home.path().join(".claude");
+    fs::create_dir_all(&claude_config).expect("foreign Claude config fixture");
+    fs::write(
+        claude_config.join(".credentials.json"),
+        "{malformed foreign store",
+    )
+    .expect("malformed foreign credential fixture");
+
+    for (arguments, expected_invocation) in [
+        (&["auth", "--status"][..], "auth\nstatus\n"),
+        (&["auth", "--logout"][..], "auth\nlogout\n"),
+        (&["auth"][..], "auth\nlogin\n"),
+    ] {
+        let output = isolated_command(&cwd, &home)
+            .args(arguments)
+            .env("PATH", &fake_path)
+            .env("OPENCLAUDIA_TEST_CLAUDE_LOG", &invocation_log)
+            .output()
+            .expect("supported auth delegation must run");
+        assert!(
+            output.status.success(),
+            "supported auth delegation failed for {arguments:?}: stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&invocation_log).expect("fake Claude invocation"),
+            expected_invocation
+        );
+    }
 }
 
 #[test]
@@ -1438,24 +1510,25 @@ fn acp_accepts_keyless_local_provider_until_stdin_eof() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn acp_accepts_keyless_anthropic_with_claude_oauth_credentials_until_stdin_eof() {
+fn acp_accepts_keyless_anthropic_with_supported_claude_login_until_stdin_eof() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
-    let claude_config = home.path().join("claude-config");
+    let (fake_path, invocation_log) = install_fake_claude(&home);
     write_anthropic_provider_config(&cwd);
-    write_claude_oauth_credentials(&claude_config);
 
     let output = isolated_command(&cwd, &home)
         .arg("acp")
-        .env("CLAUDE_CONFIG_HOME_DIR", &claude_config)
+        .env("PATH", fake_path)
+        .env("OPENCLAUDIA_TEST_CLAUDE_LOG", &invocation_log)
         .stdin(Stdio::null())
         .output()
         .expect("openclaudia acp must run");
 
     assert!(
         output.status.success(),
-        "acp should start and exit cleanly on EOF for keyless Anthropic with Claude OAuth credentials; stdout={:?} stderr={:?}",
+        "acp should start and exit cleanly on EOF for keyless Anthropic with a supported Claude login; stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1466,7 +1539,11 @@ fn acp_accepts_keyless_anthropic_with_claude_oauth_credentials_until_stdin_eof()
     );
     assert!(
         !combined.contains("ANTHROPIC_API_KEY") && !combined.contains("No API key configured"),
-        "Anthropic ACP OAuth mode must not ask for an API key; got {combined:?}"
+        "Anthropic ACP SDK mode must not ask for an API key; got {combined:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(invocation_log).expect("fake Claude invocation"),
+        "auth\nstatus\n--json\n"
     );
 }
 
@@ -2202,6 +2279,7 @@ fn doctor_mixed_case_remote_provider_returns_stable_redacted_receipt() {
     assert_eq!(provider.code(), "provider.configuration.credential_missing");
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn auth_without_code_exits_nonzero() {
     let output = run_auth_with_stdin("");
@@ -2223,6 +2301,7 @@ fn auth_without_code_exits_nonzero() {
     );
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn auth_state_mismatch_exits_nonzero_before_token_exchange() {
     let output = run_auth_with_stdin("test-code#definitely-not-the-generated-state\n");
@@ -2248,6 +2327,7 @@ fn auth_state_mismatch_exits_nonzero_before_token_exchange() {
     );
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn auth_status_with_malformed_credentials_exits_nonzero() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
@@ -2263,7 +2343,7 @@ fn auth_status_with_malformed_credentials_exits_nonzero() {
             .expect("malformed credentials fixture mode");
     }
 
-    let output = isolated_command(&cwd, &home)
+    let output = experimental_auth_command(&cwd, &home)
         .args(["auth", "--status"])
         .env("CLAUDE_CONFIG_HOME_DIR", &claude_config)
         .output()
@@ -2286,7 +2366,7 @@ fn auth_status_with_malformed_credentials_exits_nonzero() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "experimental-claude-subscription-auth"))]
 #[test]
 fn auth_status_reports_expired_foreign_credentials_without_changing_them() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2311,7 +2391,7 @@ fn auth_status_reports_expired_foreign_credentials_without_changing_them() {
     fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o600))
         .expect("credential mode");
 
-    let output = isolated_command(&cwd, &home)
+    let output = experimental_auth_command(&cwd, &home)
         .args(["auth", "--status"])
         .env("CLAUDE_CONFIG_HOME_DIR", &claude_config)
         .output()
@@ -2342,6 +2422,7 @@ fn auth_status_reports_expired_foreign_credentials_without_changing_them() {
     );
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn auth_status_with_malformed_native_oauth_store_exits_nonzero() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
@@ -2352,7 +2433,7 @@ fn auth_status_with_malformed_native_oauth_store_exits_nonzero() {
     fs::write(store_dir.join("oauth_sessions.json"), "{not valid json")
         .expect("malformed native oauth store");
 
-    let output = isolated_command(&cwd, &home)
+    let output = experimental_auth_command(&cwd, &home)
         .args(["auth", "--status"])
         .output()
         .expect("openclaudia auth --status must run");
@@ -2375,11 +2456,12 @@ fn auth_status_with_malformed_native_oauth_store_exits_nonzero() {
     );
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn auth_logout_describes_native_session_scope() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
-    let output = isolated_command(&cwd, &home)
+    let output = experimental_auth_command(&cwd, &home)
         .args(["auth", "--logout"])
         .output()
         .expect("openclaudia auth --logout must run");
@@ -2402,7 +2484,7 @@ fn auth_logout_describes_native_session_scope() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "experimental-claude-subscription-auth"))]
 #[test]
 fn auth_logout_revokes_native_sessions_without_deleting_shared_credentials() {
     use std::os::unix::fs::PermissionsExt;
@@ -2442,7 +2524,7 @@ fn auth_logout_revokes_native_sessions_without_deleting_shared_credentials() {
     let credentials_before =
         fs::read_to_string(&credentials_path).expect("credentials fixture should be readable");
 
-    let output = isolated_command(&cwd, &home)
+    let output = experimental_auth_command(&cwd, &home)
         .args(["auth", "--logout"])
         .env("CLAUDE_CONFIG_HOME_DIR", &claude_config)
         .output()
@@ -2489,7 +2571,7 @@ fn auth_logout_revokes_native_sessions_without_deleting_shared_credentials() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "experimental-claude-subscription-auth"))]
 #[test]
 fn auth_logout_removes_broken_native_oauth_symlink() {
     use std::os::unix::fs::symlink;
@@ -2510,7 +2592,7 @@ fn auth_logout_removes_broken_native_oauth_symlink() {
         "broken symlink fixture should exist as a path entry"
     );
 
-    let output = isolated_command(&cwd, &home)
+    let output = experimental_auth_command(&cwd, &home)
         .args(["auth", "--logout"])
         .output()
         .expect("openclaudia auth --logout must run");

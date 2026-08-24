@@ -78,6 +78,22 @@ fn validate_claim(
     run: &crate::tools::ToolRunContext,
 ) -> Result<ClaimTrace, Denial> {
     match claim {
+        FinalClaim::FileObservation {
+            path,
+            statement,
+            evidence,
+        } => {
+            validate_text("file-observation path", path)?;
+            validate_text("file-observation statement", statement)?;
+            evidence_for_requirement(
+                evidence,
+                ledger,
+                run,
+                "file-observation claim requires evidence",
+                &EvidenceRequirement::FileRead { path },
+            )?;
+            Ok(supported(evidence))
+        }
         FinalClaim::FileChange { path, evidence } => {
             validate_text("file-change path", path)?;
             evidence_for_requirement(
@@ -192,6 +208,13 @@ pub fn render_final_claims(claims: &[FinalClaim]) -> String {
 
 fn render_claim(claim: &FinalClaim) -> String {
     match claim {
+        FinalClaim::FileObservation {
+            path, statement, ..
+        } => format!(
+            "Observed file {}: {}.",
+            quoted(path.trim()),
+            quoted(statement.trim())
+        ),
         FinalClaim::FileChange { path, .. } => {
             format!("Changed file {}.", quoted(path.trim()))
         }

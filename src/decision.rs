@@ -43,6 +43,11 @@ pub enum AgentDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "claim_type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FinalClaim {
+    FileObservation {
+        path: String,
+        statement: String,
+        evidence: Vec<ObsId>,
+    },
     FileChange {
         path: String,
         evidence: Vec<ObsId>,

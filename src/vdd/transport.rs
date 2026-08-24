@@ -21,6 +21,7 @@ use crate::vdd::helpers::truncate_output;
 #[derive(Clone, PartialEq, Eq)]
 pub enum VddProviderAuth {
     ApiKey(ApiKey),
+    ClaudeAgentSdk(crate::claude_agent_sdk::ClaudeAgentSdk),
     ClaudeCodeToken(crate::secrets::OAuthToken),
     CodexResponses(crate::codex_credentials::CodexResponsesAuth),
     None,
@@ -30,6 +31,7 @@ impl std::fmt::Debug for VddProviderAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ApiKey(_) => f.write_str("VddProviderAuth::ApiKey(<redacted>)"),
+            Self::ClaudeAgentSdk(_) => f.write_str("VddProviderAuth::ClaudeAgentSdk"),
             Self::ClaudeCodeToken(_) => f.write_str("VddProviderAuth::ClaudeCodeToken(<redacted>)"),
             Self::CodexResponses(auth) => f
                 .debug_tuple("VddProviderAuth::CodexResponses")
@@ -52,9 +54,59 @@ impl VddProviderAuth {
     }
 
     #[must_use]
+    pub const fn claude_agent_sdk(sdk: crate::claude_agent_sdk::ClaudeAgentSdk) -> Self {
+        Self::ClaudeAgentSdk(sdk)
+    }
+
+    #[must_use]
     pub const fn codex_responses(auth: crate::codex_credentials::CodexResponsesAuth) -> Self {
         Self::CodexResponses(auth)
     }
+}
+
+async fn complete_vdd_via_claude_agent_sdk(
+    sdk: &crate::claude_agent_sdk::ClaudeAgentSdk,
+    provider_name: &str,
+    request: &Value,
+    timeout: std::time::Duration,
+) -> Result<crate::claude_agent_sdk::ClaudeAgentSdkTurn, String> {
+    if !provider_name.eq_ignore_ascii_case("anthropic") {
+        return Err(format!(
+            "Claude Agent SDK auth can only be used with Anthropic, got '{provider_name}'"
+        ));
+    }
+    let turn = tokio::time::timeout(timeout, sdk.complete_turn(request, "high"))
+        .await
+        .map_err(|_| {
+            format!(
+                "Claude Agent SDK VDD request timed out after {} seconds",
+                timeout.as_secs()
+            )
+        })?
+        .map_err(|error| error.to_string())?;
+    if !turn.tool_calls.is_empty() {
+        return Err(format!(
+            "Claude Agent SDK returned {} tool call(s) to a no-tools VDD request",
+            turn.tool_calls.len()
+        ));
+    }
+    if turn.content.trim().is_empty() {
+        return Err("Claude Agent SDK completed VDD request without assistant content".to_string());
+    }
+    Ok(turn)
+}
+
+fn claude_agent_sdk_response_json(turn: &crate::claude_agent_sdk::ClaudeAgentSdkTurn) -> Value {
+    serde_json::json!({
+        "content": [{"type": "text", "text": turn.content}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": turn.usage.input_tokens,
+            "output_tokens": turn.usage.output_tokens,
+            "cache_read_input_tokens": turn.usage.cache_read_tokens,
+            "cache_creation_input_tokens": turn.usage.cache_write_tokens,
+        }
+    })
 }
 
 /// Forward a request to a provider and return the raw reqwest response.
@@ -419,10 +471,13 @@ fn adversary_headers_and_endpoint(
                     config.adversary.provider
                 )));
             }
-            crate::claude_credentials::inject_oauth_prefix_only(transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(transformed)
+                .map_err(|error| VddError::ConfigError(error.to_string()))?;
             Ok((
-                crate::claude_credentials::get_oauth_headers(token),
-                crate::claude_credentials::get_oauth_endpoint(&request.model),
+                crate::claude_credentials::get_oauth_headers(token)
+                    .map_err(|error| VddError::ConfigError(error.to_string()))?,
+                crate::claude_credentials::get_oauth_endpoint(&request.model)
+                    .map_err(|error| VddError::ConfigError(error.to_string()))?,
             ))
         }
         Some(VddProviderAuth::None) => Ok((
@@ -446,7 +501,9 @@ fn adversary_headers_and_endpoint(
                 adapter.chat_endpoint(&request.model),
             ))
         }
-        Some(VddProviderAuth::CodexResponses(_)) => unreachable!("handled above"),
+        Some(VddProviderAuth::CodexResponses(_) | VddProviderAuth::ClaudeAgentSdk(_)) => {
+            unreachable!("handled above")
+        }
     }
 }
 
@@ -496,6 +553,37 @@ pub async fn send_to_adversary(
     let mut transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
+
+    if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
+        let provider_budget = crate::provider_budget::reserve_provider_call(
+            run,
+            &config.adversary.provider,
+            &request.model,
+            &mut transformed,
+            u64::from(config.adversary.max_tokens),
+        )
+        .map_err(|error| {
+            VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
+        })?;
+        let turn = complete_vdd_via_claude_agent_sdk(
+            sdk,
+            &config.adversary.provider,
+            &transformed,
+            timeout,
+        )
+        .await
+        .map_err(VddError::AdversaryRequestFailed)?;
+        provider_budget.reconcile(&turn.usage).map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Provider budget reconciliation failed: {error}"
+            ))
+        })?;
+        info!(
+            response_length = turn.content.len(),
+            "VDD: Received Agent SDK adversary response"
+        );
+        return Ok((turn.content, turn.usage));
+    }
 
     let (headers, endpoint) = adversary_headers_and_endpoint(
         config,
@@ -643,6 +731,29 @@ pub async fn send_to_builder(
         .transform_request(request)
         .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
 
+    if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
+        let provider_budget = crate::provider_budget::reserve_provider_call(
+            run,
+            provider_name,
+            &request.model,
+            &mut transformed,
+            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+        )
+        .map_err(|error| {
+            VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
+        })?;
+        let turn = complete_vdd_via_claude_agent_sdk(sdk, provider_name, &transformed, timeout)
+            .await
+            .map_err(VddError::BuilderRevisionFailed)?;
+        provider_budget.reconcile(&turn.usage).map_err(|error| {
+            VddError::BuilderRevisionFailed(format!(
+                "Provider budget reconciliation failed: {error}"
+            ))
+        })?;
+        let response = claude_agent_sdk_response_json(&turn);
+        return Ok((turn.content, response, turn.usage));
+    }
+
     let (headers, endpoint) = match runtime_auth {
         Some(VddProviderAuth::ApiKey(api_key)) => (
             adapter.get_headers(api_key),
@@ -654,10 +765,13 @@ pub async fn send_to_builder(
                     "Claude Code auth can only be used with Anthropic builder, got '{provider_name}'"
                 )));
             }
-            crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(&mut transformed)
+                .map_err(|error| VddError::ConfigError(error.to_string()))?;
             (
-                crate::claude_credentials::get_oauth_headers(token),
-                crate::claude_credentials::get_oauth_endpoint(&request.model),
+                crate::claude_credentials::get_oauth_headers(token)
+                    .map_err(|error| VddError::ConfigError(error.to_string()))?,
+                crate::claude_credentials::get_oauth_endpoint(&request.model)
+                    .map_err(|error| VddError::ConfigError(error.to_string()))?,
             )
         }
         Some(VddProviderAuth::None) => (
@@ -668,7 +782,9 @@ pub async fn send_to_builder(
             api_key.map(|k| adapter.get_headers(k)).unwrap_or_default(),
             adapter.chat_endpoint(&request.model),
         ),
-        Some(VddProviderAuth::CodexResponses(_)) => unreachable!("handled above"),
+        Some(VddProviderAuth::CodexResponses(_) | VddProviderAuth::ClaudeAgentSdk(_)) => {
+            unreachable!("handled above")
+        }
     };
 
     let pname = provider_name.to_string();
@@ -775,6 +891,32 @@ pub async fn send_to_builder_for_verification(
         .transform_request(request)
         .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier transform: {e}")))?;
 
+    if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
+        let provider_budget = crate::provider_budget::reserve_provider_call(
+            run,
+            provider_name,
+            &request.model,
+            &mut transformed,
+            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+        )
+        .map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Run budget denied verifier provider call: {error}"
+            ))
+        })?;
+        let turn = complete_vdd_via_claude_agent_sdk(sdk, provider_name, &transformed, timeout)
+            .await
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!("verifier request: {error}"))
+            })?;
+        provider_budget.reconcile(&turn.usage).map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Verifier budget reconciliation failed: {error}"
+            ))
+        })?;
+        return Ok((turn.content, turn.usage));
+    }
+
     let (headers, endpoint) = match runtime_auth {
         Some(VddProviderAuth::ApiKey(api_key)) => (
             adapter.get_headers(api_key),
@@ -786,10 +928,13 @@ pub async fn send_to_builder_for_verification(
                     "Claude Code auth can only be used with Anthropic verifier, got '{provider_name}'"
                 )));
             }
-            crate::claude_credentials::inject_oauth_prefix_only(&mut transformed);
+            crate::claude_credentials::inject_oauth_prefix_only(&mut transformed)
+                .map_err(|error| VddError::ConfigError(error.to_string()))?;
             (
-                crate::claude_credentials::get_oauth_headers(token),
-                crate::claude_credentials::get_oauth_endpoint(&request.model),
+                crate::claude_credentials::get_oauth_headers(token)
+                    .map_err(|error| VddError::ConfigError(error.to_string()))?,
+                crate::claude_credentials::get_oauth_endpoint(&request.model)
+                    .map_err(|error| VddError::ConfigError(error.to_string()))?,
             )
         }
         Some(VddProviderAuth::None) => (
@@ -800,7 +945,9 @@ pub async fn send_to_builder_for_verification(
             api_key.map(|k| adapter.get_headers(k)).unwrap_or_default(),
             adapter.chat_endpoint(&request.model),
         ),
-        Some(VddProviderAuth::CodexResponses(_)) => unreachable!("handled above"),
+        Some(VddProviderAuth::CodexResponses(_) | VddProviderAuth::ClaudeAgentSdk(_)) => {
+            unreachable!("handled above")
+        }
     };
 
     let pname = provider_name.to_string();

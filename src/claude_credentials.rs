@@ -11,16 +11,28 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::debug;
 
-/// OAuth beta header required when using subscriber tokens
+/// Exact runtime acknowledgement for the experimental direct protocol.
+///
+/// This is required in addition to the Cargo feature so an inherited truthy
+/// variable cannot silently activate the unsupported route.
+pub const EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV: &str =
+    "OPENCLAUDIA_EXPERIMENTAL_DIRECT_CLAUDE_SUBSCRIPTION";
+pub const EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK: &str = "I_ACCEPT_UNSUPPORTED";
+
+/// OAuth beta header required when using subscriber tokens.
+#[cfg(feature = "experimental-claude-subscription-auth")]
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
 /// Claude Code beta header for agentic queries
+#[cfg(feature = "experimental-claude-subscription-auth")]
 pub const CLAUDE_CODE_BETA_HEADER: &str = "claude-code-20250219";
 
 /// Interleaved thinking beta
+#[cfg(feature = "experimental-claude-subscription-auth")]
 pub const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
 /// Fine-grained tool streaming beta
+#[cfg(feature = "experimental-claude-subscription-auth")]
 pub const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 
 /// The canonical `anthropic-beta` header value sent on every OAuth request.
@@ -31,17 +43,26 @@ pub const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use openclaudia::claude_credentials::claude_code_beta_header_value;
-/// let v = claude_code_beta_header_value();
+/// let v = claude_code_beta_header_value()?;
 /// assert!(v.contains("oauth-2025-04-20"));
 /// assert!(v.contains("claude-code-20250219"));
 /// ```
-#[must_use]
-pub fn claude_code_beta_header_value() -> String {
-    format!(
-        "{CLAUDE_CODE_BETA_HEADER},{OAUTH_BETA_HEADER},{INTERLEAVED_THINKING_BETA},{FINE_GRAINED_TOOL_STREAMING_BETA}"
-    )
+///
+/// # Errors
+///
+/// Returns an error unless both experimental gates are enabled.
+pub fn claude_code_beta_header_value() -> Result<String, ClaudeCredentialError> {
+    require_experimental_direct_subscription()?;
+    #[cfg(feature = "experimental-claude-subscription-auth")]
+    {
+        Ok(format!(
+            "{CLAUDE_CODE_BETA_HEADER},{OAUTH_BETA_HEADER},{INTERLEAVED_THINKING_BETA},{FINE_GRAINED_TOOL_STREAMING_BETA}"
+        ))
+    }
+    #[cfg(not(feature = "experimental-claude-subscription-auth"))]
+    unreachable!("feature gate was checked above")
 }
 
 /// Five-minute margin in which Claude Code should refresh its own credentials.
@@ -102,6 +123,9 @@ pub fn credentials_path() -> Option<PathBuf> {
 /// Check if Claude Code credentials exist
 #[must_use]
 pub fn has_claude_code_credentials() -> bool {
+    if require_experimental_direct_subscription().is_err() {
+        return false;
+    }
     credentials_path().is_some_and(|p| p.exists())
 }
 
@@ -109,6 +133,16 @@ pub fn has_claude_code_credentials() -> bool {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClaudeCredentialError {
+    /// The unsupported direct subscription protocol is absent from this build.
+    #[error(
+        "direct Claude subscription routing is not compiled; use the supported Claude Agent SDK backend"
+    )]
+    ExperimentalFeatureDisabled,
+    /// The build contains the experiment, but the operator did not acknowledge it.
+    #[error(
+        "direct Claude subscription routing requires {EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV}={EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK}; use the supported Claude Agent SDK backend unless deliberately testing the legacy protocol"
+    )]
+    ExperimentalAcknowledgementRequired,
     /// No Claude-compatible configuration directory could be resolved.
     #[error("cannot determine the Claude Code config directory; run `claude auth login`")]
     LocationUnavailable,
@@ -179,6 +213,35 @@ pub enum ClaudeCredentialError {
         path.display()
     )]
     ExpiresSoon { path: PathBuf, expires_at_ms: i64 },
+}
+
+/// Whether this process explicitly enabled the unsupported direct protocol.
+#[must_use]
+pub fn experimental_direct_subscription_enabled() -> bool {
+    require_experimental_direct_subscription().is_ok()
+}
+
+/// Enforce the compile-time and runtime halves of the experiment boundary.
+///
+/// # Errors
+///
+/// Returns a typed error when the feature is absent or the exact runtime
+/// acknowledgement is missing.
+#[allow(clippy::missing_const_for_fn)] // The feature-on implementation reads the process environment.
+pub fn require_experimental_direct_subscription() -> Result<(), ClaudeCredentialError> {
+    #[cfg(not(feature = "experimental-claude-subscription-auth"))]
+    {
+        Err(ClaudeCredentialError::ExperimentalFeatureDisabled)
+    }
+    #[cfg(feature = "experimental-claude-subscription-auth")]
+    {
+        if std::env::var(EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV).as_deref()
+            != Ok(EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK)
+        {
+            return Err(ClaudeCredentialError::ExperimentalAcknowledgementRequired);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -366,6 +429,7 @@ fn load_credentials_from_dir_at(
 /// Returns a typed error when the store is missing, unsafe, malformed, stale,
 /// replaced during observation, or lacks the inference scope.
 pub fn load_credentials() -> Result<LoadedCredentials, ClaudeCredentialError> {
+    require_experimental_direct_subscription()?;
     let config_dir = claude_config_dir().ok_or(ClaudeCredentialError::LocationUnavailable)?;
     load_credentials_from_dir_at(&config_dir, chrono::Utc::now().timestamp_millis(), || {})
 }
@@ -394,6 +458,7 @@ pub struct CredentialStatus {
 /// Returns an error when an existing credential file is unsafe, unreadable,
 /// malformed, or replaced during observation.
 pub fn peek_credentials() -> Result<Option<CredentialStatus>, ClaudeCredentialError> {
+    require_experimental_direct_subscription()?;
     let Some(config_dir) = claude_config_dir() else {
         return Ok(None);
     };
@@ -425,17 +490,30 @@ fn status_from_oauth(oauth: &ClaudeAiOauth, now_ms: i64) -> CredentialStatus {
 /// Build the HTTP headers for Anthropic API with OAuth Bearer auth.
 ///
 /// These headers replace the `x-api-key` header used with API keys.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns an error unless both experimental gates are enabled.
 pub fn get_oauth_headers(
     access_token: &crate::secrets::OAuthToken,
-) -> crate::secrets::SensitiveHeaders {
+) -> Result<crate::secrets::SensitiveHeaders, ClaudeCredentialError> {
+    require_experimental_direct_subscription()?;
     crate::providers::AnthropicAdapter::oauth_headers(access_token)
 }
 
 /// Get the API endpoint for OAuth-authenticated requests.
-#[must_use]
-pub fn get_oauth_endpoint(_model: &str) -> String {
-    "https://api.anthropic.com/v1/messages".to_string()
+///
+/// # Errors
+///
+/// Returns an error unless both experimental gates are enabled.
+pub fn get_oauth_endpoint(_model: &str) -> Result<String, ClaudeCredentialError> {
+    require_experimental_direct_subscription()?;
+    #[cfg(feature = "experimental-claude-subscription-auth")]
+    {
+        Ok("https://api.anthropic.com/v1/messages".to_string())
+    }
+    #[cfg(not(feature = "experimental-claude-subscription-auth"))]
+    unreachable!("feature gate was checked above")
 }
 
 /// The system prompt prefix that must be present for OAuth tokens to access premium models.
@@ -469,6 +547,7 @@ pub fn get_oauth_endpoint(_model: &str) -> String {
 ///
 /// The prefix remains a provider-protocol compatibility credential, not a
 /// general prompt extension API.
+#[cfg(feature = "experimental-claude-subscription-auth")]
 pub const CLAUDE_CODE_SYSTEM_PROMPT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
 
@@ -484,12 +563,23 @@ pub const CLAUDE_CODE_SYSTEM_PROMPT: &str =
 /// Centralized here so that the magic-string prefix and the three-way
 /// match on the existing `system` shape live in one place. Previously
 /// inlined into `proxy::proxy_anthropic_messages` — see crosslink #386.
-pub fn inject_oauth_prefix_only(request: &mut serde_json::Value) {
+///
+/// # Errors
+///
+/// Returns an error unless both experimental gates are enabled.
+pub fn inject_oauth_prefix_only(
+    request: &mut serde_json::Value,
+) -> Result<(), ClaudeCredentialError> {
+    require_experimental_direct_subscription()?;
+    #[cfg(not(feature = "experimental-claude-subscription-auth"))]
+    let _ = request;
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     let prefix_block = serde_json::json!({
         "type": "text",
         "text": CLAUDE_CODE_SYSTEM_PROMPT,
     });
 
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     match request.get_mut("system") {
         Some(serde_json::Value::Array(arr)) => {
             arr.insert(0, prefix_block);
@@ -505,6 +595,7 @@ pub fn inject_oauth_prefix_only(request: &mut serde_json::Value) {
             request["system"] = serde_json::json!([prefix_block]);
         }
     }
+    Ok(())
 }
 
 /// Maximum recursion depth for [`strip_cache_control_ttl`].
@@ -571,6 +662,14 @@ fn strip_cache_control_ttl_inner(value: &mut serde_json::Value, depth: usize, pa
 mod tests {
     use super::*;
 
+    #[cfg(feature = "experimental-claude-subscription-auth")]
+    fn enable_direct_experiment_for_test() {
+        std::env::set_var(
+            EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV,
+            EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK,
+        );
+    }
+
     fn token(value: &str) -> crate::secrets::OAuthToken {
         crate::secrets::OAuthToken::try_from_string(value.to_string()).expect("valid test token")
     }
@@ -617,12 +716,36 @@ mod tests {
         assert!(creds.claude_ai_oauth.is_none());
     }
 
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn test_get_oauth_headers() {
-        let headers = get_oauth_headers(&token("test-token-123"));
+        enable_direct_experiment_for_test();
+        let headers = get_oauth_headers(&token("test-token-123")).expect("experimental headers");
+        let beta = claude_code_beta_header_value().expect("experimental beta header");
         assert!(headers.matches_value("Authorization", "Bearer test-token-123"));
-        assert!(headers.matches_value("anthropic-beta", &claude_code_beta_header_value()));
+        assert!(headers.matches_value("anthropic-beta", &beta));
         assert!(headers.matches_value("anthropic-version", "2023-06-01"));
+    }
+
+    #[cfg(not(feature = "experimental-claude-subscription-auth"))]
+    #[test]
+    fn direct_subscription_operations_are_unavailable_in_default_build() {
+        assert!(matches!(
+            require_experimental_direct_subscription(),
+            Err(ClaudeCredentialError::ExperimentalFeatureDisabled)
+        ));
+        assert!(!experimental_direct_subscription_enabled());
+        assert!(!has_claude_code_credentials());
+        assert!(matches!(
+            get_oauth_endpoint("claude-test"),
+            Err(ClaudeCredentialError::ExperimentalFeatureDisabled)
+        ));
+        let mut request = serde_json::json!({"system": "unchanged"});
+        assert!(matches!(
+            inject_oauth_prefix_only(&mut request),
+            Err(ClaudeCredentialError::ExperimentalFeatureDisabled)
+        ));
+        assert_eq!(request, serde_json::json!({"system": "unchanged"}));
     }
 
     #[test]
@@ -814,6 +937,7 @@ mod tests {
 
     // --- Regression guard for crosslink #272: beta-header string drift ---
 
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn beta_header_consts_have_expected_values() {
         assert_eq!(CLAUDE_CODE_BETA_HEADER, "claude-code-20250219");
@@ -825,9 +949,11 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn claude_code_beta_header_value_contains_all_flags() {
-        let v = claude_code_beta_header_value();
+        enable_direct_experiment_for_test();
+        let v = claude_code_beta_header_value().expect("experimental beta header");
         assert!(
             v.contains("claude-code-20250219"),
             "missing claude-code beta in: {v}"
@@ -843,9 +969,11 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn get_oauth_headers_beta_includes_fine_grained_tool_streaming() {
-        let headers = get_oauth_headers(&token("tok"));
+        enable_direct_experiment_for_test();
+        let headers = get_oauth_headers(&token("tok")).expect("experimental headers");
         assert_eq!(
             headers.with_value("anthropic-beta", |value| value
                 .contains("fine-grained-tool-streaming-2025-05-14")),
@@ -860,12 +988,14 @@ mod tests {
 
     /// Spec — `inject_oauth_prefix_only` prepends the exact prefix block
     /// when `system` is already an array (preserves existing blocks).
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn inject_oauth_prefix_only_prepends_to_array() {
+        enable_direct_experiment_for_test();
         let mut req = serde_json::json!({
             "system": [{"type": "text", "text": "user-provided"}]
         });
-        inject_oauth_prefix_only(&mut req);
+        inject_oauth_prefix_only(&mut req).expect("experimental prefix");
         let arr = req["system"].as_array().expect("system must be array");
         assert_eq!(arr.len(), 2, "must prepend exactly one block");
         assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
@@ -874,10 +1004,12 @@ mod tests {
 
     /// Spec — `inject_oauth_prefix_only` upgrades a string `system` to a
     /// two-block array (prefix, then the original string).
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn inject_oauth_prefix_only_upgrades_string() {
+        enable_direct_experiment_for_test();
         let mut req = serde_json::json!({"system": "you are helpful"});
-        inject_oauth_prefix_only(&mut req);
+        inject_oauth_prefix_only(&mut req).expect("experimental prefix");
         let arr = req["system"].as_array().expect("system must be array");
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
@@ -886,10 +1018,12 @@ mod tests {
 
     /// Spec — `inject_oauth_prefix_only` creates a one-block array when
     /// `system` is missing entirely.
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn inject_oauth_prefix_only_creates_when_absent() {
+        enable_direct_experiment_for_test();
         let mut req = serde_json::json!({});
-        inject_oauth_prefix_only(&mut req);
+        inject_oauth_prefix_only(&mut req).expect("experimental prefix");
         let arr = req["system"].as_array().expect("system must be array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
@@ -897,10 +1031,12 @@ mod tests {
 
     /// Spec — `inject_oauth_prefix_only` does not inject a second behavioral
     /// prompt. Behavioral context comes from the typed context projector.
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[test]
     fn inject_oauth_prefix_only_does_not_add_behavioral_block() {
+        enable_direct_experiment_for_test();
         let mut req = serde_json::json!({});
-        inject_oauth_prefix_only(&mut req);
+        inject_oauth_prefix_only(&mut req).expect("experimental prefix");
         let arr = req["system"].as_array().expect("system must be array");
         assert_eq!(arr.len(), 1, "must be prefix-only, not prefix+behavioral");
     }

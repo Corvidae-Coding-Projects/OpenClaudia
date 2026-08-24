@@ -2055,6 +2055,7 @@ fn is_openclaudia_name(name: &OsStr) -> bool {
 
 fn is_external_openclaudia_variable(name: &str) -> bool {
     name.starts_with("OPENCLAUDIA_TEST_")
+        || name == crate::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV
         || matches!(
             name,
             "OPENCLAUDIA_ACP__MAX_ITERATIONS"
@@ -2251,6 +2252,19 @@ mod tests {
         assert!(diagnostic.contains("GOOGLE_API_KEY"));
         assert!(!diagnostic.contains("secret-one"));
         assert!(!diagnostic.contains("secret-two"));
+    }
+
+    #[test]
+    fn direct_subscription_acknowledgement_is_owned_outside_typed_config() {
+        let mut config = app_config();
+        apply_environment(
+            &mut config,
+            [(
+                OsString::from(crate::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV),
+                OsString::from(crate::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK),
+            )],
+        )
+        .expect("experimental acknowledgement must reach its dedicated exact-value gate");
     }
 
     #[test]

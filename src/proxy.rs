@@ -314,6 +314,9 @@ async fn auth_device_page() -> impl IntoResponse {
 async fn auth_device_start(State(state): State<ProxyState>) -> Result<Response, ProxyError> {
     use crate::oauth::{generate_client_binding, PkceParams};
 
+    crate::claude_credentials::require_experimental_direct_subscription()
+        .map_err(|_| ProxyError::Unauthorized("experimental direct Claude OAuth is disabled"))?;
+
     let pkce = PkceParams::generate();
     let oauth_state = pkce
         .state
@@ -2038,7 +2041,8 @@ async fn send_oauth_anthropic_messages(
     let url = format!("{}/v1/messages", normalize_base_url(&provider.base_url));
     crate::provider_transport::validate_endpoint("anthropic", &url)?;
     let headers =
-        crate::providers::AnthropicAdapter::oauth_headers(&session.credentials.access_token);
+        crate::providers::AnthropicAdapter::oauth_headers(&session.credentials.access_token)
+            .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
     let mut merged = headers;
     merged.extend(&provider.headers);
     let builder = merged
@@ -2106,7 +2110,8 @@ async fn proxy_anthropic_messages(
     let max_bytes = state.config.proxy.max_response_bytes;
     let auth = resolve_anthropic_auth(&headers, &state.oauth_store, provider).await?;
     if matches!(auth, AnthropicAuth::Oauth(_)) {
-        crate::claude_credentials::inject_oauth_prefix_only(&mut request);
+        crate::claude_credentials::inject_oauth_prefix_only(&mut request)
+            .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
         crate::claude_credentials::strip_cache_control_ttl(&mut request);
     }
     let model = request
@@ -3929,8 +3934,28 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "experimental-claude-subscription-auth"))]
+    #[tokio::test]
+    async fn device_start_fails_closed_in_the_default_build() {
+        let state = test_proxy_state(minimal_config("anthropic"));
+        let error = auth_device_start(State(state))
+            .await
+            .expect_err("default build must not start direct Claude OAuth");
+        match error {
+            ProxyError::Unauthorized(message) => {
+                assert!(message.contains("experimental direct Claude OAuth is disabled"));
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "experimental-claude-subscription-auth")]
     #[tokio::test]
     async fn device_start_returns_raw_state_only_to_bound_http_client() {
+        std::env::set_var(
+            crate::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV,
+            crate::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK,
+        );
         let state = test_proxy_state(minimal_config("anthropic"));
         let response = auth_device_start(State(state.clone()))
             .await

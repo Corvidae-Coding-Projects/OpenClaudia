@@ -94,7 +94,8 @@ fn build_print_request(
         .transform_request_with_thinking(request, thinking)
         .map_err(|e| format!("request transform error: {e}"))?;
     if claude_code_token.is_some() {
-        openclaudia::claude_credentials::inject_oauth_prefix_only(&mut body);
+        openclaudia::claude_credentials::inject_oauth_prefix_only(&mut body)
+            .map_err(|error| error.to_string())?;
     }
     Ok(body)
 }
@@ -246,9 +247,10 @@ fn resolve_print_endpoint(
     provider: &openclaudia::config::ProviderConfig,
     adapter: &dyn ProviderAdapter,
     claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
-) -> String {
+) -> Result<String, String> {
     if claude_code_token.is_some() {
-        return openclaudia::claude_credentials::get_oauth_endpoint(model);
+        return openclaudia::claude_credentials::get_oauth_endpoint(model)
+            .map_err(|error| error.to_string());
     }
 
     let path = if adapter.name() == "google" {
@@ -258,11 +260,11 @@ fn resolve_print_endpoint(
             .stream_endpoint(model)
             .unwrap_or_else(|| adapter.chat_endpoint(model))
     };
-    format!(
+    Ok(format!(
         "{}{}",
         openclaudia::proxy::normalize_base_url(&provider.base_url),
         path
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -531,7 +533,8 @@ fn prepare_print_transport(
                 p.provider,
                 p.adapter,
                 p.auth.claude_code_token.as_ref(),
-            ),
+            )
+            .map_err(anyhow::Error::msg)?,
             openclaudia::pipeline::resolve_headers(
                 &p.config.proxy.target,
                 p.auth.api_key.as_ref(),
@@ -690,6 +693,39 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     .map_err(|error| anyhow::anyhow!("Run budget denied provider call: {error}"))?;
     if chat_auth.codex_responses_auth.is_some() {
         openclaudia::codex_credentials::finalize_chatgpt_responses_request(&mut request_body);
+    }
+
+    if let Some(sdk) = chat_auth.claude_agent_sdk.as_ref() {
+        let effort = provider
+            .thinking
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("medium");
+        let turn = match sdk.complete_turn(&request_body, effort).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    anyhow::anyhow!(
+                        "Claude Agent SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                    )
+                })?;
+                return Err(anyhow::anyhow!("Claude Agent SDK request failed: {error}"));
+            }
+        };
+        provider_budget
+            .reconcile(&turn.usage)
+            .map_err(|error| anyhow::anyhow!("Provider budget reconciliation failed: {error}"))?;
+        if !turn.tool_calls.is_empty() {
+            anyhow::bail!(
+                "Claude Agent SDK returned {} tool call(s) to no-tools print mode",
+                turn.tool_calls.len()
+            );
+        }
+        if turn.content.trim().is_empty() {
+            anyhow::bail!("Claude Agent SDK returned no printable assistant text");
+        }
+        println!("{}", turn.content);
+        return Ok(());
     }
 
     let client = openclaudia::provider_transport::shared_client()
@@ -943,6 +979,7 @@ mod tests {
         let auth = ChatAuth {
             api_key: None,
             claude_code_token: None,
+            claude_agent_sdk: None,
             codex_responses_auth: Some(openclaudia::codex_credentials::CodexResponsesAuth {
                 access_token: openclaudia::secrets::OAuthToken::try_from_string(
                     "print-responses-token".to_string(),
@@ -1097,7 +1134,8 @@ mod tests {
             headers: openclaudia::secrets::SensitiveHeaders::new(),
             thinking: openclaudia::config::ThinkingConfig::default(),
         };
-        let endpoint = resolve_print_endpoint("gemini-3.5-flash", &provider, adapter, None);
+        let endpoint =
+            resolve_print_endpoint("gemini-3.5-flash", &provider, adapter, None).expect("endpoint");
         assert!(endpoint.ends_with("/v1beta/models/gemini-3.5-flash:generateContent"));
         assert!(!endpoint.contains("streamGenerateContent"));
     }
