@@ -1,6 +1,6 @@
 {
   "next_display_id": 1129,
-  "next_comment_id": 1479,
+  "next_comment_id": 1480,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8426,7 +8426,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-24T06:46:11.491185689Z",
+      "updated_at": "2026-08-24T08:07:27.674695983Z",
       "labels": [
         "remediation"
       ],
@@ -8759,6 +8759,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAK36fWelEW2QW0ePIPsat6doa7JyUJCBnJgYKpEstHRBf1p8FBdhM3AOZ491R4c+KFVaktEoU6A2g6HfHdpWVDA=="
+        },
+        "751596f5-1b11-48d2-8f5f-4ae7355f95a6": {
+          "display_id": 1479,
+          "author": "6Vw9",
+          "content": "Commit 9a9b0184bd9e718f4b9b189d4bdee8b98a39e39f — feat(auth): delegate Codex accounts to official runtime. Completed child S-028 with raw Codex credential/JWT/private-endpoint handling removed, official owned-login runtime wired across all agent surfaces, direct API keys preserved, generated evidence rebound, full Rust 1.98 all-target/all-feature test suite passing, all-feature Clippy clean, and compiled live print/TUI paid-account validation successful.",
+          "created_at": "2026-08-24T08:07:27.671983745Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXy6w0K9dyQ0hBpvEiycZw7JL9b+bF3Oj0wgEzVyNLLTKbIobnxJ4G7tvAQVN/ciynnBbUMbPe/ibP/yIiw3zBA=="
         },
         "7e87d1c6-b027-460c-b3b5-eedba4ba2f58": {
           "display_id": 1136,
@@ -38417,11 +38426,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1440,
       "timestamp": "2026-08-24T08:06:26.142374856Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1441,
+      "timestamp": "2026-08-24T08:07:27.674695983Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T08:06:26.142374856Z",
+    "timestamp": "2026-08-24T08:07:27.674695983Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1440
+    "agent_seq": 1441
   }
 }
