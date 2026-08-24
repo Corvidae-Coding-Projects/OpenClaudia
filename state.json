@@ -5563,13 +5563,12 @@
       "display_id": 1129,
       "title": "S-032: Bind file edits and diffs to snapshots",
       "description": "Implement immutable read snapshot identity and digest binding across file edit, overwrite, and diff operations. Real concurrent changes must return typed conflicts; preflight match count, growth, encoding, sensitivity, file/result size, and bounded diff output before atomic commit. Preserve existing functionality and keep the slice scoped to realistic application paths.",
-      "status": "closed",
+      "status": "open",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T18:11:27.061351876Z",
-      "updated_at": "2026-08-24T19:20:46.413702072Z",
-      "closed_at": "2026-08-24T19:20:30.897513455Z",
+      "updated_at": "2026-08-24T19:21:35.016288653Z",
       "labels": [
         "remediation"
       ],
@@ -38588,11 +38587,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1455,
       "timestamp": "2026-08-24T19:20:46.413702072Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1456,
+      "timestamp": "2026-08-24T19:21:35.016288653Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:20:46.413702072Z",
+    "timestamp": "2026-08-24T19:21:35.016288653Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1455
+    "agent_seq": 1456
   }
 }
