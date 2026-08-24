@@ -1,6 +1,6 @@
 {
   "next_display_id": 1133,
-  "next_comment_id": 1505,
+  "next_comment_id": 1506,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8592,7 +8592,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-24T19:37:47.581397373Z",
+      "updated_at": "2026-08-24T20:20:40.974328729Z",
       "labels": [
         "remediation"
       ],
@@ -8814,6 +8814,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALnnVtBDzzvBS6ndje0GyqNgSUJu9GGIAK6wOmBOtxhvjMex7ScdPQG17LeVwuSh4fnUD1lB3v2QrPoEDLWU8Bw=="
+        },
+        "37b226ce-f4bb-4ce1-91e9-b9540e866158": {
+          "display_id": 1505,
+          "author": "6Vw9",
+          "content": "Runner repair #1132 is closed. Signed commits 0165301d and c938085f make the cap stress fixture duration-independent, rebind its generated evidence chain, and preserve Crosslink's exact closure changelog output. The final Rust 1.98 CI-identical suite and all lint/check gates pass locally; awaiting manual push and replacement PR runner completion.",
+          "created_at": "2026-08-24T20:20:40.971778125Z",
+          "kind": "action",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOsrsPUbNytw5QhgqgKrkL/e9v5MMDJ6QVLrr3jbKv8OjQzz49CgZ5P22R9SXLkaqUVm8f9rERJTY/LT93ODADQ=="
         },
         "39cff6d1-6a19-465b-a3b7-6a5360281577": {
           "display_id": 1259,
@@ -39000,11 +39009,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1494,
       "timestamp": "2026-08-24T20:20:23.442541637Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1495,
+      "timestamp": "2026-08-24T20:20:40.974328729Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T20:20:23.442541637Z",
+    "timestamp": "2026-08-24T20:20:40.974328729Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1494
+    "agent_seq": 1495
   }
 }
