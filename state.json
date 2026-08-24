@@ -1,6 +1,6 @@
 {
   "next_display_id": 1126,
-  "next_comment_id": 1454,
+  "next_comment_id": 1455,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24209,13 +24209,24 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T03:16:26.714155934Z",
-      "updated_at": "2026-08-24T03:17:26.222424991Z",
+      "updated_at": "2026-08-24T03:22:50.827171615Z",
       "labels": [
         "remediation"
       ],
       "related": [
         "46f1d200-b3c8-465c-9e83-85fa06120cb7"
-      ]
+      ],
+      "comments": {
+        "9ed1d20a-3f77-46cc-b958-6d9d65853477": {
+          "display_id": 1454,
+          "author": "6Vw9",
+          "content": "[action] Completed S-026 preflight: preserve valid Claude Code credentials read-only; remove foreign refresh/write; add typed stale recovery and realistic safety/manual tests.",
+          "created_at": "2026-08-24T03:22:50.824501313Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOrve4gy87oUcsTPBo0e1MTs0BcEZ19UZl/iOAUWcAwWZX+Zdj78BGzaGkNkuBbACSU8BMxNZ9LrUZNyEUIaeCQ=="
+        }
+      }
     },
     "c465e740-cba5-41e8-a8c9-1cd700e496c0": {
       "uuid": "c465e740-cba5-41e8-a8c9-1cd700e496c0",
@@ -37904,11 +37915,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1395,
       "timestamp": "2026-08-24T03:17:26.222424991Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1396,
+      "timestamp": "2026-08-24T03:22:50.827171615Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T03:17:26.222424991Z",
+    "timestamp": "2026-08-24T03:22:50.827171615Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1395
+    "agent_seq": 1396
   }
 }
