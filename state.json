@@ -1,6 +1,6 @@
 {
   "next_display_id": 1125,
-  "next_comment_id": 1445,
+  "next_comment_id": 1446,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10790,7 +10790,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T01:52:48.843928461Z",
-      "updated_at": "2026-08-24T01:54:35.544609535Z",
+      "updated_at": "2026-08-24T01:58:08.271643283Z",
       "labels": [
         "remediation"
       ],
@@ -10806,6 +10806,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9YoRB88v/gXkyVYtmJndccwLMnBEHI0M0RfXGhejEMg6Hhsxy2AT12c6lGqUtnSFHAOqKP1K3It7R5Q9nJVDAg=="
+        },
+        "424a465c-ce5f-40d5-8020-b51a82bf75bb": {
+          "display_id": 1445,
+          "author": "6Vw9",
+          "content": "Correction to the initial trace: the legacy REPL /connect route remains live through command_registry -> review::configure_provider_api_key and still echoes the key and rewrites YAML. S-030 will replace that live path as well as repair the newer startup prompt. The intended end state remains no project-local plaintext fallback and no restored YAML secret writer.",
+          "created_at": "2026-08-24T01:58:08.268859545Z",
+          "kind": "intervention",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAONiHXQn8zGqBg5uKmeY9FkpABQUOKXLQz545OXB5M8SOKGc6Crbv7bkiJO+MysuKj6fNpcQcYs8QPHOi1NxWAg=="
         },
         "b1d34ac4-44b5-4a9a-aea6-d32d2ddaa333": {
           "display_id": 1442,
@@ -37712,11 +37721,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1376,
       "timestamp": "2026-08-24T01:54:35.544609535Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1377,
+      "timestamp": "2026-08-24T01:58:08.271643283Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:54:35.544609535Z",
+    "timestamp": "2026-08-24T01:58:08.271643283Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1376
+    "agent_seq": 1377
   }
 }
