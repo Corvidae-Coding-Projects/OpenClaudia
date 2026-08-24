@@ -8085,12 +8085,13 @@
       "display_id": 1126,
       "title": "S-027: Isolate Anthropic subscription compatibility behind an experimental build",
       "description": "Complete S-027 under the user's explicit research constraint. Supported Anthropic authentication must be the only default production behavior. Preserve the existing Claude Code subscription-token compatibility path behind an explicitly named Cargo development feature that is disabled by default, requires deliberate runtime acknowledgement, remains read-only through S-026, is visibly identified in diagnostics/traces, and cannot activate through fallback or credential auto-detection. Contain the Claude Code client ID, user agent, private OAuth endpoints, beta headers, identity system block, and native subscription OAuth flow behind the same boundary. Do not remove the experiment, change Codex auth, add concealment/enforcement evasion, or widen into unrelated provider work. Verify feature-off and feature-on builds/tests plus supported and experimental live paths on Rust 1.98 with bounded resources.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T04:30:05.624298691Z",
-      "updated_at": "2026-08-24T06:36:04.976514124Z",
+      "updated_at": "2026-08-24T06:36:13.161592478Z",
+      "closed_at": "2026-08-24T06:36:13.161590896Z",
       "labels": [
         "remediation"
       ],
@@ -38189,11 +38190,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1418,
       "timestamp": "2026-08-24T06:36:04.976514124Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1419,
+      "timestamp": "2026-08-24T06:36:13.161592478Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T06:36:04.976514124Z",
+    "timestamp": "2026-08-24T06:36:13.161592478Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1418
+    "agent_seq": 1419
   }
 }
