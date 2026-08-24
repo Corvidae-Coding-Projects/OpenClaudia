@@ -1,6 +1,6 @@
 {
   "next_display_id": 1127,
-  "next_comment_id": 1461,
+  "next_comment_id": 1462,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8053,11 +8053,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T04:30:05.624298691Z",
-      "updated_at": "2026-08-24T04:34:46.866576750Z",
+      "updated_at": "2026-08-24T04:34:51.183677104Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "02c8c227-a3d3-4b58-9b13-ba80d69ce779": {
+          "display_id": 1461,
+          "author": "6Vw9",
+          "content": "[action] Expanded S-027: quarantine legacy direct OAuth and evaluate/implement official Agent SDK/claude -p subscription backend; no legacy removal unless live proof succeeds.",
+          "created_at": "2026-08-24T04:34:51.181195827Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkMZetKAXE2Nv4qyOVgMnwsvAng5r6141WXLVsMM8V2abcLp3lLBt171rRgjZ7LDlzSg9veAwyqWMWAh5r55EBg=="
+        },
         "4668b2b9-ee10-49f2-ab95-ea8b1bc55db0": {
           "display_id": 1460,
           "author": "6Vw9",
@@ -38057,11 +38066,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1408,
       "timestamp": "2026-08-24T04:34:46.866576750Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1409,
+      "timestamp": "2026-08-24T04:34:51.183677104Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T04:34:46.866576750Z",
+    "timestamp": "2026-08-24T04:34:51.183677104Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1408
+    "agent_seq": 1409
   }
 }
