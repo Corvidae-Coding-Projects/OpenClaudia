@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1131,
+  "next_display_id": 1132,
   "next_comment_id": 1494,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -224,6 +224,7 @@
     "33cb00b4-7df0-49dd-b16c-3cafe2595a7d": 807,
     "341e49f0-ad6a-48d3-aa1e-057ff907b982": 52,
     "342218b1-909d-46d6-ac09-6bd04ecd5cea": 364,
+    "34f3c26d-31c8-4e3f-9e30-d98f53383158": 1131,
     "35491088-6cfd-4320-a2c9-8ca65c96176a": 674,
     "3585b217-d0f8-4cc6-9e2b-545580a1114a": 311,
     "35caf7c0-a5ea-4cff-8feb-5b5f07438ea3": 854,
@@ -6899,6 +6900,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfNqXpOVB+h/dZHapR54vO6B6U0cuRTY+aBeLJhpQeS5+8F2MV4clIfFJTVBOL30PphsHXTDq4R9vQblMB4jJBw=="
         }
       }
+    },
+    "34f3c26d-31c8-4e3f-9e30-d98f53383158": {
+      "uuid": "34f3c26d-31c8-4e3f-9e30-d98f53383158",
+      "display_id": 1131,
+      "title": "Document unavoidable Windows target duplicate generations",
+      "description": "The PR repository-policy job fails cargo-deny bans because rpassword/rtoolbox requires windows-targets 0.52 while arboard requires 0.53. Confirm both trees are current and unavoidable, then add only exact locked skip entries for the duplicate Windows target family so new generations still fail policy.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T19:26:27.582599931Z",
+      "updated_at": "2026-08-24T19:26:27.582599931Z"
     },
     "35491088-6cfd-4320-a2c9-8ca65c96176a": {
       "uuid": "35491088-6cfd-4320-a2c9-8ca65c96176a",
@@ -38730,11 +38743,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1468,
       "timestamp": "2026-08-24T19:26:19.577051118Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1469,
+      "timestamp": "2026-08-24T19:26:27.582599931Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:26:19.577051118Z",
+    "timestamp": "2026-08-24T19:26:27.582599931Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1468
+    "agent_seq": 1469
   }
 }
