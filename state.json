@@ -1,6 +1,6 @@
 {
   "next_display_id": 1130,
-  "next_comment_id": 1491,
+  "next_comment_id": 1492,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8517,7 +8517,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-24T19:23:24.396514123Z",
+      "updated_at": "2026-08-24T19:23:37.326529516Z",
       "labels": [
         "remediation"
       ],
@@ -8712,6 +8712,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdzyJBEmDLYHpw31C8Xl3TOtzoARDl+zCjthEj3yBlgHCq8jirIrbucj3jjb1oErpTQ7Fcet8j5A6lzYdCIsuDg=="
+        },
+        "29a9cd79-e8fc-4ee0-b000-d3279b398f14": {
+          "display_id": 1491,
+          "author": "6Vw9",
+          "content": "Commit f54db67f (docs(changelog): preserve Crosslink reclosure output) records the exact CHANGELOG.md line emitted by Crosslink when completed child #1129 was reclosed after commit. No generated output was normalized or deduplicated; no code changed.",
+          "created_at": "2026-08-24T19:23:37.324078854Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALnnVtBDzzvBS6ndje0GyqNgSUJu9GGIAK6wOmBOtxhvjMex7ScdPQG17LeVwuSh4fnUD1lB3v2QrPoEDLWU8Bw=="
         },
         "39cff6d1-6a19-465b-a3b7-6a5360281577": {
           "display_id": 1259,
@@ -38659,11 +38668,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1463,
       "timestamp": "2026-08-24T19:23:24.396514123Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1464,
+      "timestamp": "2026-08-24T19:23:37.326529516Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:23:24.396514123Z",
+    "timestamp": "2026-08-24T19:23:37.326529516Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1463
+    "agent_seq": 1464
   }
 }
