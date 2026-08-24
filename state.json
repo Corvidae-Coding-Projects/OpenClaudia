@@ -1,6 +1,6 @@
 {
   "next_display_id": 1130,
-  "next_comment_id": 1485,
+  "next_comment_id": 1486,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -5572,7 +5572,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T18:11:27.061351876Z",
-      "updated_at": "2026-08-24T18:51:45.059998162Z",
+      "updated_at": "2026-08-24T19:20:16.429479423Z",
       "labels": [
         "remediation"
       ],
@@ -5585,6 +5585,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAe+Ru7iva+5lc/yy/2T4applakgH/hzSqNsYQdPHRRRve1JWEa0p3Zf+oucZHZX2ZxF6P/GpQD7mpbka8ap8DDQ=="
+        },
+        "0371357d-a560-49b6-9943-29b339b0645e": {
+          "display_id": 1485,
+          "author": "6Vw9",
+          "content": "S-032 implementation and final review are complete. read_file now returns the SHA-256 generation of the exact stable bytes used for rendering and ledger evidence; existing-file edit/write require that per-run path-bound generation, preflight bounded encoding/match/growth/diff/sensitivity/guardrail work, and publish atomically. Linux rename exchange and macOS RENAME_SWAP verify the displaced generation; concurrent one-byte changes return Conflict/Safe without overwriting newer bytes. Rust 1.98 gates passed: fmt --check, check --locked --all-targets --all-features, Clippy with -D warnings, and the full serialized all-target/all-feature suite. Final focused runs also passed 20 edit, 20 write, 21 read, 10 race, 8 cross-tool, 13 evidence-learning, 131 integration (129 pass/2 ignored), 6 security, 22 registry-handler, 28 registry-schema, and 42 ACP session-mode tests. S-088 VDD receipt remains unavailable and is not claimed.",
+          "created_at": "2026-08-24T19:20:16.425252965Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAk8lZayTsgjCOfO0XWPBSUSLyUhY+C8/55vD+THqtR+8uiidDZqq+11xUmHYmiFH3u88eeJkkin/67q4LLuszAQ=="
         },
         "4b1c0ea1-0181-496d-88e2-abeb1c4b7139": {
           "display_id": 1482,
@@ -38539,11 +38548,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1450,
       "timestamp": "2026-08-24T18:51:45.059998162Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1451,
+      "timestamp": "2026-08-24T19:20:16.429479423Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T18:51:45.059998162Z",
+    "timestamp": "2026-08-24T19:20:16.429479423Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1450
+    "agent_seq": 1451
   }
 }
