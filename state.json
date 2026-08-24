@@ -4151,12 +4151,13 @@
       "display_id": 1127,
       "title": "Allow grounded final answers for exact file-read observations",
       "description": "Live S-027 Agent SDK validation proved read_file succeeds, but the final gate has no claim type applicable to a fresh FileRead observation. It rejects ordinary read-only conclusions as if they required a quality-gate receipt. Add a narrowly scoped file_observation claim with path, statement, and exact fresh file-read evidence; keep all existing trust/freshness/run-binding checks.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "44d55ef5-2b88-40b0-a4c6-b035ca79477b",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T05:25:35.058073537Z",
-      "updated_at": "2026-08-24T06:35:32.534304014Z",
+      "updated_at": "2026-08-24T06:35:40.016849942Z",
+      "closed_at": "2026-08-24T06:35:40.016848405Z",
       "labels": [
         "defect"
       ],
@@ -38155,11 +38156,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1415,
       "timestamp": "2026-08-24T06:35:32.534304014Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1416,
+      "timestamp": "2026-08-24T06:35:40.016849942Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T06:35:32.534304014Z",
+    "timestamp": "2026-08-24T06:35:40.016849942Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1415
+    "agent_seq": 1416
   }
 }
