@@ -1,6 +1,6 @@
 {
   "next_display_id": 1130,
-  "next_comment_id": 1482,
+  "next_comment_id": 1483,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -5572,10 +5572,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T18:11:27.061351876Z",
-      "updated_at": "2026-08-24T18:11:31.655886184Z",
+      "updated_at": "2026-08-24T18:18:53.092656835Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "4b1c0ea1-0181-496d-88e2-abeb1c4b7139": {
+          "display_id": 1482,
+          "author": "6Vw9",
+          "content": "Preflight traced the production read/edit/write/diff path. Current READ_TRACKER stores only canonical path plus recency; successful read then reopens the path for ledger hashing, while edit/write reopen again and truncate in place. The scoped design will bind a per-run canonical resource to a SHA-256 generation derived from the same stable bounded bytes used to render read_file, require expected_snapshot for existing-file mutation, revalidate immediately before descriptor-relative atomic publication, precompute edit match/result/diff budgets before allocation, and emit only bounded sanitized diff evidence. New-file write remains snapshot-free. Notebook transactional migration remains S-035; only shared tracker compatibility is preserved here.",
+          "created_at": "2026-08-24T18:18:53.090045361Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATBEIenCg9y/XNHIbur2eSyYE0MPzYr9ePpTdl2bfbRLGLt5/uQxs2ZTq5Pm5MMk7klUSCGlcp1ATE4Q6KdxOBA=="
+        }
+      }
     },
     "29f59304-df4c-48be-9132-0c75e5162b83": {
       "uuid": "29f59304-df4c-48be-9132-0c75e5162b83",
@@ -38495,11 +38506,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1447,
       "timestamp": "2026-08-24T18:11:37.032615520Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1448,
+      "timestamp": "2026-08-24T18:18:53.092656835Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T18:11:37.032615520Z",
+    "timestamp": "2026-08-24T18:18:53.092656835Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1447
+    "agent_seq": 1448
   }
 }
