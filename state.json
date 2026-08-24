@@ -1,6 +1,6 @@
 {
   "next_display_id": 1132,
-  "next_comment_id": 1496,
+  "next_comment_id": 1497,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6936,10 +6936,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T19:26:27.582599931Z",
-      "updated_at": "2026-08-24T19:26:33.326935988Z",
+      "updated_at": "2026-08-24T19:34:02.084305645Z",
       "labels": [
         "ci"
-      ]
+      ],
+      "comments": {
+        "6bb49cdc-cfa2-431d-a966-22074916652e": {
+          "display_id": 1496,
+          "author": "6Vw9",
+          "content": "Confirm the root and fuzz locked dependency trees that force Windows target generations 0.52 and 0.53, add only exact older-generation exceptions while leaving the preferred generation unskipped, verify repository-policy tests and both exact cargo-deny commands, then commit and preserve Crosslink-generated changelog output exactly.",
+          "created_at": "2026-08-24T19:34:02.081779936Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAN63al/UtUflSnXi7ecbOqEoGk61GYr+GrARHWayTLKnP9qOlTuWYduNG7no2bF/FH4PImADLAOlU0RCZdwr0Dg=="
+        }
+      }
     },
     "35491088-6cfd-4320-a2c9-8ca65c96176a": {
       "uuid": "35491088-6cfd-4320-a2c9-8ca65c96176a",
@@ -38811,11 +38822,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1476,
       "timestamp": "2026-08-24T19:33:52.501012350Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1477,
+      "timestamp": "2026-08-24T19:34:02.084305645Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:33:52.501012350Z",
+    "timestamp": "2026-08-24T19:34:02.084305645Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1476
+    "agent_seq": 1477
   }
 }
