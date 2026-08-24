@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1133,
+  "next_display_id": 1134,
   "next_comment_id": 1509,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -725,6 +725,7 @@
     "af29545f-19a3-41c8-8d84-9ae94826c2f4": 230,
     "af46c0de-6bc2-443d-87b0-90465c94fd33": 416,
     "af481bd6-81aa-4baf-abb9-97a71af85f02": 618,
+    "b008e498-0c2b-4ac6-9e18-faad43bd98a2": 1133,
     "b04d2823-3401-4393-accf-f2d833fa9ffe": 503,
     "b0ac9d41-3bff-45e5-b29f-e0cb29d0ef27": 22,
     "b0cb96f2-951a-44b4-b8d3-a84db6619496": 226,
@@ -22583,6 +22584,18 @@
         "feature"
       ]
     },
+    "b008e498-0c2b-4ac6-9e18-faad43bd98a2": {
+      "uuid": "b008e498-0c2b-4ac6-9e18-faad43bd98a2",
+      "display_id": 1133,
+      "title": "Keep sandboxed background jobs owned by their supervisor thread",
+      "description": "Linux bubblewrap uses PR_SET_PDEATHSIG for --die-with-parent, whose parent is the specific thread that creates the child. BackgroundShellManager currently spawns bubblewrap on the caller thread and then moves Child to another supervisor thread, so a transient tool/spawn thread can SIGKILL a valid background job and free its cap slot. Preserve --die-with-parent and move process spawn plus supervision onto the same dedicated job thread with a synchronous startup receipt. Keep cap/preparation admission atomic, durable Starting/Running/terminal records, explicit cancellation/reaping, workspace projection settlement, budget/freshness semantics, and existing shell_id/error contracts. Add a regression proving the creating thread may return while the job stays running.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T21:28:48.784229268Z",
+      "updated_at": "2026-08-24T21:28:48.784229268Z"
+    },
     "b04d2823-3401-4393-accf-f2d833fa9ffe": {
       "uuid": "b04d2823-3401-4393-accf-f2d833fa9ffe",
       "display_id": 503,
@@ -39069,11 +39082,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1500,
       "timestamp": "2026-08-24T21:24:51.276126752Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1501,
+      "timestamp": "2026-08-24T21:28:48.784229268Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T21:24:51.276126752Z",
+    "timestamp": "2026-08-24T21:28:48.784229268Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1500
+    "agent_seq": 1501
   }
 }
