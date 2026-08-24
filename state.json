@@ -1,6 +1,6 @@
 {
   "next_display_id": 1124,
-  "next_comment_id": 1438,
+  "next_comment_id": 1439,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9329,7 +9329,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:07:01.696684309Z",
-      "updated_at": "2026-08-24T01:30:49.252320371Z",
+      "updated_at": "2026-08-24T01:31:47.982763390Z",
       "labels": [
         "defect"
       ],
@@ -9345,6 +9345,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcNHGUnHfBgMHlGZTUUH9OcEG4ifggHl9idRgilKQp9x0+6qkhexalWPKxaH9mdt4K8xNC5UOuFs1H9H+E7S8BQ=="
+        },
+        "9adf9694-900b-4731-8b6d-051ed106872f": {
+          "display_id": 1438,
+          "author": "6Vw9",
+          "content": "[result] 066804c1 fix(auth): complete native OAuth session lifecycle — removed the unsupported output-limit field only from account-backed Codex wire requests after local budget admission, repaired Responses terminal reconciliation, added regressions, and passed a real Codex auth.json conversation without rewriting credentials.",
+          "created_at": "2026-08-24T01:31:47.979316255Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAV9TuZb6vwkysgCgwlS/SnaIgi5cIWLsPDtCAW69F4pe42aejOOGAJC4i2l7s1SFjq5gTimrdMZXjs+W3Ms9zDw=="
         },
         "c4801fa3-e4d9-49a8-93ee-2dffbc9e3ff6": {
           "display_id": 1435,
@@ -37548,11 +37557,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1361,
       "timestamp": "2026-08-24T01:31:42.991463393Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1362,
+      "timestamp": "2026-08-24T01:31:47.982763390Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:31:42.991463393Z",
+    "timestamp": "2026-08-24T01:31:47.982763390Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1361
+    "agent_seq": 1362
   }
 }
