@@ -10784,11 +10784,12 @@
       "uuid": "5a1cbc16-1b92-4a8e-8f21-a33aa9646bc9",
       "display_id": 1124,
       "title": "S-030: Make interactive API-key setup secret safe",
+      "description": "Implement S-030 on the live interactive API-key entry paths: hidden terminal input into the existing typed ApiKey, an explicit provider/scope/destination/overwrite confirmation, protected OpenClaudia-owned user credential persistence through S-031, and normal runtime discovery of those stored keys. Never fall back to a project-local plaintext config or restore the removed legacy /connect YAML rewrite. Preserve existing environment/config/Codex/Claude credential precedence and behavior. Invalid, cancelled, interrupted, and denied-overwrite flows must leave prior credentials byte-identical. Verify on Rust 1.98 with memory-bounded Cargo jobs and realistic deterministic terminal/persistence tests.",
       "status": "open",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T01:52:48.843928461Z",
-      "updated_at": "2026-08-24T01:53:19.167383522Z",
+      "updated_at": "2026-08-24T01:54:22.322560785Z",
       "labels": [
         "remediation"
       ],
@@ -37669,11 +37670,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1372,
       "timestamp": "2026-08-24T01:53:19.167383522Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1373,
+      "timestamp": "2026-08-24T01:54:22.322560785Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:53:19.167383522Z",
+    "timestamp": "2026-08-24T01:54:22.322560785Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1372
+    "agent_seq": 1373
   }
 }
