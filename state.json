@@ -1,6 +1,6 @@
 {
   "next_display_id": 1126,
-  "next_comment_id": 1455,
+  "next_comment_id": 1456,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24209,7 +24209,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T03:16:26.714155934Z",
-      "updated_at": "2026-08-24T03:22:50.827171615Z",
+      "updated_at": "2026-08-24T03:23:04.512567771Z",
       "labels": [
         "remediation"
       ],
@@ -24217,6 +24217,15 @@
         "46f1d200-b3c8-465c-9e83-85fa06120cb7"
       ],
       "comments": {
+        "36e18105-1c2e-49bb-b882-f73f79e058a8": {
+          "display_id": 1455,
+          "author": "6Vw9",
+          "content": "Preflight confirmed a live, user-impacting defect: OpenClaudia refreshes and serializes Claude Code credentials through a partial schema, while the installed credential document contains at least one additional OAuth field that would be lost. S-026 will preserve valid Claude Code login compatibility through bounded read-only access, remove OpenClaudia refresh/write ownership, provide typed actionable stale states, and verify byte preservation, permissions, symlink rejection, concurrent replacement, CLI behavior, and a built-binary login path. S-027 client identity policy remains out of scope.",
+          "created_at": "2026-08-24T03:23:04.510011946Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAadmI8eKsKT3hVuHus5QFiyfQxM969jtPFqifhHf2qCypYd2OQ0AhQWJwCSJ/qH7KvGOFZDiEiZYR5SXedGfBCg=="
+        },
         "9ed1d20a-3f77-46cc-b958-6d9d65853477": {
           "display_id": 1454,
           "author": "6Vw9",
@@ -37920,11 +37929,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1396,
       "timestamp": "2026-08-24T03:22:50.827171615Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1397,
+      "timestamp": "2026-08-24T03:23:04.512567771Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T03:22:50.827171615Z",
+    "timestamp": "2026-08-24T03:23:04.512567771Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1396
+    "agent_seq": 1397
   }
 }
