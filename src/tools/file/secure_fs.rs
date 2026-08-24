@@ -16,6 +16,31 @@ use std::sync::Arc;
 
 use crate::tools::security::{ToolResource, ToolRunContext};
 
+#[derive(Debug)]
+pub(super) enum AtomicWriteError {
+    Conflict {
+        expected: Option<crate::runtime::ContentDigest>,
+        observed: Option<crate::runtime::ContentDigest>,
+    },
+    Failed(String),
+}
+
+impl std::fmt::Display for AtomicWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict { expected, observed } => write!(
+                formatter,
+                "file snapshot conflict (expected {}, observed {})",
+                expected.map_or_else(|| "missing".to_string(), |value| value.to_string()),
+                observed.map_or_else(|| "missing".to_string(), |value| value.to_string())
+            ),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AtomicWriteError {}
+
 #[derive(Clone, Copy)]
 enum CapabilityDomain {
     Agent,
@@ -386,6 +411,460 @@ fn read_bounded_once(
         ));
     }
     Ok(bytes)
+}
+
+/// Publish a complete file generation without exposing a truncated target.
+///
+/// `expected = Some(digest)` replaces only that generation. `None` is a
+/// create-only operation and never overwrites a concurrently created leaf.
+/// The staged file is synchronized before one descriptor-relative namespace
+/// operation publishes it.
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)] // Keep the ordered atomic-publication protocol visible as one transaction.
+pub(super) fn write_atomic_generation(
+    context: &ToolRunContext,
+    path: &Path,
+    expected: Option<crate::runtime::ContentDigest>,
+    contents: &[u8],
+    maximum_bytes: usize,
+) -> Result<crate::runtime::ContentDigest, AtomicWriteError> {
+    use std::ffi::CString;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if contents.len() > maximum_bytes {
+        return Err(AtomicWriteError::Failed(format!(
+            "File '{}' would exceed the {maximum_bytes}-byte write budget",
+            path.display()
+        )));
+    }
+    context
+        .require(ToolResource::WorkspaceWrite)
+        .map_err(|error| AtomicWriteError::Failed(error.to_string()))?;
+
+    let initial = observe_writable_generation(context, path, maximum_bytes)?;
+    if initial.as_ref().map(|observed| observed.digest) != expected {
+        return Err(AtomicWriteError::Conflict {
+            expected,
+            observed: initial.map(|observed| observed.digest),
+        });
+    }
+    if expected.is_none() {
+        create_parent_directories(context, path, CapabilityDomain::Agent)
+            .map_err(AtomicWriteError::Failed)?;
+    }
+
+    let (root, root_handle) = context
+        .root_handle_for(path, true)
+        .map_err(AtomicWriteError::Failed)?;
+    let relative = relative_to_root(path, root).map_err(AtomicWriteError::Failed)?;
+    let leaf = relative.file_name().ok_or_else(|| {
+        AtomicWriteError::Failed(format!("File '{}' has no leaf name", path.display()))
+    })?;
+    let parent_relative = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = openat2_relative(
+        root_handle,
+        parent_relative,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )
+    .map_err(|error| {
+        AtomicWriteError::Failed(format!(
+            "Failed to pin parent directory for '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let leaf = CString::new(leaf.as_bytes()).map_err(|_| {
+        AtomicWriteError::Failed(format!("File '{}' has a NUL leaf name", path.display()))
+    })?;
+
+    let stage_name = CString::new(format!(
+        ".openclaudia-edit-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ))
+    .expect("generated stage name contains no NUL");
+    // SAFETY: `parent` is a live directory descriptor and `stage_name` is a
+    // generated single component. O_EXCL prevents collision or substitution.
+    let raw_stage = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            stage_name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666,
+        )
+    };
+    if raw_stage < 0 {
+        return Err(AtomicWriteError::Failed(format!(
+            "Failed to stage atomic write for '{}': {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: openat returned a fresh owned descriptor.
+    let stage_file = unsafe { File::from_raw_fd(raw_stage) };
+    let mut stage = AtomicStage {
+        parent: &parent,
+        name: stage_name,
+        file: stage_file,
+        active: true,
+    };
+
+    if let Some(observed) = &initial {
+        stage
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(observed.mode))
+            .map_err(|error| {
+                AtomicWriteError::Failed(format!(
+                    "Failed to preserve mode for '{}': {error}",
+                    path.display()
+                ))
+            })?;
+    }
+    stage.file.write_all(contents).map_err(|error| {
+        AtomicWriteError::Failed(format!("Failed to stage '{}': {error}", path.display()))
+    })?;
+    stage.file.sync_all().map_err(|error| {
+        AtomicWriteError::Failed(format!(
+            "Failed to synchronize staged bytes for '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    let before_publish = observe_writable_generation(context, path, maximum_bytes)?;
+    if before_publish.as_ref().map(|observed| observed.digest) != expected {
+        return Err(AtomicWriteError::Conflict {
+            expected,
+            observed: before_publish.map(|observed| observed.digest),
+        });
+    }
+
+    if let Some(expected_generation) = expected {
+        publish_replacement(
+            &parent,
+            &mut stage,
+            &leaf,
+            expected_generation,
+            maximum_bytes,
+            path,
+        )?;
+    } else {
+        publish_new(&parent, &mut stage, &leaf).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AtomicWriteError::Conflict {
+                    expected: None,
+                    observed: observe_writable_generation(context, path, maximum_bytes)
+                        .ok()
+                        .flatten()
+                        .map(|observed| observed.digest),
+                }
+            } else {
+                AtomicWriteError::Failed(format!(
+                    "Failed to publish new file '{}': {error}",
+                    path.display()
+                ))
+            }
+        })?;
+    }
+
+    if let Err(error) = parent.sync_all() {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "atomic file bytes are visible but parent-directory durability is uncertain"
+        );
+    }
+    Ok(crate::runtime::ContentDigest::sha256(contents))
+}
+
+#[cfg(not(unix))]
+pub(super) fn write_atomic_generation(
+    _context: &ToolRunContext,
+    path: &Path,
+    _expected: Option<crate::runtime::ContentDigest>,
+    _contents: &[u8],
+    _maximum_bytes: usize,
+) -> Result<crate::runtime::ContentDigest, AtomicWriteError> {
+    Err(AtomicWriteError::Failed(format!(
+        "Atomic file write for '{}' is unavailable: this platform lacks a race-safe handle-relative filesystem backend",
+        path.display()
+    )))
+}
+
+#[cfg(unix)]
+struct ObservedGeneration {
+    digest: crate::runtime::ContentDigest,
+    mode: u32,
+}
+
+#[cfg(unix)]
+fn observe_writable_generation(
+    context: &ToolRunContext,
+    path: &Path,
+    maximum_bytes: usize,
+) -> Result<Option<ObservedGeneration>, AtomicWriteError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut file = match open_beneath(
+        context,
+        path,
+        true,
+        libc_flags::O_RDONLY,
+        0,
+        CapabilityDomain::Agent,
+    ) {
+        Ok(file) => file,
+        Err(error) if is_not_found_message(&error) => return Ok(None),
+        Err(error) => return Err(AtomicWriteError::Failed(error)),
+    };
+    require_regular(&file, path).map_err(AtomicWriteError::Failed)?;
+    reject_writable_hardlink(&file, path).map_err(AtomicWriteError::Failed)?;
+    let metadata = file.metadata().map_err(|error| {
+        AtomicWriteError::Failed(format!("Failed to inspect '{}': {error}", path.display()))
+    })?;
+    let bytes = read_stable_bounded_bytes(&mut file, path, maximum_bytes)
+        .map_err(AtomicWriteError::Failed)?;
+    Ok(Some(ObservedGeneration {
+        digest: crate::runtime::ContentDigest::sha256(bytes),
+        mode: metadata.mode() & 0o7777,
+    }))
+}
+
+#[cfg(unix)]
+struct AtomicStage<'a> {
+    parent: &'a File,
+    name: std::ffi::CString,
+    file: File,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl Drop for AtomicStage<'_> {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        if self.active {
+            // SAFETY: the parent outlives this guard and the generated name is
+            // a single NUL-terminated component.
+            unsafe {
+                libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_new(
+    parent: &File,
+    stage: &mut AtomicStage<'_>,
+    leaf: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: descriptors and names are valid. RENAME_NOREPLACE makes file
+    // creation atomic with respect to a concurrent creator.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            stage.name.as_ptr(),
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    stage.active = false;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn publish_new(
+    parent: &File,
+    stage: &mut AtomicStage<'_>,
+    leaf: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // linkat is a no-replace publication. Removing the staging name leaves the
+    // completed inode visible at the requested leaf.
+    let linked = unsafe {
+        libc::linkat(
+            parent.as_raw_fd(),
+            stage.name.as_ptr(),
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            0,
+        )
+    };
+    if linked != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let unlinked = unsafe { libc::unlinkat(parent.as_raw_fd(), stage.name.as_ptr(), 0) };
+    if unlinked != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    stage.active = false;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_replacement(
+    parent: &File,
+    stage: &mut AtomicStage<'_>,
+    leaf: &std::ffi::CStr,
+    expected: crate::runtime::ContentDigest,
+    maximum_bytes: usize,
+    path: &Path,
+) -> Result<(), AtomicWriteError> {
+    use std::os::fd::AsRawFd as _;
+    let exchange = |left: &std::ffi::CStr, right: &std::ffi::CStr| {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent.as_raw_fd(),
+                left.as_ptr(),
+                parent.as_raw_fd(),
+                right.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    publish_replacement_with_exchange(parent, stage, leaf, expected, maximum_bytes, path, exchange)
+}
+
+#[cfg(target_os = "macos")]
+fn publish_replacement(
+    parent: &File,
+    stage: &mut AtomicStage<'_>,
+    leaf: &std::ffi::CStr,
+    expected: crate::runtime::ContentDigest,
+    maximum_bytes: usize,
+    path: &Path,
+) -> Result<(), AtomicWriteError> {
+    use std::os::fd::AsRawFd as _;
+    let exchange = |left: &std::ffi::CStr, right: &std::ffi::CStr| {
+        // SAFETY: both names are single components below the pinned parent.
+        // RENAME_SWAP atomically retains the displaced generation for review.
+        let result = unsafe {
+            libc::renameatx_np(
+                parent.as_raw_fd(),
+                left.as_ptr(),
+                parent.as_raw_fd(),
+                right.as_ptr(),
+                libc::RENAME_SWAP,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    publish_replacement_with_exchange(parent, stage, leaf, expected, maximum_bytes, path, exchange)
+}
+
+/// Exchange gives us the exact displaced inode under the private staging
+/// name. Verifying that inode after the atomic swap closes the final pathname
+/// race; a mismatch is exchanged back before returning conflict.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_replacement_with_exchange(
+    parent: &File,
+    stage: &mut AtomicStage<'_>,
+    leaf: &std::ffi::CStr,
+    expected: crate::runtime::ContentDigest,
+    maximum_bytes: usize,
+    path: &Path,
+    exchange: impl Fn(&std::ffi::CStr, &std::ffi::CStr) -> std::io::Result<()>,
+) -> Result<(), AtomicWriteError> {
+    use std::os::fd::AsRawFd as _;
+    exchange(&stage.name, leaf).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AtomicWriteError::Conflict {
+                expected: Some(expected),
+                observed: None,
+            }
+        } else {
+            AtomicWriteError::Failed(format!(
+                "Failed to atomically replace '{}': {error}",
+                path.display()
+            ))
+        }
+    })?;
+
+    let displaced = openat2_relative(
+        parent,
+        Path::new(stage.name.to_str().unwrap_or_default()),
+        libc::O_RDONLY,
+        0,
+    )
+    .and_then(|mut file| {
+        read_stable_bounded_bytes(&mut file, path, maximum_bytes).map_err(std::io::Error::other)
+    });
+    let observed = displaced
+        .as_ref()
+        .ok()
+        .map(crate::runtime::ContentDigest::sha256);
+    if observed != Some(expected) {
+        exchange(&stage.name, leaf).map_err(|error| {
+            AtomicWriteError::Failed(format!(
+                "Snapshot conflict for '{}' could not restore the displaced generation: {error}",
+                path.display()
+            ))
+        })?;
+        return Err(AtomicWriteError::Conflict {
+            expected: Some(expected),
+            observed,
+        });
+    }
+    let unlinked = unsafe { libc::unlinkat(parent.as_raw_fd(), stage.name.as_ptr(), 0) };
+    if unlinked != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            error = %std::io::Error::last_os_error(),
+            "atomic replacement succeeded but displaced-file cleanup must be retried"
+        );
+        return Ok(());
+    }
+    stage.active = false;
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn publish_replacement(
+    parent: &File,
+    stage: &mut AtomicStage<'_>,
+    leaf: &std::ffi::CStr,
+    _expected: crate::runtime::ContentDigest,
+    _maximum_bytes: usize,
+    path: &Path,
+) -> Result<(), AtomicWriteError> {
+    use std::os::fd::AsRawFd as _;
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            stage.name.as_ptr(),
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(AtomicWriteError::Failed(format!(
+            "Failed to atomically replace '{}': {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    stage.active = false;
+    Ok(())
 }
 
 #[cfg(unix)]

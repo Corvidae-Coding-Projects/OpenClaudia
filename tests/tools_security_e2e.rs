@@ -263,6 +263,12 @@ fn exact_run_identity_partitions_read_before_edit_state() {
         ),
     );
     assert!(!read.is_error(), "run A read must succeed, got {read:?}");
+    let snapshot = read
+        .content()
+        .rsplit_once("File snapshot: generation=")
+        .and_then(|(_, suffix)| suffix.split(',').next())
+        .filter(|generation| generation.starts_with("sha256:"))
+        .expect("successful read must expose a snapshot generation");
 
     let edit = execute_tool(
         &run_b,
@@ -272,6 +278,7 @@ fn exact_run_identity_partitions_read_before_edit_state() {
                 "path": path.to_string_lossy().to_string(),
                 "old_string": "v1",
                 "new_string": "v2",
+                "expected_snapshot": snapshot,
             }),
         ),
     );
@@ -289,6 +296,7 @@ fn exact_run_identity_partitions_read_before_edit_state() {
                 "path": path.to_string_lossy().to_string(),
                 "old_string": "v1",
                 "new_string": "v2",
+                "expected_snapshot": snapshot,
             }),
         ),
     );

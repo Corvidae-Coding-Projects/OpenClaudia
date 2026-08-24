@@ -2928,13 +2928,18 @@ impl AcpServer {
         let path = parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")?;
         let content = parse_acp_required_string_arg(args, "content")?;
 
+        let mut local_args = json!({"path": path, "content": content});
+        if let Some(expected) = args.get("expected_snapshot") {
+            local_args["expected_snapshot"] = expected.clone();
+        }
+
         Ok(self
             .execute_local_tool_async(
                 run,
                 session_id,
                 tool_call_id,
                 "write_file",
-                &json!({"path": path, "content": content}).to_string(),
+                &local_args.to_string(),
             )
             .await)
     }
@@ -2951,19 +2956,23 @@ impl AcpServer {
         let new_string = parse_acp_required_string_arg(args, "new_string")?;
         let replace_all = parse_acp_bool_arg(args, "replace_all", false)?;
 
+        let mut local_args = json!({
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+            "replace_all": replace_all
+        });
+        if let Some(expected) = args.get("expected_snapshot") {
+            local_args["expected_snapshot"] = expected.clone();
+        }
+
         Ok(self
             .execute_local_tool_async(
                 run,
                 session_id,
                 tool_call_id,
                 "edit_file",
-                &json!({
-                    "path": path,
-                    "old_string": old_string,
-                    "new_string": new_string,
-                    "replace_all": replace_all
-                })
-                .to_string(),
+                &local_args.to_string(),
             )
             .await)
     }
@@ -5505,6 +5514,12 @@ memory:
         )
         .await;
         assert!(!read.is_error(), "ACP read failed: {read:?}");
+        let snapshot = read
+            .content()
+            .rsplit_once("File snapshot: generation=")
+            .and_then(|(_, suffix)| suffix.split(',').next())
+            .filter(|generation| generation.starts_with("sha256:"))
+            .expect("successful ACP read must expose a snapshot generation");
 
         let edit_id = "acp-learning-edit";
         let edit = execute_acp_memory_tool(
@@ -5515,7 +5530,8 @@ memory:
             json!({
                 "path": source_path,
                 "old_string": broken_source,
-                "new_string": fixed_source
+                "new_string": fixed_source,
+                "expected_snapshot": snapshot
             }),
         )
         .await;

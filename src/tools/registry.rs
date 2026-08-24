@@ -569,7 +569,7 @@ impl ToolHandler for ReadFileHandler {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file. Returns the file content as text with line numbers. Supports images (PNG, JPG, GIF, WebP) via base64 encoding, PDFs via pdftotext extraction, and Jupyter notebooks (.ipynb) with formatted cell output.",
+                "description": "Read the contents of a file and return an immutable snapshot generation for later edits or overwrites. Returns text with line numbers; supports images (PNG, JPG, GIF, WebP), PDFs, and Jupyter notebooks.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -672,7 +672,7 @@ impl ToolHandler for WriteFileHandler {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write content to a file. Creates the file if it doesn't exist. To overwrite an existing file, first read it successfully with read_file in the same session; failed reads do not satisfy the overwrite gate.",
+                "description": "Write content to a file atomically. New files need no snapshot. To overwrite, first read the file successfully with read_file and pass its returned generation as expected_snapshot; a changed generation returns a conflict without overwriting newer content.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -683,6 +683,11 @@ impl ToolHandler for WriteFileHandler {
                         "content": {
                             "type": "string",
                             "description": "The content to write to the file"
+                        },
+                        "expected_snapshot": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                            "description": "Snapshot generation returned by read_file. Required when overwriting an existing file; omit when creating a new file."
                         }
                     },
                     "required": ["path", "content"]
@@ -719,7 +724,7 @@ impl ToolHandler for EditFileHandler {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Make a targeted edit to a file by replacing old_string with new_string. The file must first be read successfully with read_file in the same session, and old_string must match exactly.",
+                "description": "Atomically replace exact text in a reviewed file generation. First read the file successfully with read_file and pass its returned generation as expected_snapshot. Concurrent changes return a conflict without overwriting newer content.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -738,9 +743,14 @@ impl ToolHandler for EditFileHandler {
                         "replace_all": {
                             "type": "boolean",
                             "description": "If true, replace every occurrence of old_string. Defaults to false, which requires old_string to match exactly once."
+                        },
+                        "expected_snapshot": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                            "description": "Exact snapshot generation returned by read_file for this path."
                         }
                     },
-                    "required": ["path", "old_string", "new_string"]
+                    "required": ["path", "old_string", "new_string", "expected_snapshot"]
                 }
             }
         })

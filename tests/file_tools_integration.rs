@@ -28,6 +28,14 @@ fn make_call(name: &str, args: &serde_json::Value) -> ToolCall {
     }
 }
 
+fn snapshot_from_read_output(output: &str) -> &str {
+    output
+        .rsplit_once("File snapshot: generation=")
+        .and_then(|(_, suffix)| suffix.split(',').next())
+        .filter(|generation| generation.starts_with("sha256:"))
+        .expect("successful read must expose a snapshot generation")
+}
+
 // =============================================================================
 // Behavior 6 + 1 + 4: write → read → edit → read cross-tool flow
 // =============================================================================
@@ -85,6 +93,7 @@ fn write_read_edit_read_cross_tool_flow() {
         "suffix present: {}",
         rs.content()
     );
+    let edit_snapshot = snapshot_from_read_output(rs.content());
 
     // ---- Step 4: edit with matching old_string (Behavior 4 happy path) ------
     let edit_ok_call = make_call(
@@ -92,7 +101,8 @@ fn write_read_edit_read_cross_tool_flow() {
         &json!({
             "path": sub.to_string_lossy(),
             "old_string": "line two",
-            "new_string": "LINE TWO (edited)"
+            "new_string": "LINE TWO (edited)",
+            "expected_snapshot": edit_snapshot
         }),
     );
     let eo = execute_tool(support::shared_run_context(), &edit_ok_call);
@@ -111,6 +121,7 @@ fn write_read_edit_read_cross_tool_flow() {
         rf.content().contains("LINE TWO (edited)"),
         "edited content visible via read"
     );
+    let failed_edit_snapshot = snapshot_from_read_output(rf.content());
 
     // ---- Step 7: edit with absent old_string returns error (Behavior 4) -----
     let edit_bad_call = make_call(
@@ -118,7 +129,8 @@ fn write_read_edit_read_cross_tool_flow() {
         &json!({
             "path": sub.to_string_lossy(),
             "old_string": "ABSENT TEXT",
-            "new_string": "whatever"
+            "new_string": "whatever",
+            "expected_snapshot": failed_edit_snapshot
         }),
     );
     let eb = execute_tool(support::shared_run_context(), &edit_bad_call);
@@ -340,7 +352,13 @@ fn edit_replace_all_multi_occurrence_replaces_every_match() {
 
     // Read first (enforced by OC)
     let read_call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
-    let _ = execute_tool(support::shared_run_context(), &read_call);
+    let read = execute_tool(support::shared_run_context(), &read_call);
+    assert!(
+        !read.is_error(),
+        "read_file must succeed: {}",
+        read.content()
+    );
+    let snapshot = snapshot_from_read_output(read.content());
 
     let edit_call = make_call(
         "edit_file",
@@ -348,7 +366,8 @@ fn edit_replace_all_multi_occurrence_replaces_every_match() {
             "path": path.to_string_lossy(),
             "old_string": "foo",
             "new_string": "qux",
-            "replace_all": true
+            "replace_all": true,
+            "expected_snapshot": snapshot
         }),
     );
     let r = execute_tool(support::shared_run_context(), &edit_call);

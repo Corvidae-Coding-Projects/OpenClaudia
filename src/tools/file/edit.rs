@@ -1,4 +1,7 @@
-use super::{canonicalize_or_walk_up, resolve_open_path, resolve_path, secure_fs, READ_TRACKER};
+use super::{
+    canonicalize_or_walk_up, resolve_open_path, resolve_path, secure_fs, MAX_MUTATION_BYTES,
+    READ_TRACKER,
+};
 use crate::tools::args::{ToolArgs as _, ToolError};
 use crate::tools::{
     ToolArtifact, ToolDiff, ToolDisplay, ToolFailure, ToolFailureCode, ToolHandlerResult,
@@ -7,17 +10,7 @@ use crate::tools::{
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
-
-/// Truncate the open handle to zero and rewrite it with `new_content`.
-/// Keeps `execute_edit_file` under the clippy line budget while preserving
-/// the single-FD discipline that makes #417's `O_NOFOLLOW` open meaningful.
-fn rewrite_in_place(file: &mut std::fs::File, new_content: &str) -> std::io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    file.write_all(new_content.as_bytes())
-}
 
 /// Canonicalise the user-supplied edit path. Thin wrapper around the
 /// shared [`canonicalize_or_walk_up`] helper (crosslink #969) that
@@ -47,7 +40,9 @@ fn format_edit_success(
     new_string: &str,
     count: usize,
     replace_all: bool,
+    snapshots: (crate::runtime::ContentDigest, crate::runtime::ContentDigest),
 ) -> ToolHandlerResult {
+    let (before_snapshot, after_snapshot) = snapshots;
     tracing::event!(
         target: "openclaudia::tools::edit",
         tracing::Level::DEBUG,
@@ -78,10 +73,16 @@ fn format_edit_success(
     if let Some(warning) = crate::guardrails::check_diff_thresholds(run) {
         let _ = write!(summary, "\n\nWarning: {}", warning.message);
     }
+    let safe_old = run.sanitize_diagnostic(old_string).to_string();
+    let safe_new = run.sanitize_diagnostic(new_string).to_string();
+    let redacted = safe_old != old_string || safe_new != new_string;
     let diff = ToolDiff {
         path: path.to_string(),
-        old_text: old_string.to_string(),
-        new_text: new_string.to_string(),
+        old_text: safe_old,
+        new_text: safe_new,
+        before_snapshot: before_snapshot.to_string(),
+        after_snapshot: after_snapshot.to_string(),
+        redacted,
     };
     ToolHandlerResult::success_structured(
         summary.clone(),
@@ -91,6 +92,9 @@ fn format_edit_success(
             "replace_all": replace_all,
             "old_chars": old_string.len(),
             "new_chars": new_string.len(),
+            "before_snapshot": before_snapshot,
+            "after_snapshot": after_snapshot,
+            "diff_redacted": redacted,
         }),
     )
     .with_display(ToolDisplay::Diff {
@@ -102,7 +106,11 @@ fn format_edit_success(
         kind: "file_diff".to_string(),
         label: path.to_string(),
         metadata: serde_json::to_value(diff).expect("ToolDiff serialization cannot fail"),
-        sensitivity: ToolSensitivity::Workspace,
+        sensitivity: if redacted {
+            ToolSensitivity::Private
+        } else {
+            ToolSensitivity::Workspace
+        },
     })
 }
 
@@ -111,6 +119,18 @@ fn edit_error(message: String) -> ToolHandlerResult {
         ToolFailureCode::External,
         message,
         ToolRetryability::Unknown,
+    ))
+}
+
+fn edit_failure(failure: ToolFailure) -> ToolHandlerResult {
+    ToolHandlerResult::error(failure)
+}
+
+fn edit_invalid(message: String) -> ToolHandlerResult {
+    edit_failure(ToolFailure::new(
+        ToolFailureCode::InvalidInput,
+        message,
+        ToolRetryability::Never,
     ))
 }
 
@@ -145,19 +165,6 @@ pub fn execute_edit_file(
     };
     let path = path.as_str();
 
-    // ENFORCE: Must read file before editing
-    // This prevents the model from making edits based on hallucinated file contents
-    if !READ_TRACKER.has_been_read(run, Path::new(path)) {
-        return edit_error(format!(
-            "You must read '{path}' before editing it. Use read_file first to see the actual contents."
-        ));
-    }
-    if let Err(msg) =
-        super::require_fresh_file_observation_if_ledger_active(run, Path::new(path), "editing it")
-    {
-        return edit_error(msg);
-    }
-
     // crosslink #675: typed accessors.
     let old_string = match args.arg_str_strict("old_string") {
         Ok(s) => s,
@@ -167,6 +174,13 @@ pub fn execute_edit_file(
         Ok(s) => s,
         Err(e) => return ToolHandlerResult::from_migrated(Err(ToolError::InvalidArgument(e))),
     };
+
+    if old_string.is_empty() {
+        return edit_invalid(
+            "old_string must not be empty; an empty pattern is a degenerate match at every character boundary"
+                .to_string(),
+        );
+    }
 
     // crosslink #970: a no-op edit (`old_string == new_string`) would otherwise
     // burn a full read+truncate+write cycle on the file, churn the mtime, and
@@ -189,42 +203,63 @@ pub fn execute_edit_file(
         Err(e) => return ToolHandlerResult::from_migrated(Err(ToolError::InvalidArgument(e))),
     };
 
-    // Open ONCE with O_NOFOLLOW against the LEAF-PRESERVING path; all
-    // I/O goes through this FD. See crosslink #417 (dup #428).
-    let mut file = match secure_fs::open_regular_edit(run, &open_path) {
-        Ok(f) => f,
-        Err(error) => return edit_error(format!("Failed to securely open file '{path}': {error}")),
-    };
-
-    let mut content = String::new();
-    if let Err(e) = file.read_to_string(&mut content) {
-        return edit_error(format!("Failed to read file '{path}': {e}"));
+    let snapshot =
+        match super::require_expected_snapshot(run, Path::new(path), args.get("expected_snapshot"))
+        {
+            Ok(snapshot) => snapshot,
+            Err(failure) => return edit_failure(failure),
+        };
+    if let Err(msg) =
+        super::require_fresh_file_observation_if_ledger_active(run, Path::new(path), "editing it")
+    {
+        return edit_error(msg);
     }
 
-    // crosslink #470: single-pass dedup. The previous implementation walked
-    // `content` three times (`contains` → `matches().count()` → `replace`/
-    // `replacen`). On a 100 KB haystack that is three full scans for every
-    // edit. Collect the match offsets once and branch on the slice shape; the
-    // downstream replace still does one pass but the bookkeeping is free.
-    let match_offsets: Vec<usize> = content
-        .match_indices(old_string)
-        .map(|(idx, _)| idx)
-        .collect();
-    let count = match match_offsets.as_slice() {
-        [] => {
+    let bytes = match super::read_expected_snapshot_bytes(run, Path::new(path), snapshot) {
+        Ok(bytes) => bytes,
+        Err(failure) => return edit_failure(failure),
+    };
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(error) => {
+            return edit_invalid(format!(
+                "File '{path}' is not UTF-8 text and cannot be edited with edit_file: {error}"
+            ))
+        }
+    };
+
+    // Count without retaining every offset. A small pattern in a large file
+    // must not allocate a vector proportional to the number of matches.
+    let count = content.match_indices(old_string).count();
+    match count {
+        0 => {
             return edit_error(format!(
                 "Could not find the specified text in '{path}'. Make sure old_string matches exactly."
             ));
         }
-        [_] => 1usize,
+        1 => {}
         many if !replace_all => {
             return edit_error(format!(
-                "Found {} occurrences of the text. Please provide a more specific old_string that matches uniquely, or set replace_all: true to replace every occurrence.",
-                many.len()
+                "Found {many} occurrences of the text. Please provide a more specific old_string that matches uniquely, or set replace_all: true to replace every occurrence."
             ));
         }
-        many => many.len(),
+        _ => {}
+    }
+
+    let replaced_bytes = old_string.len().checked_mul(count).and_then(|removed| {
+        new_string
+            .len()
+            .checked_mul(count)
+            .and_then(|added| content.len().checked_sub(removed)?.checked_add(added))
+    });
+    let Some(result_bytes) = replaced_bytes else {
+        return edit_invalid(format!("Edit result size overflow for '{path}'"));
     };
+    if result_bytes > MAX_MUTATION_BYTES {
+        return edit_invalid(format!(
+            "Edit result for '{path}' would be {result_bytes} bytes, exceeding the {MAX_MUTATION_BYTES}-byte file limit"
+        ));
+    }
 
     // crosslink #988: `str::lines()` only recognises `\n` and `\r\n` and
     // collapses a final trailing newline so e.g. "x\n" → 1 line, "x" → 1
@@ -239,10 +274,14 @@ pub fn execute_edit_file(
     } else {
         content.replacen(old_string, new_string, 1)
     };
-    let (lines_added, lines_removed) = super::changed_line_counts(&content, &new_content);
+    debug_assert_eq!(new_content.len(), result_bytes);
+    let prepared_diff = match super::prepare_file_diff(run, path, &content, &new_content) {
+        Ok(prepared) => prepared,
+        Err(message) => return edit_invalid(message),
+    };
     let mut line_reservation = match crate::guardrails::reserve_changed_lines(
         run,
-        u64::from(lines_added) + u64::from(lines_removed),
+        u64::from(prepared_diff.lines_added) + u64::from(prepared_diff.lines_removed),
     ) {
         Ok(reservation) => reservation,
         Err(message) => return edit_error(message),
@@ -253,42 +292,55 @@ pub fn execute_edit_file(
             Err(message) => return edit_error(message),
         };
 
-    match rewrite_in_place(&mut file, &new_content) {
-        Ok(()) => {
+    match secure_fs::write_atomic_generation(
+        run,
+        &open_path,
+        Some(snapshot.generation()),
+        new_content.as_bytes(),
+        MAX_MUTATION_BYTES,
+    ) {
+        Ok(after_snapshot) => {
             line_reservation.commit();
             diff_permit.commit();
-            crate::guardrails::record_file_modification(run, path, lines_added, lines_removed);
-            super::record_active_diff_observation(run, path, &content, &new_content);
-            format_edit_success(run, path, old_string, new_string, count, replace_all)
-        }
-        Err(error) => {
-            let failure_message = format!("Failed to write file '{path}': {error}");
-            if let Ok(actual_content) = secure_fs::read_to_string(&mut file, Path::new(path)) {
-                let (actual_added, actual_removed) =
-                    super::changed_line_counts(&content, &actual_content);
-                line_reservation
-                    .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
-                diff_permit.reconcile_live();
-                crate::guardrails::record_file_modification(
-                    run,
-                    path,
-                    actual_added,
-                    actual_removed,
-                );
-                super::record_active_diff_observation(run, path, &content, &actual_content);
-            } else {
-                line_reservation.commit();
-                diff_permit.reconcile_live();
-            }
-            ToolHandlerResult::partial_text(
-                failure_message.clone(),
-                vec![ToolFailure::new(
-                    ToolFailureCode::External,
-                    failure_message,
-                    ToolRetryability::Unknown,
-                )],
+            crate::guardrails::record_file_modification(
+                run,
+                path,
+                prepared_diff.lines_added,
+                prepared_diff.lines_removed,
+            );
+            super::record_prepared_diff_observation(
+                run,
+                path,
+                new_content.as_bytes(),
+                &prepared_diff,
+            );
+            format_edit_success(
+                run,
+                path,
+                old_string,
+                new_string,
+                count,
+                replace_all,
+                (snapshot.generation(), after_snapshot),
             )
         }
+        Err(secure_fs::AtomicWriteError::Conflict { expected, observed }) => {
+            READ_TRACKER.mark_stale(run, Path::new(path));
+            edit_failure(ToolFailure::new(
+                ToolFailureCode::Conflict,
+                format!(
+                    "File '{path}' changed before the edit could be committed (expected {}, observed {}). No newer content was overwritten; read the file again and retry.",
+                    expected.map_or_else(|| "missing".to_string(), |value| value.to_string()),
+                    observed.map_or_else(|| "missing".to_string(), |value| value.to_string())
+                ),
+                ToolRetryability::Safe,
+            ))
+        }
+        Err(secure_fs::AtomicWriteError::Failed(message)) => edit_failure(ToolFailure::new(
+            ToolFailureCode::External,
+            format!("Failed to atomically edit '{path}': {message}"),
+            ToolRetryability::Unknown,
+        )),
     }
 }
 
@@ -323,6 +375,12 @@ mod tests {
         m.insert("path".to_string(), serde_json::json!(path));
         m.insert("old_string".to_string(), serde_json::json!(old));
         m.insert("new_string".to_string(), serde_json::json!(new));
+        if let Some(snapshot) = READ_TRACKER.snapshot_for(test_run(), Path::new(path)) {
+            m.insert(
+                "expected_snapshot".to_string(),
+                serde_json::json!(snapshot.generation().to_string()),
+            );
+        }
         m
     }
 
@@ -355,6 +413,103 @@ mod tests {
             after, original,
             "file must be unmodified on not-found error"
         );
+    }
+
+    #[test]
+    fn one_byte_change_after_read_is_a_typed_conflict_and_is_not_overwritten() {
+        let (_file, path) = tmp_readable("alpha\n");
+        let args = make_args(&path, "alpha", "omega");
+        std::fs::write(&path, "alphb\n").expect("concurrent one-byte change");
+
+        let result = super::execute_edit_file(test_run(), &args);
+
+        assert!(matches!(
+            &result.outcome,
+            crate::tools::ToolOutcome::Error { failure }
+                if failure.code == crate::tools::ToolFailureCode::Conflict
+                    && failure.retryability == crate::tools::ToolRetryability::Safe
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "alphb\n",
+            "the newer generation must remain intact"
+        );
+    }
+
+    #[test]
+    fn edit_requires_the_generation_to_be_named_explicitly() {
+        let (_file, path) = tmp_readable("alpha\n");
+        let mut args = make_args(&path, "alpha", "omega");
+        args.remove("expected_snapshot");
+
+        let result = super::execute_edit_file(test_run(), &args);
+
+        assert!(matches!(
+            &result.outcome,
+            crate::tools::ToolOutcome::Error { failure }
+                if failure.code == crate::tools::ToolFailureCode::InvalidArguments
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "alpha\n"
+        );
+    }
+
+    #[test]
+    fn empty_pattern_is_rejected_before_replacement_allocation() {
+        let (_file, path) = tmp_readable("alpha\n");
+        let args = make_args(&path, "", "x");
+
+        let result = super::execute_edit_file(test_run(), &args);
+
+        assert!(matches!(
+            &result.outcome,
+            crate::tools::ToolOutcome::Error { failure }
+                if failure.code == crate::tools::ToolFailureCode::InvalidInput
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "alpha\n"
+        );
+    }
+
+    #[test]
+    fn replacement_expansion_over_file_limit_is_rejected_without_mutation() {
+        let original = "x".repeat(super::MAX_MUTATION_BYTES / 2 + 1);
+        let (_file, path) = tmp_readable(&original);
+        let mut args = make_args(&path, "x", "yy");
+        args.insert("replace_all".to_string(), serde_json::json!(true));
+
+        let result = super::execute_edit_file(test_run(), &args);
+
+        assert!(matches!(
+            &result.outcome,
+            crate::tools::ToolOutcome::Error { failure }
+                if failure.code == crate::tools::ToolFailureCode::InvalidInput
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            u64::try_from(original.len()).expect("test length")
+        );
+    }
+
+    #[test]
+    fn diff_display_redacts_secret_assignments_and_binds_both_generations() {
+        const SECRET: &str = "super-secret-value-123456";
+        let (_file, path) = tmp_readable(&format!("api_key={SECRET}\n"));
+        let args = make_args(&path, &format!("api_key={SECRET}"), "api_key=replaced");
+
+        let result = super::execute_edit_file(test_run(), &args);
+
+        let crate::tools::ToolDisplay::Diff { diff, .. } = &result.display else {
+            panic!("successful edit must retain typed diff metadata")
+        };
+        assert!(diff.redacted);
+        assert!(!diff.old_text.contains(SECRET));
+        assert!(diff.old_text.contains("[REDACTED]"));
+        assert!(diff.before_snapshot.starts_with("sha256:"));
+        assert!(diff.after_snapshot.starts_with("sha256:"));
+        assert_ne!(diff.before_snapshot, diff.after_snapshot);
     }
 
     // =========================================================================
@@ -440,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_edit_invalidates_prior_read_marker() {
+    fn successful_edit_publishes_the_next_snapshot_generation() {
         let _lock = super::super::shared_tracker_lock();
         let (_f, path) = tmp_readable("first\nsecond\n");
         let args = make_args(&path, "first", "one");
@@ -450,12 +605,12 @@ mod tests {
         let args2 = make_args(&path, "second", "two");
         let (msg2, is_err2) = super::execute_edit_file(test_run(), &args2).into_legacy();
         assert!(
-            is_err2,
-            "second edit without a fresh read must be rejected: {msg2}"
+            !is_err2,
+            "the generation emitted by the first edit must bind the second edit: {msg2}"
         );
-        assert!(
-            msg2.contains("must read") || msg2.contains("Use read_file"),
-            "{msg2}"
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "one\ntwo\n"
         );
     }
 

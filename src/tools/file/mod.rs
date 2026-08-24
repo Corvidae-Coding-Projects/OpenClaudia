@@ -16,15 +16,14 @@ pub use list::execute_list_files;
 pub use notebook::execute_notebook_edit;
 pub use notebook::execute_notebook_edit_typed;
 pub use notebook::source_to_line_array;
-#[allow(unused_imports)] // used by tests in tools::mod
-pub use read::{
-    detect_file_type, parse_page_range, read_image_file, read_notebook_file, read_text_file,
-    FileType, ImageKind,
-};
+pub use read::{detect_file_type, FileType};
+#[cfg(test)]
+pub use read::{parse_page_range, read_image_file, read_notebook_file, ImageKind};
 pub use write::execute_write_file;
 
 use crate::tools::args::{ToolArgError, ToolArgs as _};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -32,6 +31,9 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use similar::TextDiff;
 
 const LEDGER_EXCERPT_MAX_BYTES: usize = 100_000;
+pub(super) const MAX_MUTATION_BYTES: usize = 10 * 1024 * 1024;
+const MAX_DIFF_LINES_PER_GENERATION: usize = 100_000;
+const MAX_RETAINED_DIFF_BYTES: usize = 64 * 1024;
 
 /// Maximum number of entries in the read tracker, per session, before
 /// the oldest write is evicted from the front of the list. Per-session so
@@ -39,21 +41,41 @@ const LEDGER_EXCERPT_MAX_BYTES: usize = 100_000;
 /// previous global ceiling.
 const READ_TRACKER_MAX_ENTRIES: usize = 10_000;
 
-/// Per-run bucket: canonical path → monotonic insertion counter.
-///
-/// Counter values are pulled from a single tracker-wide [`AtomicU64`] so
-/// the smallest counter in the bucket is the least-recently-read path
-/// (LRU). Lookup is O(1) on the underlying [`HashMap`]; eviction at
-/// the cap scans the bucket once.
-type Bucket = HashMap<PathBuf, u64>;
+/// Immutable generation captured from the exact bytes used by `read_file`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FileSnapshot {
+    generation: crate::runtime::ContentDigest,
+    byte_len: u64,
+}
+
+impl FileSnapshot {
+    #[must_use]
+    pub(super) const fn generation(self) -> crate::runtime::ContentDigest {
+        self.generation
+    }
+
+    #[must_use]
+    pub(super) const fn byte_len(self) -> u64 {
+        self.byte_len
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TrackedSnapshot {
+    snapshot: FileSnapshot,
+    stamp: u64,
+}
+
+/// Per-run bucket: canonical resource identity → immutable read generation.
+type Bucket = HashMap<PathBuf, TrackedSnapshot>;
 
 /// Tracks which files have been read, bucketed by exact run identity.
 ///
-/// Each run has its own [`HashSet`]-equivalent of canonicalized paths (stored as a
-/// `HashMap<PathBuf, u64>` so we can drive LRU eviction without
-/// paying the per-lookup linear scan a `Vec` required). `edit_file`
-/// will fail if the file hasn't been read first **in the same
-/// run**. There is no ambient session lookup or shared default bucket.
+/// Each run has its own map of canonical resource identities to the exact
+/// content digest and byte length observed by `read_file`. `edit_file` and
+/// existing-file `write_file` require the caller to name that generation and
+/// revalidate it before publication. There is no ambient session lookup or
+/// shared default bucket.
 ///
 /// crosslink #986: the previous doc-comment called this an "LRU" list,
 /// which is ambiguous — true LRU bumps the entry on read too. Here, only
@@ -76,8 +98,8 @@ type Bucket = HashMap<PathBuf, u64>;
 pub static READ_TRACKER: LazyLock<ReadFileTracker> = LazyLock::new(ReadFileTracker::new);
 
 pub struct ReadFileTracker {
-    /// Per-run buckets. The inner map is canonical path → insertion counter
-    /// (see [`Bucket`]).
+    /// Per-run buckets. The inner map is canonical resource identity →
+    /// immutable snapshot plus insertion counter (see [`Bucket`]).
     /// `has_been_read` does not promote — see crosslink #986.
     buckets: Mutex<HashMap<String, Bucket>>,
     /// Monotonic counter used to assign each successful `mark_read` a
@@ -114,6 +136,7 @@ impl ReadFileTracker {
     /// raw path would let `has_been_read` succeed via the same fallback
     /// and defeat the read-before-edit gate (see crosslink #363).
     /// Other sessions' buckets are untouched.
+    #[cfg(test)]
     pub(crate) fn mark_read(&self, run: &super::security::ToolRunContext, path: &Path) {
         let anchored = if path.is_absolute() {
             path.to_path_buf()
@@ -139,19 +162,67 @@ impl ReadFileTracker {
             );
             return;
         }
+        let mut file = match secure_fs::open_regular_read(run, &resolved) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    path = %resolved.display(),
+                    error,
+                    "READ_TRACKER.mark_read: secure read failed; skipping insertion"
+                );
+                return;
+            }
+        };
+        let maximum = usize::try_from(read::MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX);
+        let bytes = match secure_fs::read_stable_bounded_bytes(&mut file, &resolved, maximum) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    path = %resolved.display(),
+                    error,
+                    "READ_TRACKER.mark_read: stable snapshot failed; skipping insertion"
+                );
+                return;
+            }
+        };
+        self.mark_snapshot(run, &resolved, &bytes);
+    }
+
+    /// Record the digest of the same stable bytes used to produce a successful
+    /// read result. The canonical path is already resolved by the caller, so
+    /// this does not reopen or canonicalize the resource.
+    pub(super) fn mark_snapshot(
+        &self,
+        run: &super::security::ToolRunContext,
+        resolved: &Path,
+        bytes: &[u8],
+    ) -> FileSnapshot {
+        let snapshot = FileSnapshot {
+            generation: crate::runtime::ContentDigest::sha256(bytes),
+            byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        if !resolved.is_absolute() || !run.permits_read(resolved) {
+            tracing::warn!(
+                path = %resolved.display(),
+                run_id = %run.run_id(),
+                "READ_TRACKER.mark_snapshot: unresolved or unauthorized resource identity"
+            );
+            return snapshot;
+        }
         let stamp = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let key = run.run_id().to_string();
         let Some(mut buckets) = self.buckets_guard("mark_read") else {
-            return;
+            return snapshot;
         };
         let files = buckets.entry(key).or_default();
         // O(1) upsert: re-inserting refreshes the LRU stamp.
-        files.insert(resolved, stamp);
+        files.insert(resolved.to_path_buf(), TrackedSnapshot { snapshot, stamp });
         if files.len() > READ_TRACKER_MAX_ENTRIES {
             Self::evict_lru(files);
         }
+        snapshot
     }
 
     /// Drop bucket entries until the count is back at the cap. Removes
@@ -162,7 +233,10 @@ impl ReadFileTracker {
             return;
         }
         // Collect (stamp, path) pairs and partial-sort by stamp ascending.
-        let mut stamped: Vec<(u64, PathBuf)> = files.iter().map(|(p, &s)| (s, p.clone())).collect();
+        let mut stamped: Vec<(u64, PathBuf)> = files
+            .iter()
+            .map(|(path, tracked)| (tracked.stamp, path.clone()))
+            .collect();
         stamped.sort_by_key(|(stamp, _)| *stamp);
         for (_, p) in stamped.into_iter().take(excess) {
             files.remove(&p);
@@ -177,6 +251,15 @@ impl ReadFileTracker {
     /// check can pass. A read in another session does not satisfy this
     /// check.
     pub(crate) fn has_been_read(&self, run: &super::security::ToolRunContext, path: &Path) -> bool {
+        self.snapshot_for(run, path).is_some()
+    }
+
+    /// Return the latest immutable generation read by this exact run.
+    pub(super) fn snapshot_for(
+        &self,
+        run: &super::security::ToolRunContext,
+        path: &Path,
+    ) -> Option<FileSnapshot> {
         let anchored = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -185,18 +268,17 @@ impl ReadFileTracker {
         let Ok(check_path) = std::fs::canonicalize(anchored) else {
             // Strict mode: refuse to silently fall back to the raw path.
             // The agent must perform a real read first. See crosslink #363.
-            return false;
+            return None;
         };
         if !run.permits_read(&check_path) {
-            return false;
+            return None;
         }
         let key = run.run_id().to_string();
-        let Some(buckets) = self.buckets_guard("has_been_read") else {
-            return false;
-        };
+        let buckets = self.buckets_guard("has_been_read")?;
         buckets
             .get(&key)
-            .is_some_and(|f| f.contains_key(&check_path))
+            .and_then(|files| files.get(&check_path))
+            .map(|tracked| tracked.snapshot)
     }
 
     /// Invalidate this exact run's read marker for a file after mutation.
@@ -371,21 +453,15 @@ pub fn read_capability_text_attachment(
     run: &super::security::ToolRunContext,
     user_path: &str,
 ) -> Result<(PathBuf, String), String> {
-    let (resolved, file) = open_capability_regular_read(run, user_path)?;
-    let mut bytes = Vec::new();
-    file.take(read::MAX_FILE_SIZE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("Failed to read '{}': {error}", resolved.display()))?;
-    if bytes.len() > usize::try_from(read::MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX) {
-        return Err(format!(
-            "File '{}' exceeds the {}-byte attachment limit",
-            resolved.display(),
-            read::MAX_FILE_SIZE_BYTES
-        ));
-    }
+    let (resolved, mut file) = open_capability_regular_read(run, user_path)?;
+    let bytes = secure_fs::read_stable_bounded_bytes(
+        &mut file,
+        &resolved,
+        usize::try_from(read::MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX),
+    )?;
     let content = String::from_utf8(bytes)
         .map_err(|error| format!("File '{}' is not valid UTF-8: {error}", resolved.display()))?;
-    READ_TRACKER.mark_read(run, &resolved);
+    READ_TRACKER.mark_snapshot(run, &resolved, content.as_bytes());
     Ok((resolved, content))
 }
 
@@ -657,9 +733,13 @@ pub fn execute_read_file(
         Err(e) => return (e, true),
     };
     let resolved_str = resolved.to_string_lossy();
+    let bytes = match read::read_safe_bytes(run, &resolved_str) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
 
-    let (content, is_error) = match detect_file_type(&resolved_str) {
-        FileType::Image(kind) => read_image_file(run, &resolved_str, kind),
+    let (mut content, is_error) = match detect_file_type(&resolved_str) {
+        FileType::Image(kind) => read::render_image_bytes(&resolved_str, kind, &bytes),
         FileType::Pdf => {
             let pages = match args.get("pages") {
                 None => None,
@@ -672,16 +752,22 @@ pub fn execute_read_file(
                     .into_tool_error();
                 }
             };
-            read::read_pdf_file(run, &resolved_str, pages)
+            read::render_pdf_bytes(run, &resolved_str, pages, &bytes)
         }
-        FileType::Notebook => read_notebook_file(run, &resolved_str),
-        FileType::Text => read_text_file(run, &resolved_str, args),
+        FileType::Notebook => read::render_notebook_bytes(&resolved_str, &bytes),
+        FileType::Text => read::render_text_bytes(&resolved_str, args, &bytes),
     };
 
     if !is_error {
-        READ_TRACKER.mark_read(run, &resolved);
+        let snapshot = READ_TRACKER.mark_snapshot(run, &resolved, &bytes);
+        let _ = write!(
+            content,
+            "\n\nFile snapshot: generation={}, bytes={}. Pass this generation as expected_snapshot when editing or overwriting this file.",
+            snapshot.generation(),
+            snapshot.byte_len()
+        );
         run.record_skill_path_touch(&resolved);
-        record_active_file_read_observation(run, &resolved, args, &content);
+        record_active_file_read_observation(run, &resolved, args, &content, &bytes);
     }
 
     (content, is_error)
@@ -692,25 +778,14 @@ fn record_active_file_read_observation(
     resolved: &Path,
     args: &std::collections::HashMap<String, serde_json::Value>,
     output: &str,
+    bytes: &[u8],
 ) {
     let session_key = run.session_id();
     let Some(ledger) = crate::ledger::active_ledger_for_session(session_key) else {
         return;
     };
 
-    let bytes = match read_file_bytes_for_ledger(run, resolved) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(
-                path = %resolved.display(),
-                error = %err,
-                "read_file succeeded but ledger hash read failed; skipping observation"
-            );
-            return;
-        }
-    };
-
-    let (start_line, end_line) = ledger_line_range(args, &bytes, output);
+    let (start_line, end_line) = ledger_line_range(args, bytes, output);
     let excerpt = super::safe_truncate(output, LEDGER_EXCERPT_MAX_BYTES).to_string();
     let mut ledger = ledger.lock().unwrap_or_else(|err| {
         tracing::error!("active reality ledger lock poisoned; recovering inner state");
@@ -719,7 +794,7 @@ fn record_active_file_read_observation(
     if let Err(err) = ledger.observe_file_read_bytes(
         run,
         resolved.to_string_lossy().to_string(),
-        &bytes,
+        bytes,
         start_line,
         end_line,
         excerpt,
@@ -766,17 +841,6 @@ pub(super) fn require_fresh_file_observation_if_ledger_active(
     ))
 }
 
-fn read_file_bytes_for_ledger(
-    run: &super::security::ToolRunContext,
-    path: &Path,
-) -> std::io::Result<Vec<u8>> {
-    let file = secure_fs::open_regular_read(run, path).map_err(std::io::Error::other)?;
-    let mut bytes = Vec::new();
-    file.take(read::MAX_FILE_SIZE_BYTES)
-        .read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
 fn ledger_line_range(
     args: &std::collections::HashMap<String, serde_json::Value>,
     bytes: &[u8],
@@ -809,6 +873,194 @@ fn count_display_lines(text: &str) -> usize {
     text.lines().count().max(1)
 }
 
+pub(super) fn require_expected_snapshot(
+    run: &super::security::ToolRunContext,
+    path: &Path,
+    supplied: Option<&serde_json::Value>,
+) -> Result<FileSnapshot, crate::tools::ToolFailure> {
+    use crate::tools::{ToolFailure, ToolFailureCode, ToolRetryability};
+
+    let Some(snapshot) = READ_TRACKER.snapshot_for(run, path) else {
+        return Err(ToolFailure::new(
+            ToolFailureCode::Conflict,
+            format!(
+                "No current snapshot exists for '{}'. Call read_file and pass the returned generation as expected_snapshot.",
+                path.display()
+            ),
+            ToolRetryability::Safe,
+        ));
+    };
+    let supplied = supplied.and_then(serde_json::Value::as_str).ok_or_else(|| {
+        ToolFailure::new(
+            ToolFailureCode::InvalidArguments,
+            format!(
+                "expected_snapshot is required for '{}'. Pass the generation returned by read_file.",
+                path.display()
+            ),
+            ToolRetryability::Never,
+        )
+    })?;
+    let expected = supplied
+        .parse::<crate::runtime::ContentDigest>()
+        .map_err(|error| {
+            ToolFailure::new(
+                ToolFailureCode::InvalidArguments,
+                format!("Invalid expected_snapshot '{supplied}': {error}"),
+                ToolRetryability::Never,
+            )
+        })?;
+    if expected != snapshot.generation() {
+        let mut failure = ToolFailure::new(
+            ToolFailureCode::Conflict,
+            format!(
+                "Snapshot generation for '{}' is stale (requested {expected}, latest read {}). Read the file again before retrying.",
+                path.display(),
+                snapshot.generation()
+            ),
+            ToolRetryability::Safe,
+        );
+        failure.recovery = Some(serde_json::json!({
+            "action": "read_file",
+            "path": path,
+            "latest_read_snapshot": snapshot.generation().to_string(),
+        }));
+        return Err(failure);
+    }
+    Ok(snapshot)
+}
+
+pub(super) fn read_expected_snapshot_bytes(
+    run: &super::security::ToolRunContext,
+    path: &Path,
+    snapshot: FileSnapshot,
+) -> Result<Vec<u8>, crate::tools::ToolFailure> {
+    use crate::tools::{ToolFailure, ToolFailureCode, ToolRetryability};
+
+    let mut file = secure_fs::open_regular_read(run, path).map_err(|error| {
+        ToolFailure::new(
+            ToolFailureCode::Conflict,
+            format!(
+                "File '{}' is no longer available at the reviewed snapshot: {error}",
+                path.display()
+            ),
+            ToolRetryability::Safe,
+        )
+    })?;
+    let bytes = secure_fs::read_stable_bounded_bytes(&mut file, path, MAX_MUTATION_BYTES).map_err(
+        |error| {
+            ToolFailure::new(
+                ToolFailureCode::Conflict,
+                format!(
+                    "File '{}' could not be revalidated against the reviewed snapshot: {error}",
+                    path.display()
+                ),
+                ToolRetryability::Safe,
+            )
+        },
+    )?;
+    let observed = crate::runtime::ContentDigest::sha256(&bytes);
+    if observed != snapshot.generation()
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != snapshot.byte_len()
+    {
+        READ_TRACKER.mark_stale(run, path);
+        let mut failure = ToolFailure::new(
+            ToolFailureCode::Conflict,
+            format!(
+                "File '{}' changed after it was read (expected {}, observed {observed}). Read it again before retrying.",
+                path.display(),
+                snapshot.generation()
+            ),
+            ToolRetryability::Safe,
+        );
+        failure.recovery = Some(serde_json::json!({
+            "action": "read_file",
+            "path": path,
+            "expected_snapshot": snapshot.generation().to_string(),
+            "observed_snapshot": observed.to_string(),
+        }));
+        return Err(failure);
+    }
+    Ok(bytes)
+}
+
+pub(super) struct PreparedFileDiff {
+    pub(super) lines_added: u32,
+    pub(super) lines_removed: u32,
+    patch: String,
+}
+
+struct BoundedDiffWriter {
+    text: String,
+    maximum_bytes: usize,
+    truncated: bool,
+}
+
+impl std::fmt::Write for BoundedDiffWriter {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let remaining = self.maximum_bytes.saturating_sub(self.text.len());
+        if value.len() <= remaining {
+            self.text.push_str(value);
+            return Ok(());
+        }
+        let mut boundary = remaining.min(value.len());
+        while boundary > 0 && !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        self.text.push_str(&value[..boundary]);
+        self.truncated = true;
+        Err(std::fmt::Error)
+    }
+}
+
+/// Compute line accounting and a bounded, secret-sanitized evidence patch
+/// before any file publication occurs.
+pub(super) fn prepare_file_diff(
+    run: &super::security::ToolRunContext,
+    path: &str,
+    before: &str,
+    after: &str,
+) -> Result<PreparedFileDiff, String> {
+    let before_lines = before.bytes().filter(|byte| *byte == b'\n').count();
+    let after_lines = after.bytes().filter(|byte| *byte == b'\n').count();
+    if before_lines > MAX_DIFF_LINES_PER_GENERATION || after_lines > MAX_DIFF_LINES_PER_GENERATION {
+        return Err(format!(
+            "Diff for '{path}' exceeds the {MAX_DIFF_LINES_PER_GENERATION}-line computation budget; use a narrower file operation"
+        ));
+    }
+    let diff = TextDiff::from_lines(before, after);
+    let mut lines_added = 0_u32;
+    let mut lines_removed = 0_u32;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => lines_added = lines_added.saturating_add(1),
+            similar::ChangeTag::Delete => lines_removed = lines_removed.saturating_add(1),
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    let mut writer = BoundedDiffWriter {
+        text: String::with_capacity(
+            MAX_RETAINED_DIFF_BYTES.min(before.len().saturating_add(after.len())),
+        ),
+        maximum_bytes: MAX_RETAINED_DIFF_BYTES,
+        truncated: false,
+    };
+    let _ = write!(
+        writer,
+        "{}",
+        diff.unified_diff()
+            .header(&format!("a/{path}"), &format!("b/{path}"))
+    );
+    if writer.truncated {
+        writer.text.push_str("\n[diff truncated at 65536 bytes]\n");
+    }
+    let sanitized_patch = run.sanitize_diagnostic(&writer.text).to_string();
+    Ok(PreparedFileDiff {
+        lines_added,
+        lines_removed,
+        patch: sanitized_patch,
+    })
+}
+
 /// Count inserted and deleted lines in the exact before/after payload.
 ///
 /// This is shared by file writers, blast-radius reservations, diff-monitor
@@ -836,20 +1088,44 @@ pub(super) fn record_active_diff_observation(
     if before == after {
         return;
     }
+    let prepared = match prepare_file_diff(run, path, before, after) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(path, error, "could not retain bounded file diff evidence");
+            READ_TRACKER.mark_stale(run, Path::new(path));
+            return;
+        }
+    };
     READ_TRACKER.mark_stale(run, Path::new(path));
+    append_prepared_diff_observation(run, path, &prepared);
+}
+
+pub(super) fn record_prepared_diff_observation(
+    run: &super::security::ToolRunContext,
+    path: &str,
+    committed_bytes: &[u8],
+    prepared: &PreparedFileDiff,
+) -> FileSnapshot {
+    let resolved = Path::new(path);
+    let snapshot = READ_TRACKER.mark_snapshot(run, resolved, committed_bytes);
+    append_prepared_diff_observation(run, path, prepared);
+    snapshot
+}
+
+fn append_prepared_diff_observation(
+    run: &super::security::ToolRunContext,
+    path: &str,
+    prepared: &PreparedFileDiff,
+) {
     let session_key = run.session_id();
     let Some(ledger) = crate::ledger::active_ledger_for_session(session_key) else {
         return;
     };
-    let diff_patch = TextDiff::from_lines(before, after)
-        .unified_diff()
-        .header(&format!("a/{path}"), &format!("b/{path}"))
-        .to_string();
     let mut ledger = ledger.lock().unwrap_or_else(|err| {
         tracing::error!("active reality ledger lock poisoned; recovering inner state");
         err.into_inner()
     });
-    if let Err(err) = ledger.observe_diff(run, vec![path.to_string()], diff_patch) {
+    if let Err(err) = ledger.observe_diff(run, vec![path.to_string()], prepared.patch.clone()) {
         tracing::warn!(
             path,
             error = %err,
@@ -1203,7 +1479,16 @@ mod tests {
         // we can predict which three get evicted.
         let cap = READ_TRACKER_MAX_ENTRIES;
         for i in 0..(cap + 3) {
-            bucket.insert(PathBuf::from(format!("/virtual/path/{i}")), i as u64);
+            bucket.insert(
+                PathBuf::from(format!("/virtual/path/{i}")),
+                TrackedSnapshot {
+                    snapshot: FileSnapshot {
+                        generation: crate::runtime::ContentDigest::sha256(i.to_le_bytes()),
+                        byte_len: 0,
+                    },
+                    stamp: i as u64,
+                },
+            );
         }
         assert_eq!(bucket.len(), cap + 3);
 

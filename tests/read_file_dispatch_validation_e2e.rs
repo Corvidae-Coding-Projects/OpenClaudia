@@ -165,6 +165,12 @@ fn read_file_records_observation_when_session_ledger_is_active() {
     let result = support::dispatch_tool_result_for_run(&run, "read_file", &args);
     let (msg, is_err) = support::legacy(&result);
     assert!(!is_err, "read should succeed: {msg}");
+    assert!(
+        msg.contains(
+            "File snapshot: generation=sha256:e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee, bytes=11"
+        ),
+        "public snapshot must bind the exact bytes recorded in the ledger: {msg}"
+    );
 
     let observation = {
         let ledger = ledger.lock().expect("ledger lock");

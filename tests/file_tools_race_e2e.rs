@@ -70,10 +70,34 @@ fn read(path: &str) -> (String, bool) {
     (r.content().to_string(), r.is_error())
 }
 
+fn snapshot_from_read_output(output: &str) -> String {
+    output
+        .rsplit_once("File snapshot: generation=")
+        .and_then(|(_, suffix)| suffix.split(',').next())
+        .filter(|generation| generation.starts_with("sha256:"))
+        .expect("successful read must expose a snapshot generation")
+        .to_string()
+}
+
 fn write(path: &str, content: &str) -> (String, bool) {
     let r = execute_tool(
         support::shared_run_context(),
         &call("write_file", &json!({"path": path, "content": content})),
+    );
+    (r.content().to_string(), r.is_error())
+}
+
+fn write_with_snapshot(path: &str, content: &str, snapshot: &str) -> (String, bool) {
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call(
+            "write_file",
+            &json!({
+                "path": path,
+                "content": content,
+                "expected_snapshot": snapshot
+            }),
+        ),
     );
     (r.content().to_string(), r.is_error())
 }
@@ -84,6 +108,22 @@ fn edit(path: &str, old: &str, new: &str) -> (String, bool) {
         &call(
             "edit_file",
             &json!({"path": path, "old_string": old, "new_string": new}),
+        ),
+    );
+    (r.content().to_string(), r.is_error())
+}
+
+fn edit_with_snapshot(path: &str, old: &str, new: &str, snapshot: &str) -> (String, bool) {
+    let r = execute_tool(
+        support::shared_run_context(),
+        &call(
+            "edit_file",
+            &json!({
+                "path": path,
+                "old_string": old,
+                "new_string": new,
+                "expected_snapshot": snapshot
+            }),
         ),
     );
     (r.content().to_string(), r.is_error())
@@ -105,8 +145,8 @@ fn edit_without_prior_read_is_refused() {
     let (msg, is_err) = edit(&path_str, "v1", "v2");
     assert!(is_err, "edit without prior read must error");
     assert!(
-        msg.to_lowercase().contains("read") && msg.to_lowercase().contains("before"),
-        "msg must mention read-before-edit; got {msg:?}"
+        msg.contains("No current snapshot") && msg.contains("read_file"),
+        "msg must explain how to establish an edit snapshot; got {msg:?}"
     );
     let after = std::fs::read_to_string(&path).expect("read after");
     assert_eq!(after, "v1", "file MUST NOT change when edit is refused");
@@ -123,8 +163,9 @@ fn edit_after_read_in_same_session_succeeds() {
 
     let (rmsg, is_err) = read(&path_str);
     assert!(!is_err, "read must succeed: {rmsg:?}");
+    let snapshot = snapshot_from_read_output(&rmsg);
 
-    let (emsg, is_err) = edit(&path_str, "alpha", "beta");
+    let (emsg, is_err) = edit_with_snapshot(&path_str, "alpha", "beta", &snapshot);
     assert!(!is_err, "edit after read must succeed: {emsg:?}");
 
     let after = std::fs::read_to_string(&path).expect("read after edit");
@@ -140,11 +181,16 @@ fn second_edit_with_same_old_string_errors_because_already_replaced() {
     std::fs::write(&path, "unique").expect("plant");
     let path_str = path.to_string_lossy().to_string();
 
-    let _ = read(&path_str);
-    let (_, is_err) = edit(&path_str, "unique", "replaced");
+    let (read_message, read_error) = read(&path_str);
+    assert!(!read_error, "read must succeed: {read_message}");
+    let snapshot = snapshot_from_read_output(&read_message);
+    let (_, is_err) = edit_with_snapshot(&path_str, "unique", "replaced", &snapshot);
     assert!(!is_err, "first edit must succeed");
 
-    let (msg, is_err) = edit(&path_str, "unique", "third");
+    let (read_message, read_error) = read(&path_str);
+    assert!(!read_error, "second read must succeed: {read_message}");
+    let snapshot = snapshot_from_read_output(&read_message);
+    let (msg, is_err) = edit_with_snapshot(&path_str, "unique", "third", &snapshot);
     assert!(
         is_err,
         "second edit with stale old_string must error; got msg={msg:?}"
@@ -169,8 +215,8 @@ fn write_to_existing_file_without_read_is_refused() {
     let (msg, is_err) = write(&path_str, "blindly overwritten");
     assert!(is_err, "write to existing without read must error");
     assert!(
-        msg.to_lowercase().contains("read") && msg.to_lowercase().contains("before"),
-        "msg must mention read-before-overwrite; got {msg:?}"
+        msg.contains("No current snapshot") && msg.contains("read_file"),
+        "msg must explain how to establish an overwrite snapshot; got {msg:?}"
     );
     let after = std::fs::read_to_string(&path).expect("read after");
     assert_eq!(after, "existing content");
@@ -200,10 +246,11 @@ fn write_to_existing_file_after_read_succeeds() {
     std::fs::write(&path, "before").expect("plant");
     let path_str = path.to_string_lossy().to_string();
 
-    let (_, is_err) = read(&path_str);
-    assert!(!is_err);
+    let (read_message, is_err) = read(&path_str);
+    assert!(!is_err, "read must succeed: {read_message}");
+    let snapshot = snapshot_from_read_output(&read_message);
 
-    let (msg, is_err) = write(&path_str, "after");
+    let (msg, is_err) = write_with_snapshot(&path_str, "after", &snapshot);
     assert!(!is_err, "write after read must succeed; got {msg:?}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
 }
@@ -260,6 +307,7 @@ fn read_in_one_session_does_not_count_in_another() {
         !read_result.is_error(),
         "run A read failed: {read_result:?}"
     );
+    let snapshot = snapshot_from_read_output(read_result.content());
 
     let edit_result = execute_tool(
         &run_b,
@@ -268,7 +316,8 @@ fn read_in_one_session_does_not_count_in_another() {
             &json!({
                 "path": path_str,
                 "old_string": "content",
-                "new_string": "replaced-by-b"
+                "new_string": "replaced-by-b",
+                "expected_snapshot": snapshot
             }),
         ),
     );
@@ -277,9 +326,9 @@ fn read_in_one_session_does_not_count_in_another() {
         "run B edit without B's own read must error; got {edit_result:?}"
     );
     assert!(
-        edit_result.content().to_lowercase().contains("read")
-            && edit_result.content().to_lowercase().contains("before"),
-        "message must mention read-before; got {edit_result:?}"
+        edit_result.content().contains("No current snapshot")
+            && edit_result.content().contains("read_file"),
+        "message must require run B's own snapshot; got {edit_result:?}"
     );
 
     let after = std::fs::read_to_string(&path).expect("read after");
@@ -326,9 +375,14 @@ fn write_refuses_when_leaf_is_a_symlink() {
 
     // Mark the link as read so the read-before-write gate
     // passes (we want to test the SYMLINK defence specifically).
-    let (_, _) = read(&link_str);
+    let (read_message, read_error) = read(&link_str);
+    assert!(
+        !read_error,
+        "symlink target read must succeed: {read_message}"
+    );
+    let snapshot = snapshot_from_read_output(&read_message);
 
-    let (msg, is_err) = write(&link_str, "overwritten via symlink");
+    let (msg, is_err) = write_with_snapshot(&link_str, "overwritten via symlink", &snapshot);
     assert!(
         is_err,
         "write through symlink leaf MUST be refused by O_NOFOLLOW; got msg={msg:?}"

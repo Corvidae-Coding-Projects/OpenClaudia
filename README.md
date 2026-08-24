@@ -76,8 +76,8 @@ owned by the audit and remediation slices.
 | `kill_shells_for_agent` | Terminate background shells owned by an agent or session |
 | `read_file` | Read text, image, PDF, or notebook content with optional offset/limit |
 | `grounding_context` | Hydrate selected Reality Ledger observations |
-| `write_file` | Create files; overwrites require a successful `read_file` first |
-| `edit_file` | Replace exact text; requires a successful `read_file` first |
+| `write_file` | Create files; overwrites require a successful `read_file` first and its `expected_snapshot` generation |
+| `edit_file` | Replace exact text; requires a successful `read_file` first and its `expected_snapshot` generation |
 | `list_files` | List directory contents |
 | `glob` | Find files by glob pattern |
 | `grep` | Search file contents by regular expression |

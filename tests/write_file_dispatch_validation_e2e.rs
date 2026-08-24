@@ -34,6 +34,29 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
     m
 }
 
+fn snapshot_from_read_output(output: &str) -> String {
+    output
+        .rsplit_once("File snapshot: generation=")
+        .and_then(|(_, suffix)| suffix.split(',').next())
+        .filter(|generation| generation.starts_with("sha256:"))
+        .expect("successful read must expose a snapshot generation")
+        .to_string()
+}
+
+fn read_snapshot_for_run(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    path: &str,
+) -> String {
+    let result = support::dispatch_tool_result_for_run(
+        run,
+        "read_file",
+        &args_with(&[("path", json!(path))]),
+    );
+    let (output, is_error) = support::legacy(&result);
+    assert!(!is_error, "read_file must succeed: {output}");
+    snapshot_from_read_output(&output)
+}
+
 fn assert_path_classification_denial(message: &str) {
     assert!(message.contains("Host safety"), "got {message:?}");
     assert!(message.contains("'path'"), "got {message:?}");
@@ -302,8 +325,8 @@ fn overwrite_existing_file_without_prior_read_errors() {
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err, "overwrite without prior read MUST be refused");
     assert!(
-        msg.contains("must read") && msg.contains("before overwriting"),
-        "MUST surface #968 message; got {msg:?}"
+        msg.contains("No current snapshot exists"),
+        "MUST surface the snapshot-bound overwrite message; got {msg:?}"
     );
     // Error MUST hint at the corrective action.
     assert!(
@@ -339,13 +362,66 @@ fn failed_read_does_not_satisfy_overwrite_gate() {
         "failed read must not unlock overwrite gate: {write_msg}"
     );
     assert!(
-        write_msg.contains("must read") && write_msg.contains("before overwriting"),
-        "overwrite gate should still require a successful read; got {write_msg:?}"
+        write_msg.contains("No current snapshot exists") && write_msg.contains("read_file"),
+        "overwrite gate should still require a successful snapshot read; got {write_msg:?}"
     );
     assert_eq!(
         std::fs::read_to_string(&path).expect("read back"),
         "",
         "failed-read path must remain untouched"
+    );
+}
+
+#[test]
+fn overwrite_uses_the_generation_returned_by_the_read_dispatch() {
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
+    let run = support::test_run_context(dir.path());
+    let path = dir.path().join("overwrite.txt");
+    std::fs::write(&path, "old content\n").expect("create fixture");
+    let path_str = path.to_str().expect("utf8 path");
+    let snapshot = read_snapshot_for_run(&run, path_str);
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("content", json!("new content\n")),
+        ("expected_snapshot", json!(snapshot)),
+    ]);
+    let result = support::dispatch_tool_result_for_run(&run, "write_file", &args);
+
+    assert!(!result.is_error(), "overwrite must succeed: {result:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read back"),
+        "new content\n"
+    );
+}
+
+#[test]
+fn one_byte_change_after_read_dispatch_returns_typed_conflict() {
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
+    let run = support::test_run_context(dir.path());
+    let path = dir.path().join("concurrent.txt");
+    std::fs::write(&path, "alpha\n").expect("create fixture");
+    let path_str = path.to_str().expect("utf8 path");
+    let snapshot = read_snapshot_for_run(&run, path_str);
+    std::fs::write(&path, "alphb\n").expect("concurrent one-byte change");
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("content", json!("replacement\n")),
+        ("expected_snapshot", json!(snapshot)),
+    ]);
+    let result = support::dispatch_tool_result_for_run(&run, "write_file", &args);
+
+    assert!(matches!(
+        result.outcome(),
+        openclaudia::tools::ToolOutcome::Error { failure }
+            if failure.code == openclaudia::tools::ToolFailureCode::Conflict
+                && failure.retryability == openclaudia::tools::ToolRetryability::Safe
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read back"),
+        "alphb\n",
+        "the concurrent generation must remain untouched"
     );
 }
 

@@ -2,7 +2,6 @@ use base64::Engine;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// Hard cap on file size accepted by all read functions.  Prevents OOM via
@@ -83,24 +82,17 @@ fn open_safe_read(
     Ok(file)
 }
 
-fn read_safe_bytes(
+pub(super) fn read_safe_bytes(
     run: &super::super::security::ToolRunContext,
     path: &str,
 ) -> Result<Vec<u8>, (String, bool)> {
-    let file = open_safe_read(run, path)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE_SIZE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| (format!("Failed to read file '{path}': {error}"), true))?;
-    if bytes.len() > usize::try_from(MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX) {
-        return Err((
-            format!(
-                "File '{path}' grew beyond the {MAX_FILE_SIZE_BYTES}-byte safety cap while it was being read"
-            ),
-            true,
-        ));
-    }
-    Ok(bytes)
+    let mut file = open_safe_read(run, path)?;
+    super::secure_fs::read_stable_bounded_bytes(
+        &mut file,
+        Path::new(path),
+        usize::try_from(MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX),
+    )
+    .map_err(|error| (error, true))
 }
 
 /// Image formats the harness can hand to vision-capable models.
@@ -182,6 +174,7 @@ pub fn detect_file_type(path: &str) -> FileType {
 /// The image kind is carried by the typed [`ImageKind`] enum (crosslink #966)
 /// rather than as a raw MIME-type `&str`, so callers can no longer fabricate a
 /// nonsense MIME like `"image/whatever"` at the call site.
+#[cfg(test)]
 pub fn read_image_file(
     run: &super::super::security::ToolRunContext,
     path: &str,
@@ -192,6 +185,10 @@ pub fn read_image_file(
         Err(error) => return error,
     };
 
+    render_image_bytes(path, kind, &bytes)
+}
+
+pub(super) fn render_image_bytes(path: &str, kind: ImageKind, bytes: &[u8]) -> (String, bool) {
     // Fail fast at the boundary: a 0-byte image is never valid input for any
     // vision-capable model. Without this check the upstream API rejects the
     // empty base64 with an opaque 400 after we've already burned a turn.
@@ -206,7 +203,7 @@ pub fn read_image_file(
     }
 
     let file_size = bytes.len();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     let filename = Path::new(path)
         .file_name()
         .map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
@@ -299,6 +296,7 @@ const PDF_TIMEOUT_SECS: u64 = 30;
 /// `pdftotext` receives no run environment grants and never inherits the host
 /// process environment. PDF bytes arrive over stdin and parser output leaves
 /// over stdout, so locale and credential state are outside this profile.
+#[cfg(test)]
 pub fn read_pdf_file(
     run: &super::super::security::ToolRunContext,
     path: &str,
@@ -309,6 +307,26 @@ pub fn read_pdf_file(
         return (err, true);
     }
 
+    // Feed the parser bytes read from the already-confined descriptor. Passing
+    // the original pathname would let a concurrent rename swap the parser's
+    // input after authorization.
+    let pdf_bytes = match read_safe_bytes(run, path) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+
+    render_pdf_bytes(run, path, pages, &pdf_bytes)
+}
+
+pub(super) fn render_pdf_bytes(
+    run: &super::super::security::ToolRunContext,
+    path: &str,
+    pages: Option<&str>,
+    pdf_bytes: &[u8],
+) -> (String, bool) {
+    if let Some(err) = reject_flag_prefix(path) {
+        return (err, true);
+    }
     let pdftotext = match pdftotext_bin(run) {
         Ok(path) => path,
         Err(msg) => return (msg, true),
@@ -316,13 +334,6 @@ pub fn read_pdf_file(
     let project_root = match super::project_root(run) {
         Ok(root) => root,
         Err(message) => return (message, true),
-    };
-    // Feed the parser bytes read from the already-confined descriptor. Passing
-    // the original pathname would let a concurrent rename swap the parser's
-    // input after authorization.
-    let pdf_bytes = match read_safe_bytes(run, path) {
-        Ok(bytes) => bytes,
-        Err(error) => return error,
     };
 
     let timeout = std::time::Duration::from_secs(PDF_TIMEOUT_SECS);
@@ -339,7 +350,7 @@ pub fn read_pdf_file(
                 &info_args,
                 &project_root,
                 timeout,
-                &pdf_bytes,
+                pdf_bytes,
             ) {
                 if info.status.success() {
                     let info_text = String::from_utf8_lossy(&info.stdout);
@@ -393,7 +404,7 @@ pub fn read_pdf_file(
         &argv_refs,
         &project_root,
         timeout,
-        &pdf_bytes,
+        pdf_bytes,
     ) {
         Ok(output) => {
             if !output.status.success() {
@@ -512,20 +523,31 @@ fn render_cell_outputs(output: &mut String, outputs: &[Value]) {
 }
 
 /// Read a Jupyter notebook (.ipynb) and format cells for display
+#[cfg(test)]
 pub fn read_notebook_file(
     run: &super::super::security::ToolRunContext,
     path: &str,
 ) -> (String, bool) {
-    let mut file = match open_safe_read(run, path) {
-        Ok(file) => file,
+    let bytes = match read_safe_bytes(run, path) {
+        Ok(bytes) => bytes,
         Err(error) => return error,
     };
-    let content = match super::secure_fs::read_to_string(&mut file, Path::new(path)) {
+
+    render_notebook_bytes(path, &bytes)
+}
+
+pub(super) fn render_notebook_bytes(path: &str, bytes: &[u8]) -> (String, bool) {
+    let content = match std::str::from_utf8(bytes) {
         Ok(content) => content,
-        Err(error) => return (error, true),
+        Err(error) => {
+            return (
+                format!("Failed to read notebook '{path}' as UTF-8: {error}"),
+                true,
+            )
+        }
     };
 
-    let notebook: Value = match serde_json::from_str(&content) {
+    let notebook: Value = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -569,10 +591,23 @@ pub fn read_notebook_file(
     (output, false)
 }
 /// Read a plain text file with optional offset/limit
+#[cfg(test)]
 pub fn read_text_file(
     run: &super::super::security::ToolRunContext,
     path: &str,
     args: &HashMap<String, Value>,
+) -> (String, bool) {
+    let bytes = match read_safe_bytes(run, path) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    render_text_bytes(path, args, &bytes)
+}
+
+pub(super) fn render_text_bytes(
+    path: &str,
+    args: &HashMap<String, Value>,
+    bytes: &[u8],
 ) -> (String, bool) {
     // Get optional offset (1-indexed line number to start from)
     let offset = match parse_read_offset_arg(args.get("offset")) {
@@ -586,13 +621,14 @@ pub fn read_text_file(
         Err(msg) => return (msg, true),
     };
 
-    let mut file = match open_safe_read(run, path) {
-        Ok(file) => file,
-        Err(error) => return error,
-    };
-    let file_content = match super::secure_fs::read_to_string(&mut file, Path::new(path)) {
+    let file_content = match std::str::from_utf8(bytes) {
         Ok(content) => content,
-        Err(error) => return (error, true),
+        Err(error) => {
+            return (
+                format!("Failed to read file '{path}' as UTF-8: {error}"),
+                true,
+            )
+        }
     };
 
     let lines: Vec<&str> = file_content.lines().collect();

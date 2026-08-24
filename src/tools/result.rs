@@ -197,6 +197,9 @@ pub struct ToolDiff {
     pub path: String,
     pub old_text: String,
     pub new_text: String,
+    pub before_snapshot: String,
+    pub after_snapshot: String,
+    pub redacted: bool,
 }
 
 /// Frontend presentation hint.  Frontends match this enum; they never scan

@@ -1,10 +1,9 @@
-use super::{resolve_open_path, resolve_path, secure_fs, READ_TRACKER};
+use super::{resolve_open_path, resolve_path, secure_fs, MAX_MUTATION_BYTES, READ_TRACKER};
 use crate::tools::args::ToolArgs as _;
 use crate::tools::{ToolFailure, ToolFailureCode, ToolHandlerResult, ToolRetryability};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 
 /// Write content to a file
@@ -45,18 +44,24 @@ pub fn execute_write_file(
         }
     };
 
-    let prepared = match prepare_write(run, path, &open_path, content) {
+    if content.len() > MAX_MUTATION_BYTES {
+        return write_invalid(format!(
+            "Write result for '{path}' would be {} bytes, exceeding the {MAX_MUTATION_BYTES}-byte file limit",
+            content.len()
+        ));
+    }
+
+    let prepared = match prepare_write(run, path, &open_path, content, args) {
         Ok(prepared) => prepared,
-        Err(error) => return write_error(error),
+        Err(failure) => return ToolHandlerResult::error(failure),
     };
     persist_write(run, path, content, prepared)
 }
 
 struct PreparedWrite {
-    file: std::fs::File,
-    old_content: String,
-    lines_added: u32,
-    lines_removed: u32,
+    expected: Option<crate::runtime::ContentDigest>,
+    open_path: std::path::PathBuf,
+    prepared_diff: super::PreparedFileDiff,
     line_reservation: crate::guardrails::ChangedLineReservation,
     diff_permit: crate::guardrails::DiffChangePermit,
 }
@@ -66,82 +71,93 @@ fn prepare_write(
     path: &str,
     open_path: &Path,
     content: &str,
-) -> Result<PreparedWrite, String> {
+    args: &HashMap<String, Value>,
+) -> Result<PreparedWrite, ToolFailure> {
     // Observe without creating anything. Admission therefore happens before
     // a missing target or parent directory can become an effect.
-    let (old_content, observed_exists) = match secure_fs::open_regular_read(run, open_path) {
-        Ok(mut file) => (secure_fs::read_to_string(&mut file, Path::new(path))?, true),
-        Err(error) if secure_fs::is_not_found_message(&error) => (String::new(), false),
+    let observed_exists = match secure_fs::open_regular_read(run, open_path) {
+        Ok(_) => true,
+        Err(error) if secure_fs::is_not_found_message(&error) => false,
         Err(error) => {
-            return Err(format!(
-                "Failed to securely inspect file '{path}' before writing: {error}"
+            return Err(ToolFailure::new(
+                ToolFailureCode::External,
+                format!("Failed to securely inspect file '{path}' before writing: {error}"),
+                ToolRetryability::Unknown,
             ));
         }
     };
 
-    // Existing content must have been observed by this exact run before it
-    // can be replaced. New files have no prior state to ground.
-    if observed_exists && !READ_TRACKER.has_been_read(run, Path::new(path)) {
-        return Err(format!(
-            "You must read '{path}' before overwriting it. Use read_file first to see the actual contents, then write_file to replace them."
-        ));
-    }
-    if observed_exists {
+    let (old_content, expected) = if observed_exists {
+        let snapshot =
+            super::require_expected_snapshot(run, Path::new(path), args.get("expected_snapshot"))?;
         super::require_fresh_file_observation_if_ledger_active(
             run,
             Path::new(path),
             "overwriting it",
-        )?;
-    }
-
-    let (lines_added, lines_removed) = super::changed_line_counts(&old_content, content);
-    let line_reservation = crate::guardrails::reserve_changed_lines(
-        run,
-        u64::from(lines_added) + u64::from(lines_removed),
-    )?;
-    let diff_permit =
-        crate::guardrails::admit_file_change(run, Path::new(path), content.as_bytes())?;
-    let (mut file, target_exists) = open_observed_target(run, path, open_path, observed_exists)?;
-    if target_exists != observed_exists {
-        return Err(format!(
-            "File '{path}' changed existence while the write was being prepared; read it again and retry"
-        ));
-    }
-    if target_exists {
-        let current_content = secure_fs::read_to_string(&mut file, Path::new(path))?;
-        if current_content != old_content {
-            return Err(format!(
-                "File '{path}' changed while the write was being prepared; read it again and retry"
+        )
+        .map_err(|message| {
+            ToolFailure::new(ToolFailureCode::Conflict, message, ToolRetryability::Safe)
+        })?;
+        let bytes = super::read_expected_snapshot_bytes(run, Path::new(path), snapshot)?;
+        let old_content = String::from_utf8(bytes).map_err(|error| {
+            ToolFailure::new(
+                ToolFailureCode::InvalidInput,
+                format!(
+                    "File '{path}' is not UTF-8 text and cannot be overwritten with write_file: {error}"
+                ),
+                ToolRetryability::Never,
+            )
+        })?;
+        (old_content, Some(snapshot.generation()))
+    } else {
+        if let Some(supplied) = args.get("expected_snapshot") {
+            return Err(ToolFailure::new(
+                ToolFailureCode::Conflict,
+                format!(
+                    "File '{path}' is missing but the write named expected_snapshot {supplied}; read or inspect the path again before retrying"
+                ),
+                ToolRetryability::Safe,
             ));
         }
-    }
+        (String::new(), None)
+    };
+
+    let prepared_diff =
+        super::prepare_file_diff(run, path, &old_content, content).map_err(|message| {
+            ToolFailure::new(
+                ToolFailureCode::InvalidInput,
+                message,
+                ToolRetryability::Never,
+            )
+        })?;
+    let line_reservation = crate::guardrails::reserve_changed_lines(
+        run,
+        u64::from(prepared_diff.lines_added) + u64::from(prepared_diff.lines_removed),
+    )
+    .map_err(|message| {
+        ToolFailure::new(
+            ToolFailureCode::PolicyDenied,
+            message,
+            ToolRetryability::Never,
+        )
+    })?;
+    let diff_permit =
+        crate::guardrails::admit_file_change(run, Path::new(path), content.as_bytes()).map_err(
+            |message| {
+                ToolFailure::new(
+                    ToolFailureCode::PolicyDenied,
+                    message,
+                    ToolRetryability::Never,
+                )
+            },
+        )?;
     Ok(PreparedWrite {
-        file,
-        old_content,
-        lines_added,
-        lines_removed,
+        expected,
+        open_path: open_path.to_path_buf(),
+        prepared_diff,
         line_reservation,
         diff_permit,
     })
-}
-
-fn open_observed_target(
-    run: &crate::tools::ToolRunContext,
-    path: &str,
-    open_path: &Path,
-    observed_exists: bool,
-) -> Result<(std::fs::File, bool), String> {
-    if observed_exists {
-        // Never fall back to create here. If the observed inode disappeared,
-        // recreating an empty path would be a partial effect on an error path.
-        return secure_fs::open_regular_edit(run, open_path)
-            .map(|file| (file, true))
-            .map_err(|error| {
-                format!("Failed to securely reopen file '{path}' for writing: {error}")
-            });
-    }
-    secure_fs::open_regular_update_or_create(run, open_path)
-        .map_err(|error| format!("Failed to securely create file '{path}' for writing: {error}"))
 }
 
 fn persist_write(
@@ -150,63 +166,56 @@ fn persist_write(
     content: &str,
     mut prepared: PreparedWrite,
 ) -> ToolHandlerResult {
-    let write_result = prepared
-        .file
-        .seek(SeekFrom::Start(0))
-        .and_then(|_| prepared.file.set_len(0))
-        .and_then(|()| prepared.file.write_all(content.as_bytes()));
-    match write_result {
-        Ok(()) => {
+    match secure_fs::write_atomic_generation(
+        run,
+        &prepared.open_path,
+        prepared.expected,
+        content.as_bytes(),
+        MAX_MUTATION_BYTES,
+    ) {
+        Ok(after_snapshot) => {
             prepared.line_reservation.commit();
             prepared.diff_permit.commit();
             crate::guardrails::record_file_modification(
                 run,
                 path,
-                prepared.lines_added,
-                prepared.lines_removed,
+                prepared.prepared_diff.lines_added,
+                prepared.prepared_diff.lines_removed,
             );
-            super::record_active_diff_observation(run, path, &prepared.old_content, content);
-            let mut result = format!("Successfully wrote {} bytes to '{}'", content.len(), path);
+            super::record_prepared_diff_observation(
+                run,
+                path,
+                content.as_bytes(),
+                &prepared.prepared_diff,
+            );
+            let mut result = format!(
+                "Successfully wrote {} bytes to '{}'. New snapshot generation: {after_snapshot}",
+                content.len(),
+                path
+            );
             if let Some(warning) = crate::guardrails::check_diff_thresholds(run) {
                 let _ = write!(result, "\n\nWarning: {}", warning.message);
             }
             ToolHandlerResult::success_text(result)
         }
-        Err(error) => {
-            let failure_message = format!("Failed to write file '{path}': {error}");
-            if let Ok(actual_content) =
-                secure_fs::read_to_string(&mut prepared.file, Path::new(path))
-            {
-                let (actual_added, actual_removed) =
-                    super::changed_line_counts(&prepared.old_content, &actual_content);
-                prepared
-                    .line_reservation
-                    .reconcile_and_commit(u64::from(actual_added) + u64::from(actual_removed));
-                prepared.diff_permit.reconcile_live();
-                crate::guardrails::record_file_modification(
-                    run,
-                    path,
-                    actual_added,
-                    actual_removed,
-                );
-                super::record_active_diff_observation(
-                    run,
-                    path,
-                    &prepared.old_content,
-                    &actual_content,
-                );
-            } else {
-                prepared.line_reservation.commit();
-                prepared.diff_permit.reconcile_live();
-            }
-            ToolHandlerResult::partial_text(
-                failure_message.clone(),
-                vec![ToolFailure::new(
-                    ToolFailureCode::External,
-                    failure_message,
-                    ToolRetryability::Unknown,
-                )],
-            )
+        Err(secure_fs::AtomicWriteError::Conflict { expected, observed }) => {
+            READ_TRACKER.mark_stale(run, Path::new(path));
+            ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::Conflict,
+                format!(
+                    "File '{path}' changed before the write could be committed (expected {}, observed {}). No newer content was overwritten; read the file again and retry.",
+                    expected.map_or_else(|| "missing".to_string(), |value| value.to_string()),
+                    observed.map_or_else(|| "missing".to_string(), |value| value.to_string())
+                ),
+                ToolRetryability::Safe,
+            ))
+        }
+        Err(secure_fs::AtomicWriteError::Failed(message)) => {
+            ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::External,
+                format!("Failed to atomically write '{path}': {message}"),
+                ToolRetryability::Unknown,
+            ))
         }
     }
 }
@@ -216,6 +225,14 @@ fn write_error(message: String) -> ToolHandlerResult {
         ToolFailureCode::Legacy,
         message,
         ToolRetryability::Unknown,
+    ))
+}
+
+fn write_invalid(message: String) -> ToolHandlerResult {
+    ToolHandlerResult::error(ToolFailure::new(
+        ToolFailureCode::InvalidInput,
+        message,
+        ToolRetryability::Never,
     ))
 }
 
@@ -240,22 +257,41 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("path".to_string(), serde_json::json!(path));
         m.insert("content".to_string(), serde_json::json!(content));
+        if let Some(snapshot) =
+            super::READ_TRACKER.snapshot_for(test_run(), std::path::Path::new(path))
+        {
+            m.insert(
+                "expected_snapshot".to_string(),
+                serde_json::json!(snapshot.generation().to_string()),
+            );
+        }
         m
     }
 
     #[test]
-    fn observed_existing_target_is_not_recreated_if_it_disappears() {
+    fn atomic_create_does_not_overwrite_an_existing_target() {
         let dir = TempDir::new_in(".").expect("tempdir");
-        let missing = dir.path().join("disappeared.txt");
-        let user_path = missing.to_string_lossy();
-        let open_path =
-            super::super::resolve_open_path(test_run(), &user_path).expect("leaf-preserving path");
-
-        let error = super::open_observed_target(test_run(), &user_path, &open_path, true)
-            .expect_err("an observed-existing target must not fall back to create");
-
-        assert!(error.contains("reopen"), "unexpected error: {error}");
-        assert!(!missing.exists(), "failed reopen must have no file effect");
+        let target = dir.path().join("already-there.txt");
+        std::fs::write(&target, "newer").expect("setup target");
+        let target = target.canonicalize().expect("canonical target");
+        let result = super::secure_fs::write_atomic_generation(
+            test_run(),
+            &target,
+            None,
+            b"stale create",
+            super::MAX_MUTATION_BYTES,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(super::secure_fs::AtomicWriteError::Conflict { .. })
+            ),
+            "create-only publication must report a typed conflict: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read back"),
+            "newer"
+        );
     }
 
     #[test]
@@ -317,7 +353,78 @@ mod tests {
     }
 
     #[test]
-    fn successful_overwrite_invalidates_prior_read_marker() {
+    fn one_byte_change_after_read_is_a_typed_conflict_and_is_not_overwritten() {
+        let _lock = tracker_lock();
+        let dir = TempDir::new_in(".").expect("tempdir");
+        let path = dir.path().join("concurrent.txt");
+        std::fs::write(&path, "alpha\n").expect("setup");
+        super::READ_TRACKER.mark_read(test_run(), &path);
+        let args = make_args(&path.to_string_lossy(), "replacement\n");
+        std::fs::write(&path, "alphb\n").expect("concurrent one-byte change");
+
+        let result = super::execute_write_file(test_run(), &args);
+
+        assert!(matches!(
+            &result.outcome,
+            crate::tools::ToolOutcome::Error { failure }
+                if failure.code == crate::tools::ToolFailureCode::Conflict
+                    && failure.retryability == crate::tools::ToolRetryability::Safe
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "alphb\n"
+        );
+    }
+
+    #[test]
+    fn overwrite_requires_the_generation_to_be_named_explicitly() {
+        let _lock = tracker_lock();
+        let dir = TempDir::new_in(".").expect("tempdir");
+        let path = dir.path().join("explicit-generation.txt");
+        std::fs::write(&path, "old").expect("setup");
+        super::READ_TRACKER.mark_read(test_run(), &path);
+        let mut args = make_args(&path.to_string_lossy(), "new");
+        args.remove("expected_snapshot");
+
+        let result = super::execute_write_file(test_run(), &args);
+
+        assert!(matches!(
+            &result.outcome,
+            crate::tools::ToolOutcome::Error { failure }
+                if failure.code == crate::tools::ToolFailureCode::InvalidArguments
+        ));
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_overwrite_preserves_existing_unix_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = tracker_lock();
+        let dir = TempDir::new_in(".").expect("tempdir");
+        let path = dir.path().join("executable.sh");
+        std::fs::write(&path, "old\n").expect("setup");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("set executable mode");
+        super::READ_TRACKER.mark_read(test_run(), &path);
+        let args = make_args(&path.to_string_lossy(), "new\n");
+
+        let (message, is_error) = super::execute_write_file(test_run(), &args).into_legacy();
+
+        assert!(!is_error, "atomic overwrite must succeed: {message}");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn successful_overwrite_publishes_the_next_snapshot_generation() {
         let _lock = tracker_lock();
         let dir = TempDir::new_in(".").expect("tempdir");
         let path = dir.path().join("stale_after_write.txt");
@@ -331,13 +438,10 @@ mod tests {
         let args2 = make_args(&path.to_string_lossy(), "newer");
         let (msg2, is_err2) = super::execute_write_file(test_run(), &args2).into_legacy();
         assert!(
-            is_err2,
-            "second overwrite without a fresh read must fail: {msg2}"
+            !is_err2,
+            "the generation emitted by the first write must bind the second: {msg2}"
         );
-        assert!(
-            msg2.contains("must read") || msg2.contains("Use read_file"),
-            "{msg2}"
-        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "newer");
     }
 
     /// crosslink #968: overwriting an existing file without first calling
@@ -354,7 +458,7 @@ mod tests {
         let (msg, is_err) = super::execute_write_file(test_run(), &args).into_legacy();
         assert!(is_err, "must reject overwrite without prior read: {msg}");
         assert!(
-            msg.contains("must read"),
+            msg.contains("Read the file") || msg.contains("read_file"),
             "error should mention read requirement: {msg}"
         );
         // File contents untouched.

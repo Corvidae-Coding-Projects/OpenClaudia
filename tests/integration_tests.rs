@@ -105,6 +105,15 @@ fn setup_test_dir() -> TempDir {
 mod file_tools {
     use super::*;
 
+    fn snapshot_from_read_result(result: &ToolResult) -> &str {
+        result
+            .content()
+            .rsplit_once("File snapshot: generation=")
+            .and_then(|(_, suffix)| suffix.split(',').next())
+            .filter(|generation| generation.starts_with("sha256:"))
+            .expect("successful read must expose a snapshot generation")
+    }
+
     #[test]
     fn test_read_file_success() {
         let dir = setup_test_dir();
@@ -234,12 +243,14 @@ mod file_tools {
             "read_file precondition failed: {}",
             read_result.content()
         );
+        let snapshot = snapshot_from_read_result(&read_result);
 
         let tool_call = make_tool_call(
             "write_file",
             &json!({
                 "path": file_path.to_string_lossy(),
-                "content": "Overwritten content"
+                "content": "Overwritten content",
+                "expected_snapshot": snapshot
             }),
         );
 
@@ -265,14 +276,17 @@ mod file_tools {
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(support::shared_run_context(), &read_call);
+        let read_result = execute_tool(support::shared_run_context(), &read_call);
+        assert!(!read_result.is_error(), "read_file must succeed");
+        let snapshot = snapshot_from_read_result(&read_result);
 
         let tool_call = make_tool_call(
             "edit_file",
             &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "Hello, World!",
-                "new_string": "Goodbye, World!"
+                "new_string": "Goodbye, World!",
+                "expected_snapshot": snapshot
             }),
         );
 
@@ -305,14 +319,17 @@ mod file_tools {
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(support::shared_run_context(), &read_call);
+        let read_result = execute_tool(support::shared_run_context(), &read_call);
+        assert!(!read_result.is_error(), "read_file must succeed");
+        let snapshot = snapshot_from_read_result(&read_result);
 
         let tool_call = make_tool_call(
             "edit_file",
             &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "This string does not exist",
-                "new_string": "Replacement"
+                "new_string": "Replacement",
+                "expected_snapshot": snapshot
             }),
         );
 
@@ -530,14 +547,17 @@ mod file_tools {
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(support::shared_run_context(), &read_call);
+        let read_result = execute_tool(support::shared_run_context(), &read_call);
+        assert!(!read_result.is_error(), "read_file must succeed");
+        let snapshot = snapshot_from_read_result(&read_result);
 
         let tool_call = make_tool_call(
             "edit_file",
             &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "function foo() {\n    console.log('old');\n}",
-                "new_string": "function foo() {\n    console.log('new');\n    return true;\n}"
+                "new_string": "function foo() {\n    console.log('new');\n    return true;\n}",
+                "expected_snapshot": snapshot
             }),
         );
 
@@ -569,14 +589,17 @@ mod file_tools {
         // Read the file first (required before editing)
         let read_call =
             make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
-        let _ = execute_tool(support::shared_run_context(), &read_call);
+        let read_result = execute_tool(support::shared_run_context(), &read_call);
+        assert!(!read_result.is_error(), "read_file must succeed");
+        let snapshot = snapshot_from_read_result(&read_result);
 
         let tool_call = make_tool_call(
             "edit_file",
             &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "$100",
-                "new_string": "$200"
+                "new_string": "$200",
+                "expected_snapshot": snapshot
             }),
         );
 

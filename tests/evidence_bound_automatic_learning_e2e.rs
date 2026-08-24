@@ -130,6 +130,15 @@ fn execute(fixture: &Fixture, id: &str, name: &str, arguments: &Value) -> ToolRe
     execute_with_config(fixture, &fixture.config, id, name, arguments)
 }
 
+fn snapshot_from_read_result(result: &ToolResult) -> &str {
+    result
+        .content()
+        .rsplit_once("File snapshot: generation=")
+        .and_then(|(_, suffix)| suffix.split(',').next())
+        .filter(|generation| generation.starts_with("sha256:"))
+        .expect("successful read must expose a snapshot generation")
+}
+
 fn execute_with_config(
     fixture: &Fixture,
     config: &AppConfig,
@@ -530,6 +539,7 @@ fn canonical_executor_preserves_causal_binding_across_real_workspace_generations
         .observations()
         .iter()
         .all(|observation| observation.kind != "technical_learning_capture"));
+    let snapshot = snapshot_from_read_result(&read);
 
     let edit = execute(
         &fixture,
@@ -538,7 +548,8 @@ fn canonical_executor_preserves_causal_binding_across_real_workspace_generations
         &json!({
             "path": "src/learning_probe.rs",
             "old_string": broken_source,
-            "new_string": fixed_source
+            "new_string": fixed_source,
+            "expected_snapshot": snapshot
         }),
     );
     assert!(!edit.is_error(), "edit failed: {}", edit.content());
