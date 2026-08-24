@@ -173,6 +173,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-026: Stop mutating the shared Claude credential store (#1125)
 - S-030: Make interactive API-key setup secret safe (#1124)
 - S-029: Implement a complete OAuth session lifecycle (#1122)
 - Codex ChatGPT Responses rejects OpenClaudia max_output_tokens (#1123)
