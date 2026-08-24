@@ -173,6 +173,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-029: Implement a complete OAuth session lifecycle (#1122)
+- Codex ChatGPT Responses rejects OpenClaudia max_output_tokens (#1123)
 - S-022: Enforce diff blocks and quality gates (#1121)
 - S-015: Finish skills as scoped capabilities (#1120)
 - S-108: Make writable sandbox workspace projection transactional (#1118)
