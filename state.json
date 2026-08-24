@@ -20214,12 +20214,13 @@
       "display_id": 1132,
       "title": "Make the background-cap stress fixture duration-independent",
       "description": "The Rust 1.98 Linux full-suite runner intermittently fails fix672_concurrent_spawn_never_exceeds_cap because the fixture uses sleep 30. Durable workspace/job preparation can take longer than 30 seconds for 62 concurrent callers, allowing an early job to finish and a legitimate replacement to raise cumulative successful spawns above 50 even though the active-job cap is never exceeded. Keep admitted fixture processes alive until explicit teardown, preserve the original cap assertion, and verify focused repetition plus the full serialized all-target/all-feature suite.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T19:57:01.619331608Z",
-      "updated_at": "2026-08-24T20:19:58.123924200Z",
+      "updated_at": "2026-08-24T20:20:04.740691870Z",
+      "closed_at": "2026-08-24T20:20:04.740690241Z",
       "labels": [
         "ci"
       ],
@@ -38979,11 +38980,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1491,
       "timestamp": "2026-08-24T20:19:58.123924200Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1492,
+      "timestamp": "2026-08-24T20:20:04.740691870Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T20:19:58.123924200Z",
+    "timestamp": "2026-08-24T20:20:04.740691870Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1491
+    "agent_seq": 1492
   }
 }
