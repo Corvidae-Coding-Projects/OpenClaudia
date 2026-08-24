@@ -1,6 +1,6 @@
 {
   "next_display_id": 1134,
-  "next_comment_id": 1514,
+  "next_comment_id": 1515,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22619,11 +22619,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T21:28:48.784229268Z",
-      "updated_at": "2026-08-24T21:57:38.967514219Z",
+      "updated_at": "2026-08-24T21:57:50.114516959Z",
       "related": [
         "9d404579-dff2-47a3-b37c-03dfb5d67530"
       ],
       "comments": {
+        "1c964bcf-45bd-45ed-8d4c-8cccaea8448f": {
+          "display_id": 1514,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 550f9006. BackgroundShellManager now constructs and starts bubblewrap inside the same named supervisor thread that owns the job through reap, preserving --die-with-parent instead of weakening sandbox cleanup. Startup uses a synchronous receipt; thread/spawn/reader failures publish durable DeliveryFailed state; capacity conversion from preparing to Starting remains atomic under the manager lock. Added a Linux regression proving the job survives its transient caller thread. Rust 1.98 fmt, locked all-target/all-feature check, strict Clippy, exact full serialized suite, background unit/integration coverage, repository policy/hygiene, and fuzz check/Clippy/tests all pass.",
+          "created_at": "2026-08-24T21:57:50.111970336Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkTqr8vbVwCe4/ml/uashHOejFGkeL27GSRRbFEM/nBTOMqS1UT3L8ZYUfcFz/i9mer3Bs21ouD5/TwfhY0U9DA=="
+        },
         "ae33d29b-3cbe-44cf-bebc-1cf53f8a97e6": {
           "display_id": 1513,
           "author": "6Vw9",
@@ -39179,11 +39188,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1505,
       "timestamp": "2026-08-24T21:57:38.967514219Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1506,
+      "timestamp": "2026-08-24T21:57:50.114516959Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T21:57:38.967514219Z",
+    "timestamp": "2026-08-24T21:57:50.114516959Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1505
+    "agent_seq": 1506
   }
 }
