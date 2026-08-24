@@ -1,6 +1,6 @@
 {
   "next_display_id": 1135,
-  "next_comment_id": 1519,
+  "next_comment_id": 1520,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7922,8 +7922,17 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T22:34:46.387503615Z",
-      "updated_at": "2026-08-24T22:35:55.538841202Z",
+      "updated_at": "2026-08-24T22:55:49.698898673Z",
       "comments": {
+        "073e36e0-6493-4bdc-ac5c-7d36574d3c18": {
+          "display_id": 1519,
+          "author": "6Vw9",
+          "content": "Result: fixed the CI/production liveness defect by publishing the first pipe chunk immediately, coalescing sustained high-throughput output into bounded 256 KiB durable batches, flushing residual bytes at EOF, and retaining the existing 2 MiB cap, truncation flag, pagination, error delivery, supervisor ownership, and reaping behavior. The 3 MiB newline-free regression now finishes in ~0.86s and asserts at most 16 retained durable events instead of permitting per-read fsync churn. Rust 1.98 validation passed: fmt; all-target/all-feature check; strict Clippy; 106 Bash unit tests; 9 background E2E; 40 Bash integration; exact serialized all-target/all-feature full suite; retrieval evidence 9/9; fuzz check/strict Clippy/4 tests; sandbox escape 11/11; filesystem capability 2/2; repository policy 27/27; hygiene verified. Rebound exact retrieval evidence: source bcdb245d..., tuning 70d500ce..., held-out unchanged 02d8c053..., evaluation 2ef150e2...; independent review remains explicitly rejected.",
+          "created_at": "2026-08-24T22:55:49.695202842Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJAKf8++ggHi1GTLsv4Duq8k/LSocEwXRdmGX0kaNzAjkPJj5VU+P8DUM+oMcW05vLQMzoLrEQxHnj5PPvtiPDA=="
+        },
         "baf5f80d-fd5f-4eee-ad63-5747628d832a": {
           "display_id": 1518,
           "author": "6Vw9",
@@ -39292,11 +39301,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1516,
       "timestamp": "2026-08-24T22:35:55.538841202Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1517,
+      "timestamp": "2026-08-24T22:55:49.698898673Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T22:35:55.538841202Z",
+    "timestamp": "2026-08-24T22:55:49.698898673Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1516
+    "agent_seq": 1517
   }
 }
