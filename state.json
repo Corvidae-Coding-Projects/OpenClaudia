@@ -1,6 +1,6 @@
 {
   "next_display_id": 1135,
-  "next_comment_id": 1518,
+  "next_comment_id": 1519,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7922,7 +7922,18 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T22:34:46.387503615Z",
-      "updated_at": "2026-08-24T22:34:46.387503615Z"
+      "updated_at": "2026-08-24T22:35:55.538841202Z",
+      "comments": {
+        "baf5f80d-fd5f-4eee-ad63-5747628d832a": {
+          "display_id": 1518,
+          "author": "6Vw9",
+          "content": "Plan: coalesce high-throughput pipe reads before each durable job-record commit while publishing the first chunk immediately, flushing on a short interval/size bound and at EOF. Preserve the 2 MiB retention cap, pagination, truncation flag, reader-error delivery, and supervisor/reaping semantics. Validate on Rust 1.98 with the focused liveness test, all Bash manager tests, formatting/check/strict Clippy, then the serialized runner-equivalent full suite.",
+          "created_at": "2026-08-24T22:35:55.535362816Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABADG4BzCKnojfy//Bs0bHbzwokW/6YtBW+GAm4GbpmF1MpJBd8o+0aFZRG5a1GgO/zVHn7z7JugZBBcCHiWUYQCA=="
+        }
+      }
     },
     "3db5b16b-38b1-4343-8090-a3606a0e4e43": {
       "uuid": "3db5b16b-38b1-4343-8090-a3606a0e4e43",
@@ -39276,11 +39287,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1515,
       "timestamp": "2026-08-24T22:34:51.854570857Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1516,
+      "timestamp": "2026-08-24T22:35:55.538841202Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T22:34:51.854570857Z",
+    "timestamp": "2026-08-24T22:35:55.538841202Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1515
+    "agent_seq": 1516
   }
 }
