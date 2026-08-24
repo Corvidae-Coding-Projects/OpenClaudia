@@ -20215,7 +20215,10 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T19:57:01.619331608Z",
-      "updated_at": "2026-08-24T19:57:01.619331608Z"
+      "updated_at": "2026-08-24T19:57:06.882878483Z",
+      "labels": [
+        "ci"
+      ]
     },
     "9d4cd177-7b87-4d67-8364-97ac5028af7b": {
       "uuid": "9d4cd177-7b87-4d67-8364-97ac5028af7b",
@@ -38918,11 +38921,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1486,
       "timestamp": "2026-08-24T19:57:01.619331608Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1487,
+      "timestamp": "2026-08-24T19:57:06.882878483Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:57:01.619331608Z",
+    "timestamp": "2026-08-24T19:57:06.882878483Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1486
+    "agent_seq": 1487
   }
 }
