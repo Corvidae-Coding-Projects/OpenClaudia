@@ -1,6 +1,6 @@
 {
   "next_display_id": 1130,
-  "next_comment_id": 1487,
+  "next_comment_id": 1488,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -5568,7 +5568,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T18:11:27.061351876Z",
-      "updated_at": "2026-08-24T19:20:30.897514992Z",
+      "updated_at": "2026-08-24T19:20:46.413702072Z",
       "closed_at": "2026-08-24T19:20:30.897513455Z",
       "labels": [
         "remediation"
@@ -5609,6 +5609,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9+qYpGRQq2FiWk4gDhmAe+Cg+NWqkGNjSATLmt952IM6D365ore0Bfz5tjVbLDPSaBVKDvpxj6aOG8ICY3SgAA=="
+        },
+        "a10a9542-7a87-4162-87e5-101e0aca5dd9": {
+          "display_id": 1487,
+          "author": "6Vw9",
+          "content": "Delivered immutable per-run read snapshot generations, explicit existing-file edit/write generation binding, bounded preflight and sanitized diff evidence, and atomic no-replace/exchange publication with typed safe conflicts. Migrated ACP and application tests to pass generations from actual reads. Rust 1.98 fmt, all-target/all-feature check, strict Clippy, full serialized all-target/all-feature tests, and focused production-path suites all passed.",
+          "created_at": "2026-08-24T19:20:46.411276279Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPtUy9QJ8Lzcd2l1lcNh4GFyhDLVtbaudIT3+MunHZpBejdD1bbrAGCGA+voohES5MuN+EOeUMI1/LOWt3VY9CQ=="
         },
         "a803bfda-de12-469e-bae6-c6d4f41102ac": {
           "display_id": 1483,
@@ -38574,11 +38583,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1454,
       "timestamp": "2026-08-24T19:20:35.476910933Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1455,
+      "timestamp": "2026-08-24T19:20:46.413702072Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:20:35.476910933Z",
+    "timestamp": "2026-08-24T19:20:46.413702072Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1454
+    "agent_seq": 1455
   }
 }
