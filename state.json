@@ -1,6 +1,6 @@
 {
   "next_display_id": 1134,
-  "next_comment_id": 1511,
+  "next_comment_id": 1512,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22610,11 +22610,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T21:28:48.784229268Z",
-      "updated_at": "2026-08-24T21:29:21.290519433Z",
+      "updated_at": "2026-08-24T21:35:45.997567607Z",
       "related": [
         "9d404579-dff2-47a3-b37c-03dfb5d67530"
       ],
       "comments": {
+        "ce19f50f-498b-4438-859b-aa8f7d55c65a": {
+          "display_id": 1511,
+          "author": "6Vw9",
+          "content": "After moving spawn into the supervisor, the focused regression changed from signal exit -1 to ordinary exit 1. The persisted job record proves the remaining event is host resource exhaustion inside bubblewrap after outer Command::spawn: stderr is 'bwrap: Can't fork for pid 1: Resource temporarily unavailable'. This confirms the parent-thread defect is repaired and exposes a separate stress-fixture classification gap.",
+          "created_at": "2026-08-24T21:35:45.992617699Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJ9HVXn+8TY/EN2BmisNOkcJ2Fld8iJ8AK0v2CzfxMjdSydAZ0tCR8yorY7xF1AMyTJ/gMG4YObJGWDuSGIzHCA=="
+        },
         "fb325e34-b945-4941-8ab9-657cbc09bc84": {
           "display_id": 1510,
           "author": "6Vw9",
@@ -39137,11 +39146,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1503,
       "timestamp": "2026-08-24T21:29:21.290519433Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1504,
+      "timestamp": "2026-08-24T21:35:45.997567607Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T21:29:21.290519433Z",
+    "timestamp": "2026-08-24T21:35:45.997567607Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1503
+    "agent_seq": 1504
   }
 }
