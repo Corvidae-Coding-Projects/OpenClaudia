@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1134,
+  "next_display_id": 1135,
   "next_comment_id": 1518,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -255,6 +255,7 @@
     "3ce0144f-77d7-4257-acd1-281a343f47af": 1107,
     "3d00c6f8-7f19-4182-8735-3fd145e801c7": 930,
     "3d4d9e2a-0b90-4075-b1a4-c05e2d9699ee": 716,
+    "3d68314b-6784-4157-8d05-bbf789e32424": 1134,
     "3db5b16b-38b1-4343-8090-a3606a0e4e43": 140,
     "3e1b7582-1876-4510-8faf-473a7a745a94": 110,
     "3e3780c5-e063-4121-8098-c174399d2d2f": 616,
@@ -7906,6 +7907,18 @@
         "qa-review",
         "security"
       ]
+    },
+    "3d68314b-6784-4157-8d05-bbf789e32424": {
+      "uuid": "3d68314b-6784-4157-8d05-bbf789e32424",
+      "display_id": 1134,
+      "title": "Batch durable background output without blocking job completion",
+      "description": "PR #66 Linux run 32783894013 failed tools::bash::tests::newline_free_output_is_bounded_and_job_finishes after 30 seconds. The reader durably rewrites and synchronizes the cumulative job.json on each pipe read (typically small chunks), making a bounded 3 MiB stream perform quadratic writes and many fsyncs on slower storage. Preserve prompt streaming and the 2 MiB retention cap while coalescing high-throughput output into bounded durable batches; verify terminal publication, pagination/truncation, and the full Rust 1.98 runner-equivalent suite.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T22:34:46.387503615Z",
+      "updated_at": "2026-08-24T22:34:46.387503615Z"
     },
     "3db5b16b-38b1-4343-8090-a3606a0e4e43": {
       "uuid": "3db5b16b-38b1-4343-8090-a3606a0e4e43",
@@ -39249,11 +39262,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1513,
       "timestamp": "2026-08-24T21:59:34.023530852Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1514,
+      "timestamp": "2026-08-24T22:34:46.387503615Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T21:59:34.023530852Z",
+    "timestamp": "2026-08-24T22:34:46.387503615Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1513
+    "agent_seq": 1514
   }
 }
