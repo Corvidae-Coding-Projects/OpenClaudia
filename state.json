@@ -1,6 +1,6 @@
 {
   "next_display_id": 1130,
-  "next_comment_id": 1488,
+  "next_comment_id": 1489,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -5572,7 +5572,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T18:11:27.061351876Z",
-      "updated_at": "2026-08-24T19:21:35.016288653Z",
+      "updated_at": "2026-08-24T19:22:19.511165114Z",
       "labels": [
         "remediation"
       ],
@@ -5630,6 +5630,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABANr+0zndzL0os84EkHLdfDKBtUBsTeOPn2eC+atJoASh0PW8A0D7jO3odHd1PQEEuHVv3mv15Vc3jKodZi3uABw=="
+        },
+        "bd9962e1-5284-48c9-b4fb-6ac887490582": {
+          "display_id": 1488,
+          "author": "6Vw9",
+          "content": "Bind each successful read to the SHA-256 of the exact stable bytes rendered, require that generation for existing-file mutations, preflight bounded diff and guardrail costs before mutation, and publish through a descriptor-relative staged file with no-replace or verified exchange semantics. Preserve new-file creation and all existing caller paths while migrating ACP and tests to pass the returned generation.",
+          "created_at": "2026-08-24T19:22:19.508302841Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPrTjGhkfSnn0pp6S/sOnd2wo4a2Yvj5cbDUa1lcqEOFMuyAcT472QMl/O+8Krm1462UEfqFhmg+zZSTB/xLbCQ=="
         }
       }
     },
@@ -38601,11 +38610,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1457,
       "timestamp": "2026-08-24T19:21:41.913792937Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1458,
+      "timestamp": "2026-08-24T19:22:19.511165114Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:21:41.913792937Z",
+    "timestamp": "2026-08-24T19:22:19.511165114Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1457
+    "agent_seq": 1458
   }
 }
