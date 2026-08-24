@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1123,
+  "next_display_id": 1124,
   "next_comment_id": 1427,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -294,6 +294,7 @@
     "4956e2e0-fc51-452d-9b2d-da82b99f33b6": 1067,
     "4979db5f-d4e8-4163-b5f1-c287a0f79936": 1060,
     "4982ed1b-8abe-4593-8690-d21f65ba603f": 84,
+    "498aec22-126b-4f73-8ca1-341df6191fb8": 1123,
     "49c38102-2591-461e-9287-c3ed3b5c9a27": 284,
     "4a075b82-af59-439a-af0e-62da4affcae6": 910,
     "4a2ac139-dbc0-41cc-bd4b-44ff5b706932": 281,
@@ -9317,6 +9318,18 @@
           "signature": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEe0KY4l/Z7G/vfkx00kFwZtY3FjD8lde6VcPNSNT06kyL5ZUnzQGbJUMzOdlFd65s/RCzZhVJQVonLQ3yKzipGAAAABFjcm9zc2xpbmstY29tbWVudAAAAAAAAAAGc2hhNTEyAAAAYwAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASAAAACApZQLGUkYeiN/uO8P1qcil9vv+r9CfZG+haKWvFgF9twAAACBY700ey9J/wLplYoCXi3S0sdrpOSwaHCKU/XDKFgvfbg=="
         }
       }
+    },
+    "498aec22-126b-4f73-8ca1-341df6191fb8": {
+      "uuid": "498aec22-126b-4f73-8ca1-341df6191fb8",
+      "display_id": 1123,
+      "title": "Codex ChatGPT Responses rejects OpenClaudia max_output_tokens",
+      "description": "A pre-edit compiled live compatibility test authenticated successfully through the existing Codex auth.json, then the ChatGPT Codex Responses backend returned HTTP 400: Unsupported parameter: max_output_tokens. The foreign credential store remained byte-identical. Repair only the provider-specific request shape needed for a real OpenClaudia one-shot conversation, add regression coverage, and relate the evidence to S-029 #1122 without conflating it with OAuth lifecycle behavior.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T00:07:01.696684309Z",
+      "updated_at": "2026-08-24T00:07:01.696684309Z"
     },
     "49c38102-2591-461e-9287-c3ed3b5c9a27": {
       "uuid": "49c38102-2591-461e-9287-c3ed3b5c9a27",
@@ -37353,11 +37366,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1347,
       "timestamp": "2026-08-24T00:01:27.415569642Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1348,
+      "timestamp": "2026-08-24T00:07:01.696684309Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T00:01:27.415569642Z",
+    "timestamp": "2026-08-24T00:07:01.696684309Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1347
+    "agent_seq": 1348
   }
 }
