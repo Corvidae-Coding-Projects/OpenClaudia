@@ -1,6 +1,6 @@
 {
   "next_display_id": 1125,
-  "next_comment_id": 1441,
+  "next_comment_id": 1442,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10788,10 +10788,24 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T01:52:48.843928461Z",
-      "updated_at": "2026-08-24T01:52:53.405173992Z",
+      "updated_at": "2026-08-24T01:53:14.992199078Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "d8547b2d-de41-42d0-bc66-4a5ad9304f70": {
+          "display_id": 1441,
+          "author": "6Vw9",
+          "content": "Blocked: no active issue",
+          "created_at": "2026-08-24T01:53:14.989685793Z",
+          "kind": "intervention",
+          "trigger_type": "tool_blocked",
+          "intervention_context": "Reading preflight, architecture, and Rust-quality skill instructions before implementing S-030 interactive API-key setup",
+          "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        }
+      }
     },
     "5a22fff6-cb7e-474c-9b62-147ae03ccda2": {
       "uuid": "5a22fff6-cb7e-474c-9b62-147ae03ccda2",
@@ -37636,11 +37650,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1370,
       "timestamp": "2026-08-24T01:52:58.540453741Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1371,
+      "timestamp": "2026-08-24T01:53:14.992199078Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:52:58.540453741Z",
+    "timestamp": "2026-08-24T01:53:14.992199078Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1370
+    "agent_seq": 1371
   }
 }
