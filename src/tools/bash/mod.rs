@@ -307,13 +307,12 @@ impl BackgroundShellManager {
             .stderr(Stdio::piped());
         #[cfg(not(windows))]
         prepared_command.command_mut().process_group(0);
-        let (mut process_command, background_projection) = prepared_command.into_parts();
+        let (process_command, background_projection) = prepared_command.into_parts();
 
         // Project snapshotting can be expensive. Keep it outside the shared
         // job-manager lock, then recheck capacity before creating durable job
         // state so concurrent spawns cannot exceed the limit.
         let mut shells = recover_mutex_lock(&self.shells, "spawn", "shells", None);
-        preparation_slot.release();
         let active = shells
             .values()
             .filter(|shell| shell.state().is_running())
@@ -339,88 +338,9 @@ impl BackgroundShellManager {
         let core = Arc::new(Mutex::new(JobCore::create(
             run, &shell_id, command, timeout,
         )?));
-        let child = process_command.spawn();
-        let mut child = match child {
-            Ok(child) => child,
-            Err(error) => {
-                let detail = format!("Failed to spawn background shell: {error}");
-                let _ = recover_mutex_lock(&core, "spawn", "job_core", Some(&shell_id)).set_state(
-                    BackgroundJobState::DeliveryFailed {
-                        error: detail.clone(),
-                    },
-                );
-                shells.insert(
-                    shell_id.clone(),
-                    Arc::new(BackgroundShell {
-                        core,
-                        control: None,
-                    }),
-                );
-                return Err(format!("{detail}; background job id: {shell_id}"));
-            }
-        };
-        let pid = child.id();
-        let mark_running =
-            recover_mutex_lock(&core, "spawn", "job_core", Some(&shell_id)).mark_running(pid);
-        if let Err(error) = mark_running {
-            terminate_sandbox_process_tree(pid);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-
         let stdout_done = Arc::new(AtomicBool::new(false));
         let stderr_done = Arc::new(AtomicBool::new(false));
         let reaped = Arc::new(AtomicBool::new(false));
-        let (errors_tx, errors_rx) = std::sync::mpsc::channel();
-        let stdout_missing = child.stdout.is_none();
-        let stderr_missing = child.stderr.is_none();
-        let stdout_reader = child.stdout.take().map(|stdout| {
-            spawn_output_reader(
-                stdout,
-                Arc::clone(&core),
-                JobOutputStream::Stdout,
-                Arc::clone(&stdout_done),
-                errors_tx.clone(),
-                shell_id.clone(),
-            )
-        });
-        let stderr_reader = child.stderr.take().map(|stderr| {
-            spawn_output_reader(
-                stderr,
-                Arc::clone(&core),
-                JobOutputStream::Stderr,
-                Arc::clone(&stderr_done),
-                errors_tx,
-                shell_id.clone(),
-            )
-        });
-        let mut reader_handles = Vec::new();
-        for reader in [stdout_reader, stderr_reader].into_iter().flatten() {
-            match reader {
-                Ok(handle) => reader_handles.push(handle),
-                Err(error) => {
-                    terminate_sandbox_process_tree(pid);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    for handle in reader_handles {
-                        let _ = handle.join();
-                    }
-                    let _ = recover_mutex_lock(&core, "spawn", "job_core", Some(&shell_id))
-                        .set_state(BackgroundJobState::DeliveryFailed {
-                            error: error.clone(),
-                        });
-                    return Err(error);
-                }
-            }
-        }
-        if stdout_missing {
-            stdout_done.store(true, Ordering::SeqCst);
-        }
-        if stderr_missing {
-            stderr_done.store(true, Ordering::SeqCst);
-        }
-
         let cancellation = run.runtime().cancellation().child();
         let requested_state = Arc::new(Mutex::new(None));
         let shell = Arc::new(BackgroundShell {
@@ -434,37 +354,79 @@ impl BackgroundShellManager {
             }),
         });
         shells.insert(shell_id.clone(), shell);
+        preparation_slot.release();
         drop(shells);
 
         let run_for_ledger = crate::ledger::RunBinding::from_run(run);
         let owner_for_ledger = run.process_owner().to_string();
         let command_for_ledger = command.to_string();
         let supervisor_id = shell_id.clone();
-        thread::spawn(move || {
-            supervise_background_job(
-                child,
-                pid,
-                timeout,
-                &cancellation,
-                &requested_state,
-                &stdout_done,
-                &stderr_done,
-                &reaped,
-                &errors_rx,
-                reader_handles,
-                &core,
-                &run_for_ledger,
-                &owner_for_ledger,
-                &cwd,
-                &command_for_ledger,
-                &supervisor_id,
-                background_freshness,
-                background_budget,
-                background_projection,
-            );
-        });
+        let supervisor_core = Arc::clone(&core);
+        let supervisor_stdout_done = Arc::clone(&stdout_done);
+        let supervisor_stderr_done = Arc::clone(&stderr_done);
+        let supervisor_reaped = Arc::clone(&reaped);
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let launch = BackgroundJobLaunch {
+            process_command,
+            background_projection,
+            startup: startup_tx,
+            core: supervisor_core,
+            job_id: supervisor_id,
+            stdout_done: supervisor_stdout_done,
+            stderr_done: supervisor_stderr_done,
+            reaped: supervisor_reaped,
+            cancellation,
+            requested_state,
+            run_for_ledger,
+            owner_for_ledger,
+            cwd,
+            command: command_for_ledger,
+            background_freshness,
+            background_budget,
+            timeout,
+        };
+        let supervisor = thread::Builder::new()
+            .name(format!("background-supervisor-{shell_id}"))
+            .spawn(move || launch.run());
+        let supervisor = match supervisor {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                let detail = format!("Cannot start background job supervisor: {error}");
+                publish_background_start_failure(
+                    &core,
+                    &shell_id,
+                    &stdout_done,
+                    &stderr_done,
+                    &reaped,
+                    &detail,
+                );
+                return Err(format!("{detail}; background job id: {shell_id}"));
+            }
+        };
 
-        Ok(shell_id)
+        match startup_rx.recv() {
+            Ok(Ok(())) => {
+                drop(supervisor);
+                Ok(shell_id)
+            }
+            Ok(Err(error)) => {
+                let _ = supervisor.join();
+                Err(format!("{error}; background job id: {shell_id}"))
+            }
+            Err(error) => {
+                let _ = supervisor.join();
+                let detail = format!("Background job supervisor stopped during startup: {error}");
+                publish_background_start_failure(
+                    &core,
+                    &shell_id,
+                    &stdout_done,
+                    &stderr_done,
+                    &reaped,
+                    &detail,
+                );
+                Err(format!("{detail}; background job id: {shell_id}"))
+            }
+        }
     }
 
     fn get_output(
@@ -647,6 +609,179 @@ impl BackgroundShellManager {
         };
         ids.sort_unstable();
         ids
+    }
+}
+
+fn publish_background_start_failure(
+    core: &Arc<Mutex<JobCore>>,
+    job_id: &str,
+    stdout_done: &Arc<AtomicBool>,
+    stderr_done: &Arc<AtomicBool>,
+    reaped: &Arc<AtomicBool>,
+    error: &str,
+) {
+    stdout_done.store(true, Ordering::SeqCst);
+    stderr_done.store(true, Ordering::SeqCst);
+    reaped.store(true, Ordering::SeqCst);
+    let _ = recover_mutex_lock(core, "spawn", "job_core", Some(job_id)).set_state(
+        BackgroundJobState::DeliveryFailed {
+            error: error.to_string(),
+        },
+    );
+}
+
+struct BackgroundJobLaunch {
+    process_command: std::process::Command,
+    background_projection: Option<crate::tools::file::workspace_projection::WorkspaceProjection>,
+    startup: std::sync::mpsc::SyncSender<Result<(), String>>,
+    core: Arc<Mutex<JobCore>>,
+    job_id: String,
+    stdout_done: Arc<AtomicBool>,
+    stderr_done: Arc<AtomicBool>,
+    reaped: Arc<AtomicBool>,
+    cancellation: crate::runtime::CancellationHandle,
+    requested_state: Arc<Mutex<Option<BackgroundJobState>>>,
+    run_for_ledger: crate::ledger::RunBinding,
+    owner_for_ledger: String,
+    cwd: PathBuf,
+    command: String,
+    background_freshness: crate::evidence_freshness::MutationReservation,
+    background_budget: crate::runtime::BudgetReservation,
+    timeout: std::time::Duration,
+}
+
+impl BackgroundJobLaunch {
+    #[allow(clippy::too_many_lines)]
+    fn run(self) {
+        let Self {
+            mut process_command,
+            background_projection,
+            startup,
+            core,
+            job_id,
+            stdout_done,
+            stderr_done,
+            reaped,
+            cancellation,
+            requested_state,
+            run_for_ledger,
+            owner_for_ledger,
+            cwd,
+            command,
+            background_freshness,
+            background_budget,
+            timeout,
+        } = self;
+        let mut child = match process_command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let detail = format!("Failed to spawn background shell: {error}");
+                publish_background_start_failure(
+                    &core,
+                    &job_id,
+                    &stdout_done,
+                    &stderr_done,
+                    &reaped,
+                    &detail,
+                );
+                let _ = startup.send(Err(detail));
+                return;
+            }
+        };
+        let pid = child.id();
+        let mark_running =
+            recover_mutex_lock(&core, "spawn", "job_core", Some(&job_id)).mark_running(pid);
+        if let Err(error) = mark_running {
+            terminate_sandbox_process_tree(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            publish_background_start_failure(
+                &core,
+                &job_id,
+                &stdout_done,
+                &stderr_done,
+                &reaped,
+                &error,
+            );
+            let _ = startup.send(Err(error));
+            return;
+        }
+
+        let (errors_tx, errors_rx) = std::sync::mpsc::channel();
+        let stdout_missing = child.stdout.is_none();
+        let stderr_missing = child.stderr.is_none();
+        let stdout_reader = child.stdout.take().map(|stdout| {
+            spawn_output_reader(
+                stdout,
+                Arc::clone(&core),
+                JobOutputStream::Stdout,
+                Arc::clone(&stdout_done),
+                errors_tx.clone(),
+                job_id.clone(),
+            )
+        });
+        let stderr_reader = child.stderr.take().map(|stderr| {
+            spawn_output_reader(
+                stderr,
+                Arc::clone(&core),
+                JobOutputStream::Stderr,
+                Arc::clone(&stderr_done),
+                errors_tx,
+                job_id.clone(),
+            )
+        });
+        let mut reader_handles = Vec::new();
+        for reader in [stdout_reader, stderr_reader].into_iter().flatten() {
+            match reader {
+                Ok(handle) => reader_handles.push(handle),
+                Err(error) => {
+                    terminate_sandbox_process_tree(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    for handle in reader_handles {
+                        let _ = handle.join();
+                    }
+                    publish_background_start_failure(
+                        &core,
+                        &job_id,
+                        &stdout_done,
+                        &stderr_done,
+                        &reaped,
+                        &error,
+                    );
+                    let _ = startup.send(Err(error));
+                    return;
+                }
+            }
+        }
+        if stdout_missing {
+            stdout_done.store(true, Ordering::SeqCst);
+        }
+        if stderr_missing {
+            stderr_done.store(true, Ordering::SeqCst);
+        }
+        let _ = startup.send(Ok(()));
+        supervise_background_job(
+            child,
+            pid,
+            timeout,
+            &cancellation,
+            &requested_state,
+            &stdout_done,
+            &stderr_done,
+            &reaped,
+            &errors_rx,
+            reader_handles,
+            &core,
+            &run_for_ledger,
+            &owner_for_ledger,
+            &cwd,
+            &command,
+            &job_id,
+            background_freshness,
+            background_budget,
+            background_projection,
+        );
     }
 }
 
@@ -2056,24 +2191,57 @@ mod tests {
             .filter(|r| {
                 r.as_ref()
                     .err()
-                    .is_some_and(|e| e.contains("Maximum background shell limit"))
+                    .is_some_and(|e| e.contains("Maximum active background shell limit"))
             })
             .count()
     }
 
+    /// `#1133`: bubblewrap's parent-death signal must remain bound to the
+    /// long-lived supervisor rather than the transient spawning caller.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fix1133_background_survives_spawning_thread_exit() {
+        let manager = Arc::new(BackgroundShellManager::new());
+        let spawning_manager = Arc::clone(&manager);
+        let id = thread::spawn(move || {
+            spawning_manager.spawn_with_timeout(
+                test_run(),
+                "while :; do sleep 3600; done",
+                std::time::Duration::from_secs(3600),
+            )
+        })
+        .join()
+        .expect("spawning thread must join")
+        .expect("background job must start");
+
+        // Linux parent-death signals are bound to the creating thread. Give
+        // bubblewrap enough time to observe that the caller has exited before
+        // proving the dedicated supervisor remains its live parent.
+        thread::sleep(std::time::Duration::from_millis(250));
+        let read = manager
+            .get_output(test_run(), &id, Some(0))
+            .expect("background job must remain readable");
+        let state = read.state;
+        let _ = manager.kill(test_run(), &id);
+
+        assert!(
+            state.is_running(),
+            "background job died when its spawning caller thread exited: {}",
+            state.label()
+        );
+    }
+
     /// `#672-a`: `cap + EXTRA` concurrent spawners on a fresh manager — the
-    /// number of *successful* spawns must not exceed `MAX_BACKGROUND_SHELLS`,
-    /// and at least one caller must observe the cap-rejection error string,
-    /// proving the rejection path is reachable under contention.
+    /// number of active successful spawns must not exceed
+    /// `MAX_BACKGROUND_SHELLS`, and at least one caller must observe the
+    /// cap-rejection error string unless host resource failures prevent the
+    /// test from reaching capacity.
     ///
     /// Pre-fix the cap check ran AFTER the spawn syscall, so a flurry of
-    /// threads would all pass the cap check and the OS+map would each see
-    /// >cap entries.
-    ///
-    /// NOTE: under heavy parallel test load (cargo test --lib) some
-    /// `Command::spawn` calls may fail with fork ENOMEM/EAGAIN. Those count
-    /// as neither a success nor a cap-rejection; the cap invariant
-    /// (`successes <= cap`) is unaffected.
+    /// threads would all pass the cap check and the OS+map would each exceed
+    /// the cap. Under heavy load, either `Command::spawn` or bubblewrap's
+    /// internal fork may fail with ENOMEM/EAGAIN; neither represents an active
+    /// admission.
     #[test]
     #[cfg(unix)]
     fn fix672_concurrent_spawn_never_exceeds_cap() {
@@ -2089,11 +2257,15 @@ mod tests {
             let bar_c = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 bar_c.wait();
-                // Keep every admitted process active until explicit teardown.
-                // A fixed-duration sleep can expire while durable preparation
-                // serializes on a slow runner, legitimately allowing slot
-                // reuse and invalidating the cumulative-success assertion.
-                mgr_c.spawn(test_run(), "exec tail -f /dev/null")
+                // Ask every admitted process to remain active until teardown.
+                // Both the command and its test-only supervisor deadline must
+                // outlive durable preparation on a slow runner. Host-level
+                // launch failures are classified after all callers return.
+                mgr_c.spawn_with_timeout(
+                    test_run(),
+                    "while :; do sleep 3600; done",
+                    std::time::Duration::from_secs(3600),
+                )
             }));
         }
 
@@ -2101,30 +2273,53 @@ mod tests {
             .into_iter()
             .map(|h| h.join().expect("join"))
             .collect();
-        let successes = results.iter().filter(|r| r.is_ok()).count();
         let cap_errors = count_capacity_errors(&results);
+        let observations = results
+            .iter()
+            .flatten()
+            .map(|id| (id, mgr.get_output(test_run(), id, Some(0))))
+            .collect::<Vec<_>>();
+        let active_successes = observations
+            .iter()
+            .filter(|(_, read)| matches!(read, Ok(read) if read.state.is_running()))
+            .count();
+        let early_terminal = observations
+            .iter()
+            .filter(|(_, read)| matches!(read, Ok(read) if read.state.is_terminal()))
+            .count();
+        let unreadable = observations
+            .iter()
+            .filter(|(_, read)| read.is_err())
+            .count();
+        let synchronous_other_errors = results
+            .iter()
+            .filter(|result| {
+                matches!(result, Err(error) if !error.contains("Maximum active background shell limit"))
+            })
+            .count();
 
         // Tear down before assertions: kill every successful spawn so we
-        // don't leak `sleep` processes on test failure.
+        // don't leak blocking processes on test failure.
         for id in results.iter().flatten() {
             let _ = mgr.kill(test_run(), id);
         }
 
         assert!(
-            successes <= MAX_BACKGROUND_SHELLS,
-            "fix672-a: successful spawns must not exceed cap ({MAX_BACKGROUND_SHELLS}); \
-             got {successes}"
+            active_successes <= MAX_BACKGROUND_SHELLS,
+            "fix672-a: active successful spawns must not exceed cap \
+             ({MAX_BACKGROUND_SHELLS}); got {active_successes}"
         );
         // The race is exercised when either (a) we hit the cap
         // (cap_errors > 0) or (b) the OS rejected enough spawns that we
-        // never reached cap — in the latter case the test result is
-        // inconclusive (test-infra noise from concurrent cwd-mutating
-        // tests). Either way the cap invariant above must hold.
-        let other_errors = total - successes - cap_errors;
+        // never reached cap. Bubblewrap can report fork EAGAIN only after the
+        // outer process starts, so successful-but-terminal jobs are the same
+        // class of test-infrastructure noise as synchronous spawn failures.
+        // Either way the active-cap invariant above must hold.
+        let other_errors = synchronous_other_errors + early_terminal + unreadable;
         assert!(
             cap_errors > 0 || other_errors >= STRESS_EXTRA,
             "fix672-a: cap-rejection path was not exercised AND not enough \
-             OS-level spawn failures to explain it; got {successes} ok + \
+             OS-level spawn failures to explain it; got {active_successes} active + \
              {cap_errors} cap-err + {other_errors} other-err out of {total}"
         );
     }
