@@ -4421,12 +4421,13 @@
       "display_id": 1128,
       "title": "S-028: Verify Codex account and compliance metadata",
       "description": "Replace OpenClaudia-owned decoding of unverified Codex JWT payloads with the supported Codex app-server managed ChatGPT authentication boundary. Keep direct OpenAI API-key credentials separate, preserve existing provider behavior, add deterministic tests, and manually verify a real paid-account conversation without exposing credentials.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T06:46:20.434770076Z",
-      "updated_at": "2026-08-24T08:05:52.226377191Z",
+      "updated_at": "2026-08-24T08:06:06.532343923Z",
+      "closed_at": "2026-08-24T08:06:06.532342643Z",
       "labels": [
         "remediation"
       ],
@@ -38396,11 +38397,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1437,
       "timestamp": "2026-08-24T08:05:52.226377191Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1438,
+      "timestamp": "2026-08-24T08:06:06.532343923Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T08:05:52.226377191Z",
+    "timestamp": "2026-08-24T08:06:06.532343923Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1437
+    "agent_seq": 1438
   }
 }
