@@ -1,6 +1,6 @@
 {
   "next_display_id": 1124,
-  "next_comment_id": 1432,
+  "next_comment_id": 1433,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9329,13 +9329,24 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:07:01.696684309Z",
-      "updated_at": "2026-08-24T00:07:19.500033189Z",
+      "updated_at": "2026-08-24T01:05:17.101469350Z",
       "labels": [
         "defect"
       ],
       "related": [
         "95529073-f3ee-4935-8580-ac744ef4b861"
-      ]
+      ],
+      "comments": {
+        "91f0d774-c04f-4783-9ccb-93335f16003d": {
+          "display_id": 1432,
+          "author": "6Vw9",
+          "content": "Live compatibility checkpoint: removed max_output_tokens only at the account-backed ChatGPT/Codex wire boundary after local budget reservation. The real backend then exposed OpenClaudia's over-strict SSE equality check; aligned it with official Codex behavior by retaining response.output_item.done as authoritative and using response.completed.output only as a no-item fallback, including output:null support. Focused unit and pipeline integration tests pass; real Codex auth.json conversation returned OPENCLAUDIA_CODEX_S029_OK without modifying auth.json. Full repository gates remain.",
+          "created_at": "2026-08-24T01:05:17.097609Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcNHGUnHfBgMHlGZTUUH9OcEG4ifggHl9idRgilKQp9x0+6qkhexalWPKxaH9mdt4K8xNC5UOuFs1H9H+E7S8BQ=="
+        }
+      }
     },
     "49c38102-2591-461e-9287-c3ed3b5c9a27": {
       "uuid": "49c38102-2591-461e-9287-c3ed3b5c9a27",
@@ -37462,11 +37473,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1355,
       "timestamp": "2026-08-24T01:05:12.207724608Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1356,
+      "timestamp": "2026-08-24T01:05:17.101469350Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:05:12.207724608Z",
+    "timestamp": "2026-08-24T01:05:17.101469350Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1355
+    "agent_seq": 1356
   }
 }
