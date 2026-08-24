@@ -1,6 +1,6 @@
 {
   "next_display_id": 1128,
-  "next_comment_id": 1473,
+  "next_comment_id": 1474,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8362,7 +8362,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-24T06:42:19.096838177Z",
+      "updated_at": "2026-08-24T06:46:11.491185689Z",
       "labels": [
         "remediation"
       ],
@@ -8629,6 +8629,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/DEloyjRldd2kU10Oc2/cjSv1m7QoU2I0XOEy1ep1sOXODzWtMTe/CC/U0WcLyGu/E2d530dImt5SyVtXZXZBg=="
+        },
+        "5a759a15-3a49-4532-a1d2-9f29ec2b9ade": {
+          "display_id": 1473,
+          "author": "6Vw9",
+          "content": "[action] S-028 preflight: official Codex app-server docs confirm managed ChatGPT auth is the supported embedded-client boundary; mapping current provider transport and local CLI protocol before editing",
+          "created_at": "2026-08-24T06:46:11.487888669Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAggCAvmga4Mm/X1fE/92/2xPItzk7JTv+Ntagi/Vu5M/d145UeJGJvPJbQ3HzYg5769jQwlz4Naf7WcnfJ/DZBA=="
         },
         "5bc5b742-de1a-432c-95fe-449f7d791681": {
           "display_id": 1031,
@@ -38289,11 +38298,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1429,
       "timestamp": "2026-08-24T06:43:49.892714751Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1430,
+      "timestamp": "2026-08-24T06:46:11.491185689Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T06:43:49.892714751Z",
+    "timestamp": "2026-08-24T06:46:11.491185689Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1429
+    "agent_seq": 1430
   }
 }
