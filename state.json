@@ -1,6 +1,6 @@
 {
   "next_display_id": 1125,
-  "next_comment_id": 1446,
+  "next_comment_id": 1447,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10790,7 +10790,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T01:52:48.843928461Z",
-      "updated_at": "2026-08-24T01:58:08.271643283Z",
+      "updated_at": "2026-08-24T01:58:12.437812594Z",
       "labels": [
         "remediation"
       ],
@@ -10845,6 +10845,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "e96dcecb-28a1-4333-b63d-f0f267e636c6": {
+          "display_id": 1446,
+          "author": "6Vw9",
+          "content": "[action] Corrected S-030 trace: live /connect YAML secret writer found; replace it alongside startup prompt",
+          "created_at": "2026-08-24T01:58:12.435529082Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARX2n1qO07hOE4eQPhZYFGPHtVffWL9sis/4MvpPeOB7NI++Ui2rGnURWWbMmwFDGrLqA556chjWgwHPQcCAwBg=="
         }
       }
     },
@@ -37726,11 +37735,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1377,
       "timestamp": "2026-08-24T01:58:08.271643283Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1378,
+      "timestamp": "2026-08-24T01:58:12.437812594Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:58:08.271643283Z",
+    "timestamp": "2026-08-24T01:58:12.437812594Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1377
+    "agent_seq": 1378
   }
 }
