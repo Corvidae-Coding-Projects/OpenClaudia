@@ -24205,11 +24205,12 @@
       "display_id": 1125,
       "title": "S-026: Stop mutating the shared Claude credential store",
       "description": "Implement S-026 without removing working Claude Code login compatibility. Treat Claude Code's credential document as a bounded, owner/mode/link-checked read-only foreign source; OpenClaudia must not refresh, normalize, truncate, login to, logout from, or otherwise rewrite it. Near-expiry/expired credentials must produce an actionable typed recovery state directing the user to refresh through Claude Code, while valid credentials remain usable through existing CLI/TUI/proxy consumers. Keep OpenClaudia-owned metadata/state under OpenClaudia persistence only. Preserve unknown foreign fields byte-for-byte, avoid locks across network awaits, and verify realistic valid/stale/symlink/mode/concurrent-replacement behavior on Rust 1.98 with memory-bounded jobs. Do not widen into S-027 client-identity policy or remove Claude/Codex login support.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T03:16:26.714155934Z",
-      "updated_at": "2026-08-24T04:02:45.435263307Z",
+      "updated_at": "2026-08-24T04:02:55.007486331Z",
+      "closed_at": "2026-08-24T04:02:55.007484966Z",
       "labels": [
         "remediation"
       ],
@@ -37976,11 +37977,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1400,
       "timestamp": "2026-08-24T04:02:45.435263307Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1401,
+      "timestamp": "2026-08-24T04:02:55.007486331Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T04:02:45.435263307Z",
+    "timestamp": "2026-08-24T04:02:55.007486331Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1400
+    "agent_seq": 1401
   }
 }
