@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1122,
+  "next_display_id": 1123,
   "next_comment_id": 1427,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -599,6 +599,7 @@
     "9516998e-c489-4d6e-9db6-2fd859d957f7": 139,
     "9519f539-5008-4db4-b5c1-594f946a52cb": 839,
     "954b6a50-e1c4-4762-ac37-ed854410ea1b": 605,
+    "95529073-f3ee-4935-8580-ac744ef4b861": 1122,
     "955c9fa9-e629-441e-8d31-104beeda2818": 526,
     "956730fe-6b1c-4bce-b20c-3c7f54f81f41": 276,
     "95db6be1-e136-47bb-8460-c232602f0c24": 514,
@@ -18441,6 +18442,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtFwy+XPUcrCM/AfTc1fo2hd6He3A4LU68yb9KzwZ41LssYyvHJ06gwCwHv+4CpHCaRDah56lzj7bXeQn04X5Bg=="
         }
       }
+    },
+    "95529073-f3ee-4935-8580-ac744ef4b861": {
+      "uuid": "95529073-f3ee-4935-8580-ac744ef4b861",
+      "display_id": 1122,
+      "title": "S-029: Implement a complete OAuth session lifecycle",
+      "description": "Repair OpenClaudia-owned OAuth sessions end to end: expiring client-bound pending grants, protected versioned storage, use-time expiry/scope checks, generation-safe single-flight refresh/rotation, and live revocation/logout. Preserve existing Claude Code and Codex login compatibility as bounded read-only credential inputs; do not rewrite their foreign stores or replace their working provider paths. Verify deterministically on Rust 1.98.0 and manually compile, launch, and complete real agent conversations through each locally available existing login without logging secret material.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T00:01:18.302848830Z",
+      "updated_at": "2026-08-24T00:01:18.302848830Z"
     },
     "955c9fa9-e629-441e-8d31-104beeda2818": {
       "uuid": "955c9fa9-e629-441e-8d31-104beeda2818",
@@ -37318,11 +37331,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1344,
       "timestamp": "2026-08-23T23:43:51.066470439Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1345,
+      "timestamp": "2026-08-24T00:01:18.302848830Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-23T23:43:51.066470439Z",
+    "timestamp": "2026-08-24T00:01:18.302848830Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1344
+    "agent_seq": 1345
   }
 }
