@@ -1,6 +1,6 @@
 {
   "next_display_id": 1134,
-  "next_comment_id": 1510,
+  "next_comment_id": 1511,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22610,10 +22610,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T21:28:48.784229268Z",
-      "updated_at": "2026-08-24T21:29:15.824869311Z",
+      "updated_at": "2026-08-24T21:29:21.290519433Z",
       "related": [
         "9d404579-dff2-47a3-b37c-03dfb5d67530"
-      ]
+      ],
+      "comments": {
+        "fb325e34-b945-4941-8ab9-657cbc09bc84": {
+          "display_id": 1510,
+          "author": "6Vw9",
+          "content": "Preferred design: preserve bubblewrap --die-with-parent and make the existing per-job supervisor thread both spawn and supervise the child. Insert a durable Starting shell under the admission lock, start the named supervisor with all lifecycle reservations, synchronously wait for a startup receipt, and publish Running only after spawn/output readers are ready. Rejected alternative: omit --die-with-parent for background jobs; that would avoid the thread-parent signal but allow orphaned sandbox processes after harness death. Rejected larger alternative for this repair: a global spawner event loop; it adds queue/lifecycle machinery without improving the one-thread-per-job model already used.",
+          "created_at": "2026-08-24T21:29:21.288053127Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwcePWsWRKUQzISzhDaKaYAOfxtw6tf7mtHpJ4MkKcdAMkjrsAM03rzbJ+JGaUaiXulH04QTrd3bwN9R3nje7BQ=="
+        }
+      }
     },
     "b04d2823-3401-4393-accf-f2d833fa9ffe": {
       "uuid": "b04d2823-3401-4393-accf-f2d833fa9ffe",
@@ -39121,10 +39132,15 @@
       "agent_id": "6Vw9",
       "agent_seq": 1503,
       "timestamp": "2026-08-24T21:29:15.824869311Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1503,
+      "timestamp": "2026-08-24T21:29:21.290519433Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T21:29:15.824869311Z",
+    "timestamp": "2026-08-24T21:29:21.290519433Z",
     "agent_id": "6Vw9",
     "agent_seq": 1503
   }
