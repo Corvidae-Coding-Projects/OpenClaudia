@@ -1,6 +1,6 @@
 {
   "next_display_id": 1129,
-  "next_comment_id": 1476,
+  "next_comment_id": 1477,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4426,7 +4426,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T06:46:20.434770076Z",
-      "updated_at": "2026-08-24T07:23:45.460943679Z",
+      "updated_at": "2026-08-24T07:23:50.053539648Z",
       "labels": [
         "remediation"
       ],
@@ -4448,6 +4448,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABADWS0HAHk6teTonFWLeVM40RDfbJwV1DhGB7L8bzjPM/ikiyD469CmTBafOJyokPahTIrhcStF2gKZvPv8sXdCQ=="
+        },
+        "a732d1bb-58df-40de-ba23-cf82159282fd": {
+          "display_id": 1476,
+          "author": "6Vw9",
+          "content": "Implemented the supported-account boundary: OpenClaudia now pins the official codex executable, asks it to confirm login, and delegates each account-backed provider turn to an ephemeral/read-only/no-native-tools codex exec process with strict structured output. OpenClaudia retains its own request construction, budgets, host-tool policy/hooks/permissions, ACP/TUI/subagent/VDD loops, and never reads or forwards Codex tokens or routing claims. Removed src/codex_credentials.rs and every private chatgpt.com/backend-api/codex call, raw bearer header, auth.json parser, unverified JWT decode, account-ID header, and FedRAMP header. Deterministic transport tests pass (6/6); cargo check --workspace --all-targets --all-features passes. Two real compiled print-mode probes using gpt-5.6-terra and the existing ChatGPT login returned exact markers; auth.json SHA-256 stayed unchanged. First live probe caught a strict-schema defect; corrected to strict arguments_json output plus inert host-tool catalog, then reran successfully.",
+          "created_at": "2026-08-24T07:23:50.051136949Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAiiYWv13Q2Io5REwon8wRcPkAsFDm59QFl7gklJCGpPhy9SZOcFOTcbYmxS8kVQ8w8wjit/JG/skJjhrg9oAsBg=="
         }
       }
     },
@@ -38368,11 +38377,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1435,
       "timestamp": "2026-08-24T07:23:45.460943679Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1436,
+      "timestamp": "2026-08-24T07:23:50.053539648Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T07:23:45.460943679Z",
+    "timestamp": "2026-08-24T07:23:50.053539648Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1435
+    "agent_seq": 1436
   }
 }
