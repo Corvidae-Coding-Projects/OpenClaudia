@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1126,
+  "next_display_id": 1127,
   "next_comment_id": 1460,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -269,6 +269,7 @@
     "4487296f-3515-465c-89da-e48d899bb322": 338,
     "44c87000-688a-41f8-8583-fdfb7a8e8d6e": 287,
     "44cf2687-5226-4c8c-8d0b-590a6db8f5f5": 298,
+    "44d55ef5-2b88-40b0-a4c6-b035ca79477b": 1126,
     "44eef0ef-feb7-4072-a59c-2db2e4a7d795": 1001,
     "44fe98de-ca02-4457-8afb-aa1da6a8a9f7": 148,
     "45664df3-df63-40de-bf3c-4f69afeb2534": 220,
@@ -8037,6 +8038,18 @@
       "created_at": "2026-04-18T00:31:24.734530561Z",
       "updated_at": "2026-05-19T12:19:10.977315951Z",
       "closed_at": "2026-05-19T12:19:10.977315951Z"
+    },
+    "44d55ef5-2b88-40b0-a4c6-b035ca79477b": {
+      "uuid": "44d55ef5-2b88-40b0-a4c6-b035ca79477b",
+      "display_id": 1126,
+      "title": "S-027: Isolate Anthropic subscription compatibility behind an experimental build",
+      "description": "Complete S-027 under the user's explicit research constraint. Supported Anthropic authentication must be the only default production behavior. Preserve the existing Claude Code subscription-token compatibility path behind an explicitly named Cargo development feature that is disabled by default, requires deliberate runtime acknowledgement, remains read-only through S-026, is visibly identified in diagnostics/traces, and cannot activate through fallback or credential auto-detection. Contain the Claude Code client ID, user agent, private OAuth endpoints, beta headers, identity system block, and native subscription OAuth flow behind the same boundary. Do not remove the experiment, change Codex auth, add concealment/enforcement evasion, or widen into unrelated provider work. Verify feature-off and feature-on builds/tests plus supported and experimental live paths on Rust 1.98 with bounded resources.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T04:30:05.624298691Z",
+      "updated_at": "2026-08-24T04:30:05.624298691Z"
     },
     "44eef0ef-feb7-4072-a59c-2db2e4a7d795": {
       "uuid": "44eef0ef-feb7-4072-a59c-2db2e4a7d795",
@@ -38006,11 +38019,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1404,
       "timestamp": "2026-08-24T04:03:19.631340564Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1405,
+      "timestamp": "2026-08-24T04:30:05.624298691Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T04:03:19.631340564Z",
+    "timestamp": "2026-08-24T04:30:05.624298691Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1404
+    "agent_seq": 1405
   }
 }
