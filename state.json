@@ -1,6 +1,6 @@
 {
   "next_display_id": 1133,
-  "next_comment_id": 1501,
+  "next_comment_id": 1502,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20219,10 +20219,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T19:57:01.619331608Z",
-      "updated_at": "2026-08-24T19:57:06.882878483Z",
+      "updated_at": "2026-08-24T19:57:47.625914544Z",
       "labels": [
         "ci"
-      ]
+      ],
+      "comments": {
+        "1ce637e0-1a16-4d6e-b802-9164258f9ee5": {
+          "display_id": 1501,
+          "author": "6Vw9",
+          "content": "Replace only the time-limited sleep fixture in fix672_concurrent_spawn_never_exceeds_cap with a zero-output process that remains alive until explicit manager teardown; retain the cumulative-success and cap-rejection assertions, reproduce the focused Rust 1.98 test repeatedly, then run fmt/check/strict Clippy and the exact full serialized CI suite before committing.",
+          "created_at": "2026-08-24T19:57:47.623443227Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAYhdP7zHGQrdT9WyuT8cIExulDY9KURfr1PRbXEHjlMrlJjbmRNUZ9CBvIrMJFbEtkMW6STdE0mR4IxaQjsmICw=="
+        }
+      }
     },
     "9d4cd177-7b87-4d67-8364-97ac5028af7b": {
       "uuid": "9d4cd177-7b87-4d67-8364-97ac5028af7b",
@@ -38935,11 +38946,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1488,
       "timestamp": "2026-08-24T19:57:13.512095354Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1489,
+      "timestamp": "2026-08-24T19:57:47.625914544Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:57:13.512095354Z",
+    "timestamp": "2026-08-24T19:57:47.625914544Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1488
+    "agent_seq": 1489
   }
 }
