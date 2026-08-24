@@ -1,6 +1,6 @@
 {
   "next_display_id": 1124,
-  "next_comment_id": 1437,
+  "next_comment_id": 1438,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18496,7 +18496,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:01:18.302848830Z",
-      "updated_at": "2026-08-24T01:30:53.875665887Z",
+      "updated_at": "2026-08-24T01:31:42.991463393Z",
       "labels": [
         "remediation"
       ],
@@ -18530,6 +18530,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzrnFo+ZdMTEXG3bemfnrgLapSwOuYEWyZOL7C1CDo6txzCY0Njlyg/8RBYnCeGN8SfmW24pWDEt34HjGMFrHCg=="
+        },
+        "4f6222a4-4bac-4315-81e6-f2239d732552": {
+          "display_id": 1437,
+          "author": "6Vw9",
+          "content": "[result] 066804c1 fix(auth): complete native OAuth session lifecycle — delivered versioned descriptor-safe native storage, browser binding, use-time scope/expiry validation, serialized refresh/rotation, revocation/logout, preserved foreign Claude/Codex stores, generated evidence refresh, complete deterministic/full/platform gates, and live Claude/Codex/proxy verification.",
+          "created_at": "2026-08-24T01:31:42.987745767Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAftGitki2b2lWqw73GfOdsRaPCtOEykV/R6KIlPYQCyZ2/lDjZyixIPNVzHXqYoqfXd9a5RNUXnk/n39df9hbDA=="
         },
         "7698b326-5022-46d2-b10b-883b6a82d232": {
           "display_id": 1429,
@@ -37534,11 +37543,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1360,
       "timestamp": "2026-08-24T01:30:53.875665887Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1361,
+      "timestamp": "2026-08-24T01:31:42.991463393Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:30:53.875665887Z",
+    "timestamp": "2026-08-24T01:31:42.991463393Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1360
+    "agent_seq": 1361
   }
 }
