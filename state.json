@@ -1,6 +1,6 @@
 {
   "next_display_id": 1124,
-  "next_comment_id": 1435,
+  "next_comment_id": 1436,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9329,7 +9329,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:07:01.696684309Z",
-      "updated_at": "2026-08-24T01:05:17.101469350Z",
+      "updated_at": "2026-08-24T01:30:49.252320371Z",
       "labels": [
         "defect"
       ],
@@ -9345,6 +9345,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcNHGUnHfBgMHlGZTUUH9OcEG4ifggHl9idRgilKQp9x0+6qkhexalWPKxaH9mdt4K8xNC5UOuFs1H9H+E7S8BQ=="
+        },
+        "c4801fa3-e4d9-49a8-93ee-2dffbc9e3ff6": {
+          "display_id": 1435,
+          "author": "6Vw9",
+          "content": "Final evidence: account-backed ChatGPT/Codex wire projection removes max_output_tokens only after local budget admission; SSE decoding treats output_item.done as authoritative and completed output as a no-item fallback, including null. Focused 26-test Responses set and 16-test pipeline integration passed, as did strict Clippy, full native suite, and Windows compile. A real Codex auth.json-backed conversation returned OPENCLAUDIA_CODEX_S029_OK and auth.json remained byte-identical/private. No blocker remains.",
+          "created_at": "2026-08-24T01:30:49.248544314Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAM2ebGX2YfKnE2G+knM9YBP/2jks2LmJf2Hq22jAO8JUSdBXaTQYyqBJZA/Lq6HXE/a0JbHIPrePEg94B3CngBg=="
         }
       }
     },
@@ -37506,11 +37515,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1358,
       "timestamp": "2026-08-24T01:30:44.924766178Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1359,
+      "timestamp": "2026-08-24T01:30:49.252320371Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:30:44.924766178Z",
+    "timestamp": "2026-08-24T01:30:49.252320371Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1358
+    "agent_seq": 1359
   }
 }
