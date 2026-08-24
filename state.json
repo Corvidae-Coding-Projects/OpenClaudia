@@ -1,6 +1,6 @@
 {
   "next_display_id": 1124,
-  "next_comment_id": 1430,
+  "next_comment_id": 1431,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18476,7 +18476,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:01:18.302848830Z",
-      "updated_at": "2026-08-24T00:13:58.430065360Z",
+      "updated_at": "2026-08-24T00:14:02.906225767Z",
       "labels": [
         "remediation"
       ],
@@ -18510,6 +18510,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAty9p7cpeK/AC9PBQ3zaRqXXi435FxhXzQrAtuSulsPvjM39KLpRPGMdFHicN6kFCBvGn9JVQKSS+9yiljBkBBA=="
+        },
+        "e74e0c93-800c-40da-bec1-c8892bf4c132": {
+          "display_id": 1430,
+          "author": "6Vw9",
+          "content": "[action] S-029 architecture selected: versioned native OAuth lifecycle with browser binding, durable use-time validation/refresh/revocation; foreign Claude/Codex stores remain separate and byte-preserving",
+          "created_at": "2026-08-24T00:14:02.903718214Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAbFJgkCkNVfb0Yb4J2QREP0dgYYEdzWBtIOEmrx6XQx5p6vLsOvFDO/sBBMlFDSCrYAJOnAUzaWcTd5JxjnKoAw=="
         }
       }
     },
@@ -37434,11 +37443,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1353,
       "timestamp": "2026-08-24T00:13:58.430065360Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1354,
+      "timestamp": "2026-08-24T00:14:02.906225767Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T00:13:58.430065360Z",
+    "timestamp": "2026-08-24T00:14:02.906225767Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1353
+    "agent_seq": 1354
   }
 }
