@@ -1,6 +1,6 @@
 {
   "next_display_id": 1125,
-  "next_comment_id": 1447,
+  "next_comment_id": 1448,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10790,7 +10790,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T01:52:48.843928461Z",
-      "updated_at": "2026-08-24T01:58:12.437812594Z",
+      "updated_at": "2026-08-24T02:46:04.771975502Z",
       "labels": [
         "remediation"
       ],
@@ -10824,6 +10824,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/c/a8vO1NdNhS08yKS8qErTFDht7EhWJD58yRzyV3uezN0BJHtiLrb979zGrsl+ZQCisCAeSSm7KMHdcGaFDDg=="
+        },
+        "b9808c9c-e3d1-4add-be17-c5357fec3cd4": {
+          "display_id": 1447,
+          "author": "6Vw9",
+          "content": "Implementation/result evidence: startup and live /connect now collect typed API keys with terminal echo disabled, show provider/scope/destination before entry, require overwrite consent before reading a replacement, and never write project YAML. A versioned OpenClaudia user credential document is discovered at lowest config priority and committed through S-031 generation-checked descriptor-safe credential storage; missing storage is empty, malformed/insecure storage fails visibly, and unsupported platforms keep existing config/env auth while declining persistence. Rust 1.98 verification passed: full locked all-target/all-feature native suite with serialized tests; strict native Clippy; format/diff; focused protected-store/config precedence/startup/connect regressions; Windows GNU all-target/all-feature check; locked fuzz check/Clippy/tests; repository hygiene/policy. Manual isolated PTY probes proved no key echo, session-only no persistence, 0600 protected save and next-launch discovery, denied overwrite byte identity with no key prompt, and live /connect leaving project config byte-identical. S-105 generated evidence was regenerated and digest-bound; independent review remains rejected pending S-088.",
+          "created_at": "2026-08-24T02:46:04.768363909Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAbYjJ69A7RTFU8jaN6qmVSwnGRO72ar5OLZnJIaVqoUtxz78JtiUpcCMNFXD5kSmNpv7eZSwtcZ1eN3MlPrzvCg=="
         },
         "b98d7f7b-cb8f-48e9-867f-01bc5d130088": {
           "display_id": 1444,
@@ -37740,11 +37749,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1378,
       "timestamp": "2026-08-24T01:58:12.437812594Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1379,
+      "timestamp": "2026-08-24T02:46:04.771975502Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T01:58:12.437812594Z",
+    "timestamp": "2026-08-24T02:46:04.771975502Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1378
+    "agent_seq": 1379
   }
 }
