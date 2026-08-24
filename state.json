@@ -1,6 +1,6 @@
 {
   "next_display_id": 1133,
-  "next_comment_id": 1507,
+  "next_comment_id": 1508,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20237,7 +20237,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T19:57:01.619331608Z",
-      "updated_at": "2026-08-24T21:21:28.585674313Z",
+      "updated_at": "2026-08-24T21:21:39.084012237Z",
       "labels": [
         "ci"
       ],
@@ -20277,6 +20277,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6AQhGzLW1WM2Nszx2mAYSVjJJkL3Rkek20xh7n1kz7g7Yvuo7QqZEEIsGt8lDgISq2A/NxwD3oPQ5yRgdRKIAA=="
+        },
+        "e9060717-1f35-4392-8761-6e075097bfc1": {
+          "display_id": 1507,
+          "author": "6Vw9",
+          "content": "Replacement CI run 32777538543 failed the same cumulative-admission assertion at 51. The prior tail -f /dev/null fixture is not a reliable keepalive: on the Linux environment it can terminate, allowing legitimate slot reuse. Replacing it with a non-terminating shell loop and adding an explicit admitted-job liveness check before evaluating cumulative admissions.",
+          "created_at": "2026-08-24T21:21:39.081456120Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAL4oWqzUWHqHtE98hWSk4K2RcfzIhJylJdl+QKHC0t8vzrD1Rbt0gHXfCsiT1HwsVkjgPUcGknKGQVIMKIhQKBQ=="
         }
       }
     },
@@ -39041,11 +39050,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1498,
       "timestamp": "2026-08-24T21:21:34.309561966Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1499,
+      "timestamp": "2026-08-24T21:21:39.084012237Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T21:21:34.309561966Z",
+    "timestamp": "2026-08-24T21:21:39.084012237Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1498
+    "agent_seq": 1499
   }
 }
