@@ -1,6 +1,6 @@
 {
   "next_display_id": 1124,
-  "next_comment_id": 1427,
+  "next_comment_id": 1428,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18476,13 +18476,24 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T00:01:18.302848830Z",
-      "updated_at": "2026-08-24T00:07:19.500033189Z",
+      "updated_at": "2026-08-24T00:07:24.042151285Z",
       "labels": [
         "remediation"
       ],
       "related": [
         "498aec22-126b-4f73-8ca1-341df6191fb8"
-      ]
+      ],
+      "comments": {
+        "bb31f074-9cd1-4feb-b92d-cf9bbb05f110": {
+          "display_id": 1427,
+          "author": "6Vw9",
+          "content": "[evidence] Pre-edit Rust 1.98 live baselines: compiled OpenClaudia completed a real Claude Code-login response and left ~/.claude/.credentials.json byte-identical after the owner refreshed it. Codex auth.json discovery/authentication succeeded and remained byte-identical, but the live Codex Responses call failed before S-029 edits with HTTP 400 Unsupported parameter: max_output_tokens; separately tracked as #1123.",
+          "created_at": "2026-08-24T00:07:24.039470982Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAty9p7cpeK/AC9PBQ3zaRqXXi435FxhXzQrAtuSulsPvjM39KLpRPGMdFHicN6kFCBvGn9JVQKSS+9yiljBkBBA=="
+        }
+      }
     },
     "955c9fa9-e629-441e-8d31-104beeda2818": {
       "uuid": "955c9fa9-e629-441e-8d31-104beeda2818",
@@ -37390,11 +37401,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1350,
       "timestamp": "2026-08-24T00:07:19.500033189Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1351,
+      "timestamp": "2026-08-24T00:07:24.042151285Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T00:07:19.500033189Z",
+    "timestamp": "2026-08-24T00:07:24.042151285Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1350
+    "agent_seq": 1351
   }
 }
