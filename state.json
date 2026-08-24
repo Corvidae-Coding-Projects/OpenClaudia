@@ -1,6 +1,6 @@
 {
   "next_display_id": 1125,
-  "next_comment_id": 1450,
+  "next_comment_id": 1451,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8242,7 +8242,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-24T01:54:26.703412076Z",
+      "updated_at": "2026-08-24T02:48:19.701553357Z",
       "labels": [
         "remediation"
       ],
@@ -8472,6 +8472,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAaNVZDbekMOY7ktwO3Ybyzuw48dEldWc4R6RI9gV5NgloBWed3+3VLqoi+zDhWst0Ni5pGFW3WoqKmzbH1u37AQ=="
+        },
+        "551d6681-05ab-47f9-ab76-f735ac2a1f80": {
+          "display_id": 1450,
+          "author": "6Vw9",
+          "content": "S-030 completed and closed as #1124. Signed implementation commit bd26de5d makes startup and live /connect API-key setup secret-safe with protected user persistence/discovery; signed commit 74c3481f preserves the exact Crosslink-generated closure changelog. Full Rust 1.98 native/Windows/fuzz/hygiene and isolated PTY evidence passed. Parent #1071 remains open for subsequent dormant-feature slices.",
+          "created_at": "2026-08-24T02:48:19.699057611Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/DEloyjRldd2kU10Oc2/cjSv1m7QoU2I0XOEy1ep1sOXODzWtMTe/CC/U0WcLyGu/E2d530dImt5SyVtXZXZBg=="
         },
         "5bc5b742-de1a-432c-95fe-449f7d791681": {
           "display_id": 1031,
@@ -37789,11 +37798,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1383,
       "timestamp": "2026-08-24T02:47:30.065773676Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1384,
+      "timestamp": "2026-08-24T02:48:19.701553357Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T02:47:30.065773676Z",
+    "timestamp": "2026-08-24T02:48:19.701553357Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1383
+    "agent_seq": 1384
   }
 }
