@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1128,
+  "next_display_id": 1129,
   "next_comment_id": 1474,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -129,6 +129,7 @@
     "1ed3dbdb-1b7f-4cf5-8fb0-19d1e2d08819": 371,
     "1ede2198-1849-43a4-96d7-1ec62172ff10": 81,
     "1eeeeae1-6480-4a1f-8203-e4a4dba43f1c": 966,
+    "20b9f497-c403-46b3-8820-df30f579f84a": 1128,
     "21371662-2722-4f5e-b80a-0fe8fcc1b6d4": 189,
     "214129e3-bc77-4d6d-904e-1dd9248bfaea": 890,
     "214a0a02-6c41-4888-92e5-5f63f51f9da8": 152,
@@ -4410,6 +4411,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAS4KozIlhjevgT4+Ryrpxwxt85/V0a2ZhVLi+VVuYnj/QsDtVOnst+eNmk/ICqe4nxhz1uTBU8mTqAq6x1E3pAw=="
         }
       }
+    },
+    "20b9f497-c403-46b3-8820-df30f579f84a": {
+      "uuid": "20b9f497-c403-46b3-8820-df30f579f84a",
+      "display_id": 1128,
+      "title": "S-028: Verify Codex account and compliance metadata",
+      "description": "Replace OpenClaudia-owned decoding of unverified Codex JWT payloads with the supported Codex app-server managed ChatGPT authentication boundary. Keep direct OpenAI API-key credentials separate, preserve existing provider behavior, add deterministic tests, and manually verify a real paid-account conversation without exposing credentials.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T06:46:20.434770076Z",
+      "updated_at": "2026-08-24T06:46:20.434770076Z"
     },
     "21371662-2722-4f5e-b80a-0fe8fcc1b6d4": {
       "uuid": "21371662-2722-4f5e-b80a-0fe8fcc1b6d4",
@@ -38303,11 +38316,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1430,
       "timestamp": "2026-08-24T06:46:11.491185689Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1431,
+      "timestamp": "2026-08-24T06:46:20.434770076Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T06:46:11.491185689Z",
+    "timestamp": "2026-08-24T06:46:20.434770076Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1430
+    "agent_seq": 1431
   }
 }
