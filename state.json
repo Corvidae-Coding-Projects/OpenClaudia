@@ -1,6 +1,6 @@
 {
   "next_display_id": 1134,
-  "next_comment_id": 1513,
+  "next_comment_id": 1514,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22619,11 +22619,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T21:28:48.784229268Z",
-      "updated_at": "2026-08-24T21:35:45.997567607Z",
+      "updated_at": "2026-08-24T21:57:38.967514219Z",
       "related": [
         "9d404579-dff2-47a3-b37c-03dfb5d67530"
       ],
       "comments": {
+        "ae33d29b-3cbe-44cf-bebc-1cf53f8a97e6": {
+          "display_id": 1513,
+          "author": "6Vw9",
+          "content": "Preserve bubblewrap --die-with-parent by transferring process creation into the existing long-lived per-job supervisor thread. Publish a durable Starting record under the admission lock, synchronously return only after the supervisor reports spawn/output-reader readiness, retain existing cancellation, timeout, workspace-settlement, budget, freshness, and shell-id contracts, and pin the Linux parent-thread lifecycle with a low-contention regression before rerunning every CI-equivalent gate.",
+          "created_at": "2026-08-24T21:57:38.964798508Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAyOms8ylobZaWtjivvg7ngt+AoeY+OWEqy5EmWEdvoi0z+A4oTqAf+q+xu3gI0dWi2TYXqCA9Uc7k2rsiY6gyDg=="
+        },
         "ce19f50f-498b-4438-859b-aa8f7d55c65a": {
           "display_id": 1511,
           "author": "6Vw9",
@@ -39165,11 +39174,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1504,
       "timestamp": "2026-08-24T21:35:51.873368849Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1505,
+      "timestamp": "2026-08-24T21:57:38.967514219Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T21:35:51.873368849Z",
+    "timestamp": "2026-08-24T21:57:38.967514219Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1504
+    "agent_seq": 1505
   }
 }
