@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1132,
+  "next_display_id": 1133,
   "next_comment_id": 1501,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -641,6 +641,7 @@
     "9c5d1e01-676d-494d-a792-7b629994de06": 158,
     "9ca25b4a-3b32-4863-b7cc-db9b5d9d813f": 357,
     "9cec09f8-b0ba-4065-b53d-06253bd2d6b1": 799,
+    "9d404579-dff2-47a3-b37c-03dfb5d67530": 1132,
     "9d4cd177-7b87-4d67-8364-97ac5028af7b": 836,
     "9d530c33-6681-4d3a-89ef-caeb2bace30e": 768,
     "9d952aa9-443b-492f-9ce1-2144f74a273d": 982,
@@ -20204,6 +20205,18 @@
       "updated_at": "2026-05-20T07:36:43.582190594Z",
       "closed_at": "2026-05-20T07:36:43.582190594Z"
     },
+    "9d404579-dff2-47a3-b37c-03dfb5d67530": {
+      "uuid": "9d404579-dff2-47a3-b37c-03dfb5d67530",
+      "display_id": 1132,
+      "title": "Make the background-cap stress fixture duration-independent",
+      "description": "The Rust 1.98 Linux full-suite runner intermittently fails fix672_concurrent_spawn_never_exceeds_cap because the fixture uses sleep 30. Durable workspace/job preparation can take longer than 30 seconds for 62 concurrent callers, allowing an early job to finish and a legitimate replacement to raise cumulative successful spawns above 50 even though the active-job cap is never exceeded. Keep admitted fixture processes alive until explicit teardown, preserve the original cap assertion, and verify focused repetition plus the full serialized all-target/all-feature suite.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T19:57:01.619331608Z",
+      "updated_at": "2026-08-24T19:57:01.619331608Z"
+    },
     "9d4cd177-7b87-4d67-8364-97ac5028af7b": {
       "uuid": "9d4cd177-7b87-4d67-8364-97ac5028af7b",
       "display_id": 836,
@@ -38900,11 +38913,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1485,
       "timestamp": "2026-08-24T19:38:29.410060426Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1486,
+      "timestamp": "2026-08-24T19:57:01.619331608Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:38:29.410060426Z",
+    "timestamp": "2026-08-24T19:57:01.619331608Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1485
+    "agent_seq": 1486
   }
 }
