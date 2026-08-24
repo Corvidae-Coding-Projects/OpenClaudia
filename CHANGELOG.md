@@ -173,6 +173,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Make the background-cap stress fixture duration-independent (#1132)
 - Document unavoidable Windows target duplicate generations (#1131)
 - Regenerate the stale fuzz lockfile for Rust 1.98 runners (#1130)
 - S-032: Bind file edits and diffs to snapshots (#1129)
