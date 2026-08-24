@@ -1,6 +1,6 @@
 {
   "next_display_id": 1132,
-  "next_comment_id": 1494,
+  "next_comment_id": 1495,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1790,10 +1790,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T19:26:13.560123234Z",
-      "updated_at": "2026-08-24T19:26:19.577051118Z",
+      "updated_at": "2026-08-24T19:26:53.592822222Z",
       "labels": [
         "ci"
-      ]
+      ],
+      "comments": {
+        "6e0bbd33-feca-4961-961a-ab70946f4fb9": {
+          "display_id": 1494,
+          "author": "6Vw9",
+          "content": "Reproduce the locked metadata failure with Rust 1.98, regenerate fuzz/Cargo.lock from the current root and fuzz manifests without changing dependency declarations, inspect the lock-only diff, then run the exact CI locked metadata/check/Clippy/test commands one Cargo process at a time.",
+          "created_at": "2026-08-24T19:26:53.590403455Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwndm9QxDV8A3+MzteD7G2Fe1uBsVt2e93sioRiJUzALNQO+yYkz2COJgPTnnrAvSiXuM7fAdCAFiObL3EviPAA=="
+        }
+      }
     },
     "0582677c-07fd-45ec-8ef2-4edd9bd58a3f": {
       "uuid": "0582677c-07fd-45ec-8ef2-4edd9bd58a3f",
@@ -38765,11 +38776,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1471,
       "timestamp": "2026-08-24T19:26:41.417454533Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1472,
+      "timestamp": "2026-08-24T19:26:53.592822222Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T19:26:41.417454533Z",
+    "timestamp": "2026-08-24T19:26:53.592822222Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1471
+    "agent_seq": 1472
   }
 }
