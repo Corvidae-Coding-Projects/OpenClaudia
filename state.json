@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1129,
+  "next_display_id": 1130,
   "next_comment_id": 1482,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -170,6 +170,7 @@
     "28e67526-76e6-4ead-9a88-750a13d1825e": 327,
     "2950b4f5-019d-41da-88e7-e2aadda07c09": 8,
     "297de2c2-cfe7-41be-aa10-fbe09c1db9cd": 998,
+    "29938ae3-95c3-4e2f-9a18-c9295a189af4": 1129,
     "29f59304-df4c-48be-9132-0c75e5162b83": 401,
     "29f8e076-ee26-418a-9e2a-eca5959ce319": 313,
     "2a0bd5b0-5406-477d-b769-c126be568f14": 958,
@@ -5556,6 +5557,18 @@
       "created_by": "lOrm",
       "created_at": "2026-04-18T00:39:00.348617842Z",
       "updated_at": "2026-04-18T00:39:00.348617842Z"
+    },
+    "29938ae3-95c3-4e2f-9a18-c9295a189af4": {
+      "uuid": "29938ae3-95c3-4e2f-9a18-c9295a189af4",
+      "display_id": 1129,
+      "title": "S-032: Bind file edits and diffs to snapshots",
+      "description": "Implement immutable read snapshot identity and digest binding across file edit, overwrite, and diff operations. Real concurrent changes must return typed conflicts; preflight match count, growth, encoding, sensitivity, file/result size, and bounded diff output before atomic commit. Preserve existing functionality and keep the slice scoped to realistic application paths.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-24T18:11:27.061351876Z",
+      "updated_at": "2026-08-24T18:11:27.061351876Z"
     },
     "29f59304-df4c-48be-9132-0c75e5162b83": {
       "uuid": "29f59304-df4c-48be-9132-0c75e5162b83",
@@ -38460,11 +38473,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1444,
       "timestamp": "2026-08-24T08:08:17.084599984Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1445,
+      "timestamp": "2026-08-24T18:11:27.061351876Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T08:08:17.084599984Z",
+    "timestamp": "2026-08-24T18:11:27.061351876Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1444
+    "agent_seq": 1445
   }
 }
