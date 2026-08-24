@@ -1,6 +1,6 @@
 {
   "next_display_id": 1128,
-  "next_comment_id": 1469,
+  "next_comment_id": 1470,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8086,7 +8086,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T04:30:05.624298691Z",
-      "updated_at": "2026-08-24T06:36:13.161592478Z",
+      "updated_at": "2026-08-24T06:37:47.081781048Z",
       "closed_at": "2026-08-24T06:36:13.161590896Z",
       "labels": [
         "remediation"
@@ -8100,6 +8100,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkMZetKAXE2Nv4qyOVgMnwsvAng5r6141WXLVsMM8V2abcLp3lLBt171rRgjZ7LDlzSg9veAwyqWMWAh5r55EBg=="
+        },
+        "1d620846-3d83-4dc6-adf3-c9db432a0b37": {
+          "display_id": 1469,
+          "author": "6Vw9",
+          "content": "Signed delivery commit: 4b4ee81608fb08e9deee7486160b8b582cff814a (feat(auth): route Claude subscriptions through official SDK). The commit has a good dollspace-gay SSH signature and includes the exact generated closure changelog entries.",
+          "created_at": "2026-08-24T06:37:47.079102127Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA00RfnGLWmrj6yF5wd23NgzM06bow+POYRKkuzIHhSSKISWpZ6I7aejcWwZl/34p17WbM37OwW7srYzu9k4wBBQ=="
         },
         "26e6e612-fd0c-40c1-bae6-2f44884347e8": {
           "display_id": 1463,
@@ -38210,11 +38219,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1421,
       "timestamp": "2026-08-24T06:37:38.718040655Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1422,
+      "timestamp": "2026-08-24T06:37:47.081781048Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T06:37:38.718040655Z",
+    "timestamp": "2026-08-24T06:37:47.081781048Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1421
+    "agent_seq": 1422
   }
 }
