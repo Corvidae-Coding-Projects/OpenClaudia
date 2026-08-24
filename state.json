@@ -1,6 +1,6 @@
 {
   "next_display_id": 1130,
-  "next_comment_id": 1484,
+  "next_comment_id": 1485,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -5572,11 +5572,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T18:11:27.061351876Z",
-      "updated_at": "2026-08-24T18:18:58.583273018Z",
+      "updated_at": "2026-08-24T18:51:45.059998162Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "01a7af58-98a8-4333-ac68-95bbe7972f42": {
+          "display_id": 1484,
+          "author": "6Vw9",
+          "content": "Focused production-path verification is green: 20 edit dispatch, 20 write dispatch, 21 read dispatch, 10 file race/security, 8 cross-tool flow, and 42 ACP session-mode tests. Tests now consume the generation emitted by the actual read_file result; deterministic one-byte post-read changes return Conflict/Safe and preserve newer bytes. Review also corrected macOS publication to use RENAME_SWAP plus displaced-generation verification, matching Linux's final-window compare/replace behavior. No scope expansion beyond file snapshot publication was taken.",
+          "created_at": "2026-08-24T18:51:45.055336165Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAe+Ru7iva+5lc/yy/2T4applakgH/hzSqNsYQdPHRRRve1JWEa0p3Zf+oucZHZX2ZxF6P/GpQD7mpbka8ap8DDQ=="
+        },
         "4b1c0ea1-0181-496d-88e2-abeb1c4b7139": {
           "display_id": 1482,
           "author": "6Vw9",
@@ -38525,11 +38534,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1449,
       "timestamp": "2026-08-24T18:18:58.583273018Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1450,
+      "timestamp": "2026-08-24T18:51:45.059998162Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T18:18:58.583273018Z",
+    "timestamp": "2026-08-24T18:51:45.059998162Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1449
+    "agent_seq": 1450
   }
 }
