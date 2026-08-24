@@ -72,11 +72,18 @@ skip = [
     { crate = "syn@2.0.119" },
     { crate = "thiserror@1.0.69" },
     { crate = "thiserror-impl@1.0.69" },
+    # rpassword/rtoolbox still requires the Windows 0.52 target family through
+    # windows-sys 0.59. Keep only that older locked branch skipped; the newest
+    # family remains enforced, and any unlisted future duplicate still fails.
     { crate = "windows-sys@0.48.0" },
+    { crate = "windows-sys@0.59.0" },
     { crate = "windows-sys@0.60.2" },
     { crate = "windows-targets@0.48.5" },
+    { crate = "windows-targets@0.52.6" },
     { crate = "windows_x86_64_gnu@0.48.5" },
+    { crate = "windows_x86_64_gnu@0.52.6" },
     { crate = "windows_x86_64_msvc@0.48.5" },
+    { crate = "windows_x86_64_msvc@0.52.6" },
     { crate = "winnow@0.7.15" },
 ]
 skip-tree = []
