@@ -2089,10 +2089,11 @@ mod tests {
             let bar_c = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 bar_c.wait();
-                // Keep every admitted process active through the serialized
-                // persistence/spawn section so this measures the active-job
-                // cap rather than normal slot reuse after early exits.
-                mgr_c.spawn(test_run(), "sleep 30")
+                // Keep every admitted process active until explicit teardown.
+                // A fixed-duration sleep can expire while durable preparation
+                // serializes on a slow runner, legitimately allowing slot
+                // reuse and invalidating the cumulative-success assertion.
+                mgr_c.spawn(test_run(), "exec tail -f /dev/null")
             }));
         }
 
