@@ -1,6 +1,6 @@
 {
   "next_display_id": 1135,
-  "next_comment_id": 1524,
+  "next_comment_id": 1525,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8645,7 +8645,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-24T22:57:25.012663708Z",
+      "updated_at": "2026-08-24T22:57:29.641934400Z",
       "labels": [
         "remediation"
       ],
@@ -8711,6 +8711,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAV19VgvlBQgsne1QV/6d7cuL0RYTKYIQY3KW/sgqLbE+yX4ddA7gkqu+h8b3FnPmRZajqbanAftr1PYg6JH5OAg=="
+        },
+        "0f4dd4a4-bc8b-411b-b6ce-ecf3dfc132b9": {
+          "display_id": 1524,
+          "author": "6Vw9",
+          "content": "[action] Repaired PR #66 Linux newline-free output liveness as #1134: signed 77e66d24 batches durable output, signed 2eb72a20 preserves exact Crosslink closure output; #1134 closed; full Rust 1.98 root/fuzz/sandbox/evidence/policy gates pass. Cleaning Cargo caches, then user push and replacement-run monitoring remain.",
+          "created_at": "2026-08-24T22:57:29.639356337Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAL6E4A4DMxcjZlR64/6cUSJHmp0Y5bKOclR06loUyLBUtyYOKM5awYrXZTH+RwT/alupVA8MD4cv+74NZH9X0Dw=="
         },
         "14788683-7e3f-40ce-8990-0950c398a8d4": {
           "display_id": 1030,
@@ -39369,11 +39378,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1523,
       "timestamp": "2026-08-24T22:57:25.012663708Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1524,
+      "timestamp": "2026-08-24T22:57:29.641934400Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T22:57:25.012663708Z",
+    "timestamp": "2026-08-24T22:57:29.641934400Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1523
+    "agent_seq": 1524
   }
 }
