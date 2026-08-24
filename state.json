@@ -1,6 +1,6 @@
 {
   "next_display_id": 1134,
-  "next_comment_id": 1509,
+  "next_comment_id": 1510,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20242,7 +20242,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T19:57:01.619331608Z",
-      "updated_at": "2026-08-24T21:24:51.276126752Z",
+      "updated_at": "2026-08-24T21:29:09.784704647Z",
       "labels": [
         "ci"
       ],
@@ -20273,6 +20273,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1OUBJlVM0NAss8yODApcbmDq/sPghfD00b8w438GfNDXdItmGtoC6tk4Ov+1xeIrITihxrHelzOsY+qUScnHDQ=="
+        },
+        "3c02425f-ba3c-4198-be5f-8ae3b9d1e796": {
+          "display_id": 1509,
+          "author": "6Vw9",
+          "content": "The new pre-teardown liveness assertion reproduced locally and identified one admitted job as finished with exit code -1. Linux PR_SET_PDEATHSIG documents that its parent is the specific creating thread. BackgroundShellManager spawns bubblewrap on each transient stress caller thread before moving Child to a supervisor, so --die-with-parent SIGKILLs the job as the caller returns. Production lifecycle defect #1133 now owns the root repair; #1132 remains the runner regression that will validate it.",
+          "created_at": "2026-08-24T21:29:09.781532505Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmmqhnOYJHVdcFQGInC+ZGsiJnGSX18r+5gp3yU1M+dqg4hyEx8rELBQXICUkK+lWJ3x8Tmpo6toh0nNs3WT2Aw=="
         },
         "5f9ab491-3b9f-4be6-b295-6b0b92daf4e5": {
           "display_id": 1502,
@@ -39096,11 +39105,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1502,
       "timestamp": "2026-08-24T21:28:54.073129549Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1503,
+      "timestamp": "2026-08-24T21:29:09.784704647Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T21:28:54.073129549Z",
+    "timestamp": "2026-08-24T21:29:09.784704647Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1502
+    "agent_seq": 1503
   }
 }
