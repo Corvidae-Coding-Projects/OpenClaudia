@@ -1,6 +1,6 @@
 {
   "next_display_id": 1128,
-  "next_comment_id": 1465,
+  "next_comment_id": 1466,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4156,10 +4156,21 @@
       "parent_uuid": "44d55ef5-2b88-40b0-a4c6-b035ca79477b",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T05:25:35.058073537Z",
-      "updated_at": "2026-08-24T05:25:39.410895970Z",
+      "updated_at": "2026-08-24T06:35:32.534304014Z",
       "labels": [
         "defect"
-      ]
+      ],
+      "comments": {
+        "5b1aef85-a892-49cb-bff6-9a627d8d57a7": {
+          "display_id": 1465,
+          "author": "6Vw9",
+          "content": "Implemented FinalClaim::FileObservation with exact path, statement, and evidence fields. The final gate requires a fresh FileRead receipt for the same path under the existing run, trust, and freshness rules; wrong-path and stale receipts fail. Rust 1.98 ledger tests pass, and the live default-TUI Agent SDK run completed read_file through the host harness and grounded its terminal claim with the resulting receipt.",
+          "created_at": "2026-08-24T06:35:32.528316543Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAlJvHYfgDJIG9iPsDlRCxPo0kYGewKwpVJ4JjmN03v4wNkK9dQzZiWFg5PQqAzTVbR1zVbu3VebwS0t0841CiAg=="
+        }
+      }
     },
     "1cf7de68-a133-41d1-b26d-7ba930ca26c0": {
       "uuid": "1cf7de68-a133-41d1-b26d-7ba930ca26c0",
@@ -38139,11 +38150,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1414,
       "timestamp": "2026-08-24T06:21:37.853226248Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1415,
+      "timestamp": "2026-08-24T06:35:32.534304014Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T06:21:37.853226248Z",
+    "timestamp": "2026-08-24T06:35:32.534304014Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1414
+    "agent_seq": 1415
   }
 }
