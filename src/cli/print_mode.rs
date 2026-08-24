@@ -474,7 +474,7 @@ struct PreparePrintTransport<'a> {
 fn prepare_print_transport(
     p: &PreparePrintTransport<'_>,
 ) -> anyhow::Result<PreparedPrintTransport> {
-    let wire_api = if p.auth.codex_responses_auth.is_some() {
+    let wire_api = if p.auth.codex_agent_sdk.is_some() {
         openclaudia::pipeline::WireApi::OpenAiResponses
     } else {
         openclaudia::pipeline::WireApi::ChatCompletions
@@ -515,17 +515,17 @@ fn prepare_print_transport(
         )
     };
     let extra_headers = p.provider.headers.clone();
-    let (endpoint, headers) = if let Some(auth) = p.auth.codex_responses_auth.as_ref() {
-        let endpoint = openclaudia::pipeline::resolve_endpoint_for_wire(
-            wire_api,
-            &p.config.proxy.target,
-            p.model,
-            openclaudia::codex_credentials::CODEX_CHATGPT_BASE_URL,
-            None,
-        )?;
-        let mut headers = auth.headers()?;
-        headers.extend(&extra_headers);
-        (endpoint, headers)
+    let (endpoint, headers) = if p.auth.codex_agent_sdk.is_some() {
+        (
+            openclaudia::pipeline::resolve_endpoint_for_wire(
+                wire_api,
+                &p.config.proxy.target,
+                p.model,
+                &p.provider.base_url,
+                None,
+            )?,
+            openclaudia::secrets::SensitiveHeaders::new(),
+        )
     } else {
         (
             resolve_print_endpoint(
@@ -691,8 +691,37 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         u64::from(config.session.token_tracking.max_output_tokens),
     )
     .map_err(|error| anyhow::anyhow!("Run budget denied provider call: {error}"))?;
-    if chat_auth.codex_responses_auth.is_some() {
-        openclaudia::codex_credentials::finalize_chatgpt_responses_request(&mut request_body);
+    if let Some(sdk) = chat_auth.codex_agent_sdk.as_ref() {
+        let effort = provider
+            .thinking
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("medium");
+        let turn = match sdk.complete_turn(&request_body, effort).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    anyhow::anyhow!(
+                        "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                    )
+                })?;
+                return Err(anyhow::anyhow!("Codex SDK request failed: {error}"));
+            }
+        };
+        provider_budget
+            .reconcile(&turn.usage)
+            .map_err(|error| anyhow::anyhow!("Provider budget reconciliation failed: {error}"))?;
+        if !turn.tool_calls.is_empty() {
+            anyhow::bail!(
+                "Codex SDK returned {} tool call(s) to no-tools print mode",
+                turn.tool_calls.len()
+            );
+        }
+        if turn.content.trim().is_empty() {
+            anyhow::bail!("Codex SDK returned no printable assistant text");
+        }
+        println!("{}", turn.content);
+        return Ok(());
     }
 
     if let Some(sdk) = chat_auth.claude_agent_sdk.as_ref() {
@@ -955,62 +984,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_print_builds_the_shared_no_tools_responses_profile() {
-        let adapter = openclaudia::providers::get_adapter("openai").expect("OpenAI adapter");
-        let mut config =
-            test_config_with_policy(openclaudia::services::policy::EnterprisePolicy::default());
-        config.proxy.target = "openai".to_string();
-        let provider = openclaudia::config::ProviderConfig {
-            api_key: None,
-            base_url: "https://api.openai.com/v1".to_string(),
-            model: None,
-            headers: openclaudia::secrets::SensitiveHeaders::new(),
-            thinking: openclaudia::config::ThinkingConfig {
-                reasoning_effort: Some("high".to_string()),
-                ..openclaudia::config::ThinkingConfig::default()
-            },
-        };
-        let request = build_print_chat_request(
-            adapter,
+    fn print_responses_profile_has_no_host_tools() {
+        let body = openclaudia::pipeline::build_request_for_wire_with_exact_tools_and_state(
+            openclaudia::pipeline::WireApi::OpenAiResponses,
+            "openai",
             "gpt-test",
-            "inspect the workspace".to_string(),
-            print_test_run(),
-        );
-        let auth = ChatAuth {
-            api_key: None,
-            claude_code_token: None,
-            claude_agent_sdk: None,
-            codex_responses_auth: Some(openclaudia::codex_credentials::CodexResponsesAuth {
-                access_token: openclaudia::secrets::OAuthToken::try_from_string(
-                    "print-responses-token".to_string(),
-                )
-                .expect("token"),
-                account_id: None,
-                is_fedramp_account: false,
-                source: openclaudia::codex_credentials::CodexAuthSource::EnvAccessToken,
-                mode: openclaudia::codex_credentials::CodexAuthMode::ChatgptAuthTokens,
-            }),
-        };
-        let prepared = prepare_print_transport(&PreparePrintTransport {
-            config: &config,
-            provider: &provider,
-            adapter,
-            model: "gpt-test",
-            chat_request: &request,
-            auth: &auth,
-        })
-        .expect("Codex print transport");
-        let body = prepared.request_body;
+            &[serde_json::json!({"role": "user", "content": "inspect the workspace"})],
+            "high",
+            None,
+            None,
+            &[],
+            None,
+        )
+        .expect("Responses print profile");
 
-        assert_eq!(prepared.responses_assistant_ordinal, Some(1));
-        assert_eq!(
-            prepared.wire_api,
-            openclaudia::pipeline::WireApi::OpenAiResponses
-        );
-        assert!(prepared.endpoint.ends_with("/responses"));
-        assert!(prepared
-            .headers
-            .matches_value("authorization", "Bearer print-responses-token"));
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert!(body.get("tools").is_none());

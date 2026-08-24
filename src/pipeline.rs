@@ -1557,6 +1557,9 @@ pub struct RunTurnParams<'a> {
     /// Supported subscription transport owned by Anthropic's unmodified
     /// executable. When present, no provider HTTP request is made here.
     pub claude_agent_sdk: Option<&'a crate::claude_agent_sdk::ClaudeAgentSdk>,
+    /// Supported account transport owned by `OpenAI`'s pinned Codex runtime.
+    /// When present, no provider HTTP request is made here.
+    pub codex_agent_sdk: Option<&'a crate::codex_agent_sdk::CodexAgentSdk>,
     /// Provider reasoning effort forwarded to transports that expose it
     /// outside the request body (currently the Claude Agent SDK).
     pub effort_level: &'a str,
@@ -1855,6 +1858,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         endpoint,
         headers,
         claude_agent_sdk,
+        codex_agent_sdk,
         effort_level,
         request_body,
         provider,
@@ -1883,10 +1887,60 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         configured_max_output,
     )
     .map_err(|error| format!("Run budget denied provider call: {error}"))?;
-    if crate::codex_credentials::is_chatgpt_codex_endpoint(endpoint) {
-        crate::codex_credentials::finalize_chatgpt_responses_request(&mut request_body);
-    }
     trace_run_turn_request(endpoint, &request_body);
+
+    if let Some(sdk) = codex_agent_sdk {
+        let sdk_turn = match sdk.complete_turn(&request_body, effort_level).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    format!(
+                        "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                    )
+                })?;
+                return Err(format!("Codex SDK request failed: {error}"));
+            }
+        };
+        provider_budget
+            .reconcile(&sdk_turn.usage)
+            .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
+        if !sdk_turn.content.is_empty() {
+            tx.send(AppEvent::StreamText(sdk_turn.content.clone()))
+                .map_err(|_| "API event receiver closed during Codex SDK turn".to_string())?;
+        }
+        let terminal_outcome = if sdk_turn.tool_calls.is_empty() {
+            ProviderTerminalOutcome::Completed
+        } else {
+            ProviderTerminalOutcome::ToolCalls
+        };
+        ensure_provider_turn_succeeded(terminal_outcome, sdk_turn.tool_calls.len())?;
+        let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+            run_context,
+            &sdk_turn.tool_calls,
+            memory_db,
+            app_config,
+            permission_mgr,
+            transient_allowed_tool_rules,
+            hook_engine,
+            policy_enforcer,
+            task_mgr,
+            session_id.as_deref(),
+            model_identity,
+            &tx,
+        )
+        .await;
+        return Ok(TurnResult {
+            content: sdk_turn.content,
+            reasoning_content: None,
+            tool_calls: sdk_turn.tool_calls,
+            tool_results,
+            usage: sdk_turn.usage,
+            needs_followup,
+            terminal_outcome,
+            finish_reason: None,
+            provider_native_state: None,
+        });
+    }
 
     if let Some(sdk) = claude_agent_sdk {
         let sdk_turn = match sdk.complete_turn(&request_body, effort_level).await {

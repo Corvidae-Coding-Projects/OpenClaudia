@@ -484,9 +484,9 @@ async fn resolve_repl_chat_auth(
             config.proxy.target
         );
     };
-    if auth.codex_responses_auth.is_some() {
+    if auth.codex_agent_sdk.is_some() {
         anyhow::bail!(
-            "Codex ChatGPT login currently requires the full-screen TUI Responses backend"
+            "Codex account login is not supported by the legacy line REPL; use the full-screen TUI or print mode"
         );
     }
     Ok(auth)
@@ -572,7 +572,7 @@ impl ChatRepl {
             api_key,
             claude_code_token,
             claude_agent_sdk,
-            codex_responses_auth: _,
+            codex_agent_sdk: _,
         } = resolve_repl_chat_auth(&config, provider).await?;
         if claude_agent_sdk.is_some() {
             anyhow::bail!(

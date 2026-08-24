@@ -440,7 +440,7 @@ struct ProviderSwitchAuth {
     api_key: Option<crate::providers::ApiKey>,
     claude_code_token: Option<crate::secrets::OAuthToken>,
     claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
-    codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
+    codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
 }
 
 fn missing_provider_auth_message(target: &str) -> String {
@@ -463,7 +463,7 @@ fn resolve_provider_switch_auth(
                 api_key: None,
                 claude_code_token: Some(creds.access_token),
                 claude_agent_sdk: None,
-                codex_responses_auth: None,
+                codex_agent_sdk: None,
             });
         }
         let sdk = crate::claude_agent_sdk::ClaudeAgentSdk::discover().map_err(|error| {
@@ -475,7 +475,7 @@ fn resolve_provider_switch_auth(
             api_key: None,
             claude_code_token: None,
             claude_agent_sdk: Some(sdk),
-            codex_responses_auth: None,
+            codex_agent_sdk: None,
         });
     }
 
@@ -484,38 +484,19 @@ fn resolve_provider_switch_auth(
             api_key: Some(api_key.clone()),
             claude_code_token: None,
             claude_agent_sdk: None,
-            codex_responses_auth: None,
+            codex_agent_sdk: None,
         });
     }
 
     if target.eq_ignore_ascii_case("openai") {
-        match crate::codex_credentials::load_codex_auth() {
-            Ok(Some(crate::codex_credentials::CodexAuthMaterial::ApiKey { api_key, .. })) => {
-                return Ok(ProviderSwitchAuth {
-                    api_key: Some(api_key),
-                    claude_code_token: None,
-                    claude_agent_sdk: None,
-                    codex_responses_auth: None,
-                });
-            }
-            Ok(Some(crate::codex_credentials::CodexAuthMaterial::Responses(auth))) => {
-                return Ok(ProviderSwitchAuth {
-                    api_key: None,
-                    claude_code_token: None,
-                    claude_agent_sdk: None,
-                    codex_responses_auth: Some(auth),
-                });
-            }
-            Ok(Some(crate::codex_credentials::CodexAuthMaterial::Unsupported { mode, source })) => {
-                return Err(format!(
-                    "Codex auth found via {}, but {} is not usable for OpenAI Responses in OpenClaudia.",
-                    source.display_name(),
-                    mode.display_name()
-                ));
-            }
-            Ok(None) => {}
-            Err(e) => return Err(format!("Codex credentials unusable: {e}")),
-        }
+        let sdk = crate::codex_agent_sdk::CodexAgentSdk::discover()
+            .map_err(|error| format!("Codex runtime unavailable: {error}"))?;
+        return Ok(ProviderSwitchAuth {
+            api_key: None,
+            claude_code_token: None,
+            claude_agent_sdk: None,
+            codex_agent_sdk: Some(sdk),
+        });
     }
 
     if crate::config::is_local_provider_name(target) {
@@ -523,7 +504,7 @@ fn resolve_provider_switch_auth(
             api_key: None,
             claude_code_token: None,
             claude_agent_sdk: None,
-            codex_responses_auth: None,
+            codex_agent_sdk: None,
         });
     }
 
@@ -555,23 +536,21 @@ fn resolve_provider_switch(
             format!("Provider '{target}' has no configured model; set providers.{target}.model")
         })?;
     let extra_headers = provider.headers.clone();
-    let wire_api = if auth.codex_responses_auth.is_some() {
+    let wire_api = if auth.codex_agent_sdk.is_some() {
         crate::pipeline::WireApi::OpenAiResponses
     } else {
         crate::pipeline::WireApi::ChatCompletions
     };
-    let (endpoint, headers) = if let Some(codex_auth) = auth.codex_responses_auth.as_ref() {
+    let (endpoint, headers) = if auth.codex_agent_sdk.is_some() {
         let endpoint = crate::pipeline::resolve_endpoint_for_wire(
             wire_api,
             &target,
             &model,
-            crate::codex_credentials::CODEX_CHATGPT_BASE_URL,
+            &provider.base_url,
             None,
         )
         .map_err(|e| e.to_string())?;
-        let mut headers = codex_auth.headers().map_err(|e| e.to_string())?;
-        headers.extend(&extra_headers);
-        (endpoint, headers)
+        (endpoint, crate::secrets::SensitiveHeaders::new())
     } else {
         let endpoint = crate::pipeline::resolve_endpoint_for_wire(
             wire_api,
@@ -600,6 +579,7 @@ fn resolve_provider_switch(
         wire_api,
         claude_code_token: auth.claude_code_token,
         claude_agent_sdk: auth.claude_agent_sdk,
+        codex_agent_sdk: auth.codex_agent_sdk,
         vdd_builder_auth,
         prompt_blocks,
     })
@@ -607,8 +587,8 @@ fn resolve_provider_switch(
 
 #[allow(clippy::option_if_let_else)] // Ordered precedence prevents combining incompatible auth modes.
 fn provider_switch_auth_to_vdd_auth(auth: &ProviderSwitchAuth) -> crate::vdd::VddProviderAuth {
-    if let Some(codex_auth) = auth.codex_responses_auth.as_ref() {
-        crate::vdd::VddProviderAuth::codex_responses(codex_auth.clone())
+    if let Some(sdk) = auth.codex_agent_sdk.as_ref() {
+        crate::vdd::VddProviderAuth::codex_agent_sdk(sdk.clone())
     } else if let Some(sdk) = auth.claude_agent_sdk.as_ref() {
         crate::vdd::VddProviderAuth::claude_agent_sdk(sdk.clone())
     } else if let Some(token) = auth.claude_code_token.as_ref() {
@@ -694,6 +674,7 @@ enum KeyMode {
 /// * `wire_api`        — request/stream protocol selected for this provider
 /// * `claude_code_token` — OAuth bearer when running in claude-code-token mode
 /// * `claude_agent_sdk` — supported Anthropic-owned subscription transport
+/// * `codex_agent_sdk` — supported OpenAI-owned account transport
 /// * `prompt_blocks`   — pre-split system prompt blocks for Anthropic caching
 ///
 /// `model` and `provider` are NOT included: they're also shown in the UI
@@ -721,6 +702,8 @@ pub struct ApiClient {
     /// Anthropic-owned executable transport. `None` for direct HTTP
     /// providers and the quarantined legacy subscription experiment.
     pub claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+    /// OpenAI-owned executable transport. `None` for direct HTTP providers.
+    pub codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
     /// Pre-split system-prompt blocks the Anthropic adapter uses to get
     /// cache hits on the long static tail. `None` when no split has been
     /// computed (non-Anthropic providers).
@@ -741,6 +724,7 @@ impl ApiClient {
             wire_api: crate::pipeline::WireApi::ChatCompletions,
             claude_code_token: None,
             claude_agent_sdk: None,
+            codex_agent_sdk: None,
             prompt_blocks: None,
         }
     }
@@ -1486,6 +1470,7 @@ impl App {
     }
 
     /// Set the API connection details needed to make requests.
+    #[allow(clippy::too_many_arguments)] // Transport capabilities must change atomically on provider switch.
     pub fn set_api_config(
         &mut self,
         endpoint: String,
@@ -1494,6 +1479,7 @@ impl App {
         prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
         claude_code_token: Option<crate::secrets::OAuthToken>,
         claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+        codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
     ) {
         self.api_client.endpoint = endpoint;
         self.api_client.headers = headers;
@@ -1501,6 +1487,7 @@ impl App {
         self.api_client.prompt_blocks = prompt_blocks;
         self.api_client.claude_code_token = claude_code_token;
         self.api_client.claude_agent_sdk = claude_agent_sdk;
+        self.api_client.codex_agent_sdk = codex_agent_sdk;
     }
 
     /// Retain the launch-time MCP discovery/trust snapshot so a later session
@@ -1527,6 +1514,7 @@ impl App {
             wire_api,
             claude_code_token,
             claude_agent_sdk,
+            codex_agent_sdk,
             vdd_builder_auth,
             prompt_blocks,
         } = switch;
@@ -1583,6 +1571,7 @@ impl App {
             prompt_blocks,
             claude_code_token,
             claude_agent_sdk,
+            codex_agent_sdk,
         );
         self.refresh_prompt_context_for_run();
         self.rebind_mcp_runtime(&next_run);
@@ -4003,6 +3992,7 @@ impl App {
         let transient_allowed_tool_rules = std::mem::take(&mut self.next_turn_allowed_tool_rules);
         let claude_code_token = api.claude_code_token;
         let claude_agent_sdk = api.claude_agent_sdk;
+        let codex_agent_sdk = api.codex_agent_sdk;
         let prompt_blocks = api.prompt_blocks;
         let wire_api = api.wire_api;
         let hook_engine = self
@@ -4057,6 +4047,7 @@ impl App {
             wire_api,
             claude_code_token,
             claude_agent_sdk,
+            codex_agent_sdk,
             prompt_blocks,
             memory_db,
             app_config,
@@ -4444,6 +4435,7 @@ struct ApiTurnParams {
     wire_api: crate::pipeline::WireApi,
     claude_code_token: Option<crate::secrets::OAuthToken>,
     claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+    codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
     prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
@@ -4493,6 +4485,7 @@ struct AgenticCtx<'a> {
     wire_api: crate::pipeline::WireApi,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     claude_agent_sdk: Option<&'a crate::claude_agent_sdk::ClaudeAgentSdk>,
+    codex_agent_sdk: Option<&'a crate::codex_agent_sdk::CodexAgentSdk>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
@@ -4517,13 +4510,17 @@ fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
 
 fn provider_state_after_turn(
     wire_api: crate::pipeline::WireApi,
+    requires_responses_native_state: bool,
     previous: Option<&crate::runtime::ProviderNativeState>,
     returned: Option<crate::runtime::ProviderNativeState>,
 ) -> Result<Option<crate::runtime::ProviderNativeState>, String> {
-    if wire_api == crate::pipeline::WireApi::OpenAiResponses {
+    if wire_api == crate::pipeline::WireApi::OpenAiResponses && requires_responses_native_state {
         return returned.map(Some).ok_or_else(|| {
             "Responses turn completed without native continuation state".to_string()
         });
+    }
+    if wire_api == crate::pipeline::WireApi::OpenAiResponses {
+        return Ok(returned);
     }
     Ok(returned.or_else(|| previous.cloned()))
 }
@@ -5178,6 +5175,7 @@ async fn run_agentic_loop(
             endpoint: ctx.endpoint,
             headers: ctx.headers,
             claude_agent_sdk: ctx.claude_agent_sdk,
+            codex_agent_sdk: ctx.codex_agent_sdk,
             effort_level: ctx.effort_level,
             request_body: &body,
             provider: ctx.provider,
@@ -5205,6 +5203,7 @@ async fn run_agentic_loop(
                 );
                 let next_provider_state = match provider_state_after_turn(
                     ctx.wire_api,
+                    ctx.codex_agent_sdk.is_none(),
                     provider_native_state.as_ref(),
                     followup.provider_native_state.take(),
                 ) {
@@ -5524,6 +5523,7 @@ async fn run_api_turn_async(mut p: ApiTurnParams) {
         endpoint: &p.endpoint,
         headers: &p.headers,
         claude_agent_sdk: p.claude_agent_sdk.as_ref(),
+        codex_agent_sdk: p.codex_agent_sdk.as_ref(),
         effort_level: p.effort_level.as_str(),
         request_body: &initial_turn.request_body,
         provider: &p.provider,
@@ -5557,6 +5557,7 @@ async fn run_api_turn_async(mut p: ApiTurnParams) {
                     wire_api: p.wire_api,
                     claude_code_token: p.claude_code_token.as_ref(),
                     claude_agent_sdk: p.claude_agent_sdk.as_ref(),
+                    codex_agent_sdk: p.codex_agent_sdk.as_ref(),
                     prompt_blocks: p.prompt_blocks.as_ref(),
                     provider_native_state: p.provider_native_state,
                     memory_db: p.memory_db,
@@ -5594,6 +5595,7 @@ struct TurnContext<'a> {
     wire_api: crate::pipeline::WireApi,
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     claude_agent_sdk: Option<&'a crate::claude_agent_sdk::ClaudeAgentSdk>,
+    codex_agent_sdk: Option<&'a crate::codex_agent_sdk::CodexAgentSdk>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     provider_native_state: Option<crate::runtime::ProviderNativeState>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
@@ -5654,6 +5656,7 @@ async fn handle_followup_turn(
 ) {
     let mut provider_native_state = match provider_state_after_turn(
         ctx.wire_api,
+        ctx.codex_agent_sdk.is_none(),
         ctx.provider_native_state.as_ref(),
         turn_result.provider_native_state.take(),
     ) {
@@ -5687,6 +5690,7 @@ async fn handle_followup_turn(
         wire_api: ctx.wire_api,
         claude_code_token: ctx.claude_code_token,
         claude_agent_sdk: ctx.claude_agent_sdk,
+        codex_agent_sdk: ctx.codex_agent_sdk,
         prompt_blocks: ctx.prompt_blocks,
         memory_db: ctx.memory_db.clone(),
         app_config: ctx.app_config.clone(),
@@ -5740,6 +5744,7 @@ async fn handle_direct_turn(
 ) {
     let provider_native_state = match provider_state_after_turn(
         ctx.wire_api,
+        ctx.codex_agent_sdk.is_none(),
         ctx.provider_native_state.as_ref(),
         turn_result.provider_native_state.take(),
     ) {
@@ -5917,10 +5922,10 @@ mod tests {
     use super::{
         append_context_reference_message, create_orphan_recovery_dir, format_api_retry_delay,
         format_api_retry_message, format_review_command_output, format_stream_timeout_message,
-        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, read_tui_session_file,
-        resolve_provider_switch_auth, save_session, write_orphan_recovery_file, ApiClient, App,
-        AppEvent, EffortLevel, MessageKind, Mode, ProviderSwitch, SpawnTarget, TurnContext,
-        TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
+        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, provider_state_after_turn,
+        read_tui_session_file, resolve_provider_switch_auth, save_session,
+        write_orphan_recovery_file, ApiClient, App, AppEvent, EffortLevel, MessageKind, Mode,
+        ProviderSwitch, SpawnTarget, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
     };
     use super::{compile_file_ref_regex, expand_file_refs};
     use crate::slash_commands::all_tui_commands;
@@ -6917,6 +6922,7 @@ mod tests {
                 wire_api: crate::pipeline::WireApi::ChatCompletions,
                 claude_code_token: None,
                 claude_agent_sdk: None,
+                codex_agent_sdk: None,
                 prompt_blocks: None,
                 provider_native_state: None,
                 memory_db: None,
@@ -6981,6 +6987,7 @@ mod tests {
                 wire_api: crate::pipeline::WireApi::ChatCompletions,
                 claude_code_token: None,
                 claude_agent_sdk: None,
+                codex_agent_sdk: None,
                 prompt_blocks: None,
                 provider_native_state: None,
                 memory_db: None,
@@ -7069,6 +7076,7 @@ mod tests {
                 wire_api: crate::pipeline::WireApi::OpenAiResponses,
                 claude_code_token: None,
                 claude_agent_sdk: None,
+                codex_agent_sdk: None,
                 prompt_blocks: None,
                 provider_native_state: None,
                 memory_db: None,
@@ -7126,6 +7134,25 @@ mod tests {
     }
 
     #[test]
+    fn direct_responses_transport_requires_native_continuation_state() {
+        let result =
+            provider_state_after_turn(crate::pipeline::WireApi::OpenAiResponses, true, None, None);
+
+        assert_eq!(
+            result.expect_err("direct Responses transport must return native state"),
+            "Responses turn completed without native continuation state"
+        );
+    }
+
+    #[test]
+    fn codex_sdk_responses_shape_does_not_require_native_continuation_state() {
+        let result =
+            provider_state_after_turn(crate::pipeline::WireApi::OpenAiResponses, false, None, None);
+
+        assert_eq!(result.expect("SDK transport owns continuation state"), None);
+    }
+
+    #[test]
     fn provider_switch_auth_allows_keyless_local_provider() {
         let provider = provider_config_without_key("http://localhost:1234/v1");
 
@@ -7134,7 +7161,6 @@ mod tests {
 
         assert!(auth.api_key.is_none());
         assert!(auth.claude_code_token.is_none());
-        assert!(auth.codex_responses_auth.is_none());
     }
 
     #[test]
@@ -7170,6 +7196,7 @@ mod tests {
                 crate::secrets::OAuthToken::try_from_string("oauth-token".to_string())
                     .expect("test token"),
             ),
+            None,
             None,
         );
         assert_eq!(app.api_client.endpoint, "https://example.com/v1");
@@ -7225,6 +7252,7 @@ mod tests {
             Some(blocks.clone()),
             Some(old_token),
             None,
+            None,
         );
 
         let mut switched_headers = crate::secrets::SensitiveHeaders::new();
@@ -7239,6 +7267,7 @@ mod tests {
             wire_api: crate::pipeline::WireApi::ChatCompletions,
             claude_code_token: None,
             claude_agent_sdk: None,
+            codex_agent_sdk: None,
             vdd_builder_auth: crate::vdd::VddProviderAuth::None,
             prompt_blocks: Some(blocks),
         });

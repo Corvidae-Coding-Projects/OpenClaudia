@@ -22,8 +22,8 @@ use crate::vdd::helpers::truncate_output;
 pub enum VddProviderAuth {
     ApiKey(ApiKey),
     ClaudeAgentSdk(crate::claude_agent_sdk::ClaudeAgentSdk),
+    CodexAgentSdk(crate::codex_agent_sdk::CodexAgentSdk),
     ClaudeCodeToken(crate::secrets::OAuthToken),
-    CodexResponses(crate::codex_credentials::CodexResponsesAuth),
     None,
 }
 
@@ -32,11 +32,8 @@ impl std::fmt::Debug for VddProviderAuth {
         match self {
             Self::ApiKey(_) => f.write_str("VddProviderAuth::ApiKey(<redacted>)"),
             Self::ClaudeAgentSdk(_) => f.write_str("VddProviderAuth::ClaudeAgentSdk"),
+            Self::CodexAgentSdk(_) => f.write_str("VddProviderAuth::CodexAgentSdk"),
             Self::ClaudeCodeToken(_) => f.write_str("VddProviderAuth::ClaudeCodeToken(<redacted>)"),
-            Self::CodexResponses(auth) => f
-                .debug_tuple("VddProviderAuth::CodexResponses")
-                .field(auth)
-                .finish(),
             Self::None => f.write_str("VddProviderAuth::None"),
         }
     }
@@ -59,9 +56,53 @@ impl VddProviderAuth {
     }
 
     #[must_use]
-    pub const fn codex_responses(auth: crate::codex_credentials::CodexResponsesAuth) -> Self {
-        Self::CodexResponses(auth)
+    pub const fn codex_agent_sdk(sdk: crate::codex_agent_sdk::CodexAgentSdk) -> Self {
+        Self::CodexAgentSdk(sdk)
     }
+}
+
+async fn complete_vdd_via_codex_agent_sdk(
+    sdk: &crate::codex_agent_sdk::CodexAgentSdk,
+    provider_name: &str,
+    request: &Value,
+    timeout: std::time::Duration,
+) -> Result<crate::codex_agent_sdk::CodexAgentSdkTurn, String> {
+    if !provider_name.eq_ignore_ascii_case("openai") {
+        return Err(format!(
+            "Codex SDK auth can only be used with OpenAI, got '{provider_name}'"
+        ));
+    }
+    let turn = tokio::time::timeout(timeout, sdk.complete_turn(request, "high"))
+        .await
+        .map_err(|_| {
+            format!(
+                "Codex SDK VDD request timed out after {} seconds",
+                timeout.as_secs()
+            )
+        })?
+        .map_err(|error| error.to_string())?;
+    if !turn.tool_calls.is_empty() {
+        return Err(format!(
+            "Codex SDK returned {} tool call(s) to a no-tools VDD request",
+            turn.tool_calls.len()
+        ));
+    }
+    if turn.content.trim().is_empty() {
+        return Err("Codex SDK completed VDD request without assistant content".to_string());
+    }
+    Ok(turn)
+}
+
+fn codex_agent_sdk_response_json(turn: &crate::codex_agent_sdk::CodexAgentSdkTurn) -> Value {
+    serde_json::json!({
+        "output_text": turn.content,
+        "usage": {
+            "input_tokens": turn.usage.input_tokens,
+            "output_tokens": turn.usage.output_tokens,
+            "cached_input_tokens": turn.usage.cache_read_tokens,
+            "cache_write_input_tokens": turn.usage.cache_write_tokens,
+        }
+    })
 }
 
 async fn complete_vdd_via_claude_agent_sdk(
@@ -182,17 +223,7 @@ async fn read_bounded_failure_body(
     Ok(Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-fn chat_messages_as_values(request: &ChatCompletionRequest) -> Result<Vec<Value>, VddError> {
-    request
-        .messages
-        .iter()
-        .map(|message| {
-            serde_json::to_value(message)
-                .map_err(|e| VddError::AdversaryRequestFailed(format!("message encode: {e}")))
-        })
-        .collect()
-}
-
+#[cfg(test)]
 fn responses_text_from_json(json: &Value) -> Option<String> {
     if let Some(text) = json.get("output_text").and_then(Value::as_str) {
         return Some(text.to_string());
@@ -218,6 +249,7 @@ fn responses_text_from_json(json: &Value) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+#[cfg(test)]
 fn responses_usage_from_json(json: &Value) -> TokenUsage {
     let Some(usage) = json.get("usage") else {
         return TokenUsage::default();
@@ -249,6 +281,7 @@ fn responses_usage_from_json(json: &Value) -> TokenUsage {
     }
 }
 
+#[cfg(test)]
 fn responses_text_from_sse(raw: &str) -> Result<(String, TokenUsage), VddError> {
     let mut text = String::new();
     let mut usage = TokenUsage::default();
@@ -332,125 +365,6 @@ fn validate_vdd_chat_terminal(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // Keep the bounded VDD request and its budget settlement in one transaction.
-async fn send_to_codex_responses(
-    run: &crate::tools::ToolRunContext,
-    client: &Client,
-    auth: &crate::codex_credentials::CodexResponsesAuth,
-    request: &ChatCompletionRequest,
-    timeout: std::time::Duration,
-    timeout_secs: u64,
-) -> Result<(String, TokenUsage), VddError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let messages = chat_messages_as_values(request)?;
-    let mut body =
-        crate::pipeline::build_openai_responses_request(&request.model, &messages, "medium")
-            .map_err(|e| VddError::AdversaryRequestFailed(format!("responses transform: {e}")))?;
-    body["stream"] = Value::Bool(false);
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("tools");
-        obj.remove("tool_choice");
-        obj.remove("parallel_tool_calls");
-        obj.remove("include");
-    }
-    let provider_budget = crate::provider_budget::reserve_provider_call(
-        run,
-        "openai",
-        &request.model,
-        &mut body,
-        u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
-    )
-    .map_err(|error| {
-        VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
-    })?;
-    crate::codex_credentials::finalize_chatgpt_responses_request(&mut body);
-
-    let endpoint = format!(
-        "{}/responses",
-        crate::proxy::normalize_base_url(crate::codex_credentials::CODEX_CHATGPT_BASE_URL)
-    );
-    crate::provider_transport::validate_endpoint("openai", &endpoint)
-        .map_err(|error| VddError::AdversaryRequestFailed(error.to_string()))?;
-    let headers = auth
-        .headers()
-        .map_err(|error| VddError::AdversaryRequestFailed(error.to_string()))?;
-    let req = headers
-        .apply(client.post(endpoint).json(&body))
-        .map_err(|error| VddError::AdversaryRequestFailed(error.to_string()))?;
-
-    let response = tokio::time::timeout_at(
-        deadline,
-        crate::provider_transport::send_until(req, deadline),
-    )
-    .await
-    .map_err(|_| VddError::Timeout {
-        provider: "openai".to_string(),
-        elapsed_secs: timeout_secs,
-    })?
-    .map_err(|e| VddError::AdversaryRequestFailed(format!("responses request: {e}")))?;
-    let status = response.status();
-
-    if !status.is_success() {
-        let raw = tokio::time::timeout_at(deadline, read_bounded_failure_body(response))
-            .await
-            .map_err(|_| VddError::Timeout {
-                provider: "openai".to_string(),
-                elapsed_secs: timeout_secs,
-            })?
-            .map_err(|e| VddError::AdversaryRequestFailed(format!("responses body: {e}")))?;
-        let diagnostic = headers.sanitize_diagnostic(&raw);
-        return Err(VddError::AdversaryRequestFailed(format!(
-            "responses request failed with HTTP {status}: {}",
-            truncate_output(diagnostic.as_str(), 1000)
-        )));
-    }
-
-    let raw = zeroize::Zeroizing::new(
-        tokio::time::timeout_at(
-            deadline,
-            crate::provider_transport::read_body_capped(
-                response,
-                crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
-            ),
-        )
-        .await
-        .map_err(|_| VddError::Timeout {
-            provider: "openai".to_string(),
-            elapsed_secs: timeout_secs,
-        })?
-        .map_err(|e| VddError::AdversaryRequestFailed(format!("responses body: {e}")))?,
-    );
-    let raw_text = String::from_utf8_lossy(&raw);
-
-    let result = if raw_text
-        .lines()
-        .any(|line| line.trim_start().starts_with("data:"))
-    {
-        responses_text_from_sse(&raw_text)
-    } else {
-        let json = serde_json::from_slice::<Value>(&raw)
-            .map_err(|e| VddError::AdversaryRequestFailed(format!("responses JSON decode: {e}")))?;
-        crate::pipeline::validate_openai_responses_terminal_json(&json).map_err(|error| {
-            VddError::AdversaryRequestFailed(format!("responses terminal validation: {error}"))
-        })?;
-        let text = responses_text_from_json(&json).unwrap_or_default();
-        if text.trim().is_empty() {
-            return Err(VddError::AdversaryRequestFailed(
-                "Responses verifier completed without assistant content".to_string(),
-            ));
-        }
-        Ok((text, responses_usage_from_json(&json)))
-    };
-    if let Ok((_, usage)) = &result {
-        provider_budget.reconcile(usage).map_err(|error| {
-            VddError::AdversaryRequestFailed(format!(
-                "Provider budget reconciliation failed: {error}"
-            ))
-        })?;
-    }
-    result
-}
-
 fn adversary_headers_and_endpoint(
     config: &VddConfig,
     provider_config: &ProviderConfig,
@@ -501,7 +415,7 @@ fn adversary_headers_and_endpoint(
                 adapter.chat_endpoint(&request.model),
             ))
         }
-        Some(VddProviderAuth::CodexResponses(_) | VddProviderAuth::ClaudeAgentSdk(_)) => {
+        Some(VddProviderAuth::ClaudeAgentSdk(_) | VddProviderAuth::CodexAgentSdk(_)) => {
             unreachable!("handled above")
         }
     }
@@ -536,16 +450,6 @@ pub async fn send_to_adversary(
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let deadline = tokio::time::Instant::now() + timeout;
 
-    if let Some(VddProviderAuth::CodexResponses(auth)) = runtime_auth {
-        if !config.adversary.provider.eq_ignore_ascii_case("openai") {
-            return Err(VddError::ConfigError(format!(
-                "Codex Responses auth can only be used with OpenAI VDD adversary, got '{}'",
-                config.adversary.provider
-            )));
-        }
-        return send_to_codex_responses(run, client, auth, request, timeout, timeout_secs).await;
-    }
-
     // Crosslink #433: a typo in `config.adversary.provider` now surfaces
     // as `ConfigError` instead of being silently mapped to OpenAIAdapter.
     let adapter = get_adapter(&config.adversary.provider)
@@ -553,6 +457,47 @@ pub async fn send_to_adversary(
     let mut transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
+
+    if let Some(VddProviderAuth::CodexAgentSdk(sdk)) = runtime_auth {
+        let provider_budget = crate::provider_budget::reserve_provider_call(
+            run,
+            &config.adversary.provider,
+            &request.model,
+            &mut transformed,
+            u64::from(config.adversary.max_tokens),
+        )
+        .map_err(|error| {
+            VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
+        })?;
+        let turn = match complete_vdd_via_codex_agent_sdk(
+            sdk,
+            &config.adversary.provider,
+            &transformed,
+            timeout,
+        )
+        .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    VddError::AdversaryRequestFailed(format!(
+                        "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                    ))
+                })?;
+                return Err(VddError::AdversaryRequestFailed(error));
+            }
+        };
+        provider_budget.reconcile(&turn.usage).map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Provider budget reconciliation failed: {error}"
+            ))
+        })?;
+        info!(
+            response_length = turn.content.len(),
+            "VDD: Received Codex SDK adversary response"
+        );
+        return Ok((turn.content, turn.usage));
+    }
 
     if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
         let provider_budget = crate::provider_budget::reserve_provider_call(
@@ -712,24 +657,42 @@ pub async fn send_to_builder(
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let deadline = tokio::time::Instant::now() + timeout;
 
-    if let Some(VddProviderAuth::CodexResponses(auth)) = runtime_auth {
-        if !provider_name.eq_ignore_ascii_case("openai") {
-            return Err(VddError::ConfigError(format!(
-                "Codex Responses auth can only be used with OpenAI builder, got '{provider_name}'"
-            )));
-        }
-        let (text, tokens) =
-            send_to_codex_responses(run, client, auth, request, timeout, timeout_secs).await?;
-        return Ok((
-            text.clone(),
-            serde_json::json!({ "output_text": text }),
-            tokens,
-        ));
-    }
-
     let mut transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
+
+    if let Some(VddProviderAuth::CodexAgentSdk(sdk)) = runtime_auth {
+        let provider_budget = crate::provider_budget::reserve_provider_call(
+            run,
+            provider_name,
+            &request.model,
+            &mut transformed,
+            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+        )
+        .map_err(|error| {
+            VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
+        })?;
+        let turn = match complete_vdd_via_codex_agent_sdk(sdk, provider_name, &transformed, timeout)
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    VddError::BuilderRevisionFailed(format!(
+                        "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                    ))
+                })?;
+                return Err(VddError::BuilderRevisionFailed(error));
+            }
+        };
+        provider_budget.reconcile(&turn.usage).map_err(|error| {
+            VddError::BuilderRevisionFailed(format!(
+                "Provider budget reconciliation failed: {error}"
+            ))
+        })?;
+        let response = codex_agent_sdk_response_json(&turn);
+        return Ok((turn.content, response, turn.usage));
+    }
 
     if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
         let provider_budget = crate::provider_budget::reserve_provider_call(
@@ -782,7 +745,7 @@ pub async fn send_to_builder(
             api_key.map(|k| adapter.get_headers(k)).unwrap_or_default(),
             adapter.chat_endpoint(&request.model),
         ),
-        Some(VddProviderAuth::CodexResponses(_) | VddProviderAuth::ClaudeAgentSdk(_)) => {
+        Some(VddProviderAuth::ClaudeAgentSdk(_) | VddProviderAuth::CodexAgentSdk(_)) => {
             unreachable!("handled above")
         }
     };
@@ -877,19 +840,46 @@ pub async fn send_to_builder_for_verification(
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let deadline = tokio::time::Instant::now() + timeout;
 
-    if let Some(VddProviderAuth::CodexResponses(auth)) = runtime_auth {
-        if !provider_name.eq_ignore_ascii_case("openai") {
-            return Err(VddError::ConfigError(format!(
-                "Codex Responses auth can only be used with OpenAI verifier, got '{provider_name}'"
-            )));
-        }
-        return send_to_codex_responses(run, client, auth, request, timeout, timeout_secs).await;
-    }
-
     let adapter = get_adapter(provider_name).map_err(|e| VddError::ConfigError(e.to_string()))?;
     let mut transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier transform: {e}")))?;
+
+    if let Some(VddProviderAuth::CodexAgentSdk(sdk)) = runtime_auth {
+        let provider_budget = crate::provider_budget::reserve_provider_call(
+            run,
+            provider_name,
+            &request.model,
+            &mut transformed,
+            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+        )
+        .map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Run budget denied verifier provider call: {error}"
+            ))
+        })?;
+        let turn = match complete_vdd_via_codex_agent_sdk(sdk, provider_name, &transformed, timeout)
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    VddError::AdversaryRequestFailed(format!(
+                        "Codex SDK verifier request failed: {error}; budget reconciliation failed: {budget_error}"
+                    ))
+                })?;
+                return Err(VddError::AdversaryRequestFailed(format!(
+                    "verifier request: {error}"
+                )));
+            }
+        };
+        provider_budget.reconcile(&turn.usage).map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Verifier budget reconciliation failed: {error}"
+            ))
+        })?;
+        return Ok((turn.content, turn.usage));
+    }
 
     if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
         let provider_budget = crate::provider_budget::reserve_provider_call(
@@ -945,7 +935,7 @@ pub async fn send_to_builder_for_verification(
             api_key.map(|k| adapter.get_headers(k)).unwrap_or_default(),
             adapter.chat_endpoint(&request.model),
         ),
-        Some(VddProviderAuth::CodexResponses(_) | VddProviderAuth::ClaudeAgentSdk(_)) => {
+        Some(VddProviderAuth::ClaudeAgentSdk(_) | VddProviderAuth::CodexAgentSdk(_)) => {
             unreachable!("handled above")
         }
     };

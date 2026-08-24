@@ -173,6 +173,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-028: Verify Codex account and compliance metadata (#1128)
 - S-027: Isolate Anthropic subscription compatibility behind an experimental build (#1126)
 - Allow grounded final answers for exact file-read observations (#1127)
 - S-026: Stop mutating the shared Claude credential store (#1125)

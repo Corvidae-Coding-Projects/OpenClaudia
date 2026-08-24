@@ -2135,7 +2135,7 @@ async fn run_subagent_inner(
                 )
             },
         );
-    let (api_key, codex_responses_auth) =
+    let (api_key, codex_agent_sdk) =
         match resolve_subagent_openai_auth(&app_config.proxy.target, configured_api_key) {
             Ok(auth) => auth,
             Err(error) => {
@@ -2157,7 +2157,7 @@ async fn run_subagent_inner(
                 };
             }
         };
-    let wire_api = if codex_responses_auth.is_some() {
+    let wire_api = if codex_agent_sdk.is_some() {
         crate::pipeline::WireApi::OpenAiResponses
     } else {
         crate::pipeline::WireApi::ChatCompletions
@@ -2522,29 +2522,19 @@ async fn run_subagent_inner(
             let request = provider_request_body
                 .as_ref()
                 .expect("Responses request uses the canonical wire builder");
-            let Some(auth) = codex_responses_auth.as_ref() else {
-                unreachable!("Responses wire selection requires Codex auth");
-            };
-            match make_openai_responses_api_call(
+            let sdk = codex_agent_sdk
+                .as_ref()
+                .expect("Responses wire selection requires the Codex SDK runtime");
+            match make_codex_agent_sdk_call(
                 &subagent_run,
-                client,
                 &app_config.proxy.target,
                 &model,
-                crate::codex_credentials::CODEX_CHATGPT_BASE_URL,
-                auth,
-                app_config
-                    .active_provider()
-                    .map(|provider| &provider.headers),
+                sdk,
                 request,
-                provider_native_state.as_ref(),
-                assistant_message_ordinal,
             )
             .await
             {
-                Ok(decoded) => {
-                    let assistant = responses_subagent_assistant_message(&decoded);
-                    (assistant, Some(decoded.provider_native_state))
-                }
+                Ok(turn) => (codex_sdk_subagent_assistant_message(&turn), None),
                 Err(error) => {
                     BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
                     store_transcript_with_state(
@@ -2925,27 +2915,17 @@ fn resolve_subagent_openai_auth(
 ) -> Result<
     (
         Option<crate::providers::ApiKey>,
-        Option<crate::codex_credentials::CodexResponsesAuth>,
+        Option<crate::codex_agent_sdk::CodexAgentSdk>,
     ),
     String,
 > {
     if !provider.eq_ignore_ascii_case("openai") || api_key.is_some() {
         return Ok((api_key, None));
     }
-    match crate::codex_credentials::load_codex_auth()? {
-        Some(crate::codex_credentials::CodexAuthMaterial::ApiKey { api_key, .. }) => {
-            Ok((Some(api_key), None))
-        }
-        Some(crate::codex_credentials::CodexAuthMaterial::Responses(auth)) => {
-            Ok((None, Some(auth)))
-        }
-        Some(crate::codex_credentials::CodexAuthMaterial::Unsupported { mode, .. }) => Err(
-            format!("{} is not supported for child runs", mode.display_name()),
-        ),
-        None => {
-            Err("OpenAI child run requires an API key or supported Codex credential".to_string())
-        }
-    }
+    let sdk = crate::codex_agent_sdk::CodexAgentSdk::discover().map_err(|error| {
+        format!("OpenAI child run requires an API key or Codex runtime login: {error}")
+    })?;
+    Ok((None, Some(sdk)))
 }
 
 /// Decode the in-flight subagent `request_body` JSON into the typed
@@ -3210,6 +3190,7 @@ fn strip_subagent_decision_argument(tool_call: &ToolCall) -> ToolCall {
     stripped
 }
 
+#[cfg(test)]
 fn responses_subagent_assistant_message(
     decoded: &crate::pipeline::OpenAiResponsesDecodedTurn,
 ) -> Value {
@@ -3233,6 +3214,32 @@ fn responses_subagent_assistant_message(
             Value::Null
         } else {
             Value::String(decoded.content.clone())
+        },
+        "tool_calls": tool_calls,
+    })
+}
+
+fn codex_sdk_subagent_assistant_message(turn: &crate::codex_agent_sdk::CodexAgentSdkTurn) -> Value {
+    let tool_calls = turn
+        .tool_calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "role": "assistant",
+        "content": if turn.content.is_empty() && !tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(turn.content.clone())
         },
         "tool_calls": tool_calls,
     })
@@ -3293,70 +3300,13 @@ fn subagent_assistant_text(message: &Value) -> String {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn make_openai_responses_api_call(
+async fn make_codex_agent_sdk_call(
     run: &crate::tools::ToolRunContext,
-    client: &Client,
     provider: &str,
     model: &str,
-    base_url: &str,
-    auth: &crate::codex_credentials::CodexResponsesAuth,
-    extra_headers: Option<&crate::secrets::SensitiveHeaders>,
+    sdk: &crate::codex_agent_sdk::CodexAgentSdk,
     request_body: &Value,
-    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
-    assistant_message_ordinal: u64,
-) -> Result<crate::pipeline::OpenAiResponsesDecodedTurn, String> {
-    make_openai_responses_api_call_impl(
-        run,
-        client,
-        provider,
-        model,
-        base_url,
-        auth,
-        extra_headers,
-        request_body,
-        provider_native_state,
-        assistant_message_ordinal,
-        true,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn make_openai_responses_api_call_impl(
-    run: &crate::tools::ToolRunContext,
-    client: &Client,
-    provider: &str,
-    model: &str,
-    base_url: &str,
-    auth: &crate::codex_credentials::CodexResponsesAuth,
-    extra_headers: Option<&crate::secrets::SensitiveHeaders>,
-    request_body: &Value,
-    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
-    assistant_message_ordinal: u64,
-    validate_endpoint: bool,
-) -> Result<crate::pipeline::OpenAiResponsesDecodedTurn, String> {
-    if !validate_endpoint && !cfg!(test) {
-        return Err("Responses endpoint validation cannot be disabled in production".to_string());
-    }
-    let endpoint = if validate_endpoint {
-        crate::pipeline::resolve_endpoint_for_wire(
-            crate::pipeline::WireApi::OpenAiResponses,
-            provider,
-            model,
-            base_url,
-            None,
-        )
-        .map_err(|error| format!("Responses endpoint error: {error}"))?
-    } else {
-        format!("{}/responses", crate::proxy::normalize_base_url(base_url))
-    };
-    let mut headers = auth
-        .headers()
-        .map_err(|error| format!("Responses header error: {error}"))?;
-    if let Some(extra_headers) = extra_headers {
-        headers.extend(extra_headers);
-    }
+) -> Result<crate::codex_agent_sdk::CodexAgentSdkTurn, String> {
     let mut request_body = request_body.clone();
     let provider_budget = crate::provider_budget::reserve_provider_call(
         run,
@@ -3366,45 +3316,29 @@ async fn make_openai_responses_api_call_impl(
         u64::from(SUBAGENT_MAX_TOKENS),
     )
     .map_err(|error| format!("Run budget denied provider call: {error}"))?;
-    crate::codex_credentials::finalize_chatgpt_responses_request(&mut request_body);
-    let request = headers
-        .apply(client.post(endpoint).json(&request_body))
-        .map_err(|error| format!("Responses header error: {error}"))?;
-    let response = crate::provider_transport::send(request)
-        .await
-        .map_err(|error| format!("Responses request failed: {error}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = crate::secrets::read_bounded_diagnostic_body(response)
-            .await
-            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
-        return Err(format!(
-            "Responses API error ({status}): {}",
-            headers.sanitize_diagnostic(&body)
-        ));
-    }
-    let decoded = crate::pipeline::decode_openai_responses_stream(
-        crate::pipeline::OpenAiResponsesStreamParams {
-            response,
-            headers: &headers,
-            provider,
-            model_identity: model,
-            provider_native_state,
-            assistant_message_ordinal,
-        },
-        |_| Ok(()),
-        |_| Ok(()),
-        |_, _| Ok(()),
-    )
-    .await?;
-    crate::pipeline::ensure_provider_turn_succeeded(
-        decoded.terminal_outcome,
-        decoded.tool_calls.len(),
-    )?;
+    let turn = match sdk.complete_turn(&request_body, "medium").await {
+        Ok(turn) => turn,
+        Err(error) => {
+            provider_budget.finish_unknown().map_err(|budget_error| {
+                format!(
+                    "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                )
+            })?;
+            return Err(format!("Codex SDK request failed: {error}"));
+        }
+    };
     provider_budget
-        .reconcile(&decoded.usage)
+        .reconcile(&turn.usage)
         .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
-    Ok(decoded)
+    crate::pipeline::ensure_provider_turn_succeeded(
+        if turn.tool_calls.is_empty() {
+            crate::pipeline::ProviderTerminalOutcome::Completed
+        } else {
+            crate::pipeline::ProviderTerminalOutcome::ToolCalls
+        },
+        turn.tool_calls.len(),
+    )?;
+    Ok(turn)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6096,96 +6030,6 @@ memory:
             ]
         });
         assert_eq!(subagent_assistant_text(&multipart), "first second");
-    }
-
-    #[tokio::test]
-    async fn responses_child_transport_uses_terminal_validated_shared_decoder() {
-        use wiremock::matchers::{body_json, header, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let reasoning = json!({
-            "type": "reasoning",
-            "id": "rs_child_transport",
-            "encrypted_content": "opaque-child-transport"
-        });
-        let function_call = json!({
-            "type": "function_call",
-            "id": "fc_child_transport",
-            "call_id": "call_child_transport",
-            "name": "read_file",
-            "arguments": r#"{"path":"src/lib.rs"}"#
-        });
-        let sse = format!(
-            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
-            json!({"type":"response.created","response":{"id":"resp_child_transport"}}),
-            json!({"type":"response.output_item.done","item":reasoning}),
-            json!({"type":"response.output_item.done","item":function_call}),
-            json!({
-                "type":"response.completed",
-                "response":{
-                    "id":"resp_child_transport",
-                    "status":"completed",
-                    "output":[reasoning, function_call],
-                    "usage":{"input_tokens":11,"output_tokens":7}
-                }
-            })
-        );
-        let request_body = json!({
-            "model": "gpt-test",
-            "store": false,
-            "stream": true,
-            "max_output_tokens": SUBAGENT_MAX_TOKENS,
-            "input": [{"role":"user","content":"inspect"}]
-        });
-        let mut expected_request_body = request_body.clone();
-        crate::codex_credentials::finalize_chatgpt_responses_request(&mut expected_request_body);
-        Mock::given(method("POST"))
-            .and(path("/responses"))
-            .and(header("authorization", "Bearer child-transport-token"))
-            .and(body_json(expected_request_body))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_raw(sse, "text/event-stream"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let auth = crate::codex_credentials::CodexResponsesAuth {
-            access_token: crate::secrets::OAuthToken::try_from_string(
-                "child-transport-token".to_string(),
-            )
-            .expect("token"),
-            account_id: None,
-            is_fedramp_account: false,
-            source: crate::codex_credentials::CodexAuthSource::EnvAccessToken,
-            mode: crate::codex_credentials::CodexAuthMode::ChatgptAuthTokens,
-        };
-
-        let decoded = make_openai_responses_api_call_impl(
-            test_run(),
-            &Client::new(),
-            "openai",
-            "gpt-test",
-            &server.uri(),
-            &auth,
-            None,
-            &request_body,
-            None,
-            1,
-            false,
-        )
-        .await
-        .expect("Responses child turn");
-
-        assert_eq!(decoded.tool_calls.len(), 1);
-        assert_eq!(decoded.tool_calls[0].id, "call_child_transport");
-        assert_eq!(decoded.usage.input_tokens, 11);
-        assert_eq!(decoded.provider_native_state.generation().get(), 1);
-        assert!(decoded.provider_native_state.items().iter().any(|item| {
-            item.payload()["item"]["encrypted_content"] == "opaque-child-transport"
-        }));
     }
 
     #[test]

@@ -89,6 +89,8 @@ pub struct ProviderSwitch {
     /// Supported subscription transport through Anthropic's unmodified
     /// Agent SDK executable.
     pub claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+    /// Supported account transport through `OpenAI`'s pinned Codex runtime.
+    pub codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
     /// Runtime auth used by VDD's builder-side verifier after switching.
     pub vdd_builder_auth: crate::vdd::VddProviderAuth,
     /// Existing split system prompt blocks, preserved for Anthropic cache efficiency.

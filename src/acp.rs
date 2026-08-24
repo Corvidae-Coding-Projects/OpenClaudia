@@ -147,9 +147,9 @@ pub struct AcpServer {
     /// Supported subscription transport through Anthropic's pinned executable.
     /// Credentials remain owned by that executable and never enter ACP state.
     claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
-    /// Codex ChatGPT/PAT authentication selects the `OpenAI` Responses wire
-    /// protocol without copying credentials into conversation state.
-    codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
+    /// Supported account transport through `OpenAI`'s pinned Codex runtime.
+    /// Credentials and verified routing metadata remain owned by Codex.
+    codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
     /// Exact Responses continuation paired with the active portable transcript.
     provider_native_state: Option<crate::runtime::ProviderNativeState>,
     /// ACP wire session that owns the in-memory transcript/native pair. ACP's
@@ -927,7 +927,7 @@ impl AcpServer {
         api_key: Option<crate::providers::ApiKey>,
         claude_code_token: Option<crate::secrets::OAuthToken>,
         claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
-        codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
+        codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
         stdout_tx: mpsc::UnboundedSender<String>,
         launch_root: std::path::PathBuf,
     ) -> Result<Self, String> {
@@ -939,7 +939,7 @@ impl AcpServer {
             api_key,
             claude_code_token,
             claude_agent_sdk,
-            codex_responses_auth,
+            codex_agent_sdk,
             stdout_tx,
             launch_root,
             host_home,
@@ -953,7 +953,7 @@ impl AcpServer {
         api_key: Option<crate::providers::ApiKey>,
         claude_code_token: Option<crate::secrets::OAuthToken>,
         claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
-        codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
+        codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
         stdout_tx: mpsc::UnboundedSender<String>,
         launch_root: std::path::PathBuf,
         host_home: std::path::PathBuf,
@@ -1018,7 +1018,7 @@ impl AcpServer {
             api_key,
             claude_code_token,
             claude_agent_sdk,
-            codex_responses_auth,
+            codex_agent_sdk,
             provider_native_state: None,
             active_conversation_acp_session_id: None,
             policy_enforcer,
@@ -1675,7 +1675,7 @@ impl AcpServer {
                 );
             }
         };
-        let wire_api = if self.codex_responses_auth.is_some() {
+        let wire_api = if self.codex_agent_sdk.is_some() {
             crate::pipeline::WireApi::OpenAiResponses
         } else {
             crate::pipeline::WireApi::ChatCompletions
@@ -1901,16 +1901,11 @@ impl AcpServer {
                     );
                 }
             }
-            let endpoint_base = if wire_api.is_responses() {
-                crate::codex_credentials::CODEX_CHATGPT_BASE_URL
-            } else {
-                &provider.base_url
-            };
             let endpoint = match crate::pipeline::resolve_endpoint_for_wire(
                 wire_api,
                 &self.config.proxy.target,
                 &self.model,
-                endpoint_base,
+                &provider.base_url,
                 claude_code_token,
             ) {
                 Ok(endpoint) => endpoint,
@@ -1922,19 +1917,8 @@ impl AcpServer {
 
             // Build HTTP request with headers
             let extra_headers = provider.headers.clone();
-            let headers = if let Some(auth) = self.codex_responses_auth.as_ref() {
-                match auth.headers() {
-                    Ok(mut headers) => {
-                        headers.extend(&extra_headers);
-                        headers
-                    }
-                    Err(error) => {
-                        return self.fail_prompt_with_update(
-                            acp_session_id,
-                            &format!("Provider header error: {error}"),
-                        );
-                    }
-                }
+            let headers = if self.codex_agent_sdk.is_some() {
+                crate::secrets::SensitiveHeaders::new()
             } else {
                 match crate::pipeline::resolve_headers(
                     &self.config.proxy.target,
@@ -1967,13 +1951,55 @@ impl AcpServer {
                     );
                 }
             };
-            if self.codex_responses_auth.is_some() {
-                crate::codex_credentials::finalize_chatgpt_responses_request(&mut transformed);
-            }
-
             let (stream_result, next_provider_native_state) = if let Some(sdk) =
-                self.claude_agent_sdk.as_ref()
+                self.codex_agent_sdk.as_ref()
             {
+                debug!(iteration, "Sending provider request through Codex SDK");
+                let turn = match sdk
+                    .complete_turn(
+                        &transformed,
+                        thinking.reasoning_effort.as_deref().unwrap_or("medium"),
+                    )
+                    .await
+                {
+                    Ok(turn) => turn,
+                    Err(error) => {
+                        if let Err(budget_error) = provider_budget.finish_unknown() {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!(
+                                    "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                                ),
+                            );
+                        }
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Codex SDK request failed: {error}"),
+                        );
+                    }
+                };
+                if let Err(error) = provider_budget.reconcile(&turn.usage) {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Provider budget reconciliation failed: {error}"),
+                    );
+                }
+                let terminal = if turn.tool_calls.is_empty() {
+                    crate::pipeline::ProviderTerminalOutcome::Completed
+                } else {
+                    crate::pipeline::ProviderTerminalOutcome::ToolCalls
+                };
+                let tool_calls = turn
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| AccumulatedToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect();
+                (finish_acp_stream(turn.content, tool_calls, terminal), None)
+            } else if let Some(sdk) = self.claude_agent_sdk.as_ref() {
                 debug!(
                     iteration,
                     "Sending provider request through Claude Agent SDK"
@@ -3661,7 +3687,7 @@ pub async fn run_acp_server(
     api_key: Option<crate::providers::ApiKey>,
     claude_code_token: Option<crate::secrets::OAuthToken>,
     claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
-    codex_responses_auth: Option<crate::codex_credentials::CodexResponsesAuth>,
+    codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
 ) -> Result<()> {
     let launch_root = std::env::current_dir()
         .map_err(|error| anyhow::anyhow!("Cannot resolve ACP workspace: {error}"))?;
@@ -3690,7 +3716,7 @@ pub async fn run_acp_server(
         api_key,
         claude_code_token,
         claude_agent_sdk,
-        codex_responses_auth,
+        codex_agent_sdk,
         stdout_tx,
         launch_root,
         host_home,
@@ -4824,7 +4850,7 @@ memory:
             api_key: None,
             claude_code_token: None,
             claude_agent_sdk: None,
-            codex_responses_auth: None,
+            codex_agent_sdk: None,
             provider_native_state: None,
             active_conversation_acp_session_id: None,
             policy_enforcer: Arc::new(crate::services::policy::PolicyEnforcer::new(

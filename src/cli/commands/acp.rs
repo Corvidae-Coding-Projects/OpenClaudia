@@ -44,7 +44,7 @@ pub async fn cmd_acp(
     let provider_api_key = provider.api_key.clone();
     let provider_model = provider.model.clone();
 
-    let (api_key, claude_code_token, claude_agent_sdk, codex_responses_auth) = if let Some(k) =
+    let (api_key, claude_code_token, claude_agent_sdk, codex_agent_sdk) = if let Some(k) =
         provider_api_key
     {
         (Some(k), None, None, None)
@@ -71,29 +71,12 @@ pub async fn cmd_acp(
             (None, None, Some(sdk), None)
         }
     } else if target.eq_ignore_ascii_case("openai") {
-        match openclaudia::codex_credentials::load_codex_auth() {
-            Ok(Some(openclaudia::codex_credentials::CodexAuthMaterial::ApiKey {
-                api_key, ..
-            })) => (Some(api_key), None, None, None),
-            Ok(Some(openclaudia::codex_credentials::CodexAuthMaterial::Responses(auth))) => {
-                (None, None, None, Some(auth))
-            }
-            Ok(Some(openclaudia::codex_credentials::CodexAuthMaterial::Unsupported {
-                mode,
-                ..
-            })) => {
-                anyhow::bail!(
-                    "{} is not supported by OpenClaudia ACP",
-                    mode.display_name()
-                );
-            }
-            Ok(None) => {
-                anyhow::bail!(
-                    "no OpenAI credentials are configured for ACP; set OPENAI_API_KEY or run `codex login`"
-                );
-            }
-            Err(error) => anyhow::bail!("could not load Codex credentials for ACP: {error}"),
-        }
+        let sdk =
+            openclaudia::codex_agent_sdk::CodexAgentSdk::discover().map_err(anyhow::Error::new)?;
+        sdk.require_authenticated()
+            .await
+            .map_err(anyhow::Error::new)?;
+        (None, None, None, Some(sdk))
     } else if config::is_local_provider_name(&target) {
         (None, None, None, None)
     } else {
@@ -119,7 +102,7 @@ pub async fn cmd_acp(
         api_key,
         claude_code_token,
         claude_agent_sdk,
-        codex_responses_auth,
+        codex_agent_sdk,
     )
     .await
 }

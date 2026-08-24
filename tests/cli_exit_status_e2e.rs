@@ -180,6 +180,38 @@ fn install_fake_claude(home: &tempfile::TempDir) -> (std::path::PathBuf, std::pa
     (bin_dir, invocation_log)
 }
 
+#[cfg(unix)]
+fn install_fake_codex(home: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin_dir = home.path().join("fake-codex-bin");
+    fs::create_dir_all(&bin_dir).expect("fake Codex bin directory");
+    let binary = bin_dir.join("codex");
+    let invocation_log = home.path().join("fake-codex-invocations.txt");
+    fs::write(
+        &binary,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$OPENCLAUDIA_TEST_CODEX_LOG"
+if [ "${1-}" = login ] && [ "${2-}" = status ]; then
+  [ "${OPENCLAUDIA_TEST_CODEX_AUTH-logged_in}" = logged_in ]
+  exit
+fi
+if [ "${1-}" = exec ]; then
+  while IFS= read -r _line; do :; done
+  printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"content\":\"codex account ok\",\"tool_calls\":[]}"}}'
+  printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":3,"cached_input_tokens":0}}'
+  exit 0
+fi
+exit 64
+"#,
+    )
+    .expect("fake Codex executable");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+        .expect("fake Codex executable permissions");
+    (bin_dir, invocation_log)
+}
+
 fn snapshot_tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     fn payload(metadata: &fs::Metadata, contents: &[u8]) -> Vec<u8> {
         let modified = metadata
@@ -1547,21 +1579,25 @@ fn acp_accepts_keyless_anthropic_with_supported_claude_login_until_stdin_eof() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn acp_rejects_keyless_remote_provider_before_handshake() {
+fn acp_accepts_keyless_openai_with_supported_codex_login_until_stdin_eof() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
+    let (fake_path, invocation_log) = install_fake_codex(&home);
     write_openai_provider_config(&cwd);
 
     let output = isolated_command(&cwd, &home)
         .arg("acp")
+        .env("PATH", fake_path)
+        .env("OPENCLAUDIA_TEST_CODEX_LOG", &invocation_log)
         .stdin(Stdio::null())
         .output()
         .expect("openclaudia acp must run");
 
     assert!(
-        !output.status.success(),
-        "acp should reject a remote provider with no API key; stdout={:?} stderr={:?}",
+        output.status.success(),
+        "acp should start and exit cleanly on EOF for keyless OpenAI with a supported Codex login; stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1571,8 +1607,12 @@ fn acp_rejects_keyless_remote_provider_before_handshake() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("OPENAI_API_KEY"),
-        "remote ACP auth failure should name the provider env var; got {combined:?}"
+        !combined.contains("OPENAI_API_KEY") && !combined.contains("not logged in"),
+        "OpenAI ACP Codex mode must not ask for an API key or reject the owned login; got {combined:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(invocation_log).expect("fake Codex invocation"),
+        "login status\n"
     );
 }
 
@@ -1920,48 +1960,89 @@ fn print_rejects_sse_stream_without_printable_text() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn print_rejects_keyless_remote_provider_before_request() {
+fn print_accepts_keyless_openai_with_supported_codex_login() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
+    let (fake_path, invocation_log) = install_fake_codex(&home);
     write_openai_provider_config(&cwd);
 
     let output = isolated_command(&cwd, &home)
         .args(["--print", "hello"])
+        .env("PATH", fake_path)
+        .env("OPENCLAUDIA_TEST_CODEX_LOG", &invocation_log)
         .output()
         .expect("openclaudia --print must run");
 
     assert!(
-        !output.status.success(),
-        "print should reject a remote provider with no API key; stdout={:?} stderr={:?}",
+        output.status.success(),
+        "print should use the owned Codex login when OpenAI has no API key; stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let combined = format!(
-        "{}{}",
+    assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "codex account ok\n"
     );
+    let invocations = fs::read_to_string(invocation_log).expect("fake Codex invocations");
     assert!(
-        combined.contains("OPENAI_API_KEY"),
-        "remote print auth failure should name the provider env var; got {combined:?}"
+        invocations.starts_with("login status\nexec "),
+        "print mode should check login and execute one Codex turn; got {invocations:?}"
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn print_mixed_case_remote_provider_names_specific_env_var() {
+fn print_mixed_case_openai_uses_codex_runtime() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
+    let (fake_path, invocation_log) = install_fake_codex(&home);
     write_openai_provider_config_with_target(&cwd, "OpenAI");
 
     let output = isolated_command(&cwd, &home)
         .args(["--print", "hello"])
+        .env("PATH", fake_path)
+        .env("OPENCLAUDIA_TEST_CODEX_LOG", &invocation_log)
+        .output()
+        .expect("openclaudia --print must run");
+
+    assert!(
+        output.status.success(),
+        "mixed-case OpenAI should use the supported Codex login; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "codex account ok\n"
+    );
+    let invocations = fs::read_to_string(invocation_log).expect("fake Codex invocations");
+    assert!(
+        invocations.starts_with("login status\nexec "),
+        "mixed-case OpenAI should retain the Codex runtime path; got {invocations:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn print_reports_owned_codex_login_failure_before_request() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let (fake_path, invocation_log) = install_fake_codex(&home);
+    write_openai_provider_config(&cwd);
+
+    let output = isolated_command(&cwd, &home)
+        .args(["--print", "hello"])
+        .env("PATH", fake_path)
+        .env("OPENCLAUDIA_TEST_CODEX_LOG", &invocation_log)
+        .env("OPENCLAUDIA_TEST_CODEX_AUTH", "logged_out")
         .output()
         .expect("openclaudia --print must run");
 
     assert!(
         !output.status.success(),
-        "print should reject mixed-case OpenAI without an API key; stdout={:?} stderr={:?}",
+        "print must fail before a provider turn when Codex is logged out; stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1971,8 +2052,13 @@ fn print_mixed_case_remote_provider_names_specific_env_var() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("OPENAI_API_KEY") && !combined.contains("Set API_KEY"),
-        "mixed-case OpenAI target should keep the OpenAI env-var hint; got {combined:?}"
+        combined.contains("Codex is not logged in") && combined.contains("codex login"),
+        "owned-login failure should name the deterministic recovery command; got {combined:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(invocation_log).expect("fake Codex invocation"),
+        "login status\n",
+        "a failed login check must prevent a provider turn"
     );
 }
 
