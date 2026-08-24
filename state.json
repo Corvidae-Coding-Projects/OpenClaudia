@@ -1,6 +1,6 @@
 {
   "next_display_id": 1128,
-  "next_comment_id": 1467,
+  "next_comment_id": 1468,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8090,7 +8090,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T04:30:05.624298691Z",
-      "updated_at": "2026-08-24T06:21:37.853226248Z",
+      "updated_at": "2026-08-24T06:36:04.976514124Z",
       "labels": [
         "remediation"
       ],
@@ -8139,6 +8139,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEPE/VPViAaRvBSMaqXMUFRTxsueMTjk6ps3xgw7lH3W2d7HDwiyRKn1Crrfjf2Nnuon3Ah+KdTzzu2f1D85jBA=="
+        },
+        "b1457c2a-7b01-44a3-9389-903802a34e7c": {
+          "display_id": 1467,
+          "author": "6Vw9",
+          "content": "Delivered the supported Anthropic subscription backend through the pinned unmodified claude executable, with native tools, MCP, slash commands, Chrome integration, and session persistence disabled; exact structured host-tool schemas; independent decoder validation; bounded output and timeout; and OpenClaudia-owned policy, permissions, hooks, budgets, VDD, ACP, ledger, and final-gate processing. Preserved direct subscription compatibility behind the disabled Cargo feature plus exact acknowledgement, with no credential auto-detection fallback and no foreign-store writes. Rust 1.98 default and feature strict Clippy pass, the complete default test suite passed, focused feature suites pass, generated retrieval evidence is current, supported TUI/print/auth paths passed live, and the feature-enabled direct print path returned its sentinel live.",
+          "created_at": "2026-08-24T06:36:04.973909616Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAYhPBFt+eVhQBt7ntMVmO17jB8qrVEju2E3hCnqCMiqGHkW9JlqiuHMWf3p3bZXdCjmsBIJ4ZTdzEp3nKRN35AQ=="
         }
       }
     },
@@ -38175,11 +38184,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1417,
       "timestamp": "2026-08-24T06:35:49.889615560Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1418,
+      "timestamp": "2026-08-24T06:36:04.976514124Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T06:35:49.889615560Z",
+    "timestamp": "2026-08-24T06:36:04.976514124Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1417
+    "agent_seq": 1418
   }
 }
