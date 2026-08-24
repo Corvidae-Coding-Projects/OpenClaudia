@@ -1,6 +1,6 @@
 {
   "next_display_id": 1133,
-  "next_comment_id": 1503,
+  "next_comment_id": 1504,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20219,7 +20219,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-24T19:57:01.619331608Z",
-      "updated_at": "2026-08-24T20:08:41.654456641Z",
+      "updated_at": "2026-08-24T20:19:58.123924200Z",
       "labels": [
         "ci"
       ],
@@ -20241,6 +20241,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJiDsyCu74oOpgavJRAd8+xsrHGzO/jkFClmrXIrEEQnFaIMQBJtV4F+p256phcfyXWQsgdYCiG0727llljOOCw=="
+        },
+        "935bfb3a-9dad-4e44-a0a2-16fb68c5bb17": {
+          "display_id": 1503,
+          "author": "6Vw9",
+          "content": "Implemented in signed commit 0165301d (test(shell): keep cap stress workers alive). Replaced the 30-second fixture with an explicitly teardown-owned zero-output process, preserving the cumulative-success and active-cap assertions while preventing legitimate slot reuse on slow CI. Rebound the checked-in technical-retrieval source citation/evaluation/rejected-review chain to the exact modified bytes. Rust 1.98.0 verification: focused cap test passed 4 consecutive runs; focused retrieval-evidence test passed; cargo fmt --all -- --check passed; locked all-target/all-feature cargo check passed; strict locked all-target/all-feature Clippy with -D warnings passed; exact cargo test --locked --all-targets --all-features -- --test-threads=1 passed.",
+          "created_at": "2026-08-24T20:19:58.121052567Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6AQhGzLW1WM2Nszx2mAYSVjJJkL3Rkek20xh7n1kz7g7Yvuo7QqZEEIsGt8lDgISq2A/NxwD3oPQ5yRgdRKIAA=="
         }
       }
     },
@@ -38965,11 +38974,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1490,
       "timestamp": "2026-08-24T20:08:41.654456641Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1491,
+      "timestamp": "2026-08-24T20:19:58.123924200Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-24T20:08:41.654456641Z",
+    "timestamp": "2026-08-24T20:19:58.123924200Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1490
+    "agent_seq": 1491
   }
 }
