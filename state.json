@@ -1,6 +1,6 @@
 {
   "next_display_id": 1142,
-  "next_comment_id": 1632,
+  "next_comment_id": 1633,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -30352,10 +30352,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T21:13:29.243020245Z",
-      "updated_at": "2026-08-25T21:13:33.436346040Z",
+      "updated_at": "2026-08-25T21:19:41.073988145Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "0b641cb8-196f-4611-b94b-723772cc7751": {
+          "display_id": 1632,
+          "author": "6Vw9",
+          "content": "Preflight/architecture decision: S-019, S-040, S-051, and S-065 are complete. Current defects match F-092: one McpManager map mutex is held across all remote I/O; HTTP bodies are read without a byte cap; timeout/replacement paths can drop live transports without close/reap; stdio lacks a transport default deadline; and static MCP resource handlers require Process+Network regardless of selected transport. Implement one bounded mailbox actor per server registration/generation. The actor owns server/reconnect/cancellation/close state, publishes a non-authoritative snapshot for catalogs/health, and reconciles caller cancellation or timeout before the next command. Manager map locks remain metadata-only. Add exact transport admission receipts for #1026 and preserve current plus explicit legacy adapters. Per-server mutex-only was rejected because caller-future cancellation can leave killed-but-unreaped state falsely live.",
+          "created_at": "2026-08-25T21:19:41.070755014Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAF21xNiLK0cQbSMZpJTB3/iZTanMM2IIPEAacPVUeZVmwfes2Zebo28pDnVhw5ah4ybNQCsU2KZKR+whfS8nwBQ=="
+        }
+      }
     },
     "ec16c4ed-d6b9-4c1c-b5f0-80e6175d855d": {
       "uuid": "ec16c4ed-d6b9-4c1c-b5f0-80e6175d855d",
@@ -41331,11 +41342,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1691,
       "timestamp": "2026-08-25T21:13:38.816472693Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1692,
+      "timestamp": "2026-08-25T21:19:41.073988145Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T21:13:38.816472693Z",
+    "timestamp": "2026-08-25T21:19:41.073988145Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1691
+    "agent_seq": 1692
   }
 }
