@@ -2236,11 +2236,18 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn fix1133_background_survives_spawning_thread_exit() {
+        // This test owns a local manager, so give it a local durable namespace
+        // as well. Reusing `test_run()` can make this manager recover a job
+        // that the global test manager is still finalizing, turning unrelated
+        // suite timing into a legitimate `job.json` generation conflict.
+        let root = tempfile::tempdir_in(".").expect("background parent-death workspace");
+        let run = crate::tools::security::test_run_context_for(root.path());
         let manager = Arc::new(BackgroundShellManager::new());
         let spawning_manager = Arc::clone(&manager);
+        let spawning_run = Arc::clone(&run);
         let id = thread::spawn(move || {
             spawning_manager.spawn_with_timeout(
-                test_run(),
+                &spawning_run,
                 "while :; do sleep 3600; done",
                 std::time::Duration::from_secs(3600),
             )
@@ -2254,10 +2261,10 @@ mod tests {
         // proving the dedicated supervisor remains its live parent.
         thread::sleep(std::time::Duration::from_millis(250));
         let read = manager
-            .get_output(test_run(), &id, Some(0))
+            .get_output(&run, &id, Some(0))
             .expect("background job must remain readable");
         let state = read.state;
-        let _ = manager.kill(test_run(), &id);
+        let _ = manager.kill(&run, &id);
 
         assert!(
             state.is_running(),
