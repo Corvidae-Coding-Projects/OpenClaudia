@@ -1,6 +1,6 @@
 {
   "next_display_id": 1138,
-  "next_comment_id": 1576,
+  "next_comment_id": 1577,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25259,7 +25259,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T05:28:55.304078244Z",
-      "updated_at": "2026-08-25T06:22:39.188784182Z",
+      "updated_at": "2026-08-25T06:24:12.113438964Z",
       "closed_at": "2026-08-25T06:21:42.401940271Z",
       "labels": [
         "remediation"
@@ -25273,6 +25273,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtZrxatNnwVEHAuzY+dN7PGNlaovEsFeW7sJyB8dsWibUYoi6hw5uEqscXTRENb8/hxO7FwMOr98wCqBoyaLGDw=="
+        },
+        "2c241c4a-ff6c-474b-9e02-f2b488cda72f": {
+          "display_id": 1576,
+          "author": "6Vw9",
+          "content": "Future verification handoff: when the S-088 VDD verifier becomes available, independently re-run S-035 through its required alternate-model verification path against commit 30d70461 and attach the genuine verifier receipt to this issue. S-088 was not available during this slice, so no receipt was fabricated and local/CI verification remains the present evidence.",
+          "created_at": "2026-08-25T06:24:12.111030058Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABACi8pMxNYF7fnIAZKM/qA66cRN3g3eVSHKMs5440F12oEB9aWKT9s5l40O97Tl713JRRfcAy17ssofaBcfuDUBw=="
         },
         "2e1ecff8-fcf6-4f2c-bfc6-69822972a0b7": {
           "display_id": 1564,
@@ -40325,11 +40334,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1608,
       "timestamp": "2026-08-25T06:22:47.985576459Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1609,
+      "timestamp": "2026-08-25T06:24:12.113438964Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T06:22:47.985576459Z",
+    "timestamp": "2026-08-25T06:24:12.113438964Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1608
+    "agent_seq": 1609
   }
 }
