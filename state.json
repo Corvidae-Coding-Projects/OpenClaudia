@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1609,
+  "next_comment_id": 1610,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,7 +16222,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T11:07:56.105630736Z",
+      "updated_at": "2026-08-25T11:22:31.293693653Z",
       "labels": [
         "remediation"
       ],
@@ -16301,6 +16301,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "9fca89e3-6d68-4a1f-b727-d8ddb2b9c8fd": {
+          "display_id": 1609,
+          "author": "6Vw9",
+          "content": "Hosted Windows run 32840908643 confirms the TokenOwner repair: root opening succeeds and the parent reparse containment test passes. The next exposed defect is atomic publication: 4 write tests fail at SetFileInformationByHandle(FileRenameInfo) with ERROR_INVALID_PARAMETER (87); no tests were changed. Investigating FILE_RENAME_INFO buffer/root-relative contract.",
+          "created_at": "2026-08-25T11:22:31.291226720Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdSWpkIdg7TUDaZT0Mn77dpVYAmSTUu96EKMcI3mxIcMVKpgCOYtnHrWB22iSI7sq4pyD2Dc3SOiCVjEDLHFmCQ=="
         },
         "b931acd0-44cd-4c19-810f-8dc3dda064ec": {
           "display_id": 1603,
@@ -40911,11 +40920,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1655,
       "timestamp": "2026-08-25T11:07:56.105630736Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1656,
+      "timestamp": "2026-08-25T11:22:31.293693653Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T11:07:56.105630736Z",
+    "timestamp": "2026-08-25T11:22:31.293693653Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1655
+    "agent_seq": 1656
   }
 }
