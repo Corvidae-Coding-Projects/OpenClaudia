@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1610,
+  "next_comment_id": 1611,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,7 +16222,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T11:22:31.293693653Z",
+      "updated_at": "2026-08-25T11:26:24.046576362Z",
       "labels": [
         "remediation"
       ],
@@ -16262,6 +16262,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGSYyAm1OXTSM5l+jJ9+EfSgNgvNqtgl8IEaYP6H8eX/F+zVLFzl4moO7SY+/o5ROIOUeNjaPD8DN93WTgae2BA=="
+        },
+        "28a4226a-b4c5-47e5-aa35-b6303ad27fe2": {
+          "display_id": 1610,
+          "author": "6Vw9",
+          "content": "Disposable Windows API probe reproduced ERROR_INVALID_PARAMETER for SetFileInformationByHandle(FileRenameInfo) with a non-null RootDirectory, while the identical root-relative FILE_RENAME_INFORMATION succeeds through NtSetInformationFile(FileRenameInformation). Absolute-path fallback also succeeds but is rejected because it would abandon handle-relative containment. Repair: use native NtSetInformationFile, consistent with this backend's NtCreateFile/NtFlushBuffersFile authority model.",
+          "created_at": "2026-08-25T11:26:24.043311397Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArpqgeVf/HZRZ9tDsEdAYLiWPpc3PWXMjpPtrdL99WnULuJpZofO0B1HsRskWA17TZAoNKHqanghaT92ZCUW3DA=="
         },
         "2ac5ef53-de94-4ea3-9afe-d51be0f56832": {
           "display_id": 1604,
@@ -40925,11 +40934,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1656,
       "timestamp": "2026-08-25T11:22:31.293693653Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1657,
+      "timestamp": "2026-08-25T11:26:24.046576362Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T11:22:31.293693653Z",
+    "timestamp": "2026-08-25T11:26:24.046576362Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1656
+    "agent_seq": 1657
   }
 }
