@@ -1,6 +1,6 @@
 {
   "next_display_id": 1145,
-  "next_comment_id": 1647,
+  "next_comment_id": 1648,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29821,12 +29821,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T23:43:22.282994195Z",
-      "updated_at": "2026-08-25T23:50:35.080603217Z",
+      "updated_at": "2026-08-25T23:50:39.376506702Z",
       "labels": [
         "feature",
         "remediation"
       ],
       "comments": {
+        "52d8dbaa-47b2-4f97-85c0-de399f388479": {
+          "display_id": 1647,
+          "author": "6Vw9",
+          "content": "Preflight/architecture: current MCP 2026-07-28 replaces server-initiated requests with MRTR. Selected design keeps provider login stores isolated, gives each HTTP MCP transport a dedicated auth owner with descriptor-safe credential persistence and single-flight refresh, drives input_required as correlated bounded retries through an attributed handler, and installs in-process callables through the same manager actor/generation/cancellation/policy path. Alternative considered: replace the MCP stack with an SDK; rejected for this slice because it would expand dependencies and destabilize already-working modern/legacy adapters. Scope remains S-067 only; S-088 receipt remains pending.",
+          "created_at": "2026-08-25T23:50:39.373933388Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6+VIxCN100qepeVmaw6FZDW7pvi0eBAyQxjwgZ52lGRMs6RXtuhaBYjtlUvQ3+Tw9xWmqR3KVNOjTq3c+pP1Dw=="
+        },
         "f968cbe2-97ee-49fc-bf4c-1640ee7450be": {
           "display_id": 1646,
           "author": "6Vw9",
@@ -41701,11 +41710,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1725,
       "timestamp": "2026-08-25T23:50:35.080603217Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1726,
+      "timestamp": "2026-08-25T23:50:39.376506702Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T23:50:35.080603217Z",
+    "timestamp": "2026-08-25T23:50:39.376506702Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1725
+    "agent_seq": 1726
   }
 }
