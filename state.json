@@ -25223,13 +25223,12 @@
       "display_id": 1137,
       "title": "S-035: Make notebook editing transactional",
       "description": "Implement S-035 on agent/refactor-agent-system-remediation: preserve operational notebook_edit behavior while moving validation and publication onto descriptor-safe snapshot-bound atomic persistence; enforce realistic bounded nbformat structure and stable unique cell IDs; prove round-trip, stale-generation, interruption/write-failure, invalid-input, and recovery behavior under Rust 1.98 resource constraints.",
-      "status": "closed",
+      "status": "open",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T05:28:55.304078244Z",
-      "updated_at": "2026-08-25T06:20:22.852323730Z",
-      "closed_at": "2026-08-25T06:20:07.788583096Z",
+      "updated_at": "2026-08-25T06:20:56.272121805Z",
       "labels": [
         "remediation"
       ],
@@ -40198,11 +40197,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1596,
       "timestamp": "2026-08-25T06:20:22.852323730Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1597,
+      "timestamp": "2026-08-25T06:20:56.272121805Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T06:20:22.852323730Z",
+    "timestamp": "2026-08-25T06:20:56.272121805Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1596
+    "agent_seq": 1597
   }
 }
