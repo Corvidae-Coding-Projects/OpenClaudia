@@ -8,20 +8,25 @@
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use futures::StreamExt as _;
 use reqwest::header::{HeaderMap, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+#[cfg(test)]
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -72,8 +77,14 @@ const STDERR_BUFFER_CAP: usize = 1024 * 1024;
 const STDERR_SNIPPET_BYTES: usize = 4096;
 // Fix #445 point 2 — bound BEFORE allocation on the response line.
 const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_HTTP_SSE_EVENTS: usize = 1000;
 const MAX_STDIO_INTERMEDIATE_MESSAGES: usize = 1000;
 const MAX_MCP_CATALOG_PAGES: usize = 100;
+const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+const MCP_ACTOR_QUEUE_CAPACITY: usize = 32;
+static NEXT_MCP_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Errors that can occur during MCP operations
 #[derive(Error, Debug)]
@@ -105,6 +116,36 @@ pub enum McpError {
 
     #[error("MCP HTTP endpoint returned status {status} without a recognized protocol error")]
     HttpStatus { status: u16 },
+
+    #[error("MCP request exceeded the {limit}-byte transport limit")]
+    RequestTooLarge { limit: usize },
+
+    #[error("MCP response exceeded the {limit}-byte transport limit")]
+    ResponseTooLarge { limit: usize },
+
+    #[error("MCP server '{server}' request queue is full (capacity {capacity})")]
+    Backpressure { server: String, capacity: usize },
+
+    #[error("MCP server '{0}' connection is closed")]
+    ConnectionClosed(String),
+
+    #[error("MCP operation cancelled during {phase} phase")]
+    Cancelled { phase: &'static str },
+
+    #[error("MCP transport capability is unavailable: {0}")]
+    Capability(#[from] crate::tools::ToolCapabilityError),
+
+    #[error(
+        "MCP server '{server}' connection generation is stale: expected {expected}, current {current}"
+    )]
+    StaleConnectionGeneration {
+        server: String,
+        expected: u64,
+        current: u64,
+    },
+
+    #[error("MCP request run generation is stale: expected {expected}, current {current}")]
+    StaleRunGeneration { expected: u64, current: u64 },
 
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
@@ -484,6 +525,15 @@ impl Drop for StdioTransport {
     fn drop(&mut self) {
         if !self.process_reaped.load(Ordering::Acquire) {
             crate::tools::terminate_sandbox_process_tree(self.pid);
+            let child = Arc::clone(&self.child);
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let mut child = child.lock().await;
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    drop(child);
+                });
+            }
         }
     }
 }
@@ -655,6 +705,11 @@ impl StdioTransport {
     async fn write_json_line(&self, value: &Value) -> Result<(), McpError> {
         let line = serde_json::to_string(value)
             .map_err(|e| McpError::Protocol(format!("Failed to serialize MCP message: {e}")))?;
+        if line.len() > MAX_REQUEST_SIZE {
+            return Err(McpError::RequestTooLarge {
+                limit: MAX_REQUEST_SIZE,
+            });
+        }
         {
             let mut child = self.child.lock().await;
             let Some(stdin) = child.stdin.as_mut() else {
@@ -888,6 +943,9 @@ impl StdioTransport {
     }
 
     async fn terminate_after_workspace_error(&self) {
+        if self.process_reaped.load(Ordering::Acquire) {
+            return;
+        }
         crate::tools::terminate_sandbox_process_tree(self.pid);
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
@@ -902,9 +960,7 @@ fn derive_mcp_stdio_run(
     parent: &Arc<crate::tools::ToolRunContext>,
     extra_environment: &crate::secrets::EnvironmentGrants,
 ) -> Result<Arc<crate::tools::ToolRunContext>, McpError> {
-    parent
-        .require(crate::tools::ToolResource::Process)
-        .map_err(|error| McpError::Transport(error.to_string()))?;
+    parent.require(crate::tools::ToolResource::Process)?;
     let session_id = crate::state::SessionId::from_raw(parent.session_id()).map_err(|error| {
         McpError::Transport(format!(
             "Cannot bind MCP process to parent session: {error}"
@@ -1046,8 +1102,7 @@ fn resolve_trusted_mcp_executable(
     run: &crate::tools::ToolRunContext,
     command: &str,
 ) -> Result<PathBuf, McpError> {
-    run.require(crate::tools::ToolResource::Process)
-        .map_err(|error| McpError::Transport(error.to_string()))?;
+    run.require(crate::tools::ToolResource::Process)?;
     let candidate = if Path::new(command).is_absolute() {
         PathBuf::from(command)
     } else {
@@ -1192,6 +1247,11 @@ impl McpTransport for StdioTransport {
 
         let request_line = serde_json::to_string(&request)
             .map_err(|e| McpError::Protocol(format!("Failed to serialize request: {e}")))?;
+        if request_line.len() > MAX_REQUEST_SIZE {
+            return Err(McpError::RequestTooLarge {
+                limit: MAX_REQUEST_SIZE,
+            });
+        }
 
         debug!(method = %method, id = id, "Sending MCP request");
 
@@ -1199,8 +1259,18 @@ impl McpTransport for StdioTransport {
         // request must not observe or extend an uncommitted candidate.
         let _request_guard = self.request_lock.lock().await;
         let mut in_flight = InFlightStdioRequestGuard::new(self.pid);
-        let result = self.perform_request(id, &request_line).await;
+        let result = tokio::time::timeout(
+            DEFAULT_MCP_REQUEST_TIMEOUT,
+            self.perform_request(id, &request_line),
+        )
+        .await
+        .unwrap_or(Err(McpError::Timeout {
+            phase: "stdio-request",
+        }));
         let checkpoint = self.checkpoint_workspace(result.is_ok()).await;
+        if matches!(result, Err(McpError::Timeout { .. })) {
+            self.terminate_after_workspace_error().await;
+        }
         in_flight.disarm();
         checkpoint?;
         result
@@ -1227,8 +1297,8 @@ impl McpTransport for StdioTransport {
 
     async fn close(&self) -> Result<(), McpError> {
         let _request_guard = self.request_lock.lock().await;
-        crate::tools::terminate_sandbox_process_tree(self.pid);
-        {
+        if !self.process_reaped.load(Ordering::Acquire) {
+            crate::tools::terminate_sandbox_process_tree(self.pid);
             let mut child = self.child.lock().await;
             let _ = child.kill().await;
             child
@@ -1360,12 +1430,10 @@ impl HttpTransport {
     /// loopback listener they just bound (which the production
     /// [`Self::new`] would correctly reject as a private address).
     ///
-    /// Hidden from the public docs (`#[doc(hidden)]`) and prefixed
-    /// `__test_` to discourage production use. The function is `pub`
-    /// rather than `pub(crate)` only so integration tests in
-    /// `tests/*.rs` — which compile as a separate crate without
-    /// access to `cfg(test)` symbols — can construct loopback
-    /// transports for the mock-server pattern.
+    /// Hidden from public docs and compiled only when debug assertions are
+    /// enabled. It remains `pub` in debug builds because integration tests in
+    /// `tests/*.rs` compile as a separate crate without `cfg(test)` access.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     #[must_use]
     pub fn __test_new_unchecked(base_url: &str) -> Self {
@@ -1376,6 +1444,7 @@ impl HttpTransport {
     }
 
     /// Test-only constructor with static headers and no SSRF guard.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     #[must_use]
     pub fn __test_new_unchecked_with_headers(
@@ -1386,6 +1455,7 @@ impl HttpTransport {
         Self::__test_new_unchecked_with_sensitive_headers(base_url, headers)
     }
 
+    #[cfg(debug_assertions)]
     fn __test_new_unchecked_with_sensitive_headers(
         base_url: &str,
         headers: crate::secrets::SensitiveHeaders,
@@ -1462,17 +1532,48 @@ fn content_type_value_is_event_stream(value: &str) -> bool {
     })
 }
 
+fn valid_mcp_session_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+}
+
 async fn parse_http_json_rpc_response(
     response: reqwest::Response,
     sanitize: &(impl Fn(&str) -> String + Sync),
 ) -> Result<JsonRpcResponse, McpError> {
     let is_event_stream = response_content_type_is_event_stream(response.headers());
-    let body = zeroize::Zeroizing::new(response.text().await.map_err(|err| {
-        if is_event_stream {
-            McpError::Protocol(format!("Failed to read SSE response: {err}"))
-        } else {
-            McpError::Protocol(format!("Failed to read response: {err}"))
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_HTTP_RESPONSE_SIZE as u64)
+    {
+        return Err(McpError::ResponseTooLarge {
+            limit: MAX_HTTP_RESPONSE_SIZE,
+        });
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(MAX_HTTP_RESPONSE_SIZE),
+    );
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            if is_event_stream {
+                McpError::Protocol(format!("Failed to read SSE response: {err}"))
+            } else {
+                McpError::Protocol(format!("Failed to read response: {err}"))
+            }
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_SIZE {
+            return Err(McpError::ResponseTooLarge {
+                limit: MAX_HTTP_RESPONSE_SIZE,
+            });
         }
+        body.extend_from_slice(&chunk);
+    }
+    let body = zeroize::Zeroizing::new(String::from_utf8(body).map_err(|error| {
+        McpError::Protocol(format!("MCP HTTP response was not valid UTF-8: {error}"))
     })?);
 
     if is_event_stream || body_looks_like_sse(&body) {
@@ -1502,9 +1603,18 @@ fn parse_sse_json_rpc_response(
 ) -> Result<JsonRpcResponse, McpError> {
     let mut event_name: Option<String> = None;
     let mut data_lines: Vec<String> = Vec::new();
+    let mut event_count = 0usize;
 
     for line in body.lines() {
         if line.is_empty() {
+            if !data_lines.is_empty() {
+                event_count = event_count.saturating_add(1);
+                if event_count > MAX_HTTP_SSE_EVENTS {
+                    return Err(McpError::Protocol(format!(
+                        "MCP SSE response exceeded {MAX_HTTP_SSE_EVENTS} events"
+                    )));
+                }
+            }
             if let Some(response) =
                 parse_sse_json_rpc_event(event_name.as_deref(), &data_lines, sanitize)?
             {
@@ -1531,6 +1641,11 @@ fn parse_sse_json_rpc_response(
         }
     }
 
+    if !data_lines.is_empty() && event_count >= MAX_HTTP_SSE_EVENTS {
+        return Err(McpError::Protocol(format!(
+            "MCP SSE response exceeded {MAX_HTTP_SSE_EVENTS} events"
+        )));
+    }
     if let Some(response) = parse_sse_json_rpc_event(event_name.as_deref(), &data_lines, sanitize)?
     {
         return Ok(response);
@@ -1636,6 +1751,13 @@ impl McpTransport for HttpTransport {
             method: method.to_string(),
             params,
         };
+        let request_body = serde_json::to_vec(&request)
+            .map_err(|error| McpError::Protocol(format!("Failed to serialize request: {error}")))?;
+        if request_body.len() > MAX_REQUEST_SIZE {
+            return Err(McpError::RequestTooLarge {
+                limit: MAX_REQUEST_SIZE,
+            });
+        }
 
         debug!(method = %method, "Sending HTTP MCP request");
 
@@ -1657,7 +1779,7 @@ impl McpTransport for HttpTransport {
             .timeout(HTTP_REQUEST_TIMEOUT)
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json")
-            .json(&request);
+            .body(request_body);
         if context.version.era() == McpProtocolEra::Modern {
             builder = builder
                 .header("MCP-Protocol-Version", context.version.as_str())
@@ -1692,14 +1814,19 @@ impl McpTransport for HttpTransport {
         // server MAY emit it on the initialize response; once set, all
         // subsequent POSTs MUST echo it (handled above on the next call).
         if context.version.era() == McpProtocolEra::Legacy {
-            if let Some(sid) = response
-                .headers()
-                .get("Mcp-Session-Id")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-            {
+            if let Some(session_id) = response.headers().get("Mcp-Session-Id") {
+                let sid = session_id.to_str().map_err(|_| {
+                    McpError::Protocol(
+                        "MCP server returned a non-ASCII session identifier".to_string(),
+                    )
+                })?;
+                if !valid_mcp_session_id(sid) {
+                    return Err(McpError::Protocol(
+                        "MCP server returned an invalid session identifier".to_string(),
+                    ));
+                }
                 if let Some(mut guard) = self.session_id_write_guard("request.store_session_id") {
-                    *guard = Some(sid);
+                    *guard = Some(sid.to_string());
                 }
             }
         }
@@ -1710,6 +1837,7 @@ impl McpTransport for HttpTransport {
         .await
         {
             Ok(response) => response,
+            Err(error @ McpError::ResponseTooLarge { .. }) => return Err(error),
             Err(_error) if !status.is_success() => {
                 return Err(McpError::HttpStatus {
                     status: status.as_u16(),
@@ -1750,6 +1878,14 @@ impl McpTransport for HttpTransport {
             "method": method,
             "params": params.unwrap_or_else(|| json!({})),
         });
+        let request_body = serde_json::to_vec(&request).map_err(|error| {
+            McpError::Protocol(format!("Failed to serialize MCP notification: {error}"))
+        })?;
+        if request_body.len() > MAX_REQUEST_SIZE {
+            return Err(McpError::RequestTooLarge {
+                limit: MAX_REQUEST_SIZE,
+            });
+        }
         let mut builder = self
             .headers
             .apply(Self::client()?.post(&self.base_url))
@@ -1757,7 +1893,7 @@ impl McpTransport for HttpTransport {
             .timeout(HTTP_REQUEST_TIMEOUT)
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json")
-            .json(&request);
+            .body(request_body);
         if let Some(session_id) = self.session_id() {
             builder = builder.header("Mcp-Session-Id", session_id);
         }
@@ -1776,12 +1912,36 @@ impl McpTransport for HttpTransport {
     }
 
     async fn close(&self) -> Result<(), McpError> {
-        // Fix #490 — HTTP transport shares the process-wide client;
-        // there is no per-transport resource to release. Tearing
-        // down the shared pool would break every other live HTTP
-        // transport in the process, so this is intentionally a
-        // no-op.
-        Ok(())
+        // The connection pool is shared, but a legacy Streamable HTTP session
+        // is server-owned state and must be terminated independently. Current
+        // discovery transports never capture a session id and remain a no-op.
+        let session_id = self
+            .session_id_write_guard("close.take_session_id")
+            .and_then(|mut session_id| session_id.take());
+        let Some(session_id) = session_id else {
+            return Ok(());
+        };
+        let response = self
+            .headers
+            .apply(Self::client()?.delete(&self.base_url))
+            .map_err(|error| McpError::Transport(format!("Invalid MCP HTTP header: {error}")))?
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .header("Mcp-Session-Id", session_id)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    McpError::Timeout {
+                        phase: "http-session-close",
+                    }
+                } else {
+                    McpError::Transport(format!("HTTP session termination failed: {error}"))
+                }
+            })?;
+        match response.status().as_u16() {
+            200 | 204 | 404 | 405 => Ok(()),
+            status => Err(McpError::HttpStatus { status }),
+        }
     }
 }
 
@@ -1899,44 +2059,54 @@ impl McpServer {
         // Fix #628 — bound the initialize handshake. A non-responsive
         // server would otherwise hang the calling tokio task forever
         // because `transport.request("initialize", ...)` has no
-        // built-in deadline (the HTTP transport's `HTTP_REQUEST_TIMEOUT`
-        // covers steady-state requests, the stdio transport has no
-        // wall-clock cap at all).
+        // constructor-specific deadline. Steady-state transport requests have
+        // their own independent caps.
         //
-        // `tokio::time::timeout` cancels the inner future on expiry,
-        // which for stdio drops the in-flight `read_until` (the child
-        // process remains, but the caller can decide whether to retry
-        // or close). For HTTP it cancels the `RequestBuilder::send`
-        // future before the per-request `HTTP_REQUEST_TIMEOUT` fires —
-        // which is the intended semantics, since the initialize
-        // handshake has its own (typically shorter) policy.
-        if config.initialize_timeout_secs == 0 {
-            server.initialize().await?;
-            server.refresh_tools().await?;
+        // `tokio::time::timeout` cancels the inner future on expiry. The
+        // transaction below always closes the transport after any handshake
+        // failure so a timed-out stdio child is killed and reaped rather than
+        // escaping an unsuccessful constructor.
+        let outcome = if config.initialize_timeout_secs == 0 {
+            match server.initialize().await {
+                Ok(()) => server.refresh_tools().await,
+                Err(error) => Err(error),
+            }
         } else {
             let deadline = Duration::from_secs(config.initialize_timeout_secs);
-            let Ok(init_res) = tokio::time::timeout(deadline, server.initialize()).await else {
-                warn!(
-                    server = %server.name,
-                    timeout_secs = config.initialize_timeout_secs,
-                    "MCP server initialize handshake timed out"
-                );
-                return Err(McpError::Timeout {
-                    phase: "initialize",
-                });
-            };
-            init_res?;
-            let Ok(tools_res) = tokio::time::timeout(deadline, server.refresh_tools()).await else {
-                warn!(
-                    server = %server.name,
-                    timeout_secs = config.initialize_timeout_secs,
-                    "MCP server tools/list timed out"
-                );
-                return Err(McpError::Timeout {
-                    phase: "tools/list",
-                });
-            };
-            tools_res?;
+            match tokio::time::timeout(deadline, server.initialize()).await {
+                Err(_) => {
+                    warn!(
+                        server = %server.name,
+                        timeout_secs = config.initialize_timeout_secs,
+                        "MCP server initialize handshake timed out"
+                    );
+                    Err(McpError::Timeout {
+                        phase: "initialize",
+                    })
+                }
+                Ok(Err(error)) => Err(error),
+                Ok(Ok(())) => match tokio::time::timeout(deadline, server.refresh_tools()).await {
+                    Err(_) => {
+                        warn!(
+                            server = %server.name,
+                            timeout_secs = config.initialize_timeout_secs,
+                            "MCP server tools/list timed out"
+                        );
+                        Err(McpError::Timeout {
+                            phase: "tools/list",
+                        })
+                    }
+                    Ok(result) => result,
+                },
+            }
+        };
+
+        if let Err(error) = outcome {
+            let server_name = server.name.clone();
+            if let Err(close_error) = server.close().await {
+                warn!(server = %server_name, error = %close_error, "Failed to close rejected MCP connection");
+            }
+            return Err(error);
         }
 
         Ok(server)
@@ -2576,19 +2746,7 @@ impl McpServer {
     /// Returns an `McpError` when the resource request or typed decoding fails.
     pub async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
         let result = self.read_resource_typed(uri).await?;
-        let content = result
-            .contents
-            .iter()
-            .map(|content| match content {
-                McpResourceContents::Text { text, .. } => text.clone(),
-                McpResourceContents::Blob { uri, mime_type, .. } => format!(
-                    "Binary MCP resource {uri} ({}) retained as typed content",
-                    mime_type.as_deref().unwrap_or("application/octet-stream")
-                ),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(content)
+        Ok(project_mcp_resource_text(&result))
     }
 
     /// List prompt templates when the negotiated server advertises them.
@@ -2911,10 +3069,25 @@ enum ConnectionSpec {
 }
 
 impl ConnectionSpec {
+    const fn binding(&self) -> McpTransportBinding {
+        match self {
+            Self::Stdio { .. } => McpTransportBinding::Stdio,
+            Self::Http { .. } => McpTransportBinding::StreamableHttp,
+        }
+    }
+
+    const fn required_resource(&self) -> crate::tools::ToolResource {
+        match self {
+            Self::Stdio { .. } => crate::tools::ToolResource::Process,
+            Self::Http { .. } => crate::tools::ToolResource::Network,
+        }
+    }
+
     fn build_transport(
         &self,
         run: &Arc<crate::tools::ToolRunContext>,
     ) -> Result<Box<dyn McpTransport>, McpError> {
+        run.require(self.required_resource())?;
         match self {
             Self::Stdio { command, args, env } => {
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -3112,14 +3285,29 @@ fn compile_mcp_input_schema(schema: &Value) -> Result<jsonschema::Validator, Str
     })
 }
 
-fn mcp_registration_definition(
+#[derive(Clone, Copy)]
+struct McpRegistrationContext<'a> {
     epoch: u64,
     run_generation: u64,
-    server_name: &str,
-    entry: &ServerEntry,
+    connection_generation: u64,
+    server_name: &'a str,
+    trust: &'a McpServerTrust,
+    available: bool,
+}
+
+fn mcp_registration_definition(
+    context: McpRegistrationContext<'_>,
     tool: &McpTool,
     schema: &Value,
 ) -> Value {
+    let McpRegistrationContext {
+        epoch,
+        run_generation,
+        connection_generation,
+        server_name,
+        trust,
+        available,
+    } = context;
     json!({
         "type": "function",
         "function": {
@@ -3130,11 +3318,12 @@ fn mcp_registration_definition(
         "x-openclaudia-mcp-registration": {
             "contract": "openclaudia.mcp-tool-registration.v1",
             "run_generation": run_generation,
+            "connection_generation": connection_generation,
             "manager_epoch": epoch,
             "server": server_name,
             "tool": tool.name,
-            "trust": entry.trust.registration_identity(),
-            "available": entry.server.is_some(),
+            "trust": trust.registration_identity(),
+            "available": available,
         }
     })
 }
@@ -3154,6 +3343,7 @@ struct ServerEntry {
     last_failure: Option<std::time::Instant>,
     cached_tools: Vec<McpTool>,
     supports_list_changed: bool,
+    connection_generation: u64,
 }
 
 impl ServerEntry {
@@ -3178,13 +3368,20 @@ impl ServerEntry {
             last_failure: None,
             cached_tools,
             supports_list_changed,
+            connection_generation: NEXT_MCP_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel),
         }
     }
 
-    fn mark_disconnected(&mut self) {
-        self.server = None;
+    async fn retire_connection(&mut self) -> Result<(), McpError> {
+        let close = if let Some(server) = self.server.take() {
+            server.close().await
+        } else {
+            Ok(())
+        };
         self.cached_tools.clear();
+        self.supports_list_changed = false;
         self.last_failure = Some(std::time::Instant::now());
+        close
     }
 
     const fn is_permanently_unreachable(&self) -> bool {
@@ -3200,12 +3397,555 @@ impl ServerEntry {
     }
 }
 
+#[derive(Clone)]
+struct McpConnectionSnapshot {
+    generation: u64,
+    live: bool,
+    cached_tools: Vec<McpTool>,
+    supports_list_changed: bool,
+}
+
+/// One server-specific failure retained alongside successful fan-out results.
+#[derive(Debug)]
+pub struct McpCatalogFailure {
+    pub server: String,
+    pub connection_generation: Option<u64>,
+    pub error: McpError,
+}
+
+/// Typed partial result for manager-wide MCP catalogue operations.
+#[derive(Debug)]
+pub struct McpCatalogResult<T> {
+    pub entries: Vec<(String, T)>,
+    pub failures: Vec<McpCatalogFailure>,
+}
+
+/// Read-only transport status for diagnostics and admission evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpConnectionStatus {
+    pub binding: McpTransportBinding,
+    pub required_resource: crate::tools::ToolResource,
+    pub run_generation: u64,
+    pub connection_generation: u64,
+    pub live: bool,
+    pub queue_capacity: usize,
+    pub queue_available: usize,
+}
+
+fn project_mcp_resource_text(result: &McpReadResourceResult) -> String {
+    result
+        .contents
+        .iter()
+        .map(|content| match content {
+            McpResourceContents::Text { text, .. } => text.clone(),
+            McpResourceContents::Blob { uri, mime_type, .. } => format!(
+                "Binary MCP resource {uri} ({}) retained as typed content",
+                mime_type.as_deref().unwrap_or("application/octet-stream")
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl McpConnectionSnapshot {
+    fn from_entry(entry: &ServerEntry) -> Self {
+        Self {
+            generation: entry.connection_generation,
+            live: entry.server.is_some(),
+            cached_tools: entry.cached_tools.clone(),
+            supports_list_changed: entry.supports_list_changed,
+        }
+    }
+}
+
+enum McpActorOperation {
+    CallTool {
+        full_name: String,
+        tool_name: String,
+        arguments: Value,
+        expected_source_digest: Option<crate::runtime::ContentDigest>,
+        on_dispatch: Option<Box<dyn FnOnce() + Send>>,
+    },
+    ListResources,
+    ReadResource {
+        uri: String,
+    },
+    ListPrompts,
+    GetPrompt {
+        prompt_name: String,
+        arguments: BTreeMap<String, String>,
+    },
+}
+
+impl McpActorOperation {
+    const fn phase(&self) -> &'static str {
+        match self {
+            Self::CallTool { .. } => "tools/call",
+            Self::ListResources => "resources/list",
+            Self::ReadResource { .. } => "resources/read",
+            Self::ListPrompts => "prompts/list",
+            Self::GetPrompt { .. } => "prompts/get",
+        }
+    }
+
+    fn validate_queued_size(&self) -> Result<(), McpError> {
+        let encoded_size = match self {
+            Self::CallTool { arguments, .. } => serde_json::to_vec(arguments)
+                .map_err(|error| McpError::Protocol(error.to_string()))?
+                .len(),
+            Self::ReadResource { uri } => uri.len(),
+            Self::GetPrompt {
+                prompt_name,
+                arguments,
+            } => {
+                prompt_name.len()
+                    + serde_json::to_vec(arguments)
+                        .map_err(|error| McpError::Protocol(error.to_string()))?
+                        .len()
+            }
+            Self::ListResources | Self::ListPrompts => 0,
+        };
+        if encoded_size > MAX_REQUEST_SIZE {
+            return Err(McpError::RequestTooLarge {
+                limit: MAX_REQUEST_SIZE,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum McpActorOutput {
+    Tool(Value),
+    Resources(Vec<McpResource>),
+    Resource(McpReadResourceResult),
+    Prompts(Vec<McpPrompt>),
+    Prompt(McpGetPromptResult),
+}
+
+struct McpActorRequest {
+    expected_run_generation: u64,
+    expected_generation: Option<u64>,
+    operation: McpActorOperation,
+    reply: oneshot::Sender<Result<McpActorOutput, McpError>>,
+}
+
+impl McpActorRequest {
+    fn reject(self, error: McpError) {
+        let _ = self.reply.send(Err(error));
+    }
+}
+
+struct McpConnectionActor {
+    name: String,
+    binding: McpTransportBinding,
+    required_resource: crate::tools::ToolResource,
+    trust: McpServerTrust,
+    sender: mpsc::Sender<McpActorRequest>,
+    snapshot: Arc<std::sync::RwLock<McpConnectionSnapshot>>,
+    cancellation: crate::runtime::CancellationHandle,
+    join: Mutex<Option<JoinHandle<Result<(), McpError>>>>,
+}
+
+impl McpConnectionActor {
+    fn spawn(
+        name: String,
+        run: Arc<crate::tools::ToolRunContext>,
+        entry: ServerEntry,
+        catalog_epoch: Arc<AtomicU64>,
+        catalog_guard: Arc<std::sync::RwLock<()>>,
+    ) -> Arc<Self> {
+        let binding = entry.spec.binding();
+        let required_resource = entry.spec.required_resource();
+        let trust = entry.trust.clone();
+        let snapshot = Arc::new(std::sync::RwLock::new(McpConnectionSnapshot::from_entry(
+            &entry,
+        )));
+        let cancellation = run.runtime().cancellation().child();
+        let (sender, receiver) = mpsc::channel(MCP_ACTOR_QUEUE_CAPACITY);
+        let task_snapshot = Arc::clone(&snapshot);
+        let task_cancellation = cancellation.clone();
+        let task_name = name.clone();
+        let join = tokio::spawn(run_mcp_connection_actor(
+            McpActorTaskContext {
+                name: task_name,
+                run,
+                snapshot: task_snapshot,
+                cancellation: task_cancellation,
+                catalog_epoch,
+                catalog_guard,
+            },
+            entry,
+            receiver,
+        ));
+        Arc::new(Self {
+            name,
+            binding,
+            required_resource,
+            trust,
+            sender,
+            snapshot,
+            cancellation,
+            join: Mutex::new(Some(join)),
+        })
+    }
+
+    fn snapshot(&self) -> McpConnectionSnapshot {
+        self.snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    const fn required_resource(&self) -> crate::tools::ToolResource {
+        self.required_resource
+    }
+
+    const fn binding(&self) -> McpTransportBinding {
+        self.binding
+    }
+
+    async fn request(
+        &self,
+        expected_run_generation: u64,
+        expected_generation: Option<u64>,
+        operation: McpActorOperation,
+    ) -> Result<McpActorOutput, McpError> {
+        if self.cancellation.is_cancelled() {
+            return Err(McpError::ConnectionClosed(self.name.clone()));
+        }
+        operation.validate_queued_size()?;
+        let (reply, response) = oneshot::channel();
+        let request = McpActorRequest {
+            expected_run_generation,
+            expected_generation,
+            operation,
+            reply,
+        };
+        match self.sender.try_send(request) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(McpError::Backpressure {
+                    server: self.name.clone(),
+                    capacity: MCP_ACTOR_QUEUE_CAPACITY,
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(McpError::ConnectionClosed(self.name.clone()));
+            }
+        }
+        response
+            .await
+            .unwrap_or_else(|_| Err(McpError::ConnectionClosed(self.name.clone())))
+    }
+
+    async fn shutdown(&self) -> Result<(), McpError> {
+        let _ = self
+            .cancellation
+            .cancel(crate::runtime::CancellationReason::ParentTerminated);
+        let Some(mut join) = self.join.lock().await.take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(DEFAULT_MCP_REQUEST_TIMEOUT, &mut join).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(McpError::Transport(format!(
+                "MCP server '{}' actor task failed: {error}",
+                self.name
+            ))),
+            Err(_) => {
+                join.abort();
+                let _ = join.await;
+                Err(McpError::Timeout {
+                    phase: "connection-shutdown",
+                })
+            }
+        }
+    }
+}
+
+impl Drop for McpConnectionActor {
+    fn drop(&mut self) {
+        let _ = self
+            .cancellation
+            .cancel(crate::runtime::CancellationReason::ParentTerminated);
+    }
+}
+
+fn update_mcp_actor_snapshot(
+    snapshot: &std::sync::RwLock<McpConnectionSnapshot>,
+    entry: &ServerEntry,
+) {
+    *snapshot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        McpConnectionSnapshot::from_entry(entry);
+}
+
+fn publish_mcp_actor_snapshot(
+    snapshot: &std::sync::RwLock<McpConnectionSnapshot>,
+    catalog_epoch: &AtomicU64,
+    catalog_guard: &std::sync::RwLock<()>,
+    entry: &ServerEntry,
+) {
+    let _guard = catalog_guard
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    update_mcp_actor_snapshot(snapshot, entry);
+    catalog_epoch.fetch_add(1, Ordering::AcqRel);
+}
+
+const fn mcp_error_breaks_connection(error: &McpError) -> bool {
+    matches!(
+        error,
+        McpError::Transport(_)
+            | McpError::Protocol(_)
+            | McpError::HttpStatus { .. }
+            | McpError::Timeout { .. }
+            | McpError::Cancelled { .. }
+            | McpError::ResponseTooLarge { .. }
+            | McpError::ResponseIdMismatch { .. }
+    )
+}
+
+fn validate_mcp_actor_tool_call(
+    server_name: &str,
+    run_generation: u64,
+    manager_epoch: u64,
+    entry: &ServerEntry,
+    operation: &McpActorOperation,
+) -> Result<(), McpError> {
+    let McpActorOperation::CallTool {
+        full_name,
+        tool_name,
+        arguments,
+        expected_source_digest,
+        ..
+    } = operation
+    else {
+        return Ok(());
+    };
+    let mut matching_tools = entry
+        .cached_tools
+        .iter()
+        .filter(|tool| tool.name == *tool_name);
+    let Some(tool) = matching_tools.next() else {
+        return Err(McpError::ToolNotFound(full_name.clone()));
+    };
+    if matching_tools.next().is_some() {
+        return Err(McpError::InvalidToolSchema {
+            tool: full_name.clone(),
+            reason: "server returned a duplicate tool identity".to_string(),
+        });
+    }
+    let schema = effective_mcp_input_schema(tool);
+    let validator =
+        compile_mcp_input_schema(&schema).map_err(|reason| McpError::InvalidToolSchema {
+            tool: full_name.clone(),
+            reason,
+        })?;
+    if !validator.is_valid(arguments) {
+        return Err(McpError::InvalidToolArguments {
+            tool: full_name.clone(),
+        });
+    }
+    if let Some(expected) = expected_source_digest {
+        let definition = mcp_registration_definition(
+            McpRegistrationContext {
+                epoch: manager_epoch,
+                run_generation,
+                connection_generation: entry.connection_generation,
+                server_name,
+                trust: &entry.trust,
+                available: entry.server.is_some(),
+            },
+            tool,
+            &schema,
+        );
+        if mcp_definition_digest(&definition)? != *expected {
+            return Err(McpError::StaleToolRegistration(full_name.clone()));
+        }
+    }
+    Ok(())
+}
+
+async fn execute_mcp_actor_operation(
+    server: &McpServer,
+    operation: McpActorOperation,
+) -> Result<McpActorOutput, McpError> {
+    match operation {
+        McpActorOperation::CallTool {
+            full_name: _,
+            tool_name,
+            arguments,
+            expected_source_digest: _,
+            on_dispatch,
+        } => {
+            if let Some(on_dispatch) = on_dispatch {
+                on_dispatch();
+            }
+            server
+                .call_tool(&tool_name, arguments)
+                .await
+                .map(McpActorOutput::Tool)
+        }
+        McpActorOperation::ListResources => {
+            server.list_resources().await.map(McpActorOutput::Resources)
+        }
+        McpActorOperation::ReadResource { uri } => server
+            .read_resource_typed(&uri)
+            .await
+            .map(McpActorOutput::Resource),
+        McpActorOperation::ListPrompts => server.list_prompts().await.map(McpActorOutput::Prompts),
+        McpActorOperation::GetPrompt {
+            prompt_name,
+            arguments,
+        } => server
+            .get_prompt(&prompt_name, arguments)
+            .await
+            .map(McpActorOutput::Prompt),
+    }
+}
+
+struct McpActorTaskContext {
+    name: String,
+    run: Arc<crate::tools::ToolRunContext>,
+    snapshot: Arc<std::sync::RwLock<McpConnectionSnapshot>>,
+    cancellation: crate::runtime::CancellationHandle,
+    catalog_epoch: Arc<AtomicU64>,
+    catalog_guard: Arc<std::sync::RwLock<()>>,
+}
+
+#[allow(clippy::too_many_lines)] // One actor loop owns its full request and teardown state machine.
+async fn run_mcp_connection_actor(
+    context: McpActorTaskContext,
+    mut entry: ServerEntry,
+    mut receiver: mpsc::Receiver<McpActorRequest>,
+) -> Result<(), McpError> {
+    let McpActorTaskContext {
+        name,
+        run,
+        snapshot,
+        cancellation,
+        catalog_epoch,
+        catalog_guard,
+    } = context;
+    loop {
+        let request = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            request = receiver.recv() => match request {
+                Some(request) => request,
+                None => break,
+            },
+        };
+        if request.reply.is_closed() {
+            continue;
+        }
+        let current_run_generation = run.generation().get();
+        if request.expected_run_generation != current_run_generation {
+            let expected = request.expected_run_generation;
+            request.reject(McpError::StaleRunGeneration {
+                expected,
+                current: current_run_generation,
+            });
+            continue;
+        }
+        if let Err(error) = run.require(entry.spec.required_resource()) {
+            request.reject(McpError::Capability(error));
+            continue;
+        }
+
+        let mut request = request;
+        let reconnected = tokio::select! {
+            _ = cancellation.cancelled() => {
+                request.reject(McpError::Cancelled { phase: "connect" });
+                break;
+            }
+            () = request.reply.closed() => continue,
+            result = McpManager::ensure_connected(&run, &mut entry, &name) => result,
+        };
+        match reconnected {
+            Ok(changed) => {
+                if changed {
+                    publish_mcp_actor_snapshot(&snapshot, &catalog_epoch, &catalog_guard, &entry);
+                }
+            }
+            Err(error) => {
+                request.reject(error);
+                continue;
+            }
+        }
+
+        if let Some(expected) = request.expected_generation {
+            if expected != entry.connection_generation {
+                request.reject(McpError::StaleConnectionGeneration {
+                    server: name.clone(),
+                    expected,
+                    current: entry.connection_generation,
+                });
+                continue;
+            }
+        }
+        if let Err(error) = validate_mcp_actor_tool_call(
+            &name,
+            run.generation().get(),
+            catalog_epoch.load(Ordering::Acquire),
+            &entry,
+            &request.operation,
+        ) {
+            request.reject(error);
+            continue;
+        }
+        let phase = request.operation.phase();
+        let deadline = entry
+            .tool_timeout
+            .filter(|_| matches!(&request.operation, McpActorOperation::CallTool { .. }))
+            .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT);
+        let outcome = {
+            let Some(server) = entry.server.as_ref() else {
+                request.reject(McpError::ServerUnreachable(name.clone()));
+                continue;
+            };
+            let operation = execute_mcp_actor_operation(server, request.operation);
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = cancellation.cancelled() => Some(Err(McpError::Cancelled { phase })),
+                () = request.reply.closed() => None,
+                result = tokio::time::timeout(deadline, &mut operation) => Some(
+                    result.unwrap_or(Err(McpError::Timeout { phase }))
+                ),
+            }
+        };
+
+        let must_retire = outcome
+            .as_ref()
+            .is_none_or(|result| result.as_ref().is_err_and(mcp_error_breaks_connection));
+        if must_retire {
+            let result = entry.retire_connection().await;
+            publish_mcp_actor_snapshot(&snapshot, &catalog_epoch, &catalog_guard, &entry);
+            if let Err(error) = result {
+                warn!(server = %name, error = %error, "Failed to close retired MCP connection");
+            }
+        }
+        if let Some(outcome) = outcome {
+            let _ = request.reply.send(outcome);
+        }
+    }
+
+    let close = entry.retire_connection().await;
+    publish_mcp_actor_snapshot(&snapshot, &catalog_epoch, &catalog_guard, &entry);
+    while let Ok(request) = receiver.try_recv() {
+        request.reject(McpError::ConnectionClosed(name.clone()));
+    }
+    close
+}
+
 /// Manages multiple MCP server connections with self-healing reconnection (fix #629).
 pub struct McpManager {
     run_context: Arc<crate::tools::ToolRunContext>,
     permissions: crate::config::PermissionsConfig,
-    catalog_epoch: AtomicU64,
-    servers: Mutex<HashMap<String, ServerEntry>>,
+    catalog_epoch: Arc<AtomicU64>,
+    catalog_guard: Arc<std::sync::RwLock<()>>,
+    servers: Mutex<HashMap<String, Arc<McpConnectionActor>>>,
 }
 
 /// Exact run-keyed index used by synchronous registry handlers to find the
@@ -3278,7 +4018,8 @@ impl McpManager {
         Self {
             run_context,
             permissions,
-            catalog_epoch: AtomicU64::new(1),
+            catalog_epoch: Arc::new(AtomicU64::new(1)),
+            catalog_guard: Arc::new(std::sync::RwLock::new(())),
             servers: Mutex::new(HashMap::new()),
         }
     }
@@ -3290,7 +4031,43 @@ impl McpManager {
     }
 
     fn bump_catalog_epoch(&self) {
+        let _guard = self
+            .catalog_guard
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.catalog_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    async fn actor(&self, name: &str) -> Result<Arc<McpConnectionActor>, McpError> {
+        self.servers
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| McpError::NotConnected(name.to_string()))
+    }
+
+    async fn install_actor(&self, name: String, entry: ServerEntry) -> Result<(), McpError> {
+        let actor = McpConnectionActor::spawn(
+            name.clone(),
+            Arc::clone(&self.run_context),
+            entry,
+            Arc::clone(&self.catalog_epoch),
+            Arc::clone(&self.catalog_guard),
+        );
+        let replaced = {
+            let mut servers = self.servers.lock().await;
+            let replaced = servers.insert(name, actor);
+            self.bump_catalog_epoch();
+            drop(servers);
+            replaced
+        };
+        if let Some(replaced) = replaced {
+            if let Err(error) = replaced.shutdown().await {
+                warn!(error = %error, "Failed to shut down replaced MCP connection cleanly");
+            }
+        }
+        Ok(())
     }
 
     /// Whether this manager is bound to the exact caller run generation.
@@ -3418,11 +4195,7 @@ impl McpManager {
         let transport = spec.build_transport(&self.run_context)?;
         let server = McpServer::new(name, transport).await?;
         let entry = ServerEntry::new_with_trust_and_tool_timeout(spec, server, trust, tool_timeout);
-        let mut servers = self.servers.lock().await;
-        servers.insert(name.to_string(), entry);
-        self.bump_catalog_epoch();
-        drop(servers);
-        Ok(())
+        self.install_actor(name.to_string(), entry).await
     }
 
     /// Connect to an MCP server via HTTP. URL validated by SSRF guard (fix #677).
@@ -3545,8 +4318,7 @@ impl McpManager {
     ) -> Result<(), McpError> {
         validate_mcp_server_identity(name)?;
         self.run_context
-            .require(crate::tools::ToolResource::Network)
-            .map_err(|error| McpError::Transport(error.to_string()))?;
+            .require(crate::tools::ToolResource::Network)?;
         let spec = ConnectionSpec::Http {
             url: url.to_string(),
             headers,
@@ -3556,11 +4328,7 @@ impl McpManager {
         let transport = spec.build_transport(&self.run_context)?;
         let server = McpServer::new(name, transport).await?;
         let entry = ServerEntry::new_with_trust_and_tool_timeout(spec, server, trust, tool_timeout);
-        let mut servers = self.servers.lock().await;
-        servers.insert(name.to_string(), entry);
-        self.bump_catalog_epoch();
-        drop(servers);
-        Ok(())
+        self.install_actor(name.to_string(), entry).await
     }
 
     /// Test-only counterpart to [`Self::connect_http`] that bypasses
@@ -3571,6 +4339,7 @@ impl McpManager {
     /// # Errors
     ///
     /// Returns an `McpError` if connection or initialization fails.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub async fn __test_connect_http_unchecked(
         &self,
@@ -3582,6 +4351,7 @@ impl McpManager {
     }
 
     /// Test-only HTTP connector with static headers and no SSRF guard.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub async fn __test_connect_http_unchecked_with_headers(
         &self,
@@ -3601,18 +4371,15 @@ impl McpManager {
         );
         let server = McpServer::new(name, transport).await?;
         let entry = ServerEntry::new(spec, server);
-        let mut servers = self.servers.lock().await;
-        servers.insert(name.to_string(), entry);
-        self.bump_catalog_epoch();
-        drop(servers);
-        Ok(())
+        self.install_actor(name.to_string(), entry).await
     }
 
     fn collect_server_tool_catalog(
         &self,
         epoch: u64,
         server_name: &str,
-        entry: &ServerEntry,
+        actor: &McpConnectionActor,
+        snapshot: &McpConnectionSnapshot,
         definitions: &mut BTreeMap<String, Value>,
         unavailable: &mut Vec<McpToolUnavailable>,
     ) {
@@ -3624,7 +4391,7 @@ impl McpManager {
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>();
         let mut tools_by_name: BTreeMap<&str, Vec<&McpTool>> = BTreeMap::new();
-        for tool in &entry.cached_tools {
+        for tool in &snapshot.cached_tools {
             if allowed.contains(tool.name.as_str()) {
                 tools_by_name.entry(&tool.name).or_default().push(tool);
             }
@@ -3634,7 +4401,7 @@ impl McpManager {
                 unavailable.push(McpToolUnavailable {
                     server: server_name.to_string(),
                     tool: tool_name.to_string(),
-                    reason: if entry.server.is_some() {
+                    reason: if snapshot.live {
                         "configured tool is absent from the discovered server generation"
                             .to_string()
                     } else {
@@ -3674,10 +4441,14 @@ impl McpManager {
             definitions.insert(
                 full_name,
                 mcp_registration_definition(
-                    epoch,
-                    self.run_context.generation().get(),
-                    server_name,
-                    entry,
+                    McpRegistrationContext {
+                        epoch,
+                        run_generation: self.run_context.generation().get(),
+                        connection_generation: snapshot.generation,
+                        server_name,
+                        trust: &actor.trust,
+                        available: snapshot.live,
+                    },
                     tool,
                     &schema,
                 ),
@@ -3687,7 +4458,7 @@ impl McpManager {
 
     fn collect_unregistered_configured_tools(
         &self,
-        servers: &HashMap<String, ServerEntry>,
+        servers: &HashMap<String, Arc<McpConnectionActor>>,
         unavailable: &mut Vec<McpToolUnavailable>,
     ) {
         for (server_name, allowed) in &self.permissions.mcp {
@@ -3714,9 +4485,13 @@ impl McpManager {
     /// catalog; they are not permission grants.
     pub async fn tool_catalog_snapshot(&self) -> McpToolCatalogSnapshot {
         let guard = self.servers.lock().await;
-        // Every server-map mutation advances the epoch while holding this
-        // mutex. Loading after acquisition binds definitions and availability
-        // to one coherent manager generation rather than a torn snapshot.
+        let catalog_read = self
+            .catalog_guard
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Map mutation and actor snapshot publication take the matching write
+        // guard. Definitions and availability therefore come from one exact
+        // manager generation rather than a torn atomic/snapshot pair.
         let epoch = self.catalog_epoch.load(Ordering::Acquire);
         let mut definitions = BTreeMap::new();
         let mut unavailable = Vec::new();
@@ -3724,18 +4499,21 @@ impl McpManager {
         let mut server_names: Vec<&String> = guard.keys().collect();
         server_names.sort_unstable();
         for server_name in server_names {
-            let Some(entry) = guard.get(server_name) else {
+            let Some(actor) = guard.get(server_name) else {
                 continue;
             };
+            let snapshot = actor.snapshot();
             self.collect_server_tool_catalog(
                 epoch,
                 server_name,
-                entry,
+                actor,
+                &snapshot,
                 &mut definitions,
                 &mut unavailable,
             );
         }
         self.collect_unregistered_configured_tools(&guard, &mut unavailable);
+        drop(catalog_read);
         drop(guard);
 
         unavailable.sort_by(|left, right| {
@@ -3771,7 +4549,7 @@ impl McpManager {
     }
 
     /// Attempt to reconnect a disconnected entry in-place (fix #629).
-    /// Caller holds the manager mutex.
+    /// Called only by the per-server actor that exclusively owns the entry.
     async fn ensure_connected(
         run: &Arc<crate::tools::ToolRunContext>,
         entry: &mut ServerEntry,
@@ -3804,6 +4582,8 @@ impl McpManager {
                 entry.cached_tools = server.tools().to_vec();
                 entry.supports_list_changed = server.supports_tool_list_changed();
                 entry.server = Some(server);
+                entry.connection_generation =
+                    NEXT_MCP_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
                 entry.failed_attempts = 0;
                 entry.last_failure = None;
                 info!(server = %name, "MCP server reconnected");
@@ -3860,7 +4640,7 @@ impl McpManager {
         on_dispatch: F,
     ) -> Result<Value, McpError>
     where
-        F: FnOnce() + Send,
+        F: FnOnce() + Send + 'static,
     {
         self.call_tool_inner(
             full_name,
@@ -3879,7 +4659,7 @@ impl McpManager {
         on_dispatch: F,
     ) -> Result<Value, McpError>
     where
-        F: FnOnce() + Send,
+        F: FnOnce() + Send + 'static,
     {
         let (server_name, tool_name) = split_mcp_tool_identity(full_name)?;
         if !arguments.is_object() {
@@ -3888,97 +4668,35 @@ impl McpManager {
             });
         }
 
-        let mut guard = self.servers.lock().await;
-        let entry = guard
-            .get_mut(server_name)
-            .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
+        let actor = self.actor(server_name).await?;
         if !self.permissions.mcp_tool_allowed(server_name, tool_name) {
             return Err(McpError::ToolNotAllowed {
                 server: server_name.to_string(),
                 tool: tool_name.to_string(),
             });
         }
-
-        if Self::ensure_connected(&self.run_context, entry, server_name).await? {
-            self.bump_catalog_epoch();
-        }
-        // `ensure_connected` returned Ok ⇒ `entry.server` is Some. Use
-        // a `let-else` rather than `.expect(_)` so this function does
-        // not advertise a `# Panics` contract; the unreachable arm
-        // hits the same `ServerUnreachable` surface as the budget-
-        // exhausted path, which is the closest semantic match if the
-        // invariant somehow broke.
-        let Some(server) = entry.server.as_ref() else {
-            return Err(McpError::ServerUnreachable(server_name.to_string()));
-        };
-
-        let mut matching_tools = entry
-            .cached_tools
-            .iter()
-            .filter(|tool| tool.name == tool_name);
-        let Some(tool) = matching_tools.next() else {
-            return Err(McpError::ToolNotFound(full_name.to_string()));
-        };
-        if matching_tools.next().is_some() {
-            return Err(McpError::InvalidToolSchema {
-                tool: full_name.to_string(),
-                reason: "server returned a duplicate tool identity".to_string(),
-            });
-        }
-        let schema = effective_mcp_input_schema(tool);
-        let validator =
-            compile_mcp_input_schema(&schema).map_err(|reason| McpError::InvalidToolSchema {
-                tool: full_name.to_string(),
-                reason,
-            })?;
-        if !validator.is_valid(&arguments) {
-            return Err(McpError::InvalidToolArguments {
-                tool: full_name.to_string(),
-            });
-        }
-        if let Some(expected) = expected_source_digest {
-            let definition = mcp_registration_definition(
-                self.catalog_epoch.load(Ordering::Acquire),
+        self.run_context.require(actor.required_resource())?;
+        let snapshot = actor.snapshot();
+        let expected_generation = snapshot.live.then_some(snapshot.generation);
+        let output = actor
+            .request(
                 self.run_context.generation().get(),
-                server_name,
-                entry,
-                tool,
-                &schema,
-            );
-            if mcp_definition_digest(&definition)? != expected {
-                return Err(McpError::StaleToolRegistration(full_name.to_string()));
-            }
+                expected_generation,
+                McpActorOperation::CallTool {
+                    full_name: full_name.to_string(),
+                    tool_name: tool_name.to_string(),
+                    arguments,
+                    expected_source_digest,
+                    on_dispatch: Some(Box::new(on_dispatch)),
+                },
+            )
+            .await?;
+        match output {
+            McpActorOutput::Tool(value) => Ok(value),
+            _ => Err(McpError::Protocol(format!(
+                "MCP server '{server_name}' returned the wrong actor response for tools/call"
+            ))),
         }
-
-        let tool_timeout = entry.tool_timeout;
-        on_dispatch();
-        let outcome = if let Some(deadline) = tool_timeout {
-            tokio::time::timeout(deadline, server.call_tool(tool_name, arguments))
-                .await
-                .unwrap_or_else(|_| {
-                    warn!(
-                        tool = %full_name,
-                        timeout_ms = deadline.as_millis(),
-                        "MCP tool call timed out"
-                    );
-                    Err(McpError::Timeout {
-                        phase: "tools/call",
-                    })
-                })
-        } else {
-            server.call_tool(tool_name, arguments).await
-        };
-        if let Err(ref e) = outcome {
-            if matches!(
-                e,
-                McpError::Transport(_) | McpError::HttpStatus { .. } | McpError::Timeout { .. }
-            ) {
-                entry.mark_disconnected();
-                self.bump_catalog_epoch();
-            }
-        }
-        drop(guard);
-        outcome
     }
 
     /// Call a tool with a timeout.
@@ -4004,234 +4722,305 @@ impl McpManager {
     /// Get information about a connected server. Owned return because
     /// the inner mutex guard cannot be held across the return.
     pub async fn get_server_info(&self, name: &str) -> Option<(String, bool)> {
-        let guard = self.servers.lock().await;
-        guard
-            .get(name)
-            .map(|entry| (name.to_string(), entry.supports_list_changed))
+        let actor = self.servers.lock().await.get(name).cloned()?;
+        Some((name.to_string(), actor.snapshot().supports_list_changed))
     }
 
-    /// List resources across all servers, or from a specific server.
-    /// Marks server disconnected on transport error (fix #629).
+    /// Return bounded, read-only transport status without contacting or
+    /// reconnecting the server.
     ///
     /// # Errors
     ///
-    /// Returns an error if a named server is not connected or the request fails.
+    /// Returns [`McpError::NotConnected`] when `name` is not registered.
+    pub async fn connection_status(&self, name: &str) -> Result<McpConnectionStatus, McpError> {
+        let actor = self.actor(name).await?;
+        let snapshot = actor.snapshot();
+        Ok(McpConnectionStatus {
+            binding: actor.binding(),
+            required_resource: actor.required_resource(),
+            run_generation: self.run_context.generation().get(),
+            connection_generation: snapshot.generation,
+            live: snapshot.live,
+            queue_capacity: MCP_ACTOR_QUEUE_CAPACITY,
+            queue_available: actor.sender.capacity(),
+        })
+    }
+
+    async fn actors_for_filter(
+        &self,
+        server_name: Option<&str>,
+    ) -> Result<Vec<(String, Arc<McpConnectionActor>)>, McpError> {
+        let servers = self.servers.lock().await;
+        if let Some(name) = server_name {
+            let actor = servers
+                .get(name)
+                .cloned()
+                .ok_or_else(|| McpError::NotConnected(name.to_string()))?;
+            drop(servers);
+            return Ok(vec![(name.to_string(), actor)]);
+        }
+        let mut actors = servers
+            .iter()
+            .map(|(name, actor)| (name.clone(), Arc::clone(actor)))
+            .collect::<Vec<_>>();
+        drop(servers);
+        actors.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(actors)
+    }
+
+    /// List resources while retaining failures from individual servers.
+    /// Fan-out is concurrent and no manager-wide lock is held during I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a specifically requested server is unknown.
+    pub async fn list_resources_report(
+        &self,
+        server_name: Option<&str>,
+    ) -> Result<McpCatalogResult<McpResource>, McpError> {
+        let actors = self.actors_for_filter(server_name).await?;
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for (name, actor) in actors {
+            let run = Arc::clone(&self.run_context);
+            pending.push(async move {
+                let snapshot = actor.snapshot();
+                let generation = snapshot.live.then_some(snapshot.generation);
+                let result = match run.require(actor.required_resource()) {
+                    Ok(()) => {
+                        actor
+                            .request(
+                                run.generation().get(),
+                                generation,
+                                McpActorOperation::ListResources,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(McpError::Capability(error)),
+                };
+                (name, generation, result)
+            });
+        }
+
+        let mut report = McpCatalogResult {
+            entries: Vec::new(),
+            failures: Vec::new(),
+        };
+        while let Some((name, generation, result)) = pending.next().await {
+            match result {
+                Ok(McpActorOutput::Resources(resources)) => report.entries.extend(
+                    resources
+                        .into_iter()
+                        .map(|resource| (name.clone(), resource)),
+                ),
+                Ok(_) => report.failures.push(McpCatalogFailure {
+                    server: name,
+                    connection_generation: generation,
+                    error: McpError::Protocol(
+                        "MCP actor returned the wrong response for resources/list".to_string(),
+                    ),
+                }),
+                Err(error) => report.failures.push(McpCatalogFailure {
+                    server: name,
+                    connection_generation: generation,
+                    error,
+                }),
+            }
+        }
+        report
+            .entries
+            .sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        report
+            .failures
+            .sort_unstable_by(|left, right| left.server.cmp(&right.server));
+        Ok(report)
+    }
+
+    /// Compatibility resource listing. A named request fails directly; an
+    /// all-server request returns successful entries and logs typed failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a named server is unknown or its transport,
+    /// generation, capability, or protocol admission fails.
     pub async fn list_resources(
         &self,
         server_name: Option<&str>,
     ) -> anyhow::Result<Vec<(String, McpResource)>> {
-        let mut all_resources = Vec::new();
-        let mut guard = self.servers.lock().await;
-
-        let result: anyhow::Result<()> = if let Some(name) = server_name {
-            let entry = guard
-                .get_mut(name)
-                .ok_or_else(|| McpError::NotConnected(name.to_string()))?;
-            if Self::ensure_connected(&self.run_context, entry, name).await? {
-                self.bump_catalog_epoch();
-            }
-            // `let-else` rather than `.expect(_)` — the unreachable
-            // arm collapses to `ServerUnreachable`, matching the
-            // budget-exhausted error surface.
-            let Some(server) = entry.server.as_ref() else {
-                return Err(McpError::ServerUnreachable(name.to_string()).into());
-            };
-            match server.list_resources().await {
-                Ok(resources) => {
-                    for r in resources {
-                        all_resources.push((name.to_string(), r));
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    if matches!(e, McpError::Transport(_) | McpError::HttpStatus { .. }) {
-                        entry.mark_disconnected();
-                        self.bump_catalog_epoch();
-                    }
-                    Err(e.into())
-                }
+        let mut report = self.list_resources_report(server_name).await?;
+        if server_name.is_some() {
+            if let Some(failure) = report.failures.pop() {
+                return Err(failure.error.into());
             }
         } else {
-            let names: Vec<String> = guard.keys().cloned().collect();
-            for n in names {
-                let Some(entry) = guard.get_mut(&n) else {
-                    continue;
-                };
-                match Self::ensure_connected(&self.run_context, entry, &n).await {
-                    Ok(true) => self.bump_catalog_epoch(),
-                    Ok(false) => {}
-                    Err(_) => continue,
-                }
-                let Some(server) = entry.server.as_ref() else {
-                    continue;
-                };
-                match server.list_resources().await {
-                    Ok(resources) => {
-                        for r in resources {
-                            all_resources.push((n.clone(), r));
-                        }
-                    }
-                    Err(e) => {
-                        if matches!(e, McpError::Transport(_) | McpError::HttpStatus { .. }) {
-                            entry.mark_disconnected();
-                            self.bump_catalog_epoch();
-                        }
-                        warn!(server = %n, error = %e, "Failed to list resources from server");
-                    }
-                }
+            for failure in &report.failures {
+                warn!(server = %failure.server, error = %failure.error, "Failed to list MCP resources");
             }
-            Ok(())
-        };
-        drop(guard);
-        result?;
-        Ok(all_resources)
+        }
+        Ok(report.entries)
     }
 
-    /// Read a specific resource from a named server.
-    /// Marks server disconnected on transport error (fix #629).
+    /// Read a specific resource from a named server without flattening typed
+    /// content. The per-server actor owns reconnect, deadline, and teardown.
     ///
     /// # Errors
     ///
-    /// Returns an error if the server is not connected or the read fails.
-    pub async fn read_resource(&self, server_name: &str, uri: &str) -> anyhow::Result<String> {
-        let mut guard = self.servers.lock().await;
-        let entry = guard
-            .get_mut(server_name)
-            .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
-        if Self::ensure_connected(&self.run_context, entry, server_name).await? {
-            self.bump_catalog_epoch();
-        }
-        // `let-else` rather than `.expect(_)` — the unreachable arm
-        // collapses to `ServerUnreachable`, matching the budget-
-        // exhausted error surface.
-        let Some(server) = entry.server.as_ref() else {
-            return Err(McpError::ServerUnreachable(server_name.to_string()).into());
-        };
-        let outcome = server.read_resource(uri).await;
-        if let Err(ref e) = outcome {
-            if matches!(e, McpError::Transport(_) | McpError::HttpStatus { .. }) {
-                entry.mark_disconnected();
-                self.bump_catalog_epoch();
-            }
-        }
-        drop(guard);
-        Ok(outcome?)
-    }
-
-    /// Read a resource without collapsing binary/text variants or cache
-    /// metadata. This is the canonical API for new frontends.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `McpError` when the server is unavailable or the read fails.
+    /// Returns an `McpError` when the server is unknown or the admitted
+    /// transport cannot complete and validate the resource read.
     pub async fn read_resource_typed(
         &self,
         server_name: &str,
         uri: &str,
     ) -> Result<McpReadResourceResult, McpError> {
-        let mut guard = self.servers.lock().await;
-        let entry = guard
-            .get_mut(server_name)
-            .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
-        if Self::ensure_connected(&self.run_context, entry, server_name).await? {
-            self.bump_catalog_epoch();
+        let actor = self.actor(server_name).await?;
+        self.run_context.require(actor.required_resource())?;
+        let snapshot = actor.snapshot();
+        let output = actor
+            .request(
+                self.run_context.generation().get(),
+                snapshot.live.then_some(snapshot.generation),
+                McpActorOperation::ReadResource {
+                    uri: uri.to_string(),
+                },
+            )
+            .await?;
+        match output {
+            McpActorOutput::Resource(resource) => Ok(resource),
+            _ => Err(McpError::Protocol(format!(
+                "MCP server '{server_name}' returned the wrong actor response for resources/read"
+            ))),
         }
-        let Some(server) = entry.server.as_ref() else {
-            return Err(McpError::ServerUnreachable(server_name.to_string()));
-        };
-        let outcome = server.read_resource_typed(uri).await;
-        if matches!(
-            &outcome,
-            Err(McpError::Transport(_) | McpError::HttpStatus { .. })
-        ) {
-            entry.mark_disconnected();
-            self.bump_catalog_epoch();
-        }
-        drop(guard);
-        outcome
     }
 
-    /// List typed prompts across all live servers or one named server.
+    /// Compatibility projection for existing text-only resource callers.
     ///
     /// # Errors
     ///
-    /// Returns an `McpError` when a named server is unavailable or listing fails.
+    /// Propagates registration, admission, transport, and protocol failures
+    /// from [`Self::read_resource_typed`].
+    pub async fn read_resource(&self, server_name: &str, uri: &str) -> anyhow::Result<String> {
+        let result = self.read_resource_typed(server_name, uri).await?;
+        Ok(project_mcp_resource_text(&result))
+    }
+
+    /// List prompts while retaining individual server failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a specifically requested server is unknown.
+    pub async fn list_prompts_report(
+        &self,
+        server_name: Option<&str>,
+    ) -> Result<McpCatalogResult<McpPrompt>, McpError> {
+        let actors = self.actors_for_filter(server_name).await?;
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for (name, actor) in actors {
+            let run = Arc::clone(&self.run_context);
+            pending.push(async move {
+                let snapshot = actor.snapshot();
+                let generation = snapshot.live.then_some(snapshot.generation);
+                let result = match run.require(actor.required_resource()) {
+                    Ok(()) => {
+                        actor
+                            .request(
+                                run.generation().get(),
+                                generation,
+                                McpActorOperation::ListPrompts,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(McpError::Capability(error)),
+                };
+                (name, generation, result)
+            });
+        }
+
+        let mut report = McpCatalogResult {
+            entries: Vec::new(),
+            failures: Vec::new(),
+        };
+        while let Some((name, generation, result)) = pending.next().await {
+            match result {
+                Ok(McpActorOutput::Prompts(prompts)) => report
+                    .entries
+                    .extend(prompts.into_iter().map(|prompt| (name.clone(), prompt))),
+                Ok(_) => report.failures.push(McpCatalogFailure {
+                    server: name,
+                    connection_generation: generation,
+                    error: McpError::Protocol(
+                        "MCP actor returned the wrong response for prompts/list".to_string(),
+                    ),
+                }),
+                Err(error) => report.failures.push(McpCatalogFailure {
+                    server: name,
+                    connection_generation: generation,
+                    error,
+                }),
+            }
+        }
+        report
+            .entries
+            .sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        report
+            .failures
+            .sort_unstable_by(|left, right| left.server.cmp(&right.server));
+        Ok(report)
+    }
+
+    /// Compatibility prompt listing. A named request fails directly; an
+    /// all-server request returns successful entries and logs typed failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a named server is unknown or its prompt listing
+    /// fails admission, transport, or protocol validation.
     pub async fn list_prompts(
         &self,
         server_name: Option<&str>,
     ) -> Result<Vec<(String, McpPrompt)>, McpError> {
-        let mut prompts = Vec::new();
-        let mut guard = self.servers.lock().await;
-        let names = server_name.map_or_else(
-            || guard.keys().cloned().collect::<Vec<_>>(),
-            |name| vec![name.to_string()],
-        );
-        for name in names {
-            let entry = guard
-                .get_mut(&name)
-                .ok_or_else(|| McpError::NotConnected(name.clone()))?;
-            if let Err(error) = Self::ensure_connected(&self.run_context, entry, &name).await {
-                if server_name.is_some() {
-                    return Err(error);
-                }
-                continue;
+        let mut report = self.list_prompts_report(server_name).await?;
+        if server_name.is_some() {
+            if let Some(failure) = report.failures.pop() {
+                return Err(failure.error);
             }
-            let Some(server) = entry.server.as_ref() else {
-                continue;
-            };
-            match server.list_prompts().await {
-                Ok(server_prompts) => prompts.extend(
-                    server_prompts
-                        .into_iter()
-                        .map(|prompt| (name.clone(), prompt)),
-                ),
-                Err(error) => {
-                    if matches!(&error, McpError::Transport(_) | McpError::HttpStatus { .. }) {
-                        entry.mark_disconnected();
-                        self.bump_catalog_epoch();
-                    }
-                    if server_name.is_some() {
-                        return Err(error);
-                    }
-                    warn!(server = %name, error = %error, "Failed to list MCP prompts");
-                }
+        } else {
+            for failure in &report.failures {
+                warn!(server = %failure.server, error = %failure.error, "Failed to list MCP prompts");
             }
         }
-        drop(guard);
-        Ok(prompts)
+        Ok(report.entries)
     }
 
-    /// Resolve a typed prompt from one named server.
+    /// Resolve a typed prompt from one named server through its owned actor.
     ///
     /// # Errors
     ///
-    /// Returns an `McpError` when the server is unavailable or resolution fails.
+    /// Returns an `McpError` when the server is unknown or prompt resolution
+    /// fails admission, transport, or protocol validation.
     pub async fn get_prompt(
         &self,
         server_name: &str,
         prompt_name: &str,
         arguments: BTreeMap<String, String>,
     ) -> Result<McpGetPromptResult, McpError> {
-        let mut guard = self.servers.lock().await;
-        let entry = guard
-            .get_mut(server_name)
-            .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
-        if Self::ensure_connected(&self.run_context, entry, server_name).await? {
-            self.bump_catalog_epoch();
+        let actor = self.actor(server_name).await?;
+        self.run_context.require(actor.required_resource())?;
+        let snapshot = actor.snapshot();
+        let output = actor
+            .request(
+                self.run_context.generation().get(),
+                snapshot.live.then_some(snapshot.generation),
+                McpActorOperation::GetPrompt {
+                    prompt_name: prompt_name.to_string(),
+                    arguments,
+                },
+            )
+            .await?;
+        match output {
+            McpActorOutput::Prompt(prompt) => Ok(prompt),
+            _ => Err(McpError::Protocol(format!(
+                "MCP server '{server_name}' returned the wrong actor response for prompts/get"
+            ))),
         }
-        let Some(server) = entry.server.as_ref() else {
-            return Err(McpError::ServerUnreachable(server_name.to_string()));
-        };
-        let outcome = server.get_prompt(prompt_name, arguments).await;
-        if matches!(
-            &outcome,
-            Err(McpError::Transport(_) | McpError::HttpStatus { .. })
-        ) {
-            entry.mark_disconnected();
-            self.bump_catalog_epoch();
-        }
-        drop(guard);
-        outcome
     }
 
     /// Disconnect from a server.
@@ -4249,10 +5038,8 @@ impl McpManager {
             drop(servers);
             removed
         };
-        if let Some(mut entry) = removed {
-            if let Some(server) = entry.server.take() {
-                server.close().await?;
-            }
+        if let Some(actor) = removed {
+            actor.shutdown().await?;
         }
         Ok(())
     }
@@ -4263,9 +5050,23 @@ impl McpManager {
     ///
     /// Returns the first `McpError` encountered while closing servers.
     pub async fn disconnect_all(&self) -> Result<(), McpError> {
-        let names: Vec<String> = self.servers.lock().await.keys().cloned().collect();
-        for name in names {
-            self.disconnect(&name).await?;
+        let actors = {
+            let mut servers = self.servers.lock().await;
+            let actors = servers.drain().map(|(_, actor)| actor).collect::<Vec<_>>();
+            if !actors.is_empty() {
+                self.bump_catalog_epoch();
+            }
+            drop(servers);
+            actors
+        };
+        let mut first_error = None;
+        for actor in actors {
+            if let Err(error) = actor.shutdown().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -4286,7 +5087,7 @@ impl McpManager {
         let registered = servers.len();
         let live = servers
             .values()
-            .filter(|entry| entry.server.is_some())
+            .filter(|actor| actor.snapshot().live)
             .count();
         drop(servers);
         Some((registered, live))
@@ -4305,7 +5106,7 @@ impl McpManager {
             .lock()
             .await
             .get(name)
-            .is_some_and(|e| e.server.is_some())
+            .is_some_and(|actor| actor.snapshot().live)
     }
 }
 
@@ -5339,6 +6140,7 @@ sys.stdout.flush()
     struct FakeTransport {
         responses: std::sync::Mutex<std::collections::VecDeque<Value>>,
         delay_first_response: std::sync::Mutex<Option<Duration>>,
+        close_count: Arc<AtomicUsize>,
     }
 
     impl FakeTransport {
@@ -5346,12 +6148,17 @@ sys.stdout.flush()
             Self {
                 responses: std::sync::Mutex::new(responses.into()),
                 delay_first_response: std::sync::Mutex::new(None),
+                close_count: Arc::new(AtomicUsize::new(0)),
             }
         }
 
         fn with_initial_delay(self, delay: Duration) -> Self {
             *self.delay_first_response.lock().expect("lock") = Some(delay);
             self
+        }
+
+        fn close_count(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.close_count)
         }
     }
 
@@ -5376,6 +6183,7 @@ sys.stdout.flush()
         }
 
         async fn close(&self) -> Result<(), McpError> {
+            self.close_count.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
     }
@@ -5759,16 +6567,260 @@ sys.stdout.flush()
             args: Vec::new(),
             env: crate::secrets::EnvironmentGrants::new(),
         };
-        manager.servers.lock().await.insert(
-            server_name.to_string(),
-            ServerEntry::new_with_trust_and_tool_timeout(
-                spec,
+        manager
+            .install_actor(
+                server_name.to_string(),
+                ServerEntry::new_with_trust_and_tool_timeout(
+                    spec,
+                    server,
+                    McpServerTrust::PluginGrant(format!("fixture/{server_name}")),
+                    None,
+                ),
+            )
+            .await
+            .expect("fake server actor installs");
+    }
+
+    fn transport_test_run(process: bool, network: bool) -> Arc<crate::tools::ToolRunContext> {
+        crate::tools::ToolRunContext::builder(
+            crate::state::SessionId::new(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(crate::tools::security::WorkspaceAccess::ReadWrite)
+        .process(process)
+        .network(network)
+        .secrets(true)
+        .provider("mcp-transport-test")
+        .build()
+        .expect("transport test run has an explicit capability set")
+    }
+
+    async fn insert_fake_resource_server(
+        manager: &McpManager,
+        server_name: &str,
+        binding: McpTransportBinding,
+    ) {
+        let transport = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": server_name, "version": "1"},
+                "capabilities": {
+                    "tools": {"listChanged": false},
+                    "resources": {"listChanged": false}
+                }
+            }),
+            Value::Null,
+            json!({"tools": []}),
+            json!({
+                "resources": [{
+                    "uri": format!("fixture://{server_name}/resource"),
+                    "name": format!("{server_name}-resource")
+                }]
+            }),
+        ]);
+        let server = McpServer::new(server_name, Box::new(transport))
+            .await
+            .expect("fake resource server initializes");
+        let spec = match binding {
+            McpTransportBinding::Stdio => ConnectionSpec::Stdio {
+                command: "unused-resource-fixture".to_string(),
+                args: Vec::new(),
+                env: crate::secrets::EnvironmentGrants::new(),
+            },
+            McpTransportBinding::StreamableHttp => ConnectionSpec::Http {
+                url: "https://fixture.invalid/mcp".to_string(),
+                headers: crate::secrets::SensitiveHeaders::new(),
+                headers_helper: None,
+                server_name: server_name.to_string(),
+            },
+            McpTransportBinding::InProcess => panic!("manager has no in-process connection spec"),
+        };
+        manager
+            .install_actor(server_name.to_string(), ServerEntry::new(spec, server))
+            .await
+            .expect("fake resource actor installs");
+    }
+
+    async fn empty_stdio_entry(server_name: &str) -> (ServerEntry, Arc<AtomicUsize>) {
+        let transport = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": server_name, "version": "1"},
+                "capabilities": {}
+            }),
+            Value::Null,
+        ]);
+        let close_count = transport.close_count();
+        let server = McpServer::new(server_name, Box::new(transport))
+            .await
+            .expect("empty fake server initializes");
+        (
+            ServerEntry::new(
+                ConnectionSpec::Stdio {
+                    command: "unused-empty-fixture".to_string(),
+                    args: Vec::new(),
+                    env: crate::secrets::EnvironmentGrants::new(),
+                },
                 server,
-                McpServerTrust::PluginGrant(format!("fixture/{server_name}")),
-                None,
             ),
+            close_count,
+        )
+    }
+
+    #[tokio::test]
+    async fn s066_replacement_and_disconnect_close_each_owned_transport() {
+        let manager = McpManager::new(Arc::clone(test_run()));
+        let (first_entry, first_close_count) = empty_stdio_entry("replaceable").await;
+        manager
+            .install_actor("replaceable".to_string(), first_entry)
+            .await
+            .expect("first actor installs");
+        let first_generation = manager
+            .connection_status("replaceable")
+            .await
+            .expect("first status")
+            .connection_generation;
+
+        let (replacement_entry, replacement_close_count) = empty_stdio_entry("replaceable").await;
+        manager
+            .install_actor("replaceable".to_string(), replacement_entry)
+            .await
+            .expect("replacement actor installs");
+        let replacement_generation = manager
+            .connection_status("replaceable")
+            .await
+            .expect("replacement status")
+            .connection_generation;
+        assert_ne!(first_generation, replacement_generation);
+        assert_eq!(first_close_count.load(Ordering::Acquire), 1);
+
+        manager
+            .disconnect("replaceable")
+            .await
+            .expect("replacement actor disconnects");
+        assert_eq!(replacement_close_count.load(Ordering::Acquire), 1);
+        assert!(!manager.is_connected("replaceable").await);
+    }
+
+    #[test]
+    fn s066_queued_payload_bytes_are_bounded_before_admission() {
+        let operation = McpActorOperation::ReadResource {
+            uri: "x".repeat(MAX_REQUEST_SIZE + 1),
+        };
+        assert!(matches!(
+            operation.validate_queued_size(),
+            Err(McpError::RequestTooLarge {
+                limit: MAX_REQUEST_SIZE
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn s066_transport_specific_admission_retains_mixed_fanout_failures() {
+        let process_run = transport_test_run(true, false);
+        let process_manager = McpManager::new(Arc::clone(&process_run));
+        insert_fake_resource_server(&process_manager, "stdio", McpTransportBinding::Stdio).await;
+        insert_fake_resource_server(
+            &process_manager,
+            "http",
+            McpTransportBinding::StreamableHttp,
+        )
+        .await;
+
+        let report = process_manager
+            .list_resources_report(None)
+            .await
+            .expect("registered fan-out returns a typed report");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].0, "stdio");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].server, "http");
+        assert!(matches!(
+            &report.failures[0].error,
+            McpError::Capability(crate::tools::ToolCapabilityError::Unavailable {
+                resource: crate::tools::ToolResource::Network,
+                ..
+            })
+        ));
+
+        let mismatch = process_manager
+            .list_resources(Some("http"))
+            .await
+            .expect_err("an HTTP server must fail closed without Network");
+        assert!(matches!(
+            mismatch.downcast_ref::<McpError>(),
+            Some(McpError::Capability(
+                crate::tools::ToolCapabilityError::Unavailable {
+                    resource: crate::tools::ToolResource::Network,
+                    ..
+                }
+            ))
+        ));
+        let status = process_manager
+            .connection_status("stdio")
+            .await
+            .expect("stdio status exists");
+        assert_eq!(status.binding, McpTransportBinding::Stdio);
+        assert_eq!(
+            status.required_resource,
+            crate::tools::ToolResource::Process
         );
-        manager.bump_catalog_epoch();
+        assert_eq!(status.run_generation, process_run.generation().get());
+        assert!(status.live);
+        assert_eq!(status.queue_capacity, MCP_ACTOR_QUEUE_CAPACITY);
+        assert_eq!(status.queue_available, MCP_ACTOR_QUEUE_CAPACITY);
+
+        let actor = process_manager.actor("stdio").await.expect("actor exists");
+        let stale_connection = actor
+            .request(
+                status.run_generation,
+                Some(status.connection_generation.wrapping_add(1)),
+                McpActorOperation::ListResources,
+            )
+            .await
+            .expect_err("a stale connection generation must fail closed");
+        assert!(matches!(
+            stale_connection,
+            McpError::StaleConnectionGeneration { .. }
+        ));
+        let stale_run = actor
+            .request(
+                status.run_generation.wrapping_add(1),
+                Some(status.connection_generation),
+                McpActorOperation::ListResources,
+            )
+            .await
+            .expect_err("a stale run generation must fail closed");
+        assert!(matches!(stale_run, McpError::StaleRunGeneration { .. }));
+
+        let unknown = process_manager
+            .list_resources_report(Some("missing"))
+            .await
+            .expect_err("an unknown server identity must fail closed");
+        assert!(matches!(unknown, McpError::NotConnected(ref name) if name == "missing"));
+        process_manager
+            .disconnect_all()
+            .await
+            .expect("all resource actors shut down");
+
+        let network_manager = McpManager::new(transport_test_run(false, true));
+        insert_fake_resource_server(
+            &network_manager,
+            "http",
+            McpTransportBinding::StreamableHttp,
+        )
+        .await;
+        let http_resources = network_manager
+            .list_resources(Some("http"))
+            .await
+            .expect("HTTP-only run admits an HTTP MCP transport");
+        assert_eq!(http_resources.len(), 1);
+        assert_eq!(http_resources[0].0, "http");
+        network_manager
+            .disconnect_all()
+            .await
+            .expect("HTTP actor shuts down");
     }
 
     #[tokio::test]
@@ -6038,11 +7090,9 @@ sys.stdout.flush()
             env: crate::secrets::EnvironmentGrants::new(),
         };
         manager
-            .servers
-            .lock()
+            .install_actor("svc".to_string(), ServerEntry::new(spec, server))
             .await
-            .insert("svc".to_string(), ServerEntry::new(spec, server));
-        manager.bump_catalog_epoch();
+            .expect("blocking server actor installs");
 
         let snapshot = manager.tool_catalog_snapshot().await;
         let source_digest = mcp_definition_digest(&snapshot.definitions[0])
@@ -6086,6 +7136,108 @@ sys.stdout.flush()
             .is_cancelled());
     }
 
+    #[tokio::test]
+    async fn s066_actor_queue_applies_backpressure_and_shutdown_drains_waiters() {
+        let manager = McpManager::new_with_permissions(
+            Arc::clone(test_run()),
+            mcp_permissions("svc", &["mutate"]),
+        );
+        let call_started = Arc::new(tokio::sync::Notify::new());
+        let server = McpServer::new(
+            "svc",
+            Box::new(BlockingCallTransport {
+                call_started: Arc::clone(&call_started),
+            }),
+        )
+        .await
+        .expect("blocking MCP server initializes");
+        let spec = ConnectionSpec::Stdio {
+            command: "unused-blocking-test-transport".to_string(),
+            args: Vec::new(),
+            env: crate::secrets::EnvironmentGrants::new(),
+        };
+        manager
+            .install_actor("svc".to_string(), ServerEntry::new(spec, server))
+            .await
+            .expect("blocking actor installs");
+        let actor = manager.actor("svc").await.expect("actor exists");
+        let status = manager
+            .connection_status("svc")
+            .await
+            .expect("status exists");
+
+        let operation = || McpActorOperation::CallTool {
+            full_name: "mcp__svc__mutate".to_string(),
+            tool_name: "mutate".to_string(),
+            arguments: json!({"value": "bounded"}),
+            expected_source_digest: None,
+            on_dispatch: None,
+        };
+        let first_actor = Arc::clone(&actor);
+        let first = tokio::spawn(async move {
+            first_actor
+                .request(
+                    status.run_generation,
+                    Some(status.connection_generation),
+                    operation(),
+                )
+                .await
+        });
+        call_started.notified().await;
+
+        let mut queued = Vec::with_capacity(MCP_ACTOR_QUEUE_CAPACITY);
+        for _ in 0..MCP_ACTOR_QUEUE_CAPACITY {
+            let queued_actor = Arc::clone(&actor);
+            queued.push(tokio::spawn(async move {
+                queued_actor
+                    .request(
+                        status.run_generation,
+                        Some(status.connection_generation),
+                        McpActorOperation::CallTool {
+                            full_name: "mcp__svc__mutate".to_string(),
+                            tool_name: "mutate".to_string(),
+                            arguments: json!({"value": "queued"}),
+                            expected_source_digest: None,
+                            on_dispatch: None,
+                        },
+                    )
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while actor.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture requests fill the bounded mailbox");
+
+        let overflow = actor
+            .request(
+                status.run_generation,
+                Some(status.connection_generation),
+                operation(),
+            )
+            .await
+            .expect_err("a full actor mailbox must reject new work");
+        assert!(matches!(
+            overflow,
+            McpError::Backpressure {
+                capacity: MCP_ACTOR_QUEUE_CAPACITY,
+                ..
+            }
+        ));
+
+        manager
+            .disconnect("svc")
+            .await
+            .expect("shutdown closes the owned actor");
+        assert!(first.await.expect("first waiter joins").is_err());
+        for waiter in queued {
+            assert!(waiter.await.expect("queued waiter joins").is_err());
+        }
+    }
+
     // ─── Fix #628 — initialize-handshake timeout ───────────────────────
     //
     // Forensic evidence: the pre-fix `McpServer::new` chained
@@ -6105,6 +7257,7 @@ sys.stdout.flush()
     async fn fix628_initialize_timeout_fires_on_hanging_server() {
         // 60 s stall on first request simulates a non-responsive server.
         let transport = FakeTransport::new(vec![]).with_initial_delay(Duration::from_mins(1));
+        let close_count = transport.close_count();
         let config = McpServerConfig::new().with_initialize_timeout_secs(1);
 
         let start = std::time::Instant::now();
@@ -6131,6 +7284,11 @@ sys.stdout.flush()
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "initialize timeout (1 s) should fire fast; took {elapsed:?}"
+        );
+        assert_eq!(
+            close_count.load(Ordering::Acquire),
+            1,
+            "a rejected connection must close its owned transport"
         );
     }
 
@@ -6480,10 +7638,9 @@ sys.stdout.flush()
         };
         let entry = ServerEntry::new(spec, server);
         manager
-            .servers
-            .lock()
+            .install_actor("svc".to_string(), entry)
             .await
-            .insert("svc".to_string(), entry);
+            .expect("fixture actor installs");
 
         assert!(manager.is_live("svc").await, "must start live");
 
@@ -6530,12 +7687,12 @@ sys.stdout.flush()
             last_failure: Some(std::time::Instant::now()),
             cached_tools: vec![],
             supports_list_changed: false,
+            connection_generation: NEXT_MCP_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel),
         };
         manager
-            .servers
-            .lock()
+            .install_actor("dead".to_string(), entry)
             .await
-            .insert("dead".to_string(), entry);
+            .expect("exhausted actor installs");
 
         let err = manager
             .call_tool("mcp__dead__anything", json!({}))
@@ -6554,10 +7711,6 @@ sys.stdout.flush()
     /// without bumping `failed_attempts` (it's not an attempt yet).
     #[tokio::test]
     async fn fix629_backoff_window_blocks_reconnect_before_elapsed() {
-        let manager = McpManager::new_with_permissions(
-            Arc::clone(test_run()),
-            mcp_permissions("pending", &["x"]),
-        );
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
             args: vec![],
@@ -6574,15 +7727,10 @@ sys.stdout.flush()
             last_failure: Some(std::time::Instant::now()),
             cached_tools: vec![],
             supports_list_changed: false,
+            connection_generation: NEXT_MCP_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel),
         };
-        manager
-            .servers
-            .lock()
-            .await
-            .insert("pending".to_string(), entry);
-
-        let err = manager
-            .call_tool("mcp__pending__x", json!({}))
+        let mut entry = entry;
+        let err = McpManager::ensure_connected(test_run(), &mut entry, "pending")
             .await
             .expect_err("backoff window must block");
         assert!(
@@ -6590,11 +7738,8 @@ sys.stdout.flush()
             "expected ServerUnreachable while backoff pending, got: {err:?}"
         );
         // Counter MUST stay at 0 — this wasn't an attempt.
-        let guard = manager.servers.lock().await;
-        let attempts = guard.get("pending").expect("entry exists").failed_attempts;
-        drop(guard);
         assert_eq!(
-            attempts, 0,
+            entry.failed_attempts, 0,
             "backoff-gated access must NOT bump failed_attempts"
         );
     }
@@ -6641,36 +7786,29 @@ sys.stdout.flush()
             last_failure: None, // ⇒ backoff_elapsed() is true
             cached_tools: vec![],
             supports_list_changed: false,
+            connection_generation: NEXT_MCP_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel),
         };
-        manager
-            .servers
-            .lock()
-            .await
-            .insert("flaky".to_string(), entry);
+        let mut entry = entry;
 
         // Attempt #1: counter goes 0 → 1, error is generic transport
         // failure (not yet ServerUnreachable).
-        let mut guard = manager.servers.lock().await;
-        let entry = guard.get_mut("flaky").expect("present");
-        let r1 = McpManager::ensure_connected(test_run(), entry, "flaky").await;
+        let r1 = McpManager::ensure_connected(test_run(), &mut entry, "flaky").await;
         assert!(r1.is_err(), "reconnect #1 must fail");
         assert_eq!(entry.failed_attempts, 1);
         // Manually reset last_failure so the next ensure_connected
         // sees the backoff as elapsed without sleeping 1 s.
         entry.last_failure = None;
-        let r2 = McpManager::ensure_connected(test_run(), entry, "flaky").await;
+        let r2 = McpManager::ensure_connected(test_run(), &mut entry, "flaky").await;
         assert!(r2.is_err(), "reconnect #2 must fail");
         assert_eq!(entry.failed_attempts, 2);
         entry.last_failure = None;
-        let r3 = McpManager::ensure_connected(test_run(), entry, "flaky").await;
+        let r3 = McpManager::ensure_connected(test_run(), &mut entry, "flaky").await;
         // Third failure exhausts the budget.
         assert!(
             matches!(r3, Err(McpError::ServerUnreachable(ref n)) if n == "flaky"),
             "reconnect #3 must surface ServerUnreachable, got: {r3:?}"
         );
         assert_eq!(entry.failed_attempts, MAX_RECONNECT_ATTEMPTS);
-        drop(guard);
-
         // Phase 2: replace with a live entry (simulating a manual
         // disconnect + reconnect by the operator) and confirm normal
         // operation resumes.
@@ -6690,10 +7828,9 @@ sys.stdout.flush()
             env: crate::secrets::EnvironmentGrants::new(),
         };
         manager
-            .servers
-            .lock()
+            .install_actor("flaky".to_string(), ServerEntry::new(spec2, server))
             .await
-            .insert("flaky".to_string(), ServerEntry::new(spec2, server));
+            .expect("replacement actor installs");
 
         assert!(manager.is_live("flaky").await);
         let result = manager
@@ -6784,6 +7921,83 @@ sys.stdout.flush()
             }
         });
         format!("http://{addr}")
+    }
+
+    async fn spawn_oversized_chunked_http_mock() -> String {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 8192];
+                let _ = socket.read(&mut request).await;
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let chunk = vec![b'x'; 64 * 1024];
+                for _ in 0..=((MAX_HTTP_RESPONSE_SIZE / chunk.len()) + 1) {
+                    let header = format!("{:x}\r\n", chunk.len());
+                    if socket.write_all(header.as_bytes()).await.is_err()
+                        || socket.write_all(&chunk).await.is_err()
+                        || socket.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn s066_http_response_without_content_length_is_still_bounded() {
+        let url = spawn_oversized_chunked_http_mock().await;
+        let transport = HttpTransport::__test_new_unchecked(&url);
+        let error = transport
+            .request("oversized", None)
+            .await
+            .expect_err("chunked response above the body cap must fail");
+        assert!(matches!(
+            error,
+            McpError::ResponseTooLarge {
+                limit: MAX_HTTP_RESPONSE_SIZE
+            }
+        ));
+    }
+
+    #[test]
+    fn s066_sse_event_count_is_bounded() {
+        let mut body = String::new();
+        for index in 0..=MAX_HTTP_SSE_EVENTS {
+            write!(
+                &mut body,
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notice/{index}\"}}\n\n"
+            )
+            .expect("write SSE fixture");
+        }
+        let error = parse_sse_json_rpc_response(&body, &str::to_string)
+            .expect_err("an unbounded notification stream must be rejected");
+        assert!(matches!(error, McpError::Protocol(message) if message.contains("exceeded")));
+    }
+
+    #[test]
+    fn s066_http_session_identity_is_validated_before_storage() {
+        assert!(valid_mcp_session_id("session-123_ABC"));
+        assert!(!valid_mcp_session_id(""));
+        assert!(!valid_mcp_session_id("session with space"));
+        assert!(!valid_mcp_session_id("session\nheader"));
+        assert!(!valid_mcp_session_id("sessión"));
     }
 
     /// Fix #701 — HTTP transport accepts a response whose `id` matches

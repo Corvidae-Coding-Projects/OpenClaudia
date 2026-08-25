@@ -55,6 +55,11 @@ struct SseEchoIdResponder {
     result_body: Value,
 }
 
+struct SessionEchoIdResponder {
+    result_body: Value,
+    session_id: &'static str,
+}
+
 impl Respond for EchoIdResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         // Parse the request body as JSON to extract the id.
@@ -103,6 +108,17 @@ impl Respond for SseEchoIdResponder {
         ResponseTemplate::new(200)
             .set_body_string(body)
             .insert_header("content-type", "text/event-stream; charset=utf-8")
+    }
+}
+
+impl Respond for SessionEchoIdResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        EchoIdResponder {
+            result_body: Some(self.result_body.clone()),
+            error_body: None,
+        }
+        .respond(request)
+        .insert_header("Mcp-Session-Id", self.session_id)
     }
 }
 
@@ -534,6 +550,58 @@ async fn disconnect_removes_server_from_manager() {
         mgr.get_server_info("srv").await.is_none(),
         "disconnect MUST drop the server entry"
     );
+}
+
+#[tokio::test]
+async fn disconnect_terminates_an_owned_legacy_http_session() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"method\":\"server/discover\""))
+        .respond_with(echo_error(json!({
+            "code": -32601,
+            "message": "Method not found"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"method\":\"initialize\""))
+        .respond_with(SessionEchoIdResponder {
+            result_body: init_result_body(),
+            session_id: "owned-session",
+        })
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "\"method\":\"notifications/initialized\"",
+        ))
+        .and(header("Mcp-Session-Id", "owned-session"))
+        .respond_with(echo_result(json!({})))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"method\":\"tools/list\""))
+        .and(header("Mcp-Session-Id", "owned-session"))
+        .respond_with(echo_result(tools_list_result_body()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(header("Mcp-Session-Id", "owned-session"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    manager
+        .__test_connect_http_unchecked("session", &mock.uri())
+        .await
+        .expect("session server connects");
+    manager
+        .disconnect("session")
+        .await
+        .expect("disconnect terminates the session");
+    mock.verify().await;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

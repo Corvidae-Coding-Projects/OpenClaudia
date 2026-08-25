@@ -828,13 +828,14 @@ fn mcp_error_result(
     remotely_dispatched: bool,
 ) -> tools::ToolHandlerResult {
     let (code, retryability) = match error {
-        crate::mcp::McpError::InvalidToolArguments { .. } => {
+        crate::mcp::McpError::InvalidToolArguments { .. }
+        | crate::mcp::McpError::RequestTooLarge { .. } => {
             (ToolFailureCode::InvalidArguments, ToolRetryability::Never)
         }
-        crate::mcp::McpError::ToolNotAllowed { .. } => {
+        crate::mcp::McpError::ToolNotAllowed { .. } | crate::mcp::McpError::Capability(_) => {
             (ToolFailureCode::PolicyDenied, ToolRetryability::Never)
         }
-        crate::mcp::McpError::Timeout { .. } => (
+        crate::mcp::McpError::Timeout { .. } | crate::mcp::McpError::Cancelled { .. } => (
             ToolFailureCode::DeadlineExceeded,
             ToolRetryability::AfterBackoff,
         ),
@@ -843,14 +844,19 @@ fn mcp_error_result(
         | crate::mcp::McpError::Protocol(_)
         | crate::mcp::McpError::Rpc { .. }
         | crate::mcp::McpError::HttpStatus { .. }
+        | crate::mcp::McpError::ResponseTooLarge { .. }
         | crate::mcp::McpError::ResponseIdMismatch { .. }
         | crate::mcp::McpError::Io(_) => (ToolFailureCode::External, ToolRetryability::Unknown),
-        crate::mcp::McpError::ServerUnreachable(_) => {
+        crate::mcp::McpError::ServerUnreachable(_)
+        | crate::mcp::McpError::Backpressure { .. }
+        | crate::mcp::McpError::ConnectionClosed(_) => {
             (ToolFailureCode::Unavailable, ToolRetryability::AfterBackoff)
         }
         crate::mcp::McpError::ToolNotFound(_)
         | crate::mcp::McpError::NotConnected(_)
         | crate::mcp::McpError::StaleToolRegistration(_)
+        | crate::mcp::McpError::StaleConnectionGeneration { .. }
+        | crate::mcp::McpError::StaleRunGeneration { .. }
         | crate::mcp::McpError::UnsupportedProtocolVersion { .. }
         | crate::mcp::McpError::UnsupportedCapability(_)
         | crate::mcp::McpError::InvalidToolSchema { .. } => {

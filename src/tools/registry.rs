@@ -332,11 +332,6 @@ const REQUIRES_PROCESS_AND_WRITE: &[super::security::ToolResource] = &[
     super::security::ToolResource::WorkspaceWrite,
     super::security::ToolResource::Process,
 ];
-const REQUIRES_PROCESS_AND_NETWORK: &[super::security::ToolResource] = &[
-    super::security::ToolResource::WorkspaceRead,
-    super::security::ToolResource::Process,
-    super::security::ToolResource::Network,
-];
 #[cfg(feature = "browser")]
 const REQUIRES_BROWSER: &[super::security::ToolResource] = &[
     super::security::ToolResource::WorkspaceRead,
@@ -2904,7 +2899,10 @@ impl ToolHandler for ListMcpResourcesHandler {
         &self,
         _args: &HashMap<String, Value>,
     ) -> &'static [super::security::ToolResource] {
-        REQUIRES_PROCESS_AND_NETWORK
+        // The exact Process or Network capability is selected from the named
+        // server's transport inside McpManager. Requiring both here rejects
+        // valid stdio-only and HTTP-only runs before transport admission.
+        REQUIRES_READ
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         // A resource read can reconnect a disconnected MCP server, spawning
@@ -2932,6 +2930,23 @@ impl ToolHandler for ListMcpResourcesHandler {
             }
         })
     }
+    fn execute(
+        &self,
+        permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        let (message, is_error) = self.execute_legacy(permit, args, ctx);
+        if is_error {
+            ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::Unavailable,
+                message,
+                ToolRetryability::AfterBackoff,
+            ))
+        } else {
+            ToolHandlerResult::success_text(message)
+        }
+    }
     fn execute_legacy(
         &self,
         _permit: &ToolDispatchPermit,
@@ -2945,8 +2960,8 @@ impl ToolHandler for ListMcpResourcesHandler {
         let Some(mgr) = crate::mcp::registered_manager(ctx.run) else {
             return (
                 "No MCP manager has been installed for this session. \
-                 Configure MCP servers under `mcp.servers` in \
-                 `.openclaudia/config.yaml` and re-launch."
+                 Declare MCP servers in an enabled plugin `.mcp.json` \
+                 and re-launch."
                     .to_string(),
                 true,
             );
@@ -2967,19 +2982,32 @@ impl ToolHandler for ListMcpResourcesHandler {
         let result = handle.block_on(async move {
             let guard = mgr.read().await;
             if !guard.matches_run(&caller_run) {
-                return Err(anyhow::anyhow!(
-                    "MCP manager capability binding does not match the calling run"
+                return Err(crate::mcp::McpError::Protocol(
+                    "MCP manager capability binding does not match the calling run".to_string(),
                 ));
             }
-            guard.list_resources(server_filter.as_deref()).await
+            guard.list_resources_report(server_filter.as_deref()).await
         });
         match result {
-            Ok(entries) if entries.is_empty() => (
+            Ok(report) if report.entries.is_empty() && report.failures.is_empty() => (
                 "No MCP resources are exposed by the connected servers.".to_string(),
                 false,
             ),
-            Ok(entries) => {
-                let body = entries
+            Ok(report) if report.entries.is_empty() => {
+                let failures = report
+                    .failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.server, failure.error))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (
+                    format!("No MCP server completed resource listing:\n{failures}"),
+                    true,
+                )
+            }
+            Ok(report) => {
+                let body = report
+                    .entries
                     .iter()
                     .map(|(server, res)| {
                         format!(
@@ -2997,9 +3025,22 @@ impl ToolHandler for ListMcpResourcesHandler {
                     .join("\n");
                 let header = format!(
                     "{count} resource(s) across MCP servers:\nserver\turi\tname[\tdescription]\n",
-                    count = entries.len()
+                    count = report.entries.len()
                 );
-                (format!("{header}{body}"), false)
+                let failures = if report.failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nUnavailable MCP servers:\n{}",
+                        report
+                            .failures
+                            .iter()
+                            .map(|failure| format!("{}: {}", failure.server, failure.error))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                };
+                (format!("{header}{body}{failures}"), false)
             }
             Err(e) => (format!("list_mcp_resources failed: {e}"), true),
         }
@@ -3015,7 +3056,7 @@ impl ToolHandler for ReadMcpResourceHandler {
         &self,
         _args: &HashMap<String, Value>,
     ) -> &'static [super::security::ToolResource] {
-        REQUIRES_PROCESS_AND_NETWORK
+        REQUIRES_READ
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "McpRead", "uri")
@@ -3081,8 +3122,8 @@ fn dispatch_typed_mcp_resource_read(
         .map_err(|(error, _)| error)?;
     let Some(manager) = crate::mcp::registered_manager(ctx.run) else {
         return Err(
-            "No MCP manager has been installed for this session. Configure MCP servers under \
-             `mcp.servers` in `.openclaudia/config.yaml` and re-launch."
+            "No MCP manager has been installed for this session. Declare MCP servers in an \
+             enabled plugin `.mcp.json` and re-launch."
                 .to_string(),
         );
     };

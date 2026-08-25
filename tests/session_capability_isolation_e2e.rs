@@ -203,8 +203,8 @@ fn absent_resource_grants_return_typed_unavailable_results() {
     let mcp = execute_tool(&read_only, &call("list_mcp_resources", json!({})));
     assert_failure_code(&mcp, ToolFailureCode::Unavailable);
     assert!(
-        mcp.content().contains("Process"),
-        "MCP I/O must fail at capability preflight before manager lookup: {mcp:?}"
+        mcp.content().contains("No MCP manager"),
+        "MCP transport admission must be deferred until an exact registered server selects Process or Network: {mcp:?}"
     );
 
     let network = execute_tool(

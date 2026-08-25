@@ -51,8 +51,8 @@ fn list_mcp_resources_no_args_reports_missing_registered_manager() {
         "must explain that no manager is registered; got {msg:?}"
     );
     assert!(
-        msg.contains("mcp.servers") && msg.contains(".openclaudia/config.yaml"),
-        "must point users at MCP configuration; got {msg:?}"
+        msg.contains("enabled plugin") && msg.contains(".mcp.json"),
+        "must point users at the MCP configuration path actually loaded at startup; got {msg:?}"
     );
 }
 
