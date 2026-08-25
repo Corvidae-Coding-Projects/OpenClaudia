@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1611,
+  "next_comment_id": 1612,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,11 +16222,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T11:26:24.046576362Z",
+      "updated_at": "2026-08-25T11:26:28.810032251Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "1dc3bf6f-a6bc-4fbc-a000-7bc00452d7d1": {
+          "display_id": 1611,
+          "author": "6Vw9",
+          "content": "[action] S-036 rename root cause isolated: Win32 SetFileInformationByHandle rejects root handle; native NtSetInformationFile succeeds. Switching the narrow rename syscall without path fallback.",
+          "created_at": "2026-08-25T11:26:28.807541264Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXjiR0xcBCT+9PuKyg4iPeAk0KBZaNB8Pe82h/mR3YKga54s7jQWHwr+qSFd9BIwzvqKH6guXh0UN0j+Q+RqTAw=="
+        },
         "22ab7422-6607-47ce-bbdd-fc980f7ac0d6": {
           "display_id": 1595,
           "author": "6Vw9",
@@ -40939,11 +40948,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1657,
       "timestamp": "2026-08-25T11:26:24.046576362Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1658,
+      "timestamp": "2026-08-25T11:26:28.810032251Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T11:26:24.046576362Z",
+    "timestamp": "2026-08-25T11:26:28.810032251Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1657
+    "agent_seq": 1658
   }
 }
