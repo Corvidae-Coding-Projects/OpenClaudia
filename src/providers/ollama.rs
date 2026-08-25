@@ -3,6 +3,7 @@
 //! See: <https://github.com/ollama/ollama/blob/main/docs/api.md>
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tracing::debug;
@@ -1075,12 +1076,53 @@ impl OllamaHistoryBuilder {
                 "Ollama tool result at index {message_index} name does not match call {call_id:?}"
             )));
         }
+        let (attachments, attachment_diagnostic) = match crate::tools::resolve_tool_attachments(
+            message
+                .extra
+                .get(crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY),
+        ) {
+            Ok(attachments) => (attachments, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let mut native_content = content.to_string();
+        if let Some(diagnostic) = attachment_diagnostic {
+            let _ = std::fmt::Write::write_fmt(
+                &mut native_content,
+                format_args!("\nNative tool attachment unavailable: {diagnostic}"),
+            );
+        }
+        let (supported, unsupported): (Vec<_>, Vec<_>) = attachments
+            .into_iter()
+            .partition(|attachment| attachment.media_type.starts_with("image/"));
+        for attachment in unsupported {
+            let _ = std::fmt::Write::write_fmt(
+                &mut native_content,
+                format_args!(
+                    "\nOllama cannot replay {} tool attachment {}",
+                    attachment.media_type, attachment.digest
+                ),
+            );
+        }
         let wire_index = self.converted.len();
-        self.converted.push(json!({
+        let mut native = json!({
             "role": "tool",
             "tool_name": expected.name,
-            "content": content,
-        }));
+            "content": native_content,
+        });
+        if !supported.is_empty() {
+            native["images"] = Value::Array(
+                supported
+                    .into_iter()
+                    .map(|attachment| {
+                        Value::String(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(attachment.bytes.as_ref()),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        self.converted.push(native);
         self.history.push(json!({
             "ordinal": ordinal,
             "wire_index": wire_index,
@@ -1543,6 +1585,42 @@ mod tests {
             .expect("text parts should convert");
 
         assert_eq!(body["messages"][0]["content"], "hello\nworld");
+    }
+
+    #[test]
+    fn typed_tool_image_becomes_one_native_ollama_image() {
+        let bytes = b"typed-ollama-image".to_vec();
+        let expected = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let attachment = crate::tools::register_transient_attachment(
+            "image/png",
+            bytes,
+            crate::tools::ToolSensitivity::Workspace,
+        )
+        .expect("register image attachment");
+        let call = ToolCall {
+            id: "ollama-image-call".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut result = tool_message(&call, "typed image metadata");
+        result.extra.insert(
+            crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY.to_string(),
+            serde_json::to_value([attachment]).expect("serialize attachment metadata"),
+        );
+        let request = request_with_messages(vec![assistant_message("", &[call]), result]);
+        let body = OllamaAdapter::transform_request_draft(&request)
+            .expect("transform typed Ollama tool image");
+        assert_eq!(body["messages"][1]["images"][0], expected);
+        assert_eq!(
+            serde_json::to_string(&body)
+                .expect("serialize Ollama body")
+                .matches(&expected)
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Google Gemini API adapter.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tracing::debug;
@@ -1086,6 +1087,56 @@ fn gemini_tool_result_payload(
     }
 }
 
+fn supports_multimodal_function_response(model: &str) -> bool {
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase()
+        .starts_with("gemini-3")
+}
+
+fn supports_function_response_media(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/webp" | "application/pdf" | "text/plain"
+    )
+}
+
+fn filter_function_response_attachments(
+    model: &str,
+    response: &mut Value,
+    attachments: Vec<crate::tools::ResolvedToolAttachment>,
+) -> Vec<crate::tools::ResolvedToolAttachment> {
+    let mut supported = Vec::new();
+    let mut diagnostics = Vec::new();
+    for attachment in attachments {
+        if !supports_multimodal_function_response(model) {
+            diagnostics.push(format!(
+                "Google model '{model}' does not support multimodal function responses for attachment {}",
+                attachment.digest
+            ));
+        } else if !supports_function_response_media(&attachment.media_type) {
+            diagnostics.push(format!(
+                "Google multimodal function responses do not support MIME type {} for attachment {}",
+                attachment.media_type, attachment.digest
+            ));
+        } else {
+            supported.push(attachment);
+        }
+    }
+    if !diagnostics.is_empty() {
+        let object = response
+            .as_object_mut()
+            .expect("Gemini tool-result payload is always an object");
+        object.insert(
+            "attachment_diagnostics".to_string(),
+            serde_json::json!(diagnostics),
+        );
+    }
+    supported
+}
+
 #[derive(Default)]
 struct GeminiHistoryBuilder {
     converted: Vec<Value>,
@@ -1093,9 +1144,17 @@ struct GeminiHistoryBuilder {
     portable_ordinal: u64,
     pending_calls: VecDeque<PortableGeminiCall>,
     tool_result_wire_index: Option<usize>,
+    model: String,
 }
 
 impl GeminiHistoryBuilder {
+    fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, message: &ChatMessage, message_index: usize) -> Result<(), ProviderError> {
         if message.role == "system" {
             return self.validate_system(message, message_index);
@@ -1258,7 +1317,26 @@ impl GeminiHistoryBuilder {
                 "Google tool result at index {message_index} name does not match call {call_id:?}"
             )));
         }
-        let response = gemini_tool_result_payload(message, message_index)?;
+        let mut response = gemini_tool_result_payload(message, message_index)?;
+        let attachments = match crate::tools::resolve_tool_attachments(
+            message
+                .extra
+                .get(crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY),
+        ) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                let object = response
+                    .as_object_mut()
+                    .expect("Gemini tool-result payload is always an object");
+                object.insert(
+                    "attachment_diagnostic".to_string(),
+                    Value::String(format!("Native tool attachment unavailable: {error}")),
+                );
+                Vec::new()
+            }
+        };
+        let supported_attachments =
+            filter_function_response_attachments(&self.model, &mut response, attachments);
         let wire_index = self.tool_result_wire_index.unwrap_or_else(|| {
             let wire_index = self.converted.len();
             self.converted.push(json!({"role": "user", "parts": []}));
@@ -1270,13 +1348,28 @@ impl GeminiHistoryBuilder {
             .and_then(Value::as_array_mut)
             .expect("tool result batch owns parts array");
         let part_index = parts.len();
-        parts.push(json!({
-            "functionResponse": {
-                "id": expected.id,
-                "name": expected.name,
-                "response": response,
-            }
-        }));
+        let mut function_response = json!({
+            "id": expected.id,
+            "name": expected.name,
+            "response": response,
+        });
+        if !supported_attachments.is_empty() {
+            function_response["parts"] = Value::Array(
+                supported_attachments
+                    .into_iter()
+                    .map(|attachment| {
+                        json!({
+                            "inlineData": {
+                                "mimeType": attachment.media_type,
+                                "data": base64::engine::general_purpose::STANDARD
+                                    .encode(attachment.bytes.as_ref()),
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        parts.push(json!({"functionResponse": function_response}));
         self.history.push(json!({
             "ordinal": ordinal,
             "wire_index": wire_index,
@@ -1311,9 +1404,10 @@ impl GoogleAdapter {
 
     /// Convert `OpenAI` messages to Gemini format
     fn convert_messages(
+        model: &str,
         messages: &[ChatMessage],
     ) -> Result<(Vec<Value>, Vec<Value>), ProviderError> {
-        let mut builder = GeminiHistoryBuilder::default();
+        let mut builder = GeminiHistoryBuilder::new(model);
         for (message_index, message) in messages.iter().enumerate() {
             builder.push(message, message_index)?;
         }
@@ -1366,7 +1460,7 @@ impl GoogleAdapter {
     }
 
     fn transform_request_draft(request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
-        let (contents, history) = Self::convert_messages(&request.messages)?;
+        let (contents, history) = Self::convert_messages(&request.model, &request.messages)?;
         let mut body = json!({
             "contents": contents,
             GEMINI_HISTORY_KEY: history,
@@ -2246,6 +2340,110 @@ mod tests {
         assert_eq!(parts[0], json!({"text": "describe this"}));
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
         assert_eq!(parts[1]["inlineData"]["data"], "iVBORw...");
+    }
+
+    #[test]
+    fn supported_typed_tool_image_becomes_native_function_response_part() {
+        let bytes = b"typed-google-image".to_vec();
+        let expected = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let attachment = crate::tools::register_transient_attachment(
+            "image/png",
+            bytes,
+            crate::tools::ToolSensitivity::Workspace,
+        )
+        .expect("register image attachment");
+        let call = crate::tools::ToolCall {
+            id: "google-image-call".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut result = tool_message(&call, "typed image metadata");
+        result.extra.insert(
+            crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY.to_string(),
+            serde_json::to_value([attachment]).expect("serialize attachment metadata"),
+        );
+        let request = google_request_with_messages(vec![assistant_message("", &[call]), result]);
+        let body = GoogleAdapter::transform_request_draft(&request)
+            .expect("transform typed function response draft");
+        let native = &body["contents"][1]["parts"][0]["functionResponse"]["parts"][0]["inlineData"];
+        assert_eq!(native["mimeType"], "image/png");
+        assert_eq!(native["data"], expected);
+        assert_eq!(
+            serde_json::to_string(&body)
+                .expect("serialize Google body")
+                .matches(&expected)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unsupported_google_function_response_media_is_a_diagnostic_not_invalid_wire_data() {
+        let attachment = crate::tools::register_transient_attachment(
+            "application/octet-stream",
+            b"typed-google-binary".to_vec(),
+            crate::tools::ToolSensitivity::Workspace,
+        )
+        .expect("register binary attachment");
+        let call = crate::tools::ToolCall {
+            id: "google-binary-call".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut result = tool_message(&call, "typed binary metadata");
+        result.extra.insert(
+            crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY.to_string(),
+            serde_json::to_value([attachment]).expect("serialize attachment metadata"),
+        );
+        let request = google_request_with_messages(vec![assistant_message("", &[call]), result]);
+
+        let body = GoogleAdapter::transform_request_draft(&request)
+            .expect("unsupported media must remain a valid Google request");
+        let response = &body["contents"][1]["parts"][0]["functionResponse"];
+        assert!(response.get("parts").is_none());
+        assert!(response["response"]["attachment_diagnostics"][0]
+            .as_str()
+            .is_some_and(|diagnostic| diagnostic.contains("application/octet-stream")));
+    }
+
+    #[test]
+    fn pre_gemini_three_model_gets_an_explicit_attachment_diagnostic() {
+        let attachment = crate::tools::register_transient_attachment(
+            "image/png",
+            b"typed-google-image".to_vec(),
+            crate::tools::ToolSensitivity::Workspace,
+        )
+        .expect("register image attachment");
+        let call = crate::tools::ToolCall {
+            id: "google-image-call".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut result = tool_message(&call, "typed image metadata");
+        result.extra.insert(
+            crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY.to_string(),
+            serde_json::to_value([attachment]).expect("serialize attachment metadata"),
+        );
+        let mut request =
+            google_request_with_messages(vec![assistant_message("", &[call]), result]);
+        request.model = "gemini-2.5-pro".to_string();
+
+        let body = GoogleAdapter::transform_request_draft(&request)
+            .expect("unsupported model must remain a valid Google request");
+        let response = &body["contents"][1]["parts"][0]["functionResponse"];
+        assert!(response.get("parts").is_none());
+        assert!(response["response"]["attachment_diagnostics"][0]
+            .as_str()
+            .is_some_and(|diagnostic| diagnostic.contains("gemini-2.5-pro")));
     }
 
     #[test]

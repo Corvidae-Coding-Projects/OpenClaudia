@@ -6222,10 +6222,10 @@ blast_radius:
             )
             .await;
 
-        assert!(
-            matches!(result.outcome(), ToolOutcome::Success { .. }),
-            "normalized read must succeed: {result:#?}"
-        );
+        let ToolOutcome::Partial { continuation, .. } = result.outcome() else {
+            panic!("one-line normalized read must return a typed continuation: {result:#?}");
+        };
+        assert!(continuation.is_some());
         assert_eq!(result.tool_call_id(), "call-wire-alias");
         assert_eq!(result.handler(), "read_file");
         assert_eq!(result.invocation().raw_arguments, arguments);

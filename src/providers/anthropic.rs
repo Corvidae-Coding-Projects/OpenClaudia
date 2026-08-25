@@ -1,6 +1,7 @@
 //! Anthropic Messages API adapter.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
@@ -1040,10 +1041,49 @@ fn convert_tool_result_message(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    let (attachments, attachment_diagnostic) = match crate::tools::resolve_tool_attachments(
+        msg.get(crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY),
+    ) {
+        Ok(attachments) => (attachments, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let native_content = if attachments.is_empty() && attachment_diagnostic.is_none() {
+        Value::String(content.to_string())
+    } else {
+        let mut blocks = vec![json!({"type": "text", "text": content})];
+        if let Some(diagnostic) = attachment_diagnostic {
+            blocks.push(json!({
+                "type": "text",
+                "text": format!("Native tool attachment unavailable: {diagnostic}")
+            }));
+        }
+        for attachment in attachments {
+            if !attachment.media_type.starts_with("image/") {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": format!(
+                        "Anthropic cannot replay {} tool attachment {}",
+                        attachment.media_type, attachment.digest
+                    )
+                }));
+                continue;
+            }
+            blocks.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": attachment.media_type,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&attachment.bytes),
+                }
+            }));
+        }
+        Value::Array(blocks)
+    };
+
     let mut tool_result = json!({
         "type": "tool_result",
         "tool_use_id": tool_use_id,
-        "content": content
+        "content": native_content
     });
     if is_error {
         tool_result["is_error"] = json!(true);
@@ -1404,6 +1444,50 @@ mod tests {
             .expect("tool result block missing — #475 regression");
         assert_eq!(tool_result["tool_use_id"], "toolu_abc");
         assert_eq!(tool_result["content"], "4");
+    }
+
+    #[test]
+    fn typed_tool_image_becomes_one_native_anthropic_block() {
+        let bytes = b"typed-anthropic-image".to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let attachment = crate::tools::register_transient_attachment(
+            "image/png",
+            bytes,
+            crate::tools::ToolSensitivity::Workspace,
+        )
+        .expect("register image");
+        let call = crate::tools::ToolCall {
+            id: "toolu_image".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let result = crate::tools::ToolResult::bind(
+            &call,
+            "read_file",
+            crate::tools::ToolHandlerResult::success_text("typed image metadata")
+                .with_attachment(attachment),
+        );
+        assert!(!result.provider_content().contains(&encoded));
+
+        let converted = convert_messages_to_anthropic_checked(&[result.openai_message()])
+            .expect("convert typed tool image");
+        let content = converted[0]["content"][0]["content"]
+            .as_array()
+            .expect("native tool result content blocks");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], encoded);
+        assert_eq!(
+            serde_json::to_string(&converted)
+                .expect("serialize wire body")
+                .matches(&encoded)
+                .count(),
+            1
+        );
     }
 
     fn request_with_assistant_tool_call(tool_call: Value) -> ChatCompletionRequest {

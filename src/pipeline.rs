@@ -20,6 +20,7 @@ use crate::tools::{self, AnthropicToolAccumulator, ToolCall, ToolCallAccumulator
 use crate::tui::events::{
     ApiRetryKind, AppEvent, PermissionResponse, PlanModeReply, PlanModeRequest,
 };
+use base64::Engine as _;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::Value;
@@ -634,6 +635,7 @@ fn build_openai_request_with_tools(
     effort_level: &str,
     tool_definitions: &Value,
 ) -> Value {
+    let messages = openai_chat_messages_with_native_attachments(messages);
     let mut req = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -651,6 +653,54 @@ fn build_openai_request_with_tools(
         _ => {}
     }
     req
+}
+
+fn openai_chat_messages_with_native_attachments(messages: &[Value]) -> Vec<Value> {
+    let mut projected = Vec::with_capacity(messages.len());
+    for message in messages {
+        let mut message = message.clone();
+        let raw_attachments = message
+            .as_object_mut()
+            .and_then(|object| object.remove(tools::TOOL_ATTACHMENTS_MESSAGE_KEY));
+        projected.push(message);
+        let Some(raw_attachments) = raw_attachments else {
+            continue;
+        };
+        match tools::resolve_tool_attachments(Some(&raw_attachments)) {
+            Ok(attachments) => {
+                let mut content = vec![serde_json::json!({
+                    "type": "text",
+                    "text": "Native media returned by the immediately preceding tool result."
+                })];
+                for attachment in attachments {
+                    if !attachment.media_type.starts_with("image/") {
+                        content.push(serde_json::json!({
+                            "type": "text",
+                            "text": format!(
+                                "Unsupported OpenAI Chat Completions attachment: {} ({})",
+                                attachment.media_type, attachment.digest
+                            )
+                        }));
+                        continue;
+                    }
+                    let encoded =
+                        base64::engine::general_purpose::STANDARD.encode(attachment.bytes.as_ref());
+                    content.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{encoded}", attachment.media_type)
+                        }
+                    }));
+                }
+                projected.push(serde_json::json!({"role": "user", "content": content}));
+            }
+            Err(error) => projected.push(serde_json::json!({
+                "role": "user",
+                "content": format!("Native tool attachment is unavailable: {error}")
+            })),
+        }
+    }
+    projected
 }
 
 fn text_from_message_content(content: &Value) -> Result<String, String> {
@@ -686,6 +736,55 @@ fn response_input_message(role: &str, text: &str, ordinal: u64) -> Value {
     })
 }
 
+fn responses_tool_output(message: &Value, content: String) -> Value {
+    let attachment_resolution =
+        tools::resolve_tool_attachments(message.get(tools::TOOL_ATTACHMENTS_MESSAGE_KEY));
+    if matches!(&attachment_resolution, Ok(attachments) if attachments.is_empty()) {
+        return Value::String(content);
+    }
+
+    let mut output = vec![serde_json::json!({
+        "type": "input_text",
+        "text": content,
+    })];
+    match attachment_resolution {
+        Ok(attachments) => {
+            for attachment in attachments {
+                if !attachment.media_type.starts_with("image/") {
+                    output.push(serde_json::json!({
+                        "type": "input_text",
+                        "text": format!(
+                            "OpenAI Responses cannot replay {} tool attachment {}",
+                            attachment.media_type, attachment.digest
+                        )
+                    }));
+                    continue;
+                }
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(attachment.bytes.as_ref());
+                output.push(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{encoded}", attachment.media_type),
+                    "detail": "auto",
+                }));
+            }
+        }
+        Err(error) => output.push(serde_json::json!({
+            "type": "input_text",
+            "text": format!("Native tool attachment unavailable: {error}")
+        })),
+    }
+    Value::Array(output)
+}
+
+fn take_responses_ordinal(next: &mut u64) -> Result<u64, String> {
+    let ordinal = *next;
+    *next = (*next)
+        .checked_add(1)
+        .ok_or_else(|| "Responses history ordinal overflow".to_string())?;
+    Ok(ordinal)
+}
+
 fn responses_input_items(messages: &[Value]) -> Result<(String, Vec<Value>, Vec<Value>), String> {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
@@ -710,18 +809,12 @@ fn responses_input_items(messages: &[Value]) -> Result<(String, Vec<Value>, Vec<
                 }
             }
             "user" => {
-                let ordinal = next_ordinal;
-                next_ordinal = next_ordinal
-                    .checked_add(1)
-                    .ok_or_else(|| "Responses history ordinal overflow".to_string())?;
+                let ordinal = take_responses_ordinal(&mut next_ordinal)?;
                 history.push(serde_json::json!({"ordinal": ordinal, "role": role}));
                 input.push(response_input_message("user", &content, ordinal));
             }
             "assistant" => {
-                let ordinal = next_ordinal;
-                next_ordinal = next_ordinal
-                    .checked_add(1)
-                    .ok_or_else(|| "Responses history ordinal overflow".to_string())?;
+                let ordinal = take_responses_ordinal(&mut next_ordinal)?;
                 history.push(serde_json::json!({"ordinal": ordinal, "role": role}));
                 if !content.is_empty() {
                     input.push(response_input_message("assistant", &content, ordinal));
@@ -763,20 +856,18 @@ fn responses_input_items(messages: &[Value]) -> Result<(String, Vec<Value>, Vec<
                 }
             }
             "tool" => {
-                let ordinal = next_ordinal;
-                next_ordinal = next_ordinal
-                    .checked_add(1)
-                    .ok_or_else(|| "Responses history ordinal overflow".to_string())?;
+                let ordinal = take_responses_ordinal(&mut next_ordinal)?;
                 history.push(serde_json::json!({"ordinal": ordinal, "role": role}));
                 let call_id = msg
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| format!("tool message missing tool_call_id: {msg}"))?;
+                let output = responses_tool_output(msg, content);
                 input.push(serde_json::json!({
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": content,
+                    "output": output,
                     "_openclaudia_message_ordinal": ordinal
                 }));
             }
@@ -6002,6 +6093,74 @@ memory:
         assert!(req["input"].as_array().is_some_and(|items| items
             .iter()
             .all(|item| item.get("_openclaudia_message_ordinal").is_none())));
+    }
+
+    #[test]
+    fn openai_wires_typed_tool_image_without_persisting_base64_in_message() {
+        let bytes = b"typed-openai-image".to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let attachment = tools::register_transient_attachment(
+            "image/png",
+            bytes,
+            tools::ToolSensitivity::Workspace,
+        )
+        .expect("register image attachment");
+        let mut tool_result = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_image",
+            "content": "typed image metadata"
+        });
+        tool_result[tools::TOOL_ATTACHMENTS_MESSAGE_KEY] =
+            serde_json::to_value([attachment]).expect("serialize attachment metadata");
+        assert!(!serde_json::to_string(&tool_result)
+            .expect("serialize portable message")
+            .contains(&encoded));
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_image",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            tool_result,
+        ];
+
+        let responses = build_openai_responses_request("gpt-5.5", &messages, "medium")
+            .expect("build Responses media request");
+        let output = responses["input"][2]["output"]
+            .as_array()
+            .expect("typed Responses output parts");
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[1]["type"], "input_image");
+        assert!(output[1]["image_url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with(&encoded)));
+        assert_eq!(
+            serde_json::to_string(&responses)
+                .expect("serialize Responses body")
+                .matches(&encoded)
+                .count(),
+            1
+        );
+
+        let chat = build_openai_request("gpt-4o", &messages, "medium");
+        assert!(chat["messages"][2]
+            .get(tools::TOOL_ATTACHMENTS_MESSAGE_KEY)
+            .is_none());
+        assert!(chat["messages"][3]["content"][1]["image_url"]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with(&encoded)));
+        assert_eq!(
+            serde_json::to_string(&chat)
+                .expect("serialize Chat Completions body")
+                .matches(&encoded)
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -21,10 +21,10 @@ pub use notebook::execute_notebook_edit_typed;
 pub use notebook::source_to_line_array;
 pub use read::{detect_file_type, FileType};
 #[cfg(test)]
-pub use read::{parse_page_range, read_image_file, read_notebook_file, ImageKind};
+pub use read::{parse_page_range, read_notebook_file, ImageKind};
 pub use write::execute_write_file;
 
-use crate::tools::args::{ToolArgError, ToolArgs as _};
+use crate::tools::args::ToolArgs as _;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -34,6 +34,9 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use similar::TextDiff;
 
 const LEDGER_EXCERPT_MAX_BYTES: usize = 100_000;
+const MAX_DERIVED_READ_OUTPUT_BYTES: usize = 100_000;
+const MAX_IMAGE_EDGE_PIXELS: u32 = 32_768;
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 pub(super) const MAX_MUTATION_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DIFF_LINES_PER_GENERATION: usize = 100_000;
 const MAX_RETAINED_DIFF_BYTES: usize = 64 * 1024;
@@ -200,9 +203,26 @@ impl ReadFileTracker {
         resolved: &Path,
         bytes: &[u8],
     ) -> FileSnapshot {
+        self.mark_generation(
+            run,
+            resolved,
+            crate::runtime::ContentDigest::sha256(bytes),
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Record an already-streamed complete generation without retaining the
+    /// source bytes in memory.
+    pub(super) fn mark_generation(
+        &self,
+        run: &super::security::ToolRunContext,
+        resolved: &Path,
+        generation: crate::runtime::ContentDigest,
+        byte_len: u64,
+    ) -> FileSnapshot {
         let snapshot = FileSnapshot {
-            generation: crate::runtime::ContentDigest::sha256(bytes),
-            byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            generation,
+            byte_len,
         };
         if !resolved.is_absolute() || !run.permits_read(resolved) {
             tracing::warn!(
@@ -722,90 +742,643 @@ pub fn resolve_open_path(
     Ok(canonical_parent.join(leaf))
 }
 
-pub fn execute_read_file(
+fn read_sensitivity(
     run: &super::security::ToolRunContext,
-    args: &std::collections::HashMap<String, serde_json::Value>,
-) -> (String, bool) {
-    let path = match args.arg_str_strict("path") {
-        Ok(path) => path,
-        Err(e) => return e.into_tool_error(),
-    };
+    resolved: &Path,
+) -> crate::tools::ToolSensitivity {
+    if resolved.starts_with(run.project_root()) {
+        crate::tools::ToolSensitivity::Workspace
+    } else {
+        crate::tools::ToolSensitivity::Private
+    }
+}
 
-    let resolved = match resolve_path(run, path) {
-        Ok(p) => p,
-        Err(e) => return (e, true),
+fn provider_accepts_attachment(provider: &str, media_type: &str) -> bool {
+    let normalized = provider.to_ascii_lowercase();
+    let provider = match normalized.as_str() {
+        "gemini" => "google",
+        other => other,
     };
-    let resolved_str = resolved.to_string_lossy();
-    let bytes = match read::read_safe_bytes(run, &resolved_str) {
+    if provider == "google" {
+        return true;
+    }
+    media_type.starts_with("image/") && matches!(provider, "anthropic" | "openai" | "ollama")
+}
+
+fn incompatible_read_option(
+    args: &HashMap<String, serde_json::Value>,
+    allowed: &[&str],
+) -> Option<&'static str> {
+    ["offset", "limit", "cursor", "pages"]
+        .into_iter()
+        .find(|option| args.contains_key(*option) && !allowed.contains(option))
+}
+
+fn incompatible_read_result(option: &str, kind: &str) -> crate::tools::ToolHandlerResult {
+    crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+        crate::tools::ToolFailureCode::InvalidArguments,
+        format!("'{option}' is not supported when reading {kind} content"),
+        crate::tools::ToolRetryability::Never,
+    ))
+}
+
+fn read_artifact(
+    resolved: &Path,
+    generation: crate::runtime::ContentDigest,
+    byte_len: u64,
+    mime_type: &str,
+    encoding: Option<&str>,
+    sensitivity: crate::tools::ToolSensitivity,
+) -> crate::tools::ToolArtifact {
+    crate::tools::ToolArtifact {
+        id: format!("file:{generation}"),
+        kind: "file_snapshot".to_string(),
+        label: resolved.to_string_lossy().into_owned(),
+        metadata: serde_json::json!({
+            "generation": generation,
+            "byte_len": byte_len,
+            "mime_type": mime_type,
+            "encoding": encoding,
+        }),
+        sensitivity,
+    }
+}
+
+fn finish_typed_read(
+    run: &super::security::ToolRunContext,
+    resolved: &Path,
+    mut result: crate::tools::ToolHandlerResult,
+    generation: crate::runtime::ContentDigest,
+    total_bytes: u64,
+    start_line: usize,
+    end_line: usize,
+) -> crate::tools::ToolHandlerResult {
+    READ_TRACKER.mark_generation(run, resolved, generation, total_bytes);
+    run.record_skill_path_touch(resolved);
+    let excerpt = super::safe_truncate(result.content(), LEDGER_EXCERPT_MAX_BYTES).to_string();
+    record_active_file_read_observation_digest(
+        run, resolved, generation, start_line, end_line, excerpt,
+    );
+    result.usage.input_bytes = total_bytes;
+    result.usage.output_bytes = u64::try_from(result.content().len()).unwrap_or(u64::MAX);
+    result
+}
+
+fn text_page_result(
+    run: &super::security::ToolRunContext,
+    resolved: &Path,
+    page: read::StableReadPage,
+) -> crate::tools::ToolHandlerResult {
+    let read::StablePageContent::Text {
+        text,
+        start_line,
+        start_column_bytes,
+        end_line,
+        end_column_bytes,
+    } = page.content
+    else {
+        unreachable!("text_page_result requires text content")
+    };
+    let sensitivity = read_sensitivity(run, resolved);
+    let mut rendered = if text.is_empty() && page.total_bytes > 0 {
+        "(no lines at or after requested offset)".to_string()
+    } else {
+        read::render_numbered_text_page(&text, start_line, start_column_bytes)
+    };
+    let _ = write!(
+        rendered,
+        "\n\nFile snapshot: generation={}, bytes={}. Byte range: {}..{}.",
+        page.generation, page.total_bytes, page.byte_start, page.byte_end
+    );
+    let continuation = page
+        .next_cursor
+        .as_ref()
+        .map(|cursor| serde_json::json!({"cursor": cursor}));
+    if let Some(cursor) = page.next_cursor.as_ref() {
+        let _ = write!(
+            rendered,
+            " Read is partial; continue with cursor={cursor:?} (do not also pass offset)."
+        );
+    }
+    let structured = serde_json::json!({
+        "kind": "text",
+        "path": resolved,
+        "encoding": "utf-8",
+        "mime_type": "text/plain; charset=utf-8",
+        "sensitivity": sensitivity,
+        "artifact": {
+            "generation": page.generation,
+            "byte_len": page.total_bytes,
+        },
+        "range": {
+            "byte_start": page.byte_start,
+            "byte_end": page.byte_end,
+            "start_line": start_line,
+            "start_column_bytes": start_column_bytes,
+            "end_line": end_line,
+            "end_column_bytes": end_column_bytes,
+        },
+        "partial": continuation.is_some(),
+        "eof": continuation.is_none(),
+        "continuation": continuation,
+    });
+    let mut result = if let Some(continuation) = continuation {
+        crate::tools::ToolHandlerResult::partial_truncated_structured(
+            rendered,
+            structured,
+            page.total_bytes.saturating_sub(page.byte_end),
+            Some(continuation),
+        )
+    } else {
+        crate::tools::ToolHandlerResult::success_structured(rendered, structured)
+    };
+    result.sensitivity = sensitivity;
+    result = result.with_artifact(read_artifact(
+        resolved,
+        page.generation,
+        page.total_bytes,
+        "text/plain; charset=utf-8",
+        Some("utf-8"),
+        sensitivity,
+    ));
+    let ledger_end = if end_column_bytes == 0 && end_line > start_line {
+        end_line.saturating_sub(1)
+    } else {
+        end_line
+    };
+    finish_typed_read(
+        run,
+        resolved,
+        result,
+        page.generation,
+        page.total_bytes,
+        usize::try_from(start_line).unwrap_or(usize::MAX),
+        usize::try_from(ledger_end).unwrap_or(usize::MAX),
+    )
+}
+
+fn binary_page_result(
+    run: &super::security::ToolRunContext,
+    resolved: &Path,
+    page: read::StableReadPage,
+) -> crate::tools::ToolHandlerResult {
+    let read::StablePageContent::Binary(bytes) = page.content else {
+        unreachable!("binary_page_result requires binary content")
+    };
+    let media_type = "application/octet-stream";
+    if !provider_accepts_attachment(run.provider_id(), media_type) {
+        return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::Unavailable,
+            format!(
+                "Provider '{}' does not support typed binary tool-result attachments; use a text/domain-specific reader for '{}'",
+                run.provider_id(),
+                resolved.display()
+            ),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    let sensitivity = read_sensitivity(run, resolved);
+    let attachment =
+        match crate::tools::register_transient_attachment(media_type, bytes, sensitivity) {
+            Ok(attachment) => attachment,
+            Err(message) => {
+                return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                    crate::tools::ToolFailureCode::Unavailable,
+                    message,
+                    crate::tools::ToolRetryability::Safe,
+                ))
+            }
+        };
+    let continuation = page
+        .next_cursor
+        .as_ref()
+        .map(|cursor| serde_json::json!({"cursor": cursor}));
+    let text = format!(
+        "Binary file page attached as {media_type}: '{}' bytes {}..{} of {} (generation={}).",
+        resolved.display(),
+        page.byte_start,
+        page.byte_end,
+        page.total_bytes,
+        page.generation
+    );
+    let structured = serde_json::json!({
+        "kind": "binary",
+        "path": resolved,
+        "encoding": "binary",
+        "mime_type": media_type,
+        "sensitivity": sensitivity,
+        "artifact": {"generation": page.generation, "byte_len": page.total_bytes},
+        "range": {"byte_start": page.byte_start, "byte_end": page.byte_end},
+        "partial": continuation.is_some(),
+        "eof": continuation.is_none(),
+        "continuation": continuation,
+    });
+    let mut result = if let Some(continuation) = continuation {
+        crate::tools::ToolHandlerResult::partial_truncated_structured(
+            text,
+            structured,
+            page.total_bytes.saturating_sub(page.byte_end),
+            Some(continuation),
+        )
+    } else {
+        crate::tools::ToolHandlerResult::success_structured(text, structured)
+    };
+    result.sensitivity = sensitivity;
+    result = result
+        .with_artifact(read_artifact(
+            resolved,
+            page.generation,
+            page.total_bytes,
+            media_type,
+            None,
+            sensitivity,
+        ))
+        .with_attachment(attachment);
+    finish_typed_read(
+        run,
+        resolved,
+        result,
+        page.generation,
+        page.total_bytes,
+        1,
+        1,
+    )
+}
+
+fn media_result(
+    run: &super::security::ToolRunContext,
+    resolved: &Path,
+    bytes: Vec<u8>,
+    kind: read::ImageKind,
+) -> crate::tools::ToolHandlerResult {
+    let sensitivity = read_sensitivity(run, resolved);
+    let generation = crate::runtime::ContentDigest::sha256(&bytes);
+    let total_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let media_type = kind.mime();
+    let Some(dimensions) = kind.dimensions(&bytes) else {
+        return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::InvalidInput,
+            format!(
+                "Image '{}' does not contain a valid {media_type} header and non-zero dimensions matching its extension",
+                resolved.display()
+            ),
+            crate::tools::ToolRetryability::Never,
+        ));
+    };
+    let pixels = u64::from(dimensions.width).saturating_mul(u64::from(dimensions.height));
+    if dimensions.width > MAX_IMAGE_EDGE_PIXELS
+        || dimensions.height > MAX_IMAGE_EDGE_PIXELS
+        || pixels > MAX_IMAGE_PIXELS
+    {
+        return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::InvalidInput,
+            format!(
+                "Image '{}' declares unsupported dimensions {}x{} (maximum edge {MAX_IMAGE_EDGE_PIXELS}, maximum pixels {MAX_IMAGE_PIXELS})",
+                resolved.display(), dimensions.width, dimensions.height
+            ),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    if !provider_accepts_attachment(run.provider_id(), media_type) {
+        return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::Unavailable,
+            format!(
+                "Provider '{}' does not support typed {media_type} tool-result attachments",
+                run.provider_id()
+            ),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    let mut attachment =
+        match crate::tools::register_transient_attachment(media_type, bytes, sensitivity) {
+            Ok(attachment) => attachment,
+            Err(message) => {
+                return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                    crate::tools::ToolFailureCode::Unavailable,
+                    message,
+                    crate::tools::ToolRetryability::Safe,
+                ))
+            }
+        };
+    if let Some(metadata) = attachment.data.as_object_mut() {
+        metadata.insert("width".to_string(), serde_json::json!(dimensions.width));
+        metadata.insert("height".to_string(), serde_json::json!(dimensions.height));
+    }
+    let text = format!(
+        "Image attached natively: '{}' ({}x{}, {total_bytes} bytes, {media_type}, generation={generation}).",
+        resolved.display(), dimensions.width, dimensions.height
+    );
+    let structured = serde_json::json!({
+        "kind": "image",
+        "path": resolved,
+        "encoding": "binary",
+        "mime_type": media_type,
+        "sensitivity": sensitivity,
+        "artifact": {"generation": generation, "byte_len": total_bytes},
+        "dimensions": {"width": dimensions.width, "height": dimensions.height},
+        "partial": false,
+        "eof": true,
+    });
+    let mut result = crate::tools::ToolHandlerResult::success_structured(text, structured)
+        .with_artifact(read_artifact(
+            resolved,
+            generation,
+            total_bytes,
+            media_type,
+            None,
+            sensitivity,
+        ))
+        .with_attachment(attachment);
+    result.sensitivity = sensitivity;
+    result.usage.input_bytes = total_bytes;
+    result.usage.output_bytes = u64::try_from(result.content().len()).unwrap_or(u64::MAX);
+    READ_TRACKER.mark_generation(run, resolved, generation, total_bytes);
+    run.record_skill_path_touch(resolved);
+    record_active_file_read_observation_digest(
+        run,
+        resolved,
+        generation,
+        1,
+        1,
+        result.content().to_string(),
+    );
+    result
+}
+
+fn read_text_or_binary_typed(
+    run: &super::security::ToolRunContext,
+    args: &HashMap<String, serde_json::Value>,
+    resolved: &Path,
+    file: &mut std::fs::File,
+) -> crate::tools::ToolHandlerResult {
+    if let Some(option) = incompatible_read_option(args, &["offset", "limit", "cursor"]) {
+        return incompatible_read_result(option, "text or binary");
+    }
+    match read::read_stable_page(run, file, resolved, args) {
+        Ok(
+            page @ read::StableReadPage {
+                content: read::StablePageContent::Text { .. },
+                ..
+            },
+        ) => text_page_result(run, resolved, page),
+        Ok(page) => binary_page_result(run, resolved, page),
+        Err(failure) => crate::tools::ToolHandlerResult::error(failure),
+    }
+}
+
+fn read_image_typed(
+    run: &super::security::ToolRunContext,
+    args: &HashMap<String, serde_json::Value>,
+    resolved: &Path,
+    file: &mut std::fs::File,
+    kind: read::ImageKind,
+) -> crate::tools::ToolHandlerResult {
+    if let Some(option) = incompatible_read_option(args, &[]) {
+        return incompatible_read_result(option, "image");
+    }
+    let bytes = match secure_fs::read_stable_bounded_bytes(
+        file,
+        resolved,
+        usize::try_from(read::MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX),
+    ) {
         Ok(bytes) => bytes,
-        Err(error) => return error,
+        Err(message) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::InvalidInput,
+                message,
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
     };
+    media_result(run, resolved, bytes, kind)
+}
 
-    let (mut content, is_error) = match detect_file_type(&resolved_str) {
-        FileType::Image(kind) => read::render_image_bytes(&resolved_str, kind, &bytes),
+fn render_derived_content(
+    run: &super::security::ToolRunContext,
+    args: &HashMap<String, serde_json::Value>,
+    resolved: &Path,
+    bytes: &[u8],
+    file_type: read::FileType,
+) -> Result<(String, &'static str, &'static str), crate::tools::ToolFailure> {
+    let (content, is_error, mime_type, representation) = match file_type {
         FileType::Pdf => {
             let pages = match args.get("pages") {
                 None => None,
                 Some(serde_json::Value::String(value)) => Some(value.as_str()),
                 Some(_) => {
-                    return ToolArgError::WrongType {
-                        key: "pages",
-                        expected: "string",
-                    }
-                    .into_tool_error();
+                    return Err(crate::tools::ToolFailure::new(
+                        crate::tools::ToolFailureCode::InvalidArguments,
+                        "'pages' must be a string".to_string(),
+                        crate::tools::ToolRetryability::Never,
+                    ));
                 }
             };
-            read::render_pdf_bytes(run, &resolved_str, pages, &bytes)
+            let (content, is_error) =
+                read::render_pdf_bytes(run, &resolved.to_string_lossy(), pages, bytes);
+            (content, is_error, "application/pdf", "extracted_text")
         }
-        FileType::Notebook => read::render_notebook_bytes(&resolved_str, &bytes),
-        FileType::Text => read::render_text_bytes(&resolved_str, args, &bytes),
+        FileType::Notebook => {
+            let (content, is_error) =
+                read::render_notebook_bytes(&resolved.to_string_lossy(), bytes);
+            (
+                content,
+                is_error,
+                "application/x-ipynb+json",
+                "rendered_notebook",
+            )
+        }
+        _ => unreachable!("derived file type was matched before rendering"),
     };
-
-    if !is_error {
-        let snapshot = READ_TRACKER.mark_snapshot(run, &resolved, &bytes);
-        let _ = write!(
+    if is_error {
+        Err(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::External,
             content,
-            "\n\nFile snapshot: generation={}, bytes={}. Pass this generation as expected_snapshot when editing or overwriting this file.",
-            snapshot.generation(),
-            snapshot.byte_len()
-        );
-        run.record_skill_path_touch(&resolved);
-        record_active_file_read_observation(run, &resolved, args, &content, &bytes);
+            crate::tools::ToolRetryability::Never,
+        ))
+    } else {
+        Ok((content, mime_type, representation))
     }
-
-    (content, is_error)
 }
 
-fn record_active_file_read_observation(
+fn build_derived_result(
     run: &super::security::ToolRunContext,
     resolved: &Path,
-    args: &std::collections::HashMap<String, serde_json::Value>,
-    output: &str,
-    bytes: &[u8],
+    content: String,
+    mime_type: &str,
+    representation: &str,
+    generation: crate::runtime::ContentDigest,
+    total_bytes: u64,
+) -> crate::tools::ToolHandlerResult {
+    let sensitivity = read_sensitivity(run, resolved);
+    let derived_bytes = content.len();
+    let truncated = derived_bytes > MAX_DERIVED_READ_OUTPUT_BYTES;
+    let content = if truncated {
+        format!(
+            "{}\n[derived representation truncated at {MAX_DERIVED_READ_OUTPUT_BYTES} bytes; narrow the document read]",
+            super::safe_truncate(&content, MAX_DERIVED_READ_OUTPUT_BYTES)
+        )
+    } else {
+        content
+    };
+    let structured = serde_json::json!({
+        "kind": "document",
+        "path": resolved,
+        "encoding": "utf-8",
+        "mime_type": mime_type,
+        "representation": representation,
+        "sensitivity": sensitivity,
+        "artifact": {"generation": generation, "byte_len": total_bytes},
+        "partial": truncated,
+        "eof": true,
+        "truncation": truncated.then(|| serde_json::json!({
+            "output_bytes": derived_bytes,
+            "kept_bytes": MAX_DERIVED_READ_OUTPUT_BYTES,
+            "continuation": null,
+        })),
+    });
+    let result = if truncated {
+        crate::tools::ToolHandlerResult::partial_truncated_structured(
+            content,
+            structured,
+            u64::try_from(derived_bytes.saturating_sub(MAX_DERIVED_READ_OUTPUT_BYTES))
+                .unwrap_or(u64::MAX),
+            None,
+        )
+    } else {
+        crate::tools::ToolHandlerResult::success_structured(content, structured)
+    };
+    let mut result = result.with_artifact(read_artifact(
+        resolved,
+        generation,
+        total_bytes,
+        mime_type,
+        Some("utf-8"),
+        sensitivity,
+    ));
+    result.sensitivity = sensitivity;
+    finish_typed_read(run, resolved, result, generation, total_bytes, 1, 1)
+}
+
+fn read_derived_document_typed(
+    run: &super::security::ToolRunContext,
+    args: &HashMap<String, serde_json::Value>,
+    resolved: &Path,
+    file: &mut std::fs::File,
+    file_type: read::FileType,
+) -> crate::tools::ToolHandlerResult {
+    let allowed = if matches!(file_type, FileType::Pdf) {
+        &["pages"][..]
+    } else {
+        &[][..]
+    };
+    if let Some(option) = incompatible_read_option(args, allowed) {
+        return incompatible_read_result(option, "derived document");
+    }
+    let bytes = match secure_fs::read_stable_bounded_bytes(
+        file,
+        resolved,
+        usize::try_from(read::MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX),
+    ) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::InvalidInput,
+                message,
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
+    };
+    let generation = crate::runtime::ContentDigest::sha256(&bytes);
+    let total_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let (content, mime_type, representation) =
+        match render_derived_content(run, args, resolved, &bytes, file_type) {
+            Ok(rendered) => rendered,
+            Err(failure) => return crate::tools::ToolHandlerResult::error(failure),
+        };
+    build_derived_result(
+        run,
+        resolved,
+        content,
+        mime_type,
+        representation,
+        generation,
+        total_bytes,
+    )
+}
+
+pub fn execute_read_file_typed(
+    run: &super::security::ToolRunContext,
+    args: &HashMap<String, serde_json::Value>,
+) -> crate::tools::ToolHandlerResult {
+    let path = match args.arg_str_strict("path") {
+        Ok(path) => path,
+        Err(error) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error.to_string(),
+                crate::tools::ToolRetryability::Never,
+            ))
+        }
+    };
+    let resolved = match resolve_path(run, path) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::PermissionDenied,
+                message,
+                crate::tools::ToolRetryability::Never,
+            ))
+        }
+    };
+    let mut file = match secure_fs::open_regular_read(run, &resolved) {
+        Ok(file) => file,
+        Err(message) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::PermissionDenied,
+                message,
+                crate::tools::ToolRetryability::Never,
+            ))
+        }
+    };
+    let file_type = detect_file_type(&resolved.to_string_lossy());
+    match file_type {
+        FileType::Text => read_text_or_binary_typed(run, args, &resolved, &mut file),
+        FileType::Image(kind) => read_image_typed(run, args, &resolved, &mut file, kind),
+        FileType::Pdf | FileType::Notebook => {
+            read_derived_document_typed(run, args, &resolved, &mut file, file_type)
+        }
+    }
+}
+
+fn record_active_file_read_observation_digest(
+    run: &super::security::ToolRunContext,
+    resolved: &Path,
+    generation: crate::runtime::ContentDigest,
+    start_line: usize,
+    end_line: usize,
+    excerpt: String,
 ) {
-    let session_key = run.session_id();
-    let Some(ledger) = crate::ledger::active_ledger_for_session(session_key) else {
+    let Some(ledger) = crate::ledger::active_ledger_for_session(run.session_id()) else {
         return;
     };
-
-    let (start_line, end_line) = ledger_line_range(args, bytes, output);
-    let excerpt = super::safe_truncate(output, LEDGER_EXCERPT_MAX_BYTES).to_string();
-    let mut ledger = ledger.lock().unwrap_or_else(|err| {
+    let digest = generation.to_string();
+    let sha256 = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    let mut ledger = ledger.lock().unwrap_or_else(|error| {
         tracing::error!("active reality ledger lock poisoned; recovering inner state");
-        err.into_inner()
+        error.into_inner()
     });
-    if let Err(err) = ledger.observe_file_read_bytes(
+    if let Err(error) = ledger.observe_file_read_digest(
         run,
         resolved.to_string_lossy().to_string(),
-        bytes,
+        sha256,
         start_line,
         end_line,
         excerpt,
     ) {
         tracing::warn!(
             path = %resolved.display(),
-            error = %err,
-            "failed to append read_file observation to reality ledger"
+            error = %error,
+            "failed to append streamed read_file observation to reality ledger"
         );
     }
 }
@@ -842,38 +1415,6 @@ pub(super) fn require_fresh_file_observation_if_ledger_active(
     Err(format!(
         "You must read '{path}' before {action}. The active reality ledger has no fresh file read observation; use read_file first to ground the change."
     ))
-}
-
-fn ledger_line_range(
-    args: &std::collections::HashMap<String, serde_json::Value>,
-    bytes: &[u8],
-    output: &str,
-) -> (usize, usize) {
-    let start_line = args
-        .get("offset")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(1);
-
-    let total_lines = std::str::from_utf8(bytes)
-        .map_or_else(|_| output.lines().count().max(1), count_display_lines);
-    let requested = args
-        .get("limit")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
-        .filter(|n| *n > 0);
-    let end_line = requested.map_or(total_lines, |limit| {
-        start_line.saturating_add(limit).saturating_sub(1)
-    });
-    (start_line, end_line.min(total_lines.max(start_line)))
-}
-
-fn count_display_lines(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-    text.lines().count().max(1)
 }
 
 pub(super) fn require_expected_snapshot(
@@ -1155,6 +1696,7 @@ pub fn shared_tracker_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::sync::MutexGuard;
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
@@ -1174,6 +1716,205 @@ mod tests {
         // previously allowed concurrent corruption of READ_TRACKER
         // state across sibling test modules.
         super::shared_tracker_lock()
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("valid embedded PNG fixture")
+    }
+
+    #[test]
+    fn typed_text_page_exposes_matching_gap_free_continuation_metadata() {
+        let root = tempfile::tempdir().expect("text project root");
+        let path = root.path().join("large.txt");
+        std::fs::write(&path, "line\n".repeat(20_000)).expect("write paged text fixture");
+        let run = crate::tools::security::test_run_context_for_provider(root.path(), "anthropic");
+        let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
+        let first = execute_read_file_typed(&run, &args);
+
+        let crate::tools::ToolOutcome::Partial {
+            content,
+            continuation,
+            ..
+        } = &first.outcome
+        else {
+            panic!("large typed text read must be partial")
+        };
+        let structured = content.structured.as_ref().expect("structured text result");
+        assert_eq!(structured["kind"], "text");
+        assert_eq!(structured["encoding"], "utf-8");
+        assert_eq!(structured["mime_type"], "text/plain; charset=utf-8");
+        assert_eq!(structured["partial"], true);
+        assert_eq!(structured["eof"], false);
+        assert_eq!(structured["continuation"], serde_json::json!(continuation));
+        let crate::tools::ToolCompleteness::Truncated {
+            continuation: completeness_continuation,
+            omitted_bytes,
+        } = &content.completeness
+        else {
+            panic!("partial result must report typed truncation")
+        };
+        assert_eq!(completeness_continuation, continuation);
+        assert!(*omitted_bytes > 0);
+        let first_end = structured["range"]["byte_end"]
+            .as_u64()
+            .expect("first byte end");
+        let cursor = continuation
+            .as_ref()
+            .and_then(|value| value.get("cursor"))
+            .and_then(serde_json::Value::as_str)
+            .expect("opaque continuation cursor");
+
+        let next_args = HashMap::from([
+            ("path".to_string(), serde_json::json!(path)),
+            ("cursor".to_string(), serde_json::json!(cursor)),
+        ]);
+        let next = execute_read_file_typed(&run, &next_args);
+        let next_structured = match &next.outcome {
+            crate::tools::ToolOutcome::Success { content }
+            | crate::tools::ToolOutcome::Partial { content, .. } => {
+                content.structured.as_ref().expect("next structured result")
+            }
+            crate::tools::ToolOutcome::Error { failure } => {
+                panic!("continuation failed: {}", failure.message)
+            }
+        };
+        assert_eq!(next_structured["range"]["byte_start"], first_end);
+        assert_eq!(next_structured["artifact"], structured["artifact"]);
+    }
+
+    #[test]
+    fn typed_binary_page_is_bounded_native_data_not_serialized_prose() {
+        let root = tempfile::tempdir().expect("binary project root");
+        let path = root.path().join("payload.bin");
+        let bytes = (0_u8..64)
+            .map(|byte| byte.wrapping_add(0x80))
+            .collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).expect("write binary fixture");
+        let run = crate::tools::security::test_run_context_for_provider(root.path(), "google");
+        let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
+        let handler_result = execute_read_file_typed(&run, &args);
+
+        let crate::tools::ToolOutcome::Success { content } = &handler_result.outcome else {
+            panic!("small Google binary read must succeed")
+        };
+        let structured = content
+            .structured
+            .as_ref()
+            .expect("structured binary result");
+        assert_eq!(structured["kind"], "binary");
+        assert_eq!(structured["encoding"], "binary");
+        assert_eq!(structured["mime_type"], "application/octet-stream");
+        assert_eq!(structured["range"]["byte_start"], 0);
+        assert_eq!(structured["range"]["byte_end"], bytes.len());
+        assert_eq!(structured["eof"], true);
+        assert_eq!(handler_result.attachments.len(), 1);
+
+        let call = crate::tools::ToolCall {
+            id: "binary-call".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: serde_json::to_string(&serde_json::json!({"path": path}))
+                    .expect("serialize arguments"),
+            },
+        };
+        let result = crate::tools::ToolResult::bind(&call, "read_file", handler_result);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert!(!serde_json::to_string(&result)
+            .expect("serialize typed binary result")
+            .contains(&encoded));
+        assert!(!result.provider_content().contains(&encoded));
+        let message = result.openai_message();
+        let resolved = crate::tools::resolve_tool_attachments(
+            message.get(crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY),
+        )
+        .expect("resolve transient binary attachment");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].bytes.as_ref(), bytes.as_slice());
+    }
+
+    #[test]
+    fn typed_image_read_keeps_raw_media_out_of_the_serialized_result() {
+        let root = tempfile::tempdir().expect("image project root");
+        let path = root.path().join("pixel.png");
+        let bytes = tiny_png();
+        std::fs::write(&path, &bytes).expect("write image fixture");
+        let run = crate::tools::security::test_run_context_for_provider(root.path(), "anthropic");
+        let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
+        let handler_result = execute_read_file_typed(&run, &args);
+
+        let crate::tools::ToolOutcome::Success { content } = &handler_result.outcome else {
+            panic!("valid PNG must produce a successful typed result")
+        };
+        let structured = content
+            .structured
+            .as_ref()
+            .expect("structured image result");
+        assert_eq!(structured["dimensions"]["width"], 1);
+        assert_eq!(structured["dimensions"]["height"], 1);
+        assert_eq!(structured["eof"], true);
+        assert_eq!(handler_result.attachments.len(), 1);
+        assert_eq!(handler_result.attachments[0].media_type, "image/png");
+        assert_eq!(handler_result.attachments[0].data["width"], 1);
+        assert_eq!(handler_result.attachments[0].data["height"], 1);
+        let call = crate::tools::ToolCall {
+            id: "image-call".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: serde_json::to_string(&serde_json::json!({"path": path}))
+                    .expect("serialize arguments"),
+            },
+        };
+        let result = crate::tools::ToolResult::bind(&call, "read_file", handler_result);
+        let encoded_media = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let serialized = serde_json::to_string(&result).expect("serialize typed result");
+        assert!(!serialized.contains(&encoded_media));
+        assert!(!result.provider_content().contains(&encoded_media));
+        assert!(result
+            .openai_message()
+            .get(crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY)
+            .is_some());
+    }
+
+    #[test]
+    fn image_read_reports_typed_unavailable_for_unsupported_provider() {
+        let root = tempfile::tempdir().expect("image project root");
+        let path = root.path().join("pixel.png");
+        std::fs::write(&path, tiny_png()).expect("write image fixture");
+        let run = crate::tools::security::test_run_context_for_provider(root.path(), "deepseek");
+        let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
+        let result = execute_read_file_typed(&run, &args);
+
+        let crate::tools::ToolOutcome::Error { failure } = &result.outcome else {
+            panic!("unsupported provider must return a typed error")
+        };
+        assert_eq!(failure.code, crate::tools::ToolFailureCode::Unavailable);
+        assert!(result.attachments.is_empty());
+    }
+
+    #[test]
+    fn image_read_rejects_excessive_declared_dimensions() {
+        let root = tempfile::tempdir().expect("image project root");
+        let path = root.path().join("oversized.png");
+        let mut bytes = vec![0_u8; 24];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&(MAX_IMAGE_EDGE_PIXELS + 1).to_be_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_be_bytes());
+        std::fs::write(&path, bytes).expect("write declared-dimension fixture");
+        let run = crate::tools::security::test_run_context_for_provider(root.path(), "anthropic");
+        let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
+        let result = execute_read_file_typed(&run, &args);
+
+        let crate::tools::ToolOutcome::Error { failure } = &result.outcome else {
+            panic!("excessive image dimensions must fail before provider delivery")
+        };
+        assert_eq!(failure.code, crate::tools::ToolFailureCode::InvalidInput);
+        assert!(failure.message.contains("dimensions"));
+        assert!(result.attachments.is_empty());
     }
 
     #[test]

@@ -1075,6 +1075,15 @@ impl ToolRunContext {
         self.runtime.descriptor().session_id.as_str()
     }
 
+    /// Provider identity captured when this immutable run was created.
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        match &self.runtime.descriptor().provider_continuation {
+            crate::runtime::ProviderContinuation::Fresh { provider }
+            | crate::runtime::ProviderContinuation::Resume { provider, .. } => provider.as_str(),
+        }
+    }
+
     /// Stable logical owner label for model-facing process lifecycle tools.
     #[must_use]
     pub fn process_owner(&self) -> &str {
@@ -2291,6 +2300,11 @@ pub(crate) fn test_run_context() -> &'static Arc<ToolRunContext> {
 /// Build an isolated crate-test capability for a caller-owned root.
 #[cfg(test)]
 pub(crate) fn test_run_context_for(root: &Path) -> Arc<ToolRunContext> {
+    test_run_context_for_provider(root, "unit-test")
+}
+
+#[cfg(test)]
+pub(crate) fn test_run_context_for_provider(root: &Path, provider: &str) -> Arc<ToolRunContext> {
     ToolRunContext::builder(SessionId::new(), root)
         .read_only_roots(Vec::new())
         .read_write_roots(Vec::new())
@@ -2299,7 +2313,7 @@ pub(crate) fn test_run_context_for(root: &Path) -> Arc<ToolRunContext> {
         .process(true)
         .network(true)
         .secrets(true)
-        .provider("unit-test")
+        .provider(provider)
         .build()
         .expect("test root must produce an explicit run capability")
 }

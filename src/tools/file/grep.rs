@@ -479,9 +479,9 @@ pub fn execute_grep_typed(
         Ok(Some(discovery::CursorPosition::Match { .. })) => {
             return invalid_arguments("Invalid cursor: grep match line must be positive")
         }
-        Ok(Some(discovery::CursorPosition::Entry { .. })) => {
-            return invalid_arguments("Invalid cursor: expected a grep-match position")
-        }
+        Ok(Some(
+            discovery::CursorPosition::Entry { .. } | discovery::CursorPosition::Read { .. },
+        )) => return invalid_arguments("Invalid cursor: expected a grep-match position"),
         Err(error) => return invalid_arguments(error),
     };
 

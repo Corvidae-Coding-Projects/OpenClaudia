@@ -8,7 +8,7 @@ use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
 use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
 use openclaudia::tools::{
     clear_todo_list, execute_tool, get_todo_list, reset_read_tracker, FunctionCall, TodoStatus,
-    ToolCall, ToolResult,
+    ToolCall, ToolOutcome, ToolResult,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -154,20 +154,17 @@ mod file_tools {
 
         let result = execute_tool(support::shared_run_context(), &tool_call);
 
-        assert!(result.is_error(), "Read of nonexistent file should fail");
-        // The path-jail (crosslink #269) rejects out-of-root paths before
-        // attempting the read, so any of these error phrasings is acceptable:
-        // strict-jail rejection, legacy not-found error, or a generic failure.
-        let c = result.content().to_lowercase();
+        let ToolOutcome::Error { failure } = result.outcome() else {
+            panic!("read of nonexistent file must return a typed error: {result:?}");
+        };
         assert!(
-            c.contains("not found")
-                || c.contains("no such file")
-                || c.contains("cannot find")
-                || c.contains("failed")
-                || c.contains("outside the project root")
-                || c.contains("path traversal"),
-            "Error should describe a path/file-access failure: {}",
-            result.content()
+            failure.message.starts_with("NOT_FOUND:")
+                && failure.message.contains("does not exist")
+                && failure
+                    .message
+                    .contains("definitely-nonexistent-integration-file.txt"),
+            "not-found failure must identify the missing path: {}",
+            failure.message
         );
     }
 

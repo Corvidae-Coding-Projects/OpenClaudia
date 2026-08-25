@@ -85,7 +85,10 @@ fn pdf_pages_arg_as_number_returns_validation_error() {
     ]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'pages' argument: expected string"));
+    assert!(
+        msg.contains("pages") && msg.contains("string"),
+        "typed validation must identify pages and its required type: {msg}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -110,7 +113,10 @@ fn nonexistent_path_errors_with_stat_message() {
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Cannot stat") || msg.contains("Failed") || msg.contains("not found"),
+        msg.contains("Cannot stat")
+            || msg.contains("Failed")
+            || msg.to_ascii_lowercase().contains("not_found")
+            || msg.to_ascii_lowercase().contains("not found"),
         "MUST surface stat / not-found error; got {msg:?}"
     );
     // Error MUST echo the offending path so model can self-correct.

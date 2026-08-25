@@ -7,11 +7,59 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::ToolCall;
 
 /// Current serialized tool-result schema.
 pub const TOOL_RESULT_SCHEMA_VERSION: u16 = 1;
+
+/// Private message field carrying bounded attachment references between the
+/// tool executor and provider adapters. The referenced bytes live only in the
+/// process-local sidecar below; serialized transcripts retain metadata, never
+/// raw media.
+pub const TOOL_ATTACHMENTS_MESSAGE_KEY: &str = "_openclaudia_tool_attachments";
+
+const MAX_TRANSIENT_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_TRANSIENT_ATTACHMENT_STORE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRANSIENT_ATTACHMENT_ENTRIES: usize = 32;
+
+#[derive(Debug)]
+struct TransientAttachmentEntry {
+    media_type: String,
+    digest: String,
+    bytes: Arc<[u8]>,
+}
+
+#[derive(Default)]
+struct TransientAttachmentStore {
+    entries: HashMap<String, TransientAttachmentEntry>,
+    insertion_order: VecDeque<String>,
+    retained_bytes: usize,
+}
+
+impl TransientAttachmentStore {
+    fn insert(&mut self, token: String, entry: TransientAttachmentEntry) {
+        while self.entries.len() >= MAX_TRANSIENT_ATTACHMENT_ENTRIES
+            || self.retained_bytes.saturating_add(entry.bytes.len())
+                > MAX_TRANSIENT_ATTACHMENT_STORE_BYTES
+        {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(removed.bytes.len());
+            }
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(entry.bytes.len());
+        self.insertion_order.push_back(token.clone());
+        self.entries.insert(token, entry);
+    }
+}
+
+static TRANSIENT_ATTACHMENTS: LazyLock<Mutex<TransientAttachmentStore>> =
+    LazyLock::new(|| Mutex::new(TransientAttachmentStore::default()));
 
 /// Exact invocation identity bound to a tool result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +218,111 @@ pub struct ToolAttachment {
     pub byte_len: u64,
     pub data: Value,
     pub sensitivity: ToolSensitivity,
+}
+
+/// Provider-ready bytes recovered from one process-local attachment reference.
+/// Cloning this value shares the immutable allocation rather than duplicating
+/// a potentially multi-megabyte image.
+#[derive(Debug, Clone)]
+pub struct ResolvedToolAttachment {
+    pub media_type: String,
+    pub digest: String,
+    pub bytes: Arc<[u8]>,
+}
+
+/// Register bounded media without placing its bytes in the canonical result or
+/// any serialized message. The returned attachment is durable metadata plus an
+/// unguessable process-local capability reference.
+pub fn register_transient_attachment(
+    media_type: impl Into<String>,
+    bytes: Vec<u8>,
+    sensitivity: ToolSensitivity,
+) -> Result<ToolAttachment, String> {
+    if bytes.is_empty() {
+        return Err("Transient attachment bytes cannot be empty".to_string());
+    }
+    if bytes.len() > MAX_TRANSIENT_ATTACHMENT_BYTES {
+        return Err(format!(
+            "Transient attachment exceeds the {MAX_TRANSIENT_ATTACHMENT_BYTES}-byte item budget"
+        ));
+    }
+    let media_type = media_type.into();
+    if media_type.is_empty() || media_type.len() > 127 || !media_type.is_ascii() {
+        return Err("Transient attachment MIME type is invalid".to_string());
+    }
+    let digest = crate::runtime::ContentDigest::sha256(&bytes).to_string();
+    let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let token = uuid::Uuid::new_v4().to_string();
+    let entry = TransientAttachmentEntry {
+        media_type: media_type.clone(),
+        digest: digest.clone(),
+        bytes: Arc::from(bytes),
+    };
+    TRANSIENT_ATTACHMENTS
+        .lock()
+        .map_err(|error| format!("Transient attachment store is unavailable: {error}"))?
+        .insert(token.clone(), entry);
+    Ok(ToolAttachment {
+        media_type,
+        digest,
+        byte_len,
+        data: json!({"kind": "transient_media", "token": token}),
+        sensitivity,
+    })
+}
+
+fn is_transient_attachment(attachment: &ToolAttachment) -> bool {
+    attachment.data.get("kind").and_then(Value::as_str) == Some("transient_media")
+        && attachment
+            .data
+            .get("token")
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+}
+
+/// Resolve the private attachment references copied into one in-memory tool
+/// message. Callers receive an explicit error after eviction or malformed
+/// metadata instead of silently sending a text-only result.
+pub fn resolve_tool_attachments(
+    raw: Option<&Value>,
+) -> Result<Vec<ResolvedToolAttachment>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let attachments: Vec<ToolAttachment> = serde_json::from_value(raw.clone())
+        .map_err(|error| format!("Invalid typed tool attachment metadata: {error}"))?;
+    let store = TRANSIENT_ATTACHMENTS
+        .lock()
+        .map_err(|error| format!("Transient attachment store is unavailable: {error}"))?;
+    attachments
+        .into_iter()
+        .map(|attachment| {
+            let token = attachment
+                .data
+                .get("token")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| "Typed tool attachment is missing its transient token".to_string())?;
+            let entry = store.entries.get(token).ok_or_else(|| {
+                format!(
+                    "Typed tool attachment {} is no longer available in the bounded transient store",
+                    attachment.digest
+                )
+            })?;
+            if entry.media_type != attachment.media_type
+                || entry.digest != attachment.digest
+                || u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX) != attachment.byte_len
+            {
+                return Err("Typed tool attachment metadata does not match its transient bytes"
+                    .to_string());
+            }
+            Ok(ResolvedToolAttachment {
+                media_type: entry.media_type.clone(),
+                digest: entry.digest.clone(),
+                bytes: Arc::clone(&entry.bytes),
+            })
+        })
+        .collect()
 }
 
 /// One authoritative or advisory observation emitted by a handler.
@@ -436,6 +589,37 @@ impl ToolHandlerResult {
         }
     }
 
+    /// Report a bounded page with exact omitted-byte and continuation data.
+    #[must_use]
+    pub fn partial_truncated_structured(
+        text: impl Into<String>,
+        structured: Value,
+        omitted_bytes: u64,
+        continuation: Option<Value>,
+    ) -> Self {
+        Self {
+            outcome: ToolOutcome::Partial {
+                content: ToolContent {
+                    text: text.into(),
+                    structured: Some(structured),
+                    completeness: ToolCompleteness::Truncated {
+                        omitted_bytes,
+                        continuation: continuation.clone(),
+                    },
+                },
+                failures: Vec::new(),
+                continuation,
+            },
+            artifacts: Vec::new(),
+            attachments: Vec::new(),
+            observations: Vec::new(),
+            display: ToolDisplay::Auto,
+            follow_up: ToolFollowUp::None,
+            usage: ToolUsage::default(),
+            sensitivity: ToolSensitivity::Workspace,
+        }
+    }
+
     #[must_use]
     pub fn legacy(content: String, is_error: bool) -> Self {
         if is_error {
@@ -517,6 +701,12 @@ impl ToolHandlerResult {
     #[must_use]
     pub fn with_artifact(mut self, artifact: ToolArtifact) -> Self {
         self.artifacts.push(artifact);
+        self
+    }
+
+    #[must_use]
+    pub fn with_attachment(mut self, attachment: ToolAttachment) -> Self {
+        self.attachments.push(attachment);
         self
     }
 
@@ -880,12 +1070,25 @@ impl ToolExecutionResult {
     /// OpenAI-compatible tool-result message derived from the typed result.
     #[must_use]
     pub fn openai_message(&self) -> Value {
-        json!({
+        let mut message = json!({
             "role": "tool",
             "tool_call_id": self.tool_call_id(),
             "content": self.provider_content(),
             "is_error": self.is_error(),
-        })
+        });
+        let transient = self
+            .attachments
+            .iter()
+            .filter(|attachment| is_transient_attachment(attachment))
+            .collect::<Vec<_>>();
+        if !transient.is_empty() {
+            if let (Some(object), Ok(serialized)) =
+                (message.as_object_mut(), serde_json::to_value(transient))
+            {
+                object.insert(TOOL_ATTACHMENTS_MESSAGE_KEY.to_string(), serialized);
+            }
+        }
+        message
     }
 }
 

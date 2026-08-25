@@ -88,10 +88,19 @@ fn write_read_edit_read_cross_tool_flow() {
     assert!(rs.content().contains("line two"), "offset=2 yields line 2");
     assert!(!rs.content().contains("line one"), "line 1 excluded");
     assert!(!rs.content().contains("line three"), "line 3 excluded");
+    assert!(rs.is_partial(), "a bounded one-line slice must be partial");
+    assert_eq!(
+        rs.structured()
+            .and_then(|value| value.pointer("/range/start_line"))
+            .and_then(serde_json::Value::as_u64),
+        Some(2)
+    );
     assert!(
-        rs.content().contains("showing lines 2-2 of 3 total"),
-        "suffix present: {}",
-        rs.content()
+        rs.structured()
+            .and_then(|value| value.pointer("/continuation/cursor"))
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "typed continuation must make the partial read resumable"
     );
     let edit_snapshot = snapshot_from_read_output(rs.content());
 
@@ -212,14 +221,11 @@ fn read_offset_beyond_eof_is_non_error() {
 }
 
 // =============================================================================
-// Behavior 8: large file — truncation is non-error (not an error like CC)
+// Behavior 8: large file — bounded partial result with continuation
 // =============================================================================
 
 #[test]
-fn read_large_file_truncated_as_non_error() {
-    // Behavior 8: OC silently truncates at 100 000 chars; CC throws an error.
-    // Pinned as current OC behavior. CC parity gap: no error flag, no offset
-    // guidance in the result.
+fn read_large_file_returns_bounded_partial_page() {
     let dir = TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("large.txt");
     // Each numbered line is ~208 chars; 600 lines ≈ 124 800 chars → triggers truncation
@@ -229,15 +235,21 @@ fn read_large_file_truncated_as_non_error() {
 
     let call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
     let r = execute_tool(support::shared_run_context(), &call);
+    assert!(!r.is_error(), "a bounded partial read is not an error");
     assert!(
-        !r.is_error(),
-        "OC large-file truncation is NOT an error (CC parity gap, Behavior 8): {}",
-        r.content()
+        r.is_partial(),
+        "large text must report an honest partial result"
     );
     assert!(
-        r.content().contains("file truncated"),
-        "truncation note present: {}",
-        r.content()
+        r.content().len() < 100_000,
+        "rendered page must remain below the output budget"
+    );
+    assert!(
+        r.structured()
+            .and_then(|value| value.pointer("/continuation/cursor"))
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "large-file partial result must provide a stable cursor"
     );
 }
 
@@ -247,24 +259,48 @@ fn read_large_file_truncated_as_non_error() {
 
 #[test]
 fn read_image_extensions_dispatched_as_image() {
-    // Behavior 2: .png, .jpg, .jpeg, .gif, .webp must trigger the image path.
-    // We write 1 byte (not valid image data, but enough to confirm dispatch).
+    // Valid headers must reach typed image capability negotiation. The shared
+    // integration-test provider intentionally lacks native image support, so a
+    // clear unsupported-provider result proves dispatch without accepting
+    // malformed media or embedding base64 in prose.
     let dir = TempDir::new_in(".").expect("tempdir");
-    for ext in &["png", "jpg", "jpeg", "gif", "webp"] {
+    let mut png = vec![0_u8; 24];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[12..16].copy_from_slice(b"IHDR");
+    png[16..20].copy_from_slice(&3_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&2_u32.to_be_bytes());
+    let mut jpeg = vec![0_u8; 21];
+    jpeg[..7].copy_from_slice(&[0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08]);
+    jpeg[7..9].copy_from_slice(&2_u16.to_be_bytes());
+    jpeg[9..11].copy_from_slice(&3_u16.to_be_bytes());
+    let mut gif = b"GIF89a\0\0\0\0".to_vec();
+    gif[6..8].copy_from_slice(&3_u16.to_le_bytes());
+    gif[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    let mut webp = vec![0_u8; 30];
+    webp[..4].copy_from_slice(b"RIFF");
+    webp[8..12].copy_from_slice(b"WEBP");
+    webp[12..16].copy_from_slice(b"VP8X");
+    webp[24] = 2;
+    webp[27] = 1;
+    for (ext, mime, bytes) in [
+        ("png", "image/png", png.as_slice()),
+        ("jpg", "image/jpeg", jpeg.as_slice()),
+        ("jpeg", "image/jpeg", jpeg.as_slice()),
+        ("gif", "image/gif", gif.as_slice()),
+        ("webp", "image/webp", webp.as_slice()),
+    ] {
         let path = dir.path().join(format!("img.{ext}"));
-        fs::write(&path, b"\x00").expect("write");
+        fs::write(&path, bytes).expect("write");
         let call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
         let r = execute_tool(support::shared_run_context(), &call);
-        // OC returns a plain-text block with base64 (Behavior 2 OC path)
         assert!(
-            !r.is_error(),
-            "image read ({ext}) must succeed: {}",
-            r.content()
+            r.is_error(),
+            "test provider must reject unsupported native image input for .{ext}"
         );
         assert!(
-            r.content().contains("[Image:"),
-            "image header for .{ext}: {}",
-            r.content()
+            r.content().contains("Provider 'test'") && r.content().contains(mime),
+            "typed unsupported-provider result for .{ext}: {}",
+            r.content(),
         );
     }
 }

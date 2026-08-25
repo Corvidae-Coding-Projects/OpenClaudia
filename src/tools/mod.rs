@@ -140,6 +140,10 @@ pub use continuation::{
     ToolContinuation, ToolContinuationError, ToolExchange, TOOL_CONTINUATION_SCHEMA_VERSION,
 };
 pub use registry::{ToolContext, ToolHandler, ToolRegistry};
+pub(crate) use result::{
+    register_transient_attachment, resolve_tool_attachments, ResolvedToolAttachment,
+    TOOL_ATTACHMENTS_MESSAGE_KEY,
+};
 pub use result::{
     ToolAllowedPrompt, ToolArtifact, ToolAttachment, ToolCompleteness, ToolContent, ToolDiff,
     ToolDisplay, ToolExecutionResult, ToolFailure, ToolFailureCode, ToolFollowUp,
@@ -1176,7 +1180,6 @@ pub enum ExecutionOutcome {
 mod tests {
     use super::*;
     use crate::session::TaskManager;
-    use base64::Engine;
     use serde_json::json;
 
     fn test_run() -> &'static std::sync::Arc<ToolRunContext> {
@@ -1315,8 +1318,8 @@ mod tests {
     }
 
     use file::{
-        detect_file_type, parse_page_range, read_image_file, read_notebook_file,
-        source_to_line_array, FileType, READ_TRACKER,
+        detect_file_type, parse_page_range, read_notebook_file, source_to_line_array, FileType,
+        READ_TRACKER,
     };
     use std::fs;
 
@@ -2034,30 +2037,6 @@ mod tests {
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error, "Should fail without cell_type for insert");
         assert!(output.contains("cell_type is required"));
-    }
-
-    // === Image reading test ===
-
-    #[test]
-    fn test_read_image_file() {
-        let dir = tempfile::tempdir_in(".").unwrap();
-        let img_path = dir.path().join("test.png");
-        // Write some fake PNG bytes
-        let fake_png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        fs::write(&img_path, &fake_png).unwrap();
-
-        let (output, is_error) = read_image_file(
-            test_run(),
-            img_path.to_str().unwrap(),
-            super::file::ImageKind::Png,
-        );
-        assert!(!is_error, "read_image_file should succeed");
-        assert!(output.contains("[Image: test.png"));
-        assert!(output.contains("image/png"));
-        assert!(output.contains("8 bytes"));
-        // Check that base64 data is present
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&fake_png);
-        assert!(output.contains(&b64));
     }
 
     // === Insert code cell has outputs field ===

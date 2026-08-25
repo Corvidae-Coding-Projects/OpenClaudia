@@ -511,8 +511,19 @@ fn display_resource_id(relative: &Path) -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum CursorPosition {
-    Entry { resource_id: String },
-    Match { resource_id: String, line: u64 },
+    Entry {
+        resource_id: String,
+    },
+    Match {
+        resource_id: String,
+        line: u64,
+    },
+    Read {
+        resource_id: String,
+        generation: String,
+        byte: u64,
+        line_limit: Option<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -577,11 +588,18 @@ pub(super) fn decode_cursor(
         return Err("Invalid cursor: it belongs to different search arguments or root".to_string());
     }
     match &envelope.position {
-        CursorPosition::Entry { resource_id } | CursorPosition::Match { resource_id, .. } => {
+        CursorPosition::Entry { resource_id }
+        | CursorPosition::Match { resource_id, .. }
+        | CursorPosition::Read { resource_id, .. } => {
             if resource_id.is_empty() || resource_id.len() > MAX_CURSOR_BYTES {
                 return Err("Invalid cursor: resource position is empty or too large".to_string());
             }
         }
+    }
+    if let CursorPosition::Read { generation, .. } = &envelope.position {
+        generation
+            .parse::<crate::runtime::ContentDigest>()
+            .map_err(|_| "Invalid cursor: malformed file generation".to_string())?;
     }
     Ok(Some(envelope.position))
 }

@@ -773,8 +773,27 @@ impl RealityLedger {
         end_line: usize,
         excerpt: impl Into<String>,
     ) -> Result<ObsId, LedgerError> {
-        let path = path.into();
         let sha256 = sha256_hex(full_contents);
+        self.observe_file_read_digest(run, path, sha256, start_line, end_line, excerpt)
+    }
+
+    /// Record a file read whose complete digest was computed by a bounded
+    /// streaming reader rather than from an in-memory byte slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persistence fails.
+    pub fn observe_file_read_digest(
+        &mut self,
+        run: &crate::tools::ToolRunContext,
+        path: impl Into<String>,
+        sha256: impl Into<String>,
+        start_line: usize,
+        end_line: usize,
+        excerpt: impl Into<String>,
+    ) -> Result<ObsId, LedgerError> {
+        let path = path.into();
+        let sha256 = sha256.into();
         let mut provenance = EvidenceProvenance::for_run(
             run,
             EvidenceTrust::RuntimeObserved,

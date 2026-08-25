@@ -946,7 +946,7 @@ fn publish_replacement(
 }
 
 #[cfg(unix)]
-fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+pub(super) fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     left.dev() == right.dev()
         && left.ino() == right.ino()
@@ -958,7 +958,7 @@ fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bo
 }
 
 #[cfg(not(unix))]
-fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+pub(super) fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 

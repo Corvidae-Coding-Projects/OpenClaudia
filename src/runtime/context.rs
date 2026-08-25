@@ -28,6 +28,13 @@ impl ContentDigest {
         Self(Sha256::digest(bytes.as_ref()).into())
     }
 
+    /// Construct a digest from the output of an already-streaming SHA-256
+    /// computation without hashing the digest a second time.
+    #[must_use]
+    pub const fn from_sha256_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Return the digest bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {

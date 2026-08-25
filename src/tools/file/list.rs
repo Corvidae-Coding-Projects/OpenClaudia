@@ -42,9 +42,9 @@ pub fn execute_list_files_typed(
     let cursor = match discovery::decode_cursor(cursor_arg, &binding) {
         Ok(None) => None,
         Ok(Some(discovery::CursorPosition::Entry { resource_id })) => Some(resource_id),
-        Ok(Some(discovery::CursorPosition::Match { .. })) => {
-            return invalid_arguments("Invalid cursor: expected a directory-entry position")
-        }
+        Ok(Some(
+            discovery::CursorPosition::Match { .. } | discovery::CursorPosition::Read { .. },
+        )) => return invalid_arguments("Invalid cursor: expected a directory-entry position"),
         Err(error) => return invalid_arguments(error),
     };
 

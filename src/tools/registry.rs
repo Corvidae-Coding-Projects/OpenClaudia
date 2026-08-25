@@ -569,7 +569,7 @@ impl ToolHandler for ReadFileHandler {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file and return an immutable snapshot generation for later edits or overwrites. Returns text with line numbers; supports images (PNG, JPG, GIF, WebP), PDFs, and Jupyter notebooks.",
+                "description": "Read a securely contained file as bounded typed text, binary, image, PDF text, or notebook text. Returns immutable artifact identity and an opaque cursor whenever more source bytes remain. Images are delivered through provider-native media inputs and fail explicitly on unsupported providers.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -585,7 +585,11 @@ impl ToolHandler for ReadFileHandler {
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Maximum number of lines to read. Defaults to reading entire file."
+                            "description": "Maximum number of text lines in this bounded page. The byte budget still applies. A continuation cursor retains this value."
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "description": "Opaque continuation returned by a partial read. Do not combine with offset or change limit while continuing."
                         },
                         "pages": {
                             "type": "string",
@@ -597,13 +601,13 @@ impl ToolHandler for ReadFileHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        file::execute_read_file(ctx.run, args)
+    ) -> ToolHandlerResult {
+        file::execute_read_file_typed(ctx.run, args)
     }
 }
 

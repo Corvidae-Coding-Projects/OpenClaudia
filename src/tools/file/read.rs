@@ -1,18 +1,99 @@
-use base64::Engine;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// Hard cap on file size accepted by all read functions.  Prevents OOM via
-/// `/dev/zero` and similar unbounded sources.  10 MiB is generous for any
-/// text file an agent would realistically need to read in full; callers
-/// should use `offset`+`limit` or `grep` for larger artifacts.
+/// Hard cap for read modes that materialize the complete file in memory.
+/// Text and binary reads use the bounded paged path below instead.
 pub(super) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Maximum chars retained in [`read_text_file`] output before truncation
-/// at the next line boundary kicks in. crosslink #939.
-const READ_TEXT_BUDGET: usize = 100_000;
+/// Maximum source bytes represented by one text or binary page. Provider
+/// envelopes add metadata and line prefixes on top of this source budget.
+const READ_PAGE_BYTES: usize = 64 * 1024;
+const READ_TEXT_RENDER_BUDGET: usize = 96 * 1024;
+
+/// Streaming reads are memory bounded, but still need a realistic time/I/O
+/// ceiling so a model cannot make the harness hash a multi-terabyte artifact
+/// twice. Files below this ceiling remain usable even though the legacy path
+/// rejected everything above 10 MiB.
+const MAX_PAGED_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+
+const READ_SCAN_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(super) enum StablePageContent {
+    Text {
+        text: String,
+        start_line: u64,
+        start_column_bytes: u64,
+        end_line: u64,
+        end_column_bytes: u64,
+    },
+    Binary(Vec<u8>),
+}
+
+#[derive(Debug)]
+pub(super) struct StableReadPage {
+    pub generation: crate::runtime::ContentDigest,
+    pub total_bytes: u64,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub next_cursor: Option<String>,
+    pub content: StablePageContent,
+}
+
+struct Utf8StreamValidator {
+    pending: Vec<u8>,
+    invalid: bool,
+}
+
+impl Utf8StreamValidator {
+    fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(4),
+            invalid: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.invalid {
+            return;
+        }
+        let mut combined = Vec::with_capacity(self.pending.len().saturating_add(bytes.len()));
+        combined.extend_from_slice(&self.pending);
+        combined.extend_from_slice(bytes);
+        self.pending.clear();
+        if let Err(error) = std::str::from_utf8(&combined) {
+            if error.error_len().is_some() {
+                self.invalid = true;
+            } else {
+                self.pending
+                    .extend_from_slice(&combined[error.valid_up_to()..]);
+            }
+        }
+    }
+
+    const fn is_valid(&self) -> bool {
+        !self.invalid && self.pending.is_empty()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadStart {
+    Line(u64),
+    Byte(u64),
+}
+
+struct FileInspection {
+    generation: crate::runtime::ContentDigest,
+    total_bytes: u64,
+    start_byte: u64,
+    start_line: u64,
+    start_column_bytes: u64,
+    utf8: bool,
+}
 
 fn pdftotext_bin(run: &super::super::security::ToolRunContext) -> Result<PathBuf, String> {
     run.resolve_executable("pdftotext")
@@ -36,6 +117,7 @@ fn pdfinfo_bin(run: &super::super::security::ToolRunContext) -> Option<PathBuf> 
 /// is too large or is not a regular file. Authorization and inspection must
 /// apply to the same kernel object; checking a pathname here would reopen the
 /// TOCTOU window closed by `secure_fs`.
+#[cfg(test)]
 fn check_file_safety(file: &std::fs::File, path: &str) -> Option<(String, bool)> {
     let meta = match file.metadata() {
         Ok(m) => m,
@@ -66,6 +148,7 @@ fn check_file_safety(file: &std::fs::File, path: &str) -> Option<(String, bool)>
     None
 }
 
+#[cfg(test)]
 fn open_safe_read(
     run: &super::super::security::ToolRunContext,
     path: &str,
@@ -82,6 +165,7 @@ fn open_safe_read(
     Ok(file)
 }
 
+#[cfg(test)]
 pub(super) fn read_safe_bytes(
     run: &super::super::security::ToolRunContext,
     path: &str,
@@ -95,12 +179,559 @@ pub(super) fn read_safe_bytes(
     .map_err(|error| (error, true))
 }
 
+fn read_failure(
+    code: crate::tools::ToolFailureCode,
+    message: impl Into<String>,
+    retryability: crate::tools::ToolRetryability,
+) -> crate::tools::ToolFailure {
+    crate::tools::ToolFailure::new(code, message.into(), retryability)
+}
+
+fn parse_positive_u64(
+    name: &str,
+    value: Option<&Value>,
+) -> Result<Option<u64>, crate::tools::ToolFailure> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64().filter(|value| *value > 0) else {
+        let qualifier = if name == "offset" { " (1-indexed)" } else { "" };
+        return Err(read_failure(
+            crate::tools::ToolFailureCode::InvalidArguments,
+            format!("'{name}' must be a positive integer{qualifier}"),
+            crate::tools::ToolRetryability::Never,
+        ));
+    };
+    Ok(Some(value))
+}
+
+fn digest_from_hasher(hasher: Sha256) -> crate::runtime::ContentDigest {
+    crate::runtime::ContentDigest::from_sha256_bytes(hasher.finalize().into())
+}
+
+// Keeping hashing, UTF-8 validation, and line-position accounting in one scan
+// makes the byte offsets auditable and avoids another pass over large files.
+#[allow(clippy::too_many_lines)]
+fn inspect_paged_file(
+    file: &mut std::fs::File,
+    path: &Path,
+    start: ReadStart,
+) -> Result<FileInspection, crate::tools::ToolFailure> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        read_failure(
+            crate::tools::ToolFailureCode::External,
+            format!("Failed to seek '{}': {error}", path.display()),
+            crate::tools::ToolRetryability::Safe,
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut validator = Utf8StreamValidator::new();
+    let mut buffer = vec![0_u8; READ_SCAN_BUFFER_BYTES];
+    let mut total_bytes = 0_u64;
+    let mut newline_count = 0_u64;
+    let mut last_byte = None;
+    let mut start_byte = match start {
+        ReadStart::Line(1) => Some(0),
+        ReadStart::Line(_) => None,
+        ReadStart::Byte(byte) => Some(byte),
+    };
+    let mut byte_start_line = 1_u64;
+    let mut byte_start_column = 0_u64;
+    let requested_byte = match start {
+        ReadStart::Byte(byte) => Some(byte),
+        ReadStart::Line(_) => None,
+    };
+    let requested_line = match start {
+        ReadStart::Line(line) => Some(line),
+        ReadStart::Byte(_) => None,
+    };
+    let mut byte_at_start = None;
+
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            read_failure(
+                crate::tools::ToolFailureCode::External,
+                format!("Failed to read '{}': {error}", path.display()),
+                crate::tools::ToolRetryability::Safe,
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        hasher.update(chunk);
+        validator.push(chunk);
+        for (index, byte) in chunk.iter().copied().enumerate() {
+            let position = total_bytes.saturating_add(u64::try_from(index).unwrap_or(u64::MAX));
+            if requested_byte == Some(position) {
+                byte_at_start = Some(byte);
+            }
+            if requested_byte.is_some_and(|requested| position < requested) {
+                if byte == b'\n' {
+                    byte_start_line = byte_start_line.saturating_add(1);
+                    byte_start_column = 0;
+                } else {
+                    byte_start_column = byte_start_column.saturating_add(1);
+                }
+            }
+            if byte == b'\n' {
+                newline_count = newline_count.saturating_add(1);
+                if requested_line.is_some_and(|line| newline_count == line.saturating_sub(1)) {
+                    start_byte = Some(position.saturating_add(1));
+                }
+            }
+            last_byte = Some(byte);
+        }
+        total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+
+    let total_lines = if total_bytes == 0 {
+        0
+    } else if last_byte == Some(b'\n') {
+        newline_count
+    } else {
+        newline_count.saturating_add(1)
+    };
+    if let Some(line) = requested_line {
+        if line != 1 && line > total_lines {
+            // Preserve the established line-window contract: an explicit
+            // offset beyond EOF is an empty successful page, not a failure.
+            start_byte = Some(total_bytes);
+        }
+    }
+    let start_byte = start_byte.ok_or_else(|| {
+        read_failure(
+            crate::tools::ToolFailureCode::InvalidInput,
+            "Requested line could not be resolved in the file",
+            crate::tools::ToolRetryability::Never,
+        )
+    })?;
+    if start_byte > total_bytes
+        || matches!(start, ReadStart::Byte(_) if total_bytes > 0 && start_byte == total_bytes)
+    {
+        return Err(read_failure(
+            crate::tools::ToolFailureCode::InvalidInput,
+            format!("Read cursor byte {start_byte} is at or beyond end of file"),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    let utf8 = validator.is_valid();
+    if utf8 && byte_at_start.is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000) {
+        return Err(read_failure(
+            crate::tools::ToolFailureCode::InvalidArguments,
+            "Read cursor does not point to a UTF-8 code-point boundary",
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    let (start_line, start_column_bytes) = match start {
+        ReadStart::Line(line) => (line, 0),
+        ReadStart::Byte(_) => (byte_start_line, byte_start_column),
+    };
+    Ok(FileInspection {
+        generation: digest_from_hasher(hasher),
+        total_bytes,
+        start_byte,
+        start_line,
+        start_column_bytes,
+        utf8,
+    })
+}
+
+fn scan_page_and_digest(
+    file: &mut std::fs::File,
+    path: &Path,
+    inspection: &FileInspection,
+    line_limit: Option<u64>,
+) -> Result<(crate::runtime::ContentDigest, Vec<u8>), crate::tools::ToolFailure> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        read_failure(
+            crate::tools::ToolFailureCode::External,
+            format!("Failed to seek '{}': {error}", path.display()),
+            crate::tools::ToolRetryability::Safe,
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; READ_SCAN_BUFFER_BYTES];
+    let mut absolute = 0_u64;
+    let mut collected = Vec::with_capacity(READ_PAGE_BYTES.saturating_add(4));
+    let mut completed_lines = 0_u64;
+    let mut line_boundary = None;
+    let collect_ceiling = if inspection.utf8 {
+        READ_PAGE_BYTES.saturating_add(3)
+    } else {
+        READ_PAGE_BYTES
+    };
+
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            read_failure(
+                crate::tools::ToolFailureCode::External,
+                format!("Failed to read '{}': {error}", path.display()),
+                crate::tools::ToolRetryability::Safe,
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        hasher.update(chunk);
+        for (index, byte) in chunk.iter().copied().enumerate() {
+            let position = absolute.saturating_add(u64::try_from(index).unwrap_or(u64::MAX));
+            if position < inspection.start_byte
+                || collected.len() >= collect_ceiling
+                || line_boundary.is_some()
+            {
+                continue;
+            }
+            collected.push(byte);
+            if inspection.utf8 && byte == b'\n' {
+                completed_lines = completed_lines.saturating_add(1);
+                if line_limit.is_some_and(|limit| completed_lines >= limit) {
+                    line_boundary = Some(collected.len());
+                }
+            }
+        }
+        absolute = absolute.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+
+    let mut retained = line_boundary
+        .filter(|boundary| *boundary <= READ_PAGE_BYTES)
+        .unwrap_or_else(|| collected.len().min(READ_PAGE_BYTES));
+    if inspection.utf8 {
+        while retained < collected.len()
+            && collected
+                .get(retained)
+                .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+        {
+            retained = retained.saturating_sub(1);
+        }
+    }
+    collected.truncate(retained);
+    Ok((digest_from_hasher(hasher), collected))
+}
+
+struct ReadRequest {
+    binding: String,
+    start: ReadStart,
+    expected_generation: Option<crate::runtime::ContentDigest>,
+    line_limit: Option<u64>,
+}
+
+fn parse_read_request(
+    run: &super::super::security::ToolRunContext,
+    resolved: &Path,
+    args: &HashMap<String, Value>,
+) -> Result<ReadRequest, crate::tools::ToolFailure> {
+    let binding = super::discovery::cursor_binding(&[
+        "read_file",
+        &run.run_id().to_string(),
+        &resolved.to_string_lossy(),
+    ]);
+    let cursor_raw = match args.get("cursor") {
+        None => None,
+        Some(Value::String(cursor)) => Some(cursor.as_str()),
+        Some(_) => {
+            return Err(read_failure(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                "'cursor' must be a string",
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
+    };
+    let requested_limit = parse_positive_u64("limit", args.get("limit"))?;
+    let decoded = super::discovery::decode_cursor(cursor_raw, &binding).map_err(|message| {
+        read_failure(
+            crate::tools::ToolFailureCode::InvalidArguments,
+            message,
+            crate::tools::ToolRetryability::Never,
+        )
+    })?;
+    let (start, expected_generation, line_limit) = match decoded {
+        Some(super::discovery::CursorPosition::Read {
+            resource_id,
+            generation,
+            byte,
+            line_limit,
+        }) => {
+            if args.contains_key("offset") {
+                return Err(read_failure(
+                    crate::tools::ToolFailureCode::InvalidArguments,
+                    "'offset' cannot be combined with a read continuation cursor",
+                    crate::tools::ToolRetryability::Never,
+                ));
+            }
+            if resource_id != resolved.to_string_lossy() {
+                return Err(read_failure(
+                    crate::tools::ToolFailureCode::InvalidArguments,
+                    "Read cursor resource identity does not match the requested path",
+                    crate::tools::ToolRetryability::Never,
+                ));
+            }
+            if requested_limit.is_some_and(|limit| Some(limit) != line_limit) {
+                return Err(read_failure(
+                    crate::tools::ToolFailureCode::InvalidArguments,
+                    "'limit' cannot change while continuing a read cursor",
+                    crate::tools::ToolRetryability::Never,
+                ));
+            }
+            let generation = generation.parse().map_err(|_| {
+                read_failure(
+                    crate::tools::ToolFailureCode::InvalidArguments,
+                    "Read cursor contains an invalid file generation",
+                    crate::tools::ToolRetryability::Never,
+                )
+            })?;
+            (ReadStart::Byte(byte), Some(generation), line_limit)
+        }
+        Some(_) => {
+            return Err(read_failure(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                "Cursor belongs to a different file operation",
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
+        None => {
+            let offset = parse_positive_u64("offset", args.get("offset"))?.unwrap_or(1);
+            (ReadStart::Line(offset), None, requested_limit)
+        }
+    };
+    Ok(ReadRequest {
+        binding,
+        start,
+        expected_generation,
+        line_limit,
+    })
+}
+
+fn page_content(inspection: &FileInspection, page: Vec<u8>) -> StablePageContent {
+    if inspection.utf8 {
+        let mut text = String::from_utf8(page).expect("stable UTF-8 inspection covers page bytes");
+        let retained = bounded_numbered_source_len(
+            &text,
+            inspection.start_line,
+            inspection.start_column_bytes,
+            READ_TEXT_RENDER_BUDGET,
+        );
+        text.truncate(retained);
+        let mut end_line = inspection.start_line;
+        let mut end_column_bytes = inspection.start_column_bytes;
+        for byte in text.bytes() {
+            if byte == b'\n' {
+                end_line = end_line.saturating_add(1);
+                end_column_bytes = 0;
+            } else {
+                end_column_bytes = end_column_bytes.saturating_add(1);
+            }
+        }
+        StablePageContent::Text {
+            text,
+            start_line: inspection.start_line,
+            start_column_bytes: inspection.start_column_bytes,
+            end_line,
+            end_column_bytes,
+        }
+    } else {
+        StablePageContent::Binary(page)
+    }
+}
+
+/// Read one stable bounded page from an already-confined descriptor.
+pub(super) fn read_stable_page(
+    run: &super::super::security::ToolRunContext,
+    file: &mut std::fs::File,
+    resolved: &Path,
+    args: &HashMap<String, Value>,
+) -> Result<StableReadPage, crate::tools::ToolFailure> {
+    let metadata_before = file.metadata().map_err(|error| {
+        read_failure(
+            crate::tools::ToolFailureCode::External,
+            format!("Cannot inspect open file '{}': {error}", resolved.display()),
+            crate::tools::ToolRetryability::Safe,
+        )
+    })?;
+    if !metadata_before.file_type().is_file() {
+        return Err(read_failure(
+            crate::tools::ToolFailureCode::InvalidInput,
+            format!("'{}' is not a regular file", resolved.display()),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    if metadata_before.len() > MAX_PAGED_FILE_BYTES {
+        return Err(read_failure(
+            crate::tools::ToolFailureCode::Unavailable,
+            format!(
+                "File '{}' is {} bytes; paged read scanning is capped at {MAX_PAGED_FILE_BYTES} bytes. Use grep or a domain-specific bounded reader.",
+                resolved.display(),
+                metadata_before.len()
+            ),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+
+    let request = parse_read_request(run, resolved, args)?;
+
+    let inspection = inspect_paged_file(file, resolved, request.start)?;
+    if let Some(expected) = request.expected_generation {
+        if expected != inspection.generation {
+            return Err(read_failure(
+                crate::tools::ToolFailureCode::Conflict,
+                format!(
+                    "File '{}' changed after the previous read page (expected {expected}, found {})",
+                    resolved.display(),
+                    inspection.generation
+                ),
+                crate::tools::ToolRetryability::Safe,
+            ));
+        }
+    }
+    if !inspection.utf8 && (args.contains_key("offset") || request.line_limit.is_some()) {
+        return Err(read_failure(
+            crate::tools::ToolFailureCode::InvalidArguments,
+            "Binary reads use byte cursors; line offset/limit arguments are unsupported",
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    let metadata_middle = file.metadata().map_err(|error| {
+        read_failure(
+            crate::tools::ToolFailureCode::External,
+            format!("Cannot inspect open file '{}': {error}", resolved.display()),
+            crate::tools::ToolRetryability::Safe,
+        )
+    })?;
+    let (second_generation, page) =
+        scan_page_and_digest(file, resolved, &inspection, request.line_limit)?;
+    let metadata_after = file.metadata().map_err(|error| {
+        read_failure(
+            crate::tools::ToolFailureCode::External,
+            format!("Cannot inspect open file '{}': {error}", resolved.display()),
+            crate::tools::ToolRetryability::Safe,
+        )
+    })?;
+    if inspection.generation != second_generation
+        || !super::secure_fs::same_file_snapshot(&metadata_before, &metadata_middle)
+        || !super::secure_fs::same_file_snapshot(&metadata_middle, &metadata_after)
+    {
+        return Err(read_failure(
+            crate::tools::ToolFailureCode::Conflict,
+            format!("File '{}' changed while it was read", resolved.display()),
+            crate::tools::ToolRetryability::Safe,
+        ));
+    }
+
+    let content = page_content(&inspection, page);
+    let page_len = match &content {
+        StablePageContent::Text { text, .. } => text.len(),
+        StablePageContent::Binary(bytes) => bytes.len(),
+    };
+    let byte_end = inspection
+        .start_byte
+        .saturating_add(u64::try_from(page_len).unwrap_or(u64::MAX));
+    let next_cursor = (byte_end < inspection.total_bytes).then(|| {
+        super::discovery::encode_cursor(
+            &request.binding,
+            super::discovery::CursorPosition::Read {
+                resource_id: resolved.to_string_lossy().into_owned(),
+                generation: inspection.generation.to_string(),
+                byte: byte_end,
+                line_limit: request.line_limit,
+            },
+        )
+    });
+    Ok(StableReadPage {
+        generation: inspection.generation,
+        total_bytes: inspection.total_bytes,
+        byte_start: inspection.start_byte,
+        byte_end,
+        next_cursor,
+        content,
+    })
+}
+
+fn bounded_numbered_source_len(
+    text: &str,
+    start_line: u64,
+    start_column_bytes: u64,
+    budget: usize,
+) -> usize {
+    let mut rendered_bytes = 0_usize;
+    let mut source_bytes = 0_usize;
+    let mut line = start_line;
+    let mut column = start_column_bytes;
+    for segment in text.split_inclusive('\n') {
+        let body = segment.strip_suffix('\n').unwrap_or(segment);
+        let prefix = if column == 0 {
+            format!("{line:>6}| ")
+        } else {
+            format!("{line:>6}:{column}| ")
+        };
+        let separator = usize::from(source_bytes > 0);
+        let fixed = separator.saturating_add(prefix.len());
+        let Some(remaining) = budget
+            .checked_sub(rendered_bytes)
+            .and_then(|remaining| remaining.checked_sub(fixed))
+        else {
+            break;
+        };
+        if body.len() <= remaining {
+            rendered_bytes = rendered_bytes
+                .saturating_add(fixed)
+                .saturating_add(body.len());
+            source_bytes = source_bytes.saturating_add(segment.len());
+            if segment.ends_with('\n') {
+                line = line.saturating_add(1);
+                column = 0;
+            } else {
+                column = column.saturating_add(u64::try_from(body.len()).unwrap_or(u64::MAX));
+            }
+            continue;
+        }
+        let mut retained = remaining.min(body.len());
+        while retained > 0 && !body.is_char_boundary(retained) {
+            retained = retained.saturating_sub(1);
+        }
+        source_bytes = source_bytes.saturating_add(retained);
+        break;
+    }
+    source_bytes
+}
+
+pub(super) fn render_numbered_text_page(
+    text: &str,
+    start_line: u64,
+    start_column_bytes: u64,
+) -> String {
+    if text.is_empty() {
+        return "(empty file)".to_string();
+    }
+    let mut rendered = String::new();
+    let mut line = start_line;
+    let mut column = start_column_bytes;
+    for segment in text.split_inclusive('\n') {
+        let body = segment.strip_suffix('\n').unwrap_or(segment);
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        if column == 0 {
+            let _ = write!(rendered, "{line:>6}| {body}");
+        } else {
+            let _ = write!(rendered, "{line:>6}:{column}| {body}");
+        }
+        if segment.ends_with('\n') {
+            line = line.saturating_add(1);
+            column = 0;
+        } else {
+            column = column.saturating_add(u64::try_from(body.len()).unwrap_or(u64::MAX));
+        }
+    }
+    rendered
+}
+
 /// Image formats the harness can hand to vision-capable models.
 ///
 /// crosslink #966: this used to live as a raw `&'static str` (the MIME type)
 /// inside `FileType::Image`. Adding a new format had to update three
-/// independent string literals across `detect_file_type`, `read_image_file`,
-/// and any downstream adapter assumption. With a closed enum the type system
+/// independent string literals across file detection, image rendering, and
+/// downstream adapter assumptions. With a closed enum the type system
 /// enforces exhaustiveness — every match arm sees every supported image kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
@@ -108,6 +739,107 @@ pub enum ImageKind {
     Jpeg,
     Gif,
     Webp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageDimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
+fn nonzero_dimensions(width: u32, height: u32) -> Option<ImageDimensions> {
+    (width > 0 && height > 0).then_some(ImageDimensions { width, height })
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<ImageDimensions> {
+    if !bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return None;
+    }
+    let mut offset = 2_usize;
+    while offset < bytes.len() {
+        while bytes.get(offset) == Some(&0xff) {
+            offset = offset.saturating_add(1);
+        }
+        let marker = *bytes.get(offset)?;
+        offset = offset.saturating_add(1);
+        if marker == 0xd9 || marker == 0xda {
+            return None;
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([
+            *bytes.get(offset)?,
+            *bytes.get(offset.saturating_add(1))?,
+        ]));
+        if length < 2 || offset.checked_add(length)? > bytes.len() {
+            return None;
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            if length < 7 {
+                return None;
+            }
+            let height = u32::from(u16::from_be_bytes([
+                *bytes.get(offset.saturating_add(3))?,
+                *bytes.get(offset.saturating_add(4))?,
+            ]));
+            let width = u32::from(u16::from_be_bytes([
+                *bytes.get(offset.saturating_add(5))?,
+                *bytes.get(offset.saturating_add(6))?,
+            ]));
+            return nonzero_dimensions(width, height);
+        }
+        offset = offset.saturating_add(length);
+    }
+    None
+}
+
+fn webp_dimensions(bytes: &[u8]) -> Option<ImageDimensions> {
+    if !bytes.starts_with(b"RIFF") || bytes.get(8..12) != Some(b"WEBP") {
+        return None;
+    }
+    match bytes.get(12..16)? {
+        b"VP8X" => {
+            let width = 1_u32
+                .saturating_add(u32::from(*bytes.get(24)?))
+                .saturating_add(u32::from(*bytes.get(25)?) << 8)
+                .saturating_add(u32::from(*bytes.get(26)?) << 16);
+            let height = 1_u32
+                .saturating_add(u32::from(*bytes.get(27)?))
+                .saturating_add(u32::from(*bytes.get(28)?) << 8)
+                .saturating_add(u32::from(*bytes.get(29)?) << 16);
+            nonzero_dimensions(width, height)
+        }
+        b"VP8L" if bytes.get(20) == Some(&0x2f) => {
+            let b0 = u32::from(*bytes.get(21)?);
+            let b1 = u32::from(*bytes.get(22)?);
+            let b2 = u32::from(*bytes.get(23)?);
+            let b3 = u32::from(*bytes.get(24)?);
+            let width = 1_u32.saturating_add(b0 | ((b1 & 0x3f) << 8));
+            let height = 1_u32.saturating_add((b1 >> 6) | (b2 << 2) | ((b3 & 0x0f) << 10));
+            nonzero_dimensions(width, height)
+        }
+        b"VP8 " if bytes.get(23..26) == Some(&[0x9d, 0x01, 0x2a]) => {
+            let width = u32::from(u16::from_le_bytes([*bytes.get(26)?, *bytes.get(27)?]) & 0x3fff);
+            let height = u32::from(u16::from_le_bytes([*bytes.get(28)?, *bytes.get(29)?]) & 0x3fff);
+            nonzero_dimensions(width, height)
+        }
+        _ => None,
+    }
 }
 
 impl ImageKind {
@@ -141,9 +873,31 @@ impl ImageKind {
             None
         }
     }
+
+    #[must_use]
+    pub fn dimensions(self, bytes: &[u8]) -> Option<ImageDimensions> {
+        match self {
+            Self::Png if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => {
+                let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+                let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+                (bytes.get(12..16) == Some(b"IHDR"))
+                    .then(|| nonzero_dimensions(width, height))
+                    .flatten()
+            }
+            Self::Jpeg => jpeg_dimensions(bytes),
+            Self::Gif if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => {
+                let width = u32::from(u16::from_le_bytes(bytes.get(6..8)?.try_into().ok()?));
+                let height = u32::from(u16::from_le_bytes(bytes.get(8..10)?.try_into().ok()?));
+                nonzero_dimensions(width, height)
+            }
+            Self::Webp => webp_dimensions(bytes),
+            _ => None,
+        }
+    }
 }
 
 /// Supported file types for `read_file`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Text,
     Image(ImageKind),
@@ -167,52 +921,6 @@ pub fn detect_file_type(path: &str) -> FileType {
         },
         FileType::Image,
     )
-}
-
-/// Read an image file, base64-encode it, and return a structured result.
-///
-/// The image kind is carried by the typed [`ImageKind`] enum (crosslink #966)
-/// rather than as a raw MIME-type `&str`, so callers can no longer fabricate a
-/// nonsense MIME like `"image/whatever"` at the call site.
-#[cfg(test)]
-pub fn read_image_file(
-    run: &super::super::security::ToolRunContext,
-    path: &str,
-    kind: ImageKind,
-) -> (String, bool) {
-    let bytes = match read_safe_bytes(run, path) {
-        Ok(bytes) => bytes,
-        Err(error) => return error,
-    };
-
-    render_image_bytes(path, kind, &bytes)
-}
-
-pub(super) fn render_image_bytes(path: &str, kind: ImageKind, bytes: &[u8]) -> (String, bool) {
-    // Fail fast at the boundary: a 0-byte image is never valid input for any
-    // vision-capable model. Without this check the upstream API rejects the
-    // empty base64 with an opaque 400 after we've already burned a turn.
-    // crosslink #942.
-    if bytes.is_empty() {
-        return (
-            format!(
-                "Image file '{path}' is empty (0 bytes); refusing to send empty base64 payload"
-            ),
-            true,
-        );
-    }
-
-    let file_size = bytes.len();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let filename = Path::new(path)
-        .file_name()
-        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
-
-    let mime_type = kind.mime();
-    let result = format!(
-        "[Image: {filename} ({file_size} bytes, {mime_type}) - base64 data included for vision-capable models]\n{b64}"
-    );
-    (result, false)
 }
 
 /// Parse a page range string like "1-5", "3", or "10-20"
@@ -590,141 +1298,6 @@ pub(super) fn render_notebook_bytes(path: &str, bytes: &[u8]) -> (String, bool) 
 
     (output, false)
 }
-/// Read a plain text file with optional offset/limit
-#[cfg(test)]
-pub fn read_text_file(
-    run: &super::super::security::ToolRunContext,
-    path: &str,
-    args: &HashMap<String, Value>,
-) -> (String, bool) {
-    let bytes = match read_safe_bytes(run, path) {
-        Ok(bytes) => bytes,
-        Err(error) => return error,
-    };
-    render_text_bytes(path, args, &bytes)
-}
-
-pub(super) fn render_text_bytes(
-    path: &str,
-    args: &HashMap<String, Value>,
-    bytes: &[u8],
-) -> (String, bool) {
-    // Get optional offset (1-indexed line number to start from)
-    let offset = match parse_read_offset_arg(args.get("offset")) {
-        Ok(offset) => offset,
-        Err(msg) => return (msg, true),
-    };
-
-    // Get optional limit (max lines to read)
-    let limit = match parse_read_limit_arg(args.get("limit")) {
-        Ok(limit) => limit,
-        Err(msg) => return (msg, true),
-    };
-
-    let file_content = match std::str::from_utf8(bytes) {
-        Ok(content) => content,
-        Err(error) => {
-            return (
-                format!("Failed to read file '{path}' as UTF-8: {error}"),
-                true,
-            )
-        }
-    };
-
-    let lines: Vec<&str> = file_content.lines().collect();
-    let total_lines = lines.len();
-
-    // Apply offset and limit
-    let selected_lines: Vec<(usize, &str)> = lines
-        .into_iter()
-        .enumerate()
-        .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
-
-    // Add line numbers (original line numbers, not relative)
-    let numbered: Vec<String> = selected_lines
-        .iter()
-        .map(|(i, line)| format!("{:4}| {}", i + 1, line))
-        .collect();
-
-    // Truncate at a *line boundary* so that the last shown line is never
-    // a half-line ending mid line-number prefix (`   N|`). crosslink #939.
-    // We accumulate lines until adding the next would exceed the budget,
-    // then emit a structured `<truncated …/>` sentinel that downstream
-    // dispatchers can detect programmatically rather than substring-grepping.
-    let total_chars: usize = numbered.iter().map(|line| line.len() + 1).sum();
-
-    // Add context about what was shown (lines actually selected, not lines
-    // surviving the byte budget — the truncation sentinel reports that).
-    let suffix = if offset > 0 || limit.is_some() {
-        let shown_start = offset + 1;
-        let shown_end = offset + selected_lines.len();
-        format!("\n(showing lines {shown_start}-{shown_end} of {total_lines} total)")
-    } else {
-        String::new()
-    };
-
-    if total_chars > READ_TEXT_BUDGET {
-        let mut acc = String::with_capacity(READ_TEXT_BUDGET + 256);
-        let mut kept_lines = 0usize;
-        let mut kept_chars = 0usize;
-        for line in &numbered {
-            // `+1` accounts for the join newline we are about to append.
-            let next_size = line.len() + 1;
-            if kept_chars + next_size > READ_TEXT_BUDGET {
-                break;
-            }
-            if !acc.is_empty() {
-                acc.push('\n');
-            }
-            acc.push_str(line);
-            kept_chars += next_size;
-            kept_lines += 1;
-        }
-        let dropped_lines = numbered.len().saturating_sub(kept_lines);
-        // Truncation sentinel: structured marker (easy to grep / parse) plus
-        // a human-readable hint pointing at offset+limit recovery.
-        let sentinel = format!(
-            "\n<truncated kept_lines=\"{kept_lines}\" dropped_lines=\"{dropped_lines}\" \
-             total_chars=\"{total_chars}\" budget_chars=\"{READ_TEXT_BUDGET}\"/>\n\
-             (file truncated at line boundary; retry with offset={} or limit=… to read the rest){suffix}",
-            kept_lines + 1
-        );
-        acc.push_str(&sentinel);
-        (acc, false)
-    } else {
-        let result = numbered.join("\n");
-        (format!("{result}{suffix}"), false)
-    }
-}
-
-fn parse_read_offset_arg(value: Option<&Value>) -> Result<usize, String> {
-    let Some(value) = value else {
-        return Ok(0);
-    };
-    let Some(offset) = value.as_u64() else {
-        return Err("Error: offset must be a 1-indexed positive integer".to_string());
-    };
-    if offset == 0 {
-        return Err("Error: offset must be a 1-indexed positive integer".to_string());
-    }
-    Ok(usize::try_from(offset.saturating_sub(1)).unwrap_or(usize::MAX))
-}
-
-fn parse_read_limit_arg(value: Option<&Value>) -> Result<Option<usize>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let Some(limit) = value.as_u64() else {
-        return Err("Error: limit must be a positive integer".to_string());
-    };
-    if limit == 0 {
-        return Err("Error: limit must be a positive integer".to_string());
-    }
-    Ok(Some(usize::try_from(limit).unwrap_or(usize::MAX)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,9 +1308,7 @@ mod tests {
         crate::tools::security::test_run_context()
     }
 
-    // =========================================================================
-    // Behavior 1: read_text_file offset + limit — 1-indexed line slice
-    // =========================================================================
+    // Stable, bounded text paging and continuation behavior.
 
     /// Helper: write content to a `NamedTempFile` and return (file, `path_string`).
     fn tmp_text(content: &str) -> (NamedTempFile, String) {
@@ -747,13 +1318,172 @@ mod tests {
         (f, path)
     }
 
+    fn stable_page(path: &str, args: &HashMap<String, Value>) -> StableReadPage {
+        let resolved = std::fs::canonicalize(path).expect("canonical test file");
+        let mut file = super::super::secure_fs::open_regular_read(test_run(), &resolved)
+            .expect("confined test read");
+        read_stable_page(test_run(), &mut file, &resolved, args).expect("stable read page")
+    }
+
+    #[test]
+    fn stable_cursor_pages_reconstruct_utf8_without_gaps() {
+        let source = (0..8_000).fold(String::new(), |mut source, line| {
+            writeln!(source, "line-{line:05} snowman=☃").expect("write string fixture");
+            source
+        });
+        let (_file, path) = tmp_text(&source);
+        let mut args = HashMap::from([("limit".to_string(), serde_json::json!(333))]);
+        let mut reconstructed = Vec::new();
+        let mut expected_start = 0_u64;
+        let mut generation = None;
+        let mut pages = 0_usize;
+
+        loop {
+            let page = stable_page(&path, &args);
+            assert_eq!(page.byte_start, expected_start);
+            assert!(page.byte_end >= page.byte_start);
+            if let Some(expected) = generation {
+                assert_eq!(page.generation, expected);
+            } else {
+                generation = Some(page.generation);
+            }
+            let StablePageContent::Text { text, .. } = page.content else {
+                panic!("UTF-8 fixture became binary")
+            };
+            reconstructed.extend_from_slice(text.as_bytes());
+            expected_start = page.byte_end;
+            pages = pages.saturating_add(1);
+            let Some(cursor) = page.next_cursor else {
+                assert_eq!(page.byte_end, u64::try_from(source.len()).unwrap());
+                break;
+            };
+            args = HashMap::from([("cursor".to_string(), Value::String(cursor))]);
+        }
+
+        assert!(pages > 2, "fixture must exercise multiple continuations");
+        assert_eq!(reconstructed, source.as_bytes());
+    }
+
+    #[test]
+    fn stable_cursor_reconstructs_one_oversized_multibyte_line() {
+        let source = "☃".repeat(100_000);
+        let (_file, path) = tmp_text(&source);
+        let mut args = HashMap::new();
+        let mut reconstructed = Vec::new();
+        let mut expected_start = 0_u64;
+        let mut saw_nonzero_column = false;
+
+        loop {
+            let page = stable_page(&path, &args);
+            assert_eq!(page.byte_start, expected_start);
+            let StablePageContent::Text {
+                text,
+                start_column_bytes,
+                ..
+            } = page.content
+            else {
+                panic!("valid UTF-8 long line became binary")
+            };
+            saw_nonzero_column |= start_column_bytes > 0;
+            reconstructed.extend_from_slice(text.as_bytes());
+            expected_start = page.byte_end;
+            let Some(cursor) = page.next_cursor else {
+                break;
+            };
+            args = HashMap::from([("cursor".to_string(), Value::String(cursor))]);
+        }
+
+        assert!(saw_nonzero_column, "continuation must expose a byte column");
+        assert_eq!(reconstructed, source.as_bytes());
+    }
+
+    #[test]
+    fn paged_text_read_accepts_files_above_legacy_ten_megabyte_cap() {
+        let mut file = NamedTempFile::new_in(".").expect("tempfile");
+        let bytes = vec![b'a'; usize::try_from(MAX_FILE_SIZE_BYTES).unwrap() + 4_096];
+        file.write_all(&bytes).expect("write oversized text");
+        file.flush().expect("flush oversized text");
+        let page = stable_page(&file.path().to_string_lossy(), &HashMap::new());
+        assert_eq!(page.byte_start, 0);
+        assert_eq!(page.byte_end, u64::try_from(READ_PAGE_BYTES).unwrap());
+        assert!(page.next_cursor.is_some());
+        assert!(matches!(page.content, StablePageContent::Text { .. }));
+    }
+
+    #[test]
+    fn read_cursor_rejects_a_changed_file_generation() {
+        let source = "a".repeat(READ_PAGE_BYTES.saturating_add(128));
+        let root = tempfile::tempdir_in(".").expect("mutation fixture root");
+        let path = root.path().join("changing.txt");
+        std::fs::write(&path, &source).expect("write initial fixture");
+        let first = stable_page(&path.to_string_lossy(), &HashMap::new());
+        let cursor = first.next_cursor.expect("first page continuation");
+        std::fs::write(&path, "b".repeat(source.len())).expect("replace fixture generation");
+        let resolved = std::fs::canonicalize(&path).expect("canonical changed file");
+        let mut reopened = super::super::secure_fs::open_regular_read(test_run(), &resolved)
+            .expect("reopen changed file");
+        let args = HashMap::from([("cursor".to_string(), Value::String(cursor))]);
+        let failure = read_stable_page(test_run(), &mut reopened, &resolved, &args)
+            .expect_err("changed generation must invalidate cursor");
+        assert_eq!(failure.code, crate::tools::ToolFailureCode::Conflict);
+    }
+
+    #[test]
+    fn supported_image_headers_report_dimensions() {
+        let mut png = vec![0_u8; 24];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[12..16].copy_from_slice(b"IHDR");
+        png[16..20].copy_from_slice(&3_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&2_u32.to_be_bytes());
+        assert_eq!(
+            ImageKind::Png.dimensions(&png),
+            Some(ImageDimensions {
+                width: 3,
+                height: 2
+            })
+        );
+
+        let mut gif = b"GIF89a\0\0\0\0".to_vec();
+        gif[6..8].copy_from_slice(&3_u16.to_le_bytes());
+        gif[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            ImageKind::Gif.dimensions(&gif),
+            ImageKind::Png.dimensions(&png)
+        );
+
+        let mut jpeg = vec![0_u8; 21];
+        jpeg[..7].copy_from_slice(&[0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08]);
+        jpeg[7..9].copy_from_slice(&2_u16.to_be_bytes());
+        jpeg[9..11].copy_from_slice(&3_u16.to_be_bytes());
+        assert_eq!(
+            ImageKind::Jpeg.dimensions(&jpeg),
+            ImageKind::Png.dimensions(&png)
+        );
+
+        let mut webp = vec![0_u8; 30];
+        webp[..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        webp[12..16].copy_from_slice(b"VP8X");
+        webp[24] = 2;
+        webp[27] = 1;
+        assert_eq!(
+            ImageKind::Webp.dimensions(&webp),
+            ImageKind::Png.dimensions(&png)
+        );
+        assert_eq!(ImageKind::Png.dimensions(b"\x89PNG\r\n\x1a\n"), None);
+    }
+
     #[test]
     fn read_pdf_uses_resolved_poppler_binaries() {
         let source = include_str!("read.rs");
-        let cfg_test = source
-            .find("#[cfg(test)]")
-            .expect("test module marker must be present");
-        let production = &source[..cfg_test];
+        let start = source
+            .find("fn pdftotext_bin")
+            .expect("pdftotext resolver must exist");
+        let end = source[start..]
+            .find("\n}\n")
+            .map(|end| start + end)
+            .expect("pdftotext resolver must terminate");
+        let production = &source[start..end];
 
         assert!(
             !production.contains("Command::new(\"which\")")
@@ -768,189 +1498,6 @@ mod tests {
         assert!(
             production.contains("run.resolve_executable(\"pdftotext\")"),
             "pdftotext availability must use the run-bound resolver"
-        );
-    }
-
-    #[test]
-    fn read_text_no_offset_returns_all_lines() {
-        // Behavior 1: without offset/limit every line is returned
-        let (_f, path) = tmp_text("alpha\nbeta\ngamma\n");
-        let args = HashMap::new();
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(!is_err);
-        assert!(output.contains("alpha"));
-        assert!(output.contains("beta"));
-        assert!(output.contains("gamma"));
-        // No suffix when neither offset nor limit is given
-        assert!(
-            !output.contains("showing lines"),
-            "no suffix without offset/limit"
-        );
-    }
-
-    #[test]
-    fn read_text_offset_1_is_first_line() {
-        // Behavior 1: offset=1 means start at line 1 (no skip)
-        let (_f, path) = tmp_text("first\nsecond\nthird\n");
-        let mut args = HashMap::new();
-        args.insert("offset".to_string(), serde_json::json!(1u64));
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(!is_err);
-        assert!(output.contains("first"), "offset=1 must include line 1");
-    }
-
-    #[test]
-    fn read_text_offset_and_limit_returns_correct_slice() {
-        // Behavior 1: offset=2,limit=1 returns only line 2
-        let (_f, path) = tmp_text("line1\nline2\nline3\n");
-        let mut args = HashMap::new();
-        args.insert("offset".to_string(), serde_json::json!(2u64));
-        args.insert("limit".to_string(), serde_json::json!(1u64));
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(!is_err);
-        assert!(output.contains("line2"), "must include line 2");
-        assert!(!output.contains("line1"), "must not include line 1");
-        assert!(!output.contains("line3"), "must not include line 3");
-        // Suffix is present when offset/limit used
-        assert!(output.contains("showing lines 2-2 of 3 total"));
-    }
-
-    #[test]
-    fn read_text_line_numbers_use_original_numbering() {
-        // Behavior 1: line numbers in output are 1-indexed originals, not relative
-        let (_f, path) = tmp_text("aaa\nbbb\nccc\n");
-        let mut args = HashMap::new();
-        args.insert("offset".to_string(), serde_json::json!(2u64));
-        args.insert("limit".to_string(), serde_json::json!(2u64));
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(!is_err);
-        // Line 2 ("bbb") must be labeled with "2|" and line 3 with "3|"
-        assert!(output.contains("2|"), "line 2 label present: {output}");
-        assert!(output.contains("3|"), "line 3 label present: {output}");
-        assert!(
-            !output.contains("1|"),
-            "line 1 label must be absent: {output}"
-        );
-    }
-
-    #[test]
-    fn read_text_offset_zero_returns_validation_error() {
-        let (_f, path) = tmp_text("alpha\nbeta\n");
-        let mut args = HashMap::new();
-        args.insert("offset".to_string(), serde_json::json!(0u64));
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(is_err);
-        assert!(
-            output.contains("offset") && output.contains("1-indexed"),
-            "offset=0 must fail with a clear contract error; got: {output}"
-        );
-    }
-
-    #[test]
-    fn read_text_offset_beyond_eof_returns_empty_body() {
-        // Behavior 1 edge: offset beyond end → empty body, suffix present
-        let (_f, path) = tmp_text("one\ntwo\n");
-        let mut args = HashMap::new();
-        args.insert("offset".to_string(), serde_json::json!(99u64));
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(!is_err, "not an error — just empty content");
-        // The body before the suffix is empty; suffix shows 0 selected lines.
-        // OC does NOT emit a "file has fewer lines" warning here (CC does).
-        // Pinned as current OC behavior; CC parity tracked via issue #525 edge-case.
-        assert!(
-            output.contains("showing lines"),
-            "suffix must be present: {output}"
-        );
-        assert!(!output.contains("one"), "line 1 must be absent");
-    }
-
-    #[test]
-    fn read_text_limit_zero_returns_validation_error() {
-        let (_f, path) = tmp_text("data\n");
-        let mut args = HashMap::new();
-        args.insert("limit".to_string(), serde_json::json!(0u64));
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(is_err);
-        assert!(
-            output.contains("limit") && output.contains("positive"),
-            "limit=0 must fail with a clear contract error; got: {output}"
-        );
-    }
-
-    #[test]
-    fn read_text_missing_file_returns_error() {
-        // Keep the nonexistent fixture inside the readable capability so this
-        // exercises secure-open ENOENT rather than the outer capability gate.
-        let path = std::env::current_dir()
-            .expect("cwd")
-            .join("__oc_test_does_not_exist_xyz.txt");
-        let args = HashMap::new();
-        let (output, is_err) = read_text_file(test_run(), &path.to_string_lossy(), &args);
-        assert!(is_err);
-        assert!(
-            output.contains("does not exist") || output.contains("securely open"),
-            "error message: {output}"
-        );
-    }
-
-    // =========================================================================
-    // Behavior 2: read_image_file — base64 encode, empty image edge case
-    // =========================================================================
-
-    #[test]
-    fn read_image_returns_base64_text_block() {
-        // Behavior 2: OC returns a plain-text string with base64 inline
-        // (not a structured image block — CC parity gap, pinned as current behavior).
-        let mut f = NamedTempFile::new_in(".").expect("tempfile");
-        // Minimal valid PNG bytes (1×1 red pixel)
-        let minimal_png: &[u8] = &[
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
-            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR length + type
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, // bit depth, color type, ...
-            0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, // IDAT length + type
-            0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, // IDAT data
-            0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc, // ...
-            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, // IEND
-            0x44, 0xae, 0x42, 0x60, 0x82,
-        ];
-        f.write_all(minimal_png).expect("write png");
-        let path = f.path().to_string_lossy().to_string();
-        let (output, is_err) = read_image_file(test_run(), &path, ImageKind::Png);
-        assert!(!is_err);
-        assert!(output.contains("[Image:"), "header line present: {output}");
-        assert!(output.contains("image/png"), "mime type present");
-        assert!(output.contains("bytes"), "byte count present");
-        // base64 data follows the header line
-        assert!(output.len() > 50, "output non-trivial");
-    }
-
-    #[test]
-    fn read_image_empty_file_returns_error() {
-        // Behavior 2 edge: empty image file is rejected at the boundary
-        // (crosslink #942 — previously OC accepted 0-byte images and let the
-        // upstream vision API reject the empty base64 after a turn was burned).
-        let f = NamedTempFile::new_in(".").expect("tempfile");
-        // Write nothing — file is 0 bytes
-        let path = f.path().to_string_lossy().to_string();
-        let (output, is_err) = read_image_file(test_run(), &path, ImageKind::Png);
-        assert!(is_err, "0-byte image must be a structured error: {output}");
-        assert!(
-            output.contains("empty") && output.contains("0 bytes"),
-            "error message must name the failure mode: {output}"
-        );
-    }
-
-    #[test]
-    fn read_image_nonexistent_returns_error() {
-        let path = std::env::current_dir()
-            .expect("cwd")
-            .join("__oc_no_such_image.png");
-        let (output, is_err) = read_image_file(test_run(), &path.to_string_lossy(), ImageKind::Png);
-        assert!(is_err);
-        assert!(
-            output.contains("does not exist") || output.contains("securely open"),
-            "error message: {output}"
         );
     }
 
@@ -997,123 +1544,6 @@ mod tests {
     fn parse_page_range_non_numeric_is_error() {
         let r = parse_page_range("abc");
         assert!(r.is_err());
-    }
-
-    // =========================================================================
-    // Behavior 8: truncation — silent non-error truncation at 100 000 chars
-    // =========================================================================
-
-    #[test]
-    fn read_text_large_file_truncated_as_non_error() {
-        // Behavior 8: large files are truncated at a *line boundary* (crosslink
-        // #939) and tagged with a structured <truncated …/> sentinel that the
-        // dispatcher can detect programmatically. The truncation itself is not
-        // surfaced as an error — the caller is told how to recover via offset.
-        let line = "x".repeat(200) + "\n"; // 201 chars per line
-                                           // Need > 100_000 chars in the numbered output: with "   N| " prefix (~7 chars)
-                                           // each line becomes ~208 chars; 600 lines = ~124 800 chars → triggers truncation.
-        let content = line.repeat(600);
-        let mut f = NamedTempFile::new_in(".").expect("tempfile");
-        f.write_all(content.as_bytes()).expect("write");
-        let path = f.path().to_string_lossy().to_string();
-        let args = HashMap::new();
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(
-            !is_err,
-            "truncation is not an error — the sentinel signals it: {output}"
-        );
-        assert!(
-            output.contains("<truncated"),
-            "structured truncation sentinel must be present: {output}"
-        );
-        assert!(
-            output.contains("file truncated at line boundary"),
-            "human-readable retry hint must be present: {output}"
-        );
-        // The kept body is bounded by the budget; the only thing past 100_000
-        // chars should be the sentinel + retry hint (a few hundred bytes).
-        assert!(
-            output.len() < 100_000 + 1024,
-            "kept body must respect the budget, only the sentinel exceeds it: {} bytes",
-            output.len()
-        );
-    }
-
-    #[test]
-    fn read_text_within_cap_not_truncated() {
-        // Behavior 8: files under the 100 000-char cap are returned in full
-        let (_f, path) = tmp_text("short line\n");
-        let args = HashMap::new();
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(!is_err);
-        assert!(
-            !output.contains("file truncated"),
-            "no truncation note for small files"
-        );
-    }
-
-    // =========================================================================
-    // Behavior 9: MAX_FILE_SIZE_BYTES — OOM-safe size cap (#288)
-    // =========================================================================
-
-    /// Helper: write `size` bytes of 'a' to a temp file.
-    fn tmp_sized(size: usize) -> (NamedTempFile, String) {
-        let mut f = NamedTempFile::new_in(".").expect("tempfile");
-        let buf = vec![b'a'; size];
-        f.write_all(&buf).expect("write");
-        let path = f.path().to_string_lossy().to_string();
-        (f, path)
-    }
-
-    #[test]
-    fn read_text_oversize_file_is_rejected_with_actionable_error() {
-        // Behavior 9: file exceeding MAX_FILE_SIZE_BYTES (10 MiB) is rejected.
-        // The error message must mention "too large" so the caller can act on it.
-        let size = (10 * 1024 * 1024) + 1; // 1 byte over the cap
-        let (_f, path) = tmp_sized(size);
-        let args = HashMap::new();
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(is_err, "oversized file must be an error: {output}");
-        assert!(
-            output.contains("too large"),
-            "error must mention 'too large': {output}"
-        );
-    }
-
-    #[test]
-    fn read_text_small_file_reads_cleanly() {
-        // Behavior 9: files well under the cap go through the bounded read path
-        // without any error or spurious truncation note.
-        let (_f, path) = tmp_text("hello world\n");
-        let args = HashMap::new();
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(!is_err, "small file must succeed: {output}");
-        assert!(output.contains("hello world"), "content present: {output}");
-    }
-
-    #[test]
-    fn read_text_empty_file_is_ok() {
-        // Behavior 9 edge: zero-byte regular file — not a device, not oversized.
-        // Must succeed with an empty body.
-        let f = NamedTempFile::new_in(".").expect("tempfile");
-        let path = f.path().to_string_lossy().to_string();
-        let args = HashMap::new();
-        let (output, is_err) = read_text_file(test_run(), &path, &args);
-        assert!(!is_err, "empty file must not be an error: {output}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_text_device_outside_capability_is_rejected() {
-        // Devices are never session file capabilities. The outer capability
-        // check should reject /dev before the implementation can open it.
-        let args = HashMap::new();
-        let (output, is_err) = read_text_file(test_run(), "/dev/null", &args);
-        assert!(is_err, "/dev/null (char device) must be rejected: {output}");
-        assert!(
-            output.contains("outside the session") || output.contains("not a regular file"),
-            "error must explain the capability/type denial: {output}"
-        );
     }
 
     // =========================================================================
