@@ -1,6 +1,6 @@
 {
   "next_display_id": 1139,
-  "next_comment_id": 1580,
+  "next_comment_id": 1581,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17122,7 +17122,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T06:45:36.008716830Z",
-      "updated_at": "2026-08-25T07:07:32.506370856Z",
+      "updated_at": "2026-08-25T07:07:54.310442442Z",
       "labels": [
         "remediation"
       ],
@@ -17135,6 +17135,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAD1+qYyj7faj2IAiudw2Ieo8Tv3ZkBI2VJjz2UQh8T3af2y5jQXzKIpMLcqeaMtpSd/jxw17YxeLLN2K/SS6dCA=="
+        },
+        "6c4d216d-d1c2-4851-9d36-37fe6c1fb5b1": {
+          "display_id": 1580,
+          "author": "6Vw9",
+          "content": "Plan: isolate the locally constructed background manager behind its own real temporary run context so the test cannot hydrate global-suite jobs; preserve production persistence behavior and all parent-death assertions; regenerate only the source-digest-bound evidence; verify focused, module, full-suite, Clippy, format, and repository-policy gates.",
+          "created_at": "2026-08-25T07:07:54.307887445Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPqEz8I6KpcPKL9NPUPaychYMu+bpIINrklowBVOdElChANxqU24rHgjukzhCOILEaXKHoIJ8wV0P99CvsrzTDQ=="
         },
         "7c8f92d7-db8a-4c59-a9ea-23a94d1fff85": {
           "display_id": 1578,
@@ -40418,11 +40427,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1615,
       "timestamp": "2026-08-25T07:07:32.506370856Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1616,
+      "timestamp": "2026-08-25T07:07:54.310442442Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T07:07:32.506370856Z",
+    "timestamp": "2026-08-25T07:07:54.310442442Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1615
+    "agent_seq": 1616
   }
 }
