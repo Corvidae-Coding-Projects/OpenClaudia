@@ -1,6 +1,6 @@
 {
   "next_display_id": 1137,
-  "next_comment_id": 1544,
+  "next_comment_id": 1545,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -27949,7 +27949,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T03:05:37.879221589Z",
-      "updated_at": "2026-08-25T04:18:50.403653464Z",
+      "updated_at": "2026-08-25T04:50:15.693520759Z",
       "labels": [
         "remediation"
       ],
@@ -27983,6 +27983,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABANbkruvVLBS54wVES2bc8HsDVeqLWZim+vRah5PW7ds1+AaLgv5l6I2cLBLXepNovhp30TAygwFo/PkJF5HL5Bg=="
+        },
+        "5edb03d8-0c90-43bb-9612-920c8daf567b": {
+          "display_id": 1544,
+          "author": "6Vw9",
+          "content": "[result] db72f6d8 feat(tools): add typed partial multimodal reads. Delivered bounded descriptor-pinned text and binary pagination with generation-bound gap-free cursors; typed MIME, encoding, sensitivity, artifact, partial, and truncation diagnostics; transient non-durable image payloads; provider-native media projection for supported transports; explicit unsupported diagnostics otherwise. Verification: Rust 1.98 cargo fmt --all; strict clippy --locked --all-targets --all-features -D warnings; full serialized cargo test --workspace --all-targets --all-features --locked; focused read, registry, provider, integration, fuzz, policy, dependency, and Windows GNU checks. No raw attachment bytes enter durable tool results or transcripts. Google function-response media is capability and MIME gated. VDD receipt is deferred to S-088 as designed; known Windows warnings remain tracked by #1099.",
+          "created_at": "2026-08-25T04:50:15.682285248Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1DdnMIdaG5uUKIyLQzotWAGRQlBvJz1cwRyucomNJrp2U0Bku4J2ojNJ+Keu6utlE1mW/FeHJFau377sPEGFDA=="
         },
         "8e7e5529-ea2c-4433-972e-60956571ea0c": {
           "display_id": 1540,
@@ -39754,11 +39763,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1556,
       "timestamp": "2026-08-25T04:18:50.403653464Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1557,
+      "timestamp": "2026-08-25T04:50:15.693520759Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T04:18:50.403653464Z",
+    "timestamp": "2026-08-25T04:50:15.693520759Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1556
+    "agent_seq": 1557
   }
 }
