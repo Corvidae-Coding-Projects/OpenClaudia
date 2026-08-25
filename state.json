@@ -1,6 +1,6 @@
 {
   "next_display_id": 1139,
-  "next_comment_id": 1578,
+  "next_comment_id": 1579,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17122,11 +17122,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T06:45:36.008716830Z",
-      "updated_at": "2026-08-25T06:51:13.361117572Z",
+      "updated_at": "2026-08-25T07:07:28.069820886Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "7c8f92d7-db8a-4c59-a9ea-23a94d1fff85": {
+          "display_id": 1578,
+          "author": "6Vw9",
+          "content": "Resolved the Linux-only CI race at its actual boundary: the parent-death test's local BackgroundShellManager now owns a temporary ToolRunContext and durable namespace, preventing recovery of global test jobs that another supervisor may still be finalizing. Production generation-conflict handling is unchanged. Canonical technical-memory evidence was regenerated because it digest-binds src/tools/bash/mod.rs. Verification: focused regression green; all 33 Bash unit tests green; Rust 1.98 full locked all-target/all-feature suite green; strict all-target/all-feature Clippy green; formatting green; 27 repository-policy tests and hygiene check green.",
+          "created_at": "2026-08-25T07:07:28.067242492Z",
+          "kind": "resolution",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5nEX/LeCLSIx94zu0LFoXc3T9d2PI+4Dl8wMu+fb9n29dgFPBoFkBVsBjojnF+DqFPdC/utgTVRiL/SFUVknBg=="
+        },
         "cc5027eb-516d-4a63-aaa5-28712acb66e7": {
           "display_id": 1577,
           "author": "6Vw9",
@@ -40390,11 +40399,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1613,
       "timestamp": "2026-08-25T06:51:13.361117572Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1614,
+      "timestamp": "2026-08-25T07:07:28.069820886Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T06:51:13.361117572Z",
+    "timestamp": "2026-08-25T07:07:28.069820886Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1613
+    "agent_seq": 1614
   }
 }
