@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1604,
+  "next_comment_id": 1605,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,7 +16222,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T10:46:54.649505652Z",
+      "updated_at": "2026-08-25T10:47:44.351242766Z",
       "labels": [
         "remediation"
       ],
@@ -16253,6 +16253,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGSYyAm1OXTSM5l+jJ9+EfSgNgvNqtgl8IEaYP6H8eX/F+zVLFzl4moO7SY+/o5ROIOUeNjaPD8DN93WTgae2BA=="
+        },
+        "2ac5ef53-de94-4ea3-9afe-d51be0f56832": {
+          "display_id": 1604,
+          "author": "6Vw9",
+          "content": "[action] S-036 delivery blocked after three consecutive checks: local HEAD 151af0ad remains two commits ahead of origin c4bd8dec. User-authorized push is required before PR #66 can run authoritative Windows evidence; #1139 remains open.",
+          "created_at": "2026-08-25T10:47:44.348565148Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6SftaMiI1DsiJ6L2nshDRvC1RKMdUJMUMXX65SOwi+X0hx+pIXXarQNTj9gJyhjOKVsrQwW49DPAvQQ7CR8OBw=="
         },
         "867d4c95-f02c-4a63-b9ba-78e6a0f98e6c": {
           "display_id": 1599,
@@ -40841,11 +40850,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1650,
       "timestamp": "2026-08-25T10:46:54.649505652Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1651,
+      "timestamp": "2026-08-25T10:47:44.351242766Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T10:46:54.649505652Z",
+    "timestamp": "2026-08-25T10:47:44.351242766Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1650
+    "agent_seq": 1651
   }
 }
