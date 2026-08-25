@@ -16,8 +16,9 @@ use std::path::{Component, Path, PathBuf, Prefix};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    NtCreateFile, NtFlushBuffersFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
-    FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, NtCreateFile, NtFlushBuffersFile, NtSetInformationFile, FILE_CREATE,
+    FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
     LocalFree, RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
@@ -37,16 +38,16 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdInfo,
-    FileRenameInfo, FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetFileType, LockFileEx, SetFileInformationByHandle, UnlockFileEx, BY_HANDLE_FILE_INFORMATION,
-    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+    FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, GetFileType,
+    LockFileEx, SetFileInformationByHandle, UnlockFileEx, BY_HANDLE_FILE_INFORMATION, DELETE,
+    FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
     FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_READ_EA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-    FILE_WRITE_EA, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_EXISTING, READ_CONTROL,
-    SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, OVERLAPPED};
@@ -903,13 +904,13 @@ pub fn rename_relative(
         .checked_mul(2)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename target is too long"))?;
-    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let length = offset
+    let length = std::mem::size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(usize::try_from(name_bytes).unwrap_or(usize::MAX))
+        .and_then(|value| value.checked_add(std::mem::size_of::<u16>()))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too long"))?;
     let words = length.div_ceil(std::mem::size_of::<usize>());
     let mut storage = vec![0_usize; words];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: storage is aligned and large enough for the fixed header and
     // exact UTF-16 payload.
     unsafe {
@@ -918,22 +919,21 @@ pub fn rename_relative(
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
     }
-    // SAFETY: the handle and complete FILE_RENAME_INFO buffer remain live.
-    if unsafe {
-        SetFileInformationByHandle(
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: the source and root-directory handles, status block, and complete
+    // FILE_RENAME_INFORMATION buffer remain live for this synchronous call.
+    let result = unsafe {
+        NtSetInformationFile(
             file.as_raw_handle() as HANDLE,
-            FileRenameInfo,
+            &raw mut status,
             info.cast(),
             u32::try_from(length).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "rename buffer exceeds u32")
             })?,
+            FileRenameInformation,
         )
-    } == 0
-    {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    };
+    nt_result(result)
 }
 
 pub fn delete_handle(file: &File) -> io::Result<()> {
@@ -1249,5 +1249,64 @@ fn nt_result(status: i32) -> io::Result<()> {
         // SAFETY: translating an NTSTATUS has no pointer preconditions.
         let code = unsafe { RtlNtStatusToDosError(status) };
         Err(io::Error::from_raw_os_error(code.cast_signed()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::*;
+
+    #[test]
+    fn root_relative_rename_publishes_through_pinned_directory() {
+        let root = tempfile::tempdir().expect("rename root");
+        let directory = open_absolute_directory_for_write(root.path()).expect("pinned root");
+        let mut stage = open_relative(
+            &directory,
+            Path::new("stage.tmp"),
+            ObjectKind::Regular,
+            OpenAccess::ExclusiveWrite,
+            OpenDisposition::Create,
+            None,
+        )
+        .expect("create handle-relative stage")
+        .file;
+        stage.write_all(b"published").expect("write stage");
+        flush(&stage).expect("flush stage");
+
+        rename_relative(&stage, &directory, OsStr::new("state.json"), false)
+            .expect("publish handle-relative rename");
+        drop(stage);
+
+        assert!(!root.path().join("stage.tmp").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("state.json")).expect("read published target"),
+            b"published"
+        );
+
+        let mut replacement = open_relative(
+            &directory,
+            Path::new("replacement.tmp"),
+            ObjectKind::Regular,
+            OpenAccess::ExclusiveWrite,
+            OpenDisposition::Create,
+            None,
+        )
+        .expect("create replacement stage")
+        .file;
+        replacement
+            .write_all(b"replaced")
+            .expect("write replacement stage");
+        flush(&replacement).expect("flush replacement stage");
+        rename_relative(&replacement, &directory, OsStr::new("state.json"), true)
+            .expect("replace through pinned directory");
+        drop(replacement);
+
+        assert!(!root.path().join("replacement.tmp").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("state.json")).expect("read replaced target"),
+            b"replaced"
+        );
     }
 }
