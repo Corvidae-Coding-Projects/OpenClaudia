@@ -3,7 +3,7 @@
 //!
 //! Sprint 145 of the verification effort. This file pins
 //! the registry-dispatched validation paths for
-//! `notebook_edit`: missing `notebook_path`, missing
+//! `notebook_edit`: missing `notebook_path`, mode-conditional
 //! `new_source`, invalid `edit_mode`, invalid `cell_type`
 //! (#985), out-of-range `cell_number` (#470).
 
@@ -89,6 +89,20 @@ fn new_source_as_number_returns_validation_error() {
     let (msg, is_err) = dispatch_notebook(&args);
     assert!(is_err);
     assert!(msg.contains("Invalid 'new_source' argument: expected string"));
+}
+
+#[test]
+fn delete_does_not_require_irrelevant_new_source() {
+    let args = args_with(&[
+        ("notebook_path", json!("nonexistent.ipynb")),
+        ("edit_mode", json!("delete")),
+    ]);
+    let (msg, is_err) = dispatch_notebook(&args);
+    assert!(is_err, "nonexistent notebook still fails downstream");
+    assert!(
+        !msg.contains("new_source"),
+        "delete must pass source validation without a placeholder: {msg}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

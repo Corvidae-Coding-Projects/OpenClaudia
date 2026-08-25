@@ -1623,27 +1623,6 @@ pub(super) fn changed_line_counts(before: &str, after: &str) -> (u32, u32) {
     (added, removed)
 }
 
-pub(super) fn record_active_diff_observation(
-    run: &super::security::ToolRunContext,
-    path: &str,
-    before: &str,
-    after: &str,
-) {
-    if before == after {
-        return;
-    }
-    let prepared = match prepare_file_diff(run, path, before, after) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            tracing::warn!(path, error, "could not retain bounded file diff evidence");
-            READ_TRACKER.mark_stale(run, Path::new(path));
-            return;
-        }
-    };
-    READ_TRACKER.mark_stale(run, Path::new(path));
-    append_prepared_diff_observation(run, path, &prepared);
-}
-
 pub(super) fn record_prepared_diff_observation(
     run: &super::security::ToolRunContext,
     path: &str,

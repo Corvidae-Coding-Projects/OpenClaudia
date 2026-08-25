@@ -1322,6 +1322,16 @@ mod tests {
         READ_TRACKER,
     };
     use std::fs;
+    use std::path::Path;
+
+    fn mark_notebook_read(path: &Path) -> String {
+        READ_TRACKER.mark_read(test_run(), path);
+        READ_TRACKER
+            .snapshot_for(test_run(), path)
+            .expect("notebook test read must record a snapshot")
+            .generation()
+            .to_string()
+    }
 
     #[test]
     fn test_tool_definitions() {
@@ -1840,8 +1850,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        // Mark as read first
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1850,6 +1859,7 @@ mod tests {
         );
         args.insert("cell_number".to_string(), json!(0));
         args.insert("new_source".to_string(), json!("new code\nline 2"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
 
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit replace should succeed: {output}");
@@ -1883,7 +1893,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1894,6 +1904,7 @@ mod tests {
         args.insert("new_source".to_string(), json!("# New markdown cell"));
         args.insert("cell_type".to_string(), json!("markdown"));
         args.insert("edit_mode".to_string(), json!("insert"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
 
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit insert should succeed: {output}");
@@ -1935,7 +1946,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -1943,8 +1954,8 @@ mod tests {
             json!(nb_path.to_str().unwrap()),
         );
         args.insert("cell_number".to_string(), json!(0));
-        args.insert("new_source".to_string(), json!(""));
         args.insert("edit_mode".to_string(), json!("delete"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
 
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "notebook_edit delete should succeed: {output}");
@@ -1995,7 +2006,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -2004,6 +2015,7 @@ mod tests {
         );
         args.insert("cell_number".to_string(), json!(5));
         args.insert("new_source".to_string(), json!("test"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
 
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error, "Should fail for out-of-bounds cell");
@@ -2022,7 +2034,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -2032,6 +2044,7 @@ mod tests {
         args.insert("cell_number".to_string(), json!(0));
         args.insert("new_source".to_string(), json!("test"));
         args.insert("edit_mode".to_string(), json!("insert"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
         // No cell_type provided
 
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
@@ -2053,7 +2066,7 @@ mod tests {
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
 
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -2064,6 +2077,7 @@ mod tests {
         args.insert("new_source".to_string(), json!("x = 1"));
         args.insert("cell_type".to_string(), json!("code"));
         args.insert("edit_mode".to_string(), json!("insert"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
 
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "insert code cell should succeed: {output}");
@@ -2097,7 +2111,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         // Replace by cell_id — no cell_number supplied.
         let mut args = HashMap::new();
@@ -2107,6 +2121,7 @@ mod tests {
         );
         args.insert("cell_id".to_string(), json!("cell-b"));
         args.insert("new_source".to_string(), json!("replaced-b"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "replace by cell_id should succeed: {output}");
 
@@ -2128,7 +2143,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         // Insert AFTER "one" — should land at position 1, pushing "two" to position 2.
         let mut args = HashMap::new();
@@ -2140,6 +2155,7 @@ mod tests {
         args.insert("edit_mode".to_string(), json!("insert"));
         args.insert("cell_type".to_string(), json!("markdown"));
         args.insert("new_source".to_string(), json!("inserted"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(!is_error, "insert after cell_id should succeed: {output}");
 
@@ -2163,7 +2179,7 @@ mod tests {
             "metadata": {}, "nbformat": 4, "nbformat_minor": 5
         });
         fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
-        READ_TRACKER.mark_read(test_run(), &nb_path);
+        let snapshot = mark_notebook_read(&nb_path);
 
         let mut args = HashMap::new();
         args.insert(
@@ -2172,6 +2188,7 @@ mod tests {
         );
         args.insert("cell_id".to_string(), json!("does-not-exist"));
         args.insert("new_source".to_string(), json!("x"));
+        args.insert("expected_snapshot".to_string(), json!(snapshot));
         let (output, is_error) = file::execute_notebook_edit(test_run(), &args);
         assert!(is_error);
         assert!(output.contains("does-not-exist"));

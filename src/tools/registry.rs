@@ -788,7 +788,7 @@ impl ToolHandler for NotebookEditHandler {
             "type": "function",
             "function": {
                 "name": "notebook_edit",
-                "description": "Edit a Jupyter notebook (.ipynb file). Supports replacing cell contents, inserting new cells, and deleting cells. The notebook must be read successfully with read_file in the same session before editing. Accepts either `cell_id` (Claude Code-compatible stable ID from the notebook's cell metadata) or `cell_number` (0-indexed position). For `insert`, `cell_id` means 'insert after this cell' and omitting it inserts at the beginning.",
+                "description": "Atomically edit a validated Jupyter notebook (.ipynb file). First read it successfully with read_file and pass the returned generation as expected_snapshot; concurrent changes return a conflict without overwriting newer content. Supports replace, insert, and delete by stable cell_id or legacy 0-indexed cell_number. For insert, cell_id means 'insert after this cell' and omitting both locators inserts at the beginning.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -806,7 +806,7 @@ impl ToolHandler for NotebookEditHandler {
                         },
                         "new_source": {
                             "type": "string",
-                            "description": "The new source content for the cell. For delete mode, this can be empty."
+                            "description": "The new source content for the cell. Required for replace and insert; omit for delete."
                         },
                         "cell_type": {
                             "type": "string",
@@ -817,9 +817,14 @@ impl ToolHandler for NotebookEditHandler {
                             "type": "string",
                             "enum": ["replace", "insert", "delete"],
                             "description": "The edit operation: 'replace' (default) overwrites cell source, 'insert' adds a new cell at the index, 'delete' removes the cell."
+                        },
+                        "expected_snapshot": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                            "description": "Exact snapshot generation returned by read_file for this notebook."
                         }
                     },
-                    "required": ["notebook_path", "new_source"]
+                    "required": ["notebook_path", "expected_snapshot"]
                 }
             }
         })

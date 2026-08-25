@@ -55,14 +55,23 @@ fn call(name: &str, args: &Value) -> ToolCall {
     }
 }
 
-/// Drive `read_file` through the public dispatch so the
-/// `READ_TRACKER` mark is recorded, then return the result tuple.
-fn mark_read(path: &str) -> (String, bool) {
-    let r = execute_tool(
+/// Drive `read_file` through public dispatch and return its typed generation.
+fn mark_read_snapshot(path: &str) -> String {
+    let result = execute_tool(
         support::shared_run_context(),
         &call("read_file", &json!({"path": path})),
     );
-    (r.content().to_string(), r.is_error())
+    assert!(
+        !result.is_error(),
+        "read_file must succeed: {}",
+        result.content()
+    );
+    result
+        .structured()
+        .and_then(|value| value.pointer("/artifact/generation"))
+        .and_then(Value::as_str)
+        .expect("successful notebook read must expose a typed snapshot generation")
+        .to_string()
 }
 
 fn notebook_edit(args: &Value) -> (String, bool) {
@@ -76,14 +85,17 @@ fn make_notebook(cells: &[(&str, &str, &str)]) -> Value {
     let cell_array: Vec<Value> = cells
         .iter()
         .map(|(id, ct, src)| {
-            json!({
+            let mut cell = json!({
                 "id": id,
                 "cell_type": ct,
                 "metadata": {},
                 "source": source_to_line_array(src),
-                "outputs": [],
-                "execution_count": Value::Null,
-            })
+            });
+            if *ct == "code" {
+                cell["outputs"] = json!([]);
+                cell["execution_count"] = Value::Null;
+            }
+            cell
         })
         .collect();
     json!({
@@ -170,13 +182,14 @@ fn replace_cell_by_id_rewrites_source() {
     let path_str = path.to_string_lossy().to_string();
 
     // Mark the file as read so the gate passes.
-    let (_, _) = mark_read(&path_str);
+    let snapshot = mark_read_snapshot(&path_str);
 
     let (msg, is_err) = notebook_edit(&json!({
         "notebook_path": path_str,
         "cell_id": "c2",
         "edit_mode": "replace",
         "new_source": "print('TWO REPLACED')",
+        "expected_snapshot": snapshot,
     }));
     assert!(!is_err, "replace must succeed: {msg:?}");
 
@@ -206,7 +219,7 @@ fn insert_cell_grows_notebook_by_one() {
     let nb = make_notebook(&[("c1", "code", "x = 1")]);
     write_notebook(&path, &nb);
     let path_str = path.to_string_lossy().to_string();
-    let (_, _) = mark_read(&path_str);
+    let snapshot = mark_read_snapshot(&path_str);
 
     let before = read_notebook(&path);
     assert_eq!(cells_len(&before), 1);
@@ -217,6 +230,7 @@ fn insert_cell_grows_notebook_by_one() {
         "edit_mode": "insert",
         "cell_type": "markdown",
         "new_source": "# Inserted markdown",
+        "expected_snapshot": snapshot,
     }));
     assert!(!is_err, "insert must succeed: {msg:?}");
 
@@ -226,6 +240,13 @@ fn insert_cell_grows_notebook_by_one() {
         2,
         "cell count must grow by 1 after insert"
     );
+    let inserted_id = after["cells"][1]["id"]
+        .as_str()
+        .expect("inserted cell has a stable id");
+    assert!((1..=64).contains(&inserted_id.len()));
+    assert!(inserted_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
 }
 
 #[test]
@@ -241,17 +262,13 @@ fn delete_cell_shrinks_notebook_by_one() {
     ]);
     write_notebook(&path, &nb);
     let path_str = path.to_string_lossy().to_string();
-    let (_, _) = mark_read(&path_str);
+    let snapshot = mark_read_snapshot(&path_str);
 
-    // Note: the API requires `new_source` even for delete (the
-    // parser validates all typed args before dispatching by
-    // edit_mode). Pass an empty placeholder so the delete path
-    // reaches the dispatch.
     let (msg, is_err) = notebook_edit(&json!({
         "notebook_path": path_str,
         "cell_id": "c2",
         "edit_mode": "delete",
-        "new_source": "",
+        "expected_snapshot": snapshot,
     }));
     assert!(!is_err, "delete must succeed: {msg:?}");
 
@@ -278,13 +295,14 @@ fn invalid_edit_mode_is_refused() {
     let path = dir.path().join("nb.ipynb");
     write_notebook(&path, &make_notebook(&[("c1", "code", "x = 1")]));
     let path_str = path.to_string_lossy().to_string();
-    let (_, _) = mark_read(&path_str);
+    let snapshot = mark_read_snapshot(&path_str);
 
     let (msg, is_err) = notebook_edit(&json!({
         "notebook_path": path_str,
         "cell_id": "c1",
         "edit_mode": "yeet",
         "new_source": "placeholder",
+        "expected_snapshot": snapshot,
     }));
     assert!(is_err, "invalid edit_mode must error");
     assert!(
@@ -301,7 +319,7 @@ fn invalid_cell_type_on_insert_is_refused() {
     let path = dir.path().join("nb.ipynb");
     write_notebook(&path, &make_notebook(&[("c1", "code", "x = 1")]));
     let path_str = path.to_string_lossy().to_string();
-    let (_, _) = mark_read(&path_str);
+    let snapshot = mark_read_snapshot(&path_str);
 
     let (msg, is_err) = notebook_edit(&json!({
         "notebook_path": path_str,
@@ -309,6 +327,7 @@ fn invalid_cell_type_on_insert_is_refused() {
         "edit_mode": "insert",
         "cell_type": "garbage",
         "new_source": "x",
+        "expected_snapshot": snapshot,
     }));
     assert!(is_err, "invalid cell_type must error");
     assert!(
@@ -325,13 +344,14 @@ fn unknown_cell_id_on_replace_is_refused() {
     let path = dir.path().join("nb.ipynb");
     write_notebook(&path, &make_notebook(&[("c1", "code", "x = 1")]));
     let path_str = path.to_string_lossy().to_string();
-    let (_, _) = mark_read(&path_str);
+    let snapshot = mark_read_snapshot(&path_str);
 
     let (msg, is_err) = notebook_edit(&json!({
         "notebook_path": path_str,
         "cell_id": "no-such-cell",
         "edit_mode": "replace",
         "new_source": "y",
+        "expected_snapshot": snapshot,
     }));
     assert!(is_err, "unknown cell_id must error; got msg={msg:?}");
 }
@@ -345,6 +365,7 @@ fn parent_dir_traversal_in_notebook_path_is_refused_before_read_gate() {
         "cell_id": "c1",
         "edit_mode": "replace",
         "new_source": "x",
+        "expected_snapshot": format!("sha256:{}", "0".repeat(64)),
     }));
     assert!(is_err, "../-traversal notebook_path MUST be rejected");
     assert!(
@@ -370,17 +391,14 @@ fn symlink_leaf_notebook_path_is_refused_through_public_dispatch() {
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
     let link_str = link.to_string_lossy().to_string();
 
-    let (read_msg, read_err) = mark_read(&link_str);
-    assert!(
-        !read_err,
-        "read_file through symlink should mark canonical target: {read_msg}"
-    );
+    let snapshot = mark_read_snapshot(&link_str);
 
     let (msg, is_err) = notebook_edit(&json!({
         "notebook_path": link_str,
         "cell_id": "guarded",
         "edit_mode": "replace",
         "new_source": "ATTACKER_INJECTED_SOURCE",
+        "expected_snapshot": snapshot,
     }));
     assert!(
         is_err,
@@ -414,13 +432,14 @@ fn nbformat_top_level_fields_survive_edit() {
     let nb = make_notebook(&[("c1", "code", "x = 1")]);
     write_notebook(&path, &nb);
     let path_str = path.to_string_lossy().to_string();
-    let (_, _) = mark_read(&path_str);
+    let snapshot = mark_read_snapshot(&path_str);
 
     let (_, is_err) = notebook_edit(&json!({
         "notebook_path": path_str,
         "cell_id": "c1",
         "edit_mode": "replace",
         "new_source": "x = 2",
+        "expected_snapshot": snapshot,
     }));
     assert!(!is_err);
 
@@ -439,5 +458,182 @@ fn nbformat_top_level_fields_survive_edit() {
         after.get("metadata").is_some(),
         "metadata MUST survive edit"
     );
+}
+
+#[test]
+fn stale_snapshot_never_overwrites_a_concurrent_notebook_generation() {
+    let _sess = session_lock();
+    let dir = TempDir::new_in(".").expect("tempdir");
+    let path = dir.path().join("stale.ipynb");
+    write_notebook(&path, &make_notebook(&[("c1", "code", "reviewed")]));
+    let path_str = path.to_string_lossy().to_string();
+    let snapshot = mark_read_snapshot(&path_str);
+
+    let concurrent = make_notebook(&[("c1", "code", "external update")]);
+    let concurrent_bytes = serde_json::to_vec_pretty(&concurrent).expect("serialize concurrent");
+    std::fs::write(&path, &concurrent_bytes).expect("concurrent write");
+
+    let (message, is_error) = notebook_edit(&json!({
+        "notebook_path": path_str,
+        "cell_id": "c1",
+        "edit_mode": "replace",
+        "new_source": "agent update",
+        "expected_snapshot": snapshot,
+    }));
+    assert!(is_error, "stale generation must be refused");
+    assert!(
+        message.contains("changed") || message.contains("conflict"),
+        "failure must explain the generation conflict: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read concurrent notebook"),
+        concurrent_bytes,
+        "the concurrent generation must remain byte-for-byte intact"
+    );
+}
+
+#[test]
+fn malformed_notebook_is_rejected_without_rewriting_it() {
+    let _sess = session_lock();
+    let dir = TempDir::new_in(".").expect("tempdir");
+    let path = dir.path().join("duplicate-ids.ipynb");
+    let malformed = json!({
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "metadata": {"preserve": true},
+        "cells": [
+            {"id": "duplicate", "cell_type": "code", "metadata": {}, "source": ["a"], "outputs": [], "execution_count": null},
+            {"id": "duplicate", "cell_type": "markdown", "metadata": {}, "source": ["b"]}
+        ]
+    });
+    let original = serde_json::to_vec_pretty(&malformed).expect("serialize malformed");
+    std::fs::write(&path, &original).expect("write malformed notebook");
+    let path_str = path.to_string_lossy().to_string();
+    let snapshot = mark_read_snapshot(&path_str);
+
+    let (message, is_error) = notebook_edit(&json!({
+        "notebook_path": path_str,
+        "cell_number": 0,
+        "edit_mode": "replace",
+        "new_source": "changed",
+        "expected_snapshot": snapshot,
+    }));
+    assert!(is_error, "duplicate cell IDs must be rejected");
+    assert!(
+        message.contains("repeats cell id"),
+        "unexpected error: {message}"
+    );
+    assert_eq!(std::fs::read(&path).expect("read malformed"), original);
+}
+
+#[test]
+fn legacy_v4_notebook_round_trip_adds_ids_and_preserves_unrelated_content() {
+    let _sess = session_lock();
+    let dir = TempDir::new_in(".").expect("tempdir");
+    let path = dir.path().join("legacy.ipynb");
+    let legacy = json!({
+        "nbformat": 4,
+        "nbformat_minor": 4,
+        "metadata": {"kernelspec": {"name": "python3"}, "custom": [1, 2, 3]},
+        "cells": [
+            {
+                "cell_type": "code",
+                "metadata": {"trusted": true},
+                "source": ["print('kept')"],
+                "outputs": [{"output_type": "stream", "name": "stdout", "text": ["kept\n"]}],
+                "execution_count": 7
+            },
+            {"cell_type": "markdown", "metadata": {"tag": "edit"}, "source": ["old"]}
+        ]
+    });
+    write_notebook(&path, &legacy);
+    let path_str = path.to_string_lossy().to_string();
+    let snapshot = mark_read_snapshot(&path_str);
+
+    let (message, is_error) = notebook_edit(&json!({
+        "notebook_path": path_str,
+        "cell_number": 1,
+        "edit_mode": "replace",
+        "new_source": "new markdown",
+        "expected_snapshot": snapshot,
+    }));
+    assert!(!is_error, "legacy notebook edit must succeed: {message}");
+
+    let after = read_notebook(&path);
+    assert_eq!(after["nbformat_minor"], 5);
+    assert_eq!(after["metadata"], legacy["metadata"]);
+    assert_eq!(after["cells"][0]["outputs"], legacy["cells"][0]["outputs"]);
+    assert_eq!(
+        after["cells"][0]["execution_count"],
+        legacy["cells"][0]["execution_count"]
+    );
+    let ids: Vec<&str> = after["cells"]
+        .as_array()
+        .expect("cells")
+        .iter()
+        .map(|cell| cell["id"].as_str().expect("stable cell id"))
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
+fn expected_snapshot_is_mandatory_after_a_successful_read() {
+    let _sess = session_lock();
+    let dir = TempDir::new_in(".").expect("tempdir");
+    let path = dir.path().join("generation-required.ipynb");
+    write_notebook(&path, &make_notebook(&[("c1", "code", "old")]));
+    let path_str = path.to_string_lossy().to_string();
+    let _snapshot = mark_read_snapshot(&path_str);
+    let original = std::fs::read(&path).expect("original bytes");
+
+    let (message, is_error) = notebook_edit(&json!({
+        "notebook_path": path_str,
+        "cell_id": "c1",
+        "edit_mode": "replace",
+        "new_source": "new",
+    }));
+    assert!(is_error, "missing generation must be rejected");
+    assert!(
+        message.contains("expected_snapshot"),
+        "unexpected error: {message}"
+    );
+    assert_eq!(std::fs::read(&path).expect("unchanged bytes"), original);
+}
+
+#[test]
+fn successful_edit_returns_the_committed_generation() {
+    let _sess = session_lock();
+    let dir = TempDir::new_in(".").expect("tempdir");
+    let path = dir.path().join("receipt.ipynb");
+    write_notebook(&path, &make_notebook(&[("c1", "code", "old")]));
+    let path_str = path.to_string_lossy().to_string();
+    let before = mark_read_snapshot(&path_str);
+
+    let result = execute_tool(
+        support::shared_run_context(),
+        &call(
+            "notebook_edit",
+            &json!({
+                "notebook_path": path_str,
+                "cell_id": "c1",
+                "edit_mode": "replace",
+                "new_source": "new",
+                "expected_snapshot": before,
+            }),
+        ),
+    );
+    assert!(
+        !result.is_error(),
+        "edit must succeed: {}",
+        result.content()
+    );
+    let receipt = result.structured().expect("typed notebook edit receipt");
+    assert_eq!(receipt["before_snapshot"], before);
+    let committed = receipt["after_snapshot"]
+        .as_str()
+        .expect("committed generation");
+    assert_ne!(committed, before);
+    assert_eq!(mark_read_snapshot(&path_str), committed);
 }
 mod support;

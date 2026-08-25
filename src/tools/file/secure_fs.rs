@@ -41,6 +41,23 @@ impl std::fmt::Display for AtomicWriteError {
 
 impl std::error::Error for AtomicWriteError {}
 
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static FAIL_BEFORE_ATOMIC_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm one deterministic, current-thread failure after staged bytes are
+/// synchronized but before the target generation is published.
+#[cfg(all(test, unix))]
+pub(super) fn fail_next_atomic_write_before_publish() {
+    FAIL_BEFORE_ATOMIC_PUBLISH.set(true);
+}
+
+#[cfg(all(test, unix))]
+fn take_fail_before_atomic_publish() -> bool {
+    FAIL_BEFORE_ATOMIC_PUBLISH.replace(false)
+}
+
 #[derive(Clone, Copy)]
 enum CapabilityDomain {
     Agent,
@@ -63,24 +80,6 @@ pub fn open_regular_read(context: &ToolRunContext, path: &Path) -> Result<File, 
     )?;
     require_regular(&file, path)?;
     reject_readable_hardlink(&file, path)?;
-    Ok(file)
-}
-
-/// Open a regular file for an in-place edit.
-pub(super) fn open_regular_edit(context: &ToolRunContext, path: &Path) -> Result<File, String> {
-    context
-        .require(ToolResource::WorkspaceWrite)
-        .map_err(|error| error.to_string())?;
-    let file = open_beneath(
-        context,
-        path,
-        true,
-        libc_flags::O_RDWR,
-        0,
-        CapabilityDomain::Agent,
-    )?;
-    require_regular(&file, path)?;
-    reject_writable_hardlink(&file, path)?;
     Ok(file)
 }
 
@@ -612,6 +611,13 @@ pub(super) fn write_atomic_generation(
             path.display()
         ))
     })?;
+
+    #[cfg(test)]
+    if take_fail_before_atomic_publish() {
+        return Err(AtomicWriteError::Failed(
+            "injected interruption before atomic publication".to_string(),
+        ));
+    }
 
     let before_publish = observe_writable_generation(context, path, maximum_bytes)?;
     if before_publish.as_ref().map(|observed| observed.digest) != expected {

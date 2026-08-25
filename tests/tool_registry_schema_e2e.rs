@@ -35,7 +35,7 @@ use openclaudia::{
     session::PLAN_MODE_ALLOWED_TOOLS,
     tools::{get_tool_definitions, registry::registry, ToolHandler},
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — aggregate shape
@@ -757,6 +757,35 @@ fn notebook_edit_schema_advertises_all_runtime_cell_types() {
             "notebook_edit cell_type schema must advertise runtime-supported {expected:?}; got {variants:?}"
         );
     }
+}
+
+#[test]
+fn notebook_edit_schema_requires_snapshot_and_makes_source_mode_conditional() {
+    let def = registry()
+        .get("notebook_edit")
+        .expect("notebook_edit registered")
+        .definition();
+    let required = def
+        .pointer("/function/parameters/required")
+        .and_then(Value::as_array)
+        .expect("notebook_edit required fields");
+    assert!(required.contains(&json!("notebook_path")));
+    assert!(required.contains(&json!("expected_snapshot")));
+    assert!(
+        !required.contains(&json!("new_source")),
+        "new_source is not required for delete"
+    );
+    assert_eq!(
+        def.pointer("/function/parameters/properties/expected_snapshot/pattern"),
+        Some(&json!("^sha256:[0-9a-f]{64}$"))
+    );
+    assert!(
+        def.pointer("/function/parameters/properties/new_source/description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| description.contains("replace and insert")
+                && description.contains("omit for delete")),
+        "provider-compatible schema must document the runtime conditional"
+    );
 }
 
 #[test]
