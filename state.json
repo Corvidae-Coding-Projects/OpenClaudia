@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1135,
+  "next_display_id": 1136,
   "next_comment_id": 1528,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -574,6 +574,7 @@
     "8c4d7614-6d19-4f44-b6d4-9c8da8d08f98": 1004,
     "8ccbbf95-aef7-46b5-b332-9f6148ed4f19": 172,
     "8cf66fd0-9684-448c-933d-15e322cdc1cd": 120,
+    "8d435fbf-0e17-4724-89ef-1ade747108d6": 1135,
     "8de5caaf-be57-4083-bc07-c9f33e5e7759": 580,
     "8e03afe6-d146-43e7-84bc-4084c696a4dc": 1115,
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": 384,
@@ -18277,6 +18278,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "8d435fbf-0e17-4724-89ef-1ade747108d6": {
+      "uuid": "8d435fbf-0e17-4724-89ef-1ade747108d6",
+      "display_id": 1135,
+      "title": "S-033: Bound and stabilize file discovery and grep",
+      "description": "Implement the S-033 contract from docs/remediation-slices/033-bounded-file-discovery-and-grep.md: use one securely contained, deterministic, cancellation-aware, paginated walker for list_files, glob, and grep; apply practical traversal, byte, match, context, line-length, time, and rendered-output limits before allocation; return explicit partial-result diagnostics instead of silent truncation; preserve existing intended behavior and remain scoped to realistic production risks. Verify on Rust 1.98 with one Cargo invocation at a time and CARGO_BUILD_JOBS=4, preserve generated Crosslink changelog output exactly, and monitor every PR #66 runner after user push.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-25T01:15:26.695055699Z",
+      "updated_at": "2026-08-25T01:15:26.695055699Z"
     },
     "8de5caaf-be57-4083-bc07-c9f33e5e7759": {
       "uuid": "8de5caaf-be57-4083-bc07-c9f33e5e7759",
@@ -39426,11 +39439,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1528,
       "timestamp": "2026-08-25T01:14:11.399230075Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1529,
+      "timestamp": "2026-08-25T01:15:26.695055699Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T01:14:11.399230075Z",
+    "timestamp": "2026-08-25T01:15:26.695055699Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1528
+    "agent_seq": 1529
   }
 }
